@@ -35,6 +35,10 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     MeasuredVramSnapshot,
     VramArbiter,
 )
+from horde_worker_regen.process_management.scheduling.admission import materialization as materialization_mod
+from horde_worker_regen.process_management.scheduling.admission import preload as preload_mod
+from horde_worker_regen.process_management.scheduling.admission import pricing
+from horde_worker_regen.process_management.scheduling.admission.materialization import ContextReduction
 from horde_worker_regen.process_management.scheduling.inference_scheduler import _WholeCardDemandOutcome
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -139,22 +143,23 @@ async def _scheduler_for(case: ResidencyCase):  # noqa: ANN202
 )
 async def test_starvation_request_does_not_offer_a_non_reducing_context_teardown(
     case: ResidencyCase,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The scheduler must not tell the arbiter contexts are teardownable when its target cannot lower the pool."""
     scheduler, head, target = await _scheduler_for(case)
     forecast = _forecast(case.total_vram_mb)
-    scheduler._forecast_streaming = Mock(return_value=forecast)  # type: ignore[method-assign]
+    monkeypatch.setattr(pricing, "forecast_streaming", lambda *_args, **_kwargs: forecast)
     scheduler._decide_whole_card_demand = Mock(  # type: ignore[method-assign]
         return_value=_WholeCardDemandOutcome.FALL_THROUGH,
     )
-    scheduler._context_reduction_demand = Mock(  # type: ignore[method-assign]
-        return_value=(case.computed_target, False),
+    monkeypatch.setattr(
+        preload_mod,
+        "context_reduction_demand",
+        lambda *_args, **_kwargs: ContextReduction(case.computed_target, False),
     )
-    scheduler._has_reclaimable_idle_model = Mock(return_value=False)  # type: ignore[method-assign]
-    scheduler._head_starved_seconds = Mock(return_value=_STARVED_SECONDS)  # type: ignore[method-assign]
-    scheduler._measured_admission_candidate_delta_mb = Mock(  # type: ignore[method-assign]
-        return_value=_INCIDENT_WEIGHTS_MB,
-    )
+    monkeypatch.setattr(pricing, "has_reclaimable_idle_model", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(materialization_mod, "head_starved_seconds", lambda *_args, **_kwargs: _STARVED_SECONDS)
+    monkeypatch.setattr(pricing, "candidate_delta_mb", lambda *_args, **_kwargs: _INCIDENT_WEIGHTS_MB)
 
     arbiter = VramArbiter()
     arbiter.begin_cycle(

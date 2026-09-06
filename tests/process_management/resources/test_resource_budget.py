@@ -1858,7 +1858,7 @@ class TestSchedulerReservationOverlay:
 
         # Grant the first preload for real; the grant path registers its reservation synchronously.
         job_a = make_job_pop_response("model_a")
-        assert scheduler._send_preload(job_a, loader) is True
+        assert scheduler._send_preload(job_a, loader, planned_charge_mb=8000.0) is True
 
         after = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
         assert after.planned_unmaterialized_mb == 8000.0
@@ -1880,7 +1880,7 @@ class TestSchedulerReservationOverlay:
         device_free = 13200.0
 
         job_a = make_job_pop_response("model_a")
-        assert scheduler._send_preload(job_a, loader) is True
+        assert scheduler._send_preload(job_a, loader, planned_charge_mb=8000.0) is True
         while_loading = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
         assert while_loading.planned_unmaterialized_mb == 8000.0
         assert self._candidate_fits(while_loading, candidate_mb=8000.0) is False
@@ -1901,7 +1901,7 @@ class TestSchedulerReservationOverlay:
         loader = scheduler._process_map[0]  # type: ignore[index]
         device_free = 13200.0
         job_a = make_job_pop_response("model_a")
-        assert scheduler._send_preload(job_a, loader) is True
+        assert scheduler._send_preload(job_a, loader, planned_charge_mb=8000.0) is True
 
         # Simulate the loader dying mid-load: its model map entry leaves the loading state (here, cleared).
         scheduler._horde_model_map.root.pop("model_a", None)  # type: ignore[attr-defined]

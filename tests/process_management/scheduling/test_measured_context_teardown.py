@@ -110,10 +110,11 @@ async def test_a_deficit_one_idle_sibling_context_closes_widens_the_flag_and_siz
     deficit = arbiter.measured_deficit_mb(request)
     assert deficit is not None and 0 < deficit < 600, "the replayed edge: short by a few hundred MB"
 
-    widened, max_resident = scheduler._apply_measured_context_teardown(
+    widened, max_resident = pricing.apply_measured_context_teardown(
+        scheduler.snapshot(),
         request,
         arbiter,
-        target,
+        target.process_id,
         structural_max_resident=5,
         device_index=0,
     )
@@ -132,10 +133,11 @@ async def test_a_deficit_no_idle_context_can_close_is_left_alone() -> None:
     arbiter = _arbiter(_edge_state(device_free_mb=12000.0))
     request = _head_request()
 
-    unchanged, max_resident = scheduler._apply_measured_context_teardown(
+    unchanged, max_resident = pricing.apply_measured_context_teardown(
+        scheduler.snapshot(),
         request,
         arbiter,
-        target,
+        target.process_id,
         structural_max_resident=5,
         device_index=0,
     )
@@ -152,19 +154,21 @@ async def test_a_fitting_candidate_and_a_non_head_are_never_widened() -> None:
     arbiter = _arbiter(_edge_state())
 
     fitting = _head_request(candidate_mb=3000.0)
-    assert scheduler._apply_measured_context_teardown(
+    assert pricing.apply_measured_context_teardown(
+        scheduler.snapshot(),
         fitting,
         arbiter,
-        target,
+        target.process_id,
         structural_max_resident=None,
         device_index=0,
     ) == (fitting, None)
 
     follower = _head_request(head=False)
-    assert scheduler._apply_measured_context_teardown(
+    assert pricing.apply_measured_context_teardown(
+        scheduler.snapshot(),
         follower,
         arbiter,
-        target,
+        target.process_id,
         structural_max_resident=5,
         device_index=0,
     ) == (follower, 5)
@@ -176,10 +180,11 @@ async def test_the_structural_judgement_is_kept_and_the_depth_is_the_deeper() ->
     arbiter = _arbiter(_edge_state())
 
     already = replace(_head_request(), idle_contexts_teardownable=True)
-    assert scheduler._apply_measured_context_teardown(
+    assert pricing.apply_measured_context_teardown(
+        scheduler.snapshot(),
         already,
         arbiter,
-        target,
+        target.process_id,
         structural_max_resident=1,
         device_index=0,
     ) == (already, 1)

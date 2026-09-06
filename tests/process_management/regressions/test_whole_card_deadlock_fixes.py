@@ -46,6 +46,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import Pr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
+from horde_worker_regen.process_management.scheduling.admission import preload, pricing
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -318,38 +319,39 @@ class TestContextReductionSizingFloor:
         scheduler.unload_models_from_vram = Mock(return_value=False)  # type: ignore[method-assign]
         return scheduler, process_info
 
-    def _captured_sizing_reserve(self, scheduler, process_info) -> float | None:  # noqa: ANN001
+    def _captured_sizing_reserve(self, scheduler, process_info, monkeypatch: pytest.MonkeyPatch) -> float | None:  # noqa: ANN001
         captured: list[float] = []
 
-        def record_sizing(peak_mb: float, reserve_mb: float, *, device_index=None):  # noqa: ANN001, ANN202
+        def record_sizing(snapshot, peak_mb: float, reserve_mb: float, *, device_index=None):  # noqa: ANN001, ANN202
             captured.append(reserve_mb)
             return 5
 
-        scheduler._max_coresident_for_peak_mb = record_sizing  # type: ignore[method-assign]
+        monkeypatch.setattr(pricing, "max_coresident_for_peak_mb", record_sizing)
         vram_verdict = Mock(fits=False, predicted_mb=8258.0, reserve_mb=4096.0, reason=Mock(return_value="over"))
-        scheduler._context_reduction_demand(
+        preload.context_reduction_demand(
+            scheduler.snapshot(),
             vram_verdict,
             Mock(is_card_demanding=False),
             is_head_blocker=True,
-            target_device_index=None,
+            device_index=None,
         )
         return captured[0] if captured else None
 
     def test_sizing_uses_streaming_floor_when_total_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With the card total known, the depth is sized against the ComfyUI floor, not the 4096 margin."""
         monkeypatch.setattr(
-            "horde_worker_regen.process_management.scheduling.inference_scheduler.effective_inference_reserve_mb",
+            "horde_worker_regen.process_management.scheduling.admission.preload.effective_inference_reserve_mb",
             lambda total, floor: 1519.0,
         )
         scheduler, process_info = self._scheduler_for_verdict(report_total=True)
 
-        assert self._captured_sizing_reserve(scheduler, process_info) == 1519.0
+        assert self._captured_sizing_reserve(scheduler, process_info, monkeypatch) == 1519.0
 
-    def test_sizing_falls_back_to_verdict_reserve_without_total(self) -> None:
+    def test_sizing_falls_back_to_verdict_reserve_without_total(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Cold start (no reported total): the conservative configured reserve is retained."""
         scheduler, process_info = self._scheduler_for_verdict(report_total=False)
 
-        assert self._captured_sizing_reserve(scheduler, process_info) == 4096.0
+        assert self._captured_sizing_reserve(scheduler, process_info, monkeypatch) == 4096.0
 
 
 class TestWholeCardResidencyProtectsFromVramEviction:

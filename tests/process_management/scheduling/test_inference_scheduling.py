@@ -34,8 +34,9 @@ from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
-from horde_worker_regen.process_management.scheduling.admission import preload
+from horde_worker_regen.process_management.scheduling.admission import preload, pricing
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob
+from horde_worker_regen.process_management.scheduling.admission.materialization import ContextReduction
 from horde_worker_regen.process_management.scheduling.admission.preload import (
     PreloadPassControl,
     decide_preload_gates,
@@ -2026,8 +2027,14 @@ class TestPreloadTargetRetiredDuringAdmission:
         scheduler, process_map = self._scheduler_with_two_idle_lanes()
         await track_popped_job_async(scheduler._job_tracker, make_job_pop_response("stable_diffusion"))
 
-        def admit(job: ImageGenerateJobPopResponse, process_info: HordeProcessInfo, *, is_head_blocker: bool) -> bool:
-            del job, is_head_blocker
+        def admit(
+            job: ImageGenerateJobPopResponse,
+            process_info: HordeProcessInfo,
+            *,
+            is_head_blocker: bool,
+            snapshot: object = None,
+        ) -> bool:
+            del job, is_head_blocker, snapshot
             assert process_info.process_id == 0, "precondition: the pass aims at the first idle lane"
             process_map.retire_process(process_map[0], "inference scale-down")
             return True
@@ -2043,8 +2050,14 @@ class TestPreloadTargetRetiredDuringAdmission:
         scheduler, process_map = self._scheduler_with_two_idle_lanes()
         await track_popped_job_async(scheduler._job_tracker, make_job_pop_response("stable_diffusion"))
 
-        def admit(job: ImageGenerateJobPopResponse, process_info: HordeProcessInfo, *, is_head_blocker: bool) -> bool:
-            del job, process_info, is_head_blocker
+        def admit(
+            job: ImageGenerateJobPopResponse,
+            process_info: HordeProcessInfo,
+            *,
+            is_head_blocker: bool,
+            snapshot: object = None,
+        ) -> bool:
+            del job, process_info, is_head_blocker, snapshot
             for process_id in (0, 1):
                 process_map.retire_process(process_map[process_id], "inference scale-down")
             return True
@@ -2108,7 +2121,7 @@ class TestContextReductionIsNotAResidencyPreference:
     with no ordinary route to that reclaim, deferred against a card whose own idle contexts hold the deficit.
     """
 
-    def _demand_with_residency(self, *, enabled: bool) -> tuple[int | None, bool]:
+    def _demand_with_residency(self, *, enabled: bool, monkeypatch: pytest.MonkeyPatch) -> ContextReduction:
         process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         process_info.total_vram_mb = 16384
         scheduler = _make_inference_scheduler(
@@ -2123,19 +2136,19 @@ class TestContextReductionIsNotAResidencyPreference:
                 whole_card_exclusive_residency=enabled,
             ),
         )
-        scheduler._max_coresident_for_peak_mb = Mock(return_value=1)  # type: ignore[method-assign]
-        scheduler._whole_card_warranted = Mock(return_value=True)  # type: ignore[method-assign]
-        return scheduler._context_reduction_demand(
+        monkeypatch.setattr(pricing, "max_coresident_for_peak_mb", lambda *_args, **_kwargs: 1)
+        return preload.context_reduction_demand(
+            scheduler.snapshot(),
             Mock(fits=False, predicted_mb=14000.0, reserve_mb=1024.0),
             Mock(is_card_demanding=True),
             is_head_blocker=True,
-            target_device_index=None,
+            device_index=None,
         )
 
-    def test_remedy_is_offered_with_the_residency_preference_off(self) -> None:
+    def test_remedy_is_offered_with_the_residency_preference_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The same card state yields the same reduction demand whichever way the preference is set."""
-        assert self._demand_with_residency(enabled=True) == (1, True)
-        assert self._demand_with_residency(enabled=False) == (1, True)
+        assert self._demand_with_residency(enabled=True, monkeypatch=monkeypatch) == ContextReduction(1, True)
+        assert self._demand_with_residency(enabled=False, monkeypatch=monkeypatch) == ContextReduction(1, True)
 
 
 class TestResidentWholeCardHeadFitsLive:
@@ -2954,6 +2967,7 @@ class TestPerCardContextOverhead:
             process_map=process_map,
             max_inference=4,
             bridge_data=make_mock_bridge_data(vram_per_process_overhead_mb=0),
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1)),
         )
         scheduler.set_measured_per_process_overhead_mb(self._SMALL_CARD_OVERHEAD_MB, device_index=0)
         scheduler.set_measured_per_process_overhead_mb(self._BIG_CARD_OVERHEAD_MB, device_index=1)
@@ -2964,10 +2978,11 @@ class TestPerCardContextOverhead:
     def test_each_card_sizes_from_its_own_measured_overhead(self) -> None:
         """The co-residency depth on each card follows that card's own first-context and marginal costs."""
         scheduler = self._two_card_scheduler()
+        snapshot = scheduler.snapshot()
         # 8192 - 4000 - 0 = 4192 budget; (4192 - 600) // 200 = 17 extra contexts beside the loader's.
-        assert scheduler._max_coresident_for_peak_mb(4000.0, 0.0, device_index=0) == 18
+        assert pricing.max_coresident_for_peak_mb(snapshot, 4000.0, 0.0, device_index=0) == 18
         # 24564 - 4000 - 0 = 20564 budget; (20564 - 1300) // 500 = 38 extra contexts.
-        assert scheduler._max_coresident_for_peak_mb(4000.0, 0.0, device_index=1) == 39
+        assert pricing.max_coresident_for_peak_mb(snapshot, 4000.0, 0.0, device_index=1) == 39
 
     def test_an_unmeasured_card_falls_back_to_the_worker_wide_maxima(self) -> None:
         """A card the probe could not measure prices exactly as it did before per-card figures existed."""

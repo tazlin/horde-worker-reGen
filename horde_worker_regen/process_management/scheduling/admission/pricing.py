@@ -39,6 +39,14 @@ from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quot
 
 type Baseline = KNOWN_IMAGE_GENERATION_BASELINE | str | None
 
+STAGING_ENCODE_VRAM_MB = 2048.0
+"""VRAM a staged (dispatched but not-yet-cleared) job actually charges the device under the clearance
+lease: the text-encoder footprint plus the conditioning working set for the largest supported family
+(SDXL's dual CLIP encode lands near 1.5-2GB). Under the clearance lease the diffusion weights load
+*inside* the leased sample call, at clearance, not at dispatch, so a staged job's device footprint is
+only this encode working set until it is cleared. Dispatch admits staging while measured device free net
+of the reserve covers this charge; the full materialisation is priced at clearance instead."""
+
 # ---- context overheads
 
 
@@ -69,6 +77,17 @@ def marginal_or_seed_mb(snapshot: SchedulingSnapshot, device_index: int | None) 
     if marginal_mb is None or marginal_mb <= 0.0:
         return _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
     return marginal_mb
+
+
+def whole_card_warranted(forecast: StreamForecast, *, marginal_overhead_mb: float | None) -> bool:
+    """Whether a teardown demand is trustworthy enough to reserve the card or reduce its live contexts.
+
+    Reserving the card stops siblings, moves safety off-GPU and holds the device through a cooldown, so it must
+    not fire on a measurement artifact. A card-demanding model warrants it outright; otherwise the per-context
+    cost must have been measured, since the unmeasured fallback charges the one-time CUDA runtime against every
+    context and can manufacture a demand for a model that co-resides with room to spare.
+    """
+    return forecast.is_card_demanding or marginal_overhead_mb is not None
 
 
 def admission_noise_mb(snapshot: SchedulingSnapshot, device_index: int | None, total_vram_mb: float | None) -> float:

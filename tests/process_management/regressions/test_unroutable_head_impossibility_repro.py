@@ -41,6 +41,7 @@ from horde_worker_regen.process_management.resources.foreign_vram_floor import F
 from horde_worker_regen.process_management.resources.resource_budget import is_model_locally_unservable_for
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
+from horde_worker_regen.process_management.scheduling.admission import materialization, pricing
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -137,6 +138,9 @@ class _World:
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", _candidate_by_model(head_candidate_mb))
         monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", _candidate_by_model(head_candidate_mb))
         monkeypatch.setattr(_sched_mod, "predict_job_weight_mb", _weights_by_model(head_candidate_mb))
+        monkeypatch.setattr(pricing, "predict_job_sampling_vram_mb", _candidate_by_model(head_candidate_mb))
+        monkeypatch.setattr(pricing, "predict_job_weight_mb", _weights_by_model(head_candidate_mb))
+        monkeypatch.setattr(materialization, "predict_job_weight_mb", _weights_by_model(head_candidate_mb))
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
         monkeypatch.setattr(self._scheduler, "_measured_available_ram_mb", lambda: 64000.0)
 

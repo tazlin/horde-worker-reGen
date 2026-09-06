@@ -30,7 +30,11 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
-from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger, RamPressureVerdict
+from horde_worker_regen.process_management.resources.resource_budget import (
+    CommittedReserveLedger,
+    RamPressureVerdict,
+    VramBudget,
+)
 from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState
 from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
@@ -278,6 +282,8 @@ class PricingServices:
     footprint_store: LearnedFootprintStore | None
     overhead: ContextOverheadModel
     reserve_ledger: CommittedReserveLedger
+    vram_budget: VramBudget
+    """The predictive VRAM budget: the static peak estimate and the configured reserve a preload is sized from."""
 
 
 @dataclass(frozen=True)
@@ -439,6 +445,7 @@ def build_scheduling_snapshot(
     footprint_store: LearnedFootprintStore | None,
     overhead: ContextOverheadModel,
     reserve_ledger: CommittedReserveLedger,
+    vram_budget: VramBudget,
     whole_card_ledger: WholeCardResidencyLedger,
     whole_card_phase: Callable[[int | None], tuple[str | None, WholeCardPhase]],
     measured_free_mb: Callable[[int | None], float | None],
@@ -617,5 +624,6 @@ def build_scheduling_snapshot(
             footprint_store=footprint_store,
             overhead=overhead,
             reserve_ledger=reserve_ledger,
+            vram_budget=vram_budget,
         ),
     )

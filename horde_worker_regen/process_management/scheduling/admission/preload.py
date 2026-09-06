@@ -17,12 +17,23 @@ from dataclasses import dataclass
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
+from horde_worker_regen.process_management.resources.resource_budget import (
+    BudgetVerdict,
+    StreamForecast,
+    effective_inference_reserve_mb,
+)
+from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter, VramRequestKind
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.commands import (
     FaultCause,
     FaultJob,
     ReplaceProcess,
     SchedulerCommand,
+)
+from horde_worker_regen.process_management.scheduling.admission.materialization import (
+    ContextReduction,
+    MaterializationRequest,
+    build_materialization_request,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import (
     JobSnapshot,
@@ -542,3 +553,137 @@ def decide_preload_gates(
         is_head_blocker=is_head_blocker,
         disallowed=disallowed,
     )
+
+
+# ---- the budget step's pricing
+
+
+@dataclass(frozen=True)
+class PricedPreload:
+    """A preload priced for the arbiter, with the predictive verdict and forecast its diagnostics read."""
+
+    priced: MaterializationRequest
+    predictive: BudgetVerdict
+    """The static budget's verdict: its rejected peak sizes the context reduction, and its ``fits`` annotates a
+    defer the measured arbiter takes against a candidate the static forecast called a fit."""
+    forecast: StreamForecast
+    context_reduction: ContextReduction
+
+    @property
+    def max_resident(self) -> int | None:
+        """The context-reduction depth after the measured widening."""
+        return self.priced.max_resident
+
+
+def preload_candidate_delta_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int | None) -> float | None:
+    """The VRAM (MB) a preload of the job charges the card at admission.
+
+    Without the clearance lease a preload is the VRAM moment (the child loads the weights when the job starts),
+    so it is priced at the job's full marginal sampling charge. Under the lease a preload only stages the job
+    in system RAM and the weights load inside the leased sample call, so the charge is capped at the staging
+    encode footprint, the same figure a staged dispatch books; the full fit-or-evict runs at clearance. Pricing
+    the stage at the full peak would park the next model's disk read behind the current sample on every model
+    switch, which is exactly the work the stage exists to overlap.
+    """
+    job = snapshot.queue.jobs[job_id]
+    delta_mb = pricing.candidate_delta_mb(
+        snapshot,
+        snapshot.queue.payloads[job_id],
+        job.baseline,
+        process_id=process_id,
+        disaggregated=job.disaggregation_class_eligible,
+    )
+    if delta_mb is None or not bool(snapshot.config.gpu_sampling_lease_enabled):
+        return delta_mb
+    return min(delta_mb, pricing.STAGING_ENCODE_VRAM_MB)
+
+
+def predictive_vram_verdict(snapshot: SchedulingSnapshot, job_id: str, device_index: int | None) -> BudgetVerdict:
+    """The static VRAM budget's verdict for the job against the card's measured free and the committed reserve."""
+    job = snapshot.queue.jobs[job_id]
+    return snapshot.services.vram_budget.check_job(
+        snapshot.queue.payloads[job_id],
+        job.baseline,
+        snapshot.card(device_index).measured_free_mb,
+        committed_reserve_mb=snapshot.committed_vram_reserve_mb,
+        disaggregated=job.disaggregation_class_eligible,
+    )
+
+
+def context_reduction_demand(
+    snapshot: SchedulingSnapshot,
+    predictive: BudgetVerdict,
+    forecast: StreamForecast,
+    *,
+    is_head_blocker: bool,
+    device_index: int | None,
+) -> ContextReduction:
+    """The head's context-reduction depth and whether reducing live contexts is a warranted remedy.
+
+    A moderate head's weights fit after a model eviction but its activation peak does not while this many
+    contexts are live (each extra context retains VRAM the allocator never returns). Reducing the live
+    inference-process count to the largest that still seats the rejected peak plus its structural reserve is
+    the remedy. The depth keys on the honest streaming floor, not the operator's configured margin, so only a
+    genuinely card-filling peak pushes the co-resident count below the live pool; a demand resting on untrusted
+    (unmeasured-fallback) overhead figures is not warranted. The warrant is measured, never an operator
+    preference: ``whole_card_exclusive_residency`` governs exclusive residencies, and a context reduction is
+    not one.
+    """
+    max_resident: int | None = None
+    if predictive.predicted_mb is not None:
+        total_vram_mb = snapshot.card(device_index).total_vram_mb
+        structural_reserve_mb = (
+            effective_inference_reserve_mb(total_vram_mb, 0.0) if total_vram_mb is not None else predictive.reserve_mb
+        )
+        max_resident = pricing.max_coresident_for_peak_mb(
+            snapshot,
+            predictive.predicted_mb,
+            structural_reserve_mb,
+            device_index=device_index,
+        )
+    demanded = (
+        is_head_blocker
+        and max_resident is not None
+        and pricing.loaded_inference_count(snapshot, device_index) > max_resident
+    )
+    warranted = pricing.whole_card_warranted(
+        forecast,
+        marginal_overhead_mb=pricing.marginal_process_overhead_mb(snapshot, None),
+    )
+    return ContextReduction(max_resident=max_resident, can_reduce_live_contexts=demanded and warranted)
+
+
+def price_preload(
+    snapshot: SchedulingSnapshot,
+    job_id: str,
+    process_id: int,
+    *,
+    arbiter: VramArbiter,
+    is_head_blocker: bool,
+    forecast: StreamForecast,
+) -> PricedPreload:
+    """Price a preload onto the slot: the predictive verdict, the context reduction it sizes, the arbiter request."""
+    slot = snapshot.slots[process_id]
+    device_index = snapshot.routing_device_index(slot)
+    predictive = predictive_vram_verdict(snapshot, job_id, device_index)
+    context_reduction = context_reduction_demand(
+        snapshot,
+        predictive,
+        forecast,
+        is_head_blocker=is_head_blocker,
+        device_index=device_index,
+    )
+    priced = build_materialization_request(
+        snapshot,
+        job_id,
+        process_id,
+        arbiter=arbiter,
+        is_head_of_queue=is_head_blocker,
+        head_outstanding_mb=None,
+        candidate_delta_override_mb=preload_candidate_delta_mb(snapshot, job_id, process_id),
+        kind=VramRequestKind.PRELOAD,
+        context_reduction=context_reduction,
+        forecast=forecast,
+        prepared_head_reprices_activation=False,
+    )
+    return PricedPreload(priced=priced, predictive=predictive, forecast=forecast, context_reduction=context_reduction)

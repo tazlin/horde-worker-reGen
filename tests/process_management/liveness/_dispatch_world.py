@@ -90,16 +90,14 @@ from horde_worker_regen.process_management.resources.run_metrics import (
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import MeasuredVramSnapshot
 from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
+from horde_worker_regen.process_management.scheduling.admission.pricing import STAGING_ENCODE_VRAM_MB
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     ClearanceController,
     ClearanceLeaseProxy,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import offer_under_pop_claim
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _STAGING_ENCODE_VRAM_MB,
-    InferenceScheduler,
-)
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
@@ -1791,7 +1789,7 @@ class _DispatchWorld:
                 # Under the lease a dispatch only stages the job: the lane holds its encode working set and
                 # nothing else, and the weights land when the parent clears it. The slot stays in the primed
                 # state production stamped on it at dispatch, which is what makes it a clearance waiter.
-                self._encode_staging_mb[lanes[0]] = _STAGING_ENCODE_VRAM_MB
+                self._encode_staging_mb[lanes[0]] = STAGING_ENCODE_VRAM_MB
                 self._clearance_waiting_since[job_id] = self.now
                 self._sync_reported_vram()
                 continue

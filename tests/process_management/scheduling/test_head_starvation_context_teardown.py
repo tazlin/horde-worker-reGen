@@ -2,7 +2,7 @@
 
 A head starved past the arbiter's escalation threshold whose remaining deficit is held by idle sibling CUDA
 contexts (a bare context that weight eviction cannot reclaim) escalates to a verified context teardown. The
-scheduler tells the arbiter whether such a teardown target exists via ``_has_teardownable_idle_context``,
+scheduler tells the arbiter whether such a teardown target exists via ``pricing.has_teardownable_idle_context``,
 which must exclude the head's own target slot and every busy process. It is independent of
 ``whole_card_exclusive_residency``: that flag governs steady-state exclusive-residency preference, but the
 starvation escalation is an emergency-liveness path that must be reachable regardless of it (the actuation runs
@@ -22,6 +22,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommandKind,
     HeadReclaimContext,
 )
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -48,20 +49,20 @@ class TestHasTeardownableIdleContext:
         head = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         idle_sibling = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         scheduler = _scheduler(ProcessMap({0: head, 1: idle_sibling}))
-        assert scheduler._has_teardownable_idle_context(head, device_index=None) is True
+        assert pricing.has_teardownable_idle_context(scheduler.snapshot(), head.process_id, device_index=None) is True
 
     def test_head_target_slot_is_never_torn_down(self) -> None:
         """With only the head's own slot present, there is no teardownable sibling."""
         head = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         scheduler = _scheduler(ProcessMap({0: head}))
-        assert scheduler._has_teardownable_idle_context(head, device_index=None) is False
+        assert pricing.has_teardownable_idle_context(scheduler.snapshot(), head.process_id, device_index=None) is False
 
     def test_busy_sibling_context_is_never_torn_down(self) -> None:
         """A busy sibling is excluded, so a head beside only busy siblings has no teardown target."""
         head = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         busy_sibling = make_mock_process_info(1, model_name="model_b", state=HordeProcessState.INFERENCE_STARTING)
         scheduler = _scheduler(ProcessMap({0: head, 1: busy_sibling}))
-        assert scheduler._has_teardownable_idle_context(head, device_index=None) is False
+        assert pricing.has_teardownable_idle_context(scheduler.snapshot(), head.process_id, device_index=None) is False
 
     def test_flag_does_not_govern_the_emergency_teardown_seam(self) -> None:
         """An idle sibling context is teardownable whether or not steady-state whole-card residency is enabled.
@@ -74,16 +75,19 @@ class TestHasTeardownableIdleContext:
             head = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
             idle_sibling = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
             scheduler = _scheduler(ProcessMap({0: head, 1: idle_sibling}), whole_card=whole_card)
-            assert scheduler._has_teardownable_idle_context(head, device_index=None) is True, (
-                f"whole_card={whole_card}: an idle sibling context must be teardownable regardless of the flag"
-            )
+            assert (
+                pricing.has_teardownable_idle_context(scheduler.snapshot(), head.process_id, device_index=None) is True
+            ), f"whole_card={whole_card}: an idle sibling context must be teardownable regardless of the flag"
 
     def test_no_idle_sibling_is_not_teardownable_regardless_of_flag(self) -> None:
         """With only the head's slot present, there is no teardown target whether or not the flag is set."""
         for whole_card in (True, False):
             head = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
             scheduler = _scheduler(ProcessMap({0: head}), whole_card=whole_card)
-            assert scheduler._has_teardownable_idle_context(head, device_index=None) is False
+            assert (
+                pricing.has_teardownable_idle_context(scheduler.snapshot(), head.process_id, device_index=None)
+                is False
+            )
 
     def test_sibling_on_another_card_is_out_of_scope(self) -> None:
         """A device-scoped query ignores an idle sibling pinned to a different card."""
@@ -92,7 +96,7 @@ class TestHasTeardownableIdleContext:
             1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=1
         )
         scheduler = _scheduler(ProcessMap({0: head, 1: other_card}))
-        assert scheduler._has_teardownable_idle_context(head, device_index=0) is False
+        assert pricing.has_teardownable_idle_context(scheduler.snapshot(), head.process_id, device_index=0) is False
 
     def test_non_inference_sibling_is_not_a_context_teardown_target(self) -> None:
         """A post-processing or other non-inference process is not a teardownable inference context."""
@@ -104,7 +108,7 @@ class TestHasTeardownableIdleContext:
             process_type=HordeProcessType.POST_PROCESS,
         )
         scheduler = _scheduler(ProcessMap({0: head, 1: pp_sibling}))
-        assert scheduler._has_teardownable_idle_context(head, device_index=None) is False
+        assert pricing.has_teardownable_idle_context(scheduler.snapshot(), head.process_id, device_index=None) is False
 
 
 class TestContextTeardownActuationExecutesWithFlagOff:

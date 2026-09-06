@@ -52,6 +52,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import VramDisposition
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _ESTABLISH_WINDOW_LIMIT,
     _ESTABLISH_WINDOW_SECONDS,
@@ -659,6 +660,8 @@ class TestChurnGovernors:
         )
         lifecycle = Mock()
         lifecycle.is_safety_gpu_paused = False
+        lifecycle.get_processes_with_model_for_queued_job = Mock(return_value=[])
+        lifecycle.is_model_load_quarantined = Mock(return_value=False)
         lifecycle.post_process_lane_enabled = Mock(return_value=False)
         lifecycle.component_lane_enabled = Mock(return_value=False)
         lifecycle.vae_lane_enabled = Mock(return_value=False)
@@ -952,6 +955,9 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
             "_forecast_streaming",
             lambda _job, _baseline, device_index=None: forecast,
         )
+        monkeypatch.setattr(
+            pricing, "forecast_streaming", lambda _snapshot, _job, _baseline, device_index=None: forecast
+        )
 
     def test_a_burst_of_heads_sharing_one_residency_charges_one_window(self) -> None:
         """Successive jobs for the held model re-ask every cycle; only the physical establishment is charged."""
@@ -980,7 +986,7 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
         )
         assert scheduler._whole_card_ledger.establish_rate_exceeded(None, now=time.time()) is False
 
-    def test_a_governed_head_that_measurably_fits_is_served_after_the_bounded_dwell(
+    async def test_a_governed_head_that_measurably_fits_is_served_after_the_bounded_dwell(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1002,6 +1008,7 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
             "precondition: the card measurably holds this model's weights right now"
         )
 
+        await track_popped_job_async(scheduler._job_tracker, flux_job)
         assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is False, (
             "inside the dwell the head keeps asking for the card rather than downgrading immediately"
         )
@@ -1017,7 +1024,7 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
             "the coerced head runs co-resident; it must not have claimed the card the governors refused it"
         )
 
-    def test_a_head_the_arbiter_refuses_still_defers_after_the_dwell(
+    async def test_a_head_the_arbiter_refuses_still_defers_after_the_dwell(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1037,6 +1044,7 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
         )
         monkeypatch.setattr(scheduler, "_ensure_preload_arbiter", lambda: arbiter)
 
+        await track_popped_job_async(scheduler._job_tracker, flux_job)
         assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is False
         scheduler._whole_card_ledger.state_for(None).governor_deferred_since = time.time() - (
             _GOVERNOR_DEFER_DWELL_SECONDS + 1.0

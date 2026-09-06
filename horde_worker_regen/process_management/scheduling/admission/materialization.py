@@ -1,7 +1,8 @@
 """The materialisation request: pricing a job's VRAM landing on a slot through the MONOLITHIC_DISPATCH identity.
 
-Shared by the dispatch residency-reconciliation gate and the clearance gate. The request is built from the
-snapshot alone; evaluating it is the arbiter's, and running the verdict's actuations is the executor's.
+Shared by the dispatch residency-reconciliation gate, the clearance gate and the preload budget step. The
+request is built from the snapshot alone; evaluating it is the arbiter's, and running the verdict's actuations
+is the executor's.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.resources.resource_budget import (
+    StreamForecast,
     effective_inference_reserve_mb,
     predict_job_weight_mb,
 )
@@ -20,6 +22,21 @@ from horde_worker_regen.process_management.scheduling.workload_flow import (
     DISPATCH_ADMISSION_FLOW,
     PRELOAD_ADMISSION_FLOW,
 )
+
+
+@dataclass(frozen=True)
+class ContextReduction:
+    """How deep a context reduction on behalf of the job may go, and whether it is a warranted remedy.
+
+    Dispatch and clearance size the depth from the candidate delta and never offer the live-context reduction;
+    a preload sizes it from the predictive verdict's rejected peak (the conservative burden estimate the static
+    budget declines on, so the structural remedy fires exactly where admission would otherwise thrash) and
+    offers the reduction only for a head whose demand the forecast makes trustworthy.
+    """
+
+    max_resident: int | None
+    """The largest live inference-process count that still seats the peak, or None when it cannot be sized."""
+    can_reduce_live_contexts: bool
 
 
 @dataclass(frozen=True)
@@ -63,14 +80,22 @@ def build_materialization_request(
     head_outstanding_mb: float | None,
     candidate_delta_override_mb: float | None = None,
     nets_own_dispatch_reservation: bool = False,
+    kind: VramRequestKind = VramRequestKind.MONOLITHIC_DISPATCH,
+    context_reduction: ContextReduction | None = None,
+    forecast: StreamForecast | None = None,
+    prepared_head_reprices_activation: bool = True,
 ) -> MaterializationRequest:
     """Price the job's landing on the slot as the arbiter will see it.
 
     ``candidate_delta_override_mb`` prices a smaller charge than the full peak (the staged child's remaining
-    materialisation at clearance); ``nets_own_dispatch_reservation`` nets the job's own outstanding dispatch
-    reservation out of the overlay, for the clearance re-price of an already-dispatched job. The idle-context
-    teardown is widened in the measured frame through the arbiter's deficit, the one thing here that is not
-    read from the snapshot.
+    materialisation at clearance, the staging-capped charge of a preload under the lease);
+    ``nets_own_dispatch_reservation`` nets the job's own outstanding dispatch reservation out of the overlay,
+    for the clearance re-price of an already-dispatched job. ``context_reduction`` supplies a depth already sized
+    by the caller (the preload's, from the predictive peak); without it the depth is sized from the candidate
+    delta and the live-context reduction is never offered. ``prepared_head_reprices_activation`` is the dispatch
+    rule that an aux-prepared job beside live work on the card re-prices its activation even where its weights
+    are resident; a preload never does. The idle-context teardown is widened in the measured frame through the
+    arbiter's deficit, the one thing here that is not read from the snapshot.
     """
     job = snapshot.queue.jobs[job_id]
     payload = snapshot.queue.payloads[job_id]
@@ -102,19 +127,25 @@ def build_materialization_request(
             disaggregated=job.disaggregation_class_eligible,
         )
     )
-    forecast = pricing.forecast_streaming(snapshot, payload, baseline, device_index=device_index)
-    structural_reserve_mb = (
-        effective_inference_reserve_mb(card.total_vram_mb, 0.0)
-        if card.total_vram_mb is not None
-        else forecast._effective_base_reserve  # noqa: SLF001 - the same budget owner sizes the teardown depth.
-    )
-    max_resident = (
-        pricing.max_coresident_for_peak_mb(
-            snapshot, candidate_delta_mb, structural_reserve_mb, device_index=device_index
+    if context_reduction is None:
+        if forecast is None:
+            forecast = pricing.forecast_streaming(snapshot, payload, baseline, device_index=device_index)
+        structural_reserve_mb = (
+            effective_inference_reserve_mb(card.total_vram_mb, 0.0)
+            if card.total_vram_mb is not None
+            else forecast._effective_base_reserve  # noqa: SLF001 - the same budget owner sizes the teardown depth.
         )
-        if candidate_delta_mb is not None
-        else None
-    )
+        context_reduction = ContextReduction(
+            max_resident=(
+                pricing.max_coresident_for_peak_mb(
+                    snapshot, candidate_delta_mb, structural_reserve_mb, device_index=device_index
+                )
+                if candidate_delta_mb is not None
+                else None
+            ),
+            can_reduce_live_contexts=False,
+        )
+    max_resident = context_reduction.max_resident
     live = pricing.loaded_inference_count(snapshot, device_index)
     idle_contexts_teardownable = (
         is_head_of_queue
@@ -122,10 +153,14 @@ def build_materialization_request(
         and max_resident < live
         and pricing.has_teardownable_idle_context(snapshot, process_id, device_index=device_index)
     )
-    prepared_head_reprices_activation = job.aux_models_prepared and bool(active_jobs_on_card(snapshot, device_index))
+    reprices_activation = (
+        prepared_head_reprices_activation
+        and job.aux_models_prepared
+        and bool(active_jobs_on_card(snapshot, device_index))
+    )
     config = snapshot.config_for(device_index)
     request = VramRequest(
-        kind=VramRequestKind.MONOLITHIC_DISPATCH,
+        kind=kind,
         job_label=str(job.model),
         baseline=baseline,
         device_index=device_index,
@@ -134,8 +169,7 @@ def build_materialization_request(
         candidate_weights_mb=predict_job_weight_mb(payload, baseline),
         accepted_work=job.tracked,
         candidate_already_resident=(
-            pricing.candidate_weights_resident(snapshot, job.model, process_id)
-            and not prepared_head_reprices_activation
+            pricing.candidate_weights_resident(snapshot, job.model, process_id) and not reprices_activation
         ),
         own_planned_unmaterialized_mb=ledger.planned_charge_for_unit(
             PRELOAD_ADMISSION_FLOW,
@@ -158,7 +192,7 @@ def build_materialization_request(
         ),
         lane_reclaim_permitted=bool(config.starved_head_lane_reclaim),
         has_reclaimable_idle_model=has_reclaimable_idle_model,
-        can_reduce_live_contexts=False,
+        can_reduce_live_contexts=context_reduction.can_reduce_live_contexts,
         idle_contexts_teardownable=idle_contexts_teardownable,
     )
     request, max_resident = pricing.apply_measured_context_teardown(

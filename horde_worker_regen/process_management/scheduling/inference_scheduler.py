@@ -6,7 +6,7 @@ import enum
 import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -79,7 +79,6 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     VramBudget,
     WholeCardResidencyState,
     assess_ram_pressure,
-    effective_inference_reserve_mb,
     forecast_weight_streaming,
     is_model_locally_unservable_for,
     platform_context_constant_mb,
@@ -122,6 +121,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     plausible_activation_ceiling_mb,
     sampling_footprint_key,
 )
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
     ClearanceDecision,
     decide_clearance_admit,
@@ -139,8 +139,11 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     every_pending_model_accounted_for,
     loaded_or_loading_models,
     pass_control_for,
+    preload_candidate_delta_mb,
     preload_head,
+    price_preload,
 )
+from horde_worker_regen.process_management.scheduling.admission.pricing import STAGING_ENCODE_VRAM_MB
 from horde_worker_regen.process_management.scheduling.admission.snapshot import (
     HostRamSnapshot,
     SchedulingSnapshot,
@@ -191,7 +194,6 @@ from horde_worker_regen.process_management.scheduling.governance import (
     decide_process_reduction,
     decide_ram_reclaim_outcome,
     decide_shed_card_restore,
-    max_coresident_for_peak,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     HEAVY_HEAD_LOAD_GRACE_SECONDS,
@@ -279,15 +281,6 @@ _PRELOAD_ADMISSION_VERDICTS: dict[AdmissionDecision, DecisionVerdict] = {
 
 Only the resolving and terminal decisions are mapped: everything else holds the job for a later cycle and
 records as ``DEFER``, which is what the coalescing recorder collapses while the hold persists."""
-
-_STAGING_ENCODE_VRAM_MB = 2048.0
-"""VRAM a staged (dispatched but not-yet-cleared) job actually charges the device under the clearance
-lease: the text-encoder footprint plus the conditioning working set for the largest supported family
-(SDXL's dual CLIP encode lands near 1.5-2GB). Under the clearance lease the diffusion weights load
-*inside* the leased sample call, at clearance, not at dispatch, so a staged job's device footprint is
-only this encode working set until it is cleared. Dispatch admits staging while measured device free net
-of the reserve covers this charge; the full materialisation is priced at clearance instead."""
-
 
 _AFFINITY_SCAN_TRACE_SECONDS = 30.0
 """Throttle window for the empty-affinity-scan diagnostic line.
@@ -1270,38 +1263,6 @@ class InferenceScheduler:
         """
         return platform_context_constant_mb(self._marginal_process_overhead_mb())
 
-    def _max_coresident_for_peak_mb(
-        self,
-        peak_mb: float,
-        reserve_mb: float,
-        *,
-        device_index: int | None = None,
-    ) -> int | None:
-        """Largest live inference-process count that still fits ``peak_mb`` plus ``reserve_mb``.
-
-        Sizes the context-reduction depth from the *same* conservative figure the VRAM verdict rejects on
-        (the burden estimate), not the forecast's resident-weight estimate. The two estimators differ: the
-        forecast judges co-residence from the resident weight footprint while the admission verdict uses the
-        fuller per-job burden peak, so a moderate head can read co-resident in the forecast yet be rejected
-        by the verdict every tick, the gap that routes it into the evict-all admit. Reasoning the teardown
-        depth from the verdict's own peak makes the structural remedy fire exactly when admission would
-        otherwise reject and thrash. The loader's first context costs the full one-time overhead; each
-        additional co-resident context costs only the marginal. Returns None when it cannot be sized.
-
-        Args:
-            peak_mb: The job's predicted peak VRAM (MB) that must fit alongside the live contexts.
-            reserve_mb: The transient-spike reserve (MB) required on top of the peak.
-            device_index: When given, size against that one card's total VRAM (the per-card context-reduction
-                depth on a multi-GPU host); when None, the worker-wide total.
-        """
-        return max_coresident_for_peak(
-            total_vram_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
-            per_process_overhead_mb=self._per_process_overhead_mb(device_index),
-            marginal_overhead_mb=self._marginal_process_overhead_mb(device_index),
-            peak_mb=peak_mb,
-            reserve_mb=reserve_mb,
-        )
-
     def _forecast_streaming(
         self,
         job: ImageGenerateJobPopResponse,
@@ -1929,9 +1890,7 @@ class InferenceScheduler:
         per-context cost must have been measured, since the unmeasured fallback charges the one-time CUDA runtime
         against every context and can manufacture a demand for a model that co-resides with room to spare.
         """
-        if forecast.is_card_demanding:
-            return True
-        return self._marginal_process_overhead_mb() is not None
+        return pricing.whole_card_warranted(forecast, marginal_overhead_mb=self._marginal_process_overhead_mb())
 
     def _residency_should_pause_safety(self, device_index: int | None) -> bool:
         """Whether a whole-card residency on this card should also move the single safety process off-GPU.
@@ -4969,6 +4928,7 @@ class InferenceScheduler:
             footprint_store=self._footprint_store,
             overhead=self._overhead,
             reserve_ledger=self._reserve_ledger,
+            vram_budget=self._vram_budget,
             whole_card_ledger=self._whole_card_ledger,
             whole_card_phase=lambda device_index: self._whole_card_ledger.phase(
                 device_index,
@@ -5339,7 +5299,7 @@ class InferenceScheduler:
             )
             return base
         headroom_mb = free_vram_mb - reserve_mb
-        if headroom_mb < _STAGING_ENCODE_VRAM_MB:
+        if headroom_mb < STAGING_ENCODE_VRAM_MB:
             self._note_staging_defer(
                 StagingDeferReason.ENCODE_HEADROOM_SHORT,
                 headroom_mb=headroom_mb,
@@ -5372,7 +5332,7 @@ class InferenceScheduler:
         suffix = f" (suppressed {suppressed} unchanged repeats)" if suppressed > 0 else ""
         logger.debug(
             f"Holding the in-progress cap at {slot_cap} sampling slot(s) rather than pre-staging onto "
-            f"{process_ceiling}: {reason.value}, {measured} against the {_STAGING_ENCODE_VRAM_MB:.0f}MB a "
+            f"{process_ceiling}: {reason.value}, {measured} against the {STAGING_ENCODE_VRAM_MB:.0f}MB a "
             f"staged job's encode working set charges.{suffix}",
         )
 
@@ -5783,12 +5743,20 @@ class InferenceScheduler:
             ledger.lane_contained_at[lane.process_id] = now
             self.unload_from_ram(lane.process_id)
 
-    def _send_preload(self, job: ImageGenerateJobPopResponse, available_process: HordeProcessInfo) -> bool:
+    def _send_preload(
+        self,
+        job: ImageGenerateJobPopResponse,
+        available_process: HordeProcessInfo,
+        *,
+        planned_charge_mb: float | None,
+    ) -> bool:
         """Send the preload command for ``job``'s model to ``available_process`` and record the load.
 
         Resets the preload-delay and head-starvation trackers, sends the PRELOAD_MODEL message inside a
         telemetry span, and on a successful send records the churn/ledger entry and advances the model map
-        and process map into the LOADING state. Returns True (a preload was issued this cycle).
+        and process map into the LOADING state. ``planned_charge_mb`` is the candidate delta the admission was
+        priced at, recorded on the reserve ledger as the load's planned charge. Returns True (a preload was
+        issued this cycle).
         """
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
@@ -5856,16 +5824,12 @@ class InferenceScheduler:
 
             # Record the grant into the planned overlay the moment the load is admitted, so a second admission
             # in this same scheduling cycle (before the per-cycle reconcile runs) sees this charge and cannot
-            # over-admit against the same measured floor. The charge is the candidate delta actually priced for
-            # this preload (sampler-only or whole-job, net of any resident credit); the admit-time reservation
-            # baseline is the target's reserved right now, so the charge decays one-for-one as this process's
-            # own reservation materialises the load. The per-cycle reconcile then prunes it once the process
-            # leaves the loading set (finished, faulted, or dead), with no explicit release on those paths.
-            planned_charge_mb = self._preload_candidate_delta_mb(
-                job,
-                model_baseline,
-                process_id=available_process.process_id,
-            )
+            # over-admit against the same measured floor. The charge is the candidate delta the admission priced
+            # (sampler-only or whole-job, net of any resident credit), taken before the model map recorded this
+            # load so the map's own entry cannot credit the weights as already resident; the admit-time
+            # reservation baseline is the target's reserved right now, so the charge decays one-for-one as this
+            # process's own reservation materialises the load. The per-cycle reconcile then prunes it once the
+            # process leaves the loading set (finished, faulted, or dead), with no explicit release on those paths.
             self._reserve_ledger.set_planned(
                 PRELOAD_ADMISSION_FLOW,
                 str(available_process.process_id),
@@ -6217,6 +6181,7 @@ class InferenceScheduler:
         available_process: HordeProcessInfo,
         *,
         is_head_blocker: bool,
+        snapshot: SchedulingSnapshot | None = None,
     ) -> bool:
         """Return whether ``job`` may be admitted for preload, with the VRAM arbiter as the deciding authority.
 
@@ -6227,10 +6192,17 @@ class InferenceScheduler:
         pressure-relief actuations so the over-commit is relieved before the request re-asks next cycle. There
         is no overcommit-admit path: a head that never becomes admittable while the device is idle is rerouted by the
         structural-queue-wedge recovery supervisor. Every decision is scoped to the card this preload would land
-        on (None keeps the worker-wide reading on a single-GPU host).
+        on (None keeps the worker-wide reading on a single-GPU host). ``snapshot`` is the pass's frozen picture;
+        the whole-card demand may act on the card, so the pricing that follows it reads a fresh one.
         """
-        if job.model is None:
-            raise ValueError(f"job.model is None ({job})")
+        if job.model is None or job.id_ is None:
+            raise ValueError(f"job.model or job.id_ is None ({job})")
+        job_id = str(job.id_)
+        arbiter = self._ensure_preload_arbiter()
+        if snapshot is None:
+            snapshot = self.snapshot()
+        if job_id not in snapshot.queue.jobs:
+            raise ValueError(f"preload admission requires a tracked job ({job})")
 
         # Each return below names why it declined, so the recorded admission decision (and the dispatch-stall
         # line that quotes it) carries the deciding block instead of the generic gate label. The recorded text
@@ -6256,7 +6228,7 @@ class InferenceScheduler:
             self._last_budget_defer_reason = "the card is held for a safety pool whose GPU start is deferred"
             return False
 
-        forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
+        forecast = pricing.forecast_streaming(snapshot, job, baseline, device_index=target_device_index)
         # Trace the forecast for every budget-gated load so the logs show the residency dynamics, not just the
         # action taken. Unchanged observations are coalesced by _log_stream_forecast.
         self._log_stream_forecast(job, forecast)
@@ -6281,58 +6253,20 @@ class InferenceScheduler:
             # co-resident (that is *why* it gets the whole card), so skip the verdict and send the preload.
             return True
 
-        arbiter = self._ensure_preload_arbiter()
-
-        # Price the predictive verdict once: it sources the candidate delta and the rejected peak the
-        # context-reduction remedy is sized from.
-        vram_verdict = self._vram_budget.check_job(
-            job,
-            baseline,
-            self._measured_free_vram_mb(device_index=target_device_index),
-            committed_reserve_mb=self._committed_vram_reserve_mb(device_index=target_device_index),
-            disaggregated=self._is_disaggregation_class_eligible(job),
-        )
-        max_resident, can_reduce_live_contexts = self._context_reduction_demand(
-            vram_verdict,
-            forecast,
+        # The whole-card demand may have acted on the card (a residency established, idle siblings unloaded), so
+        # the pricing reads the card after it, and the predictive verdict and the arbiter read one frozen picture
+        # each rather than the predictive gate reading live free VRAM beside the arbiter's snapshot.
+        snapshot = self.snapshot()
+        priced = price_preload(
+            snapshot,
+            job_id,
+            available_process.process_id,
+            arbiter=arbiter,
             is_head_blocker=is_head_blocker,
-            target_device_index=target_device_index,
+            forecast=forecast,
         )
-        has_reclaimable_idle_model = self._has_reclaimable_idle_model(
-            available_process,
-            for_head_of_queue=is_head_blocker,
-            device_index=target_device_index,
-            make_room_for_model=job.model,
-        )
-        live_inference_processes = self._process_map.num_loaded_inference_processes(
-            device_index=target_device_index,
-        )
-        idle_contexts_teardownable = (
-            is_head_blocker
-            and max_resident is not None
-            and max_resident < live_inference_processes
-            and self._has_teardownable_idle_context(
-                available_process,
-                device_index=target_device_index,
-            )
-        )
-        request = self._build_preload_request(
-            job,
-            available_process,
-            baseline,
-            target_device_index=target_device_index,
-            is_head_blocker=is_head_blocker,
-            has_reclaimable_idle_model=has_reclaimable_idle_model,
-            can_reduce_live_contexts=can_reduce_live_contexts,
-            idle_contexts_teardownable=idle_contexts_teardownable,
-        )
-        request, max_resident = self._apply_measured_context_teardown(
-            request,
-            arbiter,
-            available_process,
-            structural_max_resident=max_resident,
-            device_index=target_device_index,
-        )
+        request = priced.priced.request
+        max_resident = priced.max_resident
         verdict = arbiter.evaluate(request)
 
         if verdict.disposition is VramDisposition.FITS:
@@ -6380,7 +6314,7 @@ class InferenceScheduler:
             (str(job.model), verdict.disposition.value, verdict.reason),
         )
         if suppressed is not None:
-            forecast_note = "" if not vram_verdict.fits else " (the static forecast calls this a fit)"
+            forecast_note = "" if not priced.predictive.fits else " (the static forecast calls this a fit)"
             logger.opt(colors=True).warning(
                 f"<fg #f0beff>VRAM arbiter deferring preload of {{}}: {verdict.stated}{forecast_note}. "
                 f"Reclaiming idle VRAM.{suppressed_suffix(suppressed)}</>",
@@ -6493,106 +6427,6 @@ class InferenceScheduler:
             arbiter.begin_cycle(self.build_vram_arbiter_snapshot())
         return arbiter
 
-    def _build_preload_request(
-        self,
-        job: ImageGenerateJobPopResponse,
-        available_process: HordeProcessInfo,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        *,
-        target_device_index: int | None,
-        is_head_blocker: bool,
-        has_reclaimable_idle_model: bool,
-        can_reduce_live_contexts: bool,
-        idle_contexts_teardownable: bool,
-    ) -> VramRequest:
-        """Assemble the arbiter request for one preload, priced identically to the measured admission overlay."""
-        return VramRequest(
-            kind=VramRequestKind.PRELOAD,
-            job_label=str(job.model),
-            baseline=baseline,
-            device_index=target_device_index,
-            target_process_id=available_process.process_id,
-            candidate_delta_mb=self._preload_candidate_delta_mb(
-                job,
-                baseline,
-                process_id=available_process.process_id,
-            ),
-            candidate_weights_mb=predict_job_weight_mb(job, baseline),
-            accepted_work=job.id_ is not None and self._job_tracker.get_tracked_job(job.id_) is not None,
-            candidate_already_resident=self._candidate_weights_resident_on_process(
-                job.model,
-                available_process.process_id,
-            ),
-            own_planned_unmaterialized_mb=self._own_planned_charge_mb(
-                device_index=target_device_index,
-                target_process_id=available_process.process_id,
-            ),
-            is_head_of_queue=is_head_blocker,
-            head_job_id=str(job.id_) if job.id_ is not None else None,
-            measured_attempt_in_progress=self._job_tracker.is_measured_attempt_on_device(
-                job,
-                target_device_index,
-            ),
-            measured_attempt_already_spent=self._job_tracker.has_spent_measured_attempt_on_device(
-                job,
-                target_device_index,
-            ),
-            starved_seconds=self._head_starved_seconds(job),
-            probe_after_seconds=self._probe_after_seconds(target_device_index),
-            has_reclaimable_idle_tenancy=self._has_reclaimable_idle_tenancy(
-                job,
-                available_process,
-                device_index=target_device_index,
-            ),
-            lane_reclaim_permitted=self._starved_head_lane_reclaim_permitted(target_device_index),
-            has_reclaimable_idle_model=has_reclaimable_idle_model,
-            can_reduce_live_contexts=can_reduce_live_contexts,
-            idle_contexts_teardownable=idle_contexts_teardownable,
-        )
-
-    def _preload_candidate_delta_mb(
-        self,
-        job: ImageGenerateJobPopResponse,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        *,
-        process_id: int | None,
-    ) -> float | None:
-        """Return the VRAM (MB) a preload of ``job`` charges the card at admission.
-
-        Without the clearance lease a preload is the VRAM moment (the child loads the weights when the job
-        starts), so it is priced at the job's full marginal sampling charge. Under the lease a preload only
-        stages the job in system RAM and the weights load inside the leased sample call, so the charge is
-        capped at the staging encode footprint, the same figure a staged dispatch books; the full fit-or-evict
-        runs at clearance. Pricing the stage at the full peak parks the next model's disk read behind the
-        current sample on every model switch, since a second peak almost never fits beside a running one, and
-        that read is exactly the work the stage exists to overlap.
-        """
-        delta_mb = self._measured_admission_candidate_delta_mb(
-            job,
-            baseline,
-            process_id=process_id,
-            disaggregated=self._is_disaggregation_class_eligible(job),
-        )
-        if delta_mb is None or not self._clearance_lease_active():
-            return delta_mb
-        return min(delta_mb, _STAGING_ENCODE_VRAM_MB)
-
-    def _own_planned_charge_mb(self, *, device_index: int | None, target_process_id: int | None) -> float:
-        """Return the planned-overlay charge (MB) attributable to a request's own target process.
-
-        The arbiter subtracts this from the device's planned overlay so a re-ask nets out the load it itself
-        admitted on an earlier cycle (the candidate delta already represents it), preventing the head-of-queue
-        self-deadlock where a load's own not-yet-materialised plan holds the card against its re-ask. Every
-        other process's planned charge is left intact, so genuinely-concurrent admissions still count in full.
-        """
-        if target_process_id is None:
-            return 0.0
-        return self._reserve_ledger.planned_charge_for_unit(
-            PRELOAD_ADMISSION_FLOW,
-            str(target_process_id),
-            self._committed_process_reserved_by_pid(device_index),
-        )
-
     def _record_dispatch_reservation(
         self,
         job: ImageGenerateJobPopResponse,
@@ -6605,7 +6439,7 @@ class InferenceScheduler:
 
         Under the clearance lease a dispatch stages the job (checkpoint disk load, prompt encode) without
         loading the diffusion weights to VRAM, which happens inside the leased sample call at clearance. With
-        ``staging_only`` the reservation is booked at the encode charge (:data:`_STAGING_ENCODE_VRAM_MB`)
+        ``staging_only`` the reservation is booked at the encode charge (:data:`STAGING_ENCODE_VRAM_MB`)
         rather than the full activation-inclusive peak, so a staged job holds only the device footprint it
         actually incurs. :meth:`_upgrade_dispatch_reservation_to_full` re-books it at the full peak when the
         job is cleared (``set_planned`` refreshes the same ``(flow, unit)`` entry in place, re-charging in full
@@ -6627,7 +6461,7 @@ class InferenceScheduler:
         if job.id_ is None:
             return
         if staging_only:
-            charge_mb: float | None = _STAGING_ENCODE_VRAM_MB
+            charge_mb: float | None = STAGING_ENCODE_VRAM_MB
         else:
             charge_mb = self._measured_admission_candidate_delta_mb(
                 job,
@@ -6771,52 +6605,6 @@ class InferenceScheduler:
             starved_seconds,
         )
 
-    def _context_reduction_demand(
-        self,
-        vram_verdict: BudgetVerdict,
-        forecast: StreamForecast,
-        *,
-        is_head_blocker: bool,
-        target_device_index: int | None,
-    ) -> tuple[int | None, bool]:
-        """Return the head's context-reduction target and whether reducing live contexts is a warranted remedy.
-
-        A moderate head's weights fit after a model eviction but its activation peak does not while this many
-        contexts are live (each extra context retains VRAM the allocator never returns). Reducing the live
-        inference-process count to the largest that still seats the rejected peak plus its structural reserve
-        is the remedy. The depth keys on the honest streaming floor, not the operator's configured margin, so
-        only a genuinely card-filling peak pushes the co-resident count below the live pool; a demand resting
-        on untrusted (unmeasured-fallback) overhead figures is not warranted.
-
-        The warrant is measured, never an operator preference. ``whole_card_exclusive_residency`` governs
-        whether the worker takes an exclusive *residency* (a lease with a cooldown, safety and the service
-        lanes moved off the card); a context reduction is none of those, and both the actuator that performs it
-        (:meth:`reduce_live_contexts`) and the reachability predicate behind it
-        (:meth:`_has_teardownable_idle_context`) are deliberately independent of the flag. Gating the demand on
-        it would leave a head that is servable only once an idle context is torn down with no ordinary route to
-        that reclaim, deferring it against a card whose own idle contexts hold the deficit.
-        """
-        max_resident: int | None = None
-        if vram_verdict.predicted_mb is not None:
-            total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=target_device_index)
-            structural_reserve_mb = (
-                effective_inference_reserve_mb(total_vram_mb, 0.0)
-                if total_vram_mb is not None
-                else vram_verdict.reserve_mb
-            )
-            max_resident = self._max_coresident_for_peak_mb(
-                vram_verdict.predicted_mb,
-                structural_reserve_mb,
-                device_index=target_device_index,
-            )
-        context_reduction_demanded = (
-            is_head_blocker
-            and max_resident is not None
-            and self._process_map.num_loaded_inference_processes(device_index=target_device_index) > max_resident
-        )
-        can_reduce = context_reduction_demanded and self._whole_card_warranted(forecast)
-        return max_resident, can_reduce
-
     def _target_slot_is_spared(
         self,
         process_info: HordeProcessInfo,
@@ -6845,132 +6633,6 @@ class InferenceScheduler:
             return True
         loaded_model = process_info.loaded_horde_model_name
         return loaded_model is None or loaded_model == make_room_for_model
-
-    def _has_reclaimable_idle_model(
-        self,
-        process_with_model: HordeProcessInfo,
-        *,
-        for_head_of_queue: bool,
-        device_index: int | None,
-        make_room_for_model: str | None = None,
-    ) -> bool:
-        """Return whether an idle resident model could be evicted on the card to reclaim VRAM for this head.
-
-        A read-only mirror of the eviction targeting :meth:`unload_models_from_vram` performs under pressure:
-        a post-processing lane not already unloading, or an inference process holding a model that is not in
-        progress, not spared by the queued-lookahead or residency guards (both of which the head escalation
-        overrides), and not already unloading. It never counts an in-progress model, and it excludes the head's
-        own target slot on the terms :meth:`_target_slot_is_spared` sets: unconditionally when the caller names
-        no model to seat, otherwise only while that slot holds the head's own model or is mid-load. When this
-        is False, and no idle cache and no warranted context reduction remain, reclamation is structurally
-        exhausted for this head.
-        """
-        wanted_models = self._compute_wanted_models()
-        next_n_models = list(self.get_next_n_models(self._max_inference_processes))
-        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
-        for process_info in self._process_map.values():
-            if process_info.process_id == process_with_model.process_id and self._target_slot_is_spared(
-                process_info,
-                make_room_for_model=make_room_for_model,
-            ):
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.process_type == HordeProcessType.POST_PROCESS:
-                if process_info.is_process_busy():
-                    continue
-                if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
-                    continue
-                return True
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if process_info.loaded_horde_model_name is None:
-                continue
-            # The single-model unload guard (skip when only one model is configured) applies only when the
-            # reclaim is not under pressure; every preload reclaim here is under pressure, so it never spares.
-            if process_info.loaded_horde_model_name in in_progress_models:
-                continue
-            if (
-                process_info.loaded_horde_model_name in next_n_models
-                and not for_head_of_queue
-                and self._coresident_lookahead_affordable(
-                    process_info.loaded_horde_model_name,
-                    device_index=device_index,
-                )
-            ):
-                continue
-            if not for_head_of_queue and self._residency_protects_from_unload(
-                process_info.loaded_horde_model_name,
-                wanted_models,
-                vram=True,
-                under_pressure=True,
-            ):
-                continue
-            if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
-                continue
-            return True
-        return False
-
-    def _apply_measured_context_teardown(
-        self,
-        request: VramRequest,
-        arbiter: VramArbiter,
-        head_process: HordeProcessInfo,
-        *,
-        structural_max_resident: int | None,
-        device_index: int | None,
-    ) -> tuple[VramRequest, int | None]:
-        """Return ``request`` with the idle-context teardown flag and depth judged in the measured frame.
-
-        The structural context count (``max_coresident_for_peak``) sizes a teardown from total VRAM, the peak
-        and a per-context constant, and knows nothing of the noise buffer, the service lanes, or foreign
-        VRAM. The measured frame the arbiter refuses on knows all of them, so on a card at its edge the two
-        disagree: the structural count keeps every sibling while the measured deficit is a few hundred MB that
-        one idle sibling context would return. This reads the deficit the verdict will use
-        (:meth:`VramArbiter.measured_deficit_mb`) and, when idle sibling contexts on the card would close it,
-        marks the request teardownable and sizes the depth to exactly the contexts needed, never below one.
-
-        The structural judgement is kept wherever it already fires (the flag is widened, never narrowed), and
-        the depth is the deeper of the two so :meth:`reduce_live_contexts` acts on whichever frame demanded
-        more. A deficit that idle contexts cannot close leaves the request as it was: a teardown that cannot
-        produce a fit is churn, which is the fence :meth:`StreamForecast.max_resident_processes` keeps.
-        Non-head requests are never widened; the escalation is the head's alone.
-
-        Returns:
-            The request to evaluate and the ``max_resident`` depth to record on the actuation.
-        """
-        if not request.is_head_of_queue or request.idle_contexts_teardownable:
-            return request, structural_max_resident
-        if request.has_reclaimable_idle_model:
-            # An idle resident model is the cheaper rung: its eviction keeps the process. The teardown is only
-            # widened once weight reclaim has nothing left to return.
-            return request, structural_max_resident
-        deficit_mb = arbiter.measured_deficit_mb(request)
-        if deficit_mb is None or deficit_mb <= 0.0:
-            return request, structural_max_resident
-        marginal_mb = self._marginal_process_overhead_mb(device_index)
-        if marginal_mb is None or marginal_mb <= 0.0:
-            marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
-        idle_contexts = self._teardownable_idle_context_returns_mb(head_process, device_index=device_index)
-        if not idle_contexts:
-            return request, structural_max_resident
-        covered = 0.0
-        needed = 0
-        for returned_mb in sorted(idle_contexts, reverse=True):
-            needed += 1
-            covered += max(returned_mb, marginal_mb)
-            if covered >= deficit_mb:
-                break
-        if covered < deficit_mb:
-            return request, structural_max_resident
-        live = self._process_map.num_loaded_inference_processes(device_index=device_index)
-        measured_target = max(1, live - needed)
-        if measured_target >= live:
-            return request, structural_max_resident
-        max_resident = (
-            measured_target if structural_max_resident is None else min(structural_max_resident, measured_target)
-        )
-        return replace(request, idle_contexts_teardownable=True), max_resident
 
     def _card_bridge_data(self, device_index: int | None) -> reGenBridgeData:
         """The effective config for ``device_index``: its per-card resolution when one exists, else the global."""
@@ -7045,84 +6707,6 @@ class InferenceScheduler:
         for job in self._job_tracker.jobs_pending_inference:
             if job.model == model_name:
                 self._job_tracker.rearm_measured_attempt(job)
-
-    def _teardownable_idle_context_returns_mb(
-        self,
-        head_process: HordeProcessInfo,
-        *,
-        device_index: int | None,
-    ) -> list[float]:
-        """What each bare idle sibling context on the card would return (MB): its reservation plus a context.
-
-        The candidates :meth:`_has_teardownable_idle_context` admits, narrowed to contexts holding neither a
-        model nor warm components (those have a cheaper rung first), and priced the way the room breakdown
-        prices them, so the measured teardown depth and the room a hold reports agree about the return.
-        """
-        marginal_mb = self._marginal_process_overhead_mb(device_index)
-        if marginal_mb is None or marginal_mb <= 0.0:
-            marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
-        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
-        returns: list[float] = []
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if process_info.process_id == head_process.process_id:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.is_process_busy():
-                continue
-            if (
-                process_info.loaded_horde_model_name is not None
-                and process_info.loaded_horde_model_name in in_progress_models
-            ):
-                continue
-            # A sibling still holding a model or warm components has a cheaper rung ahead of its teardown (an
-            # eviction or a component unload keeps the process); only a bare idle context is priced here.
-            if process_info.loaded_horde_model_name is not None or process_info.held_components:
-                continue
-            reserved_mb = float(process_info.process_reserved_mb or 0)
-            returns.append(max(0.0, reserved_mb) + marginal_mb)
-        return returns
-
-    def _has_teardownable_idle_context(
-        self,
-        head_process: HordeProcessInfo,
-        *,
-        device_index: int | None,
-    ) -> bool:
-        """Return whether an idle sibling inference context could be torn down to reclaim VRAM for a starved head.
-
-        A bare CUDA context's VRAM is reclaimed only when its process exits, which weight eviction (model
-        unload, cache release) cannot achieve. An idle inference process on the card other than the head's own
-        target slot, not busy and not serving an in-progress job, is a teardown candidate the starvation
-        escalation can reduce via :meth:`reduce_live_contexts`. Excludes the head's target slot and every busy
-        process, matching that actuator's own protections.
-
-        This is independent of ``whole_card_exclusive_residency``: that flag governs whether the worker
-        establishes exclusive residency as a steady-state preference, but the starvation escalation is an
-        emergency liveness path (a head starved past the arbiter's threshold whose own idle contexts hold the
-        deficit) that must be reachable regardless. The actuation runs through :meth:`reduce_live_contexts` ->
-        ``scale_inference_processes``, neither of which gates on the flag, so tearing the idle contexts down
-        proceeds when the flag is off.
-        """
-        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if process_info.process_id == head_process.process_id:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.is_process_busy():
-                continue
-            if (
-                process_info.loaded_horde_model_name is not None
-                and process_info.loaded_horde_model_name in in_progress_models
-            ):
-                continue
-            return True
-        return False
 
     def release_cache(self, process_id: int) -> bool:
         """Return an idle lane's cached allocator reservation to the device (:class:`VramActuator`)."""
@@ -7873,6 +7457,7 @@ class InferenceScheduler:
             job,
             process,
             is_head_blocker=plan.is_head_blocker,
+            snapshot=snapshot,
         ):
             return AdmissionDecision.DEFER_BUDGET, process, self._last_budget_defer_reason or "VRAM/RAM budget gate"
         if self._process_map.get(process.process_id) is not process:
@@ -7884,7 +7469,8 @@ class InferenceScheduler:
                     "the preload target was retired during admission and no other slot is free",
                 )
             process = reselected
-        if self._send_preload(job, process):
+        planned_charge_mb = preload_candidate_delta_mb(self.snapshot(), plan.job_id, process.process_id)
+        if self._send_preload(job, process, planned_charge_mb=planned_charge_mb):
             return AdmissionDecision.ADMIT, process, "preload sent"
         return AdmissionDecision.STOP_PASS, process, "preload send failed"
 
@@ -9222,7 +8808,7 @@ class InferenceScheduler:
             )
             if materialisation_mb is None:
                 return None
-            charges_mb += max(0.0, materialisation_mb - _STAGING_ENCODE_VRAM_MB)
+            charges_mb += max(0.0, materialisation_mb - STAGING_ENCODE_VRAM_MB)
         return charges_mb
 
     def _retained_resident_charges_mb(
@@ -10440,33 +10026,6 @@ class InferenceScheduler:
             return False
         return self._dispatch_holds.is_standing(str(job.id_), DISPATCH_STALL_MIN_SECONDS)
 
-    def _has_reclaimable_idle_tenancy(
-        self,
-        head_job: ImageGenerateJobPopResponse,
-        target_process: HordeProcessInfo,
-        *,
-        device_index: int | None,
-    ) -> bool:
-        """Whether :meth:`_reclaim_idle_tenancy_for_head` would find a lane to ask for the card back.
-
-        The read-only mirror of that actuator's candidate rule, reported to the arbiter so it does not read a
-        card holding warm components or a parked preload as converged-empty and probe a load over tenancy the
-        parent was about to reclaim.
-        """
-        head_model = head_job.model
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.process_id == target_process.process_id:
-                continue
-            if process_info.loaded_horde_model_name == head_model and head_model is not None:
-                continue
-            if bool(process_info.held_components) or self._slot_is_reclaimable_while_busy(process_info):
-                return True
-        return False
-
     def _reclaim_idle_tenancy_for_head(
         self,
         head_job: ImageGenerateJobPopResponse,
@@ -10564,7 +10123,7 @@ class InferenceScheduler:
         # Head protection is preserved either way (the head's outstanding charge still reserves room), and the
         # full-price gate that used to park staging on materialisation grounds moves to the clearance VRAM
         # moment. Without the lease this is the VRAM moment, so the full materialisation is priced as before.
-        staging_charge_override = _STAGING_ENCODE_VRAM_MB if self._clearance_lease_active() else None
+        staging_charge_override = STAGING_ENCODE_VRAM_MB if self._clearance_lease_active() else None
 
         outcome = self._evaluate_materialization_admission(
             next_job,

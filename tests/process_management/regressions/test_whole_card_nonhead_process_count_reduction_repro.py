@@ -51,6 +51,7 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -172,8 +173,17 @@ def _make_scheduler(
     return scheduler
 
 
-def _install_forecast_per_model(scheduler: InferenceScheduler, forecast_for: dict[str, StreamForecast]) -> None:
-    """Make the scheduler return a chosen forecast per model name (default: co-resident)."""
+def _install_forecast_per_model(
+    scheduler: InferenceScheduler,
+    forecast_for: dict[str, StreamForecast],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Make the scheduler and the pure pricing return a chosen forecast per model name (default: co-resident)."""
+
+    def _forecast_for(job: ImageGenerateJobPopResponse) -> StreamForecast:
+        if job.model in forecast_for:
+            return forecast_for[job.model]
+        return _forecast(weights_mb=_SDXL_WEIGHTS_MB, total_vram_mb=_DEVICE_TOTAL_VRAM_MB)
 
     def _forecast_streaming(
         job: ImageGenerateJobPopResponse,
@@ -181,11 +191,14 @@ def _install_forecast_per_model(scheduler: InferenceScheduler, forecast_for: dic
         *,
         device_index: int | None = None,
     ) -> StreamForecast:
-        if job.model in forecast_for:
-            return forecast_for[job.model]
-        return _forecast(weights_mb=_SDXL_WEIGHTS_MB, total_vram_mb=_DEVICE_TOTAL_VRAM_MB)
+        return _forecast_for(job)
 
     scheduler._forecast_streaming = _forecast_streaming  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        pricing,
+        "forecast_streaming",
+        lambda _snapshot, job, _baseline, device_index=None: _forecast_for(job),
+    )
 
 
 def _resident(pid: int, model: str | None, state: HordeProcessState) -> HordeProcessInfo:
@@ -324,7 +337,9 @@ class TestVerdictDrivenEstablishGatedByWarrant:
 class TestForecastDrivenEstablishGatedByWarrant:
     """The other establish path (``needs_teardown_path``) honors the same trust gate."""
 
-    async def test_card_light_sdxl_head_unmeasured_marginal_does_not_reserve_card(self) -> None:
+    async def test_card_light_sdxl_head_unmeasured_marginal_does_not_reserve_card(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A card-light SDXL head whose per-context cost was never measured must not reserve the card.
 
         Even when the streaming forecast itself reads ``needs_process_count_reduction``, the warrant gate
@@ -341,7 +356,7 @@ class TestForecastDrivenEstablishGatedByWarrant:
             needs_pcr_shape=True,
         )
         assert pcr_forecast.needs_process_count_reduction
-        _install_forecast_per_model(scheduler, {_HEAD_SDXL: pcr_forecast})
+        _install_forecast_per_model(scheduler, {_HEAD_SDXL: pcr_forecast}, monkeypatch)
 
         await track_popped_job_async(job_tracker, make_job_pop_response(_HEAD_SDXL))
 
@@ -358,7 +373,9 @@ class TestForecastDrivenEstablishGatedByWarrant:
 class TestWarrantedTeardownClaimsCardOnlyForHead:
     """With the demand warranted (a measured marginal proving contention), queue order must still be honored."""
 
-    def _scheduler_with_resident_head(self, job_tracker: JobTracker) -> InferenceScheduler:
+    def _scheduler_with_resident_head(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> InferenceScheduler:
         head_proc = _resident(1, _HEAD_SDXL, HordeProcessState.WAITING_FOR_JOB)
         spare = _resident(2, None, HordeProcessState.WAITING_FOR_JOB)
         process_map = ProcessMap({1: head_proc, 2: spare})
@@ -367,13 +384,13 @@ class TestWarrantedTeardownClaimsCardOnlyForHead:
         pcr_forecast = _forecast(
             weights_mb=_SDXL_WEIGHTS_MB, total_vram_mb=_DEVICE_TOTAL_VRAM_MB, needs_pcr_shape=True
         )
-        _install_forecast_per_model(scheduler, {_HEAVY_SDXL: pcr_forecast})
+        _install_forecast_per_model(scheduler, {_HEAVY_SDXL: pcr_forecast}, monkeypatch)
         return scheduler
 
-    async def test_non_head_does_not_claim_card(self) -> None:
+    async def test_non_head_does_not_claim_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A warranted-teardown model behind a resident head must defer, not tear the head's process down."""
         job_tracker = JobTracker()
-        scheduler = self._scheduler_with_resident_head(job_tracker)
+        scheduler = self._scheduler_with_resident_head(job_tracker, monkeypatch)
 
         await track_popped_job_async(job_tracker, make_job_pop_response(_HEAD_SDXL))  # the head
         await track_popped_job_async(job_tracker, make_job_pop_response(_HEAVY_SDXL))
@@ -384,10 +401,10 @@ class TestWarrantedTeardownClaimsCardOnlyForHead:
             "a non-head model must not reserve the card even when its teardown demand is warranted"
         )
 
-    async def test_model_claims_card_once_it_becomes_the_head(self) -> None:
+    async def test_model_claims_card_once_it_becomes_the_head(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The deferral is until the model's turn: once it is the head, the warranted teardown must fire."""
         job_tracker = JobTracker()
-        scheduler = self._scheduler_with_resident_head(job_tracker)
+        scheduler = self._scheduler_with_resident_head(job_tracker, monkeypatch)
 
         sdxl_head = make_job_pop_response(_HEAD_SDXL)
         await track_popped_job_async(job_tracker, sdxl_head)

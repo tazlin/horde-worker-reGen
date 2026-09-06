@@ -10,8 +10,6 @@ from __future__ import annotations
 import sys
 from unittest.mock import Mock
 
-import pytest
-
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -125,16 +123,16 @@ class TestForecastAndDeltas:
                     disaggregated=disaggregated,
                 )
 
-    async def test_max_coresident_matches(self) -> None:
-        """The structural depth is the same function of total, overheads, peak and reserve."""
+    async def test_max_coresident_sizes_from_the_card_total_and_overheads(self) -> None:
+        """The structural depth is the loader's context plus the marginal contexts the remaining total seats."""
         scheduler, _ = await _worker(slots={0: _slot(0, model=None)}, pending=[])
+        scheduler.set_measured_per_process_overhead_mb(1000.0, device_index=0)
+        scheduler.set_measured_marginal_overhead_mb(500.0, device_index=0)
         snapshot = scheduler.snapshot()
-        for peak_mb in (4000.0, 12000.0):
-            assert pricing.max_coresident_for_peak_mb(
-                snapshot,
-                peak_mb,
-                1024.0,
-            ) == scheduler._max_coresident_for_peak_mb(peak_mb, 1024.0)  # type: ignore[attr-defined]
+        # 16000 - 4000 - 1024 = 10976 budget; (10976 - 1000) // 500 = 19 extra contexts beside the loader's.
+        assert pricing.max_coresident_for_peak_mb(snapshot, 4000.0, 1024.0) == 20
+        # The loader's own context always counts, so a peak past the budget still sizes to one.
+        assert pricing.max_coresident_for_peak_mb(snapshot, 15500.0, 1024.0) == 1
 
     async def test_unpausable_tenancy_matches(self) -> None:
         """A utilities lane on the card is charged the same way, per the lane-reclaim policy."""
@@ -147,16 +145,9 @@ class TestForecastAndDeltas:
 
 
 class TestReclaimPredicates:
-    """The reclaim and teardown predicates agree with the scheduler across the guard combinations."""
+    """The reclaim and teardown predicates across the guard combinations."""
 
-    @pytest.mark.parametrize("for_head_of_queue", [False, True])
-    @pytest.mark.parametrize("make_room_for_model", [None, "other", "resident"])
-    async def test_has_reclaimable_idle_model_matches(
-        self,
-        for_head_of_queue: bool,
-        make_room_for_model: str | None,
-    ) -> None:
-        """An idle resident, a busy slot, a queued lookahead model and an unloading slot are all judged alike."""
+    async def _reclaim_worker(self):  # noqa: ANN202
         unloading = _slot(2, model="queued")
         unloading.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM  # type: ignore[attr-defined]
         scheduler, _ = await _worker(
@@ -169,30 +160,33 @@ class TestReclaimPredicates:
             pending=["queued", "other"],
             in_progress=["busy"],
         )
-        snapshot = scheduler.snapshot()
-        for target in (0, 3):
-            expected = scheduler._has_reclaimable_idle_model(  # type: ignore[attr-defined]
-                scheduler._process_map[target],  # type: ignore[attr-defined]
-                for_head_of_queue=for_head_of_queue,
-                device_index=None,
-                make_room_for_model=make_room_for_model,
-            )
-            assert (
-                pricing.has_reclaimable_idle_model(
-                    snapshot,
-                    target,
-                    for_head_of_queue=for_head_of_queue,
-                    device_index=None,
-                    make_room_for_model=make_room_for_model,
-                )
-                is expected
-            )
+        return scheduler.snapshot()
 
-    async def test_teardown_predicates_match(self) -> None:
-        """The teardownable siblings, their returns and the reclaimable tenancy all agree."""
+    async def test_the_target_slot_is_spared_unless_it_holds_another_model(self) -> None:
+        """Making room on the target itself counts only when it holds a model other than the one being seated."""
+        snapshot = await self._reclaim_worker()
+        reclaimable = {
+            make_room: pricing.has_reclaimable_idle_model(
+                snapshot, 0, for_head_of_queue=False, device_index=None, make_room_for_model=make_room
+            )
+            for make_room in (None, "resident", "other")
+        }
+        # The busy, unloading and affordable queued-lookahead slots are never candidates for a follower, so
+        # the target's own resident model is the only one an "other" load may displace.
+        assert reclaimable == {None: False, "resident": False, "other": True}
+
+    async def test_the_head_overrides_the_lookahead_guard(self) -> None:
+        """A queued model's idle copy is spared for a follower but reclaimable for the head."""
+        snapshot = await self._reclaim_worker()
+        assert pricing.has_reclaimable_idle_model(snapshot, 3, for_head_of_queue=False, device_index=None) is True
+        assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is True
+        assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=False, device_index=None) is False
+
+    async def test_teardown_predicates(self) -> None:
+        """The teardownable siblings, what the bare ones return, and the warm tenancy the head could reclaim."""
         components = _slot(2, model=None)
         components.held_components = [Mock()]  # type: ignore[attr-defined]
-        scheduler, jobs = await _worker(
+        scheduler, _jobs = await _worker(
             slots={
                 0: _slot(0, model="head"),
                 1: _slot(1, model=None, reserved_mb=800),
@@ -203,16 +197,17 @@ class TestReclaimPredicates:
             in_progress=["busy"],
         )
         snapshot = scheduler.snapshot()
-        head = scheduler._process_map[0]  # type: ignore[attr-defined]
-        assert pricing.has_teardownable_idle_context(snapshot, 0, device_index=None) is (
-            scheduler._has_teardownable_idle_context(head, device_index=None)  # type: ignore[attr-defined]
-        )
-        assert pricing.teardownable_idle_context_returns_mb(snapshot, 0, device_index=None) == (
-            scheduler._teardownable_idle_context_returns_mb(head, device_index=None)  # type: ignore[attr-defined]
-        )
-        assert pricing.has_reclaimable_idle_tenancy(snapshot, "head", 0, device_index=None) is (
-            scheduler._has_reclaimable_idle_tenancy(jobs[0], head, device_index=None)  # type: ignore[attr-defined]
-        )
+        assert pricing.has_teardownable_idle_context(snapshot, 0, device_index=None) is True
+        assert [slot.process_id for slot in pricing.teardownable_idle_contexts(snapshot, 0, device_index=None)] == [
+            1,
+            2,
+        ]
+        # Only the bare idle sibling returns its reservation plus a context; the one holding components does not.
+        assert pricing.teardownable_idle_context_returns_mb(snapshot, 0, device_index=None) == [
+            800.0 + pricing.marginal_or_seed_mb(snapshot, None),
+        ]
+        assert pricing.has_reclaimable_idle_tenancy(snapshot, "head", 0, device_index=None) is True
+        assert pricing.has_reclaimable_idle_tenancy(snapshot, "head", 2, device_index=None) is False
 
     async def test_lookahead_affordability_matches(self) -> None:
         """The static lookahead fit reads the same head and the same reserve."""

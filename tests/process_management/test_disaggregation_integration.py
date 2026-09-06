@@ -42,7 +42,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
-from horde_worker_regen.process_management.scheduling.inference_scheduler import _STAGING_ENCODE_VRAM_MB
+from horde_worker_regen.process_management.scheduling.admission.pricing import STAGING_ENCODE_VRAM_MB
 from horde_worker_regen.process_management.scheduling.workload_flow import DISPATCH_ADMISSION_FLOW
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     FakeInferenceProcess,
@@ -1009,7 +1009,7 @@ async def test_staged_ahead_job_returns_its_encode_charge_when_its_sampler_binds
     ordinary_dispatch_mb = _dispatch_reservations_mb(pm)
 
     await pm._inference_scheduler._stage_head_ahead_of_pin(follower, inference)
-    assert _dispatch_reservations_mb(pm) == pytest.approx(ordinary_dispatch_mb + _STAGING_ENCODE_VRAM_MB)
+    assert _dispatch_reservations_mb(pm) == pytest.approx(ordinary_dispatch_mb + STAGING_ENCODE_VRAM_MB)
 
     orchestrator = pm._disaggregation_orchestrator
     orchestrator.tick()  # both encodes go out on the component lane
