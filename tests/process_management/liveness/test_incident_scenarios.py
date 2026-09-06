@@ -145,6 +145,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     plausible_activation_ceiling_mb,
 )
+from horde_worker_regen.process_management.scheduling.admission import clearance as clearance_mod
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
 )
@@ -2895,18 +2896,13 @@ async def test_r_defect_reinjection_a_waiter_charged_its_own_staging_waits_out_i
     and its memory largely free, and the job reaches its denoise loop only because hordelib's lease-acquire
     timeout puts it there unpriced.
     """
-    original = InferenceScheduler._evaluate_materialization_admission
+    original = clearance_mod.build_materialization_request
 
-    def unnetted(
-        self: InferenceScheduler,
-        next_job: ImageGenerateJobPopResponse,
-        process_with_model: HordeProcessInfo,
-        **kwargs: object,
-    ) -> object:
+    def unnetted(*args: object, **kwargs: object) -> object:
         kwargs["nets_own_dispatch_reservation"] = False
-        return original(self, next_job, process_with_model, **kwargs)  # type: ignore[arg-type]
+        return original(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(InferenceScheduler, "_evaluate_materialization_admission", unnetted)
+    monkeypatch.setattr(clearance_mod, "build_materialization_request", unnetted)
     world = _clearance_world()
 
     job = await _drive_lone_staged_waiter(world)

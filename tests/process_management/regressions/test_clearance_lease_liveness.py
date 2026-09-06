@@ -20,6 +20,8 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState, HordeProcessType
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
+from horde_worker_regen.process_management.scheduling.admission import materialization as _materialization_mod
+from horde_worker_regen.process_management.scheduling.admission import pricing as _pricing_mod
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     ActiveSampler,
@@ -45,6 +47,13 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap  # isort: skip
 
 _ENCODE_MB = 2048.0
+
+
+def _pin_prediction(monkeypatch: pytest.MonkeyPatch, name: str, value: float) -> None:
+    """Pin one job-size prediction on every module that binds it: the scheduler and the snapshot pricing."""
+    for module in (_sched_mod, _pricing_mod, _materialization_mod):
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, lambda _job, _baseline: value)
 
 
 class TestStagingLivenessUnlock:
@@ -135,12 +144,8 @@ class TestDispatchReservationDisaggregationPricing:
     _SAMPLER_ONLY_MB = 4000.0
 
     def _pin_predictors(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", lambda _job, _baseline: self._WHOLE_JOB_MB)
-        monkeypatch.setattr(
-            _sched_mod,
-            "predict_job_sampler_only_vram_mb",
-            lambda _job, _baseline: self._SAMPLER_ONLY_MB,
-        )
+        _pin_prediction(monkeypatch, "predict_job_sampling_vram_mb", self._WHOLE_JOB_MB)
+        _pin_prediction(monkeypatch, "predict_job_sampler_only_vram_mb", self._SAMPLER_ONLY_MB)
 
     def _reserved_vram_mb(self, scheduler: object) -> float:
         ledger = scheduler._reserve_ledger  # type: ignore[attr-defined]
@@ -393,8 +398,8 @@ class TestClearanceResidentWeightCredit:
 
     def _pin_predictors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Price the candidate at a peak dominated by weights, so the credit decides the fit."""
-        monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", lambda _job, _baseline: self._PEAK_MB)
-        monkeypatch.setattr(_sched_mod, "predict_job_weight_mb", lambda _job, _baseline: self._WEIGHTS_MB)
+        _pin_prediction(monkeypatch, "predict_job_sampling_vram_mb", self._PEAK_MB)
+        _pin_prediction(monkeypatch, "predict_job_weight_mb", self._WEIGHTS_MB)
 
     async def _scheduler_with_staged_waiter(
         self,
@@ -502,8 +507,8 @@ class TestClearanceNetsTheWaiterOwnStagingCharge:
         positive means the peak fits outright, negative means it does not even with nothing else outstanding.
         The staging reservation is booked exactly as dispatch books it.
         """
-        monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", lambda _job, _baseline: self._PEAK_MB)
-        monkeypatch.setattr(_sched_mod, "predict_job_weight_mb", lambda _job, _baseline: self._WEIGHTS_MB)
+        _pin_prediction(monkeypatch, "predict_job_sampling_vram_mb", self._PEAK_MB)
+        _pin_prediction(monkeypatch, "predict_job_weight_mb", self._WEIGHTS_MB)
         noise_mb = admission_noise_buffer_mb(float(self._TOTAL_VRAM_MB))
         job_tracker = JobTracker()
         scheduler = _make_inference_scheduler(

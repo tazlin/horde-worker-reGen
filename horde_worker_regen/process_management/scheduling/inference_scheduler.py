@@ -122,7 +122,12 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     plausible_activation_ceiling_mb,
     sampling_footprint_key,
 )
+from horde_worker_regen.process_management.scheduling.admission.clearance import (
+    ClearanceDecision,
+    decide_clearance_admit,
+)
 from horde_worker_regen.process_management.scheduling.admission.materialization import (
+    MaterializationRequest,
     build_materialization_request,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import (
@@ -5722,44 +5727,39 @@ class InferenceScheduler:
         """Full-price fit-or-evict for a staged child's job at the clearance VRAM moment.
 
         The injected ``admit_fn`` the clearance controller calls before granting a child its load-and-sample
-        window: it prices the child's primed job's full materialisation (weights plus activation peak) against
-        measured device truth through the shared MONOLITHIC_DISPATCH admission core, running the single reclaim
-        owner's eviction on a non-fit exactly as the dispatch residency gate does. On a fit it upgrades the
-        job's dispatch reservation from the encode-only staging charge to the full peak (so a second grant sees
-        it) and clears the clearance-hold record; on a non-fit it records the hold for slot-duty attribution and
-        withholds the grant, so the child stays staged until eviction frees room (or degrades into unpriced
-        sampling via hordelib's lease-acquire timeout, liveness over pricing). The co-residency mutex is applied
-        here too, since clearance, not dispatch, is now the VRAM moment for a leased job.
+        window. The decision is :func:`decide_clearance_admit` over this cycle's snapshot; this executes it: a
+        fit re-books the job's dispatch reservation at the full peak and clears the clearance-hold record, a
+        non-fit runs the described eviction through the single reclaim owner and records the hold, so the child
+        stays staged until room frees (or samples via hordelib's lease-acquire timeout, liveness over pricing).
+        The co-residency mutex is read here too, since clearance is the VRAM moment for a leased job.
         """
         process_info = self._process_map.get(process_id)
-        if process_info is None:
-            return False
-        job = process_info.current_inference_job()
-        if job is None or job.model is None:
-            # Nothing priceable to hold on; let the child proceed rather than wedge it.
-            return True
-
-        # The co-residency mutex protection moves with the VRAM moment: a leased job's weights land at
-        # clearance, so the post-processing chain fit is checked here (the dispatch-side check still guards the
-        # non-lease path). A deferral withholds the grant without faulting the job.
-        if self._should_defer_dispatch_for_post_processing(job, process_with_model=process_info):
+        job = process_info.current_inference_job() if process_info is not None else None
+        deferred = (
+            process_info is not None
+            and job is not None
+            and job.model is not None
+            and self._should_defer_dispatch_for_post_processing(job, process_with_model=process_info)
+        )
+        plan = decide_clearance_admit(
+            self.snapshot(),
+            process_id,
+            arbiter=self._ensure_preload_arbiter(),
+            post_processing_deferred=deferred,
+        )
+        if process_info is None or job is None or plan.decision is ClearanceDecision.UNPRICED:
+            return plan.grants
+        if plan.decision is ClearanceDecision.HOLD_POST_PROCESSING:
             self._note_clearance_hold(job, reclaim_applied=False)
-            self._log_clearance_hold(process_id, job, reason="post_processing_coresidency", verdict=None)
+            self._log_clearance_hold(process_id, job, reason=plan.reason, verdict=None)
             return False
-
-        if not self._budget_active():
+        if plan.decision is ClearanceDecision.BUDGET_INACTIVE:
             self._resolve_clearance_hold(job)
             return True
-
-        outcome = self._evaluate_materialization_admission(
-            job,
-            process_info,
-            is_head_of_queue=True,
-            head_outstanding_mb=None,
-            candidate_delta_override_mb=self._staged_materialization_delta_mb(job, process_info),
-            nets_own_dispatch_reservation=True,
-        )
-        if outcome.verdict.admits:
+        assert plan.priced is not None and plan.verdict is not None and job.model is not None
+        if plan.decision is ClearanceDecision.ADMIT:
+            if plan.verdict.measured_attempt:
+                self._mark_measured_attempt(job, plan.priced.request, device_index=plan.priced.device_index)
             self._resolve_clearance_hold(job)
             self._upgrade_dispatch_reservation_to_full(
                 job,
@@ -5768,48 +5768,23 @@ class InferenceScheduler:
             )
             return True
 
-        self._note_clearance_hold(job, reclaim_applied=bool(outcome.actuations_applied))
+        applied = self._actuate_materialization_verdict(
+            job,
+            process_info,
+            plan.priced,
+            plan.verdict,
+            is_head_of_queue=True,
+        )
+        self._note_clearance_hold(job, reclaim_applied=bool(applied))
         self._log_clearance_hold(
             process_id,
             job,
-            reason=outcome.verdict.disposition.value,
-            verdict=outcome.verdict,
-            candidate_mb=outcome.candidate_delta_mb,
-            actuations=outcome.actuations_applied,
+            reason=plan.reason,
+            verdict=plan.verdict,
+            candidate_mb=plan.candidate_delta_mb,
+            actuations=applied,
         )
         return False
-
-    def _staged_materialization_delta_mb(
-        self,
-        job: ImageGenerateJobPopResponse,
-        process_info: HordeProcessInfo,
-    ) -> float | None:
-        """The staged child's remaining materialisation (MB): its priced peak net of what it already holds on the card.
-
-        By the clearance moment the child's text encoder, VAE and leftover allocator cache are on the device
-        and already missing from the measured device-free reading, while the priced peak is the process's
-        whole sampling-time reservation including them. Charged gross, a child reads as further from fitting
-        the more of its own job it has staged (a multi-GB encoder alone can cost it the lease-acquire timeout).
-        The ledger already decays the staging reservation by this measured growth; the candidate gets the same
-        netting. ``None`` (unpriceable) and a resident-weight candidate (already credited) pass through.
-        """
-        if job.model is None:
-            return None
-        baseline = self._model_metadata.get_baseline(job.model)
-        gross_mb = self._measured_admission_candidate_delta_mb(
-            job,
-            baseline,
-            process_id=process_info.process_id,
-            disaggregated=self._is_disaggregation_class_eligible(job),
-        )
-        if gross_mb is None:
-            return None
-        if self._candidate_weights_resident_on_process(job.model, process_info.process_id):
-            return gross_mb
-        staged_mb = process_info.process_reserved_mb
-        if staged_mb is None:
-            return gross_mb
-        return max(0.0, gross_mb - float(staged_mb))
 
     def _log_clearance_hold(
         self,
@@ -11408,50 +11383,58 @@ class InferenceScheduler:
             candidate_delta_override_mb=candidate_delta_override_mb,
             nets_own_dispatch_reservation=nets_own_dispatch_reservation,
         )
-        request = priced.request
-        candidate_delta_mb = priced.candidate_delta_mb
-        device_index = priced.device_index
-        forecast = priced.forecast
-        max_resident = priced.max_resident
-        verdict = arbiter.evaluate(request)
-
+        verdict = arbiter.evaluate(priced.request)
         if verdict.admits:
             if verdict.measured_attempt:
-                self._mark_measured_attempt(next_job, request, device_index=device_index)
-            return _MaterializationOutcome(
-                verdict=verdict,
-                candidate_delta_mb=candidate_delta_mb,
-                device_index=device_index,
-                actuations_requested=(),
-                actuations_applied=(),
+                self._mark_measured_attempt(next_job, priced.request, device_index=priced.device_index)
+            applied: tuple[ActuatorCommand, ...] = ()
+        else:
+            applied = self._actuate_materialization_verdict(
+                next_job,
+                process_with_model,
+                priced,
+                verdict,
+                is_head_of_queue=is_head_of_queue,
             )
+        return _MaterializationOutcome(
+            verdict=verdict,
+            candidate_delta_mb=priced.candidate_delta_mb,
+            device_index=priced.device_index,
+            actuations_requested=() if verdict.admits else verdict.required_actuations,
+            actuations_applied=applied,
+        )
 
-        # The materialisation cannot land yet. Route the described idle-resident eviction through the single
-        # reclaim owner, protecting the head's own slot. The caller holds (dispatch or clearance) and re-asks
-        # next pass, releasing once the arbiter verdicts FITS (the governor having verified the reclaimed room).
-        actuations = verdict.required_actuations
+    def _actuate_materialization_verdict(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+        priced: MaterializationRequest,
+        verdict: VramVerdict,
+        *,
+        is_head_of_queue: bool,
+    ) -> tuple[ActuatorCommand, ...]:
+        """Run a non-admitting materialisation verdict's evictions through the single reclaim owner.
+
+        The head's own target slot is spared, and each lane pause the starved-head rungs actuate is booked as
+        a reclaim-ladder restore obligation. The caller holds (dispatch or clearance) and re-asks next pass,
+        releasing once the arbiter verdicts FITS on the reclaimed room.
+        """
         self._preload_actuation = _PreloadActuation(
-            job=next_job,
+            job=job,
             available_process=process_with_model,
-            forecast=forecast,
-            max_resident=max_resident,
+            forecast=priced.forecast,
+            max_resident=priced.max_resident,
         )
         try:
-            applied_actuations = self._execute_preload_actuations(
-                actuations,
-                device_index=device_index,
+            applied = self._execute_preload_actuations(
+                verdict.required_actuations,
+                device_index=priced.device_index,
                 for_head_of_queue=is_head_of_queue,
             )
         finally:
             self._preload_actuation = None
-        self._book_starved_head_lane_pauses(applied_actuations, device_index=device_index)
-        return _MaterializationOutcome(
-            verdict=verdict,
-            candidate_delta_mb=candidate_delta_mb,
-            device_index=device_index,
-            actuations_requested=actuations,
-            actuations_applied=applied_actuations,
-        )
+        self._book_starved_head_lane_pauses(applied, device_index=priced.device_index)
+        return applied
 
     def head_of_queue_is_parked(self) -> bool:
         """Whether the queue has stopped moving behind a head that is not dispatching.
