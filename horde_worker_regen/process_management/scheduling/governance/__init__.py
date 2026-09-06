@@ -34,10 +34,8 @@ from horde_worker_regen.process_management.scheduling.governance.governor import
 )
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import (
     AdmissionDecision,
-    AdmissionResult,
     PreloadSlotSnapshot,
     RamReclaimOutcome,
-    ReclamationExecutor,
     card_preload_order,
     compute_preload_disallowed_processes,
     decide_ram_reclaim_outcome,
@@ -80,7 +78,6 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
 
 __all__ = [
     "AdmissionDecision",
-    "AdmissionResult",
     "RAM_PRESSURE_PAUSE_SECONDS",
     "CardProcessSnapshot",
     "ClearProcessDraining",
@@ -95,7 +92,6 @@ __all__ = [
     "PreloadSlotSnapshot",
     "RamGovernorState",
     "RamReclaimOutcome",
-    "ReclamationExecutor",
     "RecycleProcess",
     "ReduceCardProcesses",
     "ReduceWorkerProcesses",

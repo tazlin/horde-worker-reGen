@@ -24,7 +24,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum, auto
-from typing import Protocol
 
 from horde_worker_regen.process_management.scheduling.model_affinity import (
     affinity_active,
@@ -33,9 +32,7 @@ from horde_worker_regen.process_management.scheduling.model_affinity import (
 
 __all__ = [
     "AdmissionDecision",
-    "AdmissionResult",
     "PreloadSlotSnapshot",
-    "ReclamationExecutor",
     "RamReclaimOutcome",
     "card_preload_order",
     "compute_preload_disallowed_processes",
@@ -78,46 +75,6 @@ class AdmissionDecision(StrEnum):
     """The resource budget or reclamation ladder deferred the preload."""
     PRESTAGE = auto()
     """A whole-card head should be pre-staged into RAM before it samples."""
-
-
-@dataclass(frozen=True)
-class AdmissionResult:
-    """Result returned by a preload-admission stage."""
-
-    decision: AdmissionDecision
-    """The gate's decision."""
-    reason: str = ""
-    """Optional human-readable reason for logs or tests."""
-    process_id: int | None = None
-    """Optional target process id when the decision selected a slot."""
-
-
-class ReclamationExecutor(Protocol):
-    """Side-effect surface for the same-tick preload reclamation ladder.
-
-    The pure policy in this module decides which rung should win after attempts run; the scheduler owns
-    these operations because they touch process state, lifecycle replacement, and operator logging.
-    """
-
-    def reclaim_idle_vram(self, *, for_head_of_queue: bool) -> bool:
-        """Try to free idle VRAM and return whether anything was reclaimed."""
-        ...
-
-    def reclaim_idle_ram(self, *, for_head_of_queue: bool) -> bool:
-        """Try to free idle resident RAM and return whether anything was reclaimed."""
-        ...
-
-    def cycle_stale_ram_slot(self) -> bool:
-        """Cycle an allocator-stuck idle slot and return whether a cycle was started."""
-        ...
-
-    def reduce_contexts_for_head(self) -> None:
-        """Start the context-reduction remedy for a head whose live contexts are the over-commit."""
-        ...
-
-    def admit_head_best_effort(self) -> None:
-        """Record that the head is being admitted over budget after reclamation is exhausted."""
-        ...
 
 
 @dataclass(frozen=True)

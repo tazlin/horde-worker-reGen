@@ -829,7 +829,7 @@ class TestGatesWithNoTestSeamYet:
         ),
         (GateSurface.PRELOAD_ADMISSION, "defer_ram_pressure"): (
             "the reclamation ladder's terminal rung is its declared backstop and is exercised through the "
-            "ram-governor suites; a per-gate drive needs the ReclamationExecutor protocol wired to a host-RAM "
+            "ram-governor suites; a per-gate drive needs the RAM reclaim sequence wired to a host-RAM "
             "sequence fed through InferenceScheduler.set_available_ram_mb_provider"
         ),
     }
