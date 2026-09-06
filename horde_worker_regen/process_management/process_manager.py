@@ -132,7 +132,7 @@ from horde_worker_regen.process_management.jobs.alchemy_popper import (
     AlchemyFormStatus,
 )
 from horde_worker_regen.process_management.jobs.image_coordinator import ImageGenerationCoordinator
-from horde_worker_regen.process_management.jobs.job_popper import JobPopper, _model_serviceability_verdicts
+from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -180,6 +180,7 @@ from horde_worker_regen.process_management.resources.duty_cycle import DutyCycle
 from horde_worker_regen.process_management.resources.model_serviceability import (
     ModelServiceabilityTier,
     max_power_to_pixels,
+    model_serviceability_verdicts,
 )
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRungKind,
@@ -7526,7 +7527,7 @@ class HordeWorkerProcessManager:
             unserviceable_models: list[str] = []
             constrained_models: dict[str, int] = {}
             for model in card_runtime.config.image_models_to_load:
-                for _, verdict in _model_serviceability_verdicts(
+                for _, verdict in model_serviceability_verdicts(
                     model,
                     card_runtimes={device_index: card_runtime},
                     model_metadata=self._model_metadata,

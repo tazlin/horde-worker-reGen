@@ -185,6 +185,38 @@ class TestModelServiceabilityAdmission:
         )
         assert all(not process.pipe_connection.send.called for process in scheduler._process_map.values())
 
+    async def test_whole_card_job_the_offer_admits_is_not_faulted(self) -> None:
+        """A Flux job on a 16GB card is preloaded, whatever the shared baseline and margin leave resident.
+
+        The pop offers a whole-card model by its recommended minimum card against the total; the preload gate
+        must judge by the same verdict. Judged instead by the resident co-fit (total minus the shared baseline
+        and the admission margin), a desktop card whose foreign load leaves the smallest job streaming would
+        fault every job the worker just accepted for the model.
+        """
+        model = "flux_model"
+        bridge_data = make_mock_bridge_data(image_models_to_load=[model])
+        reference = {
+            model: make_mock_model_reference_record(model, baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1),
+        }
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name=None)})
+        scheduler = _make_inference_scheduler(
+            bridge_data=bridge_data,
+            model_metadata=make_test_model_metadata(reference),
+            process_map=process_map,
+            card_runtimes=make_test_card_runtimes(config=bridge_data, total_vram_mb=16384.0),
+        )
+        scheduler.set_admission_baseline_provider(lambda _device: 4096.0)
+        job = make_job_pop_response(model)
+        assert job.id_ is not None
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        outcome = scheduler._attempt_preload_for_job(job, head_job=job, loaded_models=set())
+
+        assert outcome.name == "PRELOAD_SENT"
+        latest = scheduler.head_admission.last_preload_admission
+        assert latest is not None and latest.decision is AdmissionDecision.ADMIT
+        assert scheduler._job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
+
 
 class TestWddmPagingVictimAccessor:
     """The paging-victim accessor exposes a fresh victim map and ages a stale one out."""

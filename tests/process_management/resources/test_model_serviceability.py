@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.model_serviceability import (
@@ -13,6 +14,13 @@ from horde_worker_regen.process_management.resources.model_serviceability import
     decide_constrained_offer,
     max_power_to_pixels,
     model_footprint_figures_for_baseline,
+    model_serviceability_verdicts,
+)
+from tests.process_management.conftest import (
+    make_mock_bridge_data,
+    make_mock_model_reference_record,
+    make_test_card_runtimes,
+    make_test_model_metadata,
 )
 
 _GB = 1024.0
@@ -380,3 +388,75 @@ def test_footprint_figures_forward_the_model_name(monkeypatch: pytest.MonkeyPatc
     assert figures is not None
     assert figures.weights_mb == 12600.0
     assert calls == [("qwen_image", "Krea2-Turbo_fp8")]
+
+
+class TestModelServiceabilityVerdicts:
+    """One verdict function serves the pop offer and the preload gate."""
+
+    @staticmethod
+    def _flux_card(total_vram_mb: float, *, noise_override_mb: int | None = None) -> tuple[dict, object]:
+        model = "flux_model"
+        config = make_mock_bridge_data(image_models_to_load=[model])
+        config.vram_admission_noise_mb = noise_override_mb
+        metadata = make_test_model_metadata(
+            {model: make_mock_model_reference_record(model, baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1)},
+        )
+        return make_test_card_runtimes(config=config, total_vram_mb=total_vram_mb), metadata
+
+    def test_whole_card_model_is_judged_by_its_recommended_card_against_the_total(self) -> None:
+        """A 16GB card meets Flux's 14GB recommendation even when foreign load leaves its smallest job streaming."""
+        cards, metadata = self._flux_card(16384.0)
+
+        verdicts = model_serviceability_verdicts(
+            "flux_model",
+            card_runtimes=cards,
+            model_metadata=metadata,
+            admission_baseline_provider=lambda _device: 4096.0,
+            max_pixels=None,
+        )
+
+        assert [verdict.tier for _, verdict in verdicts] == [ModelServiceabilityTier.SERVICEABLE]
+        assert verdicts[0][1].whole_card is True
+
+    def test_a_card_below_the_recommendation_is_unserviceable(self) -> None:
+        """An 8GB card cannot meet the recommendation, so the model is neither offered nor preloaded."""
+        cards, metadata = self._flux_card(8192.0)
+
+        verdicts = model_serviceability_verdicts(
+            "flux_model",
+            card_runtimes=cards,
+            model_metadata=metadata,
+            admission_baseline_provider=None,
+            max_pixels=None,
+        )
+
+        assert [verdict.tier for _, verdict in verdicts] == [ModelServiceabilityTier.UNSERVICEABLE]
+
+    def test_the_noise_buffer_is_the_cards_admission_margin(self) -> None:
+        """The operator's per-card override is the slack the verdict subtracts, as runtime admission does."""
+        cards, metadata = self._flux_card(16384.0, noise_override_mb=0)
+
+        verdicts = model_serviceability_verdicts(
+            "flux_model",
+            card_runtimes=cards,
+            model_metadata=metadata,
+            admission_baseline_provider=None,
+            max_pixels=None,
+        )
+
+        assert verdicts[0][1].noise_buffer_mb == 0.0
+
+    def test_no_serving_card_yields_no_verdict(self) -> None:
+        """A model no card offers has nothing to judge."""
+        cards, metadata = self._flux_card(16384.0)
+
+        assert (
+            model_serviceability_verdicts(
+                "other_model",
+                card_runtimes=cards,
+                model_metadata=metadata,
+                admission_baseline_provider=None,
+                max_pixels=None,
+            )
+            == []
+        )

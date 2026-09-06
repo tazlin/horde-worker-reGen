@@ -38,11 +38,19 @@ size they all fit.
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from loguru import logger
 
-from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.models.model_sizing import is_extra_large_model
+from horde_worker_regen.process_management.resources.admission_identity import (
+    admission_margin_mb,
+    admission_noise_buffer_mb,
+)
 
 _SMALLEST_LEGAL_IMAGE_SIDE = 512
 """Smallest image side (px) accepted for Horde image jobs and used for the model minimum footprint."""
@@ -298,6 +306,67 @@ def model_footprint_figures_for_baseline(
     except Exception as e:
         logger.debug(f"Model serviceability footprint lookup failed for {baseline!r}: {type(e).__name__} {e}")
         return None
+
+
+def baseline_value_for_model(model_metadata: ModelMetadata | None, model_name: str) -> str | None:
+    """Return a model's baseline value, or None when metadata is unavailable."""
+    if model_metadata is None:
+        return None
+    baseline = model_metadata.get_baseline(model_name)
+    return baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
+
+
+def model_serviceability_verdicts(
+    model: str,
+    *,
+    card_runtimes: Mapping[int, CardRuntime],
+    model_metadata: ModelMetadata | None,
+    admission_baseline_provider: Callable[[int | None], float | None] | None,
+    max_pixels: int | None,
+) -> list[tuple[CardRuntime, ModelServiceabilityVerdict]]:
+    """Return one serviceability verdict per card that serves ``model``.
+
+    The one judgement behind both promises the worker makes about a model: the pop offers it and the preload
+    gate faults a job for it on the same verdicts, so a job the popper accepted is never faulted as
+    unserviceable by an arithmetic the offer did not run. Empty when no card serves the model. Each verdict
+    abstains (reads as serviceable) when the model's footprint or the card's total is unknown. The noise
+    buffer is the card's admission margin (the operator's per-card override, else the platform default), the
+    same slack runtime VRAM admission subtracts.
+    """
+    serving_cards = [card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)]
+    if not serving_cards:
+        return []
+    baseline_value = baseline_value_for_model(model_metadata, model)
+    figures = model_footprint_figures_for_baseline(baseline_value, model)
+    whole_card = is_extra_large_model(model, baseline_value)
+    verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]] = []
+    for card in serving_cards:
+        baseline_mb = (
+            admission_baseline_provider(card.device_index) if admission_baseline_provider is not None else None
+        )
+        override = card.config.vram_admission_noise_mb
+        verdicts.append(
+            (
+                card,
+                assess_model_serviceability(
+                    total_vram_mb=card.total_vram_mb,
+                    baseline_mb=0.0 if baseline_mb is None else baseline_mb,
+                    noise_buffer_mb=admission_margin_mb(
+                        card.total_vram_mb,
+                        override_mb=None if override is None else float(override),
+                    ),
+                    figures=figures,
+                    max_pixels=max_pixels,
+                    whole_card=whole_card,
+                ),
+            ),
+        )
+    return verdicts
+
+
+def serviceability_arithmetic(verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]]) -> str:
+    """Render every card's serviceability arithmetic on one line."""
+    return "; ".join(f"device {card.device_index}: {verdict.reason()}" for card, verdict in verdicts)
 
 
 _CONSTRAINED_LANE_FULL_CYCLES = 3

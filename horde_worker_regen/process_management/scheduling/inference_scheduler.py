@@ -56,9 +56,8 @@ from horde_worker_regen.process_management.resources.admission_identity import (
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.foreign_vram_floor import ForeignVramFloorTracker
 from horde_worker_regen.process_management.resources.model_serviceability import (
-    ModelServiceabilityVerdict,
-    assess_model_serviceability,
-    model_footprint_figures_for_baseline,
+    model_serviceability_verdicts,
+    serviceability_arithmetic,
 )
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     CacheReleaseTarget,
@@ -8556,53 +8555,25 @@ class InferenceScheduler:
             weight_mb=weight_mb,
         )
 
-    def _baseline_value_for_job(self, job: ImageGenerateJobPopResponse) -> str | None:
-        """Return the job model's baseline value, or None when metadata is unavailable."""
-        if job.model is None:
-            return None
-        baseline = self._model_metadata.get_baseline(job.model)
-        return baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
+    def _unserviceable_job_reason(self, job: ImageGenerateJobPopResponse) -> str | None:
+        """Return a fault reason when no serving card can ever host this job's model minimum.
 
-    def _model_serviceability_verdicts(
-        self,
-        job: ImageGenerateJobPopResponse,
-    ) -> list[tuple[CardRuntime, ModelServiceabilityVerdict]]:
-        """Return per-serving-card serviceability verdicts for ``job``.
-
-        The check abstains when the runtime card map or model footprint is unknown. It considers only cards
-        whose effective config serves the model, matching the offer and placement surfaces.
+        Judged by the verdicts the pop offer runs, so the gate faults only what the offer would not have
+        advertised (a stale job popped before a card shrank, or one accepted under a promise this worker cannot
+        keep); a job the offer admits passes here.
         """
         if job.model is None or not self._card_runtimes:
-            return []
-        baseline = self._baseline_value_for_job(job)
-        figures = model_footprint_figures_for_baseline(baseline, job.model)
-        if figures is None:
-            return []
-        verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]] = []
-        for card in self._card_runtimes.values():
-            if job.model not in set(card.config.image_models_to_load):
-                continue
-            baseline_mb = self._admission_baseline_mb(card.device_index)
-            verdicts.append(
-                (
-                    card,
-                    assess_model_serviceability(
-                        total_vram_mb=card.total_vram_mb,
-                        baseline_mb=baseline_mb,
-                        noise_buffer_mb=self._admission_margin_mb(card.device_index, card.total_vram_mb),
-                        figures=figures,
-                    ),
-                ),
-            )
-        return verdicts
-
-    def _unserviceable_job_reason(self, job: ImageGenerateJobPopResponse) -> str | None:
-        """Return a fault reason when no serving card can ever host this job's model minimum."""
-        verdicts = self._model_serviceability_verdicts(job)
+            return None
+        verdicts = model_serviceability_verdicts(
+            job.model,
+            card_runtimes=self._card_runtimes,
+            model_metadata=self._model_metadata,
+            admission_baseline_provider=self._admission_baseline_provider,
+            max_pixels=None,
+        )
         if not verdicts or any(verdict.serviceable for _, verdict in verdicts):
             return None
-        arithmetic = "; ".join(f"device {card.device_index}: {verdict.reason()}" for card, verdict in verdicts)
-        return f"model minimum footprint cannot fit any serving card; {arithmetic}"
+        return f"model minimum footprint cannot fit any serving card; {serviceability_arithmetic(verdicts)}"
 
     def _fault_unserviceable_job(self, job: ImageGenerateJobPopResponse, reason: str) -> None:
         """Fault an unserviceable queued job before any child process touches VRAM for it."""

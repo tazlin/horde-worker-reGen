@@ -69,11 +69,10 @@ from horde_worker_regen.process_management.resources.model_serviceability import
     _CONSTRAINED_LANE_FULL_CYCLES,
     ConstrainedLaneState,
     ModelServiceabilityTier,
-    ModelServiceabilityVerdict,
-    assess_model_serviceability,
     decide_constrained_offer,
     max_power_to_pixels,
-    model_footprint_figures_for_baseline,
+    model_serviceability_verdicts,
+    serviceability_arithmetic,
 )
 from horde_worker_regen.process_management.resources.resource_budget import (
     is_model_locally_unservable_for,
@@ -377,59 +376,6 @@ _MAX_IDLE_FILL_RUNG = 3
 count for a worker that has no model for some tier."""
 
 
-def _baseline_value_for_model(model_metadata: ModelMetadata | None, model_name: str) -> str | None:
-    """Return a model's baseline value, or None when metadata is unavailable."""
-    if model_metadata is None:
-        return None
-    baseline = model_metadata.get_baseline(model_name)
-    return baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
-
-
-def _model_serviceability_verdicts(
-    model: str,
-    *,
-    card_runtimes: dict[int, CardRuntime],
-    model_metadata: ModelMetadata,
-    admission_baseline_provider: Callable[[int | None], float | None] | None,
-    max_pixels: int | None,
-) -> list[tuple[CardRuntime, ModelServiceabilityVerdict]]:
-    """Return one serviceability verdict per card that serves ``model``.
-
-    Empty when no card serves the model. Each verdict abstains (reads as serviceable) when the model's
-    footprint or the card's total is unknown.
-    """
-    serving_cards = [card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)]
-    if not serving_cards:
-        return []
-    baseline_value = _baseline_value_for_model(model_metadata, model)
-    figures = model_footprint_figures_for_baseline(baseline_value, model)
-    whole_card = is_extra_large_model(model, baseline_value)
-    verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]] = []
-    for card in serving_cards:
-        baseline_mb = (
-            admission_baseline_provider(card.device_index) if admission_baseline_provider is not None else None
-        )
-        verdicts.append(
-            (
-                card,
-                assess_model_serviceability(
-                    total_vram_mb=card.total_vram_mb,
-                    baseline_mb=0.0 if baseline_mb is None else baseline_mb,
-                    noise_buffer_mb=None,
-                    figures=figures,
-                    max_pixels=max_pixels,
-                    whole_card=whole_card,
-                ),
-            ),
-        )
-    return verdicts
-
-
-def _serviceability_arithmetic(verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]]) -> str:
-    """Render every card's serviceability arithmetic on one line."""
-    return "; ".join(f"device {card.device_index}: {verdict.reason()}" for card, verdict in verdicts)
-
-
 def _serviceability_held_back_models(
     models: set[str],
     *,
@@ -448,7 +394,7 @@ def _serviceability_held_back_models(
 
     held_back: set[str] = set()
     for model in models:
-        verdicts = _model_serviceability_verdicts(
+        verdicts = model_serviceability_verdicts(
             model,
             card_runtimes=card_runtimes,
             model_metadata=model_metadata,
@@ -467,7 +413,7 @@ def _serviceability_held_back_models(
         logger.warning(
             f"Not offering {model}: its smallest legal job (512x512) does not fit any card that serves it, so it "
             f"is removed from every pop. Remove it from your models or free VRAM on the card. "
-            f"{_serviceability_arithmetic(verdicts)}",
+            f"{serviceability_arithmetic(verdicts)}",
         )
     return held_back
 
@@ -881,7 +827,7 @@ class JobPopper:
         if self._model_metadata is None or card_runtimes is None or len(card_runtimes) == 0:
             return caps
         for model in sorted(models):
-            verdicts = _model_serviceability_verdicts(
+            verdicts = model_serviceability_verdicts(
                 model,
                 card_runtimes=card_runtimes,
                 model_metadata=self._model_metadata,
@@ -905,7 +851,7 @@ class JobPopper:
                     f"cannot host it at full size, so it is advertised on its own reduced-size pop, one in every "
                     f"{_CONSTRAINED_LANE_FULL_CYCLES + 1}, and the other models keep the configured max_power. "
                     f"Lower max_power, free VRAM on the card, or remove the model to silence this. "
-                    f"{_serviceability_arithmetic(verdicts)}",
+                    f"{serviceability_arithmetic(verdicts)}",
                 )
             caps[model] = model_cap
         return caps
