@@ -6284,6 +6284,11 @@ class InferenceScheduler:
                 no_live_resource_consumer=no_live_resource_consumer,
             )
 
+        # The static budget admitted this candidate on the free-VRAM reading and the measured arbiter refused
+        # it: the physical over-commit the run metrics count as a measured-floor denial.
+        if priced.predictive.fits:
+            self._head_admission.note_measured_floor_denial(target_device_index)
+
         # A structural-impossibility DENY for the true head, with no other card that could ever seat it, is a
         # permanent wall: the model's demand exceeds this card's achievable ceiling (total net of the noise
         # buffer and the sustained foreign floor), so deferring only wedges the queue behind a head that no

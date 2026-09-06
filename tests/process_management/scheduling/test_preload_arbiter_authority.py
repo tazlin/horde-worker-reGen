@@ -109,6 +109,23 @@ class TestAdapterSeamAdmitsOnlyOnFits:
 
         assert admitted is True
 
+    async def test_a_measured_refusal_of_a_statically_fitting_candidate_is_a_denial(self) -> None:
+        """The free-VRAM budget admits the head and the full card refuses it: one measured-floor denial is counted.
+
+        A fitting verdict counts nothing, so the run-metrics figure names physical over-commits the lying free
+        reading would have let through and not every defer.
+        """
+        scheduler, job, target = await _budgeted_scheduler_with_head()
+        _install_cycle(scheduler, _full_card_state())
+
+        assert scheduler._admit_preload_under_budget(job, target, is_head_blocker=True) is False
+        assert scheduler.head_admission.admission_denials(None) == 1
+
+        admitted_scheduler, job, target = await _budgeted_scheduler_with_head()
+        _install_cycle(admitted_scheduler, _fitting_state())
+        assert admitted_scheduler._admit_preload_under_budget(job, target, is_head_blocker=True) is True
+        assert admitted_scheduler.head_admission.admission_denials(None) == 0
+
     async def test_starved_head_on_full_card_still_defers(self) -> None:
         """A head deferred on the clock still defers on a physically full card, with no over-budget tag."""
         scheduler, job, target = await _budgeted_scheduler_with_head()

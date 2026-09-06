@@ -334,6 +334,15 @@ class HeadAdmissionLedger:
         """Record the measured-floor headroom the admission overlay computed for a card this cycle."""
         self.admission_headroom_mb_by_device[device_index if device_index is not None else 0] = headroom_mb
 
+    def note_measured_floor_denial(self, device_index: int | None) -> None:
+        """Count one admission the static free-VRAM budget admitted but the measured arbiter refused.
+
+        The run-metrics denial figure: a physical over-commit the lying free reading would have let through,
+        caught by the committed-plus-planned ledger arithmetic. Keyed by card, worker-wide under key 0.
+        """
+        key = device_index if device_index is not None else 0
+        self.admission_denials_by_device[key] = self.admission_denials_by_device.get(key, 0) + 1
+
     def note_staging_defer(self, reason: StagingDeferReason) -> int | None:
         """Tally a staging deferral; return the suppressed repeat count when it should be logged, else None.
 

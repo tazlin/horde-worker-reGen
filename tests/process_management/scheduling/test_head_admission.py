@@ -277,3 +277,19 @@ class TestRecordsAndThrottles:
         assert ledger.heavy_head_load_grace_active(30.0) is True
         clock.now += 1.0
         assert ledger.heavy_head_load_grace_active(30.0) is False
+
+
+class TestMeasuredFloorDenials:
+    """The run-metrics denial figure counts measured refusals of statically admitted candidates, per card."""
+
+    def test_denials_count_per_card_and_read_zero_elsewhere(self) -> None:
+        """Each note adds one under the card's key, the worker-wide view under key 0, and an unseen card reads 0."""
+        ledger, _clock = _ledger()
+        assert ledger.admission_denials(None) == 0
+        ledger.note_measured_floor_denial(None)
+        ledger.note_measured_floor_denial(1)
+        ledger.note_measured_floor_denial(1)
+        assert ledger.admission_denials(None) == 1
+        assert ledger.admission_denials(0) == 1
+        assert ledger.admission_denials(1) == 2
+        assert ledger.admission_denials(2) == 0
