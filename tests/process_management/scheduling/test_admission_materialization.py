@@ -137,7 +137,7 @@ async def test_core_evaluates_the_built_request_against_one_freeze() -> None:
 
     arbiter.evaluate = capture  # type: ignore[method-assign]
     arbiter.begin_cycle = count_freeze  # type: ignore[method-assign]
-    scheduler._execute_preload_actuations = Mock(return_value=())  # type: ignore[method-assign]
+    scheduler.executor.execute_actuations = Mock(return_value=())  # type: ignore[method-assign]
 
     outcome = scheduler._evaluate_materialization_admission(  # type: ignore[attr-defined]
         head,

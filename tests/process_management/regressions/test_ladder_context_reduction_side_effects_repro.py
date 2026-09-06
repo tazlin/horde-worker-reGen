@@ -28,8 +28,12 @@ from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, ActuatorCommandKind
-from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler, _PreloadActuation
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    ActuatorCommand,
+    ActuatorCommandKind,
+    HeadReclaimContext,
+)
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -110,23 +114,19 @@ async def _flag_off_scheduler_with_tracked_head() -> tuple[
     scheduler._runtime_safety_placement_enabled = Mock(return_value=True)
     scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
 
-    forecast = Mock()
-    forecast.max_resident_processes = Mock(return_value=1)
-    forecast.total_vram_mb = 24000.0
-    forecast.fits_weights_now = True
-    scheduler._preload_actuation = _PreloadActuation(
-        job=job,
-        available_process=process_map[0],
-        forecast=forecast,
-        max_resident=1,
-    )
     return scheduler, process_map, lifecycle, job
 
 
 def _issue_reduce_contexts(scheduler: InferenceScheduler) -> None:
-    """Deliver one arbiter REDUCE_LIVE_CONTEXTS command through the preload actuation surface."""
+    """Deliver one arbiter REDUCE_LIVE_CONTEXTS command through the executor, on behalf of the queued head."""
+    job = next(iter(scheduler._job_tracker.jobs_pending_inference))
     commands = (ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None),)
-    scheduler._execute_preload_actuations(commands, device_index=None, for_head_of_queue=True)
+    scheduler.executor.execute_actuations(
+        commands,
+        device_index=None,
+        for_head_of_queue=True,
+        head=HeadReclaimContext(model=job.model, target_process_id=0, max_resident=1),
+    )
 
 
 class TestLadderReductionLeavesSafetyAndExclusivityAlone:

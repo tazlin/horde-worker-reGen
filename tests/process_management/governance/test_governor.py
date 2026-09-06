@@ -29,7 +29,7 @@ _TOTAL_RAM_MB = 64000.0
 
 
 class _FakeHost:
-    """A governance host that returns a canned snapshot and records executed actions."""
+    """A governance host and executor: returns a canned snapshot and records the actions handed to it."""
 
     def __init__(self, snapshot: HostMemorySnapshot) -> None:
         self.snapshot = snapshot
@@ -42,7 +42,7 @@ class _FakeHost:
         assert verdict is self.snapshot.verdict, "the tick must snapshot with the verdict it measured"
         return self.snapshot
 
-    def _execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
+    def execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
         self.executed.extend(actions)
 
 
@@ -52,7 +52,7 @@ class TestResourceGovernorTick:
     def test_healthy_tick_clears_the_hold_and_reports_no_pressure(self) -> None:
         """A healthy host gets exactly the cleared pop hold and no degrade actions."""
         host = _FakeHost(_snapshot())
-        governor = ResourceGovernor(host=host)
+        governor = ResourceGovernor(host=host, executor=host)
 
         under_pressure = governor.tick()
 
@@ -63,7 +63,7 @@ class TestResourceGovernorTick:
     def test_pressured_tick_executes_the_degrade_response(self) -> None:
         """A pressured host reports pressure and executes the degrade actions."""
         host = _FakeHost(_snapshot(available_mb=500.0))
-        governor = ResourceGovernor(host=host)
+        governor = ResourceGovernor(host=host, executor=host)
 
         under_pressure = governor.tick()
 
@@ -86,7 +86,7 @@ class TestResourceGovernorTick:
             ),
         )
         host = _FakeHost(snapshot)
-        governor = ResourceGovernor(host=host)
+        governor = ResourceGovernor(host=host, executor=host)
 
         governor.tick()
 
@@ -100,7 +100,7 @@ class TestResourceGovernorTick:
             worker_shed_process_count=2,
         )
         host = _FakeHost(snapshot)
-        governor = ResourceGovernor(host=host)
+        governor = ResourceGovernor(host=host, executor=host)
 
         governor.tick()
 
@@ -120,8 +120,8 @@ class TestResourceGovernorTick:
 
             governor: ResourceGovernor
 
-            def _execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
-                super()._execute_governance_actions(actions)
+            def execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
+                super().execute_governance_actions(actions)
                 draining = self.governor.ram_state.draining_process_ids
                 for action in actions:
                     if isinstance(action, MarkProcessDraining):
@@ -131,7 +131,7 @@ class TestResourceGovernorTick:
 
         busy_balloon = _slot(4, resident_ram_mb=19000.0, is_busy=True)
         host = _StatefulHost(_snapshot(available_mb=500.0, inference_slots=(busy_balloon,), in_flight_job_count=1))
-        governor = ResourceGovernor(host=host)
+        governor = ResourceGovernor(host=host, executor=host)
         host.governor = governor
 
         assert governor.tick() is True
@@ -159,7 +159,7 @@ class TestResourceGovernorTick:
         """The tick's verdict is retained so per-job gates in the same cycle act on one reading."""
         verdict = assess_ram_pressure(40000.0, _TOTAL_RAM_MB)
         host = _FakeHost(_snapshot())
-        governor = ResourceGovernor(host=host)
+        governor = ResourceGovernor(host=host, executor=host)
         assert governor.last_ram_verdict is None
 
         governor.tick()

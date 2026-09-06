@@ -6,7 +6,7 @@ records per tick is the worker's own disclosure surface plus every command that 
 
 - the decision-sink verdicts and the resource-state transitions the scheduler emitted,
 - every reclaim rung the ladder actually performed through the world's recording actuator,
-- every arbiter command batch run through ``_execute_preload_actuations``, with what each batch executed,
+- every arbiter command batch run through the executor's ``execute_actuations``, with what each batch executed,
 - every control message the lanes' pipes received, by flag, lane, model, job and, on a dispatch, the
   retention grant it carried,
 - every dispatch, as the model and lane it was seated on and the jobs that first reached sampling,
@@ -34,7 +34,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeTextEncodeControlMessage,
     HordeVaeEncodeControlMessage,
 )
-from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand
+from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, HeadReclaimContext
 
 _JOB_CARRYING_CONTROL_MESSAGES = (
     HordePreloadInferenceModelMessage,
@@ -100,16 +100,17 @@ class TraceRecorder:
 
     def _wrap_arbiter_executor(self) -> None:
         """Record every arbiter command batch the scheduler runs, forwarding the call unchanged."""
-        scheduler = self._world.scheduler
-        original = scheduler._execute_preload_actuations
+        executor = self._world.scheduler.executor
+        original = executor.execute_actuations
 
         def recording_executor(
             commands: tuple[ActuatorCommand, ...],
             *,
             device_index: int | None,
             for_head_of_queue: bool,
+            head: HeadReclaimContext | None = None,
         ) -> tuple[ActuatorCommand, ...]:
-            executed = original(commands, device_index=device_index, for_head_of_queue=for_head_of_queue)
+            executed = original(commands, device_index=device_index, for_head_of_queue=for_head_of_queue, head=head)
             self._arbiter_batches.append(
                 (
                     self._world.tick,
@@ -123,7 +124,7 @@ class TraceRecorder:
             )
             return executed
 
-        scheduler._execute_preload_actuations = recording_executor  # type: ignore[method-assign]
+        executor.execute_actuations = recording_executor  # type: ignore[method-assign]
 
     # -- normalisation ------------------------------------------------------------------------------------
 

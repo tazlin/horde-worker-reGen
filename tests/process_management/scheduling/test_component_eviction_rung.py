@@ -104,7 +104,7 @@ class TestQueuedModelSurvives:
         )
         scheduler.unload_models = Mock(return_value=True)  # type: ignore[method-assign]
 
-        scheduler._execute_governance_actions([EvictIdleModels()])
+        scheduler.executor.execute_governance_actions([EvictIdleModels()])
 
         assert _sent_evict_message(process) is not None
         scheduler.unload_models.assert_not_called()
@@ -136,7 +136,7 @@ class TestAllProtectedDegradesToLegacy:
         scheduler.unload_models = Mock(return_value=True)  # type: ignore[method-assign]
 
         # Must not raise (no wedge); the legacy whole-RAM unload runs because the gentle rung found nothing.
-        scheduler._execute_governance_actions([EvictIdleModels()])
+        scheduler.executor.execute_governance_actions([EvictIdleModels()])
 
         assert _sent_evict_message(process) is None
         scheduler.unload_models.assert_called_once_with(under_pressure=True)

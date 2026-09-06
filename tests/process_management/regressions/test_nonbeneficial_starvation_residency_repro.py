@@ -31,13 +31,11 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommandKind,
     DeviceVramState,
+    HeadReclaimContext,
     MeasuredVramSnapshot,
     VramArbiter,
 )
-from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _PreloadActuation,
-    _WholeCardDemandOutcome,
-)
+from horde_worker_regen.process_management.scheduling.inference_scheduler import _WholeCardDemandOutcome
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -174,11 +172,11 @@ async def test_starvation_request_does_not_offer_a_non_reducing_context_teardown
         ),
     )
     scheduler._vram_arbiter = arbiter
-    scheduler._execute_preload_actuations = Mock()  # type: ignore[method-assign]
+    scheduler.executor.execute_actuations = Mock()  # type: ignore[method-assign]
 
     assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
 
-    commands = scheduler._execute_preload_actuations.call_args.args[0]
+    commands = scheduler.executor.execute_actuations.call_args.args[0]
     assert ActuatorCommandKind.REDUCE_LIVE_CONTEXTS not in {command.kind for command in commands}, (
         f"computed target {case.computed_target} cannot reduce {case.live_processes} live processes"
     )
@@ -194,15 +192,16 @@ async def test_non_reducing_actuation_does_not_acquire_residency_or_recovery_gra
 ) -> None:
     """A stale/repeated REDUCE command that cannot remove a process must be a side-effect-free no-op."""
     scheduler, head, target = await _scheduler_for(case)
-    scheduler._preload_actuation = _PreloadActuation(
-        job=head,
-        available_process=target,
-        forecast=_forecast(case.total_vram_mb),
-        max_resident=case.computed_target,
-    )
     scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
 
-    reduced = scheduler.reduce_live_contexts(None)
+    reduced = scheduler.reduce_live_contexts(
+        None,
+        head=HeadReclaimContext(
+            model=head.model,
+            target_process_id=target.process_id,
+            max_resident=case.computed_target,
+        ),
+    )
 
     assert reduced is False
     assert scheduler._job_tracker.is_admitted_exclusive(head) is False

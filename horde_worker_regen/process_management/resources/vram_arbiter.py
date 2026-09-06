@@ -235,6 +235,21 @@ class ActuatorCommand:
     target_process_id: int | None = None
 
 
+@dataclass(frozen=True)
+class HeadReclaimContext:
+    """The head a described eviction or context reduction acts on behalf of.
+
+    An EVICT_IDLE_MODEL spares the head's own target slot and its model; a REDUCE_LIVE_CONTEXTS collapses the
+    card to ``max_resident``, the depth the verdict's rejected peak sized, protecting the head's model. Carried
+    alongside the commands by whoever executes a verdict, so an actuator never has to recover the head from
+    ambient state.
+    """
+
+    model: str | None
+    target_process_id: int
+    max_resident: int | None
+
+
 class VramActuator(Protocol):
     """The execution surface a caller supplies to run the pressure-relief commands a verdict describes.
 
@@ -248,12 +263,18 @@ class VramActuator(Protocol):
         """Ask one idle lane to release its cached allocator reservation back to the device."""
         ...
 
-    def evict_idle_model(self, device_index: int | None, *, for_head_of_queue: bool) -> bool:
-        """Evict an idle VRAM-resident model on the card to reclaim its weights."""
+    def evict_idle_model(
+        self,
+        device_index: int | None,
+        *,
+        for_head_of_queue: bool,
+        head: HeadReclaimContext | None = None,
+    ) -> bool:
+        """Evict an idle VRAM-resident model on the card to reclaim its weights, sparing ``head`` when given."""
         ...
 
-    def reduce_live_contexts(self, device_index: int | None) -> bool:
-        """Reduce the live inference-context count so a retained per-context reservation returns to the card."""
+    def reduce_live_contexts(self, device_index: int | None, *, head: HeadReclaimContext | None = None) -> bool:
+        """Reduce the live inference-context count to the depth ``head`` sized; a no-op without a head."""
         ...
 
     def pause_vae_lane(self, device_index: int | None) -> bool:

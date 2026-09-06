@@ -51,6 +51,7 @@ from loguru import logger
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
     ActuatorCommandKind,
+    HeadReclaimContext,
     VramActuator,
 )
 
@@ -954,6 +955,7 @@ class VerifiedReclaimLadder:
         *,
         device_index: int | None,
         for_head_of_queue: bool,
+        head: HeadReclaimContext | None = None,
     ) -> tuple[ActuatorCommand, ...]:
         """Run the arbiter's deferred-preload actuations through this single reclaim owner.
 
@@ -973,9 +975,9 @@ class VerifiedReclaimLadder:
             if command.kind is ActuatorCommandKind.RELEASE_CACHE and command.target_process_id is not None:
                 acted = actuator.release_cache(command.target_process_id)
             elif command.kind is ActuatorCommandKind.EVICT_IDLE_MODEL:
-                acted = actuator.evict_idle_model(device_index, for_head_of_queue=for_head_of_queue)
+                acted = actuator.evict_idle_model(device_index, for_head_of_queue=for_head_of_queue, head=head)
             elif command.kind is ActuatorCommandKind.REDUCE_LIVE_CONTEXTS:
-                acted = actuator.reduce_live_contexts(device_index)
+                acted = actuator.reduce_live_contexts(device_index, head=head)
             elif command.kind is ActuatorCommandKind.PAUSE_VAE_LANE:
                 acted = actuator.pause_vae_lane(device_index)
             elif command.kind is ActuatorCommandKind.PAUSE_COMPONENT_LANE:

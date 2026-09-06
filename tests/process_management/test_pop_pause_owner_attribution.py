@@ -104,7 +104,7 @@ class TestRamPressurePauseAttribution:
             floor_mb=verdict.floor_mb,
         )
 
-        manager._inference_scheduler._execute_governance_actions([action])
+        manager._inference_scheduler.executor.execute_governance_actions([action])
 
         assert manager._state.self_throttle_paused is True
         assert manager._state.self_throttle_paused_until == now + 30.0
@@ -252,7 +252,7 @@ class TestOverlappingArmsLaterDeadlineWins:
         lines: list[str] = []
         sink_id = logger.add(lambda message: lines.append(message.record["message"]), level="WARNING")
         try:
-            manager._inference_scheduler._execute_governance_actions([ram_pause])
+            manager._inference_scheduler.executor.execute_governance_actions([ram_pause])
         finally:
             logger.remove(sink_id)
 
@@ -271,7 +271,7 @@ class TestLapseAttribution:
         manager = make_testable_process_manager()
         now = time.time()
         verdict = assess_ram_pressure(_CRITICAL_AVAILABLE_MB, _TOTAL_RAM_MB)
-        manager._inference_scheduler._execute_governance_actions(
+        manager._inference_scheduler.executor.execute_governance_actions(
             [
                 PausePops(
                     until_time=now + 30.0,

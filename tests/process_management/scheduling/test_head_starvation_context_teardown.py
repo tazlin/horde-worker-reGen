@@ -17,8 +17,11 @@ from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, ActuatorCommandKind
-from horde_worker_regen.process_management.scheduling.inference_scheduler import _PreloadActuation
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    ActuatorCommand,
+    ActuatorCommandKind,
+    HeadReclaimContext,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -134,15 +137,13 @@ class TestContextTeardownActuationExecutesWithFlagOff:
         scale_down = Mock(return_value=1)
         scheduler._process_lifecycle.scale_inference_processes = scale_down  # type: ignore[method-assign]
         scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
-        scheduler._preload_actuation = _PreloadActuation(
-            job=job,
-            available_process=head,
-            forecast=Mock(),
-            max_resident=1,
-        )
-
         commands = (ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None),)
-        scheduler._execute_preload_actuations(commands, device_index=None, for_head_of_queue=True)
+        scheduler.executor.execute_actuations(
+            commands,
+            device_index=None,
+            for_head_of_queue=True,
+            head=HeadReclaimContext(model=job.model, target_process_id=head.process_id, max_resident=1),
+        )
 
         scale_down.assert_called_once()
         assert scale_down.call_args.args[0] == 1, "the pool is stopped down to the head's sized target"

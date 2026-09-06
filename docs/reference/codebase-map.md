@@ -49,6 +49,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | VRAM pricing over the snapshot         | `process_management/scheduling/admission/pricing.py` (candidate delta, streaming forecast, reclaimable idle residents) |
 | Materialisation request               | `process_management/scheduling/admission/materialization.py` (`build_materialization_request`) |
 | Clearance admit decision              | `process_management/scheduling/admission/clearance.py` (`decide_clearance_admit`, `ClearancePlan`) |
+| Governance and verdict act site       | `process_management/scheduling/admission/executor.py` (`PlanExecutor`, `ExecutionHost`) |
 | Multi-GPU routing                      | `process_management/gpu/`                                          |
 | File descriptor limit preflight        | `process_management/fd_limits.py`                                  |
 | Dry-run / test doubles                 | `process_management/simulation/`                                   |

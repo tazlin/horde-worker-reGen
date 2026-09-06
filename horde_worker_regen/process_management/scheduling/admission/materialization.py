@@ -10,7 +10,6 @@ from dataclasses import dataclass
 
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.resources.resource_budget import (
-    StreamForecast,
     effective_inference_reserve_mb,
     predict_job_weight_mb,
 )
@@ -28,7 +27,6 @@ class MaterializationRequest:
     """A priced materialisation, ready for the arbiter, with the figures its actuations act on."""
 
     request: VramRequest
-    forecast: StreamForecast
     max_resident: int | None
     """The context-reduction depth a REDUCE_LIVE_CONTEXTS actuation collapses the card to, or None."""
     candidate_delta_mb: float | None
@@ -173,7 +171,6 @@ def build_materialization_request(
     )
     return MaterializationRequest(
         request=request,
-        forecast=forecast,
         max_resident=max_resident,
         candidate_delta_mb=candidate_delta_mb,
         device_index=device_index,

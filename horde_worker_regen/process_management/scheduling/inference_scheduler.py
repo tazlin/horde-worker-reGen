@@ -18,7 +18,7 @@ from loguru import logger
 
 from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
+from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime, safety_permitted_card_indices
 from horde_worker_regen.process_management.gpu.gpu_eligibility import (
     CardEligibilityVerdict,
@@ -106,6 +106,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
     ActuatorCommandKind,
     DeviceVramState,
+    HeadReclaimContext,
     MeasuredVramSnapshot,
     VramArbiter,
     VramDisposition,
@@ -126,6 +127,7 @@ from horde_worker_regen.process_management.scheduling.admission.clearance import
     ClearanceDecision,
     decide_clearance_admit,
 )
+from horde_worker_regen.process_management.scheduling.admission.executor import PlanExecutor
 from horde_worker_regen.process_management.scheduling.admission.materialization import (
     MaterializationRequest,
     build_materialization_request,
@@ -164,31 +166,17 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
 from horde_worker_regen.process_management.scheduling.governance import (
     AdmissionDecision,
     CardProcessSnapshot,
-    ClearProcessDraining,
-    EvictIdleModels,
-    GovernanceAction,
     HostMemorySnapshot,
     InferenceSlotSnapshot,
-    MarkProcessDraining,
-    PausePops,
     PreloadSlotSnapshot,
     RamGovernorState,
     RamReclaimOutcome,
-    RecycleProcess,
-    ReduceCardProcesses,
-    ReduceWorkerProcesses,
     ResourceGovernor,
-    RestoreCardProcess,
-    RestoreWorkerProcess,
-    SetPopHold,
-    StopTrackingShedCard,
-    StopTrackingWorkerShed,
     WholeCardGovernorHold,
     WholeCardPopClaim,
     WholeCardPopClaimTracker,
     WholeCardResidency,
     WholeCardResidencyMachine,
-    WorkerProcessShedState,
     card_preload_order,
     compute_preload_disallowed_processes,
     decide_degrade_response,
@@ -405,22 +393,6 @@ class _PreloadJobOutcome(enum.Enum):
     """A gate deferred or consumed this cycle (RAM floor, no slot, serialization, budget); stop the pass."""
     PRELOAD_SENT = enum.auto()
     """A preload was issued for this job; the pass is done and reports success."""
-
-
-@dataclass
-class _PreloadActuation:
-    """The head-preload context a described actuation needs when the adapter runs a deferred verdict.
-
-    An EVICT_IDLE_MODEL or REDUCE_LIVE_CONTEXTS command targets the card on behalf of the specific head being
-    adjudicated: the eviction spares the head's own target slot, and the reduction establishes whole-card
-    residency for the head's job at the depth the verdict's rejected peak sized. The adapter records this for
-    the current head immediately before running the verdict's commands and clears it once they have run.
-    """
-
-    job: ImageGenerateJobPopResponse
-    available_process: HordeProcessInfo
-    forecast: StreamForecast
-    max_resident: int | None
 
 
 @dataclass(frozen=True)
@@ -659,7 +631,6 @@ class InferenceScheduler:
         self._available_ram_mb_provider: Callable[[], float] | None = None
         # The head-preload context the current deferred verdict's actuations act on, set immediately before the
         # adapter runs a verdict's commands and cleared once they have. None outside that window.
-        self._preload_actuation: _PreloadActuation | None = None
 
         # The holds the dispatch, post-processing defer and clearance gates place on jobs that fit the queue
         # but not yet the card, with their session counters.
@@ -806,7 +777,8 @@ class InferenceScheduler:
         # scheduling path executing (or on the inference queue being non-empty). It owns the RAM governor's
         # multi-tick bookkeeping (shed cards, draining processes), exposed under the historical attribute
         # names through the _ram_pressure_shed_cards / _processes_draining_for_ram properties.
-        self._governor = ResourceGovernor(host=self)
+        self._executor = PlanExecutor(host=self)
+        self._governor = ResourceGovernor(host=self, executor=self._executor)
         # Edge-trigger latch for the disclosure that whole-card residency is off because its config flag
         # never resolved to a value (as distinct from resolving to False, which is an operator choice).
         self._whole_card_flag_unresolved_disclosed: bool = False
@@ -4213,179 +4185,6 @@ class InferenceScheduler:
             ),
         )
 
-    def _execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
-        """Execute governance decisions against the live worker: the single act site for RAM remedies.
-
-        The governor's multi-tick bookkeeping (draining marks, shed-card tracking) is mutated here, at
-        execution time and with the measured result of each remedy (a card is only recorded as shed when
-        its count actually fell), so the decision layer stays a pure function of its snapshot.
-        """
-        governor_state = self._ram_governor_state
-        for action in actions:
-            match action:
-                case SetPopHold(active=hold_active):
-                    if hold_active != self._state.ram_pressure_pop_hold:
-                        # The soft hold has no other trace than a skipped-pop counter; name the reading behind
-                        # each edge so a log reader can see what "ram_pressure" was measuring.
-                        reading = (
-                            self._last_ram_verdict.reason() if self._last_ram_verdict is not None else "no reading"
-                        )
-                        margin = config_number(self._runtime_config.bridge_data.ram_reserve_mb)
-                        logger.info(
-                            f"Host RAM pop hold {'engaged' if hold_active else 'released'}: {reading}, hold margin "
-                            f"{margin:.0f} MB above the floor while work is in flight; in-flight jobs continue.",
-                        )
-                    self._state.ram_pressure_pop_hold = hold_active
-                case PausePops(
-                    until_time=until_time,
-                    pause_seconds=pause_seconds,
-                    reason=reason,
-                    available_mb=available_mb,
-                    floor_mb=floor_mb,
-                ):
-                    prior_owner = self._state.self_throttle_pause_owner
-                    pause_reason = f"host RAM pressure: {reason}"
-                    self._state.self_throttle_paused = True
-                    self._state.self_throttle_paused_until = until_time
-                    self._state.self_throttle_pause_owner = PopPauseOwner.RAM_PRESSURE
-                    self._state.self_throttle_pause_reason = pause_reason
-                    self._process_lifecycle.action_ledger.record(
-                        LedgerEventType.POP_PAUSE_ARMED,
-                        reason=pause_reason,
-                        detail={
-                            "owner": PopPauseOwner.RAM_PRESSURE.value,
-                            "duration_seconds": round(pause_seconds, 1),
-                            "available_ram_mb": round(available_mb, 1) if available_mb is not None else None,
-                            "floor_ram_mb": round(floor_mb, 1) if floor_mb is not None else None,
-                        },
-                    )
-                    # A still-standing pause from a different backstop is only superseded here when this
-                    # RAM deadline is the later one (the decision layer emits PausePops only then), so name
-                    # the transition rather than silently relabelling the shared deadline.
-                    takeover = (
-                        f" (superseding a standing {prior_owner.value} pause)"
-                        if prior_owner is not None and prior_owner is not PopPauseOwner.RAM_PRESSURE
-                        else ""
-                    )
-                    logger.opt(ansi=True).warning(
-                        f"<fg #ff8c69>System RAM below the danger floor ({reason}); pausing job pops for "
-                        f"{pause_seconds:.0f}s{takeover} and shedding idle footprint so the host is not driven "
-                        "into an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
-                    )
-                case EvictIdleModels():
-                    # First reclaim the cheap, targeted way: drop idle, unprotected staged components from the
-                    # budgeted RAM cache, keeping a queued job's staged model resident. Only when nothing
-                    # unprotected can be evicted (or the budgeted cache is off) does the coarser whole-RAM
-                    # unload run: unload an idle resident model, and when none remains, cycle the slot whose
-                    # allocator kept the freed pages (only a process cycle returns them to the OS). Mirrors the
-                    # preload reclaim path so sustained pressure with a drained queue still reclaims RAM.
-                    if not self._evict_unprotected_components_under_pressure() and not self.unload_models(
-                        under_pressure=True,
-                    ):
-                        self._replace_stale_ram_unload_process()
-                case ReduceWorkerProcesses(
-                    target_count=target_count,
-                    planned_count=planned_count,
-                    pressure_shortfall_mb=pressure_shortfall_mb,
-                ):
-                    current = self._process_map.num_loaded_inference_processes()
-                    planned = planned_count if planned_count > 0 else self._max_inference_processes
-                    after = self._process_lifecycle.scale_inference_processes(
-                        target_count,
-                        device_index=None,
-                        pressure_shortfall_mb=pressure_shortfall_mb,
-                    )
-                    if not isinstance(after, int):
-                        after = current
-                    if after < current:
-                        # The record is the live shortfall below plan, not an accumulation of reductions: a
-                        # whole-card residency restore can regrow the pool between reductions, and a running
-                        # total would over-count every cycle without bound while the pool is back at plan.
-                        governor_state.worker_shed = WorkerProcessShedState(
-                            planned_process_count=planned,
-                            shed_process_count=max(0, planned - after),
-                        )
-                        shortfall_note = (
-                            f", shortfall ~{pressure_shortfall_mb:.0f} MB" if pressure_shortfall_mb is not None else ""
-                        )
-                        logger.opt(ansi=True).info(
-                            f"<fg #ff8c69>RAM pressure reduced worker inference contexts "
-                            f"({current} -> {after} of {planned}{shortfall_note}); the pool will be "
-                            "restored incrementally once RAM has headroom.</>",
-                        )
-                case ReduceCardProcesses(device_index=device_index, target_count=target_count):
-                    current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-                    after = self._process_lifecycle.scale_inference_processes(
-                        target_count,
-                        device_index=device_index,
-                    )
-                    if not isinstance(after, int):
-                        after = current
-                    if after < current:
-                        governor_state.shed_cards.add(device_index)
-                case MarkProcessDraining(
-                    process_id=process_id,
-                    resident_ram_mb=resident_ram_mb,
-                    ceiling_mb=ceiling_mb,
-                ):
-                    governor_state.draining_process_ids.add(process_id)
-                    logger.opt(ansi=True).warning(
-                        f"<fg #ff8c69>Inference process {process_id} holds {resident_ram_mb:.0f} MB RAM (>= the "
-                        f"{ceiling_mb:.0f} MB per-process ceiling) while the host is under its RAM floor; "
-                        "draining it (no new work) so it can be recycled once its in-flight job finishes.</>",
-                    )
-                case ClearProcessDraining(process_id=process_id):
-                    governor_state.draining_process_ids.discard(process_id)
-                case RecycleProcess(process_id=process_id, resident_ram_mb=resident_ram_mb, ceiling_mb=ceiling_mb):
-                    process_info = self._process_map.get(process_id)
-                    if process_info is None:
-                        # The process exited between snapshot and execution; nothing to reclaim.
-                        governor_state.draining_process_ids.discard(process_id)
-                        continue
-                    logger.opt(ansi=True).warning(
-                        f"<fg #ff8c69>Inference process {process_id} holds {resident_ram_mb:.0f} MB RAM (>= the "
-                        f"{ceiling_mb:.0f} MB per-process ceiling); "
-                        "recycling it to return the retained RAM to the OS.</>",
-                    )
-                    governor_state.draining_process_ids.discard(process_id)
-                    self._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
-                    self._ram_reclaim.note_cycle()
-                    self._record_churn("process_cycle")
-                case RestoreCardProcess(device_index=device_index, target_count=target_count, planned_count=planned):
-                    current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-                    after = self._process_lifecycle.scale_inference_processes(
-                        target_count,
-                        device_index=device_index,
-                    )
-                    if not isinstance(after, int):
-                        after = current
-                    logger.opt(ansi=True).info(
-                        f"<fg #7b7d7d>System RAM has headroom; restoring an inference context on device "
-                        f"{device_index} ({current} -> {after} of {planned}) so the card resumes serving.</>",
-                    )
-                    if after >= planned:
-                        governor_state.shed_cards.discard(device_index)
-                case RestoreWorkerProcess(target_count=target_count, planned_count=planned):
-                    current = self._process_map.num_loaded_inference_processes()
-                    after = self._process_lifecycle.scale_inference_processes(target_count, device_index=None)
-                    if not isinstance(after, int):
-                        after = current
-                    logger.opt(ansi=True).info(
-                        f"<fg #7b7d7d>System RAM has headroom; restoring a worker inference context "
-                        f"({current} -> {after} of {planned}).</>",
-                    )
-                    if after >= planned:
-                        governor_state.worker_shed = None
-                    elif governor_state.worker_shed is not None and after > current:
-                        governor_state.worker_shed.shed_process_count = max(
-                            0,
-                            governor_state.worker_shed.shed_process_count - (after - current),
-                        )
-                case StopTrackingShedCard(device_index=device_index):
-                    governor_state.shed_cards.discard(device_index)
-                case StopTrackingWorkerShed():
-                    governor_state.worker_shed = None
-
     def _govern_ram_pressure(self, verdict: RamPressureVerdict) -> None:
         """Degrade the worker's footprint and intake while system RAM is below the danger floor.
 
@@ -4397,7 +4196,7 @@ class InferenceScheduler:
         """
         self._reclaim_idle_alchemy_lanes_under_pressure()
         snapshot = self._build_host_memory_snapshot(verdict)
-        self._execute_governance_actions(decide_degrade_response(snapshot))
+        self._executor.execute_governance_actions(decide_degrade_response(snapshot))
 
     def _reclaim_idle_alchemy_lanes_under_pressure(self) -> None:
         """Unload idle safety/post-process alchemy residents during a host-RAM pressure episode."""
@@ -4505,7 +4304,7 @@ class InferenceScheduler:
         (per card on a multi-GPU host, worker-wide otherwise).
         """
         snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
-        self._execute_governance_actions(decide_process_reduction(snapshot))
+        self._executor.execute_governance_actions(decide_process_reduction(snapshot))
 
     def _estimated_resident_context_ram_mb(self) -> float:
         """Conservative system-RAM cost (MB) of one more resident inference context.
@@ -4543,7 +4342,7 @@ class InferenceScheduler:
         if not self._ram_governor_state.shed_cards and self._ram_governor_state.worker_shed is None:
             return
         snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
-        self._execute_governance_actions(decide_shed_card_restore(snapshot))
+        self._executor.execute_governance_actions(decide_shed_card_restore(snapshot))
 
     def _committed_vram_reserve_mb(self, *, device_index: int | None = None) -> float:
         """Return the combined committed VRAM (MB) across every flow in the shared ledger.
@@ -5934,6 +5733,11 @@ class InferenceScheduler:
         return expired
 
     @property
+    def executor(self) -> PlanExecutor:
+        """The act site for governance decisions and arbiter verdicts."""
+        return self._executor
+
+    @property
     def ram_reclaim(self) -> RamReclaimLedger:
         """Reuse credits awaiting reconciliation and the clocks bounding RAM reclaim actuations."""
         return self._ram_reclaim
@@ -6637,20 +6441,16 @@ class InferenceScheduler:
                 f"Reclaiming idle VRAM.{suppressed_suffix(suppressed)}</>",
                 job.model,
             )
-        self._preload_actuation = _PreloadActuation(
-            job=job,
-            available_process=available_process,
-            forecast=forecast,
-            max_resident=max_resident,
+        applied_actuations = self._executor.execute_actuations(
+            verdict.required_actuations,
+            device_index=target_device_index,
+            for_head_of_queue=is_head_blocker,
+            head=HeadReclaimContext(
+                model=job.model,
+                target_process_id=available_process.process_id,
+                max_resident=max_resident,
+            ),
         )
-        try:
-            applied_actuations = self._execute_preload_actuations(
-                verdict.required_actuations,
-                device_index=target_device_index,
-                for_head_of_queue=is_head_blocker,
-            )
-        finally:
-            self._preload_actuation = None
         self._book_starved_head_lane_pauses(applied_actuations, device_index=target_device_index)
         return False
 
@@ -7379,47 +7179,26 @@ class InferenceScheduler:
             return True
         return False
 
-    def _execute_preload_actuations(
-        self,
-        commands: tuple[ActuatorCommand, ...],
-        *,
-        device_index: int | None,
-        for_head_of_queue: bool,
-    ) -> tuple[ActuatorCommand, ...]:
-        """Run the pressure-relief commands a deferred preload verdict described, at most once each this cycle.
-
-        RELEASE_CACHE returns an idle lane's cached allocator reservation to the card; EVICT_IDLE_MODEL frees
-        an idle resident model's weights; REDUCE_LIVE_CONTEXTS collapses the live inference-process count so a
-        retained per-context reservation returns; CYCLE_SAFETY_OFF_GPU frees the safety context. The arbiter
-        guarantees RELEASE_CACHE targets only idle lanes, so a busy lane is never asked to release its cache.
-
-        The command dispatch is routed through :meth:`VerifiedReclaimLadder.execute_arbiter_commands` so this
-        DEFER path and the governor's SATURATED verified ladder share one reclaim execution surface (the
-        single-owner rule): the two triggers can never become two mechanisms evicting the same card by
-        different rules.
-        """
-        return VerifiedReclaimLadder.execute_arbiter_commands(
-            commands,
-            self,
-            device_index=device_index,
-            for_head_of_queue=for_head_of_queue,
-        )
-
     def release_cache(self, process_id: int) -> bool:
         """Return an idle lane's cached allocator reservation to the device (:class:`VramActuator`)."""
         return self.release_allocator_cache(process_id)
 
-    def evict_idle_model(self, device_index: int | None, *, for_head_of_queue: bool) -> bool:
+    def evict_idle_model(
+        self,
+        device_index: int | None,
+        *,
+        for_head_of_queue: bool,
+        head: HeadReclaimContext | None = None,
+    ) -> bool:
         """Evict an idle resident model on the card to reclaim its weights (:class:`VramActuator`).
 
         The head being admitted keeps its own model's weights wherever they sit, including on its own target
         slot, and no live in-progress model is ever touched. A *different* model idle on that target slot is
         evictable: seating the head there is a model swap, and it is the only reclaim a single-lane card has.
         """
-        actuation = self._preload_actuation
         anchor = (
-            actuation.available_process
-            if actuation is not None
+            self._process_map.get(head.target_process_id)
+            if head is not None
             else self._pressure_reclaim_anchor(device_index=device_index)
         )
         if anchor is None:
@@ -7429,10 +7208,10 @@ class InferenceScheduler:
             under_pressure=True,
             for_head_of_queue=for_head_of_queue,
             device_index=device_index,
-            make_room_for_model=actuation.job.model if actuation is not None else None,
+            make_room_for_model=head.model if head is not None else None,
         )
 
-    def reduce_live_contexts(self, device_index: int | None) -> bool:
+    def reduce_live_contexts(self, device_index: int | None, *, head: HeadReclaimContext | None = None) -> bool:
         """Reduce the live inference-context count for the current head (:class:`VramActuator`).
 
         Stops the card's idle inference contexts down to the depth the rejected peak sized and evicts the idle
@@ -7448,14 +7227,16 @@ class InferenceScheduler:
         grown back when the card recovers (:meth:`restore_live_contexts`) rather than leaving the worker at
         emergency depth for the rest of the session.
 
-        A no-op when no head-preload context is recorded, the target could not be sized, the command is stale
-        and the live pool is already at or below its target, or another reduction on this card is still inside
+        A no-op without a head context, when the target could not be sized, when the command is stale and the
+        live pool is already at or below its target, or while another reduction on this card is still inside
         :data:`_CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS`.
         """
-        actuation = self._preload_actuation
-        if actuation is None:
+        if head is None:
             return False
-        target = actuation.max_resident
+        holder = self._process_map.get(head.target_process_id)
+        if holder is None:
+            return False
+        target = head.max_resident
         live_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
         if target is None or target >= live_processes:
             return False
@@ -7470,10 +7251,10 @@ class InferenceScheduler:
         after = self._process_lifecycle.scale_inference_processes(
             target,
             device_index=device_index,
-            protected_model=actuation.job.model,
+            protected_model=head.model,
         )
         self.unload_models_from_vram(
-            actuation.available_process,
+            holder,
             under_pressure=True,
             for_head_of_queue=True,
             device_index=device_index,
@@ -7485,7 +7266,7 @@ class InferenceScheduler:
         self._context_reduction_at[device_index] = self._clock()
         self._record_churn("context_reduction")
         logger.info(
-            f"Reclaiming live inference contexts for {actuation.job.model} "
+            f"Reclaiming live inference contexts for {head.model} "
             f"(inference processes {live_processes} -> {after} of {self._max_inference_processes}, target "
             f"{target}); the pool is grown back once the card recovers.",
         )
@@ -11177,7 +10958,7 @@ class InferenceScheduler:
 
         On a hold the job is never faulted: it keeps its queue position and re-asks on the next scheduling pass.
         The conflicting idle residents are evicted through the one reclaim owner (the same
-        :meth:`_execute_preload_actuations` surface the arbiter's preload-DEFER path drives), never inline and
+        :meth:`PlanExecutor.execute_actuations` surface the arbiter's preload-DEFER path drives), never inline and
         never through a second ladder; the head's own target slot is protected. The hold releases only once the
         arbiter next verdicts FITS, matching the verified-reclaim doctrine that a demand is admitted into
         measured reality rather than into hope. Can't-fit-ever models are excluded upstream by model
@@ -11361,7 +11142,7 @@ class InferenceScheduler:
         The core shared by the dispatch residency-reconciliation gate and the clearance gate: the request is
         built from one scheduling snapshot (:func:`build_materialization_request` documents the override and
         the netting), evaluated against one frozen measurement, and on a non-admit the described idle-resident
-        eviction runs through the one reclaim owner (:meth:`_execute_preload_actuations`), sparing the head's
+        eviction runs through the one reclaim owner (:meth:`PlanExecutor.execute_actuations`), sparing the head's
         own target slot. Hold bookkeeping and logging stay with the callers.
 
         Both callers guarantee a tracked job with a model before pricing.
@@ -11419,20 +11200,16 @@ class InferenceScheduler:
         a reclaim-ladder restore obligation. The caller holds (dispatch or clearance) and re-asks next pass,
         releasing once the arbiter verdicts FITS on the reclaimed room.
         """
-        self._preload_actuation = _PreloadActuation(
-            job=job,
-            available_process=process_with_model,
-            forecast=priced.forecast,
-            max_resident=priced.max_resident,
+        applied = self._executor.execute_actuations(
+            verdict.required_actuations,
+            device_index=priced.device_index,
+            for_head_of_queue=is_head_of_queue,
+            head=HeadReclaimContext(
+                model=job.model,
+                target_process_id=process_with_model.process_id,
+                max_resident=priced.max_resident,
+            ),
         )
-        try:
-            applied = self._execute_preload_actuations(
-                verdict.required_actuations,
-                device_index=priced.device_index,
-                for_head_of_queue=is_head_of_queue,
-            )
-        finally:
-            self._preload_actuation = None
         self._book_starved_head_lane_pauses(applied, device_index=priced.device_index)
         return applied
 

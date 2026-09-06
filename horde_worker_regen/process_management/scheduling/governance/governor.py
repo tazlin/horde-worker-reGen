@@ -28,6 +28,7 @@ from horde_worker_regen.process_management.scheduling.governance.ram_governor im
 from horde_worker_regen.process_management.scheduling.governance.snapshots import HostMemorySnapshot
 
 __all__ = [
+    "GovernanceExecutor",
     "GovernanceHost",
     "ResourceGovernor",
 ]
@@ -49,7 +50,11 @@ class GovernanceHost(Protocol):
         """Capture the host-RAM state and governor bookkeeping one governance decision runs over."""
         ...
 
-    def _execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
+
+class GovernanceExecutor(Protocol):
+    """The act site a governor hands its decisions to."""
+
+    def execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
         """Execute governance decisions against the live worker."""
         ...
 
@@ -67,13 +72,15 @@ class ResourceGovernor:
         Driven exclusively by the scheduler's control loop; not safe for concurrent use.
     """
 
-    def __init__(self, host: GovernanceHost) -> None:
-        """Bind the governor to the host that measures snapshots and executes actions for it.
+    def __init__(self, host: GovernanceHost, executor: GovernanceExecutor) -> None:
+        """Bind the governor to the host that measures its snapshots and the executor that acts on its decisions.
 
         Args:
-            host: The measurement/execution surface (the inference scheduler).
+            host: The measurement surface (the inference scheduler).
+            executor: The act site (the scheduler's plan executor).
         """
         self._host = host
+        self._executor = executor
         self.ram_state = RamGovernorState()
         """The RAM governor's multi-tick bookkeeping (shed cards, draining processes)."""
         self.last_ram_verdict: RamPressureVerdict | None = None
@@ -96,7 +103,7 @@ class ResourceGovernor:
         snapshot = self._host._build_host_memory_snapshot(verdict)
         actions = decide_pressure_governance(snapshot)
         actions.extend(decide_shed_restore(snapshot))
-        self._host._execute_governance_actions(actions)
+        self._executor.execute_governance_actions(actions)
         return verdict.under_pressure
 
     def reset_bookkeeping(self) -> None:

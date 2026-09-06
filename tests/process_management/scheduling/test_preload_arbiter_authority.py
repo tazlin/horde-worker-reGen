@@ -156,7 +156,7 @@ class TestActuationExecution:
         commands = (
             ActuatorCommand(kind=ActuatorCommandKind.RELEASE_CACHE, device_index=None, target_process_id=idle_pid),
         )
-        scheduler._execute_preload_actuations(commands, device_index=None, for_head_of_queue=True)
+        scheduler.executor.execute_actuations(commands, device_index=None, for_head_of_queue=True)
 
         scheduler.release_allocator_cache.assert_called_once_with(idle_pid)
         assert all(call.args != (busy_pid,) for call in scheduler.release_allocator_cache.call_args_list)
@@ -175,11 +175,11 @@ class TestActuationExecution:
             ActuatorCommand(kind=ActuatorCommandKind.EVICT_IDLE_MODEL, device_index=0),
         )
 
-        applied = scheduler._execute_preload_actuations(requested, device_index=0, for_head_of_queue=True)
+        applied = scheduler.executor.execute_actuations(requested, device_index=0, for_head_of_queue=True)
 
         assert applied == (requested[1],)
         scheduler.release_cache.assert_called_once_with(7)
-        scheduler.evict_idle_model.assert_called_once_with(0, for_head_of_queue=True)
+        scheduler.evict_idle_model.assert_called_once_with(0, for_head_of_queue=True, head=None)
 
     def test_execution_receipt_is_empty_when_no_actuator_accepts_a_command(self) -> None:
         """A proposed reclaim cannot be reported as performed when every actuator returns False."""
@@ -192,7 +192,7 @@ class TestActuationExecution:
         requested = (ActuatorCommand(kind=ActuatorCommandKind.RELEASE_CACHE, device_index=0, target_process_id=7),)
 
         assert (
-            scheduler._execute_preload_actuations(
+            scheduler.executor.execute_actuations(
                 requested,
                 device_index=0,
                 for_head_of_queue=True,

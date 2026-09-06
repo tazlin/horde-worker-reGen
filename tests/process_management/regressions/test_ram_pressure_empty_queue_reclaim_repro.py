@@ -83,7 +83,7 @@ class TestUnderPressureReclaimWithEmptyQueue:
         scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=JobTracker())
         _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
-        scheduler._execute_governance_actions([EvictIdleModels()])
+        scheduler.executor.execute_governance_actions([EvictIdleModels()])
 
         scheduler._process_lifecycle._replace_inference_process.assert_called_once()
         _, kwargs = scheduler._process_lifecycle._replace_inference_process.call_args
