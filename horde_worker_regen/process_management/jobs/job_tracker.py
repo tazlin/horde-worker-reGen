@@ -2343,6 +2343,12 @@ class JobTracker:
         tracked.measured_attempt_device_index = None
         tracked.measured_attempted_device_indices.clear()
 
+    def rearm_measured_attempts_for_model(self, model_name: str) -> None:
+        """Let every pending job for ``model_name`` earn a fresh measured-load probe after its process went away."""
+        for job in self.jobs_pending_inference:
+            if job.model == model_name:
+                self.rearm_measured_attempt(job)
+
     def mark_admitted_exclusive(
         self,
         job: ImageGenerateJobPopResponse,

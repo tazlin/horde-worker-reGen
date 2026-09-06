@@ -199,6 +199,21 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """Whether the process is currently pinned as an in-flight disaggregated job's sampler."""
         return process_id in self._disaggregation_reserved_process_ids
 
+    def process_running_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
+        """The inference process currently dispatched the given in-flight job, if any.
+
+        Matches on typed execution ownership so a preload attribution cannot make an overlap gate read model
+        preparation as a running job.
+        """
+        job_id = job.id_
+        for process_info in self.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            referenced = process_info.current_inference_job()
+            if referenced is not None and referenced.id_ == job_id:
+                return process_info
+        return None
+
     def retire_process(self, process_info: HordeProcessInfo, reason: str) -> HordeProcessInfo | None:
         """Remove a process from the active map and remember its launch for late IPC messages.
 

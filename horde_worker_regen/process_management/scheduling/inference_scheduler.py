@@ -5333,21 +5333,6 @@ class InferenceScheduler:
         baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
         return model_size_tier(model_name, baseline_value)
 
-    def _process_running_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
-        """The inference process currently dispatched the given in-flight job, if any.
-
-        Matches on typed execution ownership so a preload attribution cannot make the overlap gate read model
-        preparation as a running job.
-        """
-        job_id = job.id_
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            referenced = process_info.current_inference_job()
-            if referenced is not None and referenced.id_ == job_id:
-                return process_info
-        return None
-
     def _remaining_sampling_seconds(self, process_info: HordeProcessInfo) -> float | None:
         """Estimated wall seconds left in a process's denoise loop, or None while no rate can be trusted.
 
@@ -5377,7 +5362,7 @@ class InferenceScheduler:
         A freshly dispatched job that has not yet reported a step reads as ``0.0`` (the slot's progress
         fields are unset), which is exactly when a heavy overlap is most dangerous.
         """
-        process_info = self._process_running_job(job)
+        process_info = self._process_map.process_running_job(job)
         if process_info is None:
             return 0.0
         return process_info.progress_fraction()
@@ -5588,7 +5573,7 @@ class InferenceScheduler:
         """
         on_card: list[ImageGenerateJobPopResponse] = []
         for job in self._job_tracker.jobs_in_progress:
-            running_process = self._process_running_job(job)
+            running_process = self._process_map.process_running_job(job)
             if running_process is not None and running_process.device_index == device_index:
                 on_card.append(job)
         return on_card
@@ -5604,7 +5589,7 @@ class InferenceScheduler:
         for entry in expired:
             match entry.reason:
                 case StaleEntryReason.PROCESS_GONE:
-                    self._rearm_measured_attempts_for_model(entry.model)
+                    self._job_tracker.rearm_measured_attempts_for_model(entry.model)
                     logger.warning(
                         f"Expiring stale model-map entry for {entry.model}: process {entry.process_id} is gone.",
                     )
@@ -6633,17 +6618,6 @@ class InferenceScheduler:
                     promised_mb=self._marginal_process_overhead_mb(device_index)
                     or _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
                 )
-
-    def _rearm_measured_attempts_for_model(self, model_name: str) -> None:
-        """Let pending jobs for ``model_name`` earn a fresh measured-load probe after their process went away.
-
-        The probe is one per job per card so a load does not hit a converged card twice; a process that is
-        gone (cycled for RAM, scaled down, replaced) makes that card a different state, and a head whose only
-        escape was already spent would otherwise hold until recovery faults it.
-        """
-        for job in self._job_tracker.jobs_pending_inference:
-            if job.model == model_name:
-                self._job_tracker.rearm_measured_attempt(job)
 
     def release_cache(self, process_id: int) -> bool:
         """Return an idle lane's cached allocator reservation to the device (:class:`VramActuator`)."""
