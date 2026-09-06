@@ -29,7 +29,10 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.horde_model_map import (
+    PRELOAD_FIRST_REPORT_GRACE_SECONDS,
+    HordeModelMap,
+)
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
@@ -53,7 +56,6 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
-    _PRELOAD_FIRST_REPORT_GRACE_SECONDS,
     _RESIDENCY_GRACE_SECONDS,
     InferenceScheduler,
 )
@@ -474,7 +476,7 @@ class TestPreloadModels:
         """The first-report grace is bounded so abandoned loading entries can still expire."""
         process_info = make_mock_process_info(0, model_name="new_model", state=HordeProcessState.WAITING_FOR_JOB)
         process_info.last_control_flag = HordeControlFlag.PRELOAD_MODEL
-        process_info.last_preload_requested_at = time.time() - _PRELOAD_FIRST_REPORT_GRACE_SECONDS - 1.0
+        process_info.last_preload_requested_at = time.time() - PRELOAD_FIRST_REPORT_GRACE_SECONDS - 1.0
         process_map = ProcessMap({0: process_info})
         horde_model_map = HordeModelMap(
             root={

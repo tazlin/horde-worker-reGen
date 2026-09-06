@@ -45,7 +45,7 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
-from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, StaleEntryReason
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
@@ -315,14 +315,6 @@ _DEFAULT_RAM_RESERVE_MB = 4096.0
 """Fallback system-RAM reserve (MB) used until the live config value is read. Matches the
 ``ram_reserve_mb`` config default; keeps resident-in-RAM weights from forcing the OS to page."""
 
-_PRELOAD_FIRST_REPORT_GRACE_SECONDS = 5.0
-"""How long a just-sent preload may still look idle before its first child state report arrives.
-
-The parent records the model as ``LOADING`` immediately after sending ``PRELOAD_MODEL``, but the child
-may still read as ``WAITING_FOR_JOB`` until it drains the control pipe and publishes its first preload
-state. This short grace keeps stale-entry cleanup from expiring a healthy, just-sent preload while still
-letting genuinely abandoned loading entries clear promptly.
-"""
 _RELEASE_CACHE_MIN_RECLAIMABLE_MB = 256.0
 """Minimum reclaimable allocator cache (MB) a GPU process must hold to qualify as a RELEASE_CACHE target.
 
@@ -5602,63 +5594,32 @@ class InferenceScheduler:
         return on_card
 
     def _expire_stale_model_map_entries(self) -> list[str]:
-        """Expire model-map entries whose owning process can no longer be holding or loading that model.
+        """Run the model map's stale-entry sweep, log each removal, and re-arm measured attempts for a gone owner.
 
-        A slot holds one model at a time, so an entry naming a slot that now names a different model is a
-        record of weights nothing holds. It is not inert: the preload pass reads the map as part of the
-        already-loaded set, so a displaced model's surviving entry makes its pending job look served and the
-        job is never staged onto a free slot. Reconciling the two parent-side records here keeps a displaced
-        head loadable rather than permanently skipped.
+        The rule is the map's (:meth:`HordeModelMap.expire_stale_entries`); this is its act site. A process
+        that is gone (cycled for RAM, scaled down, replaced) makes its card a different state, so pending jobs
+        for the expired model earn a fresh measured-load probe there.
         """
-        expired: list[str] = []
-        loading_owner_states = {
-            HordeProcessState.PROCESS_STARTING,
-            HordeProcessState.DOWNLOADING_MODEL,
-            HordeProcessState.PRELOADING_MODEL,
-            HordeProcessState.UNLOADED_MODEL_FROM_RAM,
-        }
-
-        now = self._clock()
-
-        for model_name, model_info in list(self._horde_model_map.root.items()):
-            process_info = self._process_map.get(model_info.process_id)
-            if process_info is None:
-                self._horde_model_map.expire_entry(model_name)
-                expired.append(model_name)
-                self._rearm_measured_attempts_for_model(model_name)
-                logger.warning(
-                    f"Expiring stale model-map entry for {model_name}: process {model_info.process_id} is gone.",
-                )
-                continue
-
-            recent_preload_request = (
-                model_info.horde_model_load_state == ModelLoadState.LOADING
-                and process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
-                and process_info.loaded_horde_model_name == model_name
-                and (now - process_info.last_preload_requested_at) <= _PRELOAD_FIRST_REPORT_GRACE_SECONDS
-            )
-            if (
-                model_info.horde_model_load_state == ModelLoadState.LOADING
-                and process_info.last_process_state not in loading_owner_states
-                and not recent_preload_request
-            ):
-                self._horde_model_map.expire_entry(model_name)
-                expired.append(model_name)
-                logger.warning(
-                    f"Expiring stale loading entry for {model_name} on process {process_info.process_id}: "
-                    f"process is {process_info.last_process_state.name}.",
-                )
-                continue
-
-            if process_info.holds_different_model(model_name):
-                self._horde_model_map.expire_entry(model_name)
-                expired.append(model_name)
-                logger.warning(
-                    f"Expiring displaced entry for {model_name} on process {process_info.process_id}: "
-                    f"the slot now holds {process_info.loaded_horde_model_name}.",
-                )
-
-        return expired
+        expired = self._horde_model_map.expire_stale_entries(self._process_map, now=self._clock())
+        for entry in expired:
+            match entry.reason:
+                case StaleEntryReason.PROCESS_GONE:
+                    self._rearm_measured_attempts_for_model(entry.model)
+                    logger.warning(
+                        f"Expiring stale model-map entry for {entry.model}: process {entry.process_id} is gone.",
+                    )
+                case StaleEntryReason.LOADING_ABANDONED:
+                    state = entry.process_state.name if entry.process_state is not None else "unknown"
+                    logger.warning(
+                        f"Expiring stale loading entry for {entry.model} on process {entry.process_id}: "
+                        f"process is {state}.",
+                    )
+                case StaleEntryReason.DISPLACED:
+                    logger.warning(
+                        f"Expiring displaced entry for {entry.model} on process {entry.process_id}: "
+                        f"the slot now holds {entry.holder_model}.",
+                    )
+        return [entry.model for entry in expired]
 
     @property
     def executor(self) -> PlanExecutor:
