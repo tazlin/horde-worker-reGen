@@ -299,6 +299,9 @@ def derive(
         why = summarize_skips(snapshot.last_pop_skipped_reasons)
         if why:
             detail += f" Recently skipped: {why}."
+        reduced = summarize_reduced_skips(snapshot)
+        if reduced:
+            detail += f" {reduced}."
         return HealthReport(
             WorkerPhase.READY,
             HealthStatus.OK,
@@ -333,6 +336,20 @@ def summarize_skips(skipped_reasons: dict[str, int], *, limit: int = 4) -> str:
     """Render the last pop's skip reasons as a compact, count-ordered phrase ("3 models · 1 nsfw")."""
     ranked = sorted(((reason, count) for reason, count in skipped_reasons.items() if count), key=lambda r: -r[1])
     return " · ".join(f"{count} {reason}" for reason, count in ranked[:limit])
+
+
+def summarize_reduced_skips(snapshot: WorkerStateSnapshot, *, limit: int = 4) -> str:
+    """Render the last reduced-size pop's skip reasons with the size it asked at, or "" when none is outstanding.
+
+    A constrained model rides its own pop at a lowered ``max_power``, so its "no work" answer is a different
+    question from the regular lane's and is shown as its own line, only while such a pop has gone unanswered.
+    """
+    skips = summarize_skips(snapshot.last_reduced_pop_skipped_reasons, limit=limit)
+    if not skips:
+        return ""
+    size = snapshot.last_reduced_pop_max_power
+    label = f"reduced-size pop (max_power {size})" if size is not None else "reduced-size pop"
+    return f"{label}: {skips}"
 
 
 def _server_maintenance_active(
@@ -464,6 +481,9 @@ def _build_checks(
     skips = summarize_skips(snapshot.last_pop_skipped_reasons)
     if skips:
         checks.append(HealthCheck("Work", HealthStatus.INFO, f"Last pop skipped: {skips}"))
+    reduced = summarize_reduced_skips(snapshot)
+    if reduced:
+        checks.append(HealthCheck("Work", HealthStatus.INFO, f"Last {reduced}"))
 
     if snapshot_age is not None:
         responsive = snapshot_age <= _stale_threshold(snapshot)

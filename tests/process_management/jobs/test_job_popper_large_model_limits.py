@@ -225,3 +225,93 @@ class TestConstrainedModelLane(TestServiceabilityMaxPowerCap):
             idle_fill_wanted=False,
         )
         assert shaped == ({"sdxl_model", "sd15_model"}, 64)
+
+
+class TestWholeCardModelOffer:
+    """A whole-card model is offered at the configured ``max_power`` on a card of its recommended class."""
+
+    def _popper_with_card(self, *, total_vram_mb: float, baseline_mb: float, max_power: int) -> JobPopper:
+        from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
+        from tests.process_management.conftest import (
+            make_mock_model_reference_record,
+            make_test_card_runtimes,
+            make_test_model_metadata,
+        )
+
+        bridge_data = make_mock_bridge_data(image_models_to_load=["krea_model", "sd15_model"], max_power=max_power)
+        metadata = make_test_model_metadata(
+            {
+                "krea_model": make_mock_model_reference_record(
+                    "krea_model",
+                    baseline=KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo,
+                ),
+                "sd15_model": make_mock_model_reference_record(
+                    "sd15_model",
+                    baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+                ),
+            },
+        )
+        popper = JobPopper(
+            state=WorkerState(),
+            process_map=ProcessMap({}),
+            job_tracker=JobTracker(),
+            shutdown_manager=Mock(),
+            runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+            api_sessions=make_test_api_sessions(horde_client_session=Mock(), aiohttp_session=Mock()),
+            max_inference_processes=2,
+            max_concurrent_inference_processes=1,
+            model_metadata=metadata,
+            admission_baseline_provider=lambda _device: baseline_mb,
+        )
+        popper._card_runtimes = make_test_card_runtimes(config=bridge_data, total_vram_mb=total_vram_mb)
+        return popper
+
+    def test_krea_on_a_16gb_card_keeps_the_configured_max_power(self) -> None:
+        """The resident co-fit would cap Krea at 17 behind a 2 GB baseline; the whole-card regime offers it at 32."""
+        popper = self._popper_with_card(total_vram_mb=16375.0, baseline_mb=2087.0, max_power=32)
+
+        shaped = popper._shape_offer_for_serviceability(
+            {"krea_model", "sd15_model"},
+            32,
+            popper._card_runtimes,
+            idle_fill_wanted=False,
+        )
+
+        assert shaped == ({"krea_model", "sd15_model"}, 32)
+        assert popper._serviceability_cap_logged == {}
+        assert popper._last_pop_reduced_max_power is None
+
+
+class TestConstrainedLaneUnderAClaim(TestServiceabilityMaxPowerCap):
+    """A whole-card claim pins its model through the lane, and a reduced-size pop is remembered as such."""
+
+    def test_the_claimed_constrained_model_rides_its_capped_pop_first(self) -> None:
+        """With the constrained model claimed, the first pop is its capped pop, not a full-size pop without it."""
+        popper = self._popper_with_card(total_vram_mb=8192.0, baseline_mb=2048.0, max_power=64)
+        sdxl_cap = popper._serviceability_max_power_cap({"sdxl_model"}, 64, popper._card_runtimes)
+
+        shaped = popper._shape_offer_for_serviceability(
+            {"sdxl_model", "sd15_model"},
+            64,
+            popper._card_runtimes,
+            idle_fill_wanted=True,
+            pinned_model="sdxl_model",
+        )
+
+        assert shaped == ({"sdxl_model"}, sdxl_cap)
+        assert popper._last_pop_reduced_max_power == sdxl_cap
+
+    def test_a_full_size_pop_is_not_remembered_as_reduced(self) -> None:
+        """The unconstrained models' pop goes out at the configured size and leaves no reduced-size mark."""
+        popper = self._popper_with_card(total_vram_mb=8192.0, baseline_mb=2048.0, max_power=64)
+
+        shaped = popper._shape_offer_for_serviceability(
+            {"sdxl_model", "sd15_model"},
+            64,
+            popper._card_runtimes,
+            idle_fill_wanted=False,
+        )
+
+        assert shaped == ({"sd15_model"}, 64)
+        assert popper._last_pop_reduced_max_power is None

@@ -20,6 +20,14 @@ otherwise. A baseline whose smallest job does fit keeps the resident inequality,
 talked into an SDXL job it cannot seat, and the two regimes meet without a gap: every capacity below the
 resident minimum is a streaming card.
 
+A whole-card model (the EXTRA_LARGE size tier) is judged the same way whatever its smallest job does: the
+worker establishes a whole-card residency for it at runtime, evicting the co-resident contexts the resident
+inequality would have to share the card with, and hordelib partial-loads its weights past what stays
+resident. The recommended minimum card is compared with the card's total, the card class the recommendation
+names, and the job size is left to runtime admission, which prices the streamed working set against measured
+truth. A resident co-fit at the operator's ``max_power`` would otherwise cap such a model far below what the
+card runs, and the cap would ride every constrained pop.
+
 A ``CONSTRAINED`` model is not allowed to lower every other model's ``max_power``: the horde's pop carries one
 ``max_pixels`` for the whole offer, so the constrained models are advertised on a pop of their own, one in a
 bounded run of full-size pops (:func:`decide_constrained_offer`). The full-size pops carry the unconstrained
@@ -117,6 +125,8 @@ class ModelServiceabilityVerdict:
     figures: ModelFootprintFigures | None
     max_pixels: int | None = None
     """The operator's ``max_power`` job in pixels, or None when the check covered the minimum job only."""
+    whole_card: bool = False
+    """Whether the model was judged as a whole-card model, by its recommended minimum card against the total."""
 
     @property
     def serviceable(self) -> bool:
@@ -156,6 +166,15 @@ class ModelServiceabilityVerdict:
             f"{self.noise_buffer_mb:.0f} = {self.capacity_mb:.0f} MB"
         )
         minimum = self.figures.minimum_footprint_mb
+        if self.whole_card:
+            floor = self.figures.min_recommended_card_mb
+            if floor <= 0:
+                return "whole-card model with an unknown recommended minimum card: does NOT fit"
+            fits = "fits" if self.tier is not ModelServiceabilityTier.UNSERVICEABLE else "does NOT fit"
+            return (
+                f"whole-card model judged by its recommended minimum card {floor:.0f} MB against the card total "
+                f"{self.total_vram_mb:.0f} MB: {fits}; the job size is left to runtime admission"
+            )
         if self.figures.streams_on(self.capacity_mb):
             floor = self.figures.min_recommended_card_mb
             if floor <= 0:
@@ -193,6 +212,7 @@ def assess_model_serviceability(
     noise_buffer_mb: float | None,
     figures: ModelFootprintFigures | None,
     max_pixels: int | None = None,
+    whole_card: bool = False,
 ) -> ModelServiceabilityVerdict:
     """Return which tier a model falls in on one card.
 
@@ -201,7 +221,8 @@ def assess_model_serviceability(
     compared with ``total - baseline - noise``; when ``max_pixels`` is given, the job at that size is compared
     too, and a model whose minimum fits but whose ``max_pixels`` job does not is ``CONSTRAINED``. The baseline
     is the shared device load the worker cannot reclaim; the noise buffer is the same admission slack used by
-    runtime VRAM admission.
+    runtime VRAM admission. A ``whole_card`` model skips the resident inequality: it is ``SERVICEABLE`` when
+    its recommended minimum card is known and no larger than the card's total, ``UNSERVICEABLE`` otherwise.
     """
     resolved_noise_mb = noise_buffer_mb if noise_buffer_mb is not None else admission_noise_buffer_mb(total_vram_mb)
     if total_vram_mb is None or total_vram_mb <= 0 or figures is None:
@@ -212,9 +233,17 @@ def assess_model_serviceability(
             noise_buffer_mb=resolved_noise_mb,
             figures=figures,
             max_pixels=max_pixels,
+            whole_card=whole_card,
         )
     capacity_mb = (float(total_vram_mb) - max(0.0, baseline_mb)) - max(0.0, resolved_noise_mb)
-    if figures.streams_on(capacity_mb):
+    if whole_card:
+        floor_mb = figures.min_recommended_card_mb
+        tier = (
+            ModelServiceabilityTier.SERVICEABLE
+            if 0 < floor_mb <= float(total_vram_mb)
+            else ModelServiceabilityTier.UNSERVICEABLE
+        )
+    elif figures.streams_on(capacity_mb):
         # Not even the smallest job can be resident here, so the model streams and takes the whole card. The
         # recommended minimum card is the only figure that speaks to a streaming fit; the job size is left to
         # runtime admission, which prices the streamed working set against measured truth.
@@ -237,6 +266,7 @@ def assess_model_serviceability(
         noise_buffer_mb=max(0.0, resolved_noise_mb),
         figures=figures,
         max_pixels=max_pixels,
+        whole_card=whole_card,
     )
 
 
@@ -308,16 +338,20 @@ def decide_constrained_offer(
     model_caps: dict[str, int],
     pop_max_power: int,
     idle_fill: bool = False,
+    pinned_model: str | None = None,
     full_cycles: int = _CONSTRAINED_LANE_FULL_CYCLES,
 ) -> ConstrainedOfferDecision:
     """Split an offer that mixes constrained and unconstrained models across alternating pops.
 
     ``model_caps`` maps each offered model the card fits only at reduced size to the largest ``max_power``
     it fits. With no constrained model the offer is untouched. When every offered model is constrained
-    there is nothing to protect, so the whole offer goes out capped at the smallest cap (the pre-lane
-    behaviour); an idle-fill pop does the same, since its job is the quickest available work rather than
-    the shaped intake. Otherwise the cadence alternates: ``full_cycles`` pops of the unconstrained models
-    at the configured ``max_power``, then one pop of the constrained models at their shared cap. Never
+    there is nothing to protect, so the whole offer goes out capped at the smallest cap. Otherwise the
+    cadence alternates: ``full_cycles`` pops of the unconstrained models at the configured ``max_power``,
+    then one pop of the constrained models at their shared cap. An idle-fill pop wants the quickest available
+    work, so it carries the unconstrained models at full size and leaves the cadence where it is: a reduced
+    size belongs to the constrained models alone, never to the rest of the offer. ``pinned_model`` is a model
+    the pop must carry (a whole-card residency's claim): a pinned constrained model takes the constrained pop
+    now, whatever the cadence says, so the claim never empties the offer by landing on a full-size pop. Never
     empties a non-empty offer and never advertises a model outside ``offered_models``.
     """
     constrained = {model: cap for model, cap in model_caps.items() if model in offered_models}
@@ -330,10 +364,24 @@ def decide_constrained_offer(
         )
     shared_cap = min(pop_max_power, *constrained.values())
     unconstrained = offered_models - constrained.keys()
-    if not unconstrained or idle_fill:
+    if not unconstrained:
         return ConstrainedOfferDecision(
             advertised_models=offered_models,
             pop_max_power=shared_cap,
+            constrained_pop=False,
+            next_state=state,
+        )
+    if pinned_model is not None and pinned_model in constrained:
+        return ConstrainedOfferDecision(
+            advertised_models=frozenset(constrained),
+            pop_max_power=shared_cap,
+            constrained_pop=True,
+            next_state=ConstrainedLaneState(),
+        )
+    if idle_fill:
+        return ConstrainedOfferDecision(
+            advertised_models=frozenset(unconstrained),
+            pop_max_power=pop_max_power,
             constrained_pop=False,
             next_state=state,
         )

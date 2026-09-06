@@ -1871,6 +1871,32 @@ class TestApiJobPopFullFlow:
         assert len(popper._job_tracker.jobs_pending_inference) == 0
 
     @_full_flow_patches
+    async def test_a_reduced_size_pop_records_its_skips_apart_from_the_regular_lane(self, _mock_req_cls: Mock) -> None:
+        """A constrained-lane pop's no-job answer lands in the reduced record and leaves the regular lane's answer."""
+        empty_response = Mock()
+        empty_response.id_ = None
+        empty_response.skipped = Mock()
+        empty_response.skipped.model_dump.return_value = {"max_pixels": 4}
+        empty_response.skipped.model_extra = None
+        empty_response.messages = None
+        state = WorkerState(last_job_pop_time=0.0, last_pop_skipped_reasons={"models": 3})
+        popper = self._make_ready_popper(api_response=empty_response, state=state)
+        original = popper._shape_offer_for_serviceability
+
+        def reduced(models: set[str], pop_max_power: int, *args: object, **kwargs: object) -> tuple[set[str], int]:
+            original(models, pop_max_power, *args, **kwargs)
+            popper._last_pop_reduced_max_power = 17
+            return models, 17
+
+        popper._shape_offer_for_serviceability = reduced  # type: ignore[method-assign]
+
+        await popper.api_job_pop()
+
+        assert state.last_reduced_pop_skipped_reasons == {"max_pixels": 4}
+        assert state.last_reduced_pop_max_power == 17
+        assert state.last_pop_skipped_reasons == {"models": 3}
+
+    @_full_flow_patches
     async def test_no_job_available_does_not_clear_maintenance_latch(self, _mock_req_cls: Mock) -> None:
         """Only a real popped job proves horde maintenance is off; an empty response does not."""
         empty_response = Mock()

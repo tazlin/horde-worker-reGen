@@ -548,6 +548,8 @@ class StatsSample(BaseModel):
     in_error_backoff: bool = False
     last_pop_no_jobs_available: bool = False
     last_pop_skipped_reasons: dict[str, int] = Field(default_factory=dict)
+    last_reduced_pop_skipped_reasons: dict[str, int] = Field(default_factory=dict)
+    last_reduced_pop_max_power: int | None = None
     churn_counts: dict[str, int] = Field(default_factory=dict)
     """Cumulative reload/respawn churn counts by kind at sample time."""
     slot_duty_totals: dict[str, float] = Field(default_factory=dict)
@@ -1199,6 +1201,10 @@ class WorkerStateSnapshot(BaseModel):
     """The most recent successful pop returned no job (a short-term 'no work right now' signal)."""
     last_pop_skipped_reasons: dict[str, int] = Field(default_factory=dict)
     """Why the last 'no job available' pop skipped work, per reason (models/nsfw/max_pixels/...)."""
+    last_reduced_pop_skipped_reasons: dict[str, int] = Field(default_factory=dict)
+    """Why the last reduced-size (constrained lane) 'no job available' pop skipped work, per reason."""
+    last_reduced_pop_max_power: int | None = None
+    """The ``max_power`` that reduced-size pop asked with, or None when no such pop is outstanding."""
     api_messages: list[str] = Field(default_factory=list)
     """Operator/maintenance messages delivered by the horde in pop responses."""
 

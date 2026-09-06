@@ -173,8 +173,13 @@ class WorkerState:
     """Why the last 'no job available' pop skipped work, per reason (models/nsfw/max_pixels/...).
 
     Surfaced to the TUI as a "why no work" breakdown so an operator can see a quiet worker is
-    configured out of the available jobs (wrong models, too-low max_power, etc.) rather than idle.
+    configured out of the available jobs (wrong models, too-low max_power, etc.) rather than idle. A pop the
+    constrained lane sent at a reduced size records into ``last_reduced_pop_skipped_reasons`` instead.
     """
+    last_reduced_pop_skipped_reasons: dict[str, int] = dataclasses.field(default_factory=dict)
+    """Why the last reduced-size (constrained lane) 'no job available' pop skipped work, per reason."""
+    last_reduced_pop_max_power: int | None = None
+    """The ``max_power`` that reduced-size pop asked with, or None when no such pop is outstanding."""
 
     supervisor_paused: bool = False
     """Local pause requested by a supervising frontend (TUI). Stops new job/alchemy pops; in-flight work finishes."""

@@ -58,6 +58,7 @@ from horde_worker_regen.tui.health import (
     HealthStatus,
     WorkerPhase,
     gpu_duty_low_cards,
+    summarize_reduced_skips,
     summarize_skips,
 )
 from horde_worker_regen.tui.responsive import (
@@ -695,6 +696,9 @@ class OverviewView(Vertical):
             why_no_work = summarize_skips(snapshot.last_pop_skipped_reasons)
             if why_no_work:
                 body.append(Text.assemble(("∅ why no work: ", "yellow"), (why_no_work, "italic yellow")))
+            reduced = summarize_reduced_skips(snapshot)
+            if reduced:
+                body.append(Text.assemble(("∅ why no work, ", "yellow"), (reduced, "italic yellow")))
             if snapshot.lora_pops_blocked_by_downloads:
                 body.append(
                     Text(
@@ -776,6 +780,9 @@ class OverviewView(Vertical):
             why_no_work = summarize_skips(snapshot.last_pop_skipped_reasons)
             if why_no_work:
                 body.append(Text.assemble(("No work: ", "yellow"), (why_no_work, "italic yellow")))
+            reduced = summarize_reduced_skips(snapshot)
+            if reduced:
+                body.append(Text.assemble(("No work, ", "yellow"), (reduced, "italic yellow")))
             if snapshot.lora_pops_blocked_by_downloads:
                 body.append(Text("LoRA pops paused for downloads.", style="yellow"))
             if snapshot.whole_card_residency.active:

@@ -401,7 +401,9 @@ def _model_serviceability_verdicts(
     serving_cards = [card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)]
     if not serving_cards:
         return []
-    figures = model_footprint_figures_for_baseline(_baseline_value_for_model(model_metadata, model), model)
+    baseline_value = _baseline_value_for_model(model_metadata, model)
+    figures = model_footprint_figures_for_baseline(baseline_value, model)
+    whole_card = is_extra_large_model(model, baseline_value)
     verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]] = []
     for card in serving_cards:
         baseline_mb = (
@@ -416,6 +418,7 @@ def _model_serviceability_verdicts(
                     noise_buffer_mb=None,
                     figures=figures,
                     max_pixels=max_pixels,
+                    whole_card=whole_card,
                 ),
             ),
         )
@@ -623,6 +626,8 @@ class JobPopper:
         self._serviceability_exclusion_logged: set[str] = set()
         self._serviceability_cap_logged: dict[str, int] = {}
         self._constrained_lane_state = ConstrainedLaneState()
+        self._last_pop_reduced_max_power: int | None = None
+        """The ``max_power`` the pop being built went out at when the constrained lane lowered it, else None."""
         self._whole_card_residency_active = (
             whole_card_residency_active if whole_card_residency_active is not None else (lambda: False)
         )
@@ -830,13 +835,16 @@ class JobPopper:
         card_runtimes: dict[int, CardRuntime] | None,
         *,
         idle_fill_wanted: bool,
+        pinned_model: str | None = None,
     ) -> tuple[set[str], int]:
         """Return the offer and ``max_power`` for this pop once constrained models have been laned.
 
         The horde's pop carries one ``max_pixels`` for every model in it, so a model the card fits only at
         reduced size cannot share a pop with the others without capping them too. The lane decision
         (:func:`decide_constrained_offer`) alternates full-size pops of the unconstrained models with a pop of
-        the constrained models at their cap; this advances the stored cadence state once per built pop.
+        the constrained models at their cap; this advances the stored cadence state once per built pop and
+        remembers whether the pop went out at a reduced size, so a no-job answer is attributed to the right
+        lane. ``pinned_model`` is the model a whole-card residency claims the card for.
         """
         caps = self._serviceability_model_caps(models, pop_max_power, card_runtimes)
         decision = decide_constrained_offer(
@@ -845,8 +853,10 @@ class JobPopper:
             model_caps=caps,
             pop_max_power=pop_max_power,
             idle_fill=idle_fill_wanted,
+            pinned_model=pinned_model,
         )
         self._constrained_lane_state = decision.next_state
+        self._last_pop_reduced_max_power = decision.pop_max_power if decision.pop_max_power < pop_max_power else None
         if decision.constrained_pop:
             logger.debug(
                 f"Constrained-model pop: advertising {sorted(decision.advertised_models)} at max_power "
@@ -2137,11 +2147,13 @@ class JobPopper:
         # of its own with max_power lowered to the largest size that fits, so the horde never returns a job the
         # card cannot host while the other models keep the configured size (max_pixels is one figure for every
         # model in a pop, so a shared pop would cap them all).
+        pop_claim = self._whole_card_pop_claim()
         models, pop_max_power = self._shape_offer_for_serviceability(
             models,
             pop_max_power,
             advertised_card_runtimes,
             idle_fill_wanted=idle_fill_wanted,
+            pinned_model=pop_claim.model if pop_claim is not None else None,
         )
         pop_max_batch = advertised.max_batch if advertised is not None else bridge_data.max_batch
         pop_allow_img2img = advertised.allow_img2img if advertised is not None else bridge_data.allow_img2img
@@ -2178,7 +2190,6 @@ class JobPopper:
         # horde stops sending work whose arrival would evict the weights the residency exists to keep resident.
         # Applied last, and to the idle-fill path too: a card held by a residency is not free to be filled with
         # whatever is quickest, and a residency with no work of its own releases on its own evidence instead.
-        pop_claim = self._whole_card_pop_claim()
         if pop_claim is not None:
             models = self._apply_whole_card_pop_claim(models, pop_claim)
             if len(models) == 0:
@@ -2365,7 +2376,14 @@ class JobPopper:
         if job_pop_response.id_ is None:
             self._note_whole_card_pop_outcome(pop_claim, served=False)
             self._state.last_pop_no_jobs_available = True
-            self._state.last_pop_skipped_reasons = skipped_reasons
+            # A reduced-size pop asks for a different job range than the regular lane, so its skips are kept
+            # apart: the operator reads why the constrained models find nothing without that answer
+            # overwriting, or being overwritten by, the full-size lane's answer.
+            if self._last_pop_reduced_max_power is not None:
+                self._state.last_reduced_pop_skipped_reasons = skipped_reasons
+                self._state.last_reduced_pop_max_power = self._last_pop_reduced_max_power
+            else:
+                self._state.last_pop_skipped_reasons = skipped_reasons
             if idle_fill_wanted:
                 # The horde had nothing at this rung; climb one so the next fill tick offers the
                 # next-heaviest quick-start work. Clamped; the shaping helper re-clamps per worker.
@@ -2392,7 +2410,11 @@ class JobPopper:
         self._state.server_maintenance_pop_rejections = 0
         self._replaced_due_to_maintenance = False
         self._state.last_pop_no_jobs_available = False
-        self._state.last_pop_skipped_reasons = {}
+        if self._last_pop_reduced_max_power is not None:
+            self._state.last_reduced_pop_skipped_reasons = {}
+            self._state.last_reduced_pop_max_power = None
+        else:
+            self._state.last_pop_skipped_reasons = {}
         if idle_fill_wanted:
             # Fed at this rung; restart the ladder at the smallest, quickest rung for the next idle episode.
             self._state.idle_fill_rung = 0

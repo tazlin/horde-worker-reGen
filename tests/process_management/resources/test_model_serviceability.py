@@ -183,6 +183,64 @@ class TestStreamingBaselineServiceability:
         assert verdict.tier is not ModelServiceabilityTier.UNSERVICEABLE
 
 
+class TestWholeCardServiceability:
+    """A whole-card model is judged by its recommended minimum card against the card total, at any job size."""
+
+    _KREA = ModelFootprintFigures(
+        weights_mb=12600.0,
+        activation_per_megapixel_mb=1500.0,
+        min_recommended_card_mb=14000.0,
+    )
+
+    def test_a_16gb_card_serves_a_whole_card_model_at_full_size(self) -> None:
+        """Krea-class weights on 16 GB behind a 2 GB desktop baseline: the co-fit caps it, the card class fits."""
+        resident = assess_model_serviceability(
+            total_vram_mb=16375.0,
+            baseline_mb=2087.0,
+            noise_buffer_mb=None,
+            figures=self._KREA,
+            max_pixels=max_power_to_pixels(32),
+        )
+        assert resident.tier is ModelServiceabilityTier.CONSTRAINED
+
+        whole_card = assess_model_serviceability(
+            total_vram_mb=16375.0,
+            baseline_mb=2087.0,
+            noise_buffer_mb=None,
+            figures=self._KREA,
+            max_pixels=max_power_to_pixels(32),
+            whole_card=True,
+        )
+        assert whole_card.tier is ModelServiceabilityTier.SERVICEABLE
+        assert whole_card.largest_fitting_max_power is not None
+        assert "whole-card" in whole_card.reason()
+
+    def test_a_card_below_the_recommended_minimum_cannot_serve_a_whole_card_model(self) -> None:
+        """12 GB is under the recommended card: not offered at any size, whatever the resident arithmetic says."""
+        verdict = assess_model_serviceability(
+            total_vram_mb=12 * _GB,
+            baseline_mb=500.0,
+            noise_buffer_mb=None,
+            figures=self._KREA,
+            max_pixels=max_power_to_pixels(8),
+            whole_card=True,
+        )
+        assert verdict.tier is ModelServiceabilityTier.UNSERVICEABLE
+
+    def test_an_unknown_recommended_minimum_keeps_the_conservative_answer(self) -> None:
+        """Without a recommended card there is nothing to judge a whole-card fit by."""
+        figures = ModelFootprintFigures(weights_mb=12600.0, activation_per_megapixel_mb=1500.0)
+        verdict = assess_model_serviceability(
+            total_vram_mb=24 * _GB,
+            baseline_mb=500.0,
+            noise_buffer_mb=None,
+            figures=figures,
+            whole_card=True,
+        )
+        assert verdict.tier is ModelServiceabilityTier.UNSERVICEABLE
+        assert "unknown" in verdict.reason()
+
+
 class TestConstrainedOfferLane:
     """A constrained model rides its own capped pop instead of capping every other model's pop."""
 
@@ -231,8 +289,8 @@ class TestConstrainedOfferLane:
         assert decision.pop_max_power == 12
         assert decision.constrained_pop is False
 
-    def test_an_idle_fill_pop_never_takes_the_constrained_lane(self) -> None:
-        """An idle-fill pop wants the quickest work of any model: capped, not laned, and the cadence holds."""
+    def test_an_idle_fill_pop_carries_the_unconstrained_models_at_full_size(self) -> None:
+        """An idle-fill pop wants the quickest work: the constrained model is left out and nothing is capped."""
         state = ConstrainedLaneState(full_cycles_taken=3)
         decision = decide_constrained_offer(
             state,
@@ -241,10 +299,51 @@ class TestConstrainedOfferLane:
             pop_max_power=32,
             idle_fill=True,
         )
-        assert decision.advertised_models == self._OFFER
-        assert decision.pop_max_power == 19
+        assert decision.advertised_models == frozenset({"light", "other"})
+        assert decision.pop_max_power == 32
         assert decision.constrained_pop is False
         assert decision.next_state == state
+
+    def test_a_wholly_constrained_idle_fill_pop_is_still_capped(self) -> None:
+        """With every offered model constrained there is nothing to protect on an idle-fill pop either."""
+        decision = decide_constrained_offer(
+            ConstrainedLaneState(),
+            offered_models=frozenset({"heavy"}),
+            model_caps={"heavy": 19},
+            pop_max_power=32,
+            idle_fill=True,
+        )
+        assert decision.advertised_models == frozenset({"heavy"})
+        assert decision.pop_max_power == 19
+
+    def test_a_pinned_constrained_model_takes_the_constrained_pop_now(self) -> None:
+        """A whole-card claim's model rides its capped pop whatever the cadence says, so the claim never empties it."""
+        decision = decide_constrained_offer(
+            ConstrainedLaneState(full_cycles_taken=0),
+            offered_models=self._OFFER,
+            model_caps={"heavy": 19},
+            pop_max_power=32,
+            pinned_model="heavy",
+            idle_fill=True,
+        )
+        assert decision.advertised_models == frozenset({"heavy"})
+        assert decision.pop_max_power == 19
+        assert decision.constrained_pop is True
+        assert decision.next_state == ConstrainedLaneState()
+
+    def test_a_pinned_unconstrained_model_leaves_the_cadence_alone(self) -> None:
+        """A claim for a model the card fits at full size changes nothing about the lane."""
+        state = ConstrainedLaneState(full_cycles_taken=1)
+        decision = decide_constrained_offer(
+            state,
+            offered_models=self._OFFER,
+            model_caps={"heavy": 19},
+            pop_max_power=32,
+            pinned_model="light",
+        )
+        assert decision.advertised_models == frozenset({"light", "other"})
+        assert decision.pop_max_power == 32
+        assert decision.next_state == ConstrainedLaneState(full_cycles_taken=2)
 
     def test_a_cap_never_exceeds_the_configured_max_power(self) -> None:
         """A cap above the configured max_power is clamped to it on the constrained pop."""

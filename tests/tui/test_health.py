@@ -18,6 +18,7 @@ from horde_worker_regen.tui.health import (
     WorkerPhase,
     build_offline_checks,
     derive,
+    summarize_reduced_skips,
     summarize_skips,
 )
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
@@ -348,6 +349,44 @@ def test_summarize_skips_orders_by_count_and_drops_zeros() -> None:
     """The skip summary is count-ordered and omits zero-count reasons."""
     assert summarize_skips({"nsfw": 1, "models": 3, "untouched": 0}) == "3 models · 1 nsfw"
     assert summarize_skips({}) == ""
+
+
+def test_reduced_size_skips_are_named_with_their_size_only_when_outstanding() -> None:
+    """A reduced-size pop's skips render as their own phrase with the size asked; none outstanding renders nothing."""
+    assert summarize_reduced_skips(_snapshot()) == ""
+    snapshot = _snapshot(last_reduced_pop_skipped_reasons={"max_pixels": 4}, last_reduced_pop_max_power=17)
+    assert summarize_reduced_skips(snapshot) == "reduced-size pop (max_power 17): 4 max_pixels"
+
+
+def test_ready_report_lists_the_regular_and_reduced_lanes_separately() -> None:
+    """With both lanes unanswered the report carries a Work line for each; with one, only that one."""
+    both = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            last_pop_no_jobs_available=True,
+            last_pop_skipped_reasons={"models": 3},
+            last_reduced_pop_skipped_reasons={"max_pixels": 4},
+            last_reduced_pop_max_power=17,
+        ),
+        SupervisorStatus.RUNNING,
+        0.0,
+    )
+    work = [check.detail for check in both.checks if check.name == "Work"]
+    assert len(work) == 2
+    assert "3 models" in work[0]
+    assert "max_power 17" in work[1]
+    assert "max_power 17" in both.detail
+
+    regular_only = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            last_pop_no_jobs_available=True,
+            last_pop_skipped_reasons={"models": 3},
+        ),
+        SupervisorStatus.RUNNING,
+        0.0,
+    )
+    assert len([check for check in regular_only.checks if check.name == "Work"]) == 1
 
 
 def test_offline_checks_surface_in_stopped_report(tmp_path: Path) -> None:
