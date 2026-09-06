@@ -44,6 +44,7 @@ from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.vram_arbiter import _MEASURED_ATTEMPT_BAND_MB, VramArbiter
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
+from horde_worker_regen.process_management.scheduling.admission import pricing as _pricing_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -129,6 +130,7 @@ class _World:
 
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", _candidate_by_model())
         monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", _candidate_by_model())
+        monkeypatch.setattr(_pricing_mod, "predict_job_sampling_vram_mb", _candidate_by_model())
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
         monkeypatch.setattr(self._scheduler, "_measured_available_ram_mb", lambda: 64000.0)
         # Inject the two measured admission inputs directly: a fixed foreign floor (controlling the ceiling) and

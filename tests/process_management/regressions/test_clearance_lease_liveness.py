@@ -37,6 +37,7 @@ from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_mock_process_info,
     make_testable_process_manager,
+    mark_job_in_progress_async,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -198,7 +199,7 @@ class TestHeadNotStarvedBySiblingStaging:
 class TestClearanceAdmission:
     """The clearance admit function prices the full materialisation and upgrades the reservation on a grant."""
 
-    def test_admits_and_upgrades_when_device_has_ample_room(self) -> None:
+    async def test_admits_and_upgrades_when_device_has_ample_room(self) -> None:
         """An ample card admits the staged child's clearance and upgrades its reservation to the full peak."""
         scheduler = _make_inference_scheduler(
             bridge_data=make_mock_bridge_data(
@@ -213,6 +214,8 @@ class TestClearanceAdmission:
         job = make_job_pop_response("stable_diffusion")
         proc.last_job_referenced = job
         scheduler._process_map = ProcessMap({0: proc})
+        await track_popped_job_async(scheduler._job_tracker, job)
+        await mark_job_in_progress_async(scheduler._job_tracker, job)
         scheduler._record_dispatch_reservation(job, proc, baseline=None, staging_only=True)
 
         assert scheduler.clearance_admit_process(0) is True

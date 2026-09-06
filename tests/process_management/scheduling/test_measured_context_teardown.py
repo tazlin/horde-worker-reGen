@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -26,6 +28,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramRequest,
     VramRequestKind,
 )
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -182,12 +185,12 @@ async def test_the_structural_judgement_is_kept_and_the_depth_is_the_deeper() ->
     ) == (already, 1)
 
 
-async def test_the_hold_gate_carries_the_widened_flag_into_the_verdict() -> None:
+async def test_the_hold_gate_carries_the_widened_flag_into_the_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
     """Through the dispatch gate, the head's hold reports the sibling context as a rung that closes the deficit."""
     scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
     arbiter = _arbiter(_edge_state())
     scheduler._vram_arbiter = arbiter
-    scheduler._measured_admission_candidate_delta_mb = lambda *_args, **_kwargs: _CANDIDATE_MB
+    monkeypatch.setattr(pricing, "candidate_delta_mb", lambda *_args, **_kwargs: _CANDIDATE_MB)
     recorded: list[dict[str, object]] = []
     scheduler._decision_sink = lambda **kwargs: recorded.append(kwargs)
 

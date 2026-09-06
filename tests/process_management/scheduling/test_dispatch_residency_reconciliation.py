@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+
 from horde_worker_regen.process_management.ipc.message_dispatcher import (
     _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS,
     DeadlockSnapshot,
@@ -35,9 +38,11 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramRequestKind,
     VramVerdict,
 )
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _GOVERNOR_DEFER_DWELL_SECONDS,
 )
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import HEAD_PROTECTION_MAX_STARVE_SECONDS
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -176,6 +181,13 @@ class TestGatePredicate:
         assert scheduler.dispatch_holds.released_by_natural_free == 1
 
 
+def _starve_head(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse, *, seconds: float) -> None:
+    """Pin the clock and mark ``job`` the starved head for exactly ``seconds`` on the head-admission ledger."""
+    scheduler._clock = lambda: 10_000.0  # type: ignore[method-assign]
+    scheduler.head_admission.starvation_job_id = str(job.id_)
+    scheduler.head_admission.starvation_since = 10_000.0 - seconds
+
+
 class _CapturingArbiter:
     """A stand-in arbiter that records the request it is asked to evaluate and returns a fixed verdict."""
 
@@ -196,6 +208,10 @@ class _CapturingArbiter:
     def measured_deficit_mb(self, request: VramRequest) -> float | None:
         """A fixed verdict prices nothing, so the measured-frame teardown widening has no deficit to read."""
         return None
+
+    def device_state(self, device_index: int | None) -> None:
+        """A fixed verdict carries no frozen card state for the snapshot to read."""
+        return
 
 
 class TestLineSkipDispatchHeadTruth:
@@ -383,13 +399,13 @@ class TestStarvedDispatchHeadSignals:
             measured=measured,
         )
 
-    async def test_gate_does_not_offer_teardown_when_target_already_exceeds_live_pool(self) -> None:
+    async def test_gate_does_not_offer_teardown_when_target_already_exceeds_live_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A co-resident SDXL-class head does not claim whole-card residency merely because a sibling is idle."""
         scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
-        scheduler._max_coresident_for_peak_mb = Mock(return_value=4)  # type: ignore[method-assign]
-        scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
-            return_value=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0,
-        )
+        monkeypatch.setattr(pricing, "max_coresident_for_peak_mb", lambda *_args, **_kwargs: 4)
+        _starve_head(scheduler, job, seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0)
         capture = _CapturingArbiter(self._fits_verdict())
         scheduler._vram_arbiter = capture  # type: ignore[assignment]
 
@@ -399,13 +415,13 @@ class TestStarvedDispatchHeadSignals:
         assert capture.last_request.starved_seconds == _FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0
         assert capture.last_request.idle_contexts_teardownable is False
 
-    async def test_gate_offers_teardown_when_computed_target_is_below_live_pool(self) -> None:
+    async def test_gate_offers_teardown_when_computed_target_is_below_live_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A head whose priced peak genuinely requires fewer contexts retains the bounded teardown remedy."""
         scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
-        scheduler._max_coresident_for_peak_mb = Mock(return_value=1)  # type: ignore[method-assign]
-        scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
-            return_value=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0,
-        )
+        monkeypatch.setattr(pricing, "max_coresident_for_peak_mb", lambda *_args, **_kwargs: 1)
+        _starve_head(scheduler, job, seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0)
         capture = _CapturingArbiter(self._fits_verdict())
         scheduler._vram_arbiter = capture  # type: ignore[assignment]
 
@@ -416,9 +432,7 @@ class TestStarvedDispatchHeadSignals:
     async def test_line_skip_dispatch_reports_no_teardownable_context(self) -> None:
         """A line-skip dispatch (not the head) never reports a teardownable context, so it cannot tear one down."""
         scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
-        scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
-            return_value=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0,
-        )
+        _starve_head(scheduler, job, seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0)
         capture = _CapturingArbiter(self._fits_verdict())
         scheduler._vram_arbiter = capture  # type: ignore[assignment]
 

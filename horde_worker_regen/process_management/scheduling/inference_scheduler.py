@@ -122,6 +122,9 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     plausible_activation_ceiling_mb,
     sampling_footprint_key,
 )
+from horde_worker_regen.process_management.scheduling.admission.materialization import (
+    build_materialization_request,
+)
 from horde_worker_regen.process_management.scheduling.admission.snapshot import (
     HostRamSnapshot,
     SchedulingSnapshot,
@@ -11380,144 +11383,37 @@ class InferenceScheduler:
     ) -> _MaterializationOutcome:
         """Price a job's VRAM materialisation through the single MONOLITHIC_DISPATCH arbiter identity.
 
-        The reusable core shared by the dispatch residency-reconciliation gate and the clearance gate: it
-        builds the arbiter request against measured device truth (net of outstanding reservations and the
-        noise buffer), evaluates it, and on a non-admit routes the described idle-resident eviction through the
-        one reclaim owner (:meth:`_execute_preload_actuations`), protecting the head's own target slot. It owns
-        no hold bookkeeping or logging: each caller records its own hold state (dispatch-pending versus
-        clearance) and emits its own diagnostics from the returned outcome.
+        The core shared by the dispatch residency-reconciliation gate and the clearance gate: the request is
+        built from one scheduling snapshot (:func:`build_materialization_request` documents the override and
+        the netting), evaluated against one frozen measurement, and on a non-admit the described idle-resident
+        eviction runs through the one reclaim owner (:meth:`_execute_preload_actuations`), sparing the head's
+        own target slot. Hold bookkeeping and logging stay with the callers.
 
-        ``candidate_delta_override_mb`` prices a smaller charge than the job's full materialisation peak (the
-        encode-only staging charge under the clearance lease, where the weights have not yet loaded); ``None``
-        prices the full activation-inclusive peak (the non-lease dispatch VRAM moment and the clearance moment).
-
-        ``nets_own_dispatch_reservation`` is set by the clearance re-price of an already-dispatched job: its
-        encode-only staging reservation is still outstanding in the dispatch flow, and the full peak priced
-        here already covers it, so that entry is netted out of the overlay rather than counted against the
-        job's own room. Left False at dispatch, where the job holds no reservation yet.
-
-        Both callers guarantee a non-None model before pricing (an unmodelled job is not materialisable).
+        Both callers guarantee a tracked job with a model before pricing.
         """
         if next_job.model is None:
             raise ValueError("materialisation admission requires a job with a model")
-        device_index = self._routing_device_index(process_with_model)
-        own_dispatch_mb = 0.0
-        if nets_own_dispatch_reservation and next_job.id_ is not None:
-            own_dispatch_mb = self._reserve_ledger.planned_charge_for_unit(
-                DISPATCH_ADMISSION_FLOW,
-                str(next_job.id_),
-                self._committed_process_reserved_by_pid(device_index),
-            )
-        baseline = self._model_metadata.get_baseline(next_job.model)
-        has_reclaimable_idle_model = self._has_reclaimable_idle_model(
-            process_with_model,
-            for_head_of_queue=is_head_of_queue,
-            device_index=device_index,
-            make_room_for_model=next_job.model,
-        )
-        candidate_delta_mb = (
-            candidate_delta_override_mb
-            if candidate_delta_override_mb is not None
-            else self._measured_admission_candidate_delta_mb(
-                next_job,
-                baseline,
-                process_id=process_with_model.process_id,
-                disaggregated=self._is_disaggregation_class_eligible(next_job),
-            )
-        )
-        forecast = self._forecast_streaming(next_job, baseline, device_index=device_index)
-        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
-        structural_reserve_mb = (
-            effective_inference_reserve_mb(total_vram_mb, 0.0)
-            if total_vram_mb is not None
-            else forecast._effective_base_reserve  # noqa: SLF001 - same budget owner sizes teardown depth.
-        )
-        max_resident = (
-            self._max_coresident_for_peak_mb(
-                candidate_delta_mb,
-                structural_reserve_mb,
-                device_index=device_index,
-            )
-            if candidate_delta_mb is not None
-            else None
-        )
-        live_inference_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
-        idle_contexts_teardownable = (
-            is_head_of_queue
-            and max_resident is not None
-            and max_resident < live_inference_processes
-            and self._has_teardownable_idle_context(process_with_model, device_index=device_index)
-        )
-        active_jobs_on_card = (
-            self._jobs_in_progress_on_card(device_index)
-            if self._multi_gpu_routing_active and device_index is not None
-            else self._job_tracker.jobs_in_progress
-        )
-        prepared_head_reprices_activation = self._job_tracker.are_job_aux_models_prepared(next_job) and bool(
-            active_jobs_on_card,
-        )
-        request = VramRequest(
-            kind=VramRequestKind.MONOLITHIC_DISPATCH,
-            job_label=str(next_job.model),
-            baseline=baseline,
-            device_index=device_index,
-            target_process_id=process_with_model.process_id,
-            candidate_delta_mb=candidate_delta_mb,
-            candidate_weights_mb=predict_job_weight_mb(next_job, baseline),
-            accepted_work=(next_job.id_ is not None and self._job_tracker.get_tracked_job(next_job.id_) is not None),
-            # An ordinary dispatch onto resident weights is a no-materialisation fast path. A prepared head
-            # re-entering while another job owns a live reservation is not: its weights may be resident, but
-            # its activations would overlap that admitted peak. Reprice the activation-only delta so the
-            # preparation boundary cannot turn resident-weight credit into an ungoverned second sampler.
-            candidate_already_resident=(
-                self._candidate_weights_resident_on_process(
-                    next_job.model,
-                    process_with_model.process_id,
-                )
-                and not prepared_head_reprices_activation
-            ),
-            own_planned_unmaterialized_mb=self._own_planned_charge_mb(
-                device_index=device_index,
-                target_process_id=process_with_model.process_id,
-            ),
-            own_dispatch_unmaterialized_mb=own_dispatch_mb,
+        if next_job.id_ is None:
+            raise ValueError("materialisation admission requires a tracked job")
+        # Freeze the arbiter before taking the snapshot, so the snapshot's card state, the teardown widening
+        # and the verdict all read the same measurement.
+        arbiter = self._ensure_preload_arbiter()
+        priced = build_materialization_request(
+            self.snapshot(),
+            str(next_job.id_),
+            process_with_model.process_id,
+            arbiter=arbiter,
             is_head_of_queue=is_head_of_queue,
-            head_job_id=str(next_job.id_) if next_job.id_ is not None else None,
-            measured_attempt_in_progress=self._job_tracker.is_measured_attempt_on_device(
-                next_job,
-                device_index,
-            ),
-            measured_attempt_already_spent=self._job_tracker.has_spent_measured_attempt_on_device(
-                next_job,
-                device_index,
-            ),
             head_outstanding_mb=head_outstanding_mb,
-            starved_seconds=self._head_starved_seconds(next_job),
-            probe_after_seconds=self._probe_after_seconds(device_index),
-            has_reclaimable_idle_tenancy=self._has_reclaimable_idle_tenancy(
-                next_job,
-                process_with_model,
-                device_index=device_index,
-            ),
-            lane_reclaim_permitted=self._starved_head_lane_reclaim_permitted(device_index),
-            has_reclaimable_idle_model=has_reclaimable_idle_model,
-            # An ordinary staged dispatch never reduces the live inference-context count: it evicts idle
-            # residents to make room, it does not collapse the co-resident pool (can_reduce_live_contexts stays
-            # False, so the ordinary activation-peak warrant never tears a context down). The one exception is a
-            # starved head whose deficit is held by its own bare idle sibling contexts with no reality-admit and
-            # no weight reclaim left: it escalates to the same verified teardown the preload seam uses, so this
-            # head-only signal is reported for that path.
-            can_reduce_live_contexts=False,
-            idle_contexts_teardownable=idle_contexts_teardownable,
+            candidate_delta_override_mb=candidate_delta_override_mb,
+            nets_own_dispatch_reservation=nets_own_dispatch_reservation,
         )
-        request, max_resident = self._apply_measured_context_teardown(
-            request,
-            self._ensure_preload_arbiter(),
-            process_with_model,
-            structural_max_resident=max_resident,
-            device_index=device_index,
-        )
-        verdict = self._ensure_preload_arbiter().evaluate(request)
+        request = priced.request
+        candidate_delta_mb = priced.candidate_delta_mb
+        device_index = priced.device_index
+        forecast = priced.forecast
+        max_resident = priced.max_resident
+        verdict = arbiter.evaluate(request)
 
         if verdict.admits:
             if verdict.measured_attempt:
