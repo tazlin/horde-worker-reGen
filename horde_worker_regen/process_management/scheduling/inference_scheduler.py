@@ -126,10 +126,20 @@ from horde_worker_regen.process_management.scheduling.admission.clearance import
     ClearanceDecision,
     decide_clearance_admit,
 )
+from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob
 from horde_worker_regen.process_management.scheduling.admission.executor import PlanExecutor
 from horde_worker_regen.process_management.scheduling.admission.materialization import (
     MaterializationRequest,
     build_materialization_request,
+)
+from horde_worker_regen.process_management.scheduling.admission.preload import (
+    PreloadGatePlan,
+    PreloadPassControl,
+    decide_preload_gates,
+    every_pending_model_accounted_for,
+    loaded_or_loading_models,
+    pass_control_for,
+    preload_head,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import (
     HostRamSnapshot,
@@ -160,6 +170,7 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     affinity_budget_seconds,
     affinity_skip_allowed,
     affinity_skip_disclosure,
+    head_aged_past_anti_starvation,
     record_affinity_skip,
 )
 from horde_worker_regen.process_management.scheduling.governance import (
@@ -167,7 +178,6 @@ from horde_worker_regen.process_management.scheduling.governance import (
     CardProcessSnapshot,
     HostMemorySnapshot,
     InferenceSlotSnapshot,
-    PreloadSlotSnapshot,
     RamGovernorState,
     RamReclaimOutcome,
     ResourceGovernor,
@@ -177,14 +187,11 @@ from horde_worker_regen.process_management.scheduling.governance import (
     WholeCardResidency,
     WholeCardResidencyMachine,
     card_preload_order,
-    compute_preload_disallowed_processes,
     decide_degrade_response,
     decide_process_reduction,
     decide_ram_reclaim_outcome,
     decide_shed_card_restore,
     max_coresident_for_peak,
-    preload_concurrency_blocked,
-    select_head_room_process_id,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     HEAVY_HEAD_LOAD_GRACE_SECONDS,
@@ -340,16 +347,6 @@ it, and the head whose peak was rejected asks again every scheduling cycle. Rate
 head that cannot be admitted from buying one teardown per cycle; it does not change what the reduction does
 when it is taken. Paired with the restore dwell, so a reduction and its regrowth cannot chase each other."""
 
-_DISPATCH_ANTI_STARVATION_TTL_FRACTION = 0.3
-"""Fraction of a queued head's ttl past which resident-model bypass yields so the head's own preload runs.
-
-The affinity skip budget measures from the head's first bypass, so it does not bound the head's total age
-since it was popped: a head that waited in queue before its first skip can still be bypassed well past a
-winnable window, and by the time it dispatches the horde has aborted it as too slow. This absolute age gate,
-anchored at ``time_popped`` and the job's own ttl, closes that gap independently of the skip budget. Sized
-below the affinity budget fraction so the head reclaims its slot with enough of the ttl left for its own
-staging, sampling, and submission."""
-
 
 class VaeLanePauseRequester(enum.StrEnum):
     """Which subsystem is asking to pause the VAE lane, and therefore which decode-drain rule applies.
@@ -383,17 +380,6 @@ class _WholeCardDemandOutcome(enum.Enum):
     draining); defer this cycle and re-evaluate against the reduced topology next tick."""
 
 
-class _PreloadJobOutcome(enum.Enum):
-    """What one pending job's preload attempt means for the rest of this scheduling pass."""
-
-    NEXT_JOB = enum.auto()
-    """This job needs nothing (or was faulted); consider the next pending job."""
-    STOP_PASS = enum.auto()
-    """A gate deferred or consumed this cycle (RAM floor, no slot, serialization, budget); stop the pass."""
-    PRELOAD_SENT = enum.auto()
-    """A preload was issued for this job; the pass is done and reports success."""
-
-
 @dataclass(frozen=True)
 class _MaterializationOutcome:
     """The result of pricing a job's VRAM materialisation through the MONOLITHIC_DISPATCH arbiter identity.
@@ -410,22 +396,6 @@ class _MaterializationOutcome:
     device_index: int | None
     actuations_requested: tuple[ActuatorCommand, ...]
     actuations_applied: tuple[ActuatorCommand, ...]
-
-
-def _preload_outcome_from_admission(decision: AdmissionDecision) -> _PreloadJobOutcome:
-    """Map the public admission decision vocabulary onto the scheduler pass control enum."""
-    match decision:
-        case AdmissionDecision.ADMIT | AdmissionDecision.PRESTAGE:
-            return _PreloadJobOutcome.PRELOAD_SENT
-        case (
-            AdmissionDecision.NEXT_JOB
-            | AdmissionDecision.QUARANTINED
-            | AdmissionDecision.UNSERVICEABLE
-            | AdmissionDecision.ALREADY_LOADED
-        ):
-            return _PreloadJobOutcome.NEXT_JOB
-        case _:
-            return _PreloadJobOutcome.STOP_PASS
 
 
 class InferenceScheduler:
@@ -5018,12 +4988,13 @@ class InferenceScheduler:
             ),
             eligible_cards=self._eligible_card_indices,
             disaggregation_class_eligible=self._is_disaggregation_class_eligible,
+            unserviceable_reason=self._unserviceable_job_reason,
             host_ram=HostRamSnapshot(
                 available_mb=self._measured_available_ram_mb(),
                 total_mb=self._measured_total_ram_mb(),
                 reserve_mb=self._ram_budget.reserve_mb,
                 danger_floor_mb=self._ram_danger_floor_mb(),
-                pressure=ram_verdict,
+                pressure=ram_verdict if ram_verdict is not None else self._ram_pressure_verdict(),
             ),
             budget_active=self._budget_active(),
             vram_reserve_mb=self._vram_budget.reserve_mb,
@@ -5031,6 +5002,10 @@ class InferenceScheduler:
             safety_on_gpu_permitted=self._safety_on_gpu_permitted,
             context_constant_mb=self.resolved_context_constant_mb(),
             max_inference_processes=self._max_inference_processes,
+            max_concurrent_inference_processes=self._max_concurrent_inference_processes,
+            draining_process_ids=frozenset(self._processes_draining_for_ram),
+            shutting_down=self._state.shutting_down,
+            recent_job_ttl=self._state.recent_job_ttl,
             models_with_results=frozenset(
                 model
                 for model in {
@@ -5807,35 +5782,6 @@ class InferenceScheduler:
             )
             ledger.lane_contained_at[lane.process_id] = now
             self.unload_from_ram(lane.process_id)
-
-    def _preload_blocked_by_ram_pressure(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Return whether the host's absolute RAM danger floor forces this preload to defer.
-
-        When system RAM is below its danger floor, governs the pressure (sheds idle footprint, pauses
-        pops) and reports True so the caller defers rather than routing a new model's weights through a
-        host already on the edge. Clears the one-shot notice and reports False when RAM is healthy.
-        """
-        # One scheduling cycle acts on one consistent reading: reuse the verdict the governor's tick
-        # measured at the top of this cycle rather than re-measuring per job. Tests (and any path that
-        # reaches here before a first tick) fall back to a live reading.
-        ram_pressure = self._governor.last_ram_verdict
-        if ram_pressure is None:
-            ram_pressure = self._ram_pressure_verdict()
-        if not ram_pressure.under_pressure:
-            self._ram_pressure_notified = False
-            return False
-        # The governor's tick (run once per control-loop iteration via run_governance_tick) has already
-        # driven the whole-host degrade response this cycle; here we only defer *this* preload and surface
-        # the per-model notice once so the loop does not route a new model's weights through a host already
-        # on the edge.
-        if not self._ram_pressure_notified:
-            logger.opt(colors=True).warning(
-                "<fg #ff8c69>RAM danger floor reached: deferring preload of {} "
-                f"({ram_pressure.reason()}). Shedding idle footprint and pausing pops.</>",
-                job.model,
-            )
-            self._ram_pressure_notified = True
-        return True
 
     def _send_preload(self, job: ImageGenerateJobPopResponse, available_process: HordeProcessInfo) -> bool:
         """Send the preload command for ``job``'s model to ``available_process`` and record the load.
@@ -7823,10 +7769,11 @@ class InferenceScheduler:
     def preload_models(self) -> bool:
         """Preload models that are likely to be used soon.
 
-        Housekeeping first (whole-card residency restore/convergence, stale model-map expiry, clearing
-        preloads the queue no longer needs), then one pass over the pending queue: each job runs through
-        the admission pipeline (:meth:`_attempt_preload_for_job`) until one preloads or a gate stops the
-        pass for this cycle.
+        Housekeeping first (whole-card residency restore and convergence, safety placement, stale model-map
+        expiry, clearing preloads the queue no longer needs), then one pass over the pending queue in placement
+        order: each job's gate plan is decided over the cycle's snapshot and executed until one preloads or a
+        gate stops the pass. A plan that faulted a job changes the queue the remaining decisions read, so the
+        snapshot is re-taken behind it.
 
         Returns:
             True if a model was preloaded, False otherwise.
@@ -7838,13 +7785,6 @@ class InferenceScheduler:
 
         if self._pending_post_processing_should_hold_preload():
             return False
-
-        loaded_models = {process.loaded_horde_model_name for process in self._process_map.values()}
-        loaded_models = loaded_models.union(
-            model.horde_model_name
-            for model in self._horde_model_map.root.values()
-            if model.horde_model_load_state.is_loaded() or model.horde_model_load_state == ModelLoadState.LOADING
-        )
 
         pending_models = {job.model for job in self._job_tracker.jobs_pending_inference}
         for process in self._process_map.values():
@@ -7861,45 +7801,92 @@ class InferenceScheduler:
                     new_state=HordeProcessState.WAITING_FOR_JOB,
                 )
 
-        # The fast path out of the pass: every pending job's model is already accounted for. Set equality
-        # alone is not enough on a multi-GPU host, where a model can be loaded on a card that cannot serve the
-        # job that wants it, so each pending job must find its copy on a card eligible for it.
-        if loaded_models == pending_models and all(
-            self._model_loaded_for_job(job, loaded_models) for job in self._job_tracker.jobs_pending_inference
-        ):
+        snapshot = self.snapshot()
+        loaded_models = loaded_or_loading_models(snapshot)
+        if every_pending_model_accounted_for(snapshot, loaded_models):
             return False
 
-        # The first queued job not already in progress is the head of the queue. Only when *its* model
-        # is the one that cannot be loaded may the budget gate escalate to evicting another queued
-        # model (see the budget-defer branches in the admission pipeline); a later job whose turn has
-        # not come never displaces a resident head.
-        in_progress_jobs = self._job_tracker.jobs_in_progress
-        # An aux-unprepared job never anchors preload as the priority head: it holds no sampling reservation
-        # and nothing prices around it, so the first job eligible to hold capacity is the first pending one that
-        # is both not in progress and not awaiting auxiliary preparation. A fitting sibling behind a gated job
-        # is thus the head that may escalate eviction to become resident. Only when no such sibling exists may
-        # the gated job take the strictly non-displacing, empty-slot preload path below.
-        pending = self.pending_inference_in_placement_order()
-        head_job = next(
-            (j for j in pending if j not in in_progress_jobs and not self._job_requires_aux_preparation(j)),
-            None,
-        )
+        # The head is the first queued job not in progress and not awaiting auxiliary preparation. Only when
+        # its model is the one that cannot be loaded may the budget gate escalate to evicting another queued
+        # model; a later job whose turn has not come never displaces a resident head.
+        head_job_id = preload_head(snapshot)
+        head_job = snapshot.queue.payloads[head_job_id] if head_job_id is not None else None
         self._update_head_starvation_timer(head_job)
         self._reconcile_head_priority_barrier(head_job)
         if self._resident_head_should_dispatch_before_preload(head_job):
             return False
 
-        for job in pending:
-            outcome = self._attempt_preload_for_job(
-                job,
-                head_job=head_job,
-                loaded_models=loaded_models,
-            )
-            if outcome is _PreloadJobOutcome.NEXT_JOB:
+        for job_id in snapshot.queue.pending_in_placement_order:
+            if job_id not in snapshot.queue.jobs:
                 continue
-            return outcome is _PreloadJobOutcome.PRELOAD_SENT
+            plan = decide_preload_gates(snapshot, job_id, head_job_id=head_job_id, loaded_models=loaded_models)
+            control = self._run_preload_plan(plan, snapshot)
+            if control is PreloadPassControl.NEXT_JOB:
+                if plan.commands:
+                    snapshot = self.snapshot()
+                continue
+            return control is PreloadPassControl.PRELOAD_SENT
 
         return False
+
+    def _run_preload_plan(self, plan: PreloadGatePlan, snapshot: SchedulingSnapshot) -> PreloadPassControl:
+        """Execute one gate plan: its commands, the once-per-episode notices, and on admit the budget step and send.
+
+        The decision recorded is the final one: a plan the gates admit can still defer at the budget, lose its
+        target to a whole-card scale-down during admission, or fail its send.
+        """
+        self.executor.execute_commands(plan.commands)
+        job = snapshot.queue.payloads[plan.job_id]
+        decision = plan.decision
+        reason = plan.reason
+        process = self._process_map.get(plan.target_process_id) if plan.target_process_id is not None else None
+        if plan.admits and process is not None:
+            decision, process, reason = self._admit_and_send_preload(job, process, plan, snapshot)
+        elif plan.admits:
+            decision, reason = AdmissionDecision.NO_TARGET, "the preload target left the pool before admission"
+        elif decision is AdmissionDecision.DEFER_CONCURRENCY and not self._preload_delay_notified:
+            logger.opt(colors=True).info("<fg #7b7d7d>{}</>", plan.notice)
+            self._preload_delay_notified = True
+        elif decision is AdmissionDecision.DEFER_RAM_PRESSURE and not self._ram_pressure_notified:
+            logger.opt(colors=True).warning("<fg #ff8c69>{}</>", plan.notice)
+            self._ram_pressure_notified = True
+        if plan.records_admission:
+            self._record_preload_admission(decision, job=job, process=process, reason=reason)
+        return pass_control_for(decision)
+
+    def _admit_and_send_preload(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process: HordeProcessInfo,
+        plan: PreloadGatePlan,
+        snapshot: SchedulingSnapshot,
+    ) -> tuple[AdmissionDecision, HordeProcessInfo | None, str]:
+        """The budget step and the send behind an admitting gate plan.
+
+        A fresh preload loads the model's weights into VRAM and system RAM, so it is admitted only when both
+        cover its estimated cost plus their reserves; otherwise reclaim starts and the preload defers rather
+        than over-committing. Admission is not read-only: a whole-card residency establish scales the pool
+        down, and this preload's idle, empty target is exactly what that scale-down retires, so the target is
+        re-selected onto a surviving lane rather than addressed after it is gone.
+        """
+        if snapshot.budget_active and not self._admit_preload_under_budget(
+            job,
+            process,
+            is_head_blocker=plan.is_head_blocker,
+        ):
+            return AdmissionDecision.DEFER_BUDGET, process, self._last_budget_defer_reason or "VRAM/RAM budget gate"
+        if self._process_map.get(process.process_id) is not process:
+            reselected = self._select_preload_process(job, sorted(plan.disallowed_process_ids))
+            if reselected is None:
+                return (
+                    AdmissionDecision.NO_TARGET,
+                    None,
+                    "the preload target was retired during admission and no other slot is free",
+                )
+            process = reselected
+        if self._send_preload(job, process):
+            return AdmissionDecision.ADMIT, process, "preload sent"
+        return AdmissionDecision.STOP_PASS, process, "preload send failed"
 
     def _pending_post_processing_should_hold_preload(self) -> bool:
         """Whether a pending post-processing chain should receive the next drain window before preloads."""
@@ -8188,306 +8175,6 @@ class InferenceScheduler:
             },
         )
 
-    def _preload_outcome(
-        self,
-        decision: AdmissionDecision,
-        *,
-        job: ImageGenerateJobPopResponse | None = None,
-        process: HordeProcessInfo | None = None,
-        reason: str = "",
-    ) -> _PreloadJobOutcome:
-        """Record a public admission decision and map it onto the preload pass control enum."""
-        self._record_preload_admission(decision, job=job, process=process, reason=reason)
-        return _preload_outcome_from_admission(decision)
-
-    def _attempt_preload_for_job(
-        self,
-        job: ImageGenerateJobPopResponse,
-        *,
-        head_job: ImageGenerateJobPopResponse | None,
-        loaded_models: set[str | None],
-    ) -> _PreloadJobOutcome:
-        """Run one pending job through the preload admission pipeline.
-
-        The gates, in order: quarantine (faults the job), already-resident, the absolute RAM danger
-        floor, the exclusive-job hold, target selection, the
-        cycle-on-model-change replacement, the per-device load serialization gate, and the VRAM/RAM
-        budget admission. The returned :class:`_PreloadJobOutcome` tells the pass whether to consider the
-        next pending job, stop for this cycle, or record that a preload was issued.
-
-        Args:
-            job: The pending job to consider loading a model for.
-            head_job: The queue head, which alone may escalate to displacing another queued model.
-            loaded_models: The models already resident or loading, so a repeat is not staged. Read through
-                :meth:`_model_loaded_for_job`, which asks the question per job rather than card-blind.
-        """
-        bridge_data = self._runtime_config.bridge_data
-        if job.model is None:
-            raise ValueError(f"job.model is None ({job})")
-
-        # An aux-unprepared job must not compete for capacity: staging its model reserves a lane and prices
-        # VRAM around work that cannot sample yet, so any job able to run outranks it and the pass moves on so
-        # that fitting sibling is preloaded instead. With no such sibling the reservation costs nobody
-        # anything, and withholding it only serializes the checkpoint load behind the auxiliary download that
-        # the load could have run alongside. The slot must still be unoccupied (checked once a target is
-        # chosen), and dispatch stays gated on preparation either way: this moves when weights enter RAM,
-        # never when the job samples.
-        aux_gated = self._job_requires_aux_preparation(job)
-        if aux_gated and head_job is not None:
-            return _PreloadJobOutcome.NEXT_JOB
-
-        if (unserviceable_reason := self._unserviceable_job_reason(job)) is not None:
-            if job not in self._job_tracker.jobs_in_progress:
-                self._fault_unserviceable_job(job, unserviceable_reason)
-            return self._preload_outcome(
-                AdmissionDecision.UNSERVICEABLE,
-                job=job,
-                reason=unserviceable_reason,
-            )
-
-        # A model quarantined for repeatedly failing to load must never be preloaded again: doing so only
-        # re-arms the crash/recovery loop it was quarantined to stop. Fault the job so the horde reissues
-        # it elsewhere rather than letting an unservable head wedge the queue.
-        if self._process_lifecycle.is_model_load_quarantined(job.model):
-            if job not in self._job_tracker.jobs_in_progress:
-                logger.warning(
-                    f"Skipping preload of quarantined model {job.model}; faulting its job for reissue.",
-                )
-                self._job_tracker.handle_job_fault_now(job, retryable=False)
-            return self._preload_outcome(AdmissionDecision.QUARANTINED, job=job, reason="model load quarantined")
-
-        if self._model_loaded_for_job(job, loaded_models) and not self._duplicate_copy_may_serve(job):
-            return self._preload_outcome(
-                AdmissionDecision.ALREADY_LOADED, job=job, reason="model already resident or loading"
-            )
-
-        # Absolute system-RAM floor (degrade, never crash): loading a new model routes its weights through
-        # system RAM first, so admitting one while the host is already below its danger floor is the OS
-        # OOM kill, not progress. This gates every preload path independent of the marginal RAM budget, which
-        # can pass on a job's small estimate while the whole host is on the edge (resident weights + the
-        # safety process + other apps). The governor's tick has already degraded the host this cycle;
-        # this only defers the load. Gated on the budget being active (the same switch the rest of the
-        # memory machinery uses).
-        if self._budget_active() and self._preload_blocked_by_ram_pressure(job):
-            return self._preload_outcome(
-                AdmissionDecision.DEFER_RAM_PRESSURE, job=job, reason="system RAM danger floor"
-            )
-
-        is_head_blocker = head_job is not None and job is head_job
-
-        # Which slots this preload may not displace: the queued-model guard, model->process affinity
-        # (never displace the last resident copy of a still-wanted model; the working model set is
-        # taken from live state, not bridge_data.image_models_to_load, because the harness/canned
-        # path never resolves that config field), and slots draining for RAM reclaim. The guards are
-        # target exclusions only, never a wedge: the head-starvation fallback below deliberately
-        # overrides them, and the governor recycles a draining slot once it is idle.
-        inference_process_models = {
-            p.process_id: p.loaded_horde_model_name
-            for p in self._process_map.values()
-            if p.process_type == HordeProcessType.INFERENCE
-        }
-        wanted_models: set[str] = {m for m in inference_process_models.values() if m is not None}
-        wanted_models.update(j.model for j in self._job_tracker.jobs_pending_inference if j.model is not None)
-        wanted_models.update(j.model for j in self._job_tracker.jobs_in_progress if j.model is not None)
-        preload_disallowed = compute_preload_disallowed_processes(
-            queued_model_process_ids=self._process_lifecycle.get_processes_with_model_for_queued_job(),
-            busy_process_ids=[p.process_id for p in self._process_map.values() if p.is_process_busy()],
-            prefer_busy_only=self._process_map.num_loaded_inference_processes()
-            < (len(self._job_tracker.jobs_pending_inference) + len(self._job_tracker.jobs_in_progress)),
-            inference_process_models=inference_process_models,
-            wanted_models=wanted_models,
-            max_inference_processes=self._max_inference_processes,
-            draining_process_ids=frozenset(self._processes_draining_for_ram),
-        )
-        if not self._job_tracker.is_admitted_exclusive(job):
-            preload_disallowed.update(
-                process.process_id
-                for process in self._process_map.values()
-                if process.process_type is HordeProcessType.INFERENCE
-                and self._job_tracker.has_exclusive_job_in_progress(self._routing_device_index(process))
-            )
-
-        # On a multi-GPU host this also chooses *which* card to load onto: an eligible card already
-        # holding the model first, then the least-loaded eligible card. Single-GPU returns the first
-        # available slot exactly as before.
-        available_process = self._select_preload_process(job, sorted(preload_disallowed))
-
-        if available_process is None and is_head_blocker:
-            # The head of the queue could not get a slot because affinity (or the queued-model
-            # guard) protected every idle process. Affinity is provisioned against the
-            # inference-process *ceiling*, so with more resident models than running processes it
-            # can pin every slot and starve a genuinely-queued head, wedging the whole worker. The
-            # head must make progress regardless of whether the measured budget is active, so fall
-            # back to a displacement target that spares live work and prefers an idle resident model
-            # no queued job needs. This is the budget-independent counterpart to the budget-gated
-            # make-room escalation in the admission pipeline. A slot retaining weights a queued job reuses is
-            # not spared here: the placement order has already moved that job ahead of this one, so a head that
-            # still reaches this fallback is one the reorder is not protecting.
-            available_process = self._select_head_room_process(job)
-
-        if available_process is None:
-            return self._preload_outcome(
-                AdmissionDecision.NO_TARGET, job=job, reason="no idle inference slot available"
-            )
-
-        exclusive_scope = self._routing_device_index(available_process)
-        if self._job_tracker.has_exclusive_job_in_progress(exclusive_scope) and not (
-            self._job_tracker.is_admitted_exclusive(job)
-        ):
-            return self._preload_outcome(
-                AdmissionDecision.EXCLUSIVE_IN_PROGRESS,
-                job=job,
-                process=available_process,
-                reason="exclusive over-budget job in progress on target card",
-            )
-
-        # An aux-gated preload takes a wholly unoccupied slot or none at all. Displacing a resident model,
-        # cycling a process, or evicting to make room are all costs paid on behalf of a job that cannot sample
-        # until its auxiliary files land, and the model thrown away may be one a dispatchable job still wants.
-        if aux_gated and not available_process.is_unoccupied():
-            return self._preload_outcome(
-                AdmissionDecision.NEXT_JOB,
-                job=job,
-                process=available_process,
-                reason="aux-gated preload would displace an occupied slot",
-            )
-
-        # Device-free governor growth hold: while the target card's device-level free VRAM sits below the
-        # soft floor (PRESSURE or SATURATED), bringing this model to a slot that does not already hold it
-        # would grow a footprint already near the WDDM paging cliff. Defer until the card recovers. A job
-        # already in progress is exempt: its preload is part of live work, not new speculative growth, and
-        # withholding it would wedge a job the card is already committed to.
-        growth_hold_device = available_process.device_index if self._multi_gpu_routing_active else 0
-        if self.is_vram_growth_held(growth_hold_device) and job not in self._job_tracker.jobs_in_progress:
-            return self._preload_outcome(
-                AdmissionDecision.DEFER_VRAM_GROWTH_HOLD,
-                job=job,
-                process=available_process,
-                reason="device-free governor holding VRAM growth (device near paging cliff)",
-            )
-
-        if (
-            available_process.last_process_state != HordeProcessState.WAITING_FOR_JOB
-            and available_process.loaded_horde_model_name is not None
-            and bridge_data.cycle_process_on_model_change
-            and not self._state.shutting_down
-        ):
-            self._process_lifecycle._replace_inference_process(available_process, intentional_reclaim=True)
-            return self._preload_outcome(
-                AdmissionDecision.REPLACE_PROCESS,
-                job=job,
-                process=available_process,
-                reason="cycling process for model change",
-            )
-
-        # Serialize preloads per card, not worker-wide: the gate exists so two checkpoints do not load
-        # onto the same device at once (disk-read + VRAM-allocation spike). On a multi-GPU host a load
-        # onto an idle card is independent of one happening on another card, so scope the in-flight count
-        # to the card this preload would land on. Worker-wide (device_index=None) on a single-GPU host
-        # keeps the original behavior byte-identical. Without this, a card that is almost always mid-load
-        # (the busy card) perpetually blocks the idle card from ever getting its first model -> starvation.
-        preload_scope_device = self._routing_device_index(available_process)
-        num_preloading_processes = self._process_map.num_preloading_processes(
-            device_index=preload_scope_device,
-        )
-
-        if preload_concurrency_blocked(
-            num_preloading=num_preloading_processes,
-            max_concurrent_inference_processes=self._max_concurrent_inference_processes,
-            very_fast_disk_mode=bool(bridge_data.very_fast_disk_mode),
-        ):
-            if not self._preload_delay_notified:
-                logger.opt(colors=True).info(
-                    "<fg #7b7d7d>"
-                    f"Already preloading {num_preloading_processes} models, waiting for one to finish before "
-                    "preloading {}"
-                    "</>",
-                    job.model,
-                )
-                self._preload_delay_notified = True
-            return self._preload_outcome(
-                AdmissionDecision.DEFER_CONCURRENCY,
-                job=job,
-                process=available_process,
-                reason="preload concurrency gate",
-            )
-
-        # Resource budget gate: a fresh preload loads this model's weights into the shared device
-        # (VRAM) and into system RAM, so admit it only when both measured free VRAM and available
-        # RAM cover its estimated cost plus their reserves. This is the proactive guard against the
-        # multi-process over-commit that OOMs the GPU and against resident weights paging RAM to
-        # disk. When a resource does not fit, start reclaiming it from idle resident models
-        # (overriding residency under pressure) and defer this preload rather than over-committing.
-        if self._budget_active() and not self._admit_preload_under_budget(
-            job,
-            available_process,
-            is_head_blocker=is_head_blocker,
-        ):
-            return self._preload_outcome(
-                AdmissionDecision.DEFER_BUDGET,
-                job=job,
-                process=available_process,
-                reason=self._last_budget_defer_reason or "VRAM/RAM budget gate",
-            )
-
-        # Admission is not read-only: a whole-card residency establish scales the inference pool down to the
-        # depth the head needs, and this preload's chosen target is by construction an idle, empty lane, which
-        # is exactly what that scale-down selects as a victim. A lane the pool no longer has cannot be sent a
-        # load command, so re-select onto a surviving one rather than addressing a retired slot. Deferring
-        # instead would be worse than the crash it replaces: the head would lose its preload every cycle for
-        # as long as the residency keeps choosing its own target.
-        if self._process_map.get(available_process.process_id) is not available_process:
-            available_process = self._select_preload_process(job, sorted(preload_disallowed))
-            if available_process is None:
-                return self._preload_outcome(
-                    AdmissionDecision.NO_TARGET,
-                    job=job,
-                    reason="the preload target was retired during admission and no other slot is free",
-                )
-
-        if self._send_preload(job, available_process):
-            return self._preload_outcome(
-                AdmissionDecision.ADMIT, job=job, process=available_process, reason="preload sent"
-            )
-        return self._preload_outcome(
-            AdmissionDecision.STOP_PASS, job=job, process=available_process, reason="preload send failed"
-        )
-
-    def _select_head_room_process(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
-        """Pick an eligible idle process to free for a starved head-of-queue job, or None.
-
-        Used when the normal preload picker found no slot because affinity (provisioned against the
-        inference-process ceiling) or the queued-model guard protected every idle process. The head must
-        still make progress, so this deliberately overrides those guards. It never overrides card eligibility:
-        on a multi-card worker, a temporarily busy or restarting eligible card cannot make another card a valid
-        preload target. Among eligible slots it never returns a process running live work (only
-        ``can_accept_job()`` slots, and never one whose model is in progress) and prefers the cheapest
-        displacement: an empty slot, then one holding a resident model no pending or in-progress job needs, then,
-        as a last resort, one holding a merely-queued model.
-
-        """
-        eligible_cards = self._eligible_card_indices(job) if self._multi_gpu_routing_active else None
-        slots = tuple(
-            PreloadSlotSnapshot(
-                process_id=process_info.process_id,
-                model_name=process_info.loaded_horde_model_name,
-                can_accept_job=process_info.can_accept_job(),
-            )
-            for process_info in self._process_map.values()
-            if process_info.process_type == HordeProcessType.INFERENCE
-            and (eligible_cards is None or process_info.device_index in eligible_cards)
-            # A lane pinned as an in-flight disaggregated job's sampler is live work even while it idles
-            # between its stages: its state reads WAITING_FOR_JOB, but preloading over it would evict the
-            # weights the pinned job's sample stage is about to use.
-            and not self._process_map.is_reserved_for_disaggregation(process_info.process_id)
-        )
-        chosen_id = select_head_room_process_id(
-            slots,
-            in_progress_models={job.model for job in self._job_tracker.jobs_in_progress},
-            pending_models={job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None},
-        )
-        return self._process_map.get(chosen_id) if chosen_id is not None else None
-
     def _select_idle_thread_diversity_job(
         self,
         head_job: ImageGenerateJobPopResponse,
@@ -8574,16 +8261,6 @@ class InferenceScheduler:
         if not verdicts or any(verdict.serviceable for _, verdict in verdicts):
             return None
         return f"model minimum footprint cannot fit any serving card; {serviceability_arithmetic(verdicts)}"
-
-    def _fault_unserviceable_job(self, job: ImageGenerateJobPopResponse, reason: str) -> None:
-        """Fault an unserviceable queued job before any child process touches VRAM for it."""
-        logger.warning(f"Faulting unserviceable job {job.id_} for model {job.model}: {reason}")
-        self._job_tracker.handle_job_fault_now(
-            job,
-            is_resource_failure=True,
-            retryable=False,
-            fault_reason=reason,
-        )
 
     def _fault_ineligible_job(self, job: ImageGenerateJobPopResponse, verdict: CardEligibilityVerdict) -> None:
         """Fault a job no configured card can execute and disclose every card's reasons."""
@@ -8769,73 +8446,6 @@ class InferenceScheduler:
             return resident
         return None
 
-    def _model_loaded_for_job(self, job: ImageGenerateJobPopResponse, loaded_models: set[str | None]) -> bool:
-        """Whether ``job``'s model already counts as resident or loading *for this job's routing*.
-
-        Single-GPU (or the empty plan unit tests construct): the card-blind membership test the preload pass
-        has always used, so behaviour there is unchanged. Multi-GPU: a copy only counts when it sits on a card
-        eligible to serve this job. A model resident solely on a card that cannot serve this job (its
-        resolution, features or weights exceed that card's effective config) leaves the job needing its own
-        copy on an eligible card. Dispatch will not seat it on the ineligible copy, and counting that copy
-        here withholds the preload that would give the job one, so neither lane can move the job. A job with
-        no eligible card at all keeps the card-blind answer; the eligibility fault path owns that case.
-        """
-        model = job.model
-        if model is None:
-            return False
-        if not self._multi_gpu_routing_active:
-            return model in loaded_models
-        allowed = self._eligible_card_indices(job)
-        if not allowed:
-            return model in loaded_models
-        if self._process_map.get_processes_by_horde_model_name(model, allowed_cards=allowed, include_reserved=True):
-            return True
-        model_info = self._horde_model_map.root.get(model)
-        if model_info is None:
-            return False
-        if not (
-            model_info.horde_model_load_state.is_loaded()
-            or model_info.horde_model_load_state == ModelLoadState.LOADING
-        ):
-            return False
-        owner = self._process_map.get(model_info.process_id)
-        # An entry whose owning process is gone records a residency that no longer exists; counting it would
-        # suppress the preload that replaces it.
-        return owner is not None and owner.device_index in allowed
-
-    def _duplicate_copy_may_serve(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Whether a second copy of ``job``'s already-resident model may be preloaded onto another card.
-
-        The single-copy rule (a model that is resident or loading is never preloaded again) is load and
-        VRAM economy, and on one card a duplicate is pure waste. Across cards it inverts when every copy
-        is busy running other work: the queued job then waits a whole sampling window for weights an idle
-        card could be given instead, and a pending queue dominated by such jobs leaves those cards doing
-        nothing at all. A duplicate is therefore considered only when the worker routes across multiple
-        cards, at least one eligible copy exists, every such copy is busy, and no copy is still loading
-        (a load in flight is about to provide a serving copy; doubling it is the waste the rule exists to
-        stop). Whether the duplicate actually lands stays the preload pipeline's decision: the displacement
-        guards, the preload concurrency gate, VRAM admission, and the growth hold all apply to it unchanged,
-        and the target selection already excludes the slots holding the existing copies.
-        """
-        if not self._multi_gpu_routing_active or job.model is None:
-            return False
-        model_info = self._horde_model_map.root.get(job.model)
-        if model_info is not None and model_info.horde_model_load_state == ModelLoadState.LOADING:
-            return False
-        allowed = self._eligible_card_indices(job)
-        if not allowed:
-            return False
-        copies = self._process_map.get_processes_by_horde_model_name(
-            job.model,
-            allowed_cards=allowed,
-            include_reserved=True,
-        )
-        if not copies:
-            # Resident only per the model map, with no live process holding it; the missing-model
-            # recovery owns that inconsistency, not a duplicate load.
-            return False
-        return all(not copy.can_accept_job() for copy in copies)
-
     def _resident_only_on_ineligible_cards(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``job``'s model is resident somewhere, but on no card eligible to serve this job.
 
@@ -8862,14 +8472,13 @@ class InferenceScheduler:
         job_id = head_job.id_
         if job_id is None:
             return False
-        ttl = float(head_job.ttl) if head_job.ttl is not None else self._state.recent_job_ttl
-        if ttl is None or ttl <= 0:
-            return False
         tracked = self._job_tracker.get_tracked_job(job_id)
-        if tracked is None or tracked.time_popped is None:
-            return False
-        age_since_pop = self._clock() - tracked.time_popped
-        return age_since_pop > _DISPATCH_ANTI_STARVATION_TTL_FRACTION * ttl
+        return head_aged_past_anti_starvation(
+            now=self._clock(),
+            popped_at=tracked.time_popped if tracked is not None else None,
+            ttl=float(head_job.ttl) if head_job.ttl is not None else None,
+            fallback_ttl=self._state.recent_job_ttl,
+        )
 
     def _note_anti_starvation_override(self, head_job: ImageGenerateJobPopResponse) -> None:
         """Log once (edge-triggered) when the age override first suppresses resident-model bypass for a head."""
@@ -9087,7 +8696,9 @@ class InferenceScheduler:
 
         if (unserviceable_reason := self._unserviceable_job_reason(next_job)) is not None:
             if not information_only:
-                self._fault_unserviceable_job(next_job, unserviceable_reason)
+                self.executor.execute_commands(
+                    (FaultJob(next_job, FaultCause.UNSERVICEABLE, unserviceable_reason),),
+                )
             return None
 
         if self._card_runtimes:

@@ -213,12 +213,23 @@ This buys three things:
 
 ## The admission pipeline
 
-The preload loop walks the pending queue and, per job, runs a sequence of named gates. The pass uses
+The preload loop walks the pending queue in placement order and, per job, decides a gate ladder over the
+cycle's frozen
+[`SchedulingSnapshot`][horde_worker_regen.process_management.scheduling.admission.snapshot.SchedulingSnapshot].
+[`decide_preload_gates`][horde_worker_regen.process_management.scheduling.admission.preload.decide_preload_gates]
+returns a
+[`PreloadGatePlan`][horde_worker_regen.process_management.scheduling.admission.preload.PreloadGatePlan]: an
 [`AdmissionDecision`][horde_worker_regen.process_management.scheduling.governance.preload_admission.AdmissionDecision]
-as its shared vocabulary (continue, stop, admit, defer by RAM pressure/concurrency/budget, pre-stage,
-unserviceable). The scheduler keeps a tiny private adapter from those decisions to pass control, while
-the judgment calls live as pure functions in
-[`preload_admission`][horde_worker_regen.process_management.scheduling.governance.preload_admission]:
+(continue, stop, admit, defer by RAM pressure/concurrency/budget, pre-stage, unserviceable), the slot it
+chose, and the commands the decision requires (a job fault, a process cycle), which the
+[`PlanExecutor`][horde_worker_regen.process_management.scheduling.admission.executor.PlanExecutor] runs. A
+plan that faulted a job changes the queue the remaining decisions read, so the pass re-takes the snapshot
+behind it. The gates read the snapshot only; the judgment calls they compose live as pure functions in
+[`preload_admission`][horde_worker_regen.process_management.scheduling.governance.preload_admission]. The
+unserviceable gate judges by the same
+[`model_serviceability_verdicts`][horde_worker_regen.process_management.resources.model_serviceability.model_serviceability_verdicts]
+the pop offer runs, so a job the worker advertised for is never faulted by an arithmetic the offer did not
+see:
 
 1. **Target exclusion**: which slots this preload may not displace (the queued-model guard, model to
    process affinity, slots draining for RAM reclaim), composed by

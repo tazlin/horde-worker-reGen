@@ -146,6 +146,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     plausible_activation_ceiling_mb,
 )
 from horde_worker_regen.process_management.scheduling.admission import clearance as clearance_mod
+from horde_worker_regen.process_management.scheduling.admission import preload as preload_mod
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
 )
@@ -2529,9 +2530,9 @@ async def test_p_defect_reinjection_a_card_blind_residency_gate_wedges_both_card
     work, lanes that hold nothing to do, and a card with almost all of its memory free.
     """
     monkeypatch.setattr(
-        InferenceScheduler,
-        "_model_loaded_for_job",
-        lambda self, job, loaded_models: job.model in loaded_models,
+        preload_mod,
+        "model_loaded_for_job",
+        lambda snapshot, job_id, loaded_models: snapshot.queue.jobs[job_id].model in loaded_models,
     )
     world = _ineligible_card_world()
 

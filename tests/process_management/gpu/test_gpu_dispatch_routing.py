@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
@@ -17,10 +19,15 @@ from horde_worker_regen.process_management.ipc.messages import (
     ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.scheduling.admission.preload import (
+    duplicate_copy_may_serve,
+    select_preload_target,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -67,6 +74,18 @@ def _make_scheduler(
         max_inference_processes=4,
         lru=LRUCache(4),
     )
+
+
+async def _preload_target(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
+    """The slot the preload gates choose for a freshly tracked job, resolved back to its process record."""
+    await track_popped_job_async(scheduler._job_tracker, job)
+    process_id = select_preload_target(scheduler.snapshot(), str(job.id_), ())
+    return scheduler._process_map[process_id] if process_id is not None else None
+
+
+async def _duplicate_may_serve(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse) -> bool:
+    await track_popped_job_async(scheduler._job_tracker, job)
+    return duplicate_copy_may_serve(scheduler.snapshot(), str(job.id_))
 
 
 def _two_cards(*, card0_max_pixels: int, card1_max_pixels: int) -> dict:
@@ -253,7 +272,7 @@ def _empty_slot_with_vram(
 class TestPreloadCardPlacement:
     """A5.4: a fresh preload picks which eligible card to load onto (sticky, then least-loaded)."""
 
-    def test_places_on_the_least_loaded_eligible_card(self) -> None:
+    async def test_places_on_the_least_loaded_eligible_card(self) -> None:
         """With the model resident nowhere, the free slot on the card running fewer jobs wins."""
         process_map = ProcessMap(
             {
@@ -273,11 +292,11 @@ class TestPreloadCardPlacement:
             card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        chosen = scheduler._select_preload_process(job, [])
+        chosen = await _preload_target(scheduler, job)
         assert chosen is not None
         assert chosen.device_index == 1
 
-    def test_sticky_prefers_a_card_already_holding_the_model(self) -> None:
+    async def test_sticky_prefers_a_card_already_holding_the_model(self) -> None:
         """A card already serving the model is preferred for the preload even if it is the busier card."""
         process_map = ProcessMap(
             {
@@ -297,11 +316,11 @@ class TestPreloadCardPlacement:
             card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        chosen = scheduler._select_preload_process(job, [])
+        chosen = await _preload_target(scheduler, job)
         assert chosen is not None
         assert chosen.device_index == 0
 
-    def test_equal_load_prefers_card_with_more_measured_free_vram(self) -> None:
+    async def test_equal_load_prefers_card_with_more_measured_free_vram(self) -> None:
         """A safety/post-process context on card 0 should not attract a tied fresh preload."""
         process_map = ProcessMap(
             {
@@ -315,12 +334,12 @@ class TestPreloadCardPlacement:
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
 
-        chosen = scheduler._select_preload_process(job, [])
+        chosen = await _preload_target(scheduler, job)
 
         assert chosen is not None
         assert chosen.device_index == 1
 
-    def test_never_places_on_an_ineligible_card(self) -> None:
+    async def test_never_places_on_an_ineligible_card(self) -> None:
         """A card whose resolution limit excludes the job is never chosen, even when it is the only idle one."""
         process_map = ProcessMap(
             {
@@ -341,11 +360,11 @@ class TestPreloadCardPlacement:
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         assert scheduler._eligible_card_indices(job) == {0}
-        chosen = scheduler._select_preload_process(job, [])
+        chosen = await _preload_target(scheduler, job)
         assert chosen is not None
         assert chosen.device_index == 0
 
-    def test_single_gpu_uses_first_available_slot(self) -> None:
+    async def test_single_gpu_uses_first_available_slot(self) -> None:
         """With one card, placement is inactive and the first available slot is returned, as before."""
         process_map = ProcessMap({0: _empty_slot(0, device_index=0)})
         scheduler = _make_scheduler(
@@ -354,7 +373,7 @@ class TestPreloadCardPlacement:
         )
         assert scheduler._multi_gpu_routing_active is False
         job = make_job_pop_response(model="stable_diffusion")
-        chosen = scheduler._select_preload_process(job, [])
+        chosen = await _preload_target(scheduler, job)
         assert chosen is not None
         assert chosen.device_index == 0
 
@@ -508,7 +527,7 @@ class TestDuplicateCopyEscape:
             card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
         )
 
-    def test_all_copies_busy_allows_a_duplicate(self) -> None:
+    async def test_all_copies_busy_allows_a_duplicate(self) -> None:
         """Every eligible copy busy sampling: the queued job may seek a second copy on the idle card."""
         process_map = ProcessMap(
             {
@@ -520,9 +539,9 @@ class TestDuplicateCopyEscape:
         )
         scheduler = self._scheduler(process_map)
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        assert scheduler._duplicate_copy_may_serve(job) is True
+        assert await _duplicate_may_serve(scheduler, job) is True
 
-    def test_a_free_copy_forbids_a_duplicate(self) -> None:
+    async def test_a_free_copy_forbids_a_duplicate(self) -> None:
         """An accepting resident copy serves the job without any load; the single-copy rule holds."""
         process_map = ProcessMap(
             {
@@ -534,9 +553,9 @@ class TestDuplicateCopyEscape:
         )
         scheduler = self._scheduler(process_map)
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        assert scheduler._duplicate_copy_may_serve(job) is False
+        assert await _duplicate_may_serve(scheduler, job) is False
 
-    def test_a_loading_copy_forbids_a_duplicate(self) -> None:
+    async def test_a_loading_copy_forbids_a_duplicate(self) -> None:
         """A load in flight is about to provide a serving copy; doubling it is the waste the rule stops."""
         process_map = ProcessMap(
             {
@@ -553,9 +572,9 @@ class TestDuplicateCopyEscape:
             process_id=0,
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        assert scheduler._duplicate_copy_may_serve(job) is False
+        assert await _duplicate_may_serve(scheduler, job) is False
 
-    def test_single_gpu_never_duplicates(self) -> None:
+    async def test_single_gpu_never_duplicates(self) -> None:
         """On one card a duplicate is pure waste; the escape is multi-GPU only."""
         process_map = ProcessMap(
             {
@@ -566,9 +585,9 @@ class TestDuplicateCopyEscape:
         )
         scheduler = _make_scheduler(process_map=process_map, card_runtimes=None)
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        assert scheduler._duplicate_copy_may_serve(job) is False
+        assert await _duplicate_may_serve(scheduler, job) is False
 
-    def test_no_resident_copy_defers_to_the_ordinary_preload(self) -> None:
+    async def test_no_resident_copy_defers_to_the_ordinary_preload(self) -> None:
         """With no copy anywhere the ordinary preload path owns the job; the escape stays out of it."""
         process_map = ProcessMap(
             {
@@ -578,4 +597,4 @@ class TestDuplicateCopyEscape:
         )
         scheduler = self._scheduler(process_map)
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        assert scheduler._duplicate_copy_may_serve(job) is False
+        assert await _duplicate_may_serve(scheduler, job) is False

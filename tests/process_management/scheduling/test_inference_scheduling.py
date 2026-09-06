@@ -34,6 +34,12 @@ from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
+from horde_worker_regen.process_management.scheduling.admission import preload
+from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob
+from horde_worker_regen.process_management.scheduling.admission.preload import (
+    PreloadPassControl,
+    decide_preload_gates,
+)
 from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     _AFFINITY_MAX_SKIPS,
     AffinitySkipState,
@@ -170,14 +176,15 @@ class TestModelServiceabilityAdmission:
         assert job.id_ is not None
         await track_popped_job_async(scheduler._job_tracker, job)
 
-        outcome = scheduler._attempt_preload_for_job(job, head_job=job, loaded_models=set())
+        job_id = str(job.id_)
+        plan = decide_preload_gates(scheduler.snapshot(), job_id, head_job_id=job_id, loaded_models=frozenset())
 
-        assert outcome.name == "NEXT_JOB"
-        latest = scheduler.head_admission.last_preload_admission
-        assert latest is not None
-        assert latest.decision is AdmissionDecision.UNSERVICEABLE
+        assert plan.decision is AdmissionDecision.UNSERVICEABLE
+        assert plan.pass_control is PreloadPassControl.NEXT_JOB
+        assert plan.commands == (FaultJob(job, FaultCause.UNSERVICEABLE, plan.reason),)
         # The doomed job is faulted terminally through the existing fault machinery before any child preload:
         # its stage moves to PENDING_SUBMIT and the tracked job info carries the faulted generation state.
+        scheduler.executor.execute_commands(plan.commands)
         assert scheduler._job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
         assert scheduler._job_tracker.jobs_lookup[job].state is GENERATION_STATE.faulted
         assert (
@@ -210,11 +217,11 @@ class TestModelServiceabilityAdmission:
         assert job.id_ is not None
         await track_popped_job_async(scheduler._job_tracker, job)
 
-        outcome = scheduler._attempt_preload_for_job(job, head_job=job, loaded_models=set())
+        job_id = str(job.id_)
+        plan = decide_preload_gates(scheduler.snapshot(), job_id, head_job_id=job_id, loaded_models=frozenset())
 
-        assert outcome.name == "PRELOAD_SENT"
-        latest = scheduler.head_admission.last_preload_admission
-        assert latest is not None and latest.decision is AdmissionDecision.ADMIT
+        assert plan.admits and plan.commands == ()
+        assert plan.target_process_id == 0
         assert scheduler._job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
 
 
@@ -2753,24 +2760,33 @@ class TestCardAwareResidencyGate:
         )
         return scheduler, process_map
 
-    def test_a_copy_on_an_ineligible_card_is_not_already_loaded(self) -> None:
+    @staticmethod
+    async def _loaded_for(
+        scheduler: InferenceScheduler,
+        job: ImageGenerateJobPopResponse,
+        loaded_models: frozenset[str | None],
+    ) -> bool:
+        await track_popped_job_async(scheduler._job_tracker, job)
+        return preload.model_loaded_for_job(scheduler.snapshot(), str(job.id_), loaded_models)
+
+    async def test_a_copy_on_an_ineligible_card_is_not_already_loaded(self) -> None:
         """The oversized job's model is resident only on the card whose ceiling excludes it."""
         scheduler, _process_map = self._scheduler(resident_card=1)
         job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
         assert scheduler._eligible_card_indices(job) == {0}
-        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is False
+        assert await self._loaded_for(scheduler, job, frozenset({"stable_diffusion"})) is False
 
-    def test_a_copy_on_an_eligible_card_is_already_loaded(self) -> None:
+    async def test_a_copy_on_an_eligible_card_is_already_loaded(self) -> None:
         """The same copy counts for a job the small card can serve, and for one on the large card."""
         scheduler, _process_map = self._scheduler(resident_card=1)
         small_job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        assert scheduler._model_loaded_for_job(small_job, {"stable_diffusion"}) is True
+        assert await self._loaded_for(scheduler, small_job, frozenset({"stable_diffusion"})) is True
 
         scheduler, _process_map = self._scheduler(resident_card=0)
         oversized = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
-        assert scheduler._model_loaded_for_job(oversized, {"stable_diffusion"}) is True
+        assert await self._loaded_for(scheduler, oversized, frozenset({"stable_diffusion"})) is True
 
-    def test_a_load_in_flight_counts_only_on_the_card_it_is_landing_on(self) -> None:
+    async def test_a_load_in_flight_counts_only_on_the_card_it_is_landing_on(self) -> None:
         """A LOADING map entry is read through the device its owning process is pinned to."""
         scheduler, _process_map = self._scheduler(resident_card=None)
         job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
@@ -2779,19 +2795,19 @@ class TestCardAwareResidencyGate:
             load_state=ModelLoadState.LOADING,
             process_id=1,
         )
-        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is False
+        assert await self._loaded_for(scheduler, job, frozenset({"stable_diffusion"})) is False
 
         scheduler._horde_model_map.update_entry("stable_diffusion", process_id=0)
-        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is True
+        assert preload.model_loaded_for_job(scheduler.snapshot(), str(job.id_), frozenset({"stable_diffusion"}))
 
-    def test_a_record_whose_process_is_gone_is_not_a_copy(self) -> None:
+    async def test_a_record_whose_process_is_gone_is_not_a_copy(self) -> None:
         """A map entry naming a process the pool no longer holds records no residency this job can use."""
         scheduler, process_map = self._scheduler(resident_card=1)
         process_map.pop(1)
         job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
-        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is False
+        assert await self._loaded_for(scheduler, job, frozenset({"stable_diffusion"})) is False
 
-    def test_single_gpu_keeps_the_card_blind_membership_test(self) -> None:
+    async def test_single_gpu_keeps_the_card_blind_membership_test(self) -> None:
         """One card leaves routing inactive, so the gate is the plain set membership it has always been."""
         process_map = ProcessMap({0: make_mock_process_info(0, model_name="stable_diffusion", device_index=0)})
         scheduler = _make_inference_scheduler(
@@ -2801,8 +2817,8 @@ class TestCardAwareResidencyGate:
         assert scheduler._multi_gpu_routing_active is False
         # A resolution no card would serve: the single-GPU answer still comes from the set alone.
         job = make_job_pop_response(model="stable_diffusion", width=1024, height=1024)
-        assert scheduler._model_loaded_for_job(job, {"stable_diffusion"}) is True
-        assert scheduler._model_loaded_for_job(job, set()) is False
+        assert await self._loaded_for(scheduler, job, frozenset({"stable_diffusion"})) is True
+        assert preload.model_loaded_for_job(scheduler.snapshot(), str(job.id_), frozenset()) is False
 
     async def test_the_head_is_preloaded_onto_the_card_that_can_serve_it(self) -> None:
         """With the only copy on an ineligible card, the pass stages a second one onto the eligible card."""

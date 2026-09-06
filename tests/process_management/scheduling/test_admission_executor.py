@@ -5,14 +5,15 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
     ActuatorCommandKind,
     HeadReclaimContext,
 )
-from tests.process_management.conftest import make_mock_bridge_data, make_mock_process_info
+from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob, ReplaceProcess
+from tests.process_management.conftest import make_job_pop_response, make_mock_bridge_data, make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 _HEAD = HeadReclaimContext(model="model_a", target_process_id=0, max_resident=1)
@@ -81,3 +82,49 @@ def test_a_reduction_for_a_vanished_head_is_a_no_op() -> None:
 
     assert scheduler.reduce_live_contexts(None, head=gone) is False
     scale.assert_not_called()
+
+
+class TestSchedulerCommands:
+    """Each admission command maps to one collaborator call."""
+
+    async def test_an_unserviceable_fault_is_a_terminal_resource_failure(self) -> None:
+        """The fault reaches the tracker as a terminal resource failure carrying its reason."""
+        scheduler = _scheduler()
+        job = make_job_pop_response(model="model_a")
+        await scheduler._job_tracker.record_popped_job(job)
+
+        scheduler.executor.execute_commands((FaultJob(job, FaultCause.UNSERVICEABLE, "cannot fit"),))
+
+        assert job.id_ is not None
+        assert scheduler._job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+        assert "cannot fit" in scheduler._job_tracker.job_faults[job.id_][0].ref
+
+    async def test_a_quarantine_fault_is_terminal(self) -> None:
+        """A quarantined model's job is faulted without retry."""
+        scheduler = _scheduler()
+        job = make_job_pop_response(model="model_a")
+        await scheduler._job_tracker.record_popped_job(job)
+
+        scheduler.executor.execute_commands((FaultJob(job, FaultCause.QUARANTINED, "model load quarantined"),))
+
+        assert job.id_ is not None
+        assert scheduler._job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+
+    def test_a_replacement_goes_through_the_lifecycle_as_an_intentional_reclaim(self) -> None:
+        """The child is cycled by the lifecycle manager as an intentional reclaim."""
+        scheduler = _scheduler()
+
+        scheduler.executor.execute_commands((ReplaceProcess(1),))
+
+        scheduler._process_lifecycle._replace_inference_process.assert_called_once_with(
+            scheduler._process_map[1],
+            intentional_reclaim=True,
+        )
+
+    def test_a_replacement_of_a_departed_slot_is_skipped(self) -> None:
+        """A slot that left the pool before execution is not cycled."""
+        scheduler = _scheduler()
+
+        scheduler.executor.execute_commands((ReplaceProcess(9),))
+
+        scheduler._process_lifecycle._replace_inference_process.assert_not_called()

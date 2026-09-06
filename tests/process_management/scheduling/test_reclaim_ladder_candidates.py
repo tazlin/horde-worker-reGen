@@ -13,6 +13,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
+from horde_worker_regen.process_management.scheduling.admission.preload import select_preload_target
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -459,8 +460,14 @@ class TestPreloadDoesNotDisplaceTheHeadsCopy:
 
     _HEAD_MODEL = "head-model"
     _NEXT_MODEL = "next-model"
+    _NOW = 10_000.0
 
-    async def _scheduler(self, *, spare_slots: int) -> tuple[InferenceScheduler, object]:
+    async def _scheduler(
+        self,
+        *,
+        spare_slots: int,
+        head_age_seconds: float = 5.0,
+    ) -> tuple[InferenceScheduler, object]:
         holder = make_mock_process_info(1, model_name=self._HEAD_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
         processes = {1: holder}
         for spare_id in range(2, 2 + spare_slots):
@@ -471,36 +478,37 @@ class TestPreloadDoesNotDisplaceTheHeadsCopy:
             )
         job_tracker = JobTracker()
         head = make_job_pop_response(model=self._HEAD_MODEL)
-        await track_popped_job_async(job_tracker, head)
+        # The head's age since pop, against a 100 s ttl, is what decides whether it is starving.
+        await track_popped_job_async(job_tracker, head, time_popped=self._NOW - head_age_seconds)
         follower = make_job_pop_response(model=self._NEXT_MODEL)
         await track_popped_job_async(job_tracker, follower)
         scheduler = _make_inference_scheduler(
             process_map=ProcessMap(processes),
             job_tracker=job_tracker,
             bridge_data=make_mock_bridge_data(),
+            clock=lambda: self._NOW,
         )
+        scheduler._state.recent_job_ttl = 100.0
         return scheduler, follower
+
+    @staticmethod
+    def _target(scheduler: InferenceScheduler, follower: object) -> int | None:
+        return select_preload_target(scheduler.snapshot(), str(follower.id_), ())  # type: ignore[attr-defined]
 
     async def test_a_spare_slot_takes_the_preload_instead(self) -> None:
         """With anywhere else to put it, the head's copy is never the placement."""
         scheduler, follower = await self._scheduler(spare_slots=1)
 
-        selected = scheduler._select_preload_process(follower, [])
-
-        assert selected is not None and selected.process_id == 2
+        assert self._target(scheduler, follower) == 2
 
     async def test_a_starved_head_keeps_its_only_slot(self) -> None:
         """With no spare slot the placement is refused outright while the head is starving."""
-        scheduler, follower = await self._scheduler(spare_slots=0)
-        scheduler._head_aged_past_anti_starvation = lambda _job: True  # type: ignore[method-assign]
+        scheduler, follower = await self._scheduler(spare_slots=0, head_age_seconds=60.0)
 
-        assert scheduler._select_preload_process(follower, []) is None
+        assert self._target(scheduler, follower) is None
 
     async def test_an_unstarved_head_on_a_single_slot_still_swaps(self) -> None:
         """The ordinary one-slot worker keeps swapping models between jobs, as it always has."""
-        scheduler, follower = await self._scheduler(spare_slots=0)
-        scheduler._head_aged_past_anti_starvation = lambda _job: False  # type: ignore[method-assign]
+        scheduler, follower = await self._scheduler(spare_slots=0, head_age_seconds=5.0)
 
-        selected = scheduler._select_preload_process(follower, [])
-
-        assert selected is not None and selected.process_id == 1
+        assert self._target(scheduler, follower) == 1

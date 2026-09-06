@@ -59,6 +59,14 @@ class TestSlotSnapshot:
         assert slot.is_unoccupied == process_info.is_unoccupied()
         assert slot.current_job_id is None
         assert slot.resident_weight_models == frozenset({"sd"})
+        assert slot.capabilities == process_info.capabilities
+        assert slot.reserved_for_disaggregation is False
+
+    def test_a_pinned_sampler_is_marked_reserved(self) -> None:
+        """The disaggregation pin is read from the process map, not the record."""
+        process_info = make_mock_process_info(3, model_name="sd")
+        slot = snapshot_slot(process_info, HordeModelMap(root={}), now=1_000.0, reserved_for_disaggregation=True)
+        assert slot.reserved_for_disaggregation is True
 
 
 class TestSchedulingSnapshot:
@@ -115,6 +123,14 @@ class TestSchedulingSnapshot:
         assert snapshot.slots[0].resident_weight_models == frozenset({"sd"})
         assert snapshot.queue.jobs[head_id].tracked is True
         assert snapshot.queue.jobs[head_id].measured_attempt_devices == frozenset()
+        assert snapshot.queue.jobs[head_id].requires_aux_preparation is False
+        assert snapshot.queue.jobs[head_id].popped_at is not None
+        assert snapshot.queue.jobs[head_id].unserviceable_reason is None
+        assert card.exclusive_job_in_progress is False
+        assert snapshot.draining_process_ids == frozenset()
+        assert snapshot.shutting_down is False
+        assert snapshot.max_concurrent_inference_processes == 1
+        assert snapshot.host_ram.pressure.under_pressure is False, "a live reading stands in before the first tick"
         assert card.config is scheduler._runtime_config.bridge_data  # type: ignore[attr-defined]
         assert snapshot.config_for(None) is card.config
         assert snapshot.safety_footprint_mb > 0.0

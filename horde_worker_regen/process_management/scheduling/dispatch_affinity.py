@@ -42,6 +42,35 @@ _AFFINITY_BUDGET_MIN_SECONDS = 15.0
 _AFFINITY_BUDGET_MAX_SECONDS = 45.0
 """Ceiling so a long ttl does not let the head sit bypassed for an unbounded stretch."""
 
+ANTI_STARVATION_TTL_FRACTION = 0.3
+"""Fraction of a queued head's ttl past which resident-model bypass yields so the head's own preload runs.
+
+The affinity skip budget measures from the head's first bypass, so it does not bound the head's total age
+since it was popped: a head that waited in queue before its first skip can still be bypassed well past a
+winnable window, and by the time it dispatches the horde has aborted it as too slow. This absolute age gate,
+anchored at ``time_popped`` and the job's own ttl, closes that gap independently of the skip budget. Sized
+below the affinity budget fraction so the head reclaims its slot with enough of the ttl left for its own
+staging, sampling, and submission."""
+
+
+def head_aged_past_anti_starvation(
+    *,
+    now: float,
+    popped_at: float | None,
+    ttl: float | None,
+    fallback_ttl: float | None,
+) -> bool:
+    """Whether a queued head has waited past the anti-starvation fraction of its ttl and must not be bypassed.
+
+    Measures the head's absolute age since pop against its own ttl (``ttl`` when the horde supplied one, else
+    ``fallback_ttl``, the most recent ttl the worker saw). False when neither a ttl nor a pop time is known, so
+    a job the horde gave no ttl keeps the pure skip-budget behaviour and is never forced off the bypass path.
+    """
+    effective_ttl = ttl if ttl is not None else fallback_ttl
+    if effective_ttl is None or effective_ttl <= 0 or popped_at is None:
+        return False
+    return now - popped_at > ANTI_STARVATION_TTL_FRACTION * effective_ttl
+
 
 @dataclass(frozen=True)
 class AffinitySkipState:

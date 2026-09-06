@@ -8,6 +8,7 @@ every remedy the worker takes passes through one place.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Protocol
 
 from loguru import logger
@@ -15,6 +16,7 @@ from loguru import logger
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
@@ -24,6 +26,12 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
     HeadReclaimContext,
     VramActuator,
+)
+from horde_worker_regen.process_management.scheduling.admission.commands import (
+    FaultCause,
+    FaultJob,
+    ReplaceProcess,
+    SchedulerCommand,
 )
 from horde_worker_regen.process_management.scheduling.governance import (
     ClearProcessDraining,
@@ -57,6 +65,7 @@ class ExecutionHost(VramActuator, Protocol):
     _state: WorkerState
     _process_map: ProcessMap
     _process_lifecycle: ProcessLifecycleManager
+    _job_tracker: JobTracker
     _runtime_config: RuntimeConfig
     _max_inference_processes: int
     _last_ram_verdict: RamPressureVerdict | None
@@ -94,6 +103,32 @@ class PlanExecutor:
     def __init__(self, host: ExecutionHost) -> None:
         """Bind the executor to the host it acts through."""
         self._host = host
+
+    def execute_commands(self, commands: Iterable[SchedulerCommand]) -> None:
+        """Run the actions an admission plan returned, in order.
+
+        A fault goes through the tracker's fault path so the horde reissues the job; a process replacement goes
+        through the lifecycle manager as an intentional reclaim. A replacement whose slot is already gone is
+        skipped: the process exited between snapshot and execution and nothing remains to cycle.
+        """
+        for command in commands:
+            match command:
+                case FaultJob(job=job, cause=FaultCause.UNSERVICEABLE, reason=reason):
+                    logger.warning(f"Faulting unserviceable job {job.id_} for model {job.model}: {reason}")
+                    self._host._job_tracker.handle_job_fault_now(
+                        job,
+                        is_resource_failure=True,
+                        retryable=False,
+                        fault_reason=reason,
+                    )
+                case FaultJob(job=job, cause=FaultCause.QUARANTINED):
+                    logger.warning(f"Skipping preload of quarantined model {job.model}; faulting its job for reissue.")
+                    self._host._job_tracker.handle_job_fault_now(job, retryable=False)
+                case ReplaceProcess(process_id=process_id):
+                    process_info = self._host._process_map.get(process_id)
+                    if process_info is None:
+                        continue
+                    self._host._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
 
     def execute_actuations(
         self,

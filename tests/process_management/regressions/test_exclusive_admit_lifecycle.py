@@ -2,7 +2,7 @@
 
 An exclusive admit suppresses the whole device: `JobTracker.has_exclusive_job_in_progress` caps
 concurrent dispatch at the running job and holds every other model's preload
-(`InferenceScheduler._attempt_preload_for_job`). A suppression that broad must provably release, or a
+(`admission.preload.decide_preload_gates`). A suppression that broad must provably release, or a
 single job wedges the worker harder than the over-commit it was isolating. The release is structural
 (the flag is only consulted for jobs in ``PENDING_INFERENCE`` / ``INFERENCE_IN_PROGRESS``), so these
 tests pin the stage transitions that carry it:
@@ -10,7 +10,7 @@ tests pin the stage transitions that carry it:
 - a terminal fault or a completed generation releases the suppression immediately;
 - a retryable fault keeps it, because the bounded degraded retry of an over-budget job is meant to
   re-run isolated (see ``TrackedJob.admitted_exclusive``), and the job re-enters the covered stages;
-- the exclusive job's own preload passes the hold (the exemption in ``_attempt_preload_for_job``), so
+- the exclusive job's own preload passes the hold (the exemption in ``decide_preload_gates``), so
   the job that owns the device can always stage its weights onto it.
 
 The direct over-budget tag and log contract is also pinned here: it reports the decided isolation, the signal
@@ -29,6 +29,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import (
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
+from horde_worker_regen.process_management.scheduling.admission.preload import decide_preload_gates
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -156,20 +157,20 @@ class TestExclusivePreloadGate:
         sibling_job = make_job_pop_response(model=_SIBLING_MODEL)
         await job_tracker.record_popped_job(sibling_job)
 
-        scheduler._attempt_preload_for_job(sibling_job, head_job=sibling_job, loaded_models=set())
+        job_id = str(sibling_job.id_)
+        plan = decide_preload_gates(scheduler.snapshot(), job_id, head_job_id=job_id, loaded_models=frozenset())
 
-        assert scheduler.head_admission.last_preload_admission is not None
-        assert scheduler.head_admission.last_preload_admission.decision is AdmissionDecision.EXCLUSIVE_IN_PROGRESS
+        assert plan.decision is AdmissionDecision.EXCLUSIVE_IN_PROGRESS
 
     async def test_exclusive_jobs_own_preload_passes_the_hold(self, job_tracker: JobTracker) -> None:
         """The exclusive job's own preload proceeds past the hold; the device is being held for it."""
         scheduler = _make_scheduler(job_tracker)
         exclusive_job = await _exclusive_job_in_progress(job_tracker)
 
-        scheduler._attempt_preload_for_job(exclusive_job, head_job=exclusive_job, loaded_models=set())
+        job_id = str(exclusive_job.id_)
+        plan = decide_preload_gates(scheduler.snapshot(), job_id, head_job_id=job_id, loaded_models=frozenset())
 
-        assert scheduler.head_admission.last_preload_admission is not None
-        assert scheduler.head_admission.last_preload_admission.decision is not AdmissionDecision.EXCLUSIVE_IN_PROGRESS
+        assert plan.decision is not AdmissionDecision.EXCLUSIVE_IN_PROGRESS
 
 
 class TestOverbudgetAdmitLogContract:
