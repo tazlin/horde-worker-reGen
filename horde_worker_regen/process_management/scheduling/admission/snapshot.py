@@ -43,7 +43,10 @@ from horde_worker_regen.process_management.scheduling.ledgers.head_admission imp
     LatestPreloadAdmission,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import RamReclaimLedger
-from horde_worker_regen.process_management.scheduling.ledgers.retention import RetentionLedger
+from horde_worker_regen.process_management.scheduling.ledgers.retention import (
+    RETENTION_STALE_HOLD_SECONDS,
+    RetentionLedger,
+)
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SafetyPlacementLedger
 
 
@@ -77,6 +80,9 @@ class SlotSnapshot:
     held_component_count: int
     resident_weight_models: frozenset[str]
     """Models whose weights are in VRAM on this slot right now, as the model map answers it."""
+    aimdo_mb: int | None
+    parked_preload: bool
+    """Whether the slot has sat on a completed preload past the retention stale horizon with no job."""
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,8 @@ class CardSnapshot:
     reserved_by_pid: Mapping[int, float]
     """The live GPU processes' measured allocator reservation (MB) by process id, the figure planned
     reserve charges decay against."""
+    foreign_floor_mb: float | None
+    """The sustained VRAM the OS, desktop or other processes hold on the card, or None when unmeasured."""
 
 
 @dataclass(frozen=True)
@@ -115,6 +123,8 @@ class JobSnapshot:
     admitted_over_budget: bool
     aux_models_prepared: bool
     degraded_dispatch_pending: bool
+    disaggregation_class_eligible: bool
+    """Whether the job belongs to the disaggregation class (sampler-only pricing), by the wired predicate."""
     tracked: bool
     """Whether the tracker holds a record for the job (accepted work rather than a speculative offer)."""
     measured_attempt_devices: frozenset[int | None]
@@ -130,6 +140,8 @@ class QueueSnapshot:
     """The queue in placement order, with the in-progress set and each job's gate facts."""
 
     pending_in_placement_order: tuple[str, ...]
+    pending_in_pop_order: tuple[str, ...]
+    """The pending queue in the order the tracker holds it, which the lookahead and demand reads use."""
     in_progress: tuple[str, ...]
     jobs: Mapping[str, JobSnapshot]
     payloads: Mapping[str, ImageGenerateJobPopResponse]
@@ -269,6 +281,16 @@ class SchedulingSnapshot:
     vram_reserve_mb: float
     safety_footprint_mb: float
     """The device VRAM (MB) the safety process costs while it sits on the GPU: the one safety price."""
+    safety_on_gpu_permitted: bool
+    context_constant_mb: float
+    """The per-process CUDA-context charge (MB) the committed ledger and the learned store net out."""
+    max_inference_processes: int
+    committed_vram_reserve_mb: float
+    """The reserve ledger's combined committed VRAM (MB) across every flow, charged against any card."""
+    models_with_results: frozenset[str]
+    """Models that have completed at least one job on this worker, the trust gate for measured footprints."""
+    whole_card_held_models: frozenset[str]
+    """Models holding a whole-card residency somewhere, which pressure eviction never takes."""
     ledgers: LedgerViews
     services: PricingServices
 
@@ -296,7 +318,7 @@ class SchedulingSnapshot:
         return entry is not None and entry.load_state is ModelLoadState.LOADED_IN_VRAM
 
 
-def snapshot_slot(process_info: HordeProcessInfo, horde_model_map: HordeModelMap) -> SlotSnapshot:
+def snapshot_slot(process_info: HordeProcessInfo, horde_model_map: HordeModelMap, *, now: float) -> SlotSnapshot:
     """Freeze one process record, answering weight residency through the model map for the models it names."""
     job = process_info.current_inference_job()
     candidates = {name for name, info in horde_model_map.root.items() if info.process_id == process_info.process_id}
@@ -326,6 +348,8 @@ def snapshot_slot(process_info: HordeProcessInfo, horde_model_map: HordeModelMap
         resident_weight_models=frozenset(
             name for name in candidates if horde_model_map.weights_resident_on_process(name, process_info)
         ),
+        aimdo_mb=process_info.process_aimdo_mb,
+        parked_preload=process_info.is_parked_preload(now=now, dwell_seconds=RETENTION_STALE_HOLD_SECONDS),
     )
 
 
@@ -392,11 +416,17 @@ def build_scheduling_snapshot(
     governor_state: Callable[[int | None], GovernorState],
     growth_held: Callable[[int | None], bool],
     arbiter_state: Callable[[int | None], DeviceVramState | None],
+    foreign_floor_mb: Callable[[int | None], float | None],
     eligible_cards: Callable[[ImageGenerateJobPopResponse], set[int]],
+    disaggregation_class_eligible: Callable[[ImageGenerateJobPopResponse], bool],
     host_ram: HostRamSnapshot,
     budget_active: bool,
     vram_reserve_mb: float,
     safety_footprint_mb: float,
+    safety_on_gpu_permitted: bool,
+    context_constant_mb: float,
+    max_inference_processes: int,
+    models_with_results: frozenset[str],
     ledgers: LedgerViews,
 ) -> SchedulingSnapshot:
     """Freeze the worker for one cycle.
@@ -435,10 +465,12 @@ def build_scheduling_snapshot(
                 for pid, (device, reserved) in reserved_by_pid_all.items()
                 if key is None or device == key
             },
+            foreign_floor_mb=foreign_floor_mb(key),
         )
 
     in_progress_jobs = list(job_tracker.jobs_in_progress)
     pending_jobs = list(pending_in_placement_order)
+    pop_order = tuple(key for key in (job_key(job) for job in job_tracker.jobs_pending_inference) if key)
     payloads: dict[str, ImageGenerateJobPopResponse] = {}
     jobs: dict[str, JobSnapshot] = {}
     in_progress_ids: list[str] = []
@@ -461,6 +493,7 @@ def build_scheduling_snapshot(
             admitted_over_budget=job_tracker.is_admitted_over_budget(job),
             aux_models_prepared=job_tracker.are_job_aux_models_prepared(job),
             degraded_dispatch_pending=job_tracker.is_degraded_dispatch_pending(job),
+            disaggregation_class_eligible=disaggregation_class_eligible(job),
             tracked=job.id_ is not None and job_tracker.get_tracked_job(job.id_) is not None,
             measured_attempt_devices=frozenset(
                 device for device in card_keys if job_tracker.is_measured_attempt_on_device(job, device)
@@ -498,9 +531,13 @@ def build_scheduling_snapshot(
         now=now,
         multi_gpu_routing_active=multi_gpu,
         cards=cards,
-        slots={process_id: snapshot_slot(info, horde_model_map) for process_id, info in sorted(process_map.items())},
+        slots={
+            process_id: snapshot_slot(info, horde_model_map, now=now)
+            for process_id, info in sorted(process_map.items())
+        },
         queue=QueueSnapshot(
             pending_in_placement_order=tuple(pending_ids),
+            pending_in_pop_order=pop_order,
             in_progress=tuple(in_progress_ids),
             jobs=jobs,
             payloads=payloads,
@@ -515,6 +552,14 @@ def build_scheduling_snapshot(
         budget_active=budget_active,
         vram_reserve_mb=vram_reserve_mb,
         safety_footprint_mb=safety_footprint_mb,
+        safety_on_gpu_permitted=safety_on_gpu_permitted,
+        context_constant_mb=context_constant_mb,
+        max_inference_processes=max_inference_processes,
+        committed_vram_reserve_mb=reserve_ledger.total_vram_mb(),
+        models_with_results=models_with_results,
+        whole_card_held_models=frozenset(
+            state.model for _, state in whole_card_ledger.held() if state.model is not None
+        ),
         ledgers=ledgers,
         services=PricingServices(
             model_metadata=model_metadata,

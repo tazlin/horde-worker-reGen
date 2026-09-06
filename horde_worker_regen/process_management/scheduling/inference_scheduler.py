@@ -5206,7 +5206,12 @@ class InferenceScheduler:
             governor_state=self.governor_state,
             growth_held=self.is_vram_growth_held,
             arbiter_state=arbiter_state,
+            foreign_floor_mb=lambda device_index: self._foreign_vram_floor.current_floor_mb(
+                device_index if device_index is not None else 0,
+                now=self._foreign_floor_clock(),
+            ),
             eligible_cards=self._eligible_card_indices,
+            disaggregation_class_eligible=self._is_disaggregation_class_eligible,
             host_ram=HostRamSnapshot(
                 available_mb=self._measured_available_ram_mb(),
                 total_mb=self._measured_total_ram_mb(),
@@ -5217,6 +5222,18 @@ class InferenceScheduler:
             budget_active=self._budget_active(),
             vram_reserve_mb=self._vram_budget.reserve_mb,
             safety_footprint_mb=self._safety_footprint_mb(),
+            safety_on_gpu_permitted=self._safety_on_gpu_permitted,
+            context_constant_mb=self.resolved_context_constant_mb(),
+            max_inference_processes=self._max_inference_processes,
+            models_with_results=frozenset(
+                model
+                for model in {
+                    *(info.loaded_horde_model_name for info in self._process_map.values()),
+                    *(job.model for job in self._job_tracker.jobs_pending_inference),
+                    *(job.model for job in self._job_tracker.jobs_in_progress),
+                }
+                if model is not None and self._job_tracker.has_model_produced_result(model)
+            ),
             ledgers=snapshot_ledgers(
                 head_admission=self._head_admission,
                 dispatch_holds=self._dispatch_holds,

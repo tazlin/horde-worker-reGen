@@ -49,7 +49,7 @@ class TestSlotSnapshot:
         process_info.last_control_flag = HordeControlFlag.PRELOAD_MODEL
         model_map = HordeModelMap(root={})
         model_map.update_entry(horde_model_name="sd", load_state=ModelLoadState.LOADED_IN_VRAM, process_id=3)
-        slot = snapshot_slot(process_info, model_map)
+        slot = snapshot_slot(process_info, model_map, now=1_000.0)
         assert (slot.process_id, slot.model, slot.state) == (3, "sd", HordeProcessState.WAITING_FOR_JOB)
         assert (slot.reserved_mb, slot.allocated_mb, slot.ram_usage_bytes) == (4000, 3500, 5 * 1024 * 1024)
         assert slot.retained_resident_model == "sd"
