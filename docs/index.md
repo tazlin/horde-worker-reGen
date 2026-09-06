@@ -85,6 +85,9 @@ Want to know how it works under the hood, or contribute a change? The
 18. **[Updates and bootstrap](explanation/updates_and_bootstrap.md)**: how source,
     dependencies, and operator data converge safely across managed, git, and
     legacy installations.
+19. **[Admission pipeline](explanation/admission_pipeline.md)**: how preload,
+    dispatch and clearance decide over a frozen per-cycle snapshot and return
+    plans the executor runs; where each decision lives and how to change one.
 
 The **[codebase map](reference/codebase-map.md)** is a file-to-responsibility
 quick reference, and the auto-generated API reference for every module lives

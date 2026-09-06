@@ -35,6 +35,10 @@ children over IPC. See [Architecture](docs/explanation/architecture.md).
   [Resilience and recovery](docs/explanation/resilience_and_recovery.md),
   [Model downloads](docs/explanation/model_downloads.md),
   [Frontend and durable state](docs/explanation/frontend_and_state.md).
+- [Admission pipeline](docs/explanation/admission_pipeline.md): where each preload, dispatch and
+  clearance decision lives, what it reads, and how to change one;
+  [Resource governance](docs/explanation/resource_governance.md) and
+  [VRAM arbiter](docs/explanation/vram_arbiter.md) for the memory machinery behind it.
 
 ## The map (most important files & classes)
 
@@ -48,7 +52,11 @@ never reassigned), coordinated by `HordeWorkerProcessManager`.
 | Single source of truth for job stages/faults/counters | `job_tracker.py` · `JobTracker` (`JobStage`, `TrackedJob`) |
 | Pop "gauntlet" of gates + model selection | `job_popper.py` · `JobPopper` |
 | Pop-rate / megapixelstep throttling | `pop_throttler.py` · `PopThrottler` |
-| Decide which model/job to preload & launch | `inference_scheduler.py` · `InferenceScheduler` |
+| Decide which model/job to preload & launch (the act site, the ticks, the actuators) | `scheduling/inference_scheduler.py` · `InferenceScheduler` |
+| Admission decisions over a frozen per-cycle snapshot: preload gates, pricing, the materialisation request, clearance, the executor | `scheduling/admission/` · `SchedulingSnapshot`, `decide_preload_gates`, `price_preload`, `decide_clearance_admit`, `PlanExecutor` |
+| Scheduler state ledgers: retention, safety placement, RAM reclaim, head admission, dispatch holds | `scheduling/ledgers/` · `RetentionLedger`, `SafetyPlacementLedger`, `RamReclaimLedger`, `HeadAdmissionLedger`, `DispatchHoldLedger` |
+| Host RAM governance and the whole-card residency machine | `scheduling/governance/` · `ResourceGovernor`, `WholeCardResidencyLedger` |
+| Model serviceability (one verdict for the pop offer and the preload gate) | `resources/model_serviceability.py` · `model_serviceability_verdicts` |
 | Drain child→parent queue, apply results | `message_dispatcher.py` · `MessageDispatcher` |
 | Dispatch completed images to safety | `safety_orchestrator.py` · `SafetyOrchestrator` |
 | Upload to R2 + submit to API | `job_submitter.py` · `JobSubmitter` |
@@ -194,6 +202,16 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
 
 These fail as interactions, not as units, so component tests stay green through most of what matters.
 
+- **Decide over the snapshot, act through the executor.** Preload, dispatch and clearance admission are
+  decisions over a frozen per-cycle `SchedulingSnapshot` that return plans (`scheduling/admission/`);
+  the `PlanExecutor` is the one act site. A new gate reads a snapshot field (add it to the builder and
+  pin it in `test_scheduling_snapshot.py`) and returns a decision or a command; it never reads a
+  collaborator or sends a message. Where a decision needs to see an action's result, re-snapshot behind
+  the action instead of reading live state. See [Admission pipeline](docs/explanation/admission_pipeline.md).
+- **The golden traces are the parity gate for scheduler refactors.**
+  `tests/process_management/liveness/test_golden_traces.py` diffs ten dispatch-world scenarios against
+  `golden/*.json`; an intended behaviour change regenerates them with `-m golden_regen` and explains the
+  diff in the commit. Anything else the diff surfaces is a regression.
 - **Test in the simulator first.** `tests/process_management/liveness/_dispatch_world.py` runs the
   real scheduler, governor and ladder over fake children with a conserved VRAM ledger, keyed per card so a
   multi-card row states each card's own total, tenants and measured free (one entry on a single card). Changes to

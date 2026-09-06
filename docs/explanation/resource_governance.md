@@ -213,6 +213,9 @@ This buys three things:
 
 ## The admission pipeline
 
+The decide-over-a-snapshot shape every admission decision now takes, and where each one lives, is the
+subject of [Admission pipeline](admission_pipeline.md); this section is the preload-side detail.
+
 The preload loop walks the pending queue in placement order and, per job, decides a gate ladder over the
 cycle's frozen
 [`SchedulingSnapshot`][horde_worker_regen.process_management.scheduling.admission.snapshot.SchedulingSnapshot].
