@@ -294,6 +294,40 @@ paths.
 For a complete file-to-responsibility map, including the pop pipeline, scheduler,
 IPC, and process lifecycle, see the **[Codebase Map](../reference/codebase-map.md)**.
 
+### How the scheduling units compose
+
+The scheduler is the act site and the tick surface; the judgement sits beside it in units that read
+values and return values. Arrows point from a reader to what it reads or acts through.
+
+```mermaid
+flowchart TB
+    pm[process_manager: control loop] --> sched[InferenceScheduler: ticks, actuators, act site]
+    sched -->|builds| snap[admission/snapshot: SchedulingSnapshot]
+    snap --> adm["admission/: preload gates, pricing, materialisation, clearance"]
+    adm -->|plans, commands| exec[admission/executor: PlanExecutor]
+    exec -->|acts through| sched
+    sched --> ledgers["ledgers/: retention, safety placement, RAM reclaim, head admission, dispatch holds"]
+    ledgers -->|frozen views| snap
+    sched --> gov["governance/: ResourceGovernor over HostMemorySnapshot, WholeCardResidencyLedger"]
+    gov -->|GovernanceAction| exec
+    adm -->|VramRequest| arb["resources/vram_arbiter: VramArbiter, frozen per tick"]
+    arb -->|VramVerdict, actuations| exec
+    exec --> ladder[resources/reclaim_ladder: VerifiedReclaimLadder]
+    ladder -->|VramActuator| sched
+    sched --> life[lifecycle: ProcessLifecycleManager, ProcessMap]
+    sched --> tracker[jobs/job_tracker: JobTracker]
+    sched --> popper[jobs/job_popper: the offer]
+    popper -->|model_serviceability_verdicts| serv[resources/model_serviceability]
+    snap -->|unserviceable reason| serv
+```
+
+The invariants the picture encodes: decisions (`admission/`, `governance/`, the arbiter) read snapshots and
+return values; the executor and the reclaim ladder are the only places a decision becomes an action; the
+ledgers are the scheduler's mutable state and reach a decision only as frozen views; the pop offer and the
+preload gate judge a model's serviceability by one function. See
+[Admission pipeline](admission_pipeline.md) for the per-cycle sequence and
+[Resource governance](resource_governance.md) and [VRAM arbiter](vram_arbiter.md) for the two decision layers.
+
 ## See also
 
 - [Codebase Map](../reference/codebase-map.md): file→responsibility map and entry points
