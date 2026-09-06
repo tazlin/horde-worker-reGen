@@ -463,7 +463,7 @@ async def test_idle_retained_resident_is_evicted_on_demand_for_a_cross_model_hea
         max_concurrent=2,
         max_inference=2,
     )
-    monkeypatch.setattr(scheduler, "get_next_n_models", lambda n: [_OTHER_MODEL])
+    monkeypatch.setattr(scheduler._job_tracker, "next_models", lambda n: [_OTHER_MODEL])
 
     candidates = scheduler.build_reclaim_ladder_candidates(None)
     assert 1 in {resident.process_id for resident in candidates.idle_residents}

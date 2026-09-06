@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
 from horde_worker_regen.process_management.ipc.messages import HordeImageResult
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
@@ -13,6 +13,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage, Job
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_job,
+    mark_job_aux_prepared,
     mark_job_in_progress_async,
     move_job_to_being_safety_checked_async,
     queue_job_for_safety_async,
@@ -490,3 +491,50 @@ async def test_post_processing_backlog_depth_counts_pending_and_in_flight(job_tr
     assert job_tracker.post_processing_backlog_depth == 2
     await job_tracker.abandon_pending_post_processing(queued[1])
     assert job_tracker.post_processing_backlog_depth == 1
+
+
+class TestQueueQueries:
+    """The tracker answers the queue-shaped questions the scheduler asks of its pending jobs."""
+
+    async def test_undispatched_head_skips_jobs_already_running(self, job_tracker: JobTracker) -> None:
+        """The head of queue is the first pending job no process has started; a running job is not it."""
+        assert job_tracker.undispatched_head() is None
+        first = await track_popped_job_async(job_tracker, make_job_pop_response("model_a"))
+        second = await track_popped_job_async(job_tracker, make_job_pop_response("model_b"))
+        assert job_tracker.undispatched_head() is first
+
+        await job_tracker.mark_inference_started(first)
+        assert job_tracker.undispatched_head() is second
+
+    async def test_next_models_names_distinct_models_in_queue_order(self, job_tracker: JobTracker) -> None:
+        """Distinct models in pending order, capped at the requested count."""
+        for model in ("model_a", "model_b", "model_a", "model_c"):
+            await track_popped_job_async(job_tracker, make_job_pop_response(model))
+        assert job_tracker.next_models(2) == ["model_a", "model_b"]
+        assert job_tracker.next_models(5) == ["model_a", "model_b", "model_c"]
+
+    async def test_job_requires_aux_preparation_until_its_files_are_placed(self, job_tracker: JobTracker) -> None:
+        """A job with LoRAs needs preparation until the prefetch pipeline clears it; a plain job never does."""
+        plain = await track_popped_job_async(job_tracker, make_job_pop_response())
+        assert job_tracker.job_requires_aux_preparation(plain) is False
+
+        with_lora = await track_popped_job_async(
+            job_tracker,
+            make_job_pop_response(loras=[LorasPayloadEntry(name="storm_ref", is_version=False)]),
+        )
+        assert job_tracker.job_requires_aux_preparation(with_lora) is True
+        mark_job_aux_prepared(job_tracker, with_lora)
+        assert job_tracker.job_requires_aux_preparation(with_lora) is False
+
+    async def test_rearm_measured_attempts_for_model_spares_other_models(self, job_tracker: JobTracker) -> None:
+        """Re-arming by model forgets every pending probe for that model and leaves other models' probes spent."""
+        target = await track_popped_job_async(job_tracker, make_job_pop_response("model_a"))
+        other = await track_popped_job_async(job_tracker, make_job_pop_response("model_b"))
+        for job in (target, other):
+            job_tracker.mark_measured_attempt(job, candidate_mb=1000.0, device_index=0)
+
+        job_tracker.rearm_measured_attempts_for_model("model_a")
+
+        assert job_tracker.is_measured_attempt(target) is False
+        assert job_tracker.has_spent_measured_attempt_on_device(target, 0) is False
+        assert job_tracker.is_measured_attempt(other) is True

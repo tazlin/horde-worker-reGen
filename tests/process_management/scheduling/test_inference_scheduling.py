@@ -1316,8 +1316,8 @@ class TestUnloadModels:
         # residency grace so the outcome is deterministic).
         assert scheduler.unload_models(under_pressure=True) is True
 
-    async def test_get_next_n_models_returns_correct(self) -> None:
-        """get_next_n_models should return a list of unique model names for the next n pending inference jobs."""
+    async def test_next_models_returns_the_distinct_models_in_pending_order(self) -> None:
+        """The tracker names the distinct models of the next n pending jobs, in queue order."""
         job_tracker = JobTracker()
         job1 = make_job_pop_response("model_a")
         job2 = make_job_pop_response("model_b")
@@ -1326,9 +1326,7 @@ class TestUnloadModels:
         await track_popped_job_async(job_tracker, job2)
         await track_popped_job_async(job_tracker, job3)
 
-        inference_scheduler = _make_inference_scheduler(job_tracker=job_tracker)
-        result = inference_scheduler.get_next_n_models(3)
-        assert result == ["model_a", "model_b"]
+        assert job_tracker.next_models(3) == ["model_a", "model_b"]
 
     def test_unload_from_ram_invalid_process_raises(self) -> None:
         """unload_from_ram should raise an error if the process ID is not in the process map."""

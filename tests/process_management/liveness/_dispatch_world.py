@@ -2519,7 +2519,7 @@ class _DispatchWorld:
                 continue
             if self._job_tracker.is_model_held_by_ceiling(job.model):
                 continue
-            if self._scheduler._job_requires_aux_preparation(job):
+            if self._scheduler._job_tracker.job_requires_aux_preparation(job):
                 continue
             priced_mb = self._scheduler._measured_admission_candidate_delta_mb(
                 job,
@@ -2726,7 +2726,7 @@ class _DispatchWorld:
 
     def _observe_dispatch_tick(self) -> None:
         """Record what this tick looked like to the verdicts that judge whether the card was earning."""
-        head = self._scheduler._undispatched_head()
+        head = self._scheduler._job_tracker.undispatched_head()
         bucket: SlotDutyBucket | None = None
         reason: str | None = None
         if head is not None:

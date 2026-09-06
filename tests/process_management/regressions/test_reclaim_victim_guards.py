@@ -65,7 +65,7 @@ class TestVramUnloadNextModelGuard:
             max_concurrent=2,
             max_inference=2,
         )
-        monkeypatch.setattr(scheduler, "get_next_n_models", lambda n: [_NEXT_MODEL])
+        monkeypatch.setattr(scheduler._job_tracker, "next_models", lambda n: [_NEXT_MODEL])
         return scheduler, requester, sibling
 
     def test_gentle_reclaim_spares_the_next_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,7 +115,7 @@ class TestVramUnloadSparesEveryLookaheadModel:
             max_concurrent=2,
             max_inference=4,
         )
-        monkeypatch.setattr(scheduler, "get_next_n_models", lambda n: [_NEXT_MODEL, _OTHER_MODEL])
+        monkeypatch.setattr(scheduler._job_tracker, "next_models", lambda n: [_NEXT_MODEL, _OTHER_MODEL])
         return scheduler, requester, head_holder, tail_holder, idle_holder
 
     def test_lookahead_models_spared_unqueued_model_evicted(self, monkeypatch: pytest.MonkeyPatch) -> None:

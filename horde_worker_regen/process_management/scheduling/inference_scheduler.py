@@ -1091,34 +1091,6 @@ class InferenceScheduler:
             device_index=device_index,
         )
 
-    def _bare_context_total_mb(
-        self,
-        *,
-        device_used_mb: float,
-        baseline_mb: float,
-        device_index: int | None,
-    ) -> tuple[float, int] | None:
-        """Decompose a truthful device-used reading into the tenants' bare-context total and their count.
-
-        The worker-attributable bare-context total is truthful device-used minus the shared device baseline
-        minus every committed-ledger tenant's byte-exact allocator reservation: what remains is only the
-        context costs (the one-time CUDA runtime plus one context each), the exact quantity the overhead
-        model's marginal derivation is defined over. Charging anything else (the baseline, resident weights,
-        another tenant's reservation) into that residual multiplies it across the process count and prices
-        the card into a phantom over-commit. Keyed on the committed ledger's tenant set so the marginal
-        derivation and the ledger can never disagree about who holds a context. Returns None when the card
-        has no ledger tenants; the residual may be negative (a baseline estimate that absorbed context cost),
-        which the capture path skips and the invalidation path clamps toward zero.
-        """
-        reserved_sum_mb = 0.0
-        tenants = self._process_map.committed_ledger_processes(device_index)
-        if not tenants:
-            return None
-        for process_info in tenants:
-            reserved_sum_mb += (process_info.process_reserved_mb or 0.0) + (process_info.process_aimdo_mb or 0.0)
-        context_total_mb = device_used_mb - baseline_mb - reserved_sum_mb
-        return context_total_mb, len(tenants)
-
     def capture_idle_context_residency(
         self,
         *,
@@ -1165,7 +1137,7 @@ class InferenceScheduler:
                 return
         if inference_count < 1:
             return
-        decomposed = self._bare_context_total_mb(
+        decomposed = self._process_map.bare_context_total_mb(
             device_used_mb=device_used_mb,
             baseline_mb=baseline_mb,
             device_index=device_index,
@@ -1204,7 +1176,7 @@ class InferenceScheduler:
             baseline_mb: The reconciler's shared-device baseline estimate (MB) for the card.
             device_index: The card the reading belongs to; None for the single-GPU/worker-wide case.
         """
-        decomposed = self._bare_context_total_mb(
+        decomposed = self._process_map.bare_context_total_mb(
             device_used_mb=device_used_mb,
             baseline_mb=baseline_mb,
             device_index=device_index,
@@ -2650,7 +2622,7 @@ class InferenceScheduler:
         # the work that has no route to a holder, and its own claim on the card is what bars every other head.
         if self._job_tracker.has_exclusive_job_running(device_index):
             return False
-        head = self._undispatched_head()
+        head = self._job_tracker.undispatched_head()
         return not (head is not None and head.model == model)
 
     def _restore_siblings_after_whole_card(self) -> None:
@@ -3266,7 +3238,7 @@ class InferenceScheduler:
         head's load window end to end) so a hold that never resolves still trips the supervisor. Public: read by
         the recovery coordinator's wedge assessment.
         """
-        head = self._undispatched_head()
+        head = self._job_tracker.undispatched_head()
         if head is None or head.id_ is None:
             return False
         held = self._dispatch_holds.held_seconds(str(head.id_))
@@ -3278,7 +3250,7 @@ class InferenceScheduler:
         Read by the recovery coordinator to say, once per edge, how long it is deferring to the hold and when
         that deferral lapses.
         """
-        head = self._undispatched_head()
+        head = self._job_tracker.undispatched_head()
         if head is None or head.id_ is None:
             return None
         held = self._dispatch_holds.held_seconds(str(head.id_))
@@ -3306,7 +3278,7 @@ class InferenceScheduler:
         device_index: int | None,
     ) -> bool:
         """Return whether a ready queue head on this card should preempt a drained residency cooldown."""
-        head = self._undispatched_head()
+        head = self._job_tracker.undispatched_head()
         if head is None or head.model is None or head.model == residency_model:
             return False
         process_info = self.resident_process_for_job(head)
@@ -3363,13 +3335,6 @@ class InferenceScheduler:
         """Seconds this job has been the idle-device head, or 0.0 when it is not the tracked head."""
         return self._head_admission.starved_seconds(str(job.id_) if job.id_ is not None else None)
 
-    def _undispatched_head(self) -> ImageGenerateJobPopResponse | None:
-        """Return the first queued job no process is running yet (the head of queue), or None when there is none."""
-        return next(
-            (job for job in self._job_tracker.jobs_pending_inference if job not in self._job_tracker.jobs_in_progress),
-            None,
-        )
-
     def head_model_materializing(self) -> bool:
         """Return whether the head-of-queue inference job's model is actively loading onto an idle pool.
 
@@ -3385,7 +3350,7 @@ class InferenceScheduler:
             return False
         if self._process_map.has_inference_in_progress():
             return False
-        head = self._undispatched_head()
+        head = self._job_tracker.undispatched_head()
         if head is None or head.model is None:
             return False
         return self._horde_model_map.is_model_loading(head.model) or self._missing_model_recovery_latched()
@@ -3843,7 +3808,7 @@ class InferenceScheduler:
         parked, how often it has been passed) so the compared reason can stay stable across a sustained block.
         Read-only: it explains the stall, it does not change scheduling.
         """
-        head = self._undispatched_head()
+        head = self._job_tracker.undispatched_head()
         if head is None or self._head_starved_seconds(head) < DISPATCH_STALL_MIN_SECONDS:
             return
         try:
@@ -3901,7 +3866,7 @@ class InferenceScheduler:
                 hold = SlotDutyBucket.CLEARANCE_HOLD
                 waiting = primed_count
             else:
-                head = self._undispatched_head()
+                head = self._job_tracker.undispatched_head()
                 waiting = len(self._job_tracker.jobs_pending_inference) - len(in_progress)
                 if head is not None and busy < capacity:
                     try:
@@ -3919,7 +3884,7 @@ class InferenceScheduler:
             return
 
         busy = len(in_progress)
-        head = self._undispatched_head()
+        head = self._job_tracker.undispatched_head()
         waiting = len(self._job_tracker.jobs_pending_inference) - busy
 
         hold = None
@@ -4061,7 +4026,7 @@ class InferenceScheduler:
             CardProcessSnapshot(
                 device_index=device_index,
                 loaded_process_count=self._process_map.num_loaded_inference_processes(device_index=device_index),
-                busy_process_count=self._card_inference_load(device_index),
+                busy_process_count=self._process_map.card_inference_load(device_index),
                 planned_process_count=card_runtime.target_process_count,
                 held_by_whole_card_residency=device_index in residency_held_cards,
             )
@@ -4282,22 +4247,6 @@ class InferenceScheduler:
             return 0.0
         baseline = self._admission_baseline_provider(device_index)
         return baseline if baseline is not None else 0.0
-
-    def _committed_process_reserved_by_pid(self, device_index: int | None) -> dict[int, float]:
-        """Return the live GPU processes' measured allocator reservation (MB) keyed by process id, for a card.
-
-        The snapshot the planned-reserve overlay decays each entry against (a planned charge shrinks as its
-        target's reservation materialises). Keyed by :attr:`HordeProcessInfo.process_id`, matching the id the
-        planned entries are registered under.
-        """
-        reserved_by_pid: dict[int, float] = {}
-        for process_info in self._process_map.values():
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.process_reserved_mb is None:
-                continue
-            reserved_by_pid[process_info.process_id] = float(process_info.process_reserved_mb)
-        return reserved_by_pid
 
     def _in_flight_admitted_planned_units(self) -> set[str]:
         """Return the loading-process ids (as ledger units) whose admitted VRAM has not yet materialised.
@@ -4745,7 +4694,7 @@ class InferenceScheduler:
         committed_is_stale = oldest_report_age is not None and oldest_report_age > _REPORT_STALENESS_SECONDS
         self._reserve_ledger.reconcile_planned(PRELOAD_ADMISSION_FLOW, self._in_flight_admitted_planned_units())
         self._reserve_ledger.reconcile_planned(DISPATCH_ADMISSION_FLOW, self._in_flight_dispatch_units(device_index))
-        per_process_reserved = self._committed_process_reserved_by_pid(device_index)
+        per_process_reserved = self._process_map.reserved_by_pid(device_index)
         planned_mb = self._reserve_ledger.effective_planned_vram_mb(per_process_reserved)
         preload_planned_mb = self._reserve_ledger.effective_planned_vram_mb_for_flow(
             PRELOAD_ADMISSION_FLOW,
@@ -6867,7 +6816,7 @@ class InferenceScheduler:
         """Build the in-place safety weight demotion rung, promised at safety's measured reservation."""
         if not self._safety_weights_demotable(device_index):
             return None
-        reserved_mb = self._reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
+        reserved_mb = self._process_map.reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
         promised_mb = (
             reserved_mb
             if reserved_mb > 0
@@ -6997,7 +6946,7 @@ class InferenceScheduler:
             or self._process_lifecycle.safety_placement_transition_pending is True
         ):
             return None
-        reserved_mb = self._reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
+        reserved_mb = self._process_map.reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
         return LaneReclaimCandidate(
             kind=ReclaimRungKind.SAFETY_OFF_GPU,
             tenant_label="safety",
@@ -7022,18 +6971,6 @@ class InferenceScheduler:
             if device_index is not None and process_info.device_index != device_index:
                 continue
             total_mb += context_constant_mb + float(process_info.process_reserved_mb or 0)
-        return total_mb
-
-    def _reserved_mb_for_type(self, process_type: HordeProcessType, device_index: int | None) -> float:
-        """Sum the measured device reservation (MB) of a process type's live processes on a card."""
-        total_mb = 0.0
-        for process_info in self._process_map.values():
-            if process_info.process_type != process_type:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.process_reserved_mb is not None:
-                total_mb += float(process_info.process_reserved_mb)
         return total_mb
 
     def unload_idle_model(self, process_id: int, device_index: int | None = None) -> bool:
@@ -7455,7 +7392,8 @@ class InferenceScheduler:
             (
                 j
                 for j in pending
-                if j not in self._job_tracker.jobs_in_progress and not self._job_requires_aux_preparation(j)
+                if j not in self._job_tracker.jobs_in_progress
+                and not self._job_tracker.job_requires_aux_preparation(j)
             ),
             None,
         )
@@ -7480,7 +7418,8 @@ class InferenceScheduler:
             (
                 job
                 for job in self._job_tracker.jobs_pending_inference
-                if job not in self._job_tracker.jobs_in_progress and not self._job_requires_aux_preparation(job)
+                if job not in self._job_tracker.jobs_in_progress
+                and not self._job_tracker.job_requires_aux_preparation(job)
             ),
             None,
         )
@@ -7560,7 +7499,7 @@ class InferenceScheduler:
             if job is head_job or job.model is None or job.model == head_job.model:
                 rejections.append(f"{job.model}: head/same-model")
                 continue
-            if job in in_progress or self._job_requires_aux_preparation(job):
+            if job in in_progress or self._job_tracker.job_requires_aux_preparation(job):
                 rejections.append(f"{job.model}: in-progress/aux-gated")
                 continue
             # A degraded retry must run isolated (see the diversity path), so it is never a bypass target.
@@ -7770,14 +7709,6 @@ class InferenceScheduler:
             fault_reason=reason,
         )
 
-    def _card_inference_load(self, device_index: int) -> int:
-        """Count this card's inference processes currently busy: the least-loaded routing tie-breaker."""
-        return sum(
-            1
-            for p in self._process_map.values()
-            if p.process_type == HordeProcessType.INFERENCE and p.device_index == device_index and p.is_process_busy()
-        )
-
     def _pick_best_resident_process(self, candidates: list[HordeProcessInfo]) -> HordeProcessInfo:
         """Choose which resident process to dispatch to: prefer one ready now, then the least-loaded card.
 
@@ -7787,7 +7718,7 @@ class InferenceScheduler:
         """
         ready = [p for p in candidates if p.can_accept_job()]
         pool = ready or candidates
-        return min(pool, key=lambda p: self._card_inference_load(p.device_index))
+        return min(pool, key=lambda p: self._process_map.card_inference_load(p.device_index))
 
     def resident_process_for_job(
         self,
@@ -8069,7 +8000,9 @@ class InferenceScheduler:
         placement_order = card_preload_order(
             eligible,
             cards_already_serving_model=cards_already_serving_model,
-            card_busy_counts={device_index: self._card_inference_load(device_index) for device_index in eligible},
+            card_busy_counts={
+                device_index: self._process_map.card_inference_load(device_index) for device_index in eligible
+            },
             card_free_vram_mb={
                 device_index: self._measured_free_vram_mb(device_index=device_index) for device_index in eligible
             },
@@ -8179,7 +8112,7 @@ class InferenceScheduler:
             # An aux-unprepared job is invisible to dispatch: it holds nothing and cannot sample until the
             # pop-time prefetch pipeline clears its preparation gate. Skipping it here lets a fitting sibling
             # become the dispatch head and be GPU-fed while the gated job waits, so no lane idles behind it.
-            if self._job_requires_aux_preparation(job):
+            if self._job_tracker.job_requires_aux_preparation(job):
                 continue
             if next_job is None:
                 next_job = job
@@ -10280,7 +10213,7 @@ class InferenceScheduler:
         """
         if self._process_map.has_inference_in_progress():
             return False
-        head = self._undispatched_head()
+        head = self._job_tracker.undispatched_head()
         if head is None:
             return False
         return self._head_starved_seconds(head) >= DISPATCH_STALL_MIN_SECONDS
@@ -10330,7 +10263,7 @@ class InferenceScheduler:
                 self._head_admission.barrier_withhold_logged = True
             return False
 
-        if next_job_and_process.line_skip is None and self._job_requires_aux_preparation(next_job):
+        if next_job_and_process.line_skip is None and self._job_tracker.job_requires_aux_preparation(next_job):
             # An unprepared aux job is not dispatchable: it holds no lane and no VRAM reservation while the
             # pop-time prefetch pipeline places its LoRAs/TIs on disk and clears its preparation gate. It is
             # already skipped by dispatch selection and preload admission, so a fitting sibling flows past it;
@@ -10485,18 +10418,6 @@ class InferenceScheduler:
         self._head_admission.clear_stall()
 
         return True
-
-    def _job_requires_aux_preparation(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Return whether a pending job must resolve its auxiliary files before it may claim sampling admission.
-
-        A base model can already be resident while the job's LoRAs or textual inversions are not.  The
-        pop-time prefetch pipeline places those files on disk while the job stays pending, so preparation
-        creates no dispatch reservation.  Once the prepared flag is set, START_INFERENCE still revalidates
-        the files child-side and passes through every ordinary VRAM, concurrency, post-processing, and
-        degraded-retry gate.
-        """
-        has_aux = bool(job.payload.loras) or bool(job.payload.tis)
-        return has_aux and not self._job_tracker.are_job_aux_models_prepared(job)
 
     def _compute_wanted_models(self) -> set[str]:
         """The set of models the worker is actively serving right now.
@@ -10716,7 +10637,7 @@ class InferenceScheduler:
         """
         bridge_data = self._runtime_config.bridge_data
         wanted_models = self._compute_wanted_models()
-        next_n_models = list(self.get_next_n_models(self._max_inference_processes))
+        next_n_models = list(self._job_tracker.next_models(self._max_inference_processes))
         self._log_next_models_for_vram_unload(
             next_n_models,
             under_pressure=under_pressure,
@@ -10936,26 +10857,6 @@ class InferenceScheduler:
             )
         logger.debug(f"Clearing process {process_id} of model {process_info.loaded_horde_model_name}")
         self._process_map.on_model_ram_clear(process_id=process_id)
-
-    def get_next_n_models(self, n: int) -> list[str]:
-        """Get the next n models that will be used in the job deque."""
-        next_n_models: list[str] = []
-        jobs_traversed = 0
-        while len(next_n_models) < n:
-            if jobs_traversed >= len(self._job_tracker.jobs_pending_inference):
-                break
-
-            model_name = self._job_tracker.jobs_pending_inference[jobs_traversed].model
-
-            if model_name is None:
-                raise ValueError(f"job_deque[{jobs_traversed}].model is None")
-
-            if model_name not in next_n_models:
-                next_n_models.append(model_name)
-
-            jobs_traversed += 1
-
-        return next_n_models
 
     def _evict_unprotected_components_under_pressure(self) -> bool:
         """Evict idle, unprotected staged components from RAM ahead of the whole-RAM unload; return progress.

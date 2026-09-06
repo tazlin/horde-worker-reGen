@@ -1578,6 +1578,70 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             count += 1
         return count
 
+    def reserved_mb_for_type(self, process_type: HordeProcessType, device_index: int | None) -> float:
+        """Sum the measured device reservation (MB) of a process type's live processes on a card."""
+        total_mb = 0.0
+        for process_info in self.values():
+            if process_info.process_type != process_type:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_reserved_mb is not None:
+                total_mb += float(process_info.process_reserved_mb)
+        return total_mb
+
+    def card_inference_load(self, device_index: int) -> int:
+        """Count a card's inference processes currently busy: the least-loaded routing tie-breaker."""
+        return sum(
+            1
+            for p in self.values()
+            if p.process_type == HordeProcessType.INFERENCE and p.device_index == device_index and p.is_process_busy()
+        )
+
+    def reserved_by_pid(self, device_index: int | None) -> dict[int, float]:
+        """The live GPU processes' measured allocator reservation (MB) keyed by process id, for a card.
+
+        The figure the planned-reserve overlay decays each entry against (a planned charge shrinks as its
+        target's reservation materialises). Keyed by :attr:`HordeProcessInfo.process_id`, matching the id the
+        planned entries are registered under.
+        """
+        reserved: dict[int, float] = {}
+        for process_info in self.values():
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_reserved_mb is None:
+                continue
+            reserved[process_info.process_id] = float(process_info.process_reserved_mb)
+        return reserved
+
+    def bare_context_total_mb(
+        self,
+        *,
+        device_used_mb: float,
+        baseline_mb: float,
+        device_index: int | None,
+    ) -> tuple[float, int] | None:
+        """Decompose a truthful device-used reading into the tenants' bare-context total and their count.
+
+        The worker-attributable bare-context total is truthful device-used minus the shared device baseline
+        minus every committed-ledger tenant's byte-exact allocator reservation: what remains is only the
+        context costs (the one-time CUDA runtime plus one context each), the exact quantity the overhead
+        model's marginal derivation is defined over. Charging anything else (the baseline, resident weights,
+        another tenant's reservation) into that residual multiplies it across the process count and prices
+        the card into a phantom over-commit. Keyed on the committed ledger's tenant set so the marginal
+        derivation and the ledger can never disagree about who holds a context. Returns None when the card
+        has no ledger tenants; the residual may be negative (a baseline estimate that absorbed context cost),
+        which the capture path skips and the invalidation path clamps toward zero.
+        """
+        tenants = self.committed_ledger_processes(device_index)
+        if not tenants:
+            return None
+        reserved_sum_mb = sum(
+            (process_info.process_reserved_mb or 0.0) + (process_info.process_aimdo_mb or 0.0)
+            for process_info in tenants
+        )
+        return device_used_mb - baseline_mb - reserved_sum_mb, len(tenants)
+
     def num_preloading_processes(self, *, device_index: int | None = None) -> int:
         """Return the number of processes that are preloading models.
 

@@ -16,7 +16,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Top-level orchestration                | `process_management/process_manager.py` (`HordeWorkerProcessManager`) |
 | Process startup                        | `process_management/main_entry_point.py`, `worker_entry_points.py` |
 | Job popping / pop gates                | `process_management/jobs/job_popper.py` (`JobPopper`)              |
-| Job stages, faults, invariants         | `process_management/jobs/job_tracker.py` (`JobTracker`)            |
+| Job stages, faults, invariants, queue queries (head of queue, next models, aux preparation) | `process_management/jobs/job_tracker.py` (`JobTracker`) |
 | Scheduling inference & model preloads  | `process_management/scheduling/inference_scheduler.py` (`InferenceScheduler`) |
 | Pop-rate & megapixelstep throttling    | `process_management/scheduling/pop_throttler.py` (`PopThrottler`)  |
 | Pop/scheduling hold visibility         | `process_management/scheduling/pop_governor_registry.py`           |
@@ -29,7 +29,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Parsing child-to-parent messages       | `process_management/ipc/message_dispatcher.py` (`MessageDispatcher`) |
 | IPC message and enum definitions       | `process_management/ipc/messages.py`                               |
 | Starting / replacing child processes   | `process_management/lifecycle/process_lifecycle.py` (`ProcessLifecycleManager`) |
-| Live process state                     | `process_management/lifecycle/process_map.py`, `process_info.py`   |
+| Live process state and per-card queries (running job, busy load, reservations, bare-context residual) | `process_management/lifecycle/process_map.py` (`ProcessMap`), `process_info.py` |
 | Result upload & submission             | `process_management/jobs/job_submitter.py` (`JobSubmitter`)        |
 | Config fields & hot-reload             | `bridge_data/`, `process_management/config/runtime_config.py`, `process_management/config/bridge_data_reloader.py` |
 | Dashboard state channel                | `process_management/ipc/supervisor_channel.py`                     |

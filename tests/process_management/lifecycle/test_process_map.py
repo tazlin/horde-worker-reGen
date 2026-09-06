@@ -16,7 +16,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from tests.process_management.conftest import make_mock_process_info
+from tests.process_management.conftest import make_job_pop_response, make_mock_process_info
 
 
 @contextmanager
@@ -530,3 +530,83 @@ class TestLaunchTally:
         process_map[0] = process_info
 
         assert process_map.num_processes_ever_started(HordeProcessType.INFERENCE) == 1
+
+
+class TestCardQueries:
+    """The map answers the per-card questions the scheduler asks over its live processes."""
+
+    def test_process_running_job_matches_execution_ownership_only(self) -> None:
+        """A job is found on the inference process that owns its execution; preload attribution is not ownership."""
+        running = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        preloading = make_mock_process_info(1, state=HordeProcessState.PRELOADING_MODEL)
+        process_map = ProcessMap({0: running, 1: preloading})
+        job = make_job_pop_response()
+        running.record_inference_ownership(job, attempt_ordinal=1)
+
+        assert process_map.process_running_job(job) is running
+        assert process_map.process_running_job(make_job_pop_response()) is None
+
+    def test_reserved_mb_for_type_sums_one_type_on_one_card(self) -> None:
+        """Only the named type's processes on the named card count; an unreported reservation adds nothing."""
+        inference_card0 = make_mock_process_info(0, device_index=0)
+        safety_card0 = make_mock_process_info(1, process_type=HordeProcessType.SAFETY, device_index=0)
+        safety_card1 = make_mock_process_info(2, process_type=HordeProcessType.SAFETY, device_index=1)
+        unreported = make_mock_process_info(3, process_type=HordeProcessType.SAFETY, device_index=0)
+        inference_card0.process_reserved_mb = 4000
+        safety_card0.process_reserved_mb = 700
+        safety_card1.process_reserved_mb = 900
+        process_map = ProcessMap({0: inference_card0, 1: safety_card0, 2: safety_card1, 3: unreported})
+
+        assert process_map.reserved_mb_for_type(HordeProcessType.SAFETY, 0) == 700.0
+        assert process_map.reserved_mb_for_type(HordeProcessType.SAFETY, None) == 1600.0
+
+    def test_card_inference_load_counts_busy_inference_processes(self) -> None:
+        """Busy inference processes on the card count; idle ones, other cards and other types do not."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING, device_index=0),
+                1: make_mock_process_info(1, state=HordeProcessState.WAITING_FOR_JOB, device_index=0),
+                2: make_mock_process_info(2, state=HordeProcessState.INFERENCE_STARTING, device_index=1),
+                3: make_mock_process_info(
+                    3,
+                    state=HordeProcessState.EVALUATING_SAFETY,
+                    process_type=HordeProcessType.SAFETY,
+                    device_index=0,
+                ),
+            },
+        )
+
+        assert process_map.card_inference_load(0) == 1
+        assert process_map.card_inference_load(1) == 1
+
+    def test_reserved_by_pid_keys_reported_reservations_on_the_card(self) -> None:
+        """Each reporting process on the card appears under its process id; the rest are absent."""
+        reporting = make_mock_process_info(0, device_index=0)
+        reporting.process_reserved_mb = 2500
+        other_card = make_mock_process_info(1, device_index=1)
+        other_card.process_reserved_mb = 800
+        silent = make_mock_process_info(2, device_index=0)
+        process_map = ProcessMap({0: reporting, 1: other_card, 2: silent})
+
+        assert process_map.reserved_by_pid(0) == {0: 2500.0}
+        assert process_map.reserved_by_pid(None) == {0: 2500.0, 1: 800.0}
+
+    def test_bare_context_total_mb_subtracts_baseline_and_every_tenant_reservation(self) -> None:
+        """Device-used minus the baseline minus each ledger tenant's reservation plus aimdo, with the tenant count."""
+        first = make_mock_process_info(0, device_index=0)
+        first.process_reserved_mb = 3000
+        first.process_aimdo_mb = 100
+        second = make_mock_process_info(1, device_index=0)
+        second.process_reserved_mb = 1000
+        process_map = ProcessMap({0: first, 1: second})
+
+        assert process_map.bare_context_total_mb(device_used_mb=6000.0, baseline_mb=500.0, device_index=0) == (
+            1400.0,
+            2,
+        )
+
+    def test_bare_context_total_mb_is_none_without_ledger_tenants(self) -> None:
+        """A card with no reporting process has no context residual to derive."""
+        process_map = ProcessMap({0: make_mock_process_info(0, device_index=0)})
+
+        assert process_map.bare_context_total_mb(device_used_mb=6000.0, baseline_mb=500.0, device_index=0) is None

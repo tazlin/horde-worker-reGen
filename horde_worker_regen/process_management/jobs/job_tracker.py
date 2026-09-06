@@ -2030,6 +2030,33 @@ class JobTracker:
         """
         return cls._lora_name_key(lora.name, bool(lora.is_version))
 
+    def undispatched_head(self) -> ImageGenerateJobPopResponse | None:
+        """The first queued job no process is running yet (the head of queue), or None when there is none."""
+        return next((job for job in self.jobs_pending_inference if job not in self.jobs_in_progress), None)
+
+    def job_requires_aux_preparation(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether a pending job must resolve its auxiliary files before it may claim sampling admission.
+
+        A base model can already be resident while the job's LoRAs or textual inversions are not. The pop-time
+        prefetch pipeline places those files on disk while the job stays pending, so preparation creates no
+        dispatch reservation. Once the prepared flag is set, START_INFERENCE still revalidates the files
+        child-side and passes through every ordinary VRAM, concurrency, post-processing and degraded-retry gate.
+        """
+        has_aux = bool(job.payload.loras) or bool(job.payload.tis)
+        return has_aux and not self.are_job_aux_models_prepared(job)
+
+    def next_models(self, count: int) -> list[str]:
+        """The next ``count`` distinct models in pending order."""
+        models: list[str] = []
+        for index, job in enumerate(self.jobs_pending_inference):
+            if len(models) >= count:
+                break
+            if job.model is None:
+                raise ValueError(f"job_deque[{index}].model is None")
+            if job.model not in models:
+                models.append(job.model)
+        return models
+
     def are_job_aux_models_prepared(self, job: ImageGenerateJobPopResponse) -> bool:
         """Return whether this pending job completed its explicit auxiliary preparation pass."""
         tracked = self._tracked_for(job)
