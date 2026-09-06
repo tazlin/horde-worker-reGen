@@ -2068,6 +2068,25 @@ class TestPreloadTargetRetiredDuringAdmission:
         assert len(process_map) == 0
 
 
+class TestFailedPreloadSend:
+    """A send the pipe refuses is a stopped pass, never an admitted load."""
+
+    async def test_a_failed_send_records_a_stopped_pass_and_books_nothing(self) -> None:
+        """The model map and the reserve ledger stay untouched and the pass reports no preload."""
+        lane = make_mock_process_info(0, model_name=None, safe_send_returns=False)
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
+        job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        assert scheduler.preload_models() is False
+
+        latest = scheduler.head_admission.last_preload_admission
+        assert latest is not None and latest.decision is AdmissionDecision.STOP_PASS
+        assert scheduler._horde_model_map.is_model_loading("stable_diffusion") is False
+        assert lane.loaded_horde_model_name is None
+        assert scheduler._reserve_ledger.total_vram_mb() == 0.0
+
+
 class TestPrivateArbiterCycleFreshness:
     """A scheduler with no manager driving it must still price against the card as it currently is.
 

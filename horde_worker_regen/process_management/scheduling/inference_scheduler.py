@@ -5755,8 +5755,9 @@ class InferenceScheduler:
         Resets the preload-delay and head-starvation trackers, sends the PRELOAD_MODEL message inside a
         telemetry span, and on a successful send records the churn/ledger entry and advances the model map
         and process map into the LOADING state. ``planned_charge_mb`` is the candidate delta the admission was
-        priced at, recorded on the reserve ledger as the load's planned charge. Returns True (a preload was
-        issued this cycle).
+        priced at, recorded on the reserve ledger as the load's planned charge. Returns whether the send
+        succeeded: a failed send leaves the model map and the reserve ledger untouched, so the caller records
+        it as a stopped pass rather than an admitted load.
         """
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
@@ -5838,7 +5839,7 @@ class InferenceScheduler:
                 reserved_at_admit_mb=float(available_process.process_reserved_mb or 0),
             )
 
-        return True
+        return preload_sent
 
     def _reclaim_ram_for_overbudget_admit(
         self,
