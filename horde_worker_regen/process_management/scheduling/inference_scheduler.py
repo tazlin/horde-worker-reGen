@@ -415,7 +415,6 @@ class InferenceScheduler:
     _vram_budget: VramBudget
     _ram_budget: RamBudget
     _reserve_ledger: CommittedReserveLedger
-    _ram_budget_defer_notified: bool
     _ram_pressure_notified: bool
     _diagnostics: DiagnosticThrottle
     _last_budget_defer_reason: str | None
@@ -687,7 +686,6 @@ class InferenceScheduler:
         self._vram_budget = VramBudget(reserve_mb=_DEFAULT_VRAM_RESERVE_MB)
         self._ram_budget = RamBudget(reserve_mb=_DEFAULT_RAM_RESERVE_MB)
         self._reserve_ledger = reserve_ledger if reserve_ledger is not None else CommittedReserveLedger()
-        self._ram_budget_defer_notified = False
         self._ram_pressure_notified = False
         self._last_budget_defer_reason = None
         self._context_reduction_at = {}
@@ -704,8 +702,6 @@ class InferenceScheduler:
         self._component_charge_fallback_logged: set[str] = set()
         self._weights_root: Path | None = None
         self._diagnostics = DiagnosticThrottle(self._clock)
-        # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
-        self._unservable_admit_notified: dict[str, bool] = {}
         # Sustained per-card minimum of measured foreign (non-worker) VRAM usage, folded into each device
         # state's achievable ceiling so a model that can never fit even an emptied card is DENIED rather than
         # deferred forever. Driven once per snapshot build from measured device truth; see
@@ -756,13 +752,6 @@ class InferenceScheduler:
         # barrier, the safety-recovery admission hold, the last admission decision, staging deferrals, the
         # missing-model latch, the dispatch-stall diagnostic and the heavy-head load grace.
         self._head_admission = HeadAdmissionLedger(ledger_clock)
-
-        # Edge-log throttle for the post-processing/sampling time-slice hold on dispatch.
-        self._pp_mutex_hold_logged: bool = False
-        # Edge-log throttle for a dispatch admitted via the measured-truth co-residency path that the
-        # static reported-total gate would have held. Sibling of _pp_mutex_hold_logged so the two never
-        # both fire and neither repeats per tick.
-        self._pp_mutex_measured_admit_logged: bool = False
 
         # Capacity-normalized wall-clock accounting: every scheduler tick attributes each configured
         # inference slot's elapsed time to SAMPLING or to the gate/supply state that kept it empty, so
@@ -6108,7 +6097,7 @@ class InferenceScheduler:
         admission = decide_ram_admission(snapshot, str(job.id_), available_process.process_id)
         ram_verdict = admission.verdict
         if ram_verdict.fits:
-            self._ram_budget_defer_notified = False
+            self._diagnostics.forget("ram_budget_defer")
             if admission.kind is RamChargeKind.COMPONENT:
                 self._note_component_admission(job, available_process, ram_verdict)
             elif admission.kind is RamChargeKind.PAGE_REUSE:
@@ -6116,12 +6105,13 @@ class InferenceScheduler:
             self._resolve_head_ram_defer(job, reason="admitted")
             return True
 
-        if not self._ram_budget_defer_notified:
+        suppressed = self._diagnostics.suppressed_count("ram_budget_defer", (job.model, admission.kind))
+        if suppressed is not None:
             logger.opt(colors=True).warning(
-                f"<fg #f0beff>RAM budget deferring preload of {{}}: {ram_verdict.reason()}. Reclaiming idle RAM.</>",
+                f"<fg #f0beff>RAM budget deferring preload of {{}}: {ram_verdict.reason()}. Reclaiming idle RAM."
+                f"{suppressed_suffix(suppressed)}</>",
                 job.model,
             )
-            self._ram_budget_defer_notified = True
         reclaimed = self.unload_models(under_pressure=True)
         if not reclaimed and is_head_blocker:
             # Gentle reclaim freed nothing; for the head of the queue, escalate to reclaim a queued
@@ -9320,8 +9310,7 @@ class InferenceScheduler:
         stands and is edge-logged once with ``static_hold_message``.
         """
         if static_affordable:
-            self._pp_mutex_hold_logged = False
-            self._pp_mutex_measured_admit_logged = False
+            self._forget_pp_mutex_diagnostics()
             return False
 
         margin_mb = self._pp_overlap_margin_mb(next_job)
@@ -9331,24 +9320,31 @@ class InferenceScheduler:
             device_index=device_index,
             margin_mb=margin_mb,
         ):
-            if not self._pp_mutex_measured_admit_logged:
-                self._pp_mutex_measured_admit_logged = True
+            suppressed = self._diagnostics.suppressed_count("pp_mutex_measured_admit", (next_job.model, device_index))
+            if suppressed is not None:
                 device_free_mb = self._measured_device_free_mb(device_index)
                 logger.info(
                     f"Admitting dispatch of {next_job.model} via measured device truth that static "
                     f"co-residency held: {device_free_mb:.0f}MB free, {self._vram_budget.reserve_mb:.0f}MB "
                     f"reserve, {(sampling_peak_mb or 0.0):.0f}MB sampling peak, "
                     f"{pending_pp_reserve_mb:.0f}MB pending chain reserve, "
-                    f"{margin_mb:.0f}MB margin.",
+                    f"{margin_mb:.0f}MB margin.{suppressed_suffix(suppressed)}",
                 )
-            self._pp_mutex_hold_logged = False
+            self._diagnostics.forget("pp_mutex_hold")
             return False
 
-        self._pp_mutex_measured_admit_logged = False
-        if not self._pp_mutex_hold_logged:
-            self._pp_mutex_hold_logged = True
-            logger.info(f"{static_hold_message} (measured second-say margin {margin_mb:.0f}MB)")
+        self._diagnostics.forget("pp_mutex_measured_admit")
+        suppressed = self._diagnostics.suppressed_count("pp_mutex_hold", (next_job.model, device_index))
+        if suppressed is not None:
+            logger.info(
+                f"{static_hold_message} (measured second-say margin {margin_mb:.0f}MB){suppressed_suffix(suppressed)}",
+            )
         return True
+
+    def _forget_pp_mutex_diagnostics(self) -> None:
+        """End the post-processing co-residency episode: its next hold or measured admit speaks as a first."""
+        self._diagnostics.forget("pp_mutex_hold")
+        self._diagnostics.forget("pp_mutex_measured_admit")
 
     def _should_defer_dispatch_for_post_processing(
         self,
@@ -9404,8 +9400,7 @@ class InferenceScheduler:
 
         pending_pp_reserve_mb = self._pending_post_processing_reserve_mb(device_index=device_index)
         if pending_pp_reserve_mb <= 0:
-            self._pp_mutex_hold_logged = False
-            self._pp_mutex_measured_admit_logged = False
+            self._forget_pp_mutex_diagnostics()
             return False
 
         sampling_peak_mb = self._sampling_peak_mb(next_job)

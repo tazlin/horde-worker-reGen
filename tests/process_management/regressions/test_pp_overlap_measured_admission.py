@@ -158,7 +158,6 @@ class TestEdgeTriggeredAdmissionLog:
             call for call in fake_logger.info.call_args_list if "via measured device truth" in call.args[0]
         ]
         assert len(measured_admit_logs) == 1
-        assert scheduler._pp_mutex_measured_admit_logged is True
 
 
 class TestHoldLivenessEscape:
