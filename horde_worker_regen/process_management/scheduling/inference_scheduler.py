@@ -122,6 +122,12 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     plausible_activation_ceiling_mb,
     sampling_footprint_key,
 )
+from horde_worker_regen.process_management.scheduling.admission.snapshot import (
+    HostRamSnapshot,
+    SchedulingSnapshot,
+    build_scheduling_snapshot,
+    snapshot_ledgers,
+)
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE,
     ActiveSampler,
@@ -3412,7 +3418,7 @@ class InferenceScheduler:
         head = self._undispatched_head()
         if head is None or head.model is None or head.model == residency_model:
             return False
-        process_info = self._resident_process_for_job(head)
+        process_info = self.resident_process_for_job(head)
         if process_info is None or not process_info.can_accept_job():
             return False
         return device_index is None or process_info.device_index == device_index
@@ -3722,7 +3728,7 @@ class InferenceScheduler:
         cycle and every rung would look effective. Such figures belong to the formatted line instead
         (:meth:`_log_dispatch_stall_if_needed`), which prints them alongside the parked-seconds count.
         """
-        process = self._resident_process_for_job(head)
+        process = self.resident_process_for_job(head)
         # Mirror dispatch's retention affinity: where a busy slot holds the head's model on the device and a
         # second copy does not fit beside it, that slot is the head's destination, so the wait is named as the
         # resident slot being busy rather than as a preload defer.
@@ -5157,6 +5163,67 @@ class InferenceScheduler:
         device_key = device_index if device_index is not None else 0
         foreign_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
         return total_vram_mb - self._admission_margin_mb(device_index, total_vram_mb) - (foreign_floor_mb or 0.0)
+
+    def snapshot(self) -> SchedulingSnapshot:
+        """Freeze the worker as this cycle's pipelines see it.
+
+        Built from the same accessors the pipelines read today, so a decision over the snapshot and the
+        current inline reads agree within a cycle. The arbiter's per-card state is included only once the
+        arbiter has a cycle, matching the every-gate-admits-on-missing-measurement contract.
+        """
+        arbiter = self._vram_arbiter
+        now = self._clock()
+        ram_verdict = self._governor.last_ram_verdict
+
+        def arbiter_state(device_index: int | None) -> DeviceVramState | None:
+            if arbiter is None or not arbiter.has_cycle:
+                return None
+            return arbiter.device_state(device_index)
+
+        return build_scheduling_snapshot(
+            now=now,
+            process_map=self._process_map,
+            job_tracker=self._job_tracker,
+            pending_in_placement_order=self.pending_inference_in_placement_order(),
+            horde_model_map=self._horde_model_map,
+            process_lifecycle=self._process_lifecycle,
+            card_runtimes=self._card_runtimes,
+            bridge_data=self._runtime_config.bridge_data,
+            model_metadata=self._model_metadata,
+            footprint_store=self._footprint_store,
+            overhead=self._overhead,
+            reserve_ledger=self._reserve_ledger,
+            whole_card_ledger=self._whole_card_ledger,
+            whole_card_phase=lambda device_index: self._whole_card_ledger.phase(
+                device_index,
+                now=now,
+                establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+            ),
+            measured_free_mb=lambda device_index: self._measured_free_vram_mb(device_index=device_index),
+            reported_total_mb=lambda device_index: self._process_map.get_reported_total_vram_mb(
+                device_index=device_index,
+            ),
+            governor_state=self.governor_state,
+            growth_held=self.is_vram_growth_held,
+            arbiter_state=arbiter_state,
+            eligible_cards=self._eligible_card_indices,
+            host_ram=HostRamSnapshot(
+                available_mb=self._measured_available_ram_mb(),
+                total_mb=self._measured_total_ram_mb(),
+                reserve_mb=self._ram_budget.reserve_mb,
+                danger_floor_mb=self._ram_danger_floor_mb(),
+                pressure=ram_verdict,
+            ),
+            budget_active=self._budget_active(),
+            vram_reserve_mb=self._vram_budget.reserve_mb,
+            ledgers=snapshot_ledgers(
+                head_admission=self._head_admission,
+                dispatch_holds=self._dispatch_holds,
+                retention=self._retention,
+                safety_placement=self._safety_placement,
+                ram_reclaim=self._ram_reclaim,
+            ),
+        )
 
     def build_vram_arbiter_snapshot(
         self,
@@ -8078,7 +8145,7 @@ class InferenceScheduler:
         if self._process_lifecycle.is_model_load_quarantined(job.model):
             return False
 
-        process_with_model = self._resident_process_for_job(job)
+        process_with_model = self.resident_process_for_job(job)
         if process_with_model is None or not process_with_model.can_accept_job():
             return False
 
@@ -8199,7 +8266,7 @@ class InferenceScheduler:
         a slot frees.
 
         Nor is candidacy conditioned on the retainer being dispatchable *at all*. The retainer is located with
-        ``include_reserved=True``, the carve-out :meth:`_resident_process_for_job` documents for the residency and
+        ``include_reserved=True``, the carve-out :meth:`resident_process_for_job` documents for the residency and
         pricing queries: a disaggregation-pinned sampler lane is a lane no job may be dispatched onto yet, and it
         is still a lane carrying weights on the device. Whether those weights may be thrown away is a residency
         question and the answer does not change because a pin is standing, since the pin lifts when the pinned
@@ -8243,7 +8310,7 @@ class InferenceScheduler:
             if self._process_lifecycle.is_model_load_quarantined(job.model):
                 rejections.append(f"{job.model}: quarantined")
                 continue
-            resident = self._resident_process_for_job(job, include_reserved=True)
+            resident = self.resident_process_for_job(job, include_reserved=True)
             if resident is None or resident.retained_resident_model != job.model:
                 rejections.append(
                     f"{job.model}: no-retainer"
@@ -8283,7 +8350,7 @@ class InferenceScheduler:
         strict priority and its load evicts the retained weights: a reorder there would buy an upload back by
         making the head wait for a whole other job, which is a trade the head's deadline cannot be asked to fund.
         """
-        if self._resident_process_for_job(head_job) is not None:
+        if self.resident_process_for_job(head_job) is not None:
             return False
         return self._select_preload_process(head_job, [retainer.process_id]) is not None
 
@@ -8667,7 +8734,7 @@ class InferenceScheduler:
                 continue
             if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
                 continue
-            candidate_process = self._resident_process_for_job(candidate_job)
+            candidate_process = self.resident_process_for_job(candidate_job)
             if candidate_process is None or not candidate_process.can_accept_job():
                 continue
             if not self._concurrent_overlap_allowed(
@@ -8800,7 +8867,7 @@ class InferenceScheduler:
         pool = ready or candidates
         return min(pool, key=lambda p: self._card_inference_load(p.device_index))
 
-    def _resident_process_for_job(
+    def resident_process_for_job(
         self,
         job: ImageGenerateJobPopResponse,
         *,
@@ -8940,16 +9007,16 @@ class InferenceScheduler:
     def _pinned_lane_resident_for_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
         """The disaggregation-pinned lane holding ``job``'s model when that is the only resident copy, else None.
 
-        The dispatch query (:meth:`_resident_process_for_job`) excludes pinned lanes, so a job whose model is
+        The dispatch query (:meth:`resident_process_for_job`) excludes pinned lanes, so a job whose model is
         resident only on a pinned sampler lane reads as not-resident and would otherwise be priced a fresh
         preload that cannot fit beside the pinned residents. This names that case: an unreserved resident copy
         does not exist, but a pinned lane holds the model. The head then holds for the pin to release (dispatch
         onto the resident lane, priced as resident) instead of funding a second copy; a job is never dispatched
         onto the returned pinned lane.
         """
-        if self._resident_process_for_job(job) is not None:
+        if self.resident_process_for_job(job) is not None:
             return None
-        resident = self._resident_process_for_job(job, include_reserved=True)
+        resident = self.resident_process_for_job(job, include_reserved=True)
         if resident is not None and self._process_map.is_reserved_for_disaggregation(resident.process_id):
             return resident
         return None
@@ -9032,7 +9099,7 @@ class InferenceScheduler:
         model = job.model
         if model is None or not self._multi_gpu_routing_active:
             return False
-        if self._resident_process_for_job(job, include_reserved=True) is not None:
+        if self.resident_process_for_job(job, include_reserved=True) is not None:
             return False
         return self._process_map.get_process_by_horde_model_name(model, include_reserved=True) is not None
 
@@ -9282,7 +9349,7 @@ class InferenceScheduler:
                     self._fault_ineligible_job(next_job, eligibility)
                 return None
 
-        process_with_model = self._resident_process_for_job(next_job)
+        process_with_model = self.resident_process_for_job(next_job)
         # A slot busy with its own job may still be holding this model's weights on the device under an
         # earlier retention grant. Seating the head anywhere else would load a second copy of those same
         # weights; where that copy does not fit beside them, the retainer is the head's destination and the
@@ -9386,7 +9453,7 @@ class InferenceScheduler:
                     # A degraded retry must run isolated (see the diversity path), so it is never a bypass target.
                     if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
                         continue
-                    candidate_process = self._resident_process_for_job(candidate_job)
+                    candidate_process = self.resident_process_for_job(candidate_job)
                     if candidate_process is not None and candidate_process.can_accept_job():
                         line_skip = LineSkip(displaced_job=next_job, reason="resident_bypass")
                         next_job = candidate_job

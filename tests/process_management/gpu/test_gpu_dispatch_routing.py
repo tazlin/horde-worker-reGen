@@ -101,7 +101,7 @@ class TestEligibilityRouting:
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         assert scheduler._eligible_card_indices(job) == {0}
-        chosen = scheduler._resident_process_for_job(job)
+        chosen = scheduler.resident_process_for_job(job)
         assert chosen is not None
         assert chosen.device_index == 0
 
@@ -116,7 +116,7 @@ class TestEligibilityRouting:
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         assert scheduler._eligible_card_indices(job) == {0}
-        assert scheduler._resident_process_for_job(job) is None
+        assert scheduler.resident_process_for_job(job) is None
 
 
 class TestStickyLeastLoaded:
@@ -143,7 +143,7 @@ class TestStickyLeastLoaded:
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         assert scheduler._eligible_card_indices(job) == {0, 1}
-        chosen = scheduler._resident_process_for_job(job)
+        chosen = scheduler.resident_process_for_job(job)
         assert chosen is not None
         assert chosen.device_index == 1
 
@@ -165,7 +165,7 @@ class TestStickyLeastLoaded:
             card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
-        chosen = scheduler._resident_process_for_job(job)
+        chosen = scheduler.resident_process_for_job(job)
         assert chosen is not None
         assert chosen.device_index == 1
 
@@ -184,7 +184,7 @@ class TestSingleGpuNoop:
         )
         assert scheduler._multi_gpu_routing_active is False
         job = make_job_pop_response(model="stable_diffusion")
-        chosen = scheduler._resident_process_for_job(job)
+        chosen = scheduler.resident_process_for_job(job)
         assert chosen is not None
         assert chosen.device_index == 0
 
@@ -196,7 +196,7 @@ class TestSingleGpuNoop:
         scheduler = _make_scheduler(process_map=process_map, card_runtimes=None)
         assert scheduler._multi_gpu_routing_active is False
         job = make_job_pop_response(model="stable_diffusion")
-        assert scheduler._resident_process_for_job(job) is not None
+        assert scheduler.resident_process_for_job(job) is not None
 
     async def test_single_card_faults_exactly_ineligible_head_and_reaches_follower(self) -> None:
         """Exact incompatibility is bounded on one card even though placement retains its legacy fast path."""

@@ -80,11 +80,11 @@ async def test_pinned_lane_is_seen_only_by_residency_queries_not_dispatch() -> N
 
     # Dispatch selection excludes the pinned lane (never dispatch onto it): the model reads as not resident.
     assert process_map.get_process_by_horde_model_name(_MODEL) is None
-    assert scheduler._resident_process_for_job(head) is None
+    assert scheduler.resident_process_for_job(head) is None
 
     # Residency/pricing queries include it, so the scheduler can know the model's weights are resident there.
     assert process_map.get_process_by_horde_model_name(_MODEL, include_reserved=True) is process_map[0]
-    assert scheduler._resident_process_for_job(head, include_reserved=True) is process_map[0]
+    assert scheduler.resident_process_for_job(head, include_reserved=True) is process_map[0]
     assert scheduler._pinned_lane_resident_for_job(head) is process_map[0]
 
 

@@ -6898,8 +6898,7 @@ class HordeWorkerProcessManager:
                 why = "The queued job's model is loading into a process."
             else:
                 summary = f"Preparing queued job {target_job_id[:8] if target_job_id else ''}.".strip()
-                _find_resident = getattr(self._inference_scheduler, "_resident_process_for_job", None)
-                resident = _find_resident(head) if _find_resident is not None else None
+                resident = self._inference_scheduler.resident_process_for_job(head)
                 if resident is not None:
                     if resident.last_process_state.name == "INFERENCE_STARTING":
                         why = f"Process {resident.process_id} is busy sampling."

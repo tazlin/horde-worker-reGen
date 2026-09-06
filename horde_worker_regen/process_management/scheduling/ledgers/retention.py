@@ -282,6 +282,14 @@ class RetentionLedger:
         self.wddm_paging_victims_at: float = 0.0
         """When the victim set was last recorded."""
 
+    def slot_dispatch_history(self) -> Mapping[int, tuple[str, ...]]:
+        """Each slot's trailing dispatched models, newest first, frozen for a snapshot."""
+        return {process_id: tuple(history) for process_id, history in self._slot_dispatch_history.items()}
+
+    def pending_eviction_process_ids(self) -> frozenset[int]:
+        """The slots whose retention eviction has been issued but not yet evidenced at the device."""
+        return frozenset(self._pending_evictions)
+
     def note_wddm_paging(self, victims_shared_mb_by_pid: Mapping[int, float], *, active: bool) -> bool:
         """Record the parent's paging verdict; return whether this is the rising edge.
 

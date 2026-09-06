@@ -68,6 +68,7 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     SCENARIO_REVISION_ENV_VAR,
     RunMetricsSnapshot,
 )
+from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.model_demand_poller import (
     DemandSnapshot,
     ModelDemandRecord,
@@ -1282,6 +1283,14 @@ _HARNESS_STAGE_BUDGET_FIELDS: dict[JobStage, str] = {
 }
 
 
+def _scheduler_budget_defer_reason(manager: HordeWorkerProcessManager) -> str | None:
+    """The reason the scheduler's last preload admission deferred on the VRAM budget, or None."""
+    admission = manager._inference_scheduler.head_admission.last_preload_admission
+    if admission is None or admission.decision is not AdmissionDecision.DEFER_BUDGET:
+        return None
+    return admission.reason or None
+
+
 def _capture_harness_stage_snapshot(
     manager: HordeWorkerProcessManager,
     *,
@@ -1341,7 +1350,7 @@ def _capture_harness_stage_snapshot(
         source_exhausted=source.exhausted if source is not None else None,
         source_progress=source_progress,
         aux_prefetch_summary=manager._aux_prefetch_coordinator.hold_summary(now),
-        scheduler_defer_reason=manager._inference_scheduler._last_budget_defer_reason,
+        scheduler_defer_reason=_scheduler_budget_defer_reason(manager),
         whole_card_summary=whole_card_summary,
         recent_actions=tuple(event.event_type.name for event in recent_actions),
     )
