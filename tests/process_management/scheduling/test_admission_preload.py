@@ -18,7 +18,9 @@ from horde_worker_regen.process_management.scheduling.admission import preload
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob, ReplaceProcess
 from horde_worker_regen.process_management.scheduling.admission.preload import (
     PreloadPassControl,
+    RamChargeKind,
     decide_preload_gates,
+    decide_ram_admission,
     every_pending_model_accounted_for,
     loaded_or_loading_models,
     preload_head,
@@ -309,3 +311,47 @@ class TestTargetSelectionAgreesWithTheScheduler:
         head = snapshot.queue.jobs[str(jobs[0].id_)]
 
         assert preload.head_is_starving(snapshot, head) is scheduler._head_aged_past_anti_starvation(jobs[0])
+
+
+class TestRamAdmission:
+    """The RAM verdict picks the marginal accounting the target and the job's class allow."""
+
+    async def test_a_fresh_target_is_charged_the_whole_checkpoint(self) -> None:
+        """No retained pages and no component charge: the whole checkpoint, at the budget's own verdict."""
+        scheduler, jobs = await _worker(slots={0: _slot(0, model=None)}, pending=["sd"])
+
+        admission = decide_ram_admission(scheduler.snapshot(), str(jobs[0].id_), 0)
+
+        assert admission.kind is RamChargeKind.WHOLE
+        assert admission.fits is admission.verdict.fits
+
+    async def test_a_retaining_target_is_credited_its_pages(self) -> None:
+        """An idle target that kept its unloaded model's pages prices the swap at its marginal growth."""
+        retaining = _slot(0, model=None)
+        retaining.ram_usage_bytes = 8000 * 1024 * 1024
+        scheduler, jobs = await _worker(slots={0: retaining}, pending=["sd"])
+
+        admission = decide_ram_admission(scheduler.snapshot(), str(jobs[0].id_), 0)
+
+        assert admission.kind is RamChargeKind.PAGE_REUSE
+        assert admission.verdict.reusable_credit_mb > 0.0
+
+    async def test_a_disaggregation_class_job_with_a_sidecar_is_charged_its_component(self) -> None:
+        """The UNet-only residual supersedes the page credit, and a checkpoint already staged charges nothing."""
+
+        class _Sidecar:
+            residual_tensor_bytes = 6000 * 1024 * 1024
+
+        retaining = _slot(0, model=None)
+        retaining.ram_usage_bytes = 8000 * 1024 * 1024
+        scheduler, jobs = await _worker(slots={0: retaining}, pending=["sd"])
+        scheduler._is_disaggregation_class_eligible = lambda _job: True  # type: ignore[method-assign]
+        scheduler._read_component_sidecar = lambda _model: _Sidecar()  # type: ignore[assignment, method-assign, return-value]
+        job_id = str(jobs[0].id_)
+
+        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+        assert admission.kind is RamChargeKind.COMPONENT
+        assert admission.verdict.predicted_mb == 6000.0, "the residual, not the whole checkpoint net of pages"
+
+        scheduler._checkpoint_models_held_on = lambda _pid: frozenset({"sd"})  # type: ignore[method-assign]
+        assert preload.component_charge_mb(scheduler.snapshot(), job_id, 0) == 0.0

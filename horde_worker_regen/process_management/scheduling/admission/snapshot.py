@@ -32,6 +32,7 @@ from horde_worker_regen.process_management.models.model_metadata import ModelMet
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
+    RamBudget,
     RamPressureVerdict,
     VramBudget,
 )
@@ -47,7 +48,10 @@ from horde_worker_regen.process_management.scheduling.ledgers.head_admission imp
     HeadAdmissionLedger,
     LatestPreloadAdmission,
 )
-from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import RamReclaimLedger
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
+    RamReclaimLedger,
+    staging_reuse_credit_mb,
+)
 from horde_worker_regen.process_management.scheduling.ledgers.retention import (
     RETENTION_STALE_HOLD_SECONDS,
     RetentionLedger,
@@ -92,6 +96,10 @@ class SlotSnapshot:
     """Whether the slot has sat on a completed preload past the retention stale horizon with no job."""
     reserved_for_disaggregation: bool
     """Whether the slot is pinned as an in-flight disaggregated job's sampler: live work even while it idles."""
+    reuse_credit_mb: float
+    """The retained, reusable resident RSS (MB) a preload onto this slot can reuse instead of allocating."""
+    checkpoint_models_held: frozenset[str]
+    """Checkpoints staged in the slot's RAM component cache, by bare model name."""
 
 
 @dataclass(frozen=True)
@@ -153,6 +161,9 @@ class JobSnapshot:
     """The horde's time-to-live for the job in seconds, or None when it supplied none."""
     unserviceable_reason: str | None
     """Why no serving card can ever host the job's model minimum, or None when some card can."""
+    component_charge_mb: float | None
+    """The UNet-only RAM staging charge (MB) for a disaggregation-class job whose checkpoint carries a
+    component-identity sidecar, else None: the whole checkpoint is priced."""
 
 
 @dataclass(frozen=True)
@@ -284,6 +295,8 @@ class PricingServices:
     reserve_ledger: CommittedReserveLedger
     vram_budget: VramBudget
     """The predictive VRAM budget: the static peak estimate and the configured reserve a preload is sized from."""
+    ram_budget: RamBudget
+    """The system-RAM budget a preload's staging charge is judged against."""
 
 
 @dataclass(frozen=True)
@@ -352,6 +365,7 @@ def snapshot_slot(
     *,
     now: float,
     reserved_for_disaggregation: bool = False,
+    checkpoint_models_held: frozenset[str] = frozenset(),
 ) -> SlotSnapshot:
     """Freeze one process record, answering weight residency through the model map for the models it names."""
     job = process_info.current_inference_job()
@@ -386,6 +400,8 @@ def snapshot_slot(
         aimdo_mb=process_info.process_aimdo_mb,
         parked_preload=process_info.is_parked_preload(now=now, dwell_seconds=RETENTION_STALE_HOLD_SECONDS),
         reserved_for_disaggregation=reserved_for_disaggregation,
+        reuse_credit_mb=staging_reuse_credit_mb(process_info),
+        checkpoint_models_held=checkpoint_models_held,
     )
 
 
@@ -446,6 +462,7 @@ def build_scheduling_snapshot(
     overhead: ContextOverheadModel,
     reserve_ledger: CommittedReserveLedger,
     vram_budget: VramBudget,
+    ram_budget: RamBudget,
     whole_card_ledger: WholeCardResidencyLedger,
     whole_card_phase: Callable[[int | None], tuple[str | None, WholeCardPhase]],
     measured_free_mb: Callable[[int | None], float | None],
@@ -457,6 +474,8 @@ def build_scheduling_snapshot(
     eligible_cards: Callable[[ImageGenerateJobPopResponse], set[int]],
     disaggregation_class_eligible: Callable[[ImageGenerateJobPopResponse], bool],
     unserviceable_reason: Callable[[ImageGenerateJobPopResponse], str | None],
+    component_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
+    checkpoint_models_held: Callable[[int], frozenset[str]],
     host_ram: HostRamSnapshot,
     budget_active: bool,
     vram_reserve_mb: float,
@@ -551,6 +570,7 @@ def build_scheduling_snapshot(
             popped_at=tracked.time_popped if tracked is not None else None,
             ttl=float(job.ttl) if job.ttl is not None else None,
             unserviceable_reason=unserviceable_reason(job),
+            component_charge_mb=component_charge_mb(job),
         )
         (in_progress_ids if is_in_progress else pending_ids).append(key)
 
@@ -586,6 +606,7 @@ def build_scheduling_snapshot(
                 horde_model_map,
                 now=now,
                 reserved_for_disaggregation=process_map.is_reserved_for_disaggregation(process_id),
+                checkpoint_models_held=checkpoint_models_held(process_id),
             )
             for process_id, info in sorted(process_map.items())
         },
@@ -625,5 +646,6 @@ def build_scheduling_snapshot(
             overhead=overhead,
             reserve_ledger=reserve_ledger,
             vram_budget=vram_budget,
+            ram_budget=ram_budget,
         ),
     )

@@ -135,7 +135,9 @@ from horde_worker_regen.process_management.scheduling.admission.materialization 
 from horde_worker_regen.process_management.scheduling.admission.preload import (
     PreloadGatePlan,
     PreloadPassControl,
+    RamChargeKind,
     decide_preload_gates,
+    decide_ram_admission,
     every_pending_model_accounted_for,
     loaded_or_loading_models,
     pass_control_for,
@@ -4929,6 +4931,7 @@ class InferenceScheduler:
             overhead=self._overhead,
             reserve_ledger=self._reserve_ledger,
             vram_budget=self._vram_budget,
+            ram_budget=self._ram_budget,
             whole_card_ledger=self._whole_card_ledger,
             whole_card_phase=lambda device_index: self._whole_card_ledger.phase(
                 device_index,
@@ -4949,6 +4952,8 @@ class InferenceScheduler:
             eligible_cards=self._eligible_card_indices,
             disaggregation_class_eligible=self._is_disaggregation_class_eligible,
             unserviceable_reason=self._unserviceable_job_reason,
+            component_charge_mb=self._unet_component_charge_mb,
+            checkpoint_models_held=self._checkpoint_models_held_on,
             host_ram=HostRamSnapshot(
                 available_mb=self._measured_available_ram_mb(),
                 total_mb=self._measured_total_ram_mb(),
@@ -5967,20 +5972,14 @@ class InferenceScheduler:
                     record.model,
                 )
 
-    def _disaggregated_component_charge_mb(
-        self,
-        job: ImageGenerateJobPopResponse,
-        target: HordeProcessInfo,
-    ) -> float | None:
-        """Return the UNet-only RAM staging charge (MB) for a disaggregation-class ``job``, or None.
+    def _unet_component_charge_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
+        """The UNet-only RAM staging charge (MB) for a disaggregation-class ``job`` with a readable sidecar, else None.
 
-        None means "price the whole checkpoint" and is returned whenever the component charge does not apply:
-        the job is not disaggregation-class, it has no model, or no component-identity sidecar (hence no UNet
-        residual) can be read for its checkpoint. A readable sidecar yields the floored UNet residual charge
-        (:func:`predict_job_unet_only_ram_mb`), except that a checkpoint whose identity the residency map shows
-        already staged on ``target`` is charged 0.0: its pages are resident, so the stage materialises nothing
-        (the RAM analogue of the resident-weight credit the VRAM candidate delta applies). The class predicate
-        is the stable one the VRAM side charges against, so RAM and VRAM stay class-consistent within a cycle.
+        None means "price the whole checkpoint": the job is not disaggregation-class, it has no model, or no
+        component-identity sidecar (hence no UNet residual) can be read for its checkpoint. A readable sidecar
+        yields the floored UNet residual charge (:func:`predict_job_unet_only_ram_mb`). Whether the checkpoint is
+        already staged on the target slot is the snapshot's to answer. The class predicate is the stable one the
+        VRAM side charges against, so RAM and VRAM stay class-consistent within a cycle.
         """
         if not self._is_disaggregation_class_eligible(job):
             return None
@@ -5989,20 +5988,18 @@ class InferenceScheduler:
         sidecar = self._read_component_sidecar(job.model)
         if sidecar is None:
             return None
-        if self._checkpoint_identity_held_on(job.model, target.process_id):
-            return 0.0
         return predict_job_unet_only_ram_mb(sidecar.residual_tensor_bytes)
 
-    def _checkpoint_identity_held_on(self, model_name: str, process_id: int) -> bool:
-        """Whether ``model_name``'s checkpoint is already staged in ``process_id``'s RAM component cache.
+    def _checkpoint_models_held_on(self, process_id: int) -> frozenset[str]:
+        """The checkpoints staged in ``process_id``'s RAM component cache, by bare model name.
 
-        A checkpoint entry's residency identity is the bare horde model name, so this is a direct membership
-        test against the residency map. False when no residency map is wired (unit tests, or a worker whose
-        budgeted component cache is disabled), so the charge then defaults to the full UNet residual.
+        A checkpoint entry's residency identity is the bare horde model name, so this is the residency map's
+        own answer. Empty when no residency map is wired (unit tests, or a worker whose budgeted component
+        cache is disabled), so a component charge then defaults to the full UNet residual.
         """
         if self._component_residency_map is None:
-            return False
-        return model_name in self._component_residency_map.checkpoint_models_held_on([process_id])
+            return frozenset()
+        return frozenset(self._component_residency_map.checkpoint_models_held_on([process_id]))
 
     def _read_component_sidecar(self, model_name: str) -> ComponentIdentitySidecar | None:
         """Return ``model_name``'s component-identity sidecar (torch-free, cached), or None when unavailable.
@@ -6085,53 +6082,36 @@ class InferenceScheduler:
     def _apply_ram_verdict(
         self,
         job: ImageGenerateJobPopResponse,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
         available_process: HordeProcessInfo,
         *,
         is_head_blocker: bool,
         no_live_resource_consumer: bool,
+        snapshot: SchedulingSnapshot | None = None,
     ) -> bool:
-        """Apply the system-RAM budget verdict for a preload: reclaim idle RAM or best-effort admit.
+        """Apply the system-RAM budget verdict for a preload: admit, reclaim idle RAM, or best-effort admit.
 
-        When the predicted RAM cost fits, returns True immediately. The charge is credited for a reusable
-        staging target: an idle ``available_process`` that retains its unloaded model's pages (or swaps a model
-        in place) reuses those pages, so the verdict prices the swap at its marginal growth rather than a full
-        cold load (see :func:`staging_reuse_credit_mb` and :meth:`RamBudget.check_job`). The credit is gated on
-        the host RAM danger floor so it never admits into a floor breach.
-
-        A disaggregation-class job (the same class predicate the VRAM side charges sampler-only against) is
-        instead priced at its UNet-only component charge: its sampler stages only the UNet, so the whole-
-        checkpoint charge would over-count by the text encoders and VAE that never enter this process. The
-        component charge supersedes the page-reuse credit (they are alternative marginal accountings of the
-        same load). When no component charge applies (the job is not disaggregation-class, or its checkpoint has
-        no resolvable sidecar, e.g. a ``.ckpt`` pickle that can never carry one), the verdict is exactly the
-        pre-feature path: the whole-checkpoint charge with the reusable-page credit still applied, so a model
-        that lacks a sidecar is never admitted more strictly than before this feature existed (see
-        :meth:`_disaggregated_component_charge_mb`). Otherwise runs the reclaim attempts (gentle
-        eviction, escalated for the head, then cycling an allocator-stuck idle slot that is *not* this target)
-        and dispatches on
-        [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome]:
-        reclaim progress is always worth waiting for, and only a head-of-queue blocker with no live job
-        holding memory is admitted best-effort once nothing more can be reclaimed.
+        The verdict is :func:`decide_ram_admission` over the phase snapshot (the component charge or the
+        page-reuse credit, both marginal accountings of the same load). A fit records the accounting it was
+        admitted under for the measured-truth reconciliation and returns True. Otherwise the reclaim attempts
+        run (gentle eviction, escalated for the head, then cycling an allocator-stuck idle slot that is *not*
+        this target) and
+        [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome]
+        resolves over the reclaim booleans, never a fresh reading: reclaim progress is always worth waiting
+        for, and only a head-of-queue blocker with no live job holding memory is admitted best-effort once
+        nothing more can be reclaimed.
         """
+        if job.id_ is None:
+            raise ValueError(f"job.id_ is None ({job})")
         self._reconcile_reuse_credit()
-        component_charge_mb = self._disaggregated_component_charge_mb(job, available_process)
-        is_component_charge = component_charge_mb is not None
-        ram_verdict = self._ram_budget.check_job(
-            job,
-            baseline,
-            self._measured_available_ram_mb(),
-            committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
-            reusable_credit_mb=0.0 if is_component_charge else staging_reuse_credit_mb(available_process),
-            danger_floor_mb=self._ram_danger_floor_mb(),
-            disaggregated=is_component_charge,
-            component_charge_mb=component_charge_mb,
-        )
+        if snapshot is None:
+            snapshot = self.snapshot()
+        admission = decide_ram_admission(snapshot, str(job.id_), available_process.process_id)
+        ram_verdict = admission.verdict
         if ram_verdict.fits:
             self._ram_budget_defer_notified = False
-            if is_component_charge:
+            if admission.kind is RamChargeKind.COMPONENT:
                 self._note_component_admission(job, available_process, ram_verdict)
-            elif ram_verdict.reusable_credit_mb > 0.0:
+            elif admission.kind is RamChargeKind.PAGE_REUSE:
                 self._note_credited_admission(job, available_process, ram_verdict)
             self._resolve_head_ram_defer(job, reason="admitted")
             return True
@@ -6278,10 +6258,10 @@ class InferenceScheduler:
             # through system RAM, so the marginal RAM verdict runs.
             return self._apply_ram_verdict(
                 job,
-                baseline,
                 available_process,
                 is_head_blocker=is_head_blocker,
                 no_live_resource_consumer=no_live_resource_consumer,
+                snapshot=snapshot,
             )
 
         # The static budget admitted this candidate on the free-VRAM reading and the measured arbiter refused

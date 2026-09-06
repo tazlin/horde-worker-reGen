@@ -65,6 +65,7 @@ flowchart TD
 | Preload gate ladder (serviceable, quarantined, already resident, RAM floor, target, exclusive hold, growth hold, model change, load serialization) | [`decide_preload_gates`][horde_worker_regen.process_management.scheduling.admission.preload.decide_preload_gates] | `SchedulingSnapshot` | `PreloadGatePlan`: an `AdmissionDecision`, the target slot, `FaultJob` / `ReplaceProcess` commands, a once-per-episode notice | `InferenceScheduler._run_preload_plan`, `PlanExecutor.execute_commands` |
 | Preload target choice (sticky, then least loaded, sparing the head's own copy) | [`select_preload_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_preload_target], [`select_head_room_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_head_room_target] | snapshot | a process id or None | the gate ladder |
 | Preload budget pricing (predictive verdict, context-reduction depth, arbiter request) | [`price_preload`][horde_worker_regen.process_management.scheduling.admission.preload.price_preload] | snapshot, the frozen arbiter, the streaming forecast | `PricedPreload` | `_admit_preload_under_budget`, which evaluates through the arbiter and runs the RAM verdict or the actuations |
+| RAM staging verdict (whole checkpoint, page-reuse credit, or the UNet-only component charge) | [`decide_ram_admission`][horde_worker_regen.process_management.scheduling.admission.preload.decide_ram_admission] | snapshot | `RamAdmission` | `_apply_ram_verdict`, which records the accounting on a fit and runs the reclaim sequence on a miss |
 | Materialisation request (dispatch, clearance and preload share it) | [`build_materialization_request`][horde_worker_regen.process_management.scheduling.admission.materialization.build_materialization_request] | snapshot, the frozen arbiter | `MaterializationRequest` (the `VramRequest`, the context-reduction depth, the candidate delta) | `VramArbiter.evaluate` |
 | VRAM pricing primitives (candidate delta, learned peaks, the streaming forecast, the co-resident maximum, what the card could give back) | [`pricing`][horde_worker_regen.process_management.scheduling.admission.pricing] | snapshot | numbers and predicates | every decision above |
 | Clearance admit for a staged child | [`decide_clearance_admit`][horde_worker_regen.process_management.scheduling.admission.clearance.decide_clearance_admit] | snapshot, the frozen arbiter | `ClearancePlan` | `clearance_admit_process` |
@@ -73,9 +74,9 @@ flowchart TD
 
 Still inline on the scheduler, and the next cuts in order: the whole-card residency demand
 (`_decide_whole_card_demand`, which establishes residencies and unloads siblings inside the budget step),
-the RAM verdict (`_apply_ram_verdict`), dispatch selection (`get_next_job_and_process`) and the dispatch
-holds (`_dispatch_residency_reconciliation_holds`). Each is actuation over the same collaborators and will
-take the same shape.
+the RAM reclaim sequence behind a RAM miss (`_apply_ram_verdict`), dispatch selection
+(`get_next_job_and_process`) and the dispatch holds (`_dispatch_residency_reconciliation_holds`). Each is
+actuation over the same collaborators and will take the same shape.
 
 ## The state the decisions read
 

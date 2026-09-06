@@ -61,6 +61,7 @@ class TestSlotSnapshot:
         assert slot.resident_weight_models == frozenset({"sd"})
         assert slot.capabilities == process_info.capabilities
         assert slot.reserved_for_disaggregation is False
+        assert slot.reuse_credit_mb == 0.0 and slot.checkpoint_models_held == frozenset()
 
     def test_a_pinned_sampler_is_marked_reserved(self) -> None:
         """The disaggregation pin is read from the process map, not the record."""
@@ -126,6 +127,8 @@ class TestSchedulingSnapshot:
         assert snapshot.queue.jobs[head_id].requires_aux_preparation is False
         assert snapshot.queue.jobs[head_id].popped_at is not None
         assert snapshot.queue.jobs[head_id].unserviceable_reason is None
+        assert snapshot.queue.jobs[head_id].component_charge_mb is None
+        assert snapshot.services.ram_budget is scheduler._ram_budget  # type: ignore[attr-defined]
         assert card.exclusive_job_in_progress is False
         assert snapshot.draining_process_ids == frozenset()
         assert snapshot.shutting_down is False

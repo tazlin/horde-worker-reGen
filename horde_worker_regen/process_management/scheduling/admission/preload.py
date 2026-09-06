@@ -687,3 +687,78 @@ def price_preload(
         prepared_head_reprices_activation=False,
     )
     return PricedPreload(priced=priced, predictive=predictive, forecast=forecast, context_reduction=context_reduction)
+
+
+# ---- the RAM verdict
+
+
+class RamChargeKind(enum.Enum):
+    """Which marginal accounting priced a preload's system-RAM staging charge."""
+
+    WHOLE = enum.auto()
+    """The whole checkpoint, with no reusable pages on the target."""
+    PAGE_REUSE = enum.auto()
+    """The whole checkpoint net of the pages the idle target retained from its unloaded model."""
+    COMPONENT = enum.auto()
+    """The UNet-only residual a disaggregation-class sampler stages; the text encoders and VAE never enter it."""
+
+
+@dataclass(frozen=True)
+class RamAdmission:
+    """The system-RAM budget's verdict for a preload and the accounting that produced it."""
+
+    verdict: BudgetVerdict
+    kind: RamChargeKind
+
+    @property
+    def fits(self) -> bool:
+        """Whether the staging charge fits available host RAM above the danger floor."""
+        return self.verdict.fits
+
+
+def component_charge_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
+    """The UNet-only RAM staging charge (MB) for the job onto the slot, or None to price the whole checkpoint.
+
+    None whenever the component charge does not apply: the job is not disaggregation-class, or no
+    component-identity sidecar can be read for its checkpoint (a ``.ckpt`` pickle never carries one), so a
+    model that lacks a sidecar is never admitted more strictly than the whole-checkpoint path. A checkpoint
+    whose identity the residency map shows already staged on the slot is charged 0.0: its pages are resident,
+    so the stage materialises nothing (the RAM analogue of the resident-weight credit on the VRAM side).
+    """
+    job = snapshot.queue.jobs[job_id]
+    if job.component_charge_mb is None or job.model is None:
+        return None
+    if job.model in snapshot.slots[process_id].checkpoint_models_held:
+        return 0.0
+    return job.component_charge_mb
+
+
+def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> RamAdmission:
+    """Judge a preload's staging charge against available host RAM, at its marginal accounting.
+
+    A disaggregation-class job with a sidecar is charged its UNet-only component; otherwise the whole
+    checkpoint is charged net of the reusable pages an idle target retained from its unloaded model (the credit
+    is gated on the danger floor inside the budget so it never admits into a floor breach). The two are
+    alternative marginal accountings of the same load, so the component charge supersedes the credit.
+    """
+    job = snapshot.queue.jobs[job_id]
+    slot = snapshot.slots[process_id]
+    component = component_charge_mb(snapshot, job_id, process_id)
+    is_component = component is not None
+    verdict = snapshot.services.ram_budget.check_job(
+        snapshot.queue.payloads[job_id],
+        job.baseline,
+        snapshot.host_ram.available_mb,
+        committed_reserve_mb=snapshot.services.reserve_ledger.total_ram_mb(),
+        reusable_credit_mb=0.0 if is_component else slot.reuse_credit_mb,
+        danger_floor_mb=snapshot.host_ram.danger_floor_mb,
+        disaggregated=is_component,
+        component_charge_mb=component,
+    )
+    if is_component:
+        kind = RamChargeKind.COMPONENT
+    elif verdict.reusable_credit_mb > 0.0:
+        kind = RamChargeKind.PAGE_REUSE
+    else:
+        kind = RamChargeKind.WHOLE
+    return RamAdmission(verdict=verdict, kind=kind)

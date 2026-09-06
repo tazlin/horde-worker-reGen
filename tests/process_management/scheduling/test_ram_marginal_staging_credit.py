@@ -47,6 +47,7 @@ from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
     mark_ram_unload_settled,
+    track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
@@ -104,7 +105,7 @@ class TestStagingReuseCredit:
 class TestCreditedAdmission:
     """A retaining target admits a swap the cold-load charge would defer, and the admission is recorded."""
 
-    def test_credited_admit_records_pending_reconciliation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_credited_admit_records_pending_reconciliation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The credit admits the live-window SDXL swap and records it for the measured-truth check."""
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 16000.0)
         target = _retaining_target(rss_mb=8000.0)
@@ -113,9 +114,9 @@ class TestCreditedAdmission:
         scheduler._ram_danger_floor_mb = lambda: 4800.0  # type: ignore[method-assign]
 
         job = make_job_pop_response("head_model")
+        await track_popped_job_async(scheduler._job_tracker, job)
         admitted = scheduler._apply_ram_verdict(
             job,
-            "x",
             target,
             is_head_blocker=False,
             no_live_resource_consumer=True,
@@ -124,7 +125,7 @@ class TestCreditedAdmission:
         assert 0 in scheduler.ram_reclaim.pending_reuse_credits
         assert scheduler.ram_reclaim.pending_reuse_credits[0].model == "head_model"
 
-    def test_credited_defer_escalates_to_cycle_of_a_different_stale_slot(
+    async def test_credited_defer_escalates_to_cycle_of_a_different_stale_slot(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """When even the credited charge cannot fit, reclaim cycles a stale slot other than the target."""
@@ -138,9 +139,9 @@ class TestCreditedAdmission:
         scheduler.unload_models = Mock(return_value=False)  # type: ignore[method-assign]
 
         job = make_job_pop_response("head_model")
+        await track_popped_job_async(scheduler._job_tracker, job)
         admitted = scheduler._apply_ram_verdict(
             job,
-            "x",
             target,
             is_head_blocker=False,
             no_live_resource_consumer=False,
