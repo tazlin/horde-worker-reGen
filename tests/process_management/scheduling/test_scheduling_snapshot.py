@@ -47,7 +47,9 @@ class TestSlotSnapshot:
         process_info.ram_usage_bytes = 5 * 1024 * 1024
         process_info.retained_resident_model = "sd"
         process_info.last_control_flag = HordeControlFlag.PRELOAD_MODEL
-        slot = snapshot_slot(process_info)
+        model_map = HordeModelMap(root={})
+        model_map.update_entry(horde_model_name="sd", load_state=ModelLoadState.LOADED_IN_VRAM, process_id=3)
+        slot = snapshot_slot(process_info, model_map)
         assert (slot.process_id, slot.model, slot.state) == (3, "sd", HordeProcessState.WAITING_FOR_JOB)
         assert (slot.reserved_mb, slot.allocated_mb, slot.ram_usage_bytes) == (4000, 3500, 5 * 1024 * 1024)
         assert slot.retained_resident_model == "sd"
@@ -56,6 +58,7 @@ class TestSlotSnapshot:
         assert slot.can_accept_job == process_info.can_accept_job()
         assert slot.is_unoccupied == process_info.is_unoccupied()
         assert slot.current_job_id is None
+        assert slot.resident_weight_models == frozenset({"sd"})
 
 
 class TestSchedulingSnapshot:
@@ -109,6 +112,12 @@ class TestSchedulingSnapshot:
         assert snapshot.queue.payloads[head_id].model == "sd"
         assert snapshot.model_loaded("sd") is True and snapshot.model_loaded("xl") is False
         assert snapshot.model_map["sd"].process_id == 0
+        assert snapshot.slots[0].resident_weight_models == frozenset({"sd"})
+        assert snapshot.queue.jobs[head_id].tracked is True
+        assert snapshot.queue.jobs[head_id].measured_attempt_devices == frozenset()
+        assert card.config is scheduler._runtime_config.bridge_data  # type: ignore[attr-defined]
+        assert snapshot.config_for(None) is card.config
+        assert snapshot.safety_footprint_mb > 0.0
 
         assert snapshot.ledgers.retention.wddm_paging_active is False
         assert snapshot.ledgers.dispatch_holds.hold_since == {}
@@ -141,7 +150,8 @@ class TestSchedulingSnapshot:
         assert snapshot.multi_gpu_routing_active is True
         assert set(snapshot.cards) == {None, 0, 1}
         assert snapshot.cards[1].config is card_runtimes[1].config
-        assert snapshot.cards[None].config is None
+        assert snapshot.cards[None].config is scheduler._runtime_config.bridge_data  # type: ignore[attr-defined]
+        assert snapshot.config_for(1) is card_runtimes[1].config
         assert snapshot.routing_device_index(snapshot.slots[0]) == 1
         assert snapshot.card(1) is snapshot.cards[1]
         assert snapshot.slots_of_type(HordeProcessType.INFERENCE) == (snapshot.slots[0],)

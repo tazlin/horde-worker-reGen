@@ -5216,6 +5216,7 @@ class InferenceScheduler:
             ),
             budget_active=self._budget_active(),
             vram_reserve_mb=self._vram_budget.reserve_mb,
+            safety_footprint_mb=self._safety_footprint_mb(),
             ledgers=snapshot_ledgers(
                 head_admission=self._head_admission,
                 dispatch_holds=self._dispatch_holds,

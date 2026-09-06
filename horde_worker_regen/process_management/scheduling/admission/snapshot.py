@@ -75,6 +75,8 @@ class SlotSnapshot:
     is_unoccupied: bool
     current_job_id: str | None
     held_component_count: int
+    resident_weight_models: frozenset[str]
+    """Models whose weights are in VRAM on this slot right now, as the model map answers it."""
 
 
 @dataclass(frozen=True)
@@ -94,8 +96,11 @@ class CardSnapshot:
     whole_card_phase: WholeCardPhase | None
     max_concurrent_inference: int | None
     target_process_count: int | None
-    config: reGenBridgeData | None
-    """The card's effective config on a multi-GPU host; None means the global config applies."""
+    config: reGenBridgeData
+    """The card's effective config: its per-card resolution on a multi-GPU host, else the global config."""
+    reserved_by_pid: Mapping[int, float]
+    """The live GPU processes' measured allocator reservation (MB) by process id, the figure planned
+    reserve charges decay against."""
 
 
 @dataclass(frozen=True)
@@ -110,6 +115,12 @@ class JobSnapshot:
     admitted_over_budget: bool
     aux_models_prepared: bool
     degraded_dispatch_pending: bool
+    tracked: bool
+    """Whether the tracker holds a record for the job (accepted work rather than a speculative offer)."""
+    measured_attempt_devices: frozenset[int | None]
+    """Cards (or the worker-wide key) on which the job has an active measured-load attempt."""
+    measured_attempt_spent_devices: frozenset[int | None]
+    """Cards (or the worker-wide key) on which the job has ever started a measured-load attempt."""
     eligible_cards: frozenset[int]
     """Cards whose effective config can serve the job; every card on a single-GPU host."""
 
@@ -256,6 +267,8 @@ class SchedulingSnapshot:
     config: reGenBridgeData
     budget_active: bool
     vram_reserve_mb: float
+    safety_footprint_mb: float
+    """The device VRAM (MB) the safety process costs while it sits on the GPU: the one safety price."""
     ledgers: LedgerViews
     services: PricingServices
 
@@ -263,6 +276,11 @@ class SchedulingSnapshot:
         """The card a slot's memory is scoped to, or the worker-wide view when routing is card-agnostic."""
         key = device_index if self.multi_gpu_routing_active else None
         return self.cards[key]
+
+    def config_for(self, device_index: int | None) -> reGenBridgeData:
+        """The effective config for a card: its per-card resolution when one exists, else the global."""
+        card = self.cards.get(device_index)
+        return card.config if card is not None else self.config
 
     def routing_device_index(self, slot: SlotSnapshot) -> int | None:
         """The card a slot's memory is scoped to: its device on a multi-GPU host, the whole worker otherwise."""
@@ -278,9 +296,13 @@ class SchedulingSnapshot:
         return entry is not None and entry.load_state is ModelLoadState.LOADED_IN_VRAM
 
 
-def snapshot_slot(process_info: HordeProcessInfo) -> SlotSnapshot:
-    """Freeze one process record."""
+def snapshot_slot(process_info: HordeProcessInfo, horde_model_map: HordeModelMap) -> SlotSnapshot:
+    """Freeze one process record, answering weight residency through the model map for the models it names."""
     job = process_info.current_inference_job()
+    candidates = {name for name, info in horde_model_map.root.items() if info.process_id == process_info.process_id}
+    candidates.update(
+        name for name in (process_info.loaded_horde_model_name, process_info.retained_resident_model) if name
+    )
     return SlotSnapshot(
         process_id=process_info.process_id,
         os_pid=process_info.os_pid,
@@ -301,6 +323,9 @@ def snapshot_slot(process_info: HordeProcessInfo) -> SlotSnapshot:
         is_unoccupied=process_info.is_unoccupied(),
         current_job_id=job_key(job) if job is not None else None,
         held_component_count=len(process_info.held_components or ()),
+        resident_weight_models=frozenset(
+            name for name in candidates if horde_model_map.weights_resident_on_process(name, process_info)
+        ),
     )
 
 
@@ -371,6 +396,7 @@ def build_scheduling_snapshot(
     host_ram: HostRamSnapshot,
     budget_active: bool,
     vram_reserve_mb: float,
+    safety_footprint_mb: float,
     ledgers: LedgerViews,
 ) -> SchedulingSnapshot:
     """Freeze the worker for one cycle.
@@ -384,6 +410,11 @@ def build_scheduling_snapshot(
     if multi_gpu:
         card_keys.extend(sorted(card_runtimes))
     cards: dict[int | None, CardSnapshot] = {}
+    reserved_by_pid_all = {
+        info.process_id: (info.device_index, float(info.process_reserved_mb))
+        for info in process_map.values()
+        if info.process_reserved_mb is not None
+    }
     for key in card_keys:
         runtime = card_runtimes.get(key) if key is not None else None
         held_model, phase = whole_card_phase(key)
@@ -398,7 +429,12 @@ def build_scheduling_snapshot(
             whole_card_phase=phase if held_model is not None else None,
             max_concurrent_inference=runtime.max_concurrent_inference if runtime is not None else None,
             target_process_count=runtime.target_process_count if runtime is not None else None,
-            config=runtime.config if runtime is not None else None,
+            config=runtime.config if runtime is not None else bridge_data,
+            reserved_by_pid={
+                pid: reserved
+                for pid, (device, reserved) in reserved_by_pid_all.items()
+                if key is None or device == key
+            },
         )
 
     in_progress_jobs = list(job_tracker.jobs_in_progress)
@@ -425,6 +461,13 @@ def build_scheduling_snapshot(
             admitted_over_budget=job_tracker.is_admitted_over_budget(job),
             aux_models_prepared=job_tracker.are_job_aux_models_prepared(job),
             degraded_dispatch_pending=job_tracker.is_degraded_dispatch_pending(job),
+            tracked=job.id_ is not None and job_tracker.get_tracked_job(job.id_) is not None,
+            measured_attempt_devices=frozenset(
+                device for device in card_keys if job_tracker.is_measured_attempt_on_device(job, device)
+            ),
+            measured_attempt_spent_devices=frozenset(
+                device for device in card_keys if job_tracker.has_spent_measured_attempt_on_device(job, device)
+            ),
             eligible_cards=frozenset(eligible_cards(job)),
         )
         (in_progress_ids if is_in_progress else pending_ids).append(key)
@@ -455,7 +498,7 @@ def build_scheduling_snapshot(
         now=now,
         multi_gpu_routing_active=multi_gpu,
         cards=cards,
-        slots={process_id: snapshot_slot(info) for process_id, info in sorted(process_map.items())},
+        slots={process_id: snapshot_slot(info, horde_model_map) for process_id, info in sorted(process_map.items())},
         queue=QueueSnapshot(
             pending_in_placement_order=tuple(pending_ids),
             in_progress=tuple(in_progress_ids),
@@ -471,6 +514,7 @@ def build_scheduling_snapshot(
         config=bridge_data,
         budget_active=budget_active,
         vram_reserve_mb=vram_reserve_mb,
+        safety_footprint_mb=safety_footprint_mb,
         ledgers=ledgers,
         services=PricingServices(
             model_metadata=model_metadata,
