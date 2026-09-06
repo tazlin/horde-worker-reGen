@@ -85,6 +85,8 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     DecisionKind,
     DecisionVerdict,
     FlatScalarMap,
+    ResourceStateEvent,
+    ResourceStateKind,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import MeasuredVramSnapshot
 from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
@@ -424,6 +426,18 @@ class _DecisionRecord:
     decision_kind: DecisionKind
     subject: str
     verdict: DecisionVerdict
+    reason: str
+    inputs: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _ResourceStateRecord:
+    """One device or hold state transition the scheduler recorded, stamped with the tick it landed on."""
+
+    tick: int
+    state_kind: ResourceStateKind
+    state: str
+    device_index: int | None
     reason: str
     inputs: dict[str, object]
 
@@ -820,6 +834,12 @@ class _DispatchWorld:
         The worker's own disclosure surface, wired here rather than re-derived: a hold the scheduler does not
         record is a hold an operator cannot see either, so an oracle that reads this is held to the same
         evidence a post-mortem has."""
+        self.resource_state_records: list[_ResourceStateRecord] = []
+        """Every device or hold state transition the scheduler disclosed, stamped with its tick.
+
+        The edge-triggered half of the same disclosure surface as :attr:`decision_records`: a dispatch hold
+        opening, standing and resolving is reported here and nowhere else, so a per-tick oracle over holds
+        reads this rather than re-deriving the hold from the card."""
         self.tick_observations: list[_TickObservation] = []
         """What each tick looked like to the verdicts that judge whether the card was earning."""
 
@@ -949,6 +969,7 @@ class _DispatchWorld:
             lru=LRUCache(max(2, lane_count)),
             reserve_ledger=self._reserve_ledger,
             decision_sink=self._record_decision,
+            resource_state_sink=self._record_resource_state,
             clock=lambda: self.now,
         )
         if disaggregated:
@@ -2437,6 +2458,33 @@ class _DispatchWorld:
                 decision_kind=decision_kind,
                 subject=subject,
                 verdict=verdict,
+                reason=reason,
+                inputs=dict(inputs or {}),
+            ),
+        )
+        return None
+
+    def _record_resource_state(
+        self,
+        *,
+        state_kind: ResourceStateKind,
+        state: str,
+        device_index: int | None = None,
+        reason: str = "",
+        inputs: FlatScalarMap | None = None,
+        timestamp: float | None = None,
+    ) -> ResourceStateEvent | None:
+        """Take the scheduler's disclosure of one device or hold state transition, stamped with its tick.
+
+        The counterpart of :meth:`_record_decision` for the edge-triggered surface. Returns None on the same
+        terms: the scheduler ignores the return and a run has no export to append to.
+        """
+        self.resource_state_records.append(
+            _ResourceStateRecord(
+                tick=self.tick,
+                state_kind=state_kind,
+                state=state,
+                device_index=device_index,
                 reason=reason,
                 inputs=dict(inputs or {}),
             ),

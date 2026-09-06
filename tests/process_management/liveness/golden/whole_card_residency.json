@@ -1,0 +1,1141 @@
+{
+  "jobs": 3,
+  "scenario": "whole_card_residency",
+  "schema": 2,
+  "ticks": [
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 1
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 2
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 3
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 4
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 5
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-1",
+          "verdict": "admit"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-1",
+          "keep_model_resident_after": null,
+          "model": "Flux.1-Schnell fp8 (Compact)",
+          "process_id": 0
+        }
+      ],
+      "tick": 6
+    },
+    {
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "Flux.1-Schnell fp8 (Compact)"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-1",
+          "keep_model_resident_after": false,
+          "model": "Flux.1-Schnell fp8 (Compact)",
+          "process_id": 0
+        }
+      ],
+      "sampling_started": [
+        "job-1"
+      ],
+      "tick": 7
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 8
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 9
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 10
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 11
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 12
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 13
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 14
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 15
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "available_mb": 14210.8,
+            "candidate_delta_mb": 14573.0,
+            "device_free_mb": 15030.0,
+            "device_index": null,
+            "hold_seconds": 0.0,
+            "is_head_of_queue": true,
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "probe_state": "waiting_10s",
+            "reclaim_applied": false,
+            "reclaim_applied_kinds": "",
+            "reclaim_requested": false,
+            "reclaim_requested_kinds": "",
+            "room_available_mb": 14210.8,
+            "room_candidate_mb": 14573.0,
+            "room_closable": false,
+            "room_deficit_mb": 362.2,
+            "room_reclaimable_mb": 0,
+            "room_unpausable_mb": 970.0,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 970.0,
+            "tenancy_inference_target_mb": 384.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": true
+          },
+          "kind": "inference_dispatch",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-2",
+          "verdict": "defer"
+        }
+      ],
+      "resource_states": [
+        {
+          "device_index": null,
+          "inputs": {
+            "hold_seconds": 0.0,
+            "job_id": "job-2",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "probe_state": "waiting_10s",
+            "room_available_mb": 14210.8,
+            "room_candidate_mb": 14573.0,
+            "room_closable": false,
+            "room_deficit_mb": 362.2,
+            "room_reclaimable_mb": 0,
+            "room_unpausable_mb": 970.0,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 970.0,
+            "tenancy_inference_target_mb": 384.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": true
+          },
+          "kind": "dispatch_hold",
+          "reason": "dispatch_residency_hold",
+          "state": "standing"
+        }
+      ],
+      "tick": 16
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "available_mb": 14210.8,
+            "candidate_delta_mb": 14573.0,
+            "device_free_mb": 15030.0,
+            "device_index": null,
+            "hold_seconds": 2.0,
+            "is_head_of_queue": true,
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "probe_state": "waiting_8s",
+            "reclaim_applied": false,
+            "reclaim_applied_kinds": "",
+            "reclaim_requested": false,
+            "reclaim_requested_kinds": "",
+            "room_available_mb": 14210.8,
+            "room_candidate_mb": 14573.0,
+            "room_closable": false,
+            "room_deficit_mb": 362.2,
+            "room_reclaimable_mb": 0,
+            "room_unpausable_mb": 970.0,
+            "starved_seconds": 2.0,
+            "tenancy_foreign_mb": 970.0,
+            "tenancy_inference_target_mb": 384.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": true
+          },
+          "kind": "inference_dispatch",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-2",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 17
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "available_mb": 14210.8,
+            "candidate_delta_mb": 14573.0,
+            "device_free_mb": 15030.0,
+            "device_index": null,
+            "hold_seconds": 4.0,
+            "is_head_of_queue": true,
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "probe_state": "waiting_6s",
+            "reclaim_applied": false,
+            "reclaim_applied_kinds": "",
+            "reclaim_requested": false,
+            "reclaim_requested_kinds": "",
+            "room_available_mb": 14210.8,
+            "room_candidate_mb": 14573.0,
+            "room_closable": false,
+            "room_deficit_mb": 362.2,
+            "room_reclaimable_mb": 0,
+            "room_unpausable_mb": 970.0,
+            "starved_seconds": 4.0,
+            "tenancy_foreign_mb": 970.0,
+            "tenancy_inference_target_mb": 384.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": true
+          },
+          "kind": "inference_dispatch",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-2",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 18
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "available_mb": 14210.8,
+            "candidate_delta_mb": 14573.0,
+            "device_free_mb": 15030.0,
+            "device_index": null,
+            "hold_seconds": 6.0,
+            "is_head_of_queue": true,
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "probe_state": "waiting_4s",
+            "reclaim_applied": false,
+            "reclaim_applied_kinds": "",
+            "reclaim_requested": false,
+            "reclaim_requested_kinds": "",
+            "room_available_mb": 14210.8,
+            "room_candidate_mb": 14573.0,
+            "room_closable": false,
+            "room_deficit_mb": 362.2,
+            "room_reclaimable_mb": 0,
+            "room_unpausable_mb": 970.0,
+            "starved_seconds": 6.0,
+            "tenancy_foreign_mb": 970.0,
+            "tenancy_inference_target_mb": 384.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": true
+          },
+          "kind": "inference_dispatch",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-2",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 19
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [],
+          "for_head_of_queue": true,
+          "requested": []
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "available_mb": 14210.8,
+            "candidate_delta_mb": 14573.0,
+            "device_free_mb": 15030.0,
+            "device_index": null,
+            "hold_seconds": 8.0,
+            "is_head_of_queue": true,
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "probe_state": "waiting_2s",
+            "reclaim_applied": false,
+            "reclaim_applied_kinds": "",
+            "reclaim_requested": false,
+            "reclaim_requested_kinds": "",
+            "room_available_mb": 14210.8,
+            "room_candidate_mb": 14573.0,
+            "room_closable": false,
+            "room_deficit_mb": 362.2,
+            "room_reclaimable_mb": 0,
+            "room_unpausable_mb": 970.0,
+            "starved_seconds": 8.0,
+            "tenancy_foreign_mb": 970.0,
+            "tenancy_inference_target_mb": 384.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": true
+          },
+          "kind": "inference_dispatch",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-2",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 20
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {},
+          "kind": "inference_dispatch",
+          "reason": "dispatch_admitted",
+          "subject": "job-2",
+          "verdict": "no_op"
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "Flux.1-Schnell fp8 (Compact)"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-2",
+          "keep_model_resident_after": true,
+          "model": "Flux.1-Schnell fp8 (Compact)",
+          "process_id": 0
+        }
+      ],
+      "resource_states": [
+        {
+          "device_index": null,
+          "inputs": {
+            "hold_seconds": 10.0,
+            "job_id": "job-2",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "probe_state": "waiting_2s",
+            "room_available_mb": 14210.8,
+            "room_candidate_mb": 14573.0,
+            "room_closable": false,
+            "room_deficit_mb": 362.2,
+            "room_reclaimable_mb": 0,
+            "room_unpausable_mb": 970.0,
+            "starved_seconds": 8.0,
+            "tenancy_foreign_mb": 970.0,
+            "tenancy_inference_target_mb": 384.0,
+            "whole_card_measured_mb": null,
+            "whole_card_observations": 0,
+            "whole_card_retired_by_measurement": false,
+            "whole_card_wants": true
+          },
+          "kind": "dispatch_hold",
+          "reason": "measured_attempt",
+          "state": "released"
+        }
+      ],
+      "sampling_started": [
+        "job-2"
+      ],
+      "tick": 21
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 22
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 23
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 24
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 25
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 26
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 27
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 28
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "Flux.1-Schnell fp8 (Compact)",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 29
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": true,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "sd15-checkpoint",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": "Flux.1-Schnell fp8 (Compact)",
+          "process_id": 0
+        }
+      ],
+      "tick": 30
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sd15-checkpoint",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-3",
+          "verdict": "admit"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-3",
+          "keep_model_resident_after": null,
+          "model": "sd15-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "tick": 31
+    },
+    {
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sd15-checkpoint"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-3",
+          "keep_model_resident_after": false,
+          "model": "sd15-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "sampling_started": [
+        "job-3"
+      ],
+      "tick": 32
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 33
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 34
+    }
+  ],
+  "ticks_driven": 40
+}

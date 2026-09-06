@@ -106,7 +106,10 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
 - **Marker contract:** the `slow`, `gpu`, and `chaos_sweep` bands run only when the `-m` expression
   names them (`-m "not slow"` and `-m slow` both behave as written). The chaos sweep's full-worker
   half is also `slow`: `-m "chaos_sweep and slow"`. `CONTRIBUTING.md` carries the gate commands and
-  the `HORDE_CHAOS_SEEDS` replay/widen override.
+  the `HORDE_CHAOS_SEEDS` replay/widen override. `golden_regen` is a fourth opt-in band, and the only one
+  that writes: it rewrites the committed scheduler traces under
+  `tests/process_management/liveness/golden/` (`-m golden_regen`), so a regeneration is always a reviewed
+  diff. The default sweep compares against them instead.
 - **Rerun the failure, not the band.** Every `FAILED` line carries a node id; rerun exactly that
   (quote parametrized ids verbatim). One chaos seed replays via `HORDE_CHAOS_SEEDS=<seed>`. Tee long
   runs to a file once and grep the tee. One pytest invocation per working copy: concurrent suites in

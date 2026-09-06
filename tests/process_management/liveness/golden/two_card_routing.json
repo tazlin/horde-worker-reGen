@@ -1,0 +1,225 @@
+{
+  "jobs": 3,
+  "scenario": "two_card_routing",
+  "schema": 2,
+  "ticks": [
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sdxl-checkpoint",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-1",
+          "verdict": "admit"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-1",
+          "keep_model_resident_after": null,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "tick": 1
+    },
+    {
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sdxl-checkpoint"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-1",
+          "keep_model_resident_after": false,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "sampling_started": [
+        "job-1"
+      ],
+      "tick": 2
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 3
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 4
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 5
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sd15-checkpoint",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-2",
+          "verdict": "admit"
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sd15-checkpoint"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-2",
+          "keep_model_resident_after": null,
+          "model": "sd15-checkpoint",
+          "process_id": 0
+        },
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-2",
+          "keep_model_resident_after": false,
+          "model": "sd15-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "sampling_started": [
+        "job-2"
+      ],
+      "tick": 6
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sd15-checkpoint",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-2",
+          "verdict": "admit"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-2",
+          "keep_model_resident_after": null,
+          "model": "sd15-checkpoint",
+          "process_id": 1
+        }
+      ],
+      "tick": 7
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sd15-checkpoint-b",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-3",
+          "verdict": "admit"
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 1,
+          "model": "sd15-checkpoint-b"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-3",
+          "keep_model_resident_after": null,
+          "model": "sd15-checkpoint-b",
+          "process_id": 1
+        },
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-3",
+          "keep_model_resident_after": false,
+          "model": "sd15-checkpoint-b",
+          "process_id": 1
+        }
+      ],
+      "sampling_started": [
+        "job-3"
+      ],
+      "tick": 8
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "no_target",
+            "model": "sd15-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "no idle inference slot available",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 9
+    }
+  ],
+  "ticks_driven": 24
+}

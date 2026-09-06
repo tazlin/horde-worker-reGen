@@ -179,6 +179,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     slice instead. Its full-worker half also carries ``slow``, so running that half means naming both bands
     (``-m "chaos_sweep and slow"``).
 
+    ``golden_regen`` is opt-in because it writes rather than asserts: it rewrites the committed golden
+    scheduler traces, so it runs only when the ``-m`` expression names it and a regeneration is always a
+    reviewed diff rather than something a default sweep can do silently.
+
     The run order is defined by ``_ORDER_PHASES_FIRST`` / ``_ORDER_PHASES_LAST``; the sort is stable, so tests
     sharing a phase keep their collection order (siblings in a namespace stay together).
     """
@@ -213,6 +217,15 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if item.get_closest_marker("chaos_sweep"):
                 item.add_marker(skip_sweep)
+
+    if "golden_regen" not in m_expression:
+        skip_regen = pytest.mark.skip(
+            reason="golden trace regeneration is opt-in: request it with -m golden_regen (it rewrites the "
+            "committed traces, so a regeneration is always a reviewed diff)",
+        )
+        for item in items:
+            if item.get_closest_marker("golden_regen"):
+                item.add_marker(skip_regen)
 
     items.sort(key=_run_order_rank)
 

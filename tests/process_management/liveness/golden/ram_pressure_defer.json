@@ -1,0 +1,264 @@
+{
+  "jobs": 1,
+  "scenario": "ram_pressure_defer",
+  "schema": 2,
+  "ticks": [
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 1
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 2
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 3
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 4
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 5
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 6
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 7
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 8
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 9
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 10
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 11
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 12
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 13
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 14
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 15
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "defer_ram_pressure",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "system RAM danger floor",
+          "subject": "job-1",
+          "verdict": "defer"
+        }
+      ],
+      "tick": 16
+    }
+  ],
+  "ticks_driven": 16
+}

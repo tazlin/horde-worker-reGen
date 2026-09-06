@@ -1,0 +1,443 @@
+{
+  "jobs": 3,
+  "scenario": "disaggregated_head",
+  "schema": 2,
+  "ticks": [
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sdxl-checkpoint",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-1",
+          "verdict": "admit"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-1",
+          "keep_model_resident_after": null,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "tick": 1
+    },
+    {
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sdxl-checkpoint"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-1",
+          "keep_model_resident_after": false,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "sampling_started": [
+        "job-1"
+      ],
+      "tick": 2
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": false,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "sd15-checkpoint",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 3
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": false,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "sd15-checkpoint",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 4
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": false,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "sd15-checkpoint",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 5
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": false,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "defer_budget",
+            "model": "sd15-checkpoint",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 6
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sd15-checkpoint",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-3",
+          "verdict": "admit"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-3",
+          "keep_model_resident_after": null,
+          "model": "sd15-checkpoint",
+          "process_id": 1
+        }
+      ],
+      "tick": 7
+    },
+    {
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sdxl-checkpoint"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-2",
+          "keep_model_resident_after": true,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "sampling_started": [
+        "job-2"
+      ],
+      "tick": 8
+    },
+    {
+      "dispatches": [
+        {
+          "lane": 1,
+          "model": "sd15-checkpoint"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-3",
+          "keep_model_resident_after": false,
+          "model": "sd15-checkpoint",
+          "process_id": 1
+        }
+      ],
+      "sampling_started": [
+        "job-3"
+      ],
+      "tick": 14
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 15
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sd15-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 16
+    }
+  ],
+  "ticks_driven": 32
+}

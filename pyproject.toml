@@ -302,4 +302,5 @@ markers = [
     "slow: spawns real OS subprocesses or runs multi-second workloads; opt-in via -m slow, skipped otherwise so a default `pytest` sweep stays fast",
     "network: needs a real network connection to the AI Horde or other external service; opt-in via -m network, skipped otherwise",
     "chaos_sweep: the full generated wedge-liveness chaos sweep (hundreds of seeded scenarios); opt-in via -m chaos_sweep, skipped otherwise, and run as a pre-release gate and nightly",
+    "golden_regen: rewrites the committed golden scheduler traces instead of comparing against them; opt-in via -m golden_regen, skipped otherwise so a regeneration is always a reviewed diff",
 ]
