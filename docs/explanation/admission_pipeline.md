@@ -78,6 +78,49 @@ the RAM reclaim sequence behind a RAM miss (`_apply_ram_verdict`), dispatch sele
 (`get_next_job_and_process`) and the dispatch holds (`_dispatch_residency_reconciliation_holds`). Each is
 actuation over the same collaborators and will take the same shape.
 
+## One job through the preload pass
+
+```mermaid
+flowchart LR
+    job[pending job] --> gates{decide_preload_gates}
+    gates -->|"NEXT_JOB: aux-gated, already resident"| next[next job]
+    gates -->|"UNSERVICEABLE / QUARANTINED: FaultJob"| fault[executor faults the job] --> resnap["snapshot() again"] --> next
+    gates -->|"DEFER_*, NO_TARGET, EXCLUSIVE_IN_PROGRESS"| stop[pass stops this cycle]
+    gates -->|"REPLACE_PROCESS: ReplaceProcess"| cycle[executor cycles the child] --> stop
+    gates -->|ADMIT| wc{whole-card demand}
+    wc -->|PRESTAGE| send
+    wc -->|DEFER| stop
+    wc -->|FALL_THROUGH| price["snapshot(), price_preload, arbiter.evaluate"]
+    price -->|FITS| ram{decide_ram_admission}
+    price -->|"DENY, unroutable head"| hold[fault and ceiling hold] --> stop
+    price -->|DEFER| act[execute_actuations] --> stop
+    ram -->|fits| send[_send_preload]
+    ram -->|miss| reclaim[unload, escalate, cycle a stale slot] --> outcome{decide_ram_reclaim_outcome}
+    outcome -->|DEFER| stop
+    outcome -->|BEST_EFFORT_ADMIT| send
+```
+
+## Reading a preload decision back
+
+Every exit of the pass is recorded once, as the final decision the job ended on:
+
+- **The head-admission ledger** keeps the latest record
+  (`InferenceScheduler.head_admission.last_preload_admission`: decision, model, target process, reason). The
+  dispatch-stall line quotes it when it names the parked head's model, and the harness reads the budget
+  defer reason from it.
+- **The decision sink** receives a `VRAM_ADMISSION` event per job whose verdict is the decision's kind:
+  `ADMIT` for a sent preload, `NO_OP` for an already-resident model, `DENY` for a faulted (unserviceable or
+  quarantined) job, `WITHHOLD` for a pass that moved on or stopped, and `DEFER` for every hold (RAM floor,
+  growth hold, no target, exclusive hold, concurrency, budget). The sink coalesces repeats, so a head declined
+  for the same reason every cycle costs one event.
+- **Log lines**, each edge-triggered or coalesced: the RAM danger floor notice and the concurrency notice fire
+  once per episode (the plan carries the text, the scheduler the latch); the arbiter's defer names its
+  arithmetic and is coalesced on the stable reason (`VRAM arbiter deferring preload of ...`); the RAM budget's
+  defer fires once until a fit (`RAM budget deferring preload of ...`); an unroutable head arms a ceiling hold
+  with one warning per arm.
+- **Run metrics** count the measured-floor denials (`admission_denials`): a candidate the static free-VRAM
+  budget admitted and the measured arbiter refused.
+
 ## The state the decisions read
 
 The scheduler's mutable state sits in five ledgers under `scheduling/ledgers/`, each with a frozen view on the
