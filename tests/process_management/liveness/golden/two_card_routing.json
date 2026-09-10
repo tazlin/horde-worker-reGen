@@ -53,14 +53,14 @@
       "decisions": [
         {
           "inputs": {
-            "decision": "no_target",
+            "decision": "already_loaded",
             "model": "sdxl-checkpoint",
             "process_id": null
           },
           "kind": "vram_admission",
-          "reason": "no idle inference slot available",
+          "reason": "model already resident or loading",
           "subject": "job-1",
-          "verdict": "defer"
+          "verdict": "no_op"
         },
         {
           "inputs": {
@@ -110,25 +110,25 @@
       "decisions": [
         {
           "inputs": {
-            "decision": "no_target",
+            "decision": "already_loaded",
             "model": "sdxl-checkpoint",
             "process_id": null
           },
           "kind": "vram_admission",
-          "reason": "no idle inference slot available",
+          "reason": "model already resident or loading",
           "subject": "job-1",
-          "verdict": "defer"
+          "verdict": "no_op"
         },
         {
           "inputs": {
-            "decision": "no_target",
+            "decision": "already_loaded",
             "model": "sd15-checkpoint",
             "process_id": null
           },
           "kind": "vram_admission",
-          "reason": "no idle inference slot available",
+          "reason": "model already resident or loading",
           "subject": "job-2",
-          "verdict": "defer"
+          "verdict": "no_op"
         },
         {
           "inputs": {
@@ -189,14 +189,14 @@
       "decisions": [
         {
           "inputs": {
-            "decision": "no_target",
+            "decision": "already_loaded",
             "model": "sd15-checkpoint-b",
             "process_id": null
           },
           "kind": "vram_admission",
-          "reason": "no idle inference slot available",
+          "reason": "model already resident or loading",
           "subject": "job-3",
-          "verdict": "defer"
+          "verdict": "no_op"
         }
       ],
       "tick": 7

@@ -111,7 +111,16 @@ their sum:
 - The **concurrent-sampling ceiling** (how many jobs may sample at once across the whole worker) is the sum
   of every card's `max_threads`. Eight cards at `max_threads: 1` run 8 concurrent jobs, not 1.
 - A model busy sampling on one card may be **loaded a second time onto an idle card** when queued demand
-  warrants it; the VRAM budget and displacement guards still gate the load.
+  warrants it; the VRAM budget and displacement guards still gate the load. The second copy goes to a card
+  that can run it now: a card already serving the model and sitting at its `max_threads` ranks last, since a
+  copy on its sibling lane could not sample until the running job ends. Copies are capped at the model's own
+  outstanding jobs and at one per card, so a burst of one model cannot take the whole pool and leave the next
+  model's job reloading from disk wherever it lands.
+- On a multi-card worker, a lane holding a model that **no queued job names and nothing has demanded
+  recently** is treated as spare capacity and may be loaded over. Otherwise a worker with a model per lane
+  protects every lane, and a model the queue is backed up on can never earn a second copy. Any model a
+  pending or in-progress job names keeps its lane, as does one the worker served within a window derived from
+  the horde's recent job ttl. On a single card residency alone still counts, so nothing changes there.
 
 Dispatch selection follows the same rule. The head of the queue can only be seated on a card that can serve
 it, so a head whose card is at its own `max_threads`, whose resident lane is busy, or whose model is not

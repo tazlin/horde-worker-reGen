@@ -147,6 +147,26 @@ class TestCardPreloadOrder:
         )
         assert order == [2, 1, 0]
 
+    def test_a_serving_card_at_its_cap_ranks_last(self) -> None:
+        """A second copy on a saturated card could not sample, so the cards that could run it come first."""
+        order = card_preload_order(
+            {0, 1, 2},
+            cards_already_serving_model={0},
+            card_busy_counts={0: 1, 1: 2, 2: 3},
+            cards_serving_at_concurrency_cap=frozenset({0}),
+        )
+        assert order == [1, 2, 0], "the saturated sticky card ranks behind even the busiest fresh card"
+
+    def test_a_serving_card_with_spare_capacity_keeps_its_preference(self) -> None:
+        """With room to run the copy at once the sticky card is still the cheapest placement."""
+        order = card_preload_order(
+            {0, 1},
+            cards_already_serving_model={0},
+            card_busy_counts={0: 1, 1: 0},
+            cards_serving_at_concurrency_cap=frozenset(),
+        )
+        assert order == [0, 1]
+
     def test_measured_free_vram_breaks_equal_load_ties(self) -> None:
         """When cards are equally loaded, prefer the card with more measured free VRAM."""
         order = card_preload_order(

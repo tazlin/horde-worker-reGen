@@ -754,6 +754,19 @@ class _DispatchWorld:
         """The model whose weights each lane most recently committed to the device."""
         self._loading: dict[int, _PendingPreload] = {}
         """Per-lane preloads the parent has commanded and the child has not finished, keyed by lane."""
+        self.preloads_commanded: list[tuple[int, int, str]] = []
+        """Every preload the parent has sent over the run, as ``(tick, lane id, model)``.
+
+        A weight upload the run paid for. A row that asserts a placement rule spreads copies rather than
+        thrashing them reads its cost here."""
+        self.preload_idle_ticks: list[int] = []
+        """Ticks where staging a model cost a lane that had work waiting for it.
+
+        A tick lands here when the parent sent a preload, some pending job already had a lane holding its
+        model and free to take it on a card under its sampling cap, and nothing was dispatched. Moving weights
+        for a future job and starting a job whose weights are already there are independent, so a cycle that
+        does the first must not skip the second: every entry is a sampling window a card lost for no reason
+        the workload required."""
         self._clearance_waiting_since: dict[str, float] = {}
         """Per staged job, the world-clock instant its child began waiting on its clearance permit.
 
@@ -1641,6 +1654,7 @@ class _DispatchWorld:
             if model is None:
                 continue
             report_at = self.now + self.preload_report_latency_seconds
+            self.preloads_commanded.append((self.tick, info.process_id, name))
             self._loading[info.process_id] = _PendingPreload(
                 model=name,
                 weights_mb=self._actual_charge_mb(model.weights_mb),
@@ -1761,8 +1775,35 @@ class _DispatchWorld:
             await self._job_tracker.begin_post_processing(job_info, process_id=-1, process_launch_identifier=1)
             await self._job_tracker.queue_for_safety_post_processed(job_info)
 
-    async def _dispatch_until_full(self) -> None:
-        """Dispatch onto free lanes, recording the tick each job first reached sampling."""
+    def _a_pending_job_could_be_seated(self) -> bool:
+        """Whether some pending job has a lane it could start on right now.
+
+        A lane qualifies when it already holds the job's model, is free to take work, and sits on a card
+        running fewer jobs than that card's own sampling cap. No weights need to move for such a job to
+        start, so a cycle that ends without dispatching leaves a lane idle that had work waiting for it.
+        """
+        cap = max(1, int(self._scheduler._runtime_config.bridge_data.max_threads))
+        for job in self._job_tracker.jobs_pending_inference:
+            if job.model is None:
+                continue
+            for lane in self._process_map.values():
+                if lane.process_type is not HordeProcessType.INFERENCE:
+                    continue
+                if lane.loaded_horde_model_name != job.model or not lane.can_accept_job():
+                    continue
+                if lane.device_index is None:
+                    continue
+                if self._process_map.card_inference_load(lane.device_index) < cap:
+                    return True
+        return False
+
+    async def _dispatch_until_full(self) -> int:
+        """Dispatch onto free lanes, recording the tick each job first reached sampling.
+
+        Returns:
+            How many jobs reached sampling this cycle.
+        """
+        dispatched = 0
         for _attempt in range(max(1, int(self._scheduler._runtime_config.bridge_data.max_threads))):
             before = {str(job.id_) for job in self._job_tracker.jobs_in_progress}
             started = await self._scheduler.start_inference()
@@ -1772,14 +1813,25 @@ class _DispatchWorld:
                 break
             assert len(newly) == 1, "a successful dispatch must admit exactly one job"
             admitted = newly[0]
+            dispatched += 1
             job_id = str(admitted.id_)
+            # The lane is identified by the job it now owns, not by the model it holds: once a model has more
+            # than one copy, "a lane holding this model that was last told to start inference" names several
+            # lanes and the first of them is routinely not the one the parent dispatched to. Ownership is
+            # recorded at dispatch and is unique to the job.
             lanes = [
                 lane.process_id
                 for lane in self._process_map.values()
-                if lane.loaded_horde_model_name == admitted.model
-                and lane.last_control_flag == HordeControlFlag.START_INFERENCE
+                if (owned := lane.current_inference_job()) is not None and str(owned.id_) == job_id
             ]
-            assert lanes, "an admitted job must have been dispatched onto a lane holding its model"
+            assert lanes, "an admitted job must have been dispatched onto a lane that owns it"
+            assert len(lanes) == 1, f"job {job_id} was dispatched onto lanes {lanes}"
+            assert self._process_map[lanes[0]].loaded_horde_model_name == admitted.model, (
+                "an admitted job's lane must hold its model"
+            )
+            assert self._process_map[lanes[0]].last_control_flag == HordeControlFlag.START_INFERENCE, (
+                "an admitted job's lane must have been told to start inference"
+            )
             self._lane_of[job_id] = lanes[0]
             if not self.clearance_lease:
                 # Sampling starts here only when dispatch is the VRAM moment; under the lease the job is
@@ -1827,6 +1879,7 @@ class _DispatchWorld:
                 continue
             # Dispatch is the moment staged weights commit to VRAM, so this is where the card is charged.
             self._commit_staged_weights(admitted, lane_id=lanes[0], encode_seconds=encode_seconds)
+        return dispatched
 
     def _commit_staged_weights(
         self,
@@ -2446,10 +2499,18 @@ class _DispatchWorld:
         # boundary is opened here: selection state scoped to one cycle must not survive the child reports this
         # tick applied, or the world presents the scheduler a staleness its own control loop never can.
         self._scheduler.begin_scheduling_cycle()
+        # Read before the preload is commanded, not after: staging can take the very lane that was ready to
+        # be dispatched to, and once it has, the lane the cycle owed a job to is indistinguishable from one
+        # that never had work waiting for it.
+        could_have_seated = self._a_pending_job_could_be_seated()
         preloaded = self._scheduler.preload_models()
         self._begin_started_preloads()
-        if not (preloaded and self.preload_ends_dispatch):
-            await self._dispatch_until_full()
+        if preloaded and self.preload_ends_dispatch:
+            dispatched = 0
+        else:
+            dispatched = await self._dispatch_until_full()
+        if preloaded and could_have_seated and dispatched == 0:
+            self.preload_idle_ticks.append(self.tick)
         for device_index in self._card_totals:
             self.min_card_free_mb[device_index] = min(
                 self.min_card_free_mb[device_index],

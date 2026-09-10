@@ -344,6 +344,13 @@ class SchedulingSnapshot:
     ledgers: LedgerViews
     services: PricingServices
 
+    @property
+    def card_count(self) -> int:
+        """How many cards the worker routes across; 1 when routing is card-agnostic."""
+        if not self.multi_gpu_routing_active:
+            return 1
+        return sum(1 for key in self.cards if key is not None)
+
     def card(self, device_index: int | None) -> CardSnapshot:
         """The card a slot's memory is scoped to, or the worker-wide view when routing is card-agnostic."""
         key = device_index if self.multi_gpu_routing_active else None

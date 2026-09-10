@@ -257,14 +257,41 @@ def model_loaded_for_job(snapshot: SchedulingSnapshot, job_id: str, loaded_model
     return owner is not None and owner.device_index in allowed
 
 
+def model_copy_count(snapshot: SchedulingSnapshot, model: str) -> int:
+    """How many inference slots hold the model, across every card."""
+    return sum(
+        1
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE and slot.model == model
+    )
+
+
+def model_demand_count(snapshot: SchedulingSnapshot, model: str) -> int:
+    """How many pending and in-progress jobs name the model: the work a copy of it could be given."""
+    return sum(1 for job in snapshot.queue.jobs.values() if job.model == model)
+
+
+def duplicate_copies_permitted(snapshot: SchedulingSnapshot, model: str) -> int:
+    """How many copies of the model the worker may hold at once.
+
+    Two ceilings, whichever binds first. The queue's own demand: a copy the queue has no job for is a load
+    and a lane spent on nothing, so a model with two jobs outstanding earns at most two copies. And the card
+    count: copies past one per card land on lanes that share a card with a copy already there, so they add
+    weight uploads and VRAM without adding a card that can sample.
+    """
+    return min(model_demand_count(snapshot, model), snapshot.card_count)
+
+
 def duplicate_copy_may_serve(snapshot: SchedulingSnapshot, job_id: str) -> bool:
     """Whether a second copy of the job's already-resident model may be preloaded onto another card.
 
     On one card a duplicate is pure waste. Across cards the single-copy rule inverts when every eligible copy
     is busy running other work: the queued job would otherwise wait a whole sampling window for weights an idle
     card could be given. A duplicate is considered only when the worker routes across cards, at least one
-    eligible copy exists, every such copy is busy, and no copy is still loading (a load in flight is about to
-    provide a serving copy). Whether it lands stays the rest of the ladder's decision.
+    eligible copy exists, every such copy is busy, no copy is still loading (a load in flight is about to
+    provide a serving copy), and the copies already held are inside the bound
+    (:func:`duplicate_copies_permitted`) that keeps a burst of one model from taking the whole pool. Whether
+    it lands stays the rest of the ladder's decision.
     """
     job = snapshot.queue.jobs[job_id]
     if not snapshot.multi_gpu_routing_active or job.model is None:
@@ -278,7 +305,9 @@ def duplicate_copy_may_serve(snapshot: SchedulingSnapshot, job_id: str) -> bool:
     copies = [slot for slot in snapshot.slots.values() if slot.model == job.model and slot.device_index in allowed]
     if not copies:
         return False
-    return all(not copy.can_accept_job for copy in copies)
+    if not all(not copy.can_accept_job for copy in copies):
+        return False
+    return model_copy_count(snapshot, job.model) < duplicate_copies_permitted(snapshot, job.model)
 
 
 def first_available_inference_slot(
@@ -364,13 +393,41 @@ def card_inference_load(snapshot: SchedulingSnapshot, device_index: int) -> int:
     )
 
 
+def card_concurrency_cap(snapshot: SchedulingSnapshot, device_index: int) -> int:
+    """How many inference jobs the card may run at once: its own cap, else the worker-wide ceiling."""
+    card = snapshot.cards.get(device_index)
+    if card is None or card.max_concurrent_inference is None:
+        return snapshot.max_concurrent_inference_processes
+    return card.max_concurrent_inference
+
+
+def cards_serving_model_at_capacity(snapshot: SchedulingSnapshot, model: str | None) -> frozenset[int]:
+    """The cards holding the model whose busy lanes have reached their sampling cap.
+
+    A further copy of the model on such a card would sit idle behind the job already running there, so
+    placement ranks these last (:func:`card_preload_order`). With ``max_threads`` above one and a lane free,
+    the card is not here and keeps its sticky preference.
+    """
+    if model is None:
+        return frozenset()
+    serving = {slot.device_index for slot in snapshot.slots.values() if slot.model == model}
+    return frozenset(
+        device_index
+        for device_index in serving
+        if device_index is not None
+        and card_inference_load(snapshot, device_index) >= card_concurrency_cap(snapshot, device_index)
+    )
+
+
 def select_preload_target(snapshot: SchedulingSnapshot, job_id: str, disallowed: Iterable[int] = ()) -> int | None:
     """The inference slot to preload the job's model onto, choosing the card on a multi-GPU host, or None.
 
     Single-GPU: the first available slot. Multi-GPU: among the cards eligible for this job, the same
     sticky-then-least-loaded policy dispatch uses (a card already holding the model first, then the card
     running the fewest jobs, then the most measured free VRAM), taking the first available slot on the best
-    card. Slots carrying the queue head's own copy are excluded first on either topology.
+    card. A card holding the model with no spare sampling capacity ranks last instead of first, so a second
+    copy the queue is waiting on goes to a card that can run it. Slots carrying the queue head's own copy are
+    excluded first on either topology.
     """
     job = snapshot.queue.jobs[job_id]
     excluded = sorted(set(disallowed))
@@ -389,6 +446,7 @@ def select_preload_target(snapshot: SchedulingSnapshot, job_id: str, disallowed:
         cards_already_serving_model=cards_already_serving_model,
         card_busy_counts={device_index: card_inference_load(snapshot, device_index) for device_index in eligible},
         card_free_vram_mb={device_index: snapshot.cards[device_index].measured_free_mb for device_index in eligible},
+        cards_serving_at_concurrency_cap=cards_serving_model_at_capacity(snapshot, job.model),
     )
     for device_index in placement_order:
         slot = first_available_inference_slot(snapshot, disallowed=excluded, device_index=device_index)

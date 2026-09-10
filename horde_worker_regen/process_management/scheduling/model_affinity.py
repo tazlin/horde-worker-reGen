@@ -57,5 +57,8 @@ def affinity_active(num_models_to_load: int, num_inference_processes: int) -> bo
     With more models than processes, models must share processes and reloading is unavoidable
     (the existing ``horde_model_stickiness`` path handles that slow-disk regime); pinning would
     only deadlock preloads, so affinity is off there.
+
+    ``num_inference_processes`` is the worker's whole lane pool, not one card's: a model's home is a lane
+    anywhere on the host, so a two-card worker with eight lanes each has sixteen homes to give out.
     """
     return 0 < num_models_to_load <= num_inference_processes

@@ -186,6 +186,30 @@ class TestSchedulingSnapshot:
         assert snapshot.card(1) is snapshot.cards[1]
         assert snapshot.slots_of_type(HordeProcessType.INFERENCE) == (snapshot.slots[0],)
 
+    async def test_the_card_count_excludes_the_worker_wide_view(self) -> None:
+        """``card_count`` counts real cards only, so a bound expressed in cards is not inflated by one.
+
+        The worker-wide entry is keyed ``None`` alongside the per-card ones, and a copy bound that counted it
+        would permit one more copy of a model than there are cards to sample it on.
+        """
+        slot = make_mock_process_info(0, model_name="sd", state=HordeProcessState.WAITING_FOR_JOB)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: slot}),
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1)),
+        )
+
+        snapshot = scheduler.snapshot()
+
+        assert set(snapshot.cards) == {None, 0, 1}
+        assert snapshot.card_count == 2
+
+    async def test_one_card_counts_as_one_card(self) -> None:
+        """Card-agnostic routing still reports a card, so a per-card bound stays a number rather than zero."""
+        snapshot, _ = await self._scheduler()
+
+        assert snapshot.multi_gpu_routing_active is False
+        assert snapshot.card_count == 1
+
 
 class TestPendingPostProcessingFacts:
     """The preload gate's two post-processing facts: which card the lane sits on, and what a chain will cost."""

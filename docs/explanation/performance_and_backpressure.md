@@ -390,6 +390,10 @@ model and marks them off-limits as displacement targets. Surplus copies and
 processes holding no-longer-wanted models stay displaceable, so spare capacity is
 still usable. It is pure and table-testable, with no scheduler imports.
 
+A model counts as *wanted* while it is resident on an inference slot or while a pending or
+in-progress job names it. The lane count `affinity_active` compares that set against is the worker's
+whole pool, summed across every card, because a model's home is a lane anywhere on the host.
+
 ### The line-skip cache
 
 `get_next_job_and_process` is called twice per cycle: once to peek and once to

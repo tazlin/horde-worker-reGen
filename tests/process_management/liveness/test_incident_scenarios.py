@@ -122,9 +122,19 @@ The failures encoded here:
   changes while a lone waiter waits, so the hold only ended when the child sampled through its bounded
   lease-acquire timeout: every such job paid the full timeout in dead card time for room the card had all
   along. That is the ``own staging charge`` scenario, and its reinjection is the unnetted re-price.
+- **A second copy loaded onto a card that could not run it.** Preload placement preferred a card already
+  holding the model, which is right while that card can start another copy and wrong the moment it cannot.
+  Under a sampling cap of one, the serving card's second lane cannot sample until the running job ends, so a
+  duplicate the queue had earned was loaded onto a lane that then sat idle; and because an idle resident copy
+  reads as an available one, the next job for the class was called already loaded and waited for that lane
+  rather than seeking a card that could serve it. Hot classes drained through a single lane while the rest of
+  the pool idled. That is the ``burst placement`` scenario, and its reinjection is sticky placement that
+  ignores the serving card's capacity.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -150,6 +160,7 @@ from horde_worker_regen.process_management.scheduling.admission import preload a
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
 )
+from horde_worker_regen.process_management.scheduling.governance.preload_admission import card_preload_order
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _GRACE_BUDGET_SECONDS,
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
@@ -3348,6 +3359,25 @@ async def _drive_chain_traffic(world: _DispatchWorld) -> None:
         await world.step()
 
 
+def _assert_no_staging_tick_cost_a_ready_lane(world: _DispatchWorld, *, context: str) -> None:
+    """Assert no cycle that staged a model skipped a dispatch some lane was already able to take.
+
+    The property the cycle shape is answerable for, stated directly. Duty is the symptom and this is the
+    cause: staging weights for a future job and starting a job whose weights are already resident are
+    independent, so a preload must never be the reason a ready lane sat out a tick. Counted per tick rather
+    than inferred from throughput, so it holds however cheap the run's loading happens to be.
+
+    One-sided: a pool with more lanes than classes stages models only while it fills for the first time, and
+    by then every card is holding work, so the forbidden state never arises to be counted. Zero here means
+    the run never hit it, not that the run could have.
+    """
+    assert not world.preload_idle_ticks, (
+        f"{context}: {len(world.preload_idle_ticks)} cycle(s) staged a model and dispatched nothing while a "
+        f"pending job already had a free lane holding its model on a card under its cap, at tick(s) "
+        f"{world.preload_idle_ticks[:5]}. {world.state_dump()}"
+    )
+
+
 def _assert_the_cards_away_from_the_lane_kept_serving(world: _DispatchWorld, *, context: str) -> None:
     """Assert every card the chain does not sit on earned its own duty."""
     for device_index in sorted(world.min_card_free_mb):
@@ -3368,11 +3398,22 @@ async def test_t_a_staged_model_does_not_stop_the_cards_that_were_ready_to_sampl
     is live for the whole run. That hold is one card's, so the verdict is made of the cards it does not sit
     on, and the backlog it is owed is still expected to drain: a hold that gives a lane its window must not
     become a wedge.
+
+    This row stands unpaired, and deliberately. Its staging claim
+    (:func:`_assert_no_staging_tick_cost_a_ready_lane`) cannot be shown by reinjection at a sampling cap of
+    one, because the state the claim forbids does not arise in a pool this shape: with more lanes than
+    classes, the worker stages a model only while it is still filling cards for the first time, and by the
+    tick a load is commanded every card is already holding the job it was just given. Loads recur only where
+    classes outnumber lanes and models must be swapped, which is a different workload rather than a harsher
+    version of this one. The claim is kept as a one-sided invariant because it is cheap, exact and would
+    catch the defect wherever a pool does have a free card at staging time; the duty floor beneath it is what
+    carries this row's throughput verdict.
     """
     world = _chain_world()
 
     await _drive_chain_traffic(world)
 
+    _assert_no_staging_tick_cost_a_ready_lane(world, context="backlogged lane")
     _assert_the_cards_away_from_the_lane_kept_serving(world, context="backlogged lane")
     assert not world.job_tracker.jobs_pending_post_processing, (
         f"backlogged lane: chains were still pending at the end of the run, so the hold that gives the lane "
@@ -3380,15 +3421,202 @@ async def test_t_a_staged_model_does_not_stop_the_cards_that_were_ready_to_sampl
     )
 
 
-async def test_t_defect_reinjection_a_preload_that_ends_the_cycle_starves_the_pool() -> None:
-    """With a sent preload ending the tick again, the cards away from the lane fall under their duty floor.
+# --------------------------------------------------------------------------------------------------------
+# A second copy is only worth making on a card that can run it
+# --------------------------------------------------------------------------------------------------------
 
-    Reinjected at the cycle shape alone: every gate, hold and routing rule is production's, and the only
-    thing taken away is that dispatch runs whether or not a model was staged.
+_BURST_PIXELS = dict.fromkeys(range(4), 4_194_304)
+"""Four identical cards, so nothing but placement decides which one a second copy lands on."""
+
+_BURST_RESIDENTS = (_SD15, _SD15_OTHER, _SDXL, _SDXL_OTHER)
+"""One distinct class seeded on each card's first lane. Each card's second lane starts empty, which is where
+a second copy of a class can go and, at a sampling cap of one, sit unable to run."""
+
+_BURST_HOT = _SD15
+"""The class the burst is made of, seeded on card 0. Its jobs are what has to reach the other cards."""
+
+_BURST_WARM = _SD15_OTHER
+"""The class the queue keeps one job for throughout, seeded on card 1, so that card is busy with its own work
+and is not simply a free card the burst could have taken regardless."""
+
+_BURST_IDLE = (_SDXL, _SDXL_OTHER)
+"""The classes on cards 2 and 3 that no job ever names again, leaving those two cards idle and available."""
+
+_BURST_HOT_PENDING = 6
+"""Hot jobs kept queued, more than the pool can run at once, so the burst is always pressing for a lane."""
+
+_BURST_SHAPE = (1024, 1024)
+_BURST_STEPS = 100
+"""A megapixel job of enough steps that its sampling window spans many ticks, so how many cards are in use is
+observable at all: at a cap of one per card a job finishing inside a tick could never be joined by a second."""
+
+_BURST_TICK_SECONDS = 0.5
+_BURST_TICKS = 60
+"""Ticks the row runs for, long enough that a card carrying none of the burst shows as duty it never earned."""
+
+_BURST_SPREAD_TICKS = 30
+"""Ticks the burst has to reach the idle cards.
+
+One preload leaves per cycle, so two copies need two cycles at best; this is comfortably past that and far
+short of the run's end."""
+
+_BURST_DUTY_FLOOR = 0.20
+"""Fraction of its own slot-time each card must spend sampling once the burst has spread to it."""
+
+
+def _burst_world() -> _DispatchWorld:
+    """Four cards, two lanes each, one sampling slot per card, one resident class per card.
+
+    The operator posture the failure was found on: ``max_threads`` of one per card, so a running job takes its
+    card's only sampling slot while that card's second lane stays free but useless. Whole-card residency is
+    off and no card's config differs, so nothing but preload placement decides which card a second copy of a
+    class lands on.
     """
-    world = _chain_world(preload_ends_dispatch=True)
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=8,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        tick_seconds=_BURST_TICK_SECONDS,
+        card_max_pixels=_BURST_PIXELS,
+    )
+    for lane_id, model in enumerate(_BURST_RESIDENTS):
+        world.seed_resident(lane_id, model, in_vram=True)
+        assert world.card_of_lane(lane_id) == lane_id, (
+            "precondition: each seeded copy must sit on a card of its own, so every card starts able to serve"
+        )
+    return world
 
-    await _drive_chain_traffic(world)
 
-    with pytest.raises(AssertionError, match="under the"):
-        _assert_the_cards_away_from_the_lane_kept_serving(world, context="preload-bound cycle")
+async def _drive_burst_traffic(world: _DispatchWorld) -> list[int]:
+    """Keep the burst and one warm job queued, and record how many jobs were sampling at each tick.
+
+    The idle classes are never popped again, so cards 2 and 3 have nothing of their own to run and are free
+    for the burst to reach. The warm class always has exactly one job outstanding, so card 1 is genuinely
+    occupied rather than merely unused.
+
+    Returns:
+        The number of jobs in progress after each tick, in order.
+    """
+    width, height = _BURST_SHAPE
+    concurrency: list[int] = []
+    for _ in range(_BURST_TICKS):
+        for model, depth in ((_BURST_HOT, _BURST_HOT_PENDING), (_BURST_WARM, 1)):
+            while sum(1 for job in world.job_tracker.jobs_pending_inference if job.model == model.name) < depth:
+                await world.pop(
+                    make_job_pop_response(model.name, width=width, height=height, ddim_steps=_BURST_STEPS),
+                )
+        await world.step()
+        concurrency.append(len(world.job_tracker.jobs_in_progress))
+    return concurrency
+
+
+def _assert_the_burst_reached_the_free_cards(world: _DispatchWorld, concurrency: list[int], *, context: str) -> None:
+    """Assert the burst earned lanes on cards that could run them, rather than beside the job it queued behind."""
+    reached = max(concurrency[:_BURST_SPREAD_TICKS], default=0)
+    assert reached >= len(_BURST_PIXELS), (
+        f"{context}: the pool ran at most {reached} job(s) at once over its first {_BURST_SPREAD_TICKS} ticks, "
+        f"with {len(_BURST_PIXELS)} cards, two of them idle, and a queue of {_BURST_HOT_PENDING} jobs for a "
+        f"class only one card held. {world.state_dump()}"
+    )
+    for device_index in sorted(_BURST_PIXELS):
+        assert_duty_floor_on_card(world, device_index, _BURST_DUTY_FLOOR, context=context)
+
+
+def _assert_no_copy_sits_where_it_cannot_run(world: _DispatchWorld, *, context: str) -> None:
+    """Assert no card ended up holding two copies of the burst's class under a sampling cap of one."""
+    for device_index in sorted(_BURST_PIXELS):
+        holders = [
+            lane for lane, model in world.card_resident_models(device_index).items() if model == _BURST_HOT.name
+        ]
+        assert len(holders) <= 1, (
+            f"{context}: card {device_index} holds {len(holders)} copies of {_BURST_HOT.name} on lanes "
+            f"{holders} while it may sample one job at a time, so the extra copy is weights the card paid "
+            f"for and cannot use. {world.state_dump()}"
+        )
+
+
+async def test_v_a_second_copy_goes_to_a_card_that_can_run_it() -> None:
+    """A burst of one class reaches the idle cards instead of stacking on the card already running it.
+
+    The failure this encodes: preload placement preferred a card already holding the model, which is right
+    while that card can start another copy and wrong the moment it cannot. Under ``max_threads`` of one the
+    serving card's second lane can never sample until the running job ends, so every duplicate the queue
+    earned was loaded onto a lane that then sat idle. Worse, that idle copy reads as an available resident
+    copy, so the next job for the class is called already loaded and waits for it rather than seeking a card
+    that could serve it. On an eight-card host the result was hot classes drained through a single lane while
+    fourteen lanes idled, and 383 preloads bought 822 dispatches.
+
+    Read as one statement: a copy is worth making where it can run. Its consequences are that concurrency
+    reaches the card count, that every card earns its own duty, and that no card ends the run holding two
+    copies of one class it can only sample one of.
+    """
+    world = _burst_world()
+
+    concurrency = await _drive_burst_traffic(world)
+
+    _assert_the_burst_reached_the_free_cards(world, concurrency, context="burst placement")
+    _assert_no_copy_sits_where_it_cannot_run(world, context="burst placement")
+
+
+async def test_v_the_copies_a_burst_earns_are_bounded() -> None:
+    """The same burst never takes more of the pool than it can use, and the run does not thrash loading.
+
+    The escape's own failure mode is the mirror of the defect: a queue dominated by one class taking a lane on
+    every card leaves the worker holding one model, so the next class's job pays a full disk reload wherever
+    it lands. Two ceilings hold it: the class's own outstanding jobs, and one copy per card.
+    """
+    world = _burst_world()
+
+    await _drive_burst_traffic(world)
+
+    copies = len(world.vram_resident_lanes(_BURST_HOT.name))
+    assert copies <= len(_BURST_PIXELS), (
+        f"bounded burst: {copies} copies of {_BURST_HOT.name} for {len(_BURST_PIXELS)} cards. {world.state_dump()}"
+    )
+    assert world.vram_resident_lanes(_BURST_WARM.name), (
+        f"bounded burst: the only copy of {_BURST_WARM.name} was displaced while a job for it was queued, so "
+        f"making room for the burst reached work the queue still wanted. {world.state_dump()}"
+    )
+    # One load per lane the burst takes is the whole cost of converging; a pool that reloaded per job would
+    # sit at the job count instead.
+    assert len(world.preloads_commanded) <= 2 * len(_BURST_RESIDENTS), (
+        f"bounded burst: {len(world.preloads_commanded)} preloads over the run "
+        f"({[entry[2] for entry in world.preloads_commanded]}). {world.state_dump()}"
+    )
+
+
+async def test_v_defect_reinjection_sticky_placement_stacks_copies_on_the_busy_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the serving card preferred again, the burst stacks on card 0 and the idle cards stay idle.
+
+    Reinjected at the placement ranking alone: the duplicate escape, the copy bounds, the affinity guard and
+    every gate below are production's, and the only thing taken away is that a card at its sampling cap loses
+    its sticky preference.
+    """
+
+    def _sticky_first_regardless_of_capacity(
+        eligible_card_indices: set[int],
+        *,
+        cards_already_serving_model: set[int],
+        card_busy_counts: Mapping[int, int],
+        card_free_vram_mb: Mapping[int, float | None] | None = None,
+        cards_serving_at_concurrency_cap: frozenset[int] = frozenset(),
+    ) -> list[int]:
+        return card_preload_order(
+            eligible_card_indices,
+            cards_already_serving_model=cards_already_serving_model,
+            card_busy_counts=card_busy_counts,
+            card_free_vram_mb=card_free_vram_mb,
+        )
+
+    monkeypatch.setattr(preload_mod, "card_preload_order", _sticky_first_regardless_of_capacity)
+    world = _burst_world()
+
+    concurrency = await _drive_burst_traffic(world)
+
+    with pytest.raises(AssertionError, match="the pool ran at most|under the"):
+        _assert_the_burst_reached_the_free_cards(world, concurrency, context="sticky placement")

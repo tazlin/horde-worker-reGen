@@ -3155,8 +3155,15 @@ class TestPreloadPassContinuesPastACardScopedStop:
 
         Card 0's only lane is busy, so the head's model has no target and the head-room fallback has nothing
         to free. Card 1 has a free lane and a queued job it could serve, and neither is used this cycle.
+
+        The lane's own job is tracked in progress, as a real busy lane's is: the duplicate-copy bound is read
+        off the queue, so a lane sampling work the queue does not know about would understate the demand its
+        model has.
         """
         job_tracker = JobTracker()
+        running = make_job_pop_response("model_a")
+        await track_popped_job_async(job_tracker, running)
+        await mark_job_in_progress_async(job_tracker, running)
         await track_popped_job_async(job_tracker, make_job_pop_response("model_a"))
         await track_popped_job_async(job_tracker, make_job_pop_response("model_b"))
         busy_lane = make_mock_process_info(0, model_name="model_a", state=HordeProcessState.INFERENCE_STARTING)

@@ -8206,6 +8206,30 @@ class InferenceScheduler:
             return holders
         return []
 
+    def _cards_serving_model_at_capacity(self, model_name: str | None) -> frozenset[int]:
+        """The cards holding ``model_name`` whose busy lanes have reached their own sampling cap.
+
+        A further copy of the model on such a card cannot sample until the job already running there ends, so
+        placement ranks these last rather than first (:func:`card_preload_order`). A serving card with spare
+        cap and a free lane is absent from this set and keeps its sticky preference.
+        """
+        if model_name is None:
+            return frozenset()
+        serving = {
+            process.device_index
+            for process in self._process_map.values()
+            if process.loaded_horde_model_name == model_name
+        }
+        at_capacity: set[int] = set()
+        for device_index in serving:
+            if device_index is None:
+                continue
+            card = self._card_runtimes.get(device_index)
+            cap = card.max_concurrent_inference if card is not None else self._max_concurrent_inference_processes
+            if self._process_map.card_inference_load(device_index) >= cap:
+                at_capacity.add(device_index)
+        return frozenset(at_capacity)
+
     def _select_preload_process(
         self,
         job: ImageGenerateJobPopResponse,
@@ -8215,9 +8239,11 @@ class InferenceScheduler:
 
         Single-GPU: identical to :meth:`ProcessMap.get_first_available_inference_process`, so the preload path
         is byte-identical. Multi-GPU: restrict to cards eligible for this job and pick the placement card by the
-        same sticky-then-least-loaded policy dispatch uses: a card already holding this model first (avoid a
-        duplicate load), then the card running the fewest inference jobs (balance fresh loads). Returns the
-        first available slot on the best such card, or None when no eligible card has a free slot.
+        same sticky-then-least-loaded policy dispatch uses: a card already holding this model first (its copy
+        is the one the job would rather reuse), then the card running the fewest inference jobs (balance fresh
+        loads). A card holding the model with no spare sampling capacity ranks last instead of first, since a
+        further copy there could not run until the job already on it ends. Returns the first available slot on
+        the best such card, or None when no eligible card has a free slot.
 
         Slots carrying the queue head's own copy are excluded first
         (:meth:`_slots_holding_the_head_model`), on either topology.
@@ -8245,6 +8271,7 @@ class InferenceScheduler:
             card_free_vram_mb={
                 device_index: self._measured_free_vram_mb(device_index=device_index) for device_index in eligible
             },
+            cards_serving_at_concurrency_cap=self._cards_serving_model_at_capacity(job.model),
         )
         for device_index in placement_order:
             candidate = self._process_map.get_first_available_inference_process(

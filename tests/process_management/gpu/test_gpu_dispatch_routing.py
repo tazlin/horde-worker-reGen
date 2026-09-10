@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.scheduling.admission.preload import (
+    duplicate_copies_permitted,
     duplicate_copy_may_serve,
     select_preload_target,
 )
@@ -42,6 +43,7 @@ from tests.process_management.conftest import (
     make_test_model_metadata,
     make_test_runtime_config,
     make_testable_process_manager,
+    mark_job_in_progress_async,
     track_popped_job_async,
 )
 
@@ -94,17 +96,23 @@ async def _duplicate_may_serve(scheduler: InferenceScheduler, job: ImageGenerate
     return duplicate_copy_may_serve(scheduler.snapshot(), str(job.id_))
 
 
-def _two_cards(*, card0_max_pixels: int, card1_max_pixels: int) -> dict:
-    """A 24GB card 0 and an 8GB card 1, each serving stable_diffusion, differing only in max_pixels."""
+def _two_cards(*, card0_max_pixels: int, card1_max_pixels: int, max_threads: int = 1) -> dict:
+    """A 24GB card 0 and an 8GB card 1, each serving stable_diffusion, differing only in max_pixels.
+
+    ``max_threads`` is each card's sampling cap, which placement reads to decide whether a card already
+    serving the model could run another copy of it.
+    """
     rt0 = make_test_card_runtimes(
         device_indices=(0,),
         config=_card_config(models=["stable_diffusion"], max_pixels=card0_max_pixels),
         total_vram_mb=24576.0,
+        max_concurrent_inference=max_threads,
     )
     rt1 = make_test_card_runtimes(
         device_indices=(1,),
         config=_card_config(models=["stable_diffusion"], max_pixels=card1_max_pixels),
         total_vram_mb=8192.0,
+        max_concurrent_inference=max_threads,
     )
     return {0: rt0[0], 1: rt1[1]}
 
@@ -302,8 +310,12 @@ class TestPreloadCardPlacement:
         assert chosen is not None
         assert chosen.device_index == 1
 
-    async def test_sticky_prefers_a_card_already_holding_the_model(self) -> None:
-        """A card already serving the model is preferred for the preload even if it is the busier card."""
+    async def test_sticky_prefers_a_serving_card_that_can_still_run_another_copy(self) -> None:
+        """A card already serving the model wins the preload while it has spare sampling capacity.
+
+        Its second lane can start the copy the moment it lands, so the sticky preference costs nothing and
+        keeps the model's copies together.
+        """
         process_map = ProcessMap(
             {
                 # Card 0 already holds the model on a busy slot (sticky) and is the more-loaded card.
@@ -319,12 +331,43 @@ class TestPreloadCardPlacement:
         )
         scheduler = _make_scheduler(
             process_map=process_map,
-            card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
+            card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000, max_threads=2),
         )
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         chosen = await _preload_target(scheduler, job)
         assert chosen is not None
         assert chosen.device_index == 0
+
+    async def test_a_serving_card_at_its_cap_ranks_last_for_a_second_copy(self) -> None:
+        """With one sampling slot per card, the copy goes to a card that can run it, not beside the busy one.
+
+        The eight-card serialization: sticky placement sent every duplicate to the card already running the
+        model, whose sibling lane could not sample under a cap of one, so the hot model's queue drained
+        through a single lane while other cards idled.
+        """
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(
+                    0,
+                    model_name="stable_diffusion",
+                    device_index=0,
+                    state=HordeProcessState.INFERENCE_STARTING,
+                ),
+                1: _empty_slot(1, device_index=0),
+                2: _empty_slot(2, device_index=1),
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000, max_threads=1),
+        )
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+
+        chosen = await _preload_target(scheduler, job)
+
+        assert chosen is not None
+        assert chosen.device_index == 1
+        assert chosen.process_id == 2
 
     async def test_equal_load_prefers_card_with_more_measured_free_vram(self) -> None:
         """A safety/post-process context on card 0 should not attract a tied fresh preload."""
@@ -533,6 +576,16 @@ class TestDuplicateCopyEscape:
             card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
         )
 
+    async def _seat_running_copy(self, scheduler: InferenceScheduler, model: str) -> None:
+        """Track the job the busy copy is sampling, so the queue accounts for the work that copy holds.
+
+        The duplicate bound is read off the queue: a lane sampling work the tracker does not know about would
+        understate its model's demand and refuse the second copy the queued job is waiting for.
+        """
+        running = make_job_pop_response(model=model, width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, running)
+        await mark_job_in_progress_async(scheduler._job_tracker, running)
+
     async def test_all_copies_busy_allows_a_duplicate(self) -> None:
         """Every eligible copy busy sampling: the queued job may seek a second copy on the idle card."""
         process_map = ProcessMap(
@@ -544,6 +597,7 @@ class TestDuplicateCopyEscape:
             },
         )
         scheduler = self._scheduler(process_map)
+        await self._seat_running_copy(scheduler, "stable_diffusion")
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         assert await _duplicate_may_serve(scheduler, job) is True
 
@@ -572,6 +626,7 @@ class TestDuplicateCopyEscape:
             },
         )
         scheduler = self._scheduler(process_map)
+        await self._seat_running_copy(scheduler, "stable_diffusion")
         scheduler._horde_model_map.root["stable_diffusion"] = ModelInfo(
             horde_model_name="stable_diffusion",
             horde_model_load_state=ModelLoadState.LOADING,
@@ -604,6 +659,85 @@ class TestDuplicateCopyEscape:
         scheduler = self._scheduler(process_map)
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         assert await _duplicate_may_serve(scheduler, job) is False
+
+
+class TestDuplicateCopiesAreBounded:
+    """A burst of one model earns copies up to its own demand, and never more than one per card.
+
+    Without a bound the escape is the mirror of the defect it fixes: a queue dominated by one model would take
+    a lane on every card for it and leave the pool holding one model, so the next model's job pays a full disk
+    reload wherever it lands.
+    """
+
+    def _four_card_scheduler(self, process_map: ProcessMap) -> InferenceScheduler:
+        return _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(4))
+
+    async def test_the_bound_is_the_smaller_of_the_queues_demand_and_the_card_count(self) -> None:
+        """Two jobs on a four-card host earn two copies; six jobs earn four, one per card."""
+        process_map = ProcessMap({index: _lane(index, device_index=index, model=None) for index in range(4)})
+        scheduler = self._four_card_scheduler(process_map)
+        await _queue(scheduler, "stable_diffusion", "stable_diffusion")
+
+        snapshot = scheduler.snapshot()
+        assert duplicate_copies_permitted(snapshot, "stable_diffusion") == 2, "the queue's demand binds first"
+
+        await _queue(scheduler, *(["stable_diffusion"] * 4))
+        assert duplicate_copies_permitted(scheduler.snapshot(), "stable_diffusion") == 4, "the card count binds"
+
+    async def test_a_copy_per_card_is_the_ceiling(self) -> None:
+        """With every card already holding a busy copy, a deeper queue earns no further copy.
+
+        A fifth copy would have to share a card with one of the four, where it cannot sample under a cap of
+        one; the job waits for a running copy instead of paying for weights that would idle.
+        """
+        process_map = ProcessMap(
+            {
+                index: make_mock_process_info(
+                    index,
+                    model_name="stable_diffusion",
+                    device_index=index,
+                    state=HordeProcessState.INFERENCE_STARTING,
+                )
+                for index in range(4)
+            },
+        )
+        scheduler = self._four_card_scheduler(process_map)
+        for _running in range(4):
+            running = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+            await track_popped_job_async(scheduler._job_tracker, running)
+            await mark_job_in_progress_async(scheduler._job_tracker, running)
+        waiting = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, waiting)
+
+        snapshot = scheduler.snapshot()
+        assert duplicate_copies_permitted(snapshot, "stable_diffusion") == 4
+        assert duplicate_copy_may_serve(snapshot, str(waiting.id_)) is False
+
+    async def test_a_free_card_still_earns_the_next_copy(self) -> None:
+        """The control: below the bound the escape still fires, so the ceiling is what refused above."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(
+                    0,
+                    model_name="stable_diffusion",
+                    device_index=0,
+                    state=HordeProcessState.INFERENCE_STARTING,
+                ),
+                1: _lane(1, device_index=1, model=None),
+                2: _lane(2, device_index=2, model=None),
+                3: _lane(3, device_index=3, model=None),
+            },
+        )
+        scheduler = self._four_card_scheduler(process_map)
+        running = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, running)
+        await mark_job_in_progress_async(scheduler._job_tracker, running)
+        waiting = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, waiting)
+
+        snapshot = scheduler.snapshot()
+        assert duplicate_copy_may_serve(snapshot, str(waiting.id_)) is True
+        assert select_preload_target(snapshot, str(waiting.id_), ()) in {1, 2, 3}, "onto a card that can run it"
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -712,6 +846,19 @@ class TestWorkerWideConcurrencyCeiling:
         scheduler._runtime_config.set_effective_max_threads(1)
 
         assert scheduler.worker_wide_concurrency_ceiling() == 4
+
+    def test_the_lane_pool_is_summed_across_cards(self) -> None:
+        """The scheduler's lane count is every card's target process count, not one card's.
+
+        It is what sizes ``affinity_active``: a model's home is a lane anywhere on the host, so a worker whose
+        lane pool read as one card's would call itself the overflow regime while it had homes to give out.
+        """
+        manager = make_testable_process_manager()
+
+        assert manager.max_inference_processes == sum(
+            card.target_process_count for card in manager._card_runtimes.values()
+        )
+        assert manager._inference_scheduler.snapshot().max_inference_processes == manager.max_inference_processes
 
 
 class TestCrossCardDispatch:

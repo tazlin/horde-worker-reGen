@@ -169,26 +169,60 @@ def select_head_room_process_id(
     return min(candidates, key=_displacement_cost).process_id
 
 
+_STICKY_CARD_RANK = 0
+"""A card already holding the model and able to run another copy of it: the cheapest place to route to."""
+
+_FRESH_CARD_RANK = 1
+"""A card not holding the model: a fresh load, and the only useful place for a copy the queue is waiting on."""
+
+_SATURATED_STICKY_CARD_RANK = 2
+"""A card holding the model with no room to run another copy of it: routing there buys nothing."""
+
+
 def card_preload_order(
     eligible_card_indices: set[int],
     *,
     cards_already_serving_model: set[int],
     card_busy_counts: Mapping[int, int],
     card_free_vram_mb: Mapping[int, float | None] | None = None,
+    cards_serving_at_concurrency_cap: frozenset[int] = frozenset(),
 ) -> list[int]:
     """Return the eligible cards in placement preference order for a fresh model load.
 
     The same sticky-then-least-loaded policy dispatch uses: a card already holding this model first
-    (avoid a duplicate copy), then the card running the fewest inference jobs (balance fresh loads). When
-    those are tied, prefer the card with the largest measured free VRAM so a safety/post-processing context on
-    one otherwise-idle card does not attract a preload that another otherwise-equal card could admit.
+    (its copy is the one the job would rather reuse), then the card running the fewest inference jobs
+    (balance fresh loads). When those are tied, prefer the card with the largest measured free VRAM so a
+    safety/post-processing context on one otherwise-idle card does not attract a preload that another
+    otherwise-equal card could admit.
+
+    Stickiness inverts on a card that is already at its concurrency cap. A load onto such a card can only be
+    a second copy of a model the card is already running, and the sibling lane it lands on cannot sample until
+    the running job ends, so the copy is paid for and idle while the cards that could have run it stay empty.
+    That card therefore ranks last, and the queue's second copy goes somewhere it can run. A serving card with
+    spare cap and an idle lane keeps its sticky preference: there the second copy runs immediately.
+
+    Args:
+        eligible_card_indices: The cards the job may be routed to.
+        cards_already_serving_model: Cards a copy of the model is resident on.
+        card_busy_counts: Per card, how many of its inference lanes are busy.
+        card_free_vram_mb: Per card, its measured free VRAM, for the tie-break. None ranks last.
+        cards_serving_at_concurrency_cap: Cards in ``cards_already_serving_model`` whose busy lanes have
+            reached their sampling cap, so a further copy there could not run.
+
+    Returns:
+        The eligible cards, best placement first.
     """
 
     def _placement_key(device_index: int) -> tuple[int, int, float, int]:
-        already_serves = 0 if device_index in cards_already_serving_model else 1
+        if device_index not in cards_already_serving_model:
+            sticky_rank = _FRESH_CARD_RANK
+        elif device_index in cards_serving_at_concurrency_cap:
+            sticky_rank = _SATURATED_STICKY_CARD_RANK
+        else:
+            sticky_rank = _STICKY_CARD_RANK
         free_vram_mb = card_free_vram_mb.get(device_index) if card_free_vram_mb is not None else None
         free_vram_rank = -free_vram_mb if free_vram_mb is not None else float("inf")
-        return (already_serves, card_busy_counts.get(device_index, 0), free_vram_rank, device_index)
+        return (sticky_rank, card_busy_counts.get(device_index, 0), free_vram_rank, device_index)
 
     return sorted(eligible_card_indices, key=_placement_key)
 

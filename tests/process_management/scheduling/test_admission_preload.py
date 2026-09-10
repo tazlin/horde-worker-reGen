@@ -54,6 +54,8 @@ async def _worker(
     available_ram_mb: float | None = 65536.0,
     quarantined: bool = False,
     queued_model_process_ids: list[int] | None = None,
+    max_inference: int = 2,
+    card_runtimes: dict | None = None,
 ) -> tuple[InferenceScheduler, list[ImageGenerateJobPopResponse]]:
     """A scheduler over the given slots and queue, with the lifecycle answers the gates read pinned."""
     tracker = JobTracker()
@@ -62,8 +64,9 @@ async def _worker(
         job_tracker=tracker,
         bridge_data=bridge_data,
         available_ram_mb=available_ram_mb,
-        max_inference=2,
+        max_inference=max_inference,
         max_concurrent=2,
+        card_runtimes=card_runtimes,
         clock=lambda: _NOW,
     )
     scheduler._process_lifecycle.is_model_load_quarantined = Mock(return_value=quarantined)  # type: ignore[attr-defined]
@@ -289,14 +292,28 @@ class TestTargetSelectionAgreesWithTheScheduler:
             scheduler._select_preload_process(follower, []).process_id  # type: ignore[union-attr]
         )
 
-    async def test_multi_gpu_sticky_then_least_loaded(self) -> None:
-        """A card already serving the model is preferred for its spare slot."""
+    async def test_multi_gpu_places_a_second_copy_off_the_saturated_serving_card(self) -> None:
+        """The serving card is at its cap of one, so its spare slot loses to the idle card's."""
         model = "stable_diffusion"
         busy = make_mock_process_info(0, model_name=model, device_index=0, state=HordeProcessState.INFERENCE_STARTING)
         spare_0 = make_mock_process_info(1, model_name=None, device_index=0)
         spare_1 = make_mock_process_info(2, model_name=None, device_index=1)
         scheduler, jobs = await _worker(slots={0: busy, 1: spare_0, 2: spare_1}, pending=[model])
         scheduler._card_runtimes = make_test_card_runtimes(device_indices=(0, 1))
+
+        chosen = select_preload_target(scheduler.snapshot(), str(jobs[0].id_), ())
+
+        assert chosen == 2
+        assert chosen == scheduler._select_preload_process(jobs[0], []).process_id  # type: ignore[union-attr]
+
+    async def test_multi_gpu_sticky_holds_while_the_serving_card_has_spare_capacity(self) -> None:
+        """With a cap of two the serving card can run the second copy at once, so it keeps its preference."""
+        model = "stable_diffusion"
+        busy = make_mock_process_info(0, model_name=model, device_index=0, state=HordeProcessState.INFERENCE_STARTING)
+        spare_0 = make_mock_process_info(1, model_name=None, device_index=0)
+        spare_1 = make_mock_process_info(2, model_name=None, device_index=1)
+        scheduler, jobs = await _worker(slots={0: busy, 1: spare_0, 2: spare_1}, pending=[model])
+        scheduler._card_runtimes = make_test_card_runtimes(device_indices=(0, 1), max_concurrent_inference=2)
 
         chosen = select_preload_target(scheduler.snapshot(), str(jobs[0].id_), ())
 
