@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
+import pytest
+from horde_sdk.ai_horde_api import GENERATION_STATE
+
+from horde_worker_regen.process_management.ipc.messages import (
+    HordeControlFlag,
+    HordeImageResult,
+    HordeProcessState,
+    ModelLoadState,
+)
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot, snapshot_slot
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -174,3 +185,71 @@ class TestSchedulingSnapshot:
         assert snapshot.routing_device_index(snapshot.slots[0]) == 1
         assert snapshot.card(1) is snapshot.cards[1]
         assert snapshot.slots_of_type(HordeProcessType.INFERENCE) == (snapshot.slots[0],)
+
+
+class TestPendingPostProcessingFacts:
+    """The preload gate's two post-processing facts: which card the lane sits on, and what a chain will cost."""
+
+    async def _scheduler_with_lane(self, *, lane_card: int) -> SchedulingSnapshot:
+        """A two-card worker whose post-processing lane sits on ``lane_card`` with one chain pending."""
+        inference_lane = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        post_process_lane = make_mock_process_info(
+            7,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+            device_index=lane_card,
+        )
+        job_tracker = JobTracker()
+        pending_chain = make_job_pop_response("sd", post_processing=["RealESRGAN_x4plus"])
+        await job_tracker.queue_for_post_processing(
+            HordeJobInfo(
+                sdk_api_job_info=pending_chain,
+                job_image_results=[HordeImageResult(image_bytes=b"raw")],
+                state=GENERATION_STATE.ok,
+                censored=False,
+                time_popped=time.time(),
+            ),
+        )
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: inference_lane, 7: post_process_lane}),
+            job_tracker=job_tracker,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1)),
+        )
+        return scheduler.snapshot()
+
+    async def test_the_lane_card_and_the_smallest_pending_peak_are_pinned(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The card carrying the idle lane, and the chain estimate the hold weighs, are both on the snapshot."""
+        monkeypatch.setattr(_sched_mod, "predict_job_post_processing_vram_mb", lambda _job, _baseline: 4000.0)
+
+        snapshot = await self._scheduler_with_lane(lane_card=1)
+
+        assert snapshot.post_processing_lane_card_index == 1
+        assert snapshot.pending_post_processing_reserve_mb == 4000.0
+
+    async def test_an_unknown_chain_estimate_reads_as_nothing_pending(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no estimate for the pending chain the reserve is zero: the gate restricts only on evidence."""
+        monkeypatch.setattr(_sched_mod, "predict_job_post_processing_vram_mb", lambda _job, _baseline: None)
+
+        snapshot = await self._scheduler_with_lane(lane_card=0)
+
+        assert snapshot.post_processing_lane_card_index == 0
+        assert snapshot.pending_post_processing_reserve_mb == 0.0
+
+    async def test_no_lane_names_no_card(self) -> None:
+        """A worker with no post-processing lane names no card for the hold to apply to."""
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: make_mock_process_info(0, model_name=None)}),
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1)),
+        )
+
+        snapshot = scheduler.snapshot()
+
+        assert snapshot.post_processing_lane_card_index is None
+        assert snapshot.pending_post_processing_reserve_mb == 0.0

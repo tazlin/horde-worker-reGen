@@ -340,7 +340,8 @@ response stay live even when the queue is empty.
    `DOWNLOAD_AUX_COMPLETE` aux-model download path. This is opportunistic: when
    the queue head is already resident on an idle process, dispatch is attempted
    before later models are preloaded; when pending post-processing has an idle
-   lane and a known peak, preloads also yield so the lane gets the drain window.
+   lane and a known peak, preloads onto that lane's own card also yield so the
+   lane gets the drain window.
    "Already loaded" is judged per job on a multi-GPU worker: a resident (or
    loading) copy counts only where it sits on a card eligible for *that* job, so
    a job whose model is resident on a card its resolution or features exclude is
@@ -506,6 +507,9 @@ immediately admissible image post-processing work. When pending PP chains cannot
 next sampler that would also be non-co-resident waits, including just after the current sampler finishes, so
 the lane gets the next drain window instead of extending the PP backlog. Speculative preloads yield to that
 pending chain as well; otherwise a later model load can consume the very headroom the chain is waiting for.
+Both holds are the lane's card's, matching each other: on a multi-GPU worker a load whose target lands on
+another card proceeds (the gate ladder's `DEFER_POST_PROCESSING` names the lane's card), and only a single-GPU
+worker sees the hold stop every preload, because there the lane's card is the only one.
 
 ### Concurrent-overlap gating
 

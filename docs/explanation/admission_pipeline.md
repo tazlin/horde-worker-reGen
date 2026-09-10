@@ -58,11 +58,15 @@ flowchart TD
     holds --> send["_dispatch_inference_message"]
 ```
 
+Both branches off `begin_scheduling_cycle` run every cycle. A preload stages one model onto one slot of one
+card, and the lanes already holding resident weights are idle while it does, so dispatch is not withheld for
+it; the preload pass's own ceiling of one send per cycle is what bounds the pair.
+
 ## Where each decision lives
 
 | Decision | Function | Reads | Returns | Acted on by |
 | --- | --- | --- | --- | --- |
-| Preload gate ladder (serviceable, quarantined, already resident, RAM floor, target, exclusive hold, growth hold, model change, load serialization) | [`decide_preload_gates`][horde_worker_regen.process_management.scheduling.admission.preload.decide_preload_gates] | `SchedulingSnapshot` | `PreloadGatePlan`: an `AdmissionDecision`, the target slot, `FaultJob` / `ReplaceProcess` commands, a once-per-episode notice | `InferenceScheduler._run_preload_plan`, `PlanExecutor.execute_commands` |
+| Preload gate ladder (serviceable, quarantined, already resident, RAM floor, target, exclusive hold, pending post-processing on the lane's card, growth hold, model change, load serialization) | [`decide_preload_gates`][horde_worker_regen.process_management.scheduling.admission.preload.decide_preload_gates] | `SchedulingSnapshot` | `PreloadGatePlan`: an `AdmissionDecision`, the target slot, `FaultJob` / `ReplaceProcess` commands, a once-per-episode notice | `InferenceScheduler._run_preload_plan`, `PlanExecutor.execute_commands` |
 | Preload target choice (sticky, then least loaded, sparing the head's own copy) | [`select_preload_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_preload_target], [`select_head_room_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_head_room_target] | snapshot | a process id or None | the gate ladder |
 | Preload budget pricing (predictive verdict, context-reduction depth, arbiter request) | [`price_preload`][horde_worker_regen.process_management.scheduling.admission.preload.price_preload] | snapshot, the frozen arbiter, the streaming forecast | `PricedPreload` | `_admit_preload_under_budget`, which evaluates through the arbiter and runs the RAM verdict or the actuations |
 | RAM staging verdict (whole checkpoint, page-reuse credit, or the UNet-only component charge) | [`decide_ram_admission`][horde_worker_regen.process_management.scheduling.admission.preload.decide_ram_admission] | snapshot | `RamAdmission` | `_apply_ram_verdict`, which records the accounting on a fit and runs the reclaim sequence on a miss |
@@ -89,9 +93,10 @@ semaphore and its own copy of `max_threads`, so the worker-wide ceiling is the s
 A head that cannot be seated therefore blocks only its own card. Where the worker drives more than one, the
 walk resumes and the first job another card can serve immediately is dispatched instead
 (`LineSkip(reason="cross_card")`). The head's own card is excluded, so nothing takes the capacity it is
-queued for; a cold head excludes no card, because a preload it could take is admitted earlier in the same
-cycle and ends the cycle before any dispatch is attempted. The three line-skip reasons differ in what they
-cost the head:
+queued for. A cold head names no card of its own, but a cycle preloads *and* dispatches, so a card carrying
+an in-flight load of the head's model is excluded too: seating other work there could put it at its cap just
+as the head's weights land. Cards with no copy of the head's model in flight withhold nothing from it and
+stay available. The three line-skip reasons differ in what they cost the head:
 
 | Reason | When | Effect on the head's affinity skip window |
 | --- | --- | --- |
@@ -101,6 +106,38 @@ cost the head:
 
 A single-GPU worker takes none of the per-card branches: the cap is the worker-wide one it always was, and
 `cross_card` never arises.
+
+Two gates that follow selection are scoped the same way. The **head-priority barrier** (armed when the head's
+preload has been RAM-deferred behind live work past its starvation bound) withholds other dispatch only onto
+the card the barred head's load is aimed at, because the escape it is waiting for (the no-live-consumer
+best-effort admit) is judged per card; a barred head that names no card keeps the fleet-wide withholding, as
+no single card's draining can be shown to admit it. **Degraded-retry isolation** compares against the jobs
+sampling on the card the retry would land on, since the VRAM pressure it is avoiding is that card's.
+
+### Continuing the preload pass across cards
+
+The pass walks the pending queue and stops at the first job whose gates refuse it. Most refusals are a
+statement about the card the load would have landed on, so on a multi-card worker the walk continues over
+jobs that would load elsewhere, and any later job aimed at a card already stopped is refused for the reason
+already recorded against it. One preload per cycle is still the ceiling
+([`stop_is_card_scoped`][horde_worker_regen.process_management.scheduling.admission.preload.stop_is_card_scoped]):
+
+| Decision | Scope | Why |
+| --- | --- | --- |
+| `DEFER_RAM_PRESSURE` | worker-wide | the host RAM danger floor, and every load routes through host RAM |
+| `STOP_PASS` | worker-wide | a preload send failed, so the pool's state is no longer trusted |
+| `NO_TARGET` for the head | worker-wide | the head-room fallback is spent, so every remaining slot is one the head still needs |
+| `DEFER_BUDGET` for the head | worker-wide | the head's reclaim ladder is evicting on its behalf, and a later load would spend what it frees |
+| `DEFER_VRAM_GROWTH_HOLD` | card | the target card sits near its paging cliff |
+| `EXCLUSIVE_IN_PROGRESS` | card | an exclusive job holds the target card to itself |
+| `DEFER_POST_PROCESSING` | card | the post-processing lane's card is owed a drain window |
+| `DEFER_CONCURRENCY` | card | loads are serialized per device, not worker-wide |
+| `REPLACE_PROCESS` | card | one slot on one card is being cycled for its model change |
+| `NO_TARGET` / `DEFER_BUDGET` for a later job | card | this job's own target, which withholds no other card |
+
+A card-scoped stop for the head is still card-scoped: the head is waiting for that one card, and a load onto a
+card it is not waiting for takes nothing from it. A single-GPU worker has nowhere to continue to, so the pass
+exits at its first stop exactly as it always has.
 
 ## One job through the preload pass
 

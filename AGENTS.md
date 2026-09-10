@@ -137,6 +137,11 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   (quote parametrized ids verbatim). One chaos seed replays via `HORDE_CHAOS_SEEDS=<seed>`. Tee long
   runs to a file once and grep the tee. One pytest invocation per working copy: concurrent suites in
   the same checkout abort each other.
+- **Wait on a run, do not poll it.** Run pytest at full verbosity (never `-q`) redirected to a tee, in the
+  foreground with a timeout, or once in the background and then wait for its completion. Sleep-and-tail
+  loops and monitors on the tee are forbidden; an empty tee is a buffered redirect, not a hang, so check
+  the python process's CPU time before calling a run stuck. A run that outlives its timeout is bisected by
+  directory rather than waited on.
 - Most pipeline tests run **without GPU or network** via dry-run mode (`CannedJobSource` +
   `fake_worker_processes`); see [Architecture → Dry-run mode](docs/explanation/architecture.md#dry-run-mode).
 - `AI_HORDE_TESTING=1` suppresses runtime side effects (orphan reaping, action-ledger mirroring)

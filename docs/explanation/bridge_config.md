@@ -347,7 +347,8 @@ post-processing lane to unload its modules from VRAM/RAM before starting more
 work; the whole lane is a pause candidate only while post-processing is enabled
 and still offered. A pending chain that fits the card once drained gets the next drain window before a fresh sampler that
 would be unable to co-reside with it, and speculative model preloads yield to the same drain window so they
-do not recreate the pressure the lane is waiting to clear. Only structurally unhostable chains become
+do not recreate the pressure the lane is waiting to clear. The lane is one card's tenant, so on a multi-GPU
+worker both holds apply to that card's dispatches and loads only, and the other cards go on serving. Only structurally unhostable chains become
 no-image faults. See
 [Process lanes and job chaining](process_lanes_and_chaining.md) for the full
 picture, including how lane failures are reported as no-image faults rather than

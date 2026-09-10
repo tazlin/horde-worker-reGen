@@ -135,6 +135,7 @@ from horde_worker_regen.process_management.scheduling.admission.materialization 
 from horde_worker_regen.process_management.scheduling.admission.preload import (
     PreloadGatePlan,
     PreloadPassControl,
+    PreloadPassStep,
     RamChargeKind,
     decide_preload_gates,
     decide_ram_admission,
@@ -4953,6 +4954,8 @@ class InferenceScheduler:
             draining_process_ids=frozenset(self._processes_draining_for_ram),
             shutting_down=self._state.shutting_down,
             recent_job_ttl=self._state.recent_job_ttl,
+            post_processing_lane_card_index=self._post_processing_lane_card_index(),
+            pending_post_processing_reserve_mb=self._pending_post_processing_reserve_mb(device_index=None),
             models_with_results=frozenset(
                 model
                 for model in {
@@ -5603,7 +5606,7 @@ class InferenceScheduler:
                         f"process is {state}.",
                     )
                 case StaleEntryReason.DISPLACED:
-                    # Parsed by analysis/log_signatures.py (displaced_entry_expired): change the message and the registry together.
+                    # Log contract: analysis/log_signatures.py (displaced_entry_expired).
                     logger.warning(
                         f"Expiring displaced entry for {entry.model} on process {entry.process_id}: "
                         f"the slot now holds {entry.holder_model}.",
@@ -5708,7 +5711,7 @@ class InferenceScheduler:
 
         self._preload_delay_notified = False
         self._clear_head_starvation_timer()
-        # Parsed by analysis/log_signatures.py (model_preloading): change the message and the registry together.
+        # Log contract: analysis/log_signatures.py (model_preloading).
         logger.debug(f"Preloading model {job.model} on process {available_process.process_id}")
         logger.debug(f"Available inference processes: {self._process_map}")
         only_active_models = {
@@ -7263,6 +7266,12 @@ class InferenceScheduler:
         gate stops the pass. A plan that faulted a job changes the queue the remaining decisions read, so the
         snapshot is re-taken behind it.
 
+        Where the worker drives more than one card, a stop that names a card (:func:`stop_is_card_scoped`)
+        stops only that card: the walk goes on over jobs whose load would land elsewhere, and any later job
+        aimed at a stopped card is refused for the reason already recorded against it. A stop about the host
+        or the queue head stops everything, and one preload per cycle is still the ceiling. A single card has
+        nowhere else to continue to, so the pass exits at the first stop exactly as it always has.
+
         Returns:
             True if a model was preloaded, False otherwise.
         """
@@ -7280,7 +7289,7 @@ class InferenceScheduler:
                 process.last_process_state == HordeProcessState.PRELOADED_MODEL
                 and process.loaded_horde_model_name not in pending_models
             ):
-                # Parsed by analysis/log_signatures.py (preload_cleared): change the message and the registry together.
+                # Log contract: analysis/log_signatures.py (preload_cleared).
                 logger.debug(
                     f"Clearing preloaded model {process.loaded_horde_model_name} "
                     f"from process {process.process_id} as it is no longer needed",
@@ -7305,24 +7314,42 @@ class InferenceScheduler:
         if self._resident_head_should_dispatch_before_preload(head_job):
             return False
 
+        stopped_cards: set[int] = set()
         for job_id in snapshot.queue.pending_in_placement_order:
             if job_id not in snapshot.queue.jobs:
                 continue
             plan = decide_preload_gates(snapshot, job_id, head_job_id=head_job_id, loaded_models=loaded_models)
-            control = self._run_preload_plan(plan, snapshot)
-            if control is PreloadPassControl.NEXT_JOB:
-                if plan.commands:
-                    snapshot = self.snapshot()
+            if self._preload_plan_card(snapshot, plan) in stopped_cards:
+                # An earlier job already stopped this card for a reason that still stands, so this job's load
+                # onto it is refused for the same reason. Deciding it again would only restate that.
                 continue
-            return control is PreloadPassControl.PRELOAD_SENT
+            step = self._run_preload_plan(plan, snapshot)
+            if step.control is PreloadPassControl.PRELOAD_SENT:
+                return True
+            if step.control is PreloadPassControl.STOP_PASS and (
+                not self._multi_gpu_routing_active or step.stops_every_card
+            ):
+                return False
+            if step.control is PreloadPassControl.STOP_PASS and step.device_index is not None:
+                stopped_cards.add(step.device_index)
+            if plan.commands:
+                snapshot = self.snapshot()
 
         return False
 
-    def _run_preload_plan(self, plan: PreloadGatePlan, snapshot: SchedulingSnapshot) -> PreloadPassControl:
+    def _preload_plan_card(self, snapshot: SchedulingSnapshot, plan: PreloadGatePlan) -> int | None:
+        """The card a gate plan's preload would land on, or None when it named no target (or one card is driven)."""
+        if plan.target_process_id is None:
+            return None
+        slot = snapshot.slots.get(plan.target_process_id)
+        return snapshot.routing_device_index(slot) if slot is not None else None
+
+    def _run_preload_plan(self, plan: PreloadGatePlan, snapshot: SchedulingSnapshot) -> PreloadPassStep:
         """Execute one gate plan: its commands, the once-per-episode notices, and on admit the budget step and send.
 
         The decision recorded is the final one: a plan the gates admit can still defer at the budget, lose its
-        target to a whole-card scale-down during admission, or fail its send.
+        target to a whole-card scale-down during admission, or fail its send. The card returned is the one the
+        preload was last aimed at, which is what a card-scoped stop is a statement about.
         """
         self.executor.execute_commands(plan.commands)
         job = snapshot.queue.payloads[plan.job_id]
@@ -7341,7 +7368,12 @@ class InferenceScheduler:
             self._ram_pressure_notified = True
         if plan.records_admission:
             self._record_preload_admission(decision, job=job, process=process, reason=reason)
-        return pass_control_for(decision)
+        return PreloadPassStep(
+            control=pass_control_for(decision),
+            decision=decision,
+            device_index=self._routing_device_index(process) if process is not None else None,
+            is_head_blocker=plan.is_head_blocker,
+        )
 
     def _admit_and_send_preload(
         self,
@@ -7380,8 +7412,29 @@ class InferenceScheduler:
         return AdmissionDecision.STOP_PASS, process, "preload send failed"
 
     def _pending_post_processing_should_hold_preload(self) -> bool:
-        """Whether a pending post-processing chain should receive the next drain window before preloads."""
-        return self._pending_post_processing_reserve_mb(device_index=None) > 0
+        """Whether a pending post-processing chain holds every preload this cycle: the single-card answer.
+
+        A post-processing lane is one card's tenant, and a chain waiting for it competes for that card's VRAM
+        and no other's. With one card that is every preload, so the pass exits here and nothing else in it
+        runs. Where the worker drives more than one card the hold belongs to the target's card and is decided
+        per job in the gate ladder (:data:`AdmissionDecision.DEFER_POST_PROCESSING`), which is the same scope
+        the dispatch-side hold has always used.
+
+        The early exit is kept for the single-card path rather than routing it through the ladder because it
+        suppresses more than the loads: with it, the cycle also skips the stale-preload sweep, the head
+        starvation and barrier clocks and every recorded admission. Reproducing that from inside the ladder
+        would change the one topology whose behaviour must stay identical.
+        """
+        return not self._multi_gpu_routing_active and self._pending_post_processing_reserve_mb(device_index=None) > 0
+
+    def _post_processing_lane_card_index(self) -> int | None:
+        """The card the idle post-processing lane sits on, or None when no lane is free to take a chain.
+
+        Read from the lane the pending reserve is measured against rather than from the lifecycle's
+        configured placement, so the card and the reserve can never describe different lanes.
+        """
+        post_process_process = self._process_map.get_first_available_post_process_process()
+        return post_process_process.device_index if post_process_process is not None else None
 
     def _resident_head_should_dispatch_before_preload(self, head_job: ImageGenerateJobPopResponse | None) -> bool:
         """Whether the queue head can already try dispatch, so speculative preloading should yield."""
@@ -7748,9 +7801,13 @@ class InferenceScheduler:
 
         The head's own card is excluded outright. Where the head is waiting for a lane there, that card's
         capacity is the head's to claim the moment it frees, and its cap would refuse the candidate anyway;
-        excluding it says so directly rather than relying on the arithmetic. A cold head names no card, and
-        needs none excluded: a preload it could take runs earlier in the same cycle and ends the cycle before
-        any dispatch is attempted, so nothing seated here can take the slot its load was going to use.
+        excluding it says so directly rather than relying on the arithmetic.
+
+        A cold head names no card of its own, but it may already have a load in flight, and a cycle preloads
+        *and* dispatches. The card carrying that load is excluded too (:meth:`_cards_loading_model`): seating
+        another job there could put it at its cap by the time the weights land, so the head would wait a whole
+        sampling window for capacity its own load was already staged against. Cards with no in-flight copy of
+        the head's model withhold nothing from it and stay available.
 
         The head keeps its queue position, and the skip costs it nothing: the affinity skip budget bounds a
         head being passed *for the lane it is waiting on*, and a dispatch onto another card takes nothing
@@ -7759,6 +7816,7 @@ class InferenceScheduler:
         """
         if not self._multi_gpu_routing_active:
             return None
+        excluded_cards = {head_device_index} if head_device_index is not None else self._cards_loading_model(head_job)
         for candidate_job in candidates:
             if candidate_job is head_job or candidate_job.model is None:
                 continue
@@ -7767,10 +7825,38 @@ class InferenceScheduler:
             if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
                 continue
             candidate_process = self._seatable_resident_process(candidate_job)
-            if candidate_process is None or candidate_process.device_index == head_device_index:
+            if candidate_process is None or candidate_process.device_index in excluded_cards:
                 continue
             return candidate_job, candidate_process
         return None
+
+    def _cards_loading_model(self, job: ImageGenerateJobPopResponse) -> set[int]:
+        """The cards where a load of ``job``'s model is in flight right now.
+
+        A load in flight is capacity already spoken for: the job it is being staged for will want a sampling
+        slot on that card as soon as the weights land. Both records of an in-flight load count, since they
+        describe different moments of the same one: the model map's LOADING entry (the send has gone out) and
+        a slot sitting in PRELOADING_MODEL or PRELOADED_MODEL holding the model (the child is reading, or has
+        finished and is waiting for the dispatch).
+        """
+        model = job.model
+        if model is None:
+            return set()
+        cards: set[int] = set()
+        if self._horde_model_map.is_model_loading(model):
+            entry = self._horde_model_map.root.get(model)
+            owner = self._process_map.get(entry.process_id) if entry is not None else None
+            if owner is not None:
+                cards.add(owner.device_index)
+        cards.update(
+            process_info.device_index
+            for process_info in self._process_map.values()
+            if process_info.process_type == HordeProcessType.INFERENCE
+            and process_info.loaded_horde_model_name == model
+            and process_info.last_process_state
+            in (HordeProcessState.PRELOADING_MODEL, HordeProcessState.PRELOADED_MODEL)
+        )
+        return cards
 
     def _cross_card_selection(
         self,
@@ -9578,7 +9664,7 @@ class InferenceScheduler:
             f"with sampler {next_job.payload.sampler_name} for a batch of {next_job.payload.n_iter}",
         )
 
-        # Parsed by analysis/log_signatures.py (batch_ids, batch_id_entry): change the message and the registry together.
+        # Log contract: analysis/log_signatures.py (batch_ids, batch_id_entry).
         logger.debug(f"All Batch IDs: {next_job.ids}")
 
     async def _stage_head_ahead_of_pin(
@@ -10410,6 +10496,87 @@ class InferenceScheduler:
         """Return the card the safety process currently occupies, or None when safety is off-GPU (on CPU)."""
         return self._process_lifecycle.safety_gpu_card_index()
 
+    def _jobs_in_progress_in_dispatch_scope(self, device_index: int) -> bool:
+        """Whether work is already sampling in the scope a dispatch onto ``device_index`` shares memory with.
+
+        One card on a multi-card worker; the whole worker otherwise, which is the single-GPU answer unchanged.
+        """
+        if not self._multi_gpu_routing_active:
+            return len(self._job_tracker.jobs_in_progress) > 0
+        return len(self._jobs_in_progress_on_card(device_index)) > 0
+
+    def _barrier_covers_card(self, device_index: int) -> bool:
+        """Whether the head-priority barrier withholds a dispatch that would land on ``device_index``.
+
+        The barrier's remedy is the running jobs draining so the barred head's preload reaches the
+        no-live-consumer best-effort admit. That escape is judged per card (the admission asks whether *this
+        card* has a live job holding it), so the cards that have to empty are the one the head's own load is
+        aimed at, and no other: withholding dispatch from a card the head will never load onto costs duty and
+        brings the head's admit no closer.
+
+        A barred head that names no card is cold everywhere, so its load has not chosen a card yet; the
+        preload pass will choose one among the cards eligible to serve it. The drain therefore has to happen
+        on an eligible card and nowhere else. An ineligible card can never host that load, so it goes on
+        dispatching; and if some eligible card is already free of live work, the no-live-consumer escape is
+        satisfied where the load will land and nothing needs to be withheld at all. Only while every eligible
+        card is busy is dispatch onto them withheld, which is the drain the barrier exists to produce.
+
+        A barred head that cannot be found in the queue at all, or names no eligible card, keeps the
+        fleet-wide answer: nothing identifies a card whose draining admits it.
+        """
+        if not self._multi_gpu_routing_active:
+            return True
+        barred_card = self._barred_head_card_index()
+        if barred_card is not None:
+            return barred_card == device_index
+        eligible_cards = self._barred_head_eligible_cards()
+        if not eligible_cards:
+            return True
+        if any(not self._jobs_in_progress_on_card(card) for card in eligible_cards):
+            return False
+        return device_index in eligible_cards
+
+    def _barred_head_eligible_cards(self) -> set[int]:
+        """The cards whose config can serve the barred head, which are the cards its load may be placed on."""
+        barred_head = self._barred_head_job()
+        return self._eligible_card_indices(barred_head) if barred_head is not None else set()
+
+    def _barred_head_job(self) -> ImageGenerateJobPopResponse | None:
+        """The pending job the head-priority barrier is held for, or None when none is held or it has departed."""
+        barrier_job_id = self._head_admission.barrier_job_id
+        if barrier_job_id is None:
+            return None
+        return next(
+            (job for job in self._job_tracker.jobs_pending_inference if str(job.id_) == barrier_job_id),
+            None,
+        )
+
+    def _barred_head_card_index(self) -> int | None:
+        """The card the barred head's load is aimed at, or None when it names none.
+
+        Read in the order the head would reach a lane: an eligible resident copy it could be dispatched onto,
+        then a load of its model already in flight, then a lane still retaining its weights.
+        """
+        barred_head = self._barred_head_job()
+        if barred_head is None or barred_head.model is None:
+            return None
+        resident = self.resident_process_for_job(barred_head, include_reserved=True)
+        if resident is not None:
+            return resident.device_index
+        loading_cards = self._cards_loading_model(barred_head)
+        if loading_cards:
+            return min(loading_cards)
+        retainer = next(
+            (
+                process_info
+                for process_info in self._process_map.values()
+                if process_info.process_type == HordeProcessType.INFERENCE
+                and process_info.retained_resident_model == barred_head.model
+            ),
+            None,
+        )
+        return retainer.device_index if retainer is not None else None
+
     async def start_inference(self) -> bool:
         """Start inference for the next job in jobs_pending_inference, if possible.
 
@@ -10428,10 +10595,13 @@ class InferenceScheduler:
         process_with_model = next_job_and_process.process_with_model
         next_job = next_job_and_process.next_job
 
-        if self._head_admission.barrier_withholds(str(next_job.id_) if next_job.id_ is not None else None):
+        if self._head_admission.barrier_withholds(
+            str(next_job.id_) if next_job.id_ is not None else None,
+        ) and self._barrier_covers_card(process_with_model.device_index):
             # A starved head has latched the head-priority barrier: withhold every dispatch but the head's own
-            # so the running jobs drain and the head reaches its best-effort admit. The head keeps its queue
-            # position and dispatches the moment the barrier releases.
+            # onto the card its load is aimed at, so that card's running jobs drain and the head reaches its
+            # best-effort admit (:meth:`_barrier_covers_card`). The head keeps its queue position and
+            # dispatches the moment the barrier releases.
             if not self._head_admission.barrier_withhold_logged:
                 logger.opt(colors=True).info(
                     "<fg #7b7d7d><i>Holding dispatch of job {} behind the head-priority "
@@ -10449,10 +10619,13 @@ class InferenceScheduler:
             return False
 
         degraded_dispatch = self._job_tracker.is_degraded_dispatch_pending(next_job)
-        if degraded_dispatch and len(self._job_tracker.jobs_in_progress) > 0:
+        if degraded_dispatch and self._jobs_in_progress_in_dispatch_scope(process_with_model.device_index):
             # A degraded retry (after a resource/OOM failure) runs in isolation to minimise VRAM
             # pressure: defer it until no other job is sampling. It keeps its head-of-queue position, so
-            # it dispatches as soon as the in-flight jobs drain rather than being starved.
+            # it dispatches as soon as the in-flight jobs drain rather than being starved. The pressure it
+            # avoids is on the card it would land on, so on a multi-card worker it waits for that card only:
+            # a sibling card's sampling neither shares its allocator nor its device memory, and waiting for
+            # the whole fleet to be empty would leave the retry unrunnable for as long as any card has work.
             return False
 
         if self._prestaged_whole_card_not_ready(next_job):
@@ -10552,7 +10725,7 @@ class InferenceScheduler:
                 )
             else:
                 skip_detail = "the displaced job's process is busy sampling its own model"
-            # Parsed by analysis/log_signatures.py (line_skip): change the message and the registry together.
+            # Log contract: analysis/log_signatures.py (line_skip).
             logger.info(
                 f"Job {next_job.id_} skipped the line ({line_skip.reason}) and will run on process "
                 f"{process_with_model.process_id} ahead of job {line_skip.displaced_job.id_}: {skip_detail}.",
@@ -10583,7 +10756,7 @@ class InferenceScheduler:
         # Past every hold/fault gate: this job is dispatching now, so emit the start logging here rather than
         # before the reclaim decision (where a deferred or faulted job would mislead the log as "starting").
         color_format_string = "<fg #f0beff>{message}</>"
-        # Parsed by analysis/log_signatures.py (inference_dispatched): change the message and the registry together.
+        # Log contract: analysis/log_signatures.py (inference_dispatched).
         logger.opt(colors=True).info(
             color_format_string,
             message=f"Starting inference for job {str(next_job.id_)[:8]} on process {process_with_model.process_id}",
@@ -11222,6 +11395,12 @@ class InferenceScheduler:
     async def run_scheduling_cycle(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
         """Run a single scheduling cycle: preload, start inference, unload.
 
+        Both stages run every cycle. A preload stages one model onto one slot and returns; the lanes that
+        already hold resident weights are idle while it does, and on a multi-card worker they are mostly not
+        even on the card being loaded. Ending the cycle at a sent preload therefore surrendered a dispatch
+        opportunity per staged model, worth a whole control-loop tick of every free lane on every card. The
+        preload pass's own ceiling of one send per cycle is what bounds the pair.
+
         This absorbs the inline orchestration block from _process_control_loop.
         """
         self.begin_scheduling_cycle()
@@ -11233,24 +11412,25 @@ class InferenceScheduler:
         # Resource governance is not driven here: the process manager runs run_governance_tick() every
         # control-loop iteration, so the danger-floor verdict and shed/restore response are already fresh
         # for this cycle regardless of whether any preload or dispatch happens.
-        if not self.preload_models():
-            # Fill every free inference slot this cycle rather than one per ~0.5s control-loop
-            # tick: when several jobs complete close together, dispatching them one tick apart
-            # leaves the GPU underfed. start_inference() returns False once no more can start
-            # (its own concurrency gate: jobs_in_progress >= max_concurrent, no free process,
-            # or no eligible job, stops the loop), so this cannot over-subscribe. There is no
-            # worker-wide serialisation ahead of it: a workflow's extra weights are priced per
-            # card by the admission and overlap gates, like a batch or a card-demanding model.
-            started = 0
-            while await self.start_inference():
-                started += 1
+        self.preload_models()
 
-            if not started:
-                # Nothing dispatched this cycle though the queue has work: if the head has been parked
-                # long enough to be a real stall (not a between-jobs gap), explain *why* it is not
-                # dispatching. Throttled, read-only; it never changes scheduling.
-                self._log_dispatch_stall_if_needed(stable_diffusion_reference)
-                # Arm the idle-fill breaker off the same idle-head signal: if the head has been starved
-                # long enough with a free sibling, let the popper over-pop a quick no-LoRA fill job.
-                self._update_idle_fill_arm(bridge_data)
-                self.unload_models()
+        # Fill every free inference slot this cycle rather than one per ~0.5s control-loop
+        # tick: when several jobs complete close together, dispatching them one tick apart
+        # leaves the GPU underfed. start_inference() returns False once no more can start
+        # (its own concurrency gate: jobs_in_progress >= max_concurrent, no free process,
+        # or no eligible job, stops the loop), so this cannot over-subscribe. There is no
+        # worker-wide serialisation ahead of it: a workflow's extra weights are priced per
+        # card by the admission and overlap gates, like a batch or a card-demanding model.
+        started = 0
+        while await self.start_inference():
+            started += 1
+
+        if not started:
+            # Nothing dispatched this cycle though the queue has work: if the head has been parked
+            # long enough to be a real stall (not a between-jobs gap), explain *why* it is not
+            # dispatching. Throttled, read-only; it never changes scheduling.
+            self._log_dispatch_stall_if_needed(stable_diffusion_reference)
+            # Arm the idle-fill breaker off the same idle-head signal: if the head has been starved
+            # long enough with a free sibling, let the popper over-pop a quick no-LoRA fill job.
+            self._update_idle_fill_arm(bridge_data)
+            self.unload_models()

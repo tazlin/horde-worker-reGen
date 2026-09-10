@@ -591,6 +591,9 @@ class _DispatchWorld:
         disaggregated_encode_seconds: float = 0.0,
         card_max_pixels: dict[int, int] | None = None,
         safety_card_index: int = 0,
+        post_process_card_index: int = 0,
+        post_processing_chain_ticks: int = 0,
+        preload_ends_dispatch: bool = False,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -707,6 +710,17 @@ class _DispatchWorld:
             safety_card_index: The card the on-GPU safety process is pinned to, which is the card its charge
                 lands on and the card its placement policy reasons about. The lowest index is the historical
                 fixed pin and what every single-card row runs on.
+            post_process_card_index: The card the dedicated post-processing lane is pinned to. The lane is one
+                card's tenant, so which card it sits on is what decides whose loads and dispatches a waiting
+                chain competes with. The lowest index is the single-card shape.
+            post_processing_chain_ticks: How many ticks a finished job's post-processing chain waits in the
+                pending queue before the hand-driven lane takes it. Zero drains every chain on the tick it
+                arrives, which is what a row not about the lane's queue wants; a positive value is a lane with
+                a real backlog, which is the only state in which a pending chain is owed a drain window.
+            preload_ends_dispatch: Whether a sent preload ends the tick before any dispatch is attempted. The
+                cycle shape a worker had before preload and dispatch were separated; kept as an opt-in so a
+                row can state what it costs, and off everywhere else because it is not what the control loop
+                does.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -842,6 +856,12 @@ class _DispatchWorld:
         """What each tick looked like to the verdicts that judge whether the card was earning."""
 
         self._service_contexts = service_contexts
+        self.post_processing_chain_ticks = post_processing_chain_ticks
+        """How long a finished job's chain sits pending before the hand-driven lane takes it."""
+        self.preload_ends_dispatch = preload_ends_dispatch
+        """Whether a sent preload ends the tick, the cycle shape from before the two stages were separated."""
+        self._chain_ready_at: dict[str, int] = {}
+        """The tick each pending chain becomes drainable, so a backlog persists across ticks."""
         card_indices = sorted(card_max_pixels) if card_max_pixels else [0]
         self._card_totals: dict[int, float] = dict.fromkeys(card_indices, card.total_mb)
         """The conserved ledger, one entry per card: what that card's total is, and therefore what its free
@@ -873,6 +893,9 @@ class _DispatchWorld:
                 model_name=None,
                 process_type=HordeProcessType.POST_PROCESS,
                 state=HordeProcessState.WAITING_FOR_JOB,
+                device_index=(
+                    post_process_card_index if post_process_card_index in self._card_totals else card_indices[0]
+                ),
             )
         self._process_map = ProcessMap(processes)
         self._model_map = HordeModelMap(root={})
@@ -1724,8 +1747,17 @@ class _DispatchWorld:
             await self._job_tracker.finalize_submitted(job_info)
 
     async def _drain_post_processing(self) -> None:
-        """Complete pending post-processing on the hand-driven lane and pass its result to safety."""
+        """Complete pending post-processing on the hand-driven lane and pass its result to safety.
+
+        A chain waits ``post_processing_chain_ticks`` before the lane takes it, so a row can hold a real
+        backlog against the lane's card. At the default of zero every chain drains on the tick it arrives.
+        """
         for job_info in list(self._job_tracker.jobs_pending_post_processing):
+            job_id = str(job_info.sdk_api_job_info.id_)
+            ready_at = self._chain_ready_at.setdefault(job_id, self.tick + self.post_processing_chain_ticks)
+            if self.tick < ready_at:
+                continue
+            self._chain_ready_at.pop(job_id, None)
             await self._job_tracker.begin_post_processing(job_info, process_id=-1, process_launch_identifier=1)
             await self._job_tracker.queue_for_safety_post_processed(job_info)
 
@@ -2414,9 +2446,10 @@ class _DispatchWorld:
         # boundary is opened here: selection state scoped to one cycle must not survive the child reports this
         # tick applied, or the world presents the scheduler a staleness its own control loop never can.
         self._scheduler.begin_scheduling_cycle()
-        self._scheduler.preload_models()
+        preloaded = self._scheduler.preload_models()
         self._begin_started_preloads()
-        await self._dispatch_until_full()
+        if not (preloaded and self.preload_ends_dispatch):
+            await self._dispatch_until_full()
         for device_index in self._card_totals:
             self.min_card_free_mb[device_index] = min(
                 self.min_card_free_mb[device_index],

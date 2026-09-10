@@ -282,6 +282,27 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at="the exclusive_isolation slot-duty bucket, plus JobTracker.is_admitted_exclusive",
     ),
     GateEntry(
+        key="defer_post_processing",
+        surface=GateSurface.PRELOAD_ADMISSION,
+        kind=GateKind.HOLD,
+        subsystem="process_management.scheduling.inference_scheduler",
+        engaged_by=(
+            "a post-processing chain is pending for the lane on the target card, and a load started there "
+            "would keep the card never-idle so the chain never gets its drain window"
+        ),
+        released_by=(
+            "the pending chains draining onto the lane, or the lane going away, either of which drops the "
+            "pending reserve to nothing; a load onto any other card is never held by it"
+        ),
+        bound_seconds=None,
+        bound_source="the pending chains' own durations, which the lane runs one after another",
+        backstop=(
+            "the post-processing lane's own job watchdog, which faults a chain that stops making progress, "
+            "so a stuck lane cannot hold its card's loads indefinitely"
+        ),
+        observable_at=_PRELOAD_ADMISSION_OBSERVABLE,
+    ),
+    GateEntry(
         key="no_target",
         surface=GateSurface.PRELOAD_ADMISSION,
         kind=GateKind.HOLD,

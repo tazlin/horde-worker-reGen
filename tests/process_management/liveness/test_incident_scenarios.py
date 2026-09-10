@@ -3266,3 +3266,129 @@ async def test_s_defect_reinjection_a_head_bound_selector_serializes_the_whole_p
 
     with pytest.raises(AssertionError, match="the pool ran at most"):
         _assert_the_whole_pool_was_used(world, concurrency, context="head-bound selector")
+
+
+# --------------------------------------------------------------------------------------------------------
+# Worker-wide holds on a multi-card pool: one lane's backlog, and one cycle's preload, must not stop the fleet
+# --------------------------------------------------------------------------------------------------------
+
+_CHAIN_CARD = 1
+"""The card the dedicated post-processing lane sits on, and so the only card a waiting chain competes with."""
+
+_CHAIN_TICKS = 8
+"""How long each chain sits pending before the lane takes it, so a real backlog stands against that card."""
+
+_CHAIN_POOL_MODELS = (_SD15, _SD15_OTHER, _SDXL, _SDXL_OTHER)
+"""One resident class per card, seeded on that card's first lane, so every card can serve queued work."""
+
+_CHAIN_COLD_MODEL = _FLUX
+"""The class resident nowhere, so the queue always opens with a head no card can seat yet."""
+
+_CHAIN_PENDING_PER_CLASS = 2
+_CHAIN_SHAPE = (1024, 1024)
+_CHAIN_STEPS = 100
+_CHAIN_TICK_SECONDS = 0.5
+_CHAIN_TICKS_DRIVEN = 60
+_CHAIN_DUTY_FLOOR = 0.20
+"""Fraction of its own slot-time each card away from the lane must spend sampling.
+
+Each such card serves one class off weights it already holds and is never the lane's card, so nothing in the
+run is a reason for it to idle. A pool that reaches full concurrency once and then serializes fails this."""
+
+
+def _chain_world(*, preload_ends_dispatch: bool = False) -> _DispatchWorld:
+    """Four cards, two lanes each, one sampling slot per card, and a backlogged lane on card 1."""
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=8,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        service_contexts=True,
+        tick_seconds=_CHAIN_TICK_SECONDS,
+        card_max_pixels=dict.fromkeys(range(4), 4_194_304),
+        post_process_card_index=_CHAIN_CARD,
+        post_processing_chain_ticks=_CHAIN_TICKS,
+        preload_ends_dispatch=preload_ends_dispatch,
+    )
+    for lane_id, model in enumerate(_CHAIN_POOL_MODELS):
+        world.seed_resident(lane_id, model, in_vram=True)
+        assert world.card_of_lane(lane_id) == lane_id, (
+            "precondition: each seeded copy must sit on a card of its own, so every card can serve queued work"
+        )
+    return world
+
+
+async def _drive_chain_traffic(world: _DispatchWorld) -> None:
+    """Keep every class queued, with the cold class at the front and chain work behind the lane's card.
+
+    The cold class is popped first each round, so the head is a job no card holds weights for and the pool has
+    to be filled by seating work from further down the queue. The class seeded on the lane's own card carries
+    post-processing, so the lane accumulates the backlog that owes it a drain window.
+    """
+    width, height = _CHAIN_SHAPE
+    chain_model = _CHAIN_POOL_MODELS[_CHAIN_CARD]
+    for _ in range(_CHAIN_TICKS_DRIVEN):
+        for model in (_CHAIN_COLD_MODEL, *_CHAIN_POOL_MODELS):
+            post_processing = ["RealESRGAN_x4plus"] if model is chain_model else None
+            while (
+                sum(1 for job in world.job_tracker.jobs_pending_inference if job.model == model.name)
+                < _CHAIN_PENDING_PER_CLASS
+            ):
+                await world.pop(
+                    make_job_pop_response(
+                        model.name,
+                        width=width,
+                        height=height,
+                        ddim_steps=_CHAIN_STEPS,
+                        post_processing=post_processing,
+                    ),
+                )
+        await world.step()
+
+
+def _assert_the_cards_away_from_the_lane_kept_serving(world: _DispatchWorld, *, context: str) -> None:
+    """Assert every card the chain does not sit on earned its own duty."""
+    for device_index in sorted(world.min_card_free_mb):
+        if device_index == _CHAIN_CARD:
+            continue
+        assert_duty_floor_on_card(world, device_index, _CHAIN_DUTY_FLOOR, context=context)
+
+
+async def test_t_a_staged_model_does_not_stop_the_cards_that_were_ready_to_sample() -> None:
+    """Three cards keep sampling through a run of model changes, while the fourth owes its lane a backlog.
+
+    The failure this encodes: a sent preload ended the whole scheduling cycle. A preload stages one model
+    onto one slot of one card, and every other lane in the pool is idle while it does, so on each model
+    change the fleet's ready lanes sat out a control-loop tick for a load that concerned none of them. The
+    queue here keeps a class resident nowhere at its front, so the pool is loading throughout.
+
+    The row runs with the post-processing lane on card 1 carrying a real backlog, so the pending-chain hold
+    is live for the whole run. That hold is one card's, so the verdict is made of the cards it does not sit
+    on, and the backlog it is owed is still expected to drain: a hold that gives a lane its window must not
+    become a wedge.
+    """
+    world = _chain_world()
+
+    await _drive_chain_traffic(world)
+
+    _assert_the_cards_away_from_the_lane_kept_serving(world, context="backlogged lane")
+    assert not world.job_tracker.jobs_pending_post_processing, (
+        f"backlogged lane: chains were still pending at the end of the run, so the hold that gives the lane "
+        f"its window never let it drain. {world.state_dump()}"
+    )
+
+
+async def test_t_defect_reinjection_a_preload_that_ends_the_cycle_starves_the_pool() -> None:
+    """With a sent preload ending the tick again, the cards away from the lane fall under their duty floor.
+
+    Reinjected at the cycle shape alone: every gate, hold and routing rule is production's, and the only
+    thing taken away is that dispatch runs whether or not a model was staged.
+    """
+    world = _chain_world(preload_ends_dispatch=True)
+
+    await _drive_chain_traffic(world)
+
+    with pytest.raises(AssertionError, match="under the"):
+        _assert_the_cards_away_from_the_lane_kept_serving(world, context="preload-bound cycle")

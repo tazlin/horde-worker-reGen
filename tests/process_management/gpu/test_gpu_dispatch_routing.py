@@ -29,6 +29,10 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     duplicate_copy_may_serve,
     select_preload_target,
 )
+from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
+    _AFFINITY_MAX_SKIPS,
+    record_affinity_skip,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -934,3 +938,348 @@ class TestCrossCardDispatch:
 
         assert scheduler._multi_gpu_routing_active is False
         assert await scheduler.get_next_job_and_process() is None
+
+
+class TestColdHeadWithALoadInFlight:
+    """A cold head whose load is already staging keeps the capacity on that card and no more.
+
+    Reached once the head has spent its resident-bypass window: past that the bypass loop yields (so the
+    head's own load can run) and cross-card seating is what still fills the rest of the pool. A cycle
+    preloads *and* dispatches, so the head's in-flight load and a cross-card seat now happen together.
+    """
+
+    def _spend_the_bypass_window(self, scheduler: InferenceScheduler, head: ImageGenerateJobPopResponse) -> None:
+        """Age the head past its resident-bypass skip ceiling, as a queue of resident work does."""
+        head_id = str(head.id_)
+        for _skip in range(_AFFINITY_MAX_SKIPS):
+            scheduler._affinity_skip_state = record_affinity_skip(
+                scheduler._affinity_skip_state,
+                head_id,
+                scheduler._clock(),
+            )
+
+    async def test_cross_card_seating_spares_the_loading_cards_other_lane(self) -> None:
+        """Cards with no copy of the head's model take queued work; the loading card's spare lane does not.
+
+        Card 0 is staging the head's model and has a second idle lane holding another queued model: seating
+        that would put card 0 at its cap just as the head's weights land.
+        """
+        loading_lane = _lane(0, device_index=0, model=None)
+        loading_lane.last_process_state = HordeProcessState.PRELOADING_MODEL
+        process_map = ProcessMap(
+            {
+                0: loading_lane,
+                1: _lane(1, device_index=0, model="model_b"),
+                2: _lane(2, device_index=1, model="model_c"),
+                3: _lane(3, device_index=2, model="model_d"),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(3), max_threads=1)
+        scheduler._horde_model_map.update_entry(
+            horde_model_name="model_a",
+            load_state=ModelLoadState.LOADING,
+            process_id=0,
+        )
+        cold_head, card_zero_candidate, *_followers = await _queue(
+            scheduler,
+            "model_a",
+            "model_b",
+            "model_c",
+            "model_d",
+        )
+        self._spend_the_bypass_window(scheduler, cold_head)
+
+        seated = await _drain_one_cycle(scheduler)
+
+        assert [card for _job, card in seated] == [1, 2]
+        assert card_zero_candidate in scheduler._job_tracker.jobs_pending_inference
+        assert cold_head in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_a_load_on_another_card_does_not_exclude_it(self) -> None:
+        """Only the card carrying the head's own load is spared; a load for someone else withholds nothing."""
+        loading_lane = _lane(0, device_index=0, model=None)
+        loading_lane.last_process_state = HordeProcessState.PRELOADING_MODEL
+        process_map = ProcessMap(
+            {
+                0: loading_lane,
+                1: _lane(1, device_index=0, model="model_b"),
+                2: _lane(2, device_index=1, model="model_c"),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2), max_threads=1)
+        # The load in flight is for model_e, which no queued job here is the head for.
+        scheduler._horde_model_map.update_entry(
+            horde_model_name="model_e",
+            load_state=ModelLoadState.LOADING,
+            process_id=0,
+        )
+        cold_head, card_zero_candidate, other_card_candidate = await _queue(
+            scheduler,
+            "model_a",
+            "model_b",
+            "model_c",
+        )
+        self._spend_the_bypass_window(scheduler, cold_head)
+
+        selection = await scheduler.get_next_job_and_process()
+
+        assert selection is not None
+        assert selection.line_skip is not None and selection.line_skip.reason == "cross_card"
+        assert selection.next_job is card_zero_candidate
+        assert selection.process_with_model.device_index == 0
+        assert other_card_candidate in scheduler._job_tracker.jobs_pending_inference
+
+
+class TestHeadPriorityBarrierScope:
+    """The head-priority barrier drains the card the barred head's load is aimed at, not the whole fleet."""
+
+    async def test_another_cards_resident_work_still_dispatches(self) -> None:
+        """The barred head waits on card 0; card 1's queued job runs, since card 1 never has to drain for it."""
+        head_lane = _lane(0, device_index=0, model="model_a")
+        process_map = ProcessMap({0: head_lane, 1: _lane(1, device_index=1, model="model_b")})
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2), max_threads=1)
+        blocking_job, head, other_card_candidate = await _queue(scheduler, "model_a", "model_a", "model_b")
+        await _seat(scheduler, blocking_job, head_lane)
+        scheduler._head_admission.engage_barrier(str(head.id_))
+
+        assert scheduler._barred_head_card_index() == 0
+        assert scheduler._barrier_covers_card(1) is False
+
+        started = await scheduler.start_inference()
+
+        assert started is True
+        assert other_card_candidate in scheduler._job_tracker.jobs_in_progress
+
+    async def test_the_heads_own_card_is_still_withheld(self) -> None:
+        """A second job on the barred head's own card is held: that card draining is the head's remedy."""
+        head_lane = _lane(0, device_index=0, model="model_a")
+        process_map = ProcessMap(
+            {
+                0: head_lane,
+                1: _lane(1, device_index=0, model="model_c"),
+                2: _lane(2, device_index=1, model="model_d"),
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_uniform_cards(2, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        blocking_job, head, same_card_candidate = await _queue(scheduler, "model_a", "model_a", "model_c")
+        await _seat(scheduler, blocking_job, head_lane)
+        scheduler._head_admission.engage_barrier(str(head.id_))
+
+        assert scheduler._barrier_covers_card(0) is True
+
+        started = await scheduler.start_inference()
+
+        assert started is False
+        assert same_card_candidate in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_a_single_card_barrier_withholds_everything(self) -> None:
+        """Single-GPU parity: with one card the barrier holds every dispatch but the head's, as it always has."""
+        head_lane = _lane(0, device_index=0, model="model_a")
+        process_map = ProcessMap({0: head_lane, 1: _lane(1, device_index=0, model="model_c")})
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_uniform_cards(1, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        blocking_job, head, same_card_candidate = await _queue(scheduler, "model_a", "model_a", "model_c")
+        await _seat(scheduler, blocking_job, head_lane)
+        scheduler._head_admission.engage_barrier(str(head.id_))
+
+        assert scheduler._multi_gpu_routing_active is False
+        assert scheduler._barrier_covers_card(0) is True
+
+        assert await scheduler.start_inference() is False
+        assert same_card_candidate in scheduler._job_tracker.jobs_pending_inference
+
+
+class TestDegradedRetryIsolation:
+    """A degraded retry waits for the card it would land on to empty, not for the whole worker."""
+
+    def _mark_degraded(self, scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse) -> None:
+        """Flag ``job`` for the isolated retry the tracker grants after a resource failure."""
+        tracked = scheduler._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        tracked.needs_degraded_dispatch = True
+
+    async def test_it_waits_only_for_its_own_card(self) -> None:
+        """Card 1 is sampling; the retry's own card is empty, so it runs rather than waiting for the fleet."""
+        retry_lane = _lane(0, device_index=0, model="model_a")
+        busy_lane = _lane(1, device_index=1, model="model_b")
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: retry_lane, 1: busy_lane}),
+            card_runtimes=_uniform_cards(2),
+            max_threads=1,
+        )
+        retry_job, other_card_job = await _queue(scheduler, "model_a", "model_b")
+        await _seat(scheduler, other_card_job, busy_lane)
+        self._mark_degraded(scheduler, retry_job)
+
+        started = await scheduler.start_inference()
+
+        assert started is True
+        assert retry_job in scheduler._job_tracker.jobs_in_progress
+
+    async def test_it_still_waits_for_work_on_its_own_card(self) -> None:
+        """A sibling sampling on the retry's own card holds it: that is the VRAM pressure isolation is for."""
+        retry_lane = _lane(0, device_index=0, model="model_a")
+        sibling_lane = _lane(1, device_index=0, model="model_b")
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: retry_lane, 1: sibling_lane, 2: _lane(2, device_index=1, model="model_c")}),
+            card_runtimes=_uniform_cards(2, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        retry_job, sibling_job = await _queue(scheduler, "model_a", "model_b")
+        await _seat(scheduler, sibling_job, sibling_lane)
+        self._mark_degraded(scheduler, retry_job)
+
+        started = await scheduler.start_inference()
+
+        assert started is False
+        assert retry_job in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_one_card_waits_for_the_whole_worker(self) -> None:
+        """Single-GPU parity: with one card the scope is the worker's in-progress count, exactly as before."""
+        retry_lane = _lane(0, device_index=0, model="model_a")
+        sibling_lane = _lane(1, device_index=0, model="model_b")
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: retry_lane, 1: sibling_lane}),
+            card_runtimes=_uniform_cards(1, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        retry_job, sibling_job = await _queue(scheduler, "model_a", "model_b")
+        await _seat(scheduler, sibling_job, sibling_lane)
+        self._mark_degraded(scheduler, retry_job)
+
+        assert scheduler._multi_gpu_routing_active is False
+        assert await scheduler.start_inference() is False
+        assert retry_job in scheduler._job_tracker.jobs_pending_inference
+
+
+class TestHeadPriorityBarrierForAColdHead:
+    """A barred head with no copy anywhere has not chosen a card, so the barrier follows where it may load."""
+
+    async def test_an_idle_eligible_card_means_nothing_is_withheld(self) -> None:
+        """Card 1 is eligible for the head and already free of live work, so the drain is already satisfied.
+
+        The escape the barrier waits for is a card with no live consumer where the head's load will land.
+        One exists, so withholding card 0's resident work would cost duty and bring the admit no closer.
+        """
+        busy_lane = _lane(0, device_index=0, model="model_b")
+        process_map = ProcessMap(
+            {
+                0: busy_lane,
+                1: _lane(1, device_index=0, model="model_c"),
+                2: _lane(2, device_index=1, model=None),
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_uniform_cards(2, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        cold_head, running_job, same_card_candidate = await _queue(scheduler, "model_a", "model_b", "model_c")
+        await _seat(scheduler, running_job, busy_lane)
+        scheduler._head_admission.engage_barrier(str(cold_head.id_))
+
+        assert scheduler._barred_head_card_index() is None
+        assert scheduler._barrier_covers_card(0) is False
+
+        started = await scheduler.start_inference()
+
+        assert started is True
+        assert same_card_candidate in scheduler._job_tracker.jobs_in_progress
+
+    async def _every_eligible_card_busy(self) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse]:
+        """Cards 0 and 1 busy and eligible for a cold barred head, card 2 unable to serve it at all.
+
+        Returns:
+            The scheduler and the candidate resident on card 2.
+        """
+        card_zero_lane = _lane(0, device_index=0, model="model_b")
+        card_one_lane = _lane(1, device_index=1, model="model_c")
+        process_map = ProcessMap(
+            {
+                0: card_zero_lane,
+                1: card_one_lane,
+                2: _lane(2, device_index=2, model="model_e"),
+            },
+        )
+        card_runtimes = _uniform_cards(3, max_concurrent_inference=2)
+        # Card 2 offers only model_e, so the head's model can never be placed there while its own resident
+        # candidate still can be dispatched onto it.
+        card_runtimes[2] = dataclasses.replace(
+            card_runtimes[2],
+            config=_card_config(models=["model_e"], max_pixels=5_000_000),
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=card_runtimes, max_threads=2)
+        cold_head, running_zero, running_one, ineligible_card_candidate = await _queue(
+            scheduler,
+            "model_a",
+            "model_b",
+            "model_c",
+            "model_e",
+        )
+        await _seat(scheduler, running_zero, card_zero_lane)
+        await _seat(scheduler, running_one, card_one_lane)
+        scheduler._head_admission.engage_barrier(str(cold_head.id_))
+        return scheduler, ineligible_card_candidate
+
+    async def test_a_card_that_could_never_host_the_head_keeps_dispatching(self) -> None:
+        """Card 2's config cannot serve the head, so no amount of draining it admits the head; it keeps serving.
+
+        This is the card whose work the fleet-wide answer used to withhold for nothing.
+        """
+        scheduler, ineligible_card_candidate = await self._every_eligible_card_busy()
+
+        assert scheduler._barred_head_card_index() is None
+        assert scheduler._barred_head_eligible_cards() == {0, 1}
+        assert scheduler._barrier_covers_card(2) is False
+
+        started = await scheduler.start_inference()
+
+        assert started is True
+        assert ineligible_card_candidate in scheduler._job_tracker.jobs_in_progress
+
+    async def test_the_eligible_busy_cards_are_the_ones_that_drain(self) -> None:
+        """A job that would land on an eligible card is withheld, so those cards empty for the head's load.
+
+        Both cards can serve the head and both are sampling, so its load has nowhere to go until one frees.
+        Card 0's spare lane holds a queued model and is the only thing that could take its second slot.
+        """
+        card_zero_lane = _lane(0, device_index=0, model="model_b")
+        card_one_lane = _lane(1, device_index=1, model="model_c")
+        process_map = ProcessMap(
+            {
+                0: card_zero_lane,
+                1: card_one_lane,
+                2: _lane(2, device_index=0, model="model_d"),
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_uniform_cards(2, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        cold_head, running_zero, running_one, eligible_card_candidate = await _queue(
+            scheduler,
+            "model_a",
+            "model_b",
+            "model_c",
+            "model_d",
+        )
+        await _seat(scheduler, running_zero, card_zero_lane)
+        await _seat(scheduler, running_one, card_one_lane)
+        scheduler._head_admission.engage_barrier(str(cold_head.id_))
+
+        assert scheduler._barred_head_card_index() is None
+        assert scheduler._barrier_covers_card(0) is True
+        assert scheduler._barrier_covers_card(1) is True
+
+        started = await scheduler.start_inference()
+
+        assert started is False
+        assert eligible_card_candidate in scheduler._job_tracker.jobs_pending_inference

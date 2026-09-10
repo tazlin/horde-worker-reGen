@@ -332,6 +332,15 @@ class SchedulingSnapshot:
     """Models that have completed at least one job on this worker, the trust gate for measured footprints."""
     whole_card_held_models: frozenset[str]
     """Models holding a whole-card residency somewhere, which pressure eviction never takes."""
+    post_processing_lane_card_index: int | None
+    """The card the idle post-processing lane sits on, or None when no lane is free to take a chain.
+
+    The card ``pending_post_processing_reserve_mb`` was measured for, so the two are read as a pair: a lane
+    is a card's tenant, and a chain waiting for it competes for that card's VRAM and no other's."""
+    pending_post_processing_reserve_mb: float
+    """The smallest known pending post-processing chain peak (MB), or 0.0 when nothing is pending or no
+    estimate is known. Unknown estimates read as nothing pending: every memory gate here restricts only on
+    evidence."""
     ledgers: LedgerViews
     services: PricingServices
 
@@ -488,6 +497,8 @@ def build_scheduling_snapshot(
     shutting_down: bool,
     recent_job_ttl: float | None,
     models_with_results: frozenset[str],
+    post_processing_lane_card_index: int | None,
+    pending_post_processing_reserve_mb: float,
     ledgers: LedgerViews,
 ) -> SchedulingSnapshot:
     """Freeze the worker for one cycle.
@@ -639,6 +650,8 @@ def build_scheduling_snapshot(
         whole_card_held_models=frozenset(
             state.model for _, state in whole_card_ledger.held() if state.model is not None
         ),
+        post_processing_lane_card_index=post_processing_lane_card_index,
+        pending_post_processing_reserve_mb=pending_post_processing_reserve_mb,
         ledgers=ledgers,
         services=PricingServices(
             model_metadata=model_metadata,

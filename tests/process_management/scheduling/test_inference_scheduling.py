@@ -3011,3 +3011,263 @@ class TestPerCardContextOverhead:
         # And a caller with no card in hand keeps the same worker-wide reduction it always had.
         assert scheduler._per_process_overhead_mb() == pytest.approx(self._BIG_CARD_OVERHEAD_MB)
         assert scheduler._marginal_process_overhead_mb() == pytest.approx(500.0)
+
+
+# ----------------------------------------------------------------------------------------------------------
+# The preload pass across cards: one card's stop is not every card's stop
+# ----------------------------------------------------------------------------------------------------------
+
+
+def _serving_card_config(models: list[str]) -> Mock:
+    """A per-card effective config that can serve ``models`` at any ordinary resolution."""
+    config = make_mock_bridge_data(image_models_to_load=models)
+    config.max_pixels = 5_000_000
+    config.nsfw = True
+    return config
+
+
+def _cards_serving(*model_lists: list[str]) -> dict[int, CardRuntime]:
+    """One card per entry, card N serving exactly ``model_lists[N]``."""
+    cards: dict[int, CardRuntime] = {}
+    for device_index, models in enumerate(model_lists):
+        cards.update(
+            make_test_card_runtimes(
+                device_indices=(device_index,),
+                config=_serving_card_config(models),
+                max_concurrent_inference=1,
+                target_process_count=2,
+            ),
+        )
+    return cards
+
+
+async def _queue_pending_chain(job_tracker: JobTracker) -> None:
+    """Put one finished job in the post-processing queue, so a chain is owed the lane's next drain window."""
+    chain_job = make_job_pop_response("stable_diffusion", post_processing=["RealESRGAN_x4plus"])
+    await job_tracker.queue_for_post_processing(
+        HordeJobInfo(
+            sdk_api_job_info=chain_job,
+            job_image_results=[HordeImageResult(image_bytes=b"raw-image")],
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=time.time(),
+        ),
+    )
+
+
+def _preloaded_processes(process_map: ProcessMap) -> list[int]:
+    """The slots that were sent a preload, in process-id order."""
+    return sorted(
+        process_id
+        for process_id, process_info in process_map.items()
+        if process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+    )
+
+
+class TestPendingPostProcessingHoldIsPerCard:
+    """A chain waiting for the post-processing lane holds loads onto the lane's card and no others."""
+
+    async def _scheduler(self, *, lane_card: int, monkeypatch: pytest.MonkeyPatch) -> InferenceScheduler:
+        """Two cards, one free lane on card 1, a post-processing lane on ``lane_card`` with a chain pending.
+
+        Card 0's lane is busy, so card 1's free lane is the only place a load can go: whether the pass sends
+        one is then a statement about the hold alone.
+        """
+        monkeypatch.setattr(_sched_mod, "predict_job_post_processing_vram_mb", lambda _job, _baseline: 4000.0)
+        busy_lane = make_mock_process_info(0, model_name="resident_model", state=HordeProcessState.INFERENCE_STARTING)
+        free_lane = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        free_lane.device_index = 1
+        post_process_lane = make_mock_process_info(
+            7,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+            device_index=lane_card,
+        )
+        job_tracker = JobTracker()
+        await _queue_pending_chain(job_tracker)
+        await track_popped_job_async(job_tracker, make_job_pop_response("cold_model"))
+        return _make_inference_scheduler(
+            process_map=ProcessMap({0: busy_lane, 1: free_lane, 7: post_process_lane}),
+            job_tracker=job_tracker,
+            card_runtimes=_cards_serving(["resident_model", "cold_model"], ["resident_model", "cold_model"]),
+            max_inference=2,
+        )
+
+    async def test_the_lanes_own_card_is_held(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the lane on card 1, the free lane there takes no load until the chain has had its window."""
+        scheduler = await self._scheduler(lane_card=1, monkeypatch=monkeypatch)
+
+        sent = scheduler.preload_models()
+
+        assert sent is False
+        assert _preloaded_processes(scheduler._process_map) == []
+
+    async def test_another_cards_load_proceeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the lane on card 0, the same load onto card 1 is sent: the chain competes for its own card."""
+        scheduler = await self._scheduler(lane_card=0, monkeypatch=monkeypatch)
+
+        sent = scheduler.preload_models()
+
+        assert sent is True
+        assert _preloaded_processes(scheduler._process_map) == [1]
+
+
+class TestPreloadPassContinuesPastACardScopedStop:
+    """One card's gate stops that card's loads; jobs that would load elsewhere are still considered."""
+
+    async def _two_card_scheduler(self) -> InferenceScheduler:
+        """Card 0 serves model_a only and card 1 model_b only, each with one empty idle lane."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("model_a"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("model_b"))
+        card_zero_lane = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        card_one_lane = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        card_one_lane.device_index = 1
+        return _make_inference_scheduler(
+            process_map=ProcessMap({0: card_zero_lane, 1: card_one_lane}),
+            job_tracker=job_tracker,
+            card_runtimes=_cards_serving(["model_a"], ["model_b"]),
+            max_inference=2,
+        )
+
+    async def test_a_growth_hold_on_one_card_leaves_the_other_cards_load_alone(self) -> None:
+        """The head's load is held by card 0's paging-cliff hold; the next job still loads onto card 1."""
+        scheduler = await self._two_card_scheduler()
+        scheduler.set_vram_growth_hold(0, True)
+
+        sent = scheduler.preload_models()
+
+        assert sent is True
+        assert _preloaded_processes(scheduler._process_map) == [1]
+
+    async def test_without_the_hold_the_head_is_the_one_that_loads(self) -> None:
+        """The control: with card 0 free the head takes the cycle's one preload and the pass stops there."""
+        scheduler = await self._two_card_scheduler()
+
+        sent = scheduler.preload_models()
+
+        assert sent is True
+        assert _preloaded_processes(scheduler._process_map) == [0]
+
+    async def test_a_head_with_nowhere_to_load_stops_every_card(self) -> None:
+        """The head's own escalation is worker-wide: no later job takes a slot the head may still be given.
+
+        Card 0's only lane is busy, so the head's model has no target and the head-room fallback has nothing
+        to free. Card 1 has a free lane and a queued job it could serve, and neither is used this cycle.
+        """
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("model_a"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("model_b"))
+        busy_lane = make_mock_process_info(0, model_name="model_a", state=HordeProcessState.INFERENCE_STARTING)
+        card_one_lane = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        card_one_lane.device_index = 1
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: busy_lane, 1: card_one_lane}),
+            job_tracker=job_tracker,
+            card_runtimes=_cards_serving(["model_a"], ["model_b"]),
+            max_inference=2,
+        )
+
+        sent = scheduler.preload_models()
+
+        assert sent is False
+        assert _preloaded_processes(scheduler._process_map) == []
+
+    async def test_one_card_still_stops_at_its_first_stop(self) -> None:
+        """Single-GPU parity: with one card there is nowhere to continue to, so the pass exits where it did."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("model_a"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("model_b"))
+        lane = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: lane}),
+            job_tracker=job_tracker,
+            card_runtimes=_cards_serving(["model_a", "model_b"]),
+            max_inference=1,
+        )
+        assert scheduler._multi_gpu_routing_active is False
+        scheduler.set_vram_growth_hold(0, True)
+
+        sent = scheduler.preload_models()
+
+        assert sent is False
+        assert _preloaded_processes(scheduler._process_map) == []
+
+
+def _control_flags_sent_to(process_info: HordeProcessInfo) -> list[HordeControlFlag]:
+    """Every control flag a slot was sent, in order.
+
+    Read instead of the slot's last flag wherever a cycle both stages and dispatches: the dispatch's own flag
+    overwrites the preload's, so the last flag alone cannot say whether the preload went out.
+    """
+    send: Mock = process_info.pipe_connection.send  # type: ignore[assignment]
+    return [call.args[0].control_flag for call in send.call_args_list]
+
+
+class TestACycleBothPreloadsAndDispatches:
+    """A sent preload no longer ends the scheduling cycle: the lanes that are ready still get their work."""
+
+    async def _scheduler(self, *, lane_count: int, max_concurrent: int) -> InferenceScheduler:
+        """One card with ``lane_count`` lanes: lane 0 idle holding resident_model, the rest empty and idle."""
+        processes = {
+            0: make_mock_process_info(0, model_name="resident_model", state=HordeProcessState.WAITING_FOR_JOB)
+        }
+        for process_id in range(1, lane_count):
+            processes[process_id] = make_mock_process_info(
+                process_id,
+                model_name=None,
+                state=HordeProcessState.WAITING_FOR_JOB,
+            )
+        job_tracker = JobTracker()
+        # The cold model is queued first, so it is the head and the cycle has a preload to send; the resident
+        # job behind it is what the dispatch half of the cycle can seat.
+        await track_popped_job_async(job_tracker, make_job_pop_response("cold_model"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("resident_model"))
+        return _make_inference_scheduler(
+            process_map=ProcessMap(processes),
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(image_models_to_load=["resident_model", "cold_model"]),
+            max_concurrent=max_concurrent,
+            max_inference=lane_count,
+        )
+
+    async def test_a_preload_and_a_dispatch_land_in_the_same_cycle(self) -> None:
+        """With a free sampling slot, the cycle stages the cold head and seats the resident job behind it."""
+        scheduler = await self._scheduler(lane_count=2, max_concurrent=2)
+
+        await scheduler.run_scheduling_cycle({})
+
+        assert HordeControlFlag.PRELOAD_MODEL in _control_flags_sent_to(scheduler._process_map[1])
+        assert "resident_model" in {job.model for job in scheduler._job_tracker.jobs_in_progress}
+
+    async def test_nothing_dispatches_when_the_cap_is_spent_not_because_a_preload_went_out(self) -> None:
+        """At a cap of one the cycle still stages the cold head, and the seat is refused by the cap alone."""
+        scheduler = await self._scheduler(lane_count=2, max_concurrent=1)
+        resident_lane = scheduler._process_map[0]
+        blocking_job = make_job_pop_response("resident_model")
+        await track_popped_job_async(scheduler._job_tracker, blocking_job)
+        resident_lane.record_inference_ownership(blocking_job, attempt_ordinal=0)
+        resident_lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+        await scheduler._job_tracker.mark_inference_started(blocking_job, device_index=0)
+
+        await scheduler.run_scheduling_cycle({})
+
+        assert _preloaded_processes(scheduler._process_map) == [1]
+        assert [job.model for job in scheduler._job_tracker.jobs_in_progress] == ["resident_model"]
+        assert len(scheduler._job_tracker.jobs_in_progress) == 1
+
+    async def test_the_look_ahead_agrees_with_the_dispatch_after_a_preload(self) -> None:
+        """The cycle's peek and its dispatch name the same job, with a preload sent between them."""
+        scheduler = await self._scheduler(lane_count=2, max_concurrent=2)
+
+        scheduler.begin_scheduling_cycle()
+        assert scheduler.preload_models() is True
+        peeked = await scheduler.get_next_job_and_process(information_only=True)
+        before = {str(job.id_) for job in scheduler._job_tracker.jobs_in_progress}
+        started = await scheduler.start_inference()
+        newly_started = [job for job in scheduler._job_tracker.jobs_in_progress if str(job.id_) not in before]
+
+        assert peeked is not None
+        assert started is True
+        assert [str(job.id_) for job in newly_started] == [str(peeked.next_job.id_)]

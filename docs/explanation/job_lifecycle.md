@@ -154,12 +154,19 @@ shaping affects synthetic intake too. See [Architecture → Dry-run mode](archit
 `run_scheduling_cycle` when there are pending jobs and a free process or preloaded model. (Resource
 governance is driven separately, every control-loop iteration via `run_governance_tick`, so it does not
 depend on this queue-gated cycle running; see
-[Resource governance](resource_governance.md#the-governor-tick).) One cycle:
+[Resource governance](resource_governance.md#the-governor-tick).) Both the preload and the dispatch stage run
+every cycle: a preload stages one model onto one slot, and the lanes already holding resident weights (on a
+multi-GPU host, mostly on other cards entirely) are dispatched in the same cycle rather than waiting a
+control-loop tick for it. One preload per cycle remains the ceiling. One cycle:
 
 1. **`preload_models()`**: for the first pending job whose model is not already loading or resident, pick an
    available inference process, send `PRELOAD_MODEL`, and mark the model `LOADING` in `HordeModelMap`. On a
    multi-GPU host the target card is chosen by model stickiness, per-card inference load, and measured free
-   VRAM. The preload is subject to the [VRAM and RAM budget](performance_and_backpressure.md#the-vram-and-ram-budget);
+   VRAM, and a gate that stops the pass for one card's reason (its growth hold, an exclusive job on it, its
+   load-serialization gate, a post-processing chain owed its drain window there) leaves the pass free to
+   continue over jobs that would load onto another card; a stop about the host or about the head's own
+   escalation still stops everything. The preload is subject to the
+   [VRAM and RAM budget](performance_and_backpressure.md#the-vram-and-ram-budget);
    concurrent-preload limits differ under `very_fast_disk_mode`. The process records this association as
    preload intent, not execution ownership: a replacement during preparation cannot spend an inference retry
    for work that was never dispatched.

@@ -65,6 +65,10 @@ class AdmissionDecision(StrEnum):
     the WDDM paging cliff. Deferred until the card recovers (foreign pressure eases, or reclaim frees room)."""
     EXCLUSIVE_IN_PROGRESS = auto()
     """An exclusive over-budget job is in progress and suppresses unrelated staging."""
+    DEFER_POST_PROCESSING = auto()
+    """A pending post-processing chain is owed the next drain window on the target card, so a load onto that
+    card waits: starting one there would keep the card never-idle and the lane would never get its turn.
+    Cards the lane does not sit on are untouched."""
     NO_TARGET = auto()
     """No suitable inference slot is available for this preload."""
     REPLACE_PROCESS = auto()

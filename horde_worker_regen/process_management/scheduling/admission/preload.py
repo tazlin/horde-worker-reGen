@@ -78,6 +78,60 @@ def pass_control_for(decision: AdmissionDecision) -> PreloadPassControl:
             return PreloadPassControl.STOP_PASS
 
 
+_WORKER_WIDE_STOPS = frozenset(
+    {
+        AdmissionDecision.DEFER_RAM_PRESSURE,
+        AdmissionDecision.STOP_PASS,
+    },
+)
+"""The stops that describe the host rather than one card, so no card can proceed past them."""
+
+_HEAD_ESCALATION_STOPS = frozenset(
+    {
+        AdmissionDecision.NO_TARGET,
+        AdmissionDecision.DEFER_BUDGET,
+    },
+)
+"""The two stops that mean the head's own escalation is running: the head-room fallback found no slot to
+free, or its reclaim ladder is working through the card on its behalf. Both spend pool-wide resources for
+the head, so a later job's load must not race them."""
+
+
+def stop_is_card_scoped(decision: AdmissionDecision, *, is_head_blocker: bool) -> bool:
+    """Whether a stopping decision belongs to one card, so the pass may continue over jobs targeting others.
+
+    A card is its own memory and load-serialization domain. Most stops are a statement about the card the
+    preload would have landed on, and on a multi-card worker a job that would load elsewhere is unaffected by
+    them; the remainder are about the host, or about an escalation being run for the head, and stop
+    everything. One preload per cycle remains the ceiling either way: a continued pass is looking for the one
+    job that can still be staged.
+
+    | Decision               | Scope       | Why                                                            |
+    | ---------------------- | ----------- | -------------------------------------------------------------- |
+    | DEFER_RAM_PRESSURE     | worker-wide | The host RAM danger floor: every load routes through host RAM   |
+    | STOP_PASS              | worker-wide | A preload send failed; the pool's state is no longer trusted    |
+    | NO_TARGET, head        | worker-wide | The head-room fallback is spent: every slot left is one the head needs |
+    | DEFER_BUDGET, head     | worker-wide | Its reclaim ladder is evicting for the head; a later load spends that |
+    | DEFER_VRAM_GROWTH_HOLD | card        | The target card sits near its paging cliff                      |
+    | EXCLUSIVE_IN_PROGRESS  | card        | An exclusive job holds the target card to itself                |
+    | DEFER_POST_PROCESSING  | card        | The post-processing lane's card is owed a drain window          |
+    | DEFER_CONCURRENCY      | card        | Loads are serialized per device, not worker-wide                |
+    | REPLACE_PROCESS        | card        | One slot on one card is being cycled for its model change       |
+    | NO_TARGET, later job   | card        | This job found no slot it may use; it withholds no other card   |
+    | DEFER_BUDGET, later job| card        | Priced against the target card's own measured free and reserve  |
+
+    A card-scoped stop for the head is still card-scoped: the head is waiting for that one card, and a load
+    onto a card it is not waiting for takes nothing from it.
+
+    Args:
+        decision: The recorded decision for the job whose plan stopped the pass.
+        is_head_blocker: Whether that job is the queue head, whose escalations outrank later jobs' loads.
+    """
+    if is_head_blocker and decision in _HEAD_ESCALATION_STOPS:
+        return False
+    return decision not in _WORKER_WIDE_STOPS
+
+
 @dataclass(frozen=True)
 class PreloadGatePlan:
     """One pending job's answer from the gate ladder.
@@ -108,6 +162,23 @@ class PreloadGatePlan:
     def pass_control(self) -> PreloadPassControl:
         """What the pass does after this plan, before any budget step."""
         return pass_control_for(self.decision)
+
+
+@dataclass(frozen=True)
+class PreloadPassStep:
+    """One executed gate plan: what the pass does next, on which card it happened, and whose plan it was."""
+
+    control: PreloadPassControl
+    decision: AdmissionDecision
+    """The final decision, which a budget step or a failed send can move away from the plan's own."""
+    device_index: int | None
+    """The card the preload would have landed on, or None when no target was named (or one card is driven)."""
+    is_head_blocker: bool
+
+    @property
+    def stops_every_card(self) -> bool:
+        """Whether this stop is about the host or the queue, so no other card may be tried this cycle."""
+        return not stop_is_card_scoped(self.decision, is_head_blocker=self.is_head_blocker)
 
 
 def loaded_or_loading_models(snapshot: SchedulingSnapshot) -> frozenset[str | None]:
@@ -402,8 +473,9 @@ def decide_preload_gates(
     The gates, in order: aux preparation (yields to a sibling able to sample), unserviceable (faults),
     quarantine (faults), already resident for this job's routing, the absolute RAM danger floor, target
     selection over the disallowed set with the head-room fallback, the exclusive-job hold on the target's
-    card, the aux-gated occupied-slot refusal, the growth hold, cycle-on-model-change (replaces the child), and
-    the per-card load serialization gate. An admitting plan names the target; the budget step follows.
+    card, the pending post-processing hold on the lane's card, the aux-gated occupied-slot refusal, the growth
+    hold, cycle-on-model-change (replaces the child), and the per-card load serialization gate. An admitting
+    plan names the target; the budget step follows.
 
     Args:
         snapshot: The cycle's snapshot.
@@ -499,6 +571,21 @@ def decide_preload_gates(
         return plan(
             AdmissionDecision.EXCLUSIVE_IN_PROGRESS,
             "exclusive over-budget job in progress on target card",
+            target=target,
+        )
+
+    # A pending post-processing chain is owed the next drain window on the lane's own card: a load started
+    # there keeps the card never-idle and the chain never gets its turn. The lane is one card's tenant, so
+    # this holds that card's loads and no other's, matching the dispatch-side overlap hold. On a single-GPU
+    # host the pass has already exited before reaching any job, so this is inert there by construction.
+    if (
+        snapshot.pending_post_processing_reserve_mb > 0.0
+        and snapshot.post_processing_lane_card_index is not None
+        and slot.device_index == snapshot.post_processing_lane_card_index
+    ):
+        return plan(
+            AdmissionDecision.DEFER_POST_PROCESSING,
+            "pending post-processing is owed the next drain window on the target card",
             target=target,
         )
 

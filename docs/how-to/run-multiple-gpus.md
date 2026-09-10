@@ -79,6 +79,16 @@ card, so the worker places it on a card that permits it (the one with the most m
 off-GPU when no card does. Turn it off for a card you want kept clear of safety's CUDA context; on a
 single-GPU worker with no override it means exactly what the global flag has always meant.
 
+The auxiliary lanes (post-processing, and the image-utilities lane when it is enabled) are one process each
+for the whole worker, not one per card. Each is placed at its first spawn onto the card best able to host
+it: safety's card is skipped when safety is on a GPU and another card is available, and among the rest the
+worker prefers a card that is not already carrying another auxiliary lane, then the one with the most
+measured free VRAM. That placement is then pinned. Stopping a lane to free VRAM (whole-card residency, or
+the reclaim ladder relieving a saturated card) and restarting it does not re-shop the cards: the lane comes
+back on the card it held, so a temporary pause cannot land it on top of a card already hosting safety or a
+large model. Only removing that card from `gpu_device_indices` re-places the lane. If safety later moves
+onto a card an auxiliary lane holds, the bridge log says so once; nothing moves automatically.
+
 When cards advertise different models, features, policy, resolution ceilings, or batch ceilings, the worker
 rotates complete card-scoped offers. This preserves the relationship between those fields; separately unioning them could ask
 for a model from one card with a feature or size supported only by another. `gpu_pop_balance_threshold`
@@ -107,7 +117,20 @@ Dispatch selection follows the same rule. The head of the queue can only be seat
 it, so a head whose card is at its own `max_threads`, whose resident lane is busy, or whose model is not
 loaded anywhere yet is a fact about **one** card. The scheduler carries on down the queue and seats the
 first job another card can run immediately; the head keeps its queue position and its claim on the card it
-is waiting for. The card the head waits on is left alone, so nothing takes the capacity it is queued for.
+is waiting for. The card the head waits on is left alone, so nothing takes the capacity it is queued for,
+and where the head is cold with a load already in flight, the card carrying that load is left alone too.
+
+Four more worker-wide behaviours are per card for the same reason:
+
+- A scheduling cycle **preloads and dispatches**. Staging a model onto one slot of one card no longer costs
+  every other card a control-loop tick; one preload per cycle is still the ceiling.
+- The **pending post-processing hold** applies to the post-processing lane's own card. A load or a dispatch
+  aimed at another card proceeds while the lane waits for its drain window.
+- The **preload pass** continues past a stop that names a card (its growth hold, an exclusive job on it, its
+  load-serialization gate, the post-processing hold) and considers jobs that would load elsewhere. A stop
+  about the host (the RAM danger floor) or about the head's own escalation still stops everything.
+- The **head-priority barrier** withholds dispatch only onto the card the starved head's load is aimed at,
+  and a **degraded retry** waits for its own card to empty rather than for the whole worker.
 
 At startup the worker logs how the per-card figures compose ("Driving N cards, each with its own inference
 process pool …" and the megapixelstep budget line), so the effective worker-wide appetite is always stated
