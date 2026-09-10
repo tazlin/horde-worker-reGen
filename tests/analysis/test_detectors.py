@@ -118,13 +118,17 @@ def _maintenance_pop(ts: str, *, reason: str = "dropping too many jobs") -> str:
     )
 
 
-def _force_admit(ts: str, *, starved_seconds: int, free_vram_mb: int, model: str = "AlbedoBase XL (SDXL)") -> str:
-    """The head-of-queue starvation force-admit warning (budget deferred a job on an idle, free device)."""
+def _starvation_diagnostic(
+    ts: str, *, starved_seconds: int, free_vram_mb: int, model: str = "AlbedoBase XL (SDXL)"
+) -> str:
+    """The VRAM arbiter's head-of-queue starvation diagnostic, verbatim from a live worker log."""
+    available = free_vram_mb - 819
     return (
-        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.scheduling.inference_scheduler:_log_head_starvation_force_admit:1348 - "
-        f"Head-of-queue {model} was budget-deferred on an idle device for {starved_seconds}s (reclamation "
-        "exhausted); force-admitting it best-effort to break the wedge before the recovery supervisor "
-        f"soft-resets the pools and faults the backlog. slots=[#1:-[WAITING_FOR_JOB]] device_free_vram={free_vram_mb}MB"
+        f"2026-06-25 {ts} | WARNING  | "
+        "horde_worker_regen.process_management.resources.vram_arbiter:_note_starvation_diagnostic:843 - "
+        f"Head-of-queue {model} deferred {starved_seconds}s >= 60s with no verified progress; it stays queued "
+        "for the structural-wedge recovery supervisor to reroute. Measured: candidate 14573 MB vs available "
+        f"(device-free {free_vram_mb} - reservations 0 - noise 819) = {available} MB: does NOT fit."
     )
 
 
@@ -327,7 +331,7 @@ class TestSchedulerStarvationWedge:
 
     The budget refuses to admit the head-of-queue model on a device with ample free VRAM, so the queue
     deadlocks with idle processes; the recovery supervisor soft-resets the pools and faults the backlog.
-    The detector must separate this self-inflicted wedge from a transient near-miss that force-admit absorbed.
+    The detector must separate this self-inflicted wedge from a transient near-miss that cleared on its own.
     """
 
     def _bridge(self, *lines: str) -> str:
@@ -341,7 +345,7 @@ class TestSchedulerStarvationWedge:
     def test_wedge_with_soft_reset_and_giveup_is_critical(self, tmp_path: Path) -> None:
         """Starvation that escalated to a soft reset and faulted jobs is the critical root-cause finding."""
         bridge = self._bridge(
-            _force_admit("15:18:52.000", starved_seconds=110, free_vram_mb=19179),
+            _starvation_diagnostic("15:18:52.000", starved_seconds=110, free_vram_mb=19179),
             _soft_reset("15:18:43.000"),
             _give_up("15:19:08.000", jobs=4),
         )
@@ -353,9 +357,9 @@ class TestSchedulerStarvationWedge:
         assert "19179" in finding.verdict
         assert "110" in finding.verdict
 
-    def test_transient_force_admit_is_warning(self, tmp_path: Path) -> None:
-        """A lone force-admit that broke the wedge without a soft reset is a near-miss warning, not critical."""
-        bridge = self._bridge(_force_admit("14:21:44.000", starved_seconds=15, free_vram_mb=19829))
+    def test_transient_starvation_is_warning(self, tmp_path: Path) -> None:
+        """A lone starvation diagnostic that cleared without a soft reset is a near-miss warning, not critical."""
+        bridge = self._bridge(_starvation_diagnostic("14:21:44.000", starved_seconds=15, free_vram_mb=19829))
         findings = _diagnose(tmp_path, bridge)
         assert "scheduler_starvation_wedge" in findings
         assert findings["scheduler_starvation_wedge"].severity is Severity.WARNING

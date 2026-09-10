@@ -113,7 +113,8 @@ _DROPPING_JOBS_RE = pattern_for("dropping_jobs_reason")
 _GIVE_UP_RE = pattern_for("give_up")
 # The scheduler starving: the VRAM budget deferred the head-of-queue on an idle device, with the
 # starvation duration and the free VRAM that proves the budget was over-conservative.
-_FORCE_ADMIT_RE = re.compile(r"budget-deferred on an idle device for (\d+)s")
+_HEAD_STARVATION_MODEL_RE = pattern_for("head_starvation_model")
+_HEAD_STARVATION_AVAILABLE_RE = pattern_for("head_starvation_available")
 _DEVICE_FREE_VRAM_RE = re.compile(r"device_free_vram=(\d+)MB")
 # The worker self-pausing pops after three consecutive faults.
 _CONSECUTIVE_PAUSE_RE = pattern_for("consecutive_pause")
@@ -1009,15 +1010,16 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
 
     The budget refused to admit a head-of-queue model on a device with ample free VRAM, so the queue
     deadlocked with idle processes and the recovery supervisor soft-reset the pools and faulted the
-    backlog. A lone force-admit that broke the wedge without escalating is a near-miss (warning); a
-    force-admit that still ended in a soft reset and faulted jobs is the self-inflicted wedge (critical).
+    backlog. A lone starvation diagnostic that cleared without escalating is a near-miss (warning); one
+    that still ended in a soft reset and faulted jobs is the self-inflicted wedge (critical). The starved
+    duration is read straight off the diagnostic's own parked-seconds figure, not derived from timestamps.
     """
-    starved = _matching(context.session.records, _FORCE_ADMIT_RE)
+    starved = _matching(context.session.records, _HEAD_STARVATION_MODEL_RE)
     if not starved:
         return []
 
-    durations = [int(m.group(1)) for r in starved if (m := _FORCE_ADMIT_RE.search(r.message))]
-    free_vrams = [int(m.group(1)) for r in starved if (m := _DEVICE_FREE_VRAM_RE.search(r.message))]
+    durations = [int(m.group("seconds")) for r in starved if (m := _HEAD_STARVATION_MODEL_RE.search(r.message))]
+    free_vrams = [int(m.group("free")) for r in starved if (m := _HEAD_STARVATION_AVAILABLE_RE.search(r.message))]
     max_starved = max(durations) if durations else 0
     free_hint = f" with as much as {max(free_vrams)} MB free VRAM on the device" if free_vrams else ""
 
@@ -1053,7 +1055,7 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
             title_override="Head-of-queue budget starvation (recovered)",
             verdict=(
                 f"The VRAM budget deferred head-of-queue job(s) on an idle device for up to {max_starved}s"
-                f"{free_hint}, but force-admit broke the wedge before it escalated to a soft reset. A near-miss: "
+                f"{free_hint}, but the wedge cleared before it escalated to a soft reset. A near-miss: "
                 "the budget is close to starving the scheduler on this device."
             ),
             remediation_addendum=(
@@ -1065,8 +1067,6 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
     ]
 
 
-_HEAD_STARVATION_MODEL_RE = pattern_for("head_starvation_model")
-_HEAD_STARVATION_AVAILABLE_RE = pattern_for("head_starvation_available")
 _HEAD_STARVATION_IDLE_WINDOW_SECONDS = 120.0
 """Repeated head starvation whose device-idle span reaches this reads as a persistent, not transient, stall."""
 _HEAD_STARVATION_MIN_DIAGNOSTICS = 2

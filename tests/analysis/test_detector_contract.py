@@ -40,7 +40,6 @@ from tests.analysis.test_detectors import (
     _dispatch_stall,
     _empty_model_pop,
     _fault_report,
-    _force_admit,
     _full_queue_frozen,
     _give_up,
     _load_failure_recovery,
@@ -54,6 +53,7 @@ from tests.analysis.test_detectors import (
     _sample_stage_fault,
     _server_slow_abort,
     _soft_reset,
+    _starvation_diagnostic,
     _whole_card_reserve,
 )
 from tests.analysis.test_dispatch_detectors import _multi_card_session, _safety_stage_session
@@ -73,7 +73,6 @@ from tests.analysis.test_job_lifecycle import (
     startup_line,
     status_block,
 )
-from tests.analysis.test_unsatisfiable_head_starvation import _starvation_diagnostic
 
 # --- Golden lines for detectors whose trigger is not already a reusable helper in test_detectors. ---
 # Each mirrors a specific worker emit; the source is named so a reworded log line is traceable here.
@@ -261,7 +260,7 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "detect_scheduler_starvation_wedge": Contract(
         bridge=_bridge(
-            _force_admit("15:18:52.000", starved_seconds=110, free_vram_mb=19179),
+            _starvation_diagnostic("15:18:52.000", starved_seconds=110, free_vram_mb=19179),
             _soft_reset("15:18:43.000"),
             _give_up("15:19:08.000", jobs=4),
         ),

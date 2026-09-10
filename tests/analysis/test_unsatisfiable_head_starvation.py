@@ -12,24 +12,12 @@ from pathlib import Path
 from horde_worker_regen.analysis.bundle import LogBundle
 from horde_worker_regen.analysis.detectors import Severity
 from horde_worker_regen.analysis.watch import WatchState, watch_pass
-from tests.analysis.test_detectors import _consecutive_pause, _diagnose, _give_up
+from tests.analysis.test_detectors import _consecutive_pause, _diagnose, _give_up, _starvation_diagnostic
 
 _STARTUP_LINE = (
     "2026-06-24 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process"
 )
 _MODEL = "AlbedoBase XL (SDXL)"
-
-
-def _starvation_diagnostic(ts: str, *, starved_seconds: int, free_vram_mb: int, model: str = _MODEL) -> str:
-    """The arbiter's head-of-queue starvation diagnostic, verbatim from a live worker log."""
-    available = free_vram_mb - 819
-    return (
-        f"2026-06-25 {ts} | WARNING  | "
-        "horde_worker_regen.process_management.resources.vram_arbiter:_note_starvation_diagnostic:843 - "
-        f"Head-of-queue {model} deferred {starved_seconds}s >= 60s with no verified progress; it stays queued "
-        "for the structural-wedge recovery supervisor to reroute. Measured: candidate 14573 MB vs available "
-        f"(device-free {free_vram_mb} - reservations 0 - noise 819) = {available} MB: does NOT fit."
-    )
 
 
 def _starvation_lines() -> list[str]:

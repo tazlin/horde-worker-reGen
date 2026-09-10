@@ -31,7 +31,6 @@ _ALLOWLISTED_DETECTOR_PATTERNS: dict[str, str] = {
     r"Process \d+ has ([\d.]+) GiB memory in use": "fragment",
     r"Too many open files(?! in system)": "external",
     r"Too many open files: '(?P<path>[^']+)'|open file <(?P<file>[^>]+)> in read-only mode": "external",
-    r"budget-deferred on an idle device for (\d+)s": "superseded",
     r"device_free_vram=(\d+)MB": "fragment",
     (r"GitCommandError|git clone .* failed|Untracked working tree file|unable to checkout working tree"): "external",
     r"untrusted users can only have|maintenance mode|invalid api key|wrong credentials|"
