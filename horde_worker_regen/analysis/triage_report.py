@@ -12,6 +12,7 @@ from pathlib import Path
 from .bundle import RotationStitch
 from .correlate import TimelineEntry
 from .detectors import Finding, Severity
+from .job_lifecycle import JobLifecycleModel, JobRecord
 from .sessions import WorkerSession
 
 
@@ -154,7 +155,7 @@ def finding_to_dict(finding: Finding) -> dict[str, object]:
         "verdict": finding.verdict,
         "remediation": finding.remediation,
         "evidence": finding.evidence,
-        "see_also": finding.see_also,
+        "see_also": finding.see_also.value if finding.see_also is not None else None,
     }
 
 
@@ -179,3 +180,150 @@ def render_findings(session: WorkerSession, findings: list[Finding]) -> str:
         if finding.see_also:
             blocks.append(f"    see also: {finding.see_also}")
     return "\n".join(blocks)
+
+
+def _fmt_seconds(seconds: float | None) -> str:
+    """Format a wait segment in seconds to one decimal, or a placeholder when it is unmeasurable."""
+    return f"{seconds:.1f}" if seconds is not None else "-"
+
+
+def _job_sort_key(job: JobRecord) -> datetime:
+    """Order jobs by pop time, falling back to dispatch for a job whose pop is off the front of the log."""
+    return job.popped_at or job.dispatched_at or datetime.min
+
+
+def job_record_to_dict(job: JobRecord) -> dict[str, object]:
+    """A JSON-serializable per-job lifecycle row."""
+    return {
+        "job_id": job.job_id,
+        "model": job.model,
+        "popped_at": job.popped_at.isoformat() if job.popped_at else None,
+        "dispatched_at": job.dispatched_at.isoformat() if job.dispatched_at else None,
+        "inference_finished_at": (job.inference_finished_at.isoformat() if job.inference_finished_at else None),
+        "submitted_at": job.submitted_at.isoformat() if job.submitted_at else None,
+        "process_id": job.process_id,
+        "device_index": job.device_index,
+        "batch": job.batch,
+        "effective_megapixelsteps": job.effective_megapixelsteps,
+        "pre_inference_seconds": job.pre_inference_seconds,
+        "inference_seconds": job.inference_seconds,
+        "post_inference_seconds": job.post_inference_seconds,
+        "safety_seconds": job.safety_seconds,
+        "faulted": job.faulted,
+        "line_skipped": job.line_skipped,
+    }
+
+
+def job_lifecycle_to_dict(session: WorkerSession, model: JobLifecycleModel) -> dict[str, object]:
+    """A JSON-serializable per-job table plus the session's wait percentiles and concurrency histogram."""
+    profile = model.sampling_concurrency()
+    census = model.status_census()
+    return {
+        "session": session_to_dict(session),
+        "card_count": model.card_count,
+        "intake_budget": model.intake_budget,
+        "jobs": [job_record_to_dict(job) for job in sorted(model.jobs.values(), key=_job_sort_key)],
+        "wait_segments": [
+            {
+                "name": segment.name,
+                "count": segment.count,
+                "median_seconds": segment.median,
+                "p90_seconds": segment.p90,
+            }
+            for segment in model.wait_segments()
+        ],
+        "sampling_concurrency": {
+            "observed_seconds": profile.observed_seconds,
+            "mean_cards_busy": profile.mean_cards_busy,
+            "seconds_by_card_count": {str(count): seconds for count, seconds in profile.seconds_by_card_count.items()},
+        },
+        "status_census": {
+            "snapshots": census.snapshots,
+            "median_pending": census.median_pending,
+            "median_idle_lanes": census.median_idle_lanes,
+            "median_seatable_pending": census.median_seatable_pending,
+            "max_seatable_pending": census.max_seatable_pending,
+            "head_seatable": census.head_states.seatable,
+            "head_resident_but_blocked": census.head_states.resident_but_blocked,
+            "head_cold": census.head_states.cold,
+        },
+        "line_skips": model.line_skip_census(),
+        "model_movement": {
+            "preloads": model.model_movement.preloads,
+            "unloads": model.model_movement.unloads,
+            "cleared_preloads": model.model_movement.cleared_preloads,
+            "displaced_expiries": model.model_movement.displaced_expiries,
+        },
+        "lane_placement": {
+            str(device_index): [
+                {"process_id": placement.process_id, "role": str(placement.role)} for placement in lanes
+            ]
+            for device_index, lanes in model.card_occupancy().items()
+        },
+    }
+
+
+_JOB_TABLE_HEADER = (
+    f"{'job':<9}{'popped':<10}{'model':<28}{'proc':>5}{'card':>6}{'pop->disp':>11}{'generate':>10}{'->submit':>10}"
+)
+
+
+def render_job_lifecycle(session: WorkerSession, model: JobLifecycleModel, *, limit: int | None = None) -> str:
+    """A per-job lifecycle table with the session's wait percentiles and sampling-concurrency histogram.
+
+    The three wait columns are the whole point: a session whose time sits in ``pop->disp`` is a
+    scheduling problem, in ``generate`` a GPU/config one, and in ``->submit`` a pipeline-balance one.
+    """
+    span, duration = _fmt_session_span(session)
+    lines = [f"=== Session #{session.index}  {span}  ({duration})  {session.end_reason} ==="]
+    if not model.jobs:
+        return "\n".join([*lines, "  (no job lifecycle lines in this session)"])
+
+    ordered = sorted(model.jobs.values(), key=_job_sort_key)
+    shown = ordered if limit is None else ordered[:limit]
+    lines.append("")
+    lines.append(_JOB_TABLE_HEADER)
+    for job in shown:
+        model_name = (job.model or "?")[:27]
+        card = str(job.device_index) if job.device_index is not None else "-"
+        process = str(job.process_id) if job.process_id is not None else "-"
+        lines.append(
+            f"{job.job_id:<9}{_fmt_ts(job.popped_at):<10}{model_name:<28}{process:>5}{card:>6}"
+            f"{_fmt_seconds(job.pre_inference_seconds):>11}"
+            f"{_fmt_seconds(job.inference_seconds):>10}"
+            f"{_fmt_seconds(job.post_inference_seconds):>10}",
+        )
+    if limit is not None and len(ordered) > limit:
+        lines.append(f"... {len(ordered) - limit} more job(s) not shown (use --limit 0 for all)")
+
+    lines.append("")
+    lines.append(f"{len(ordered)} job(s); wait segments (seconds):")
+    for segment in model.wait_segments():
+        lines.append(
+            f"  {segment.name:<15} n={segment.count:<5} median={_fmt_seconds(segment.median):>8} "
+            f"p90={_fmt_seconds(segment.p90):>8}",
+        )
+
+    profile = model.sampling_concurrency()
+    cards = model.card_count
+    lines.append("")
+    if cards is None:
+        lines.append("Cards driven: unknown (no 'Driving N cards' line in this capture)")
+    else:
+        lines.append(f"Cards driven: {cards} | worker-wide intake budget: {model.intake_budget or '?'}")
+    mean_busy = profile.mean_cards_busy
+    mean_clause = f"{mean_busy:.2f}" if mean_busy is not None else "?"
+    lines.append(f"Sampling concurrency (time-weighted mean cards busy: {mean_clause})")
+    lines.append(f"  {profile.describe(top=(cards or 8) + 1)}")
+
+    census = model.status_census()
+    if census.snapshots:
+        lines.append(
+            f"Status prints: {census.snapshots} | median pending {census.median_pending:.0f} | "
+            f"median idle lanes {census.median_idle_lanes:.0f} | "
+            f"median seatable pending {census.median_seatable_pending:.0f}",
+        )
+    skips = model.line_skip_census()
+    if skips:
+        lines.append("Line skips: " + ", ".join(f"{reason} {count}" for reason, count in sorted(skips.items())))
+    return "\n".join(lines)

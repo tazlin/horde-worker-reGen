@@ -1245,6 +1245,7 @@ class ProcessLifecycleManager:
             self._register_owned(self._process_map[pid])
 
             self._safety_start_initiated_at = time.time()
+            # Parsed by analysis/log_signatures.py (safety_lane_started): change the message and the registry together.
             logger.info(f"Started safety process (id: {pid})")
             self.num_processes_launched += 1
         return True
@@ -1342,6 +1343,7 @@ class ProcessLifecycleManager:
         )
         self._register_owned(self._process_map[pid])
 
+        # Parsed by analysis/log_signatures.py (post_process_lane_started): change the message and the registry together.
         logger.info(f"Started post-process process (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
         return True
@@ -1611,6 +1613,7 @@ class ProcessLifecycleManager:
         )
         self._register_owned(self._process_map[pid])
 
+        # Parsed by analysis/log_signatures.py (utilities_lane_started): change the message and the registry together.
         logger.info(f"Started image utilities process (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
         return True
@@ -2489,6 +2492,7 @@ class ProcessLifecycleManager:
         # A card whose index is not in the plan (e.g. an unexpected device_index) falls back to the lowest
         # configured card so a spawn never fails on a missing key; single-GPU always resolves to card 0.
         card = self._card_runtimes.get(device_index) or self._card_runtimes[min(self._card_runtimes)]
+        # Parsed by analysis/log_signatures.py (inference_lane_started): change the message and the registry together.
         logger.info(f"Starting inference process on PID {pid} (device {card.device_index})")
         vram_heavy_models = any_offered_model_wants_whole_card(bridge_data.image_models_to_load)
 

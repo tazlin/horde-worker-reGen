@@ -30,6 +30,7 @@ as needed.
     - [troubleshoot](how-to/troubleshoot.md)
 - **Reference** (look something up): [command line](reference/cli.md),
   [update bootstrap](reference/update_bootstrap.md), [logs](reference/logs.md),
+  [log findings](reference/log_findings.md),
   [codebase map](reference/codebase-map.md).
 
 ## Understanding the worker

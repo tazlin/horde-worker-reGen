@@ -545,19 +545,22 @@ an operator sent you.
 | `sessions [PATH]` | List each worker launch in the log with its span, version, end-reason, and peak process recoveries. |
 | `diagnose [PATH]` | Run the detectors and print ranked findings (root cause + remediation) per session. |
 | `timeline [PATH]` | Merged, time-ordered parent + child + ledger event stream for a session. |
+| `jobs [PATH]` | Per-job lifecycle table for a session: which lane and card ran each job, and how its wall clock split across pop->dispatch, generation, and finished->submit. |
 | `job <ID> [PATH]` | Trace one job across the parent and the inference slot that ran it. |
 | `watch [PATH]` | Live-poll the logs and alert when a new warning/critical finding or a rising recovery count appears. |
 | `bundle [PATH]` | Build a single redacted `.zip` (logs + diagnosis + config + system/cache info) to send a maintainer. |
 
-`PATH` defaults to `logs/`. `sessions`, `diagnose`, and `timeline` take `--session N` or `--last` to
-select a session and `--json` for machine-readable output; `timeline` also takes `--process N`,
-`--grep RE`, and `--child` (include verbose child-loop records). Each detector recognizes one incident
+`PATH` defaults to `logs/`. `sessions`, `diagnose`, `timeline`, and `jobs` take `--session N` or
+`--last` to select a session and `--json` for machine-readable output; `timeline` also takes
+`--process N`, `--grep RE`, and `--child` (include verbose child-loop records), and `jobs` takes
+`--limit N` (`0` for every row; the summary always covers every job whatever the table shows). Each detector recognizes one incident
 class (an inference pool crashing on start, a recovery storm that never gives up, GPU OOM, the swallowed
 "no images produced" OOM, an orphaned-job storm, a local queue that filled and stopped moving, a
 model-reference read that faulted a running sample, a pop that named no model, a model that ends every
 slot it is loaded onto, and the horde repeatedly refusing this worker's pops) and emits the child's
 exception as the root cause where it can. Every session also carries a census of the jobs it faulted,
-with each one's model and cause. See
+with each one's model and cause. Every finding id, with its severity and what it means, is catalogued in
+[Log findings](log_findings.md). See
 [Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-recovery-storm-from-the-logs).
 
 Findings quote the worker's own words wherever the log carries them, and only fall back to listing
@@ -565,6 +568,40 @@ candidate causes when it does not: a pop rejection is reported with the horde's 
 keyed to whether an operator can act on it, a safety stall names the subsystem whose pause/restore lines
 cycled the safety process, and a start-up crash reads the child's failure text before suggesting a fix
 (a git clone/checkout failure points at the shared ComfyUI environment directory, not at torch).
+
+### `jobs`: where a session's wall clock went
+
+A slow worker is one of three different problems, and the remedies are opposite. `horde-log jobs` splits
+every job's wall clock into the three segments the worker logs separately, so the question is answered
+from the log rather than guessed:
+
+| Segment | Bounded by | A large median means |
+|---------|------------|----------------------|
+| `pop->disp` | the pop line to `Starting inference for job` | a scheduling problem: the job waited for a lane |
+| `generate` | the child's own reported generation time | a GPU/config problem: it sampled slowly |
+| `->submit` | `Inference finished for job` to the submit line | a pipeline-balance problem: safety, upload or submit backed up |
+
+Under the table it prints the median and p90 of each segment, the card count and worker-wide intake
+budget, the **sampling-concurrency histogram** (the share of time 0, 1, 2 ... cards held an in-flight
+job, which is the fleet's real parallelism rather than its lane count), the status-print census (median
+queue depth, idle lanes, and pending jobs whose model was already resident on an idle lane), and the
+line-skip census. On a multi-card host this is the view that separates "each card is slow" from "only
+two cards are doing anything":
+
+```text
+1000 job(s); wait segments (seconds):
+  pre_inference   n=992   median=    87.8 p90=   154.3
+  inference       n=1002  median=    15.9 p90=    37.6
+  post_inference  n=969   median=     4.9 p90=    13.6
+
+Cards driven: 8 | worker-wide intake budget: 16
+Sampling concurrency (time-weighted mean cards busy: 2.50)
+  0 cards 2% | 1 card 28% | 2 cards 25% | 3 cards 20% | 4 cards 13% | 5 cards 8% | 6 cards 2%
+```
+
+The same parse backs the `multi_card_dispatch_serialization`, `model_churn`, `lane_placement`, and
+`parent_loop_stall` findings and the wait attribution in `slow_generation_drop_spiral`, so `diagnose`
+and `jobs` never disagree about where a session's time went.
 
 ### Rotated logs are stitched back into their run
 

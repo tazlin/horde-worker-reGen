@@ -629,6 +629,7 @@ class MessageDispatcher:
                 # Near-identical on every poll (annotator availability rarely changes; a process idling
                 # between jobs reports the same state repeatedly), so the receipt itself is not worth DEBUG.
                 receipt_level = "TRACE"
+            # Parsed by analysis/log_signatures.py (ipc_drain): change the message and the registry together.
             logger.log(
                 receipt_level,
                 f"Received {type(message).__name__} from process {message.process_id}: {message.info}",
@@ -1513,6 +1514,7 @@ class MessageDispatcher:
             )
 
             if message.horde_model_state == ModelLoadState.LOADING:
+                # Parsed by analysis/log_signatures.py (model_loading): change the message and the registry together.
                 logger.debug(f"Process {message.process_id} is loading model {message.horde_model_name}")
 
             if (
@@ -1540,6 +1542,7 @@ class MessageDispatcher:
                         )
                     logger.debug(loaded_message)
                 elif message.horde_model_state == ModelLoadState.LOADED_IN_RAM:
+                    # Parsed by analysis/log_signatures.py (model_moved_to_system_ram): change the message and the registry together.
                     loaded_message = (
                         f"Process {message.process_id} moved model {message.horde_model_name} to system RAM. "
                     )
@@ -1555,6 +1558,7 @@ class MessageDispatcher:
             # download process reports auxiliary models here under names that come from the model host (a
             # LoRA title may contain HTML), and loguru parses only the template for colour tags, so a name
             # like "<p>" cannot be read as a colour directive and abort the emission.
+            # Parsed by analysis/log_signatures.py (model_unloaded): change the message and the registry together.
             logger.opt(colors=True).info(
                 "<fg #7b7d7d>Process {} unloaded model {}</>",
                 message.process_id,
@@ -1665,6 +1669,7 @@ class MessageDispatcher:
             inference_duration_histogram.record(message.time_elapsed)
             # The model name and the child's free-form info are formatting arguments, not template text, so
             # colour-tag parsing never sees a value the parent did not author.
+            # Parsed by analysis/log_signatures.py (inference_finished): change the message and the registry together.
             logger.opt(colors=True).info(
                 "\0<fg #da9dff>"
                 "Inference finished for job {} <u>({})</u> on process {}. "
@@ -1863,6 +1868,7 @@ class MessageDispatcher:
                 reason=message.info or "inference failed",
                 detail={"degraded": degraded, "resource_failure": resource_failure},
             )
+            # Parsed by analysis/log_signatures.py (job_faulted_on_process): change the message and the registry together.
             logger.warning(
                 f"Job {job_id} faulted on process {message.process_id} ({message.info}); requeued for "
                 f"{'a degraded, isolated' if degraded else 'another'} attempt.",
@@ -1883,6 +1889,7 @@ class MessageDispatcher:
             reason=message.info or "inference failed",
             detail={"resource_failure": resource_failure},
         )
+        # Parsed by analysis/log_signatures.py (job_faulted_on_process): change the message and the registry together.
         logger.error(
             f"Job {message.sdk_api_job_info.id_} faulted on process {message.process_id}: {message.info}",
         )
@@ -1971,6 +1978,7 @@ class MessageDispatcher:
 
         safety_elapsed_display = f"{safety_elapsed:.2f}" if safety_elapsed is not None else "unknown"
 
+        # Parsed by analysis/log_signatures.py (safety_checked): change the message and the registry together.
         logger.debug(
             f"Job {message.job_id} had {num_images_censored} images censored and took "
             f"{safety_elapsed_display} seconds to check safety",

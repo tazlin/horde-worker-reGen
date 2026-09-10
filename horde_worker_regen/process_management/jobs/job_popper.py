@@ -1861,6 +1861,7 @@ class JobPopper:
                 jobs.append(f"<{str(job.id_)[:8]}: {job.model}>")
             else:
                 jobs.append(f"<{job.model}>")
+        # Parsed by analysis/log_signatures.py (job_queue): change the message and the registry together.
         logger.info(f"Job queue: {', '.join(jobs)}")
 
     # endregion
@@ -2375,6 +2376,7 @@ class JobPopper:
             )
             > 0
         )
+        # Parsed by analysis/log_signatures.py (popped_job): change the message and the registry together.
         logger.opt(colors=True).info(
             "<fg #a200ff>"
             "Popped job {} "

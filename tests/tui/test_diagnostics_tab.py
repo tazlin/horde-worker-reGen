@@ -15,7 +15,7 @@ import pytest
 from rich.text import Text
 from textual.widgets import Select, Static, TabbedContent
 
-from horde_worker_regen.analysis.detectors import Finding, Severity
+from horde_worker_regen.analysis.detectors import Finding, FindingKind, Severity
 from horde_worker_regen.analysis.diagnose import SessionDiagnosisView, SessionSummary
 from horde_worker_regen.app_state import AppStateStore
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
@@ -39,14 +39,14 @@ def _diagnosis(index: int, *findings: Finding, version: str = "12.29.0") -> Sess
     return SessionDiagnosisView(session=session, findings=list(findings))
 
 
-def _finding(finding_id: str, severity: Severity) -> Finding:
+def _finding(kind: FindingKind, severity: Severity) -> Finding:
     """A minimal finding with distinct, assertable text."""
     return Finding(
-        id=finding_id,
+        kind=kind,
         severity=severity,
-        title=f"Title for {finding_id}",
-        verdict=f"Verdict for {finding_id}",
-        remediation=f"Fix {finding_id}",
+        title_override=f"Title for {kind.value}",
+        verdict=f"Verdict for {kind.value}",
+        remediation_addendum=f"Fix {kind.value}",
     )
 
 
@@ -99,8 +99,12 @@ async def _run_and_wait(pilot: object, view: DiagnosticsView) -> str:
 async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Opening the tab runs the analysis off the loop and renders the latest session's findings generically."""
     results = [
-        _diagnosis(0, _finding("oom", Severity.CRITICAL)),
-        _diagnosis(1, _finding("forced_maintenance", Severity.CRITICAL), _finding("session_summary", Severity.INFO)),
+        _diagnosis(0, _finding(FindingKind.OOM, Severity.CRITICAL)),
+        _diagnosis(
+            1,
+            _finding(FindingKind.FORCED_MAINTENANCE, Severity.CRITICAL),
+            _finding(FindingKind.SESSION_SUMMARY, Severity.INFO),
+        ),
     ]
     monkeypatch.setattr("horde_worker_regen.analysis.diagnose.diagnose_views_for", lambda *a: results)
 
@@ -143,7 +147,7 @@ async def test_scope_change_defers_until_run(tmp_path: Path, monkeypatch: pytest
 
     def _fake(_path: Path, recent: int | None, active_only: bool) -> list[SessionDiagnosisView]:
         calls.append((recent, active_only))
-        return [_diagnosis(0, _finding("oom", Severity.CRITICAL))]
+        return [_diagnosis(0, _finding(FindingKind.OOM, Severity.CRITICAL))]
 
     monkeypatch.setattr("horde_worker_regen.analysis.diagnose.diagnose_views_for", _fake)
 
@@ -173,7 +177,7 @@ async def test_scope_change_defers_until_run(tmp_path: Path, monkeypatch: pytest
 
 async def test_diagnostics_runs_with_worker_stopped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Triage reads logs off disk, so it works when the worker is not running (the common case)."""
-    results = [_diagnosis(0, _finding("oom", Severity.CRITICAL))]
+    results = [_diagnosis(0, _finding(FindingKind.OOM, Severity.CRITICAL))]
     monkeypatch.setattr("horde_worker_regen.analysis.diagnose.diagnose_views_for", lambda *a: results)
 
     app = _make_app(tmp_path, alive=False)  # worker stopped
@@ -188,7 +192,7 @@ async def test_diagnostics_timing_shows_analysis_and_current_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """After a pass, the timing line dates the analysis, shows the current time, and its age."""
-    results = [_diagnosis(0, _finding("oom", Severity.CRITICAL))]
+    results = [_diagnosis(0, _finding(FindingKind.OOM, Severity.CRITICAL))]
     monkeypatch.setattr("horde_worker_regen.analysis.diagnose.diagnose_views_for", lambda *a: results)
 
     app = _make_app(tmp_path)
@@ -208,7 +212,7 @@ async def test_diagnostics_timing_flags_stale_after_five_minutes(
     """An analysis older than five minutes flips the timing line to a clear stale warning."""
     from datetime import datetime, timedelta
 
-    results = [_diagnosis(0, _finding("oom", Severity.CRITICAL))]
+    results = [_diagnosis(0, _finding(FindingKind.OOM, Severity.CRITICAL))]
     monkeypatch.setattr("horde_worker_regen.analysis.diagnose.diagnose_views_for", lambda *a: results)
 
     app = _make_app(tmp_path)
@@ -235,6 +239,6 @@ async def test_diagnostics_tab_reruns_on_button(tmp_path: Path, monkeypatch: pyt
         assert view._diagnoses == []
 
         # A new incident appears in the logs; the operator re-runs and the tab reflects it.
-        state["results"] = [_diagnosis(0, _finding("oom", Severity.CRITICAL))]
+        state["results"] = [_diagnosis(0, _finding(FindingKind.OOM, Severity.CRITICAL))]
         status = await _run_and_wait(pilot, view)
         assert "Session #0" in status and len(view._diagnoses) == 1

@@ -19,8 +19,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEvent
+
+if TYPE_CHECKING:
+    from .job_lifecycle import JobLifecycleModel
 
 from .bundle import LogBundle
 from .log_ingest import LogRecord
@@ -90,6 +94,12 @@ class SessionContext:
     bundle: LogBundle
     recoveries: list[RecoveryDiagnostic] = field(default_factory=list)
     ledger_events: list[LedgerEvent] = field(default_factory=list)
+    job_lifecycle: JobLifecycleModel | None = field(default=None, repr=False)
+    """The per-job lifecycle parse, filled in on first use by ``job_lifecycle.job_lifecycle_for``.
+
+    Cached here rather than parsed per detector: several detectors need the same job-shaped facts and the
+    parse is linear in the session's records, which run to hundreds of thousands of lines on a long run.
+    """
 
 
 def extract_exception(text: str) -> str | None:

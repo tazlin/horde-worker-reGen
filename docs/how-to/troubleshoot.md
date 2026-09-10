@@ -80,6 +80,30 @@ the parent and the slot that ran it. `horde-log watch` tails a live worker and a
 problem appears. All of it is read-only, accepts a `.zip` of logs someone sent you, and has a `--json`
 mode; see the [command reference](../reference/cli.md#horde-log).
 
+### A worker with several GPUs is slow
+
+Do not start from per-card duty. Ask where the time went first:
+
+```bash
+horde-log jobs logs/ --last
+```
+
+Read the three wait medians before anything else. A large `pre_inference` median against a small
+`inference` one means jobs sat waiting for a lane, which is a scheduling problem: no amount of lowering
+`max_power` or `queue_size` will help, and lowering `queue_size` only makes the queue shorter, not
+faster. A large `inference` median is the GPU/config case. A large `post_inference` median is the
+pipeline-balance case (see `safety_on_gpu`).
+
+Then read the **sampling concurrency** line under the table. On an N-card host this is how many cards
+actually held work; if the mean sits at two or three on an eight-card host while the queue stayed at the
+intake budget, dispatch is not spreading across the fleet. `horde-log diagnose` names that directly as
+`multi_card_dispatch_serialization`, along with how many idle lanes already held the models the queue
+was asking for. The neighbouring `model_churn` and `lane_placement` findings cover the two things that
+usually travel with it: a resident set turning over faster than the work, and an auxiliary lane sitting
+on a card you did not expect.
+
+Every finding id is explained in [Log findings](../reference/log_findings.md).
+
 ### Send your logs to a maintainer
 
 When a maintainer asks for your logs, run `horde-log bundle` (or press **Support bundle** / `Ctrl+B` on

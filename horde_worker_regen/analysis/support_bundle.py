@@ -210,7 +210,15 @@ def _read_log_text(file_path: Path, *, cap: bool) -> str:
 
 
 def _find_stats_files(root: Path, *, modified_since: datetime | None = None) -> list[Path]:
-    """Find retained stats JSONL files related to ``root``, keeping those last written at or after ``modified_since``."""
+    """Find retained stats JSONL files related to ``root``.
+
+    Args:
+        root: The working directory whose durable-state and stats directories are searched.
+        modified_since: When given, only files last written at or after this instant are kept.
+
+    Returns:
+        The matching paths.
+    """
     candidate_dirs = [
         root / _APP_STATE_DIRNAME / _STATS_DIRNAME,
         root.parent / _APP_STATE_DIRNAME / _STATS_DIRNAME,

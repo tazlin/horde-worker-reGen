@@ -1715,6 +1715,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                     process_info.last_heartbeat_percent_complete is not None
                     and process_info.last_job_referenced is not None
                 ):
+                    # Parsed by analysis/log_signatures.py (status_sampling_state): change the message and the registry together.
                     process_state_detail = (
                         f"{process_info.last_heartbeat_percent_complete}% of "
                         f"{process_info.last_job_referenced.payload.ddim_steps} steps "
@@ -1729,6 +1730,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                     else "No model loaded"
                 )
                 last_heartbeat_delta_now = round((current_time - process_info.last_heartbeat_timestamp), 2)
+                # Parsed by analysis/log_signatures.py (status_inference_lane): change the message and the registry together.
                 info_strings.append(
                     (
                         f"Process {process_id} ({process_state_detail}) "
@@ -1741,6 +1743,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 )
 
             else:
+                # Parsed by analysis/log_signatures.py (status_aux_lane): change the message and the registry together.
                 info_strings.append(
                     f"Process {process_id}: ({process_info.process_type.name}) "
                     f"{process_info.last_process_state.name} "

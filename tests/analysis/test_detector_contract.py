@@ -18,12 +18,14 @@ test that goes red and names which one.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
 from horde_worker_regen.analysis.detectors import DETECTORS, Detector, Severity
+from horde_worker_regen.analysis.finding_kinds import FINDING_SPECS, Finding, FindingKind
 from tests.analysis.test_detectors import (
     _DISPATCH_BUG_REASON,
     _DISPATCH_NONHEAD_REASON,
@@ -53,6 +55,23 @@ from tests.analysis.test_detectors import (
     _server_slow_abort,
     _soft_reset,
     _whole_card_reserve,
+)
+from tests.analysis.test_dispatch_detectors import _multi_card_session
+from tests.analysis.test_dispatch_detectors import _stamp as _lifecycle_stamp
+from tests.analysis.test_job_lifecycle import (
+    driving_cards,
+    inference_dispatched,
+    inference_finished,
+    inference_lane_started,
+    ipc_drain,
+    model_preloading,
+    model_unloaded,
+    popped_job,
+    post_process_lane_started,
+    preload_cleared,
+    safety_lane_started,
+    startup_line,
+    status_block,
 )
 from tests.analysis.test_unsatisfiable_head_starvation import _starvation_diagnostic
 
@@ -172,6 +191,21 @@ def _bridge(*lines: str) -> str:
     return "\n".join([_startup_line(), *lines])
 
 
+def _lifecycle_bridge(*lines: str) -> str:
+    """A single-session bridge log for the lifecycle-model fixtures, in timestamp order.
+
+    Sorted rather than hand-interleaved: these fixtures assemble several independently-timed streams
+    (status prints, IPC drains, per-job lines), and the shared ``YYYY-MM-DD HH:MM:SS.mmm`` prefix makes
+    a lexicographic sort chronological. The startup boundary from the same builders leads.
+    """
+    return "\n".join([startup_line(), *sorted(lines)])
+
+
+def _lifecycle_job_id(index: int) -> str:
+    """A stable synthetic job UUID for the nth job of a lifecycle-model fixture."""
+    return f"{index:08x}-0000-4000-8000-000000000000"
+
+
 @dataclass
 class Contract:
     """A detector paired with a golden log that must make it fire, and the severity it must report."""
@@ -248,6 +282,63 @@ CONTRACTS: dict[str, Contract] = {
             _server_slow_abort("06:38:37.000"),
             _server_slow_abort("06:42:12.000"),
             _server_slow_abort("07:03:16.000"),
+        ),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_multi_card_dispatch_serialization": Contract(
+        # Two of eight cards carrying every job while the intake budget's worth of work sits queued on
+        # idle lanes that already hold the models it asks for.
+        bridge=_multi_card_session(),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_model_churn": Contract(
+        # Twenty dispatches against ten preloads and three preloads cleared before they ran.
+        bridge=_lifecycle_bridge(
+            *[
+                line
+                for index in range(20)
+                for line in (
+                    popped_job(_lifecycle_stamp(10 + index), job_id=_lifecycle_job_id(index), model="Deliberate"),
+                    inference_dispatched(_lifecycle_stamp(11 + index), job_id=_lifecycle_job_id(index), process=3),
+                    inference_finished(
+                        _lifecycle_stamp(12 + index),
+                        job_id=_lifecycle_job_id(index),
+                        model="Deliberate",
+                        process=3,
+                        seconds=1.0,
+                    ),
+                )
+            ],
+            *[model_preloading(_lifecycle_stamp(200 + i), model=f"Model {i}", process=3) for i in range(10)],
+            *[model_unloaded(_lifecycle_stamp(250 + i), model=f"Model {i}", process=3) for i in range(10)],
+            *[preload_cleared(_lifecycle_stamp(300 + i), model=f"Model {i}", process=3) for i in range(3)],
+        ),
+        severity=Severity.WARNING,
+    ),
+    "detect_lane_placement": Contract(
+        # The post-processing lane re-spawned onto card 0, where GPU safety already lives.
+        bridge=_lifecycle_bridge(
+            driving_cards(_lifecycle_stamp(0), cards=4),
+            safety_lane_started(_lifecycle_stamp(1)),
+            post_process_lane_started(_lifecycle_stamp(2), process=1, device=2),
+            inference_lane_started(_lifecycle_stamp(3), process=3, device=1),
+            post_process_lane_started(_lifecycle_stamp(600), process=1, device=0),
+        ),
+        severity=Severity.WARNING,
+    ),
+    "detect_parent_loop_stall": Contract(
+        # A two-minute silence in the IPC drain against a 20s status cadence.
+        bridge=_lifecycle_bridge(
+            *[
+                line
+                for tick in range(0, 600, 20)
+                for line in status_block(
+                    _lifecycle_stamp(tick),
+                    lanes=[(3, "WAITING_FOR_JOB", None)],
+                    pending=[],
+                )
+            ],
+            *[ipc_drain(_lifecycle_stamp(tick), process=3) for tick in range(0, 600, 2) if not 200 <= tick < 320],
         ),
         severity=Severity.CRITICAL,
     ),
@@ -403,6 +494,88 @@ def test_detector_fires_on_its_golden_signature(detector: Detector, tmp_path: Pa
     finding_id = _finding_id(detector)
     assert finding_id in findings, f"{detector.__name__} did not fire on its golden signature"
     assert findings[finding_id].severity is contract.severity
+
+
+@pytest.mark.parametrize("detector", DETECTORS, ids=lambda d: d.__name__)
+def test_every_emitted_finding_is_declared(detector: Detector, tmp_path: Path) -> None:
+    """Nothing reaches a reader under an undeclared kind or with a cross-reference that goes nowhere.
+
+    The golden signatures drive real detector output, so this checks what is actually emitted rather than
+    what the table says: a kind with no spec would fail at render time, and a ``see also:`` naming a kind
+    no detector can emit is the dead end the typed field exists to prevent.
+    """
+    contract = CONTRACTS[detector.__name__]
+    for finding in _diagnose(tmp_path, contract.bridge, contract.child_logs or None).values():
+        assert finding.kind in FINDING_SPECS, f"{finding.kind} has no spec"
+        assert finding.see_also is None or finding.see_also in FINDING_SPECS
+
+
+def test_every_declared_cross_reference_resolves() -> None:
+    """A spec's default ``see_also`` names another kind, never itself."""
+    for kind, spec in FINDING_SPECS.items():
+        if spec.see_also is None:
+            continue
+        assert spec.see_also in FINDING_SPECS, f"{kind} points at an unknown kind"
+        assert spec.see_also is not kind, f"{kind} points at itself"
+
+
+def test_the_printed_id_survives_the_json_round_trip() -> None:
+    """``finding_to_dict`` prints the kind's value, which is the id the JSON output has always carried."""
+    from horde_worker_regen.analysis.triage_report import finding_to_dict
+
+    for kind in FindingKind:
+        payload = finding_to_dict(Finding(kind=kind, severity=Severity.INFO, verdict="v"))
+        assert payload["id"] == kind.value
+        assert json.loads(json.dumps(payload))["id"] == kind.value
+
+
+def test_the_remediation_is_the_invariant_advice_plus_the_measured_part() -> None:
+    """A kind's declared advice is always present; the detector's addendum follows it."""
+    spec = FINDING_SPECS[FindingKind.OOM]
+    assert spec.remediation, "this test needs a kind whose advice is declared, not per-emit"
+
+    without_addendum = Finding(kind=FindingKind.OOM, severity=Severity.CRITICAL, verdict="v")
+    assert without_addendum.remediation == spec.remediation
+
+    with_addendum = Finding(
+        kind=FindingKind.OOM,
+        severity=Severity.CRITICAL,
+        verdict="v",
+        remediation_addendum="Card 2 is the one that faulted.",
+    )
+    assert with_addendum.remediation == f"{spec.remediation} Card 2 is the one that faulted."
+
+
+def test_a_kind_with_no_declared_advice_renders_only_the_addendum() -> None:
+    """Where the whole fix depends on the measurement, nothing is prefixed to it."""
+    spec = FINDING_SPECS[FindingKind.SAFETY_STAGE_STALL]
+    assert spec.remediation == "", "this test needs a kind whose advice is written per-emit"
+
+    finding = Finding(
+        kind=FindingKind.SAFETY_STAGE_STALL,
+        severity=Severity.WARNING,
+        verdict="v",
+        remediation_addendum="Stabilise the safety process.",
+    )
+    assert finding.remediation == "Stabilise the safety process."
+
+
+def test_an_emit_falls_back_to_the_declared_title_and_cross_reference() -> None:
+    """The catalogue name and cross-reference are used unless the emit site words its own."""
+    spec = FINDING_SPECS[FindingKind.HEAD_DISPATCH_STALL]
+    default = Finding(kind=FindingKind.HEAD_DISPATCH_STALL, severity=Severity.WARNING, verdict="v")
+    assert default.title == spec.title
+    assert default.see_also == spec.see_also
+
+    overridden = Finding(
+        kind=FindingKind.HEAD_DISPATCH_STALL,
+        severity=Severity.CRITICAL,
+        verdict="v",
+        title_override="Head-of-queue job not dispatching (no blocking gate)",
+        see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
+    )
+    assert overridden.title == "Head-of-queue job not dispatching (no blocking gate)"
+    assert overridden.see_also is FindingKind.SCHEDULER_STARVATION_WEDGE
 
 
 def test_every_detector_has_a_contract_fixture() -> None:

@@ -21,11 +21,14 @@ from pathlib import Path
 from .bundle import LogBundle
 from .correlate import build_session_context, build_timeline
 from .diagnose import diagnose, select_sessions
+from .job_lifecycle import job_lifecycle_for
 from .sessions import WorkerSession, segment_sessions
 from .support_bundle import build_support_bundle
 from .triage_report import (
     finding_to_dict,
+    job_lifecycle_to_dict,
     render_findings,
+    render_job_lifecycle,
     render_sessions,
     render_timeline,
     session_to_dict,
@@ -93,6 +96,34 @@ def _run_timeline(args: argparse.Namespace) -> int:
         print(json.dumps([timeline_entry_to_dict(e) for e in all_entries], indent=2))
     else:
         print(render_timeline(all_entries))
+    return 0
+
+
+def _run_jobs(args: argparse.Namespace) -> int:
+    """Print the per-job lifecycle table and the session's wait/concurrency summary.
+
+    A separate subcommand rather than an option on ``job`` or ``timeline``: ``job`` takes a required job
+    id and traces exactly one job across processes, and ``timeline`` is the raw merged event stream.
+    Neither has a shape that a whole-session table fits into without a mutually exclusive argument set.
+    """
+    bundle, sessions = _load_sessions(args.path)
+    selected = select_sessions(sessions, last=args.last, session_index=args.session)
+    if not selected:
+        print("No matching sessions.")
+        return 1
+    limit = None if args.limit == 0 else args.limit
+    rendered = []
+    payload = []
+    for session in selected:
+        model = job_lifecycle_for(build_session_context(session, bundle))
+        if args.json:
+            payload.append(job_lifecycle_to_dict(session, model))
+        else:
+            rendered.append(render_job_lifecycle(session, model, limit=limit))
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print("\n\n".join(rendered))
     return 0
 
 
@@ -206,6 +237,20 @@ def build_parser() -> argparse.ArgumentParser:
     timeline_parser.add_argument("--grep", default=None, metavar="RE", help="Only entries matching this regex.")
     timeline_parser.add_argument("--child", action="store_true", help="Include verbose child-loop records.")
     timeline_parser.set_defaults(func=_run_timeline)
+
+    jobs_parser = subparsers.add_parser(
+        "jobs",
+        help="Per-job lifecycle table: pop->dispatch, generation, and finished->submit for every job.",
+    )
+    _add_common_source_args(jobs_parser)
+    jobs_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Show only the first N jobs (0 for all; default: 50). The summary always covers every job.",
+    )
+    jobs_parser.set_defaults(func=_run_jobs)
 
     job_parser = subparsers.add_parser("job", help="Trace one job across the parent and its inference slot.")
     job_parser.add_argument("job_id", help="The horde job id (full UUID or its leading 8 characters).")

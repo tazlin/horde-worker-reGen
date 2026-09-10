@@ -40,6 +40,21 @@ children over IPC. See [Architecture](docs/explanation/architecture.md).
   [Resource governance](docs/explanation/resource_governance.md) and
   [VRAM arbiter](docs/explanation/vram_arbiter.md) for the memory machinery behind it.
 
+## Diagnosing a log bundle
+
+Run the tool before hand-rolling anything. `horde-log sessions` lists each launch in an appended
+`bridge.log`; `diagnose` gives ranked findings with remediation; `jobs` splits every job's wall clock
+into pop->dispatch / generation / finished->submit plus the sampling-concurrency histogram (which
+answers "is a multi-GPU worker actually using its cards"); `timeline` is the raw merged parent/child
+event stream; `bundle` builds a redacted zip for a maintainer. Every finding id is catalogued in
+[docs/reference/log_findings.md](docs/reference/log_findings.md).
+
+**When a session needs a hand-rolled script, the tool needs a finding: add it there.** And the log lines
+`horde_worker_regen/analysis/` parses are a contract, registered in `analysis/log_signatures.py` with
+their emitting sites. Before changing a log message in `process_management/`, grep that registry; if the
+line is registered, update the pattern, the sample, and any detector in the same change, then re-run
+`tests/analysis/test_log_signatures.py` and `-m slow tests/analysis/test_log_contract_dry_run.py`.
+
 ## The map (most important files & classes)
 
 Almost all orchestration lives in `horde_worker_regen/process_management/`. The main process is a set

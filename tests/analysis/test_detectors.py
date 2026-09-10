@@ -13,7 +13,13 @@ from pathlib import Path
 
 from horde_worker_regen.analysis.bundle import LogBundle
 from horde_worker_regen.analysis.correlate import build_session_context
-from horde_worker_regen.analysis.detectors import Finding, Severity, _records_in_window, run_detectors
+from horde_worker_regen.analysis.detectors import (
+    Finding,
+    FindingKind,
+    Severity,
+    _records_in_window,
+    run_detectors,
+)
 from horde_worker_regen.analysis.log_ingest import LogRecord
 from horde_worker_regen.analysis.sessions import segment_sessions
 
@@ -186,12 +192,29 @@ def _slowdown_grade(ts: str, *, pid: int = 4, ratio: float = 4.1, free_vram_mb: 
     )
 
 
-def _submit_latency(ts: str, *, popped_ago: float, gen: float) -> str:
+def _submit_latency(ts: str, *, popped_ago: float, gen: float, job_id: str = "abcd1234") -> str:
     """A successful-submit line reporting pop->submit latency and generation time."""
     return (
         f"2026-06-25 {ts} | SUCCESS  | horde_worker_regen.process_management.jobs.job_submitter:submit_single_generation:343 - "
-        f"Submitted generation abcd1234 (model: stable_diffusion) for 5.76 kudos. Job popped {popped_ago} seconds "
+        f"Submitted generation {job_id} (model: stable_diffusion) for 5.76 kudos. Job popped {popped_ago} seconds "
         f"ago and took {gen} to generate. (0.8 kudos/second for the whole batch. 0.4 or greater is ideal)"
+    )
+
+
+def _dispatch_line(ts: str, *, job_id: str, process: int = 3) -> str:
+    """inference_scheduler.start_inference: the line that marks the end of a job's queue wait."""
+    return (
+        f"2026-06-25 {ts} | INFO     | horde_worker_regen.process_management.scheduling.inference_scheduler:start_inference:10400 - "
+        f"Starting inference for job {job_id} on process {process}"
+    )
+
+
+def _inference_finished_line(ts: str, *, job_id: str, seconds: float, process: int = 3) -> str:
+    """message_dispatcher._handle_inference_result: the line that marks the end of generation."""
+    return (
+        f"2026-06-25 {ts} | INFO     | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_inference_result:1668 - "
+        f"Inference finished for job {job_id} (stable_diffusion) on process {process}. It took {seconds} "
+        f"seconds, finishing at 3.42 iterations per second and reported 0 faults."
     )
 
 
@@ -268,7 +291,7 @@ class TestForcedMaintenance:
         assert finding.severity is Severity.CRITICAL
         assert "2 generation(s) as too slow" in finding.verdict
         assert "save-our-ship" not in finding.verdict
-        assert finding.see_also == "slow_generation_drop_spiral"
+        assert finding.see_also is FindingKind.SLOW_GENERATION_DROP_SPIRAL
 
     def test_forced_for_both_drop_kinds_names_both(self, tmp_path: Path) -> None:
         """When the worker both gave up backlog jobs and had generations aborted, the verdict names both."""
@@ -413,17 +436,26 @@ class TestSlowGenerationDropSpiral:
         bridge = self._bridge(_slowdown_grade("05:15:13.000"))
         assert "slow_generation_drop_spiral" not in _diagnose(tmp_path, bridge)
 
-    def test_queue_aging_is_distinguished_from_slow_gpu(self, tmp_path: Path) -> None:
-        """Fast generation but long pop->submit latency is diagnosed as pipeline aging, not a slow GPU.
+    def test_post_inference_aging_is_distinguished_from_slow_gpu(self, tmp_path: Path) -> None:
+        """Fast generation and a fast dispatch, but a long finished->submit tail, is pipeline aging.
 
-        When generation is fast but jobs age in the pipeline queue (pop->submit latency well above
-        generation time), the cause is a downstream bottleneck (typically a slow safety stage), not a
-        slow GPU. The detector must say so rather than blaming generation throughput.
+        The wait is located from the lifecycle lines rather than inferred from the ratio: each job here
+        is dispatched within seconds of its pop and generates in seconds, then sits between the
+        inference-finished line and its submit. That is a downstream bottleneck (typically the safety
+        stage), and the detector must say so rather than blaming generation throughput.
         """
+        lines = []
+        for index in range(3):
+            job_id = f"aaaa000{index}"
+            lines.extend(
+                [
+                    _dispatch_line(f"07:1{index}:03.000", job_id=job_id),
+                    _inference_finished_line(f"07:1{index}:10.000", job_id=job_id, seconds=7.0),
+                    _submit_latency(f"07:1{index}:59.000", popped_ago=59.0, gen=7.0, job_id=job_id),
+                ],
+            )
         bridge = self._bridge(
-            _submit_latency("07:13:09.000", popped_ago=180.0, gen=7.0),
-            _submit_latency("07:13:19.000", popped_ago=175.0, gen=8.0),
-            _submit_latency("07:13:29.000", popped_ago=170.0, gen=7.5),
+            *lines,
             _safety_duration("07:13:30.000", seconds=9.2),
             _server_slow_abort("07:14:00.000"),
             _server_slow_abort("07:18:00.000"),
@@ -433,9 +465,56 @@ class TestSlowGenerationDropSpiral:
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
         assert "aged in the post-inference queue" in finding.verdict
+        assert "inference-finished->submit" in finding.verdict
         # The remediation must not blame max_power for a pipeline-balance problem.
         assert "backpressure" in finding.remediation
         assert "max_power will not help" in finding.remediation
+
+    def test_pre_inference_aging_points_at_scheduling_not_safety(self, tmp_path: Path) -> None:
+        """Jobs that wait for a lane, then generate and submit quickly, are a scheduling problem.
+
+        This is the case the detector used to misattribute: it saw only the pop->submit total and blamed
+        the post-inference queue and the safety stage, when the wait was entirely in front of inference.
+        The verdict must name the pop->dispatch median and point at dispatch rather than at safety.
+        """
+        lines = []
+        for index in range(3):
+            job_id = f"bbbb000{index}"
+            lines.extend(
+                [
+                    _dispatch_line(f"07:1{index}:50.000", job_id=job_id),
+                    _inference_finished_line(f"07:1{index}:57.000", job_id=job_id, seconds=7.0),
+                    _submit_latency(f"07:1{index}:59.000", popped_ago=59.0, gen=7.0, job_id=job_id),
+                ],
+            )
+        bridge = self._bridge(
+            *lines,
+            _safety_duration("07:13:30.000", seconds=1.1),
+            _server_slow_abort("07:14:00.000"),
+            _server_slow_abort("07:18:00.000"),
+            _server_slow_abort("07:22:00.000"),
+            _maintenance_pop("07:33:02.000"),
+        )
+        finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
+        assert finding.severity is Severity.CRITICAL
+        assert "aged before inference started" in finding.verdict
+        assert "pop->dispatch" in finding.verdict
+        assert "safety" not in finding.title
+        assert finding.see_also is FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION
+
+    def test_aging_with_no_lifecycle_lines_declines_to_locate_the_wait(self, tmp_path: Path) -> None:
+        """An older capture with only submit lines cannot say where the wait was, and must not guess."""
+        bridge = self._bridge(
+            _submit_latency("07:13:09.000", popped_ago=180.0, gen=7.0, job_id="cccc0001"),
+            _submit_latency("07:13:19.000", popped_ago=175.0, gen=8.0, job_id="cccc0002"),
+            _submit_latency("07:13:29.000", popped_ago=170.0, gen=7.5, job_id="cccc0003"),
+            _server_slow_abort("07:14:00.000"),
+            _server_slow_abort("07:18:00.000"),
+            _server_slow_abort("07:22:00.000"),
+        )
+        finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
+        assert "cannot be attributed to a stage" in finding.verdict
+        assert "stage not located" in finding.title
 
     def test_genuinely_slow_generation_keeps_gpu_framing(self, tmp_path: Path) -> None:
         """When generation itself is slow (latency ~ generation time), keep the slow-GPU remediation."""
@@ -882,7 +961,7 @@ class TestSafetyStageStall:
         findings = _diagnose(tmp_path, bridge)
         assert "safety_stage_stall" in findings
         assert findings["safety_stage_stall"].severity is Severity.CRITICAL
-        assert findings["safety_stage_stall"].see_also == "forced_maintenance"
+        assert findings["safety_stage_stall"].see_also is FindingKind.FORCED_MAINTENANCE
 
     def test_pure_backpressure_is_warning(self, tmp_path: Path) -> None:
         """Throttling intake to a slow safety stage (no orphan recovery) is the benign, lower-severity case."""
@@ -923,7 +1002,7 @@ class TestWholeCardConvergenceWedge:
         findings = _diagnose(tmp_path, bridge)
         assert "whole_card_convergence_wedge" in findings
         assert findings["whole_card_convergence_wedge"].severity is Severity.CRITICAL
-        assert findings["whole_card_convergence_wedge"].see_also == "head_dispatch_stall"
+        assert findings["whole_card_convergence_wedge"].see_also is FindingKind.HEAD_DISPATCH_STALL
 
     def test_wedge_line_does_not_also_fire_generic_dispatch_warning(self, tmp_path: Path) -> None:
         """The wedge owns its line: head_dispatch_stall must not double-report it as a generic warning."""
@@ -955,7 +1034,7 @@ class TestWholeCardNonHeadResidencyStarvation:
         findings = _diagnose(tmp_path, bridge)
         assert "whole_card_nonhead_residency_starvation" in findings
         assert findings["whole_card_nonhead_residency_starvation"].severity is Severity.CRITICAL
-        assert findings["whole_card_nonhead_residency_starvation"].see_also == "scheduler_starvation_wedge"
+        assert findings["whole_card_nonhead_residency_starvation"].see_also is FindingKind.SCHEDULER_STARVATION_WEDGE
 
     def test_starvation_without_escalation_is_warning(self, tmp_path: Path) -> None:
         """A non-head residency stall that did not escalate to a soft reset or drops is the lower-severity case."""
@@ -1330,7 +1409,7 @@ class TestWholeCardPopClaim:
         finding = findings["whole_card_pop_claim_monopoly"]
         assert finding.severity is Severity.WARNING
         assert "Juggernaut XL" in finding.verdict
-        assert finding.see_also == "whole_card_pop_claim_episodes"
+        assert finding.see_also is FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES
 
     def test_cap_ends_with_nothing_else_queued_are_not_a_monopoly(self, tmp_path: Path) -> None:
         """A worker serving only the claimed model rides its cap without squeezing anything."""
@@ -1375,7 +1454,7 @@ class TestHeadDispatchStall:
         findings = _diagnose(tmp_path, bridge)
         assert "head_dispatch_stall" in findings
         assert findings["head_dispatch_stall"].severity is Severity.CRITICAL
-        assert findings["head_dispatch_stall"].see_also == "scheduler_starvation_wedge"
+        assert findings["head_dispatch_stall"].see_also is FindingKind.SCHEDULER_STARVATION_WEDGE
 
     def test_known_gate_is_warning(self, tmp_path: Path) -> None:
         """A head parked by a named gate (concurrency cap) is a throughput warning, not a wedge."""
