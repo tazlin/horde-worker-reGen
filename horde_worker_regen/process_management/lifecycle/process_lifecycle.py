@@ -706,6 +706,18 @@ class ProcessLifecycleManager:
         # in-flight post-processing work is recorded known-lost so the recovery coordinator requeues it
         # (bounded), then reports a no-image fault if the lane cannot return a result.
         self._post_process_gpu_paused = False
+        # The card each auxiliary lane was actually placed on, recorded at its spawn and held for the life of
+        # the worker. Placement is a first-placement decision, not a per-start one: a pause is a temporary
+        # eviction, so re-deriving the card at the restore reads a card map that the pause itself distorted
+        # (safety held off-GPU during a reclaim makes its card look like the emptiest one) and lands the lane
+        # on top of the very tenants it was placed away from. The pin is only given up when the card leaves
+        # the driven set, so a hot-reload that drops a card still re-places the lane.
+        self._post_process_pinned_card: int | None = None
+        self._utilities_pinned_card: int | None = None
+        # The last disclosed (safety card, lane names) co-tenancy, so the notice is edge-triggered: it fires
+        # once when an auxiliary lane's pinned card becomes the on-GPU safety card and stays quiet until that
+        # changes. None means nothing is currently shared.
+        self._auxiliary_lane_safety_sharing_notice: tuple[int, tuple[str, ...]] | None = None
         # Which initiator (whole-card residency or the reclaim ladder) holds the current pause, so only its
         # restore path clears it; None while the lane is not paused. See :class:`PauseOwner`.
         self._post_process_pause_owner: PauseOwner | None = None
@@ -1245,9 +1257,10 @@ class ProcessLifecycleManager:
             self._register_owned(self._process_map[pid])
 
             self._safety_start_initiated_at = time.time()
-            # Parsed by analysis/log_signatures.py (safety_lane_started): change the message and the registry together.
+            # Log contract: analysis/log_signatures.py (safety_lane_started).
             logger.info(f"Started safety process (id: {pid})")
             self.num_processes_launched += 1
+            self._note_auxiliary_lane_safety_sharing()
         return True
 
     def post_process_lane_enabled(self) -> bool:
@@ -1263,19 +1276,101 @@ class ProcessLifecycleManager:
             or self._runtime_config.bridge_data.enable_pipeline_disaggregation
         )
 
-    def _post_process_card(self) -> CardRuntime:
-        """Return the card the dedicated post-processing lane is pinned to.
+    def _place_auxiliary_lane(self, *, co_tenant_cards: tuple[int, ...]) -> CardRuntime:
+        """Return the card best able to host an auxiliary lane placed now.
 
-        The lane avoids sharing a card with an on-GPU safety context when another card exists; otherwise
-        it takes the first configured card.
+        A single-card host always answers card 0 without consulting anything, so nothing about the
+        multi-card ordering below reaches it.
+
+        On a multi-card host the safety card is excluded first (an auxiliary lane's peak must not compete
+        with the safety context when somewhere else will take it), and the remaining cards are ordered by
+        how many auxiliary lanes already sit on them, then by measured free VRAM (largest first), then by
+        device index. Tenant count leads because an already-placed lane's peak is a claim on the card that
+        its present free reading does not yet show, whereas the reading only describes the instant it was
+        taken; spreading the lanes first and comparing readings second keeps two lanes from stacking on a
+        card that merely happens to look empty between jobs.
+
+        Without a measured free reading for any eligible card the order collapses to the device index,
+        which is the historical static rule (the lowest-index card, or the second card when safety holds
+        the first).
+
+        Args:
+            co_tenant_cards: Cards already carrying another auxiliary lane, counted as tenants.
+
+        Returns:
+            The chosen card runtime.
         """
         ordered_cards = [self._card_runtimes[index] for index in sorted(self._card_runtimes)]
-        safety_holds_first_card = (
+        if len(ordered_cards) == 1:
+            return ordered_cards[0]
+
+        safety_holds_a_card = (
             self.safety_on_gpu_permitted and not is_cpu_only_install() and not self._safety_gpu_paused
         )
-        if safety_holds_first_card and len(ordered_cards) > 1:
-            return ordered_cards[1]
-        return ordered_cards[0]
+        eligible_cards = ordered_cards
+        if safety_holds_a_card:
+            safety_card_index = (
+                self._safety_pinned_card if self._safety_pinned_card is not None else ordered_cards[0].device_index
+            )
+            eligible_cards = [
+                card for card in ordered_cards if card.device_index != safety_card_index
+            ] or ordered_cards
+
+        free_mb_by_card = {
+            card.device_index: self._device_free_mb_provider(card.device_index) for card in eligible_cards
+        }
+        if all(free_mb is None for free_mb in free_mb_by_card.values()):
+            return eligible_cards[0]
+
+        def placement_rank(card: CardRuntime) -> tuple[int, float, int]:
+            free_mb = free_mb_by_card[card.device_index]
+            return (
+                co_tenant_cards.count(card.device_index),
+                -(free_mb if free_mb is not None else 0.0),
+                card.device_index,
+            )
+
+        return min(eligible_cards, key=placement_rank)
+
+    def _auxiliary_lane_card(self, *, pinned_card: int | None, co_tenant_cards: tuple[int, ...]) -> CardRuntime:
+        """Return a lane's pinned card, re-placing it only when that card has left the driven set."""
+        if pinned_card is not None and pinned_card in self._card_runtimes:
+            return self._card_runtimes[pinned_card]
+        return self._place_auxiliary_lane(co_tenant_cards=co_tenant_cards)
+
+    def _note_auxiliary_lane_safety_sharing(self) -> None:
+        """Disclose, once per onset, that an auxiliary lane's pinned card is now the on-GPU safety card.
+
+        Nothing is moved: a pinned lane stays where it was placed, and migrating it is a scheduling
+        decision. This exists so the placement is legible after a pause/restore has brought safety back to
+        a card an auxiliary lane already holds. Silent on a single-card host, where the two always share.
+        """
+        if len(self._card_runtimes) < 2:
+            return
+        safety_card = self.safety_gpu_card_index()
+        sharing_lanes: list[str] = []
+        if safety_card is not None:
+            if self._post_process_pinned_card == safety_card:
+                sharing_lanes.append("post-processing")
+            if self._utilities_pinned_card == safety_card:
+                sharing_lanes.append("image-utilities")
+        current_sharing = (safety_card, tuple(sharing_lanes)) if safety_card is not None and sharing_lanes else None
+        if current_sharing == self._auxiliary_lane_safety_sharing_notice:
+            return
+        self._auxiliary_lane_safety_sharing_notice = current_sharing
+        if current_sharing is None:
+            return
+        logger.info(
+            f"The safety process and the {' and '.join(sharing_lanes)} lane(s) now share device "
+            f"{safety_card}; the lane(s) stay on the card they were placed on.",
+        )
+
+    def _post_process_card(self) -> CardRuntime:
+        """Return the card the dedicated post-processing lane is pinned to (placing it if it has none)."""
+        return self._auxiliary_lane_card(
+            pinned_card=self._post_process_pinned_card,
+            co_tenant_cards=() if self._utilities_pinned_card is None else (self._utilities_pinned_card,),
+        )
 
     def post_process_lane_card_index(self) -> int:
         """Return the device index the dedicated post-processing lane is (or would be) pinned to."""
@@ -1343,9 +1438,12 @@ class ProcessLifecycleManager:
         )
         self._register_owned(self._process_map[pid])
 
-        # Parsed by analysis/log_signatures.py (post_process_lane_started): change the message and the registry together.
+        self._post_process_pinned_card = lane_card.device_index
+
+        # Log contract: analysis/log_signatures.py (post_process_lane_started).
         logger.info(f"Started post-process process (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
+        self._note_auxiliary_lane_safety_sharing()
         return True
 
     def end_post_process_processes(self) -> None:
@@ -1450,8 +1548,15 @@ class ProcessLifecycleManager:
         return self._runtime_config.bridge_data.enable_image_utilities is True
 
     def _utilities_card(self) -> CardRuntime:
-        """Return the card the image-utilities lane is pinned to (the post-processing lane's placement)."""
-        return self._post_process_card()
+        """Return the card the image-utilities lane is pinned to (placing it if it has none).
+
+        The post-processing lane's card counts as a tenant, so on a host with a spare card the two lanes
+        do not stack; on a two-card host with safety on one of them they still share the other.
+        """
+        return self._auxiliary_lane_card(
+            pinned_card=self._utilities_pinned_card,
+            co_tenant_cards=() if self._post_process_pinned_card is None else (self._post_process_pinned_card,),
+        )
 
     def utilities_lane_card_index(self) -> int:
         """Return the device index the image-utilities lane is (or would be) pinned to."""
@@ -1613,9 +1718,12 @@ class ProcessLifecycleManager:
         )
         self._register_owned(self._process_map[pid])
 
-        # Parsed by analysis/log_signatures.py (utilities_lane_started): change the message and the registry together.
+        self._utilities_pinned_card = lane_card.device_index
+
+        # Log contract: analysis/log_signatures.py (utilities_lane_started).
         logger.info(f"Started image utilities process (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
+        self._note_auxiliary_lane_safety_sharing()
         return True
 
     def end_utilities_processes(self) -> None:
@@ -2492,7 +2600,7 @@ class ProcessLifecycleManager:
         # A card whose index is not in the plan (e.g. an unexpected device_index) falls back to the lowest
         # configured card so a spawn never fails on a missing key; single-GPU always resolves to card 0.
         card = self._card_runtimes.get(device_index) or self._card_runtimes[min(self._card_runtimes)]
-        # Parsed by analysis/log_signatures.py (inference_lane_started): change the message and the registry together.
+        # Log contract: analysis/log_signatures.py (inference_lane_started).
         logger.info(f"Starting inference process on PID {pid} (device {card.device_index})")
         vram_heavy_models = any_offered_model_wants_whole_card(bridge_data.image_models_to_load)
 
@@ -3005,6 +3113,8 @@ class ProcessLifecycleManager:
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
         logger.info(f"{_pause_owner_phrase(owner)}: moving the safety process off-GPU to free its VRAM context.")
+        # Safety no longer holds a card, so any disclosed co-tenancy is over and a later one is a fresh edge.
+        self._note_auxiliary_lane_safety_sharing()
         return True
 
     def restore_safety_on_gpu(self, *, owner: PauseOwner) -> bool:

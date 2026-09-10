@@ -20,8 +20,22 @@ subprocess bridged by a parent-side adapter. See [Image utilities lane](image_ut
 Dispatch keys on the capability flags (`WorkerCapability`), not on process types, so a new work kind adds a
 flag and a handler rather than special cases. The download process sits outside the lanes entirely.
 
-The post-processing lane is a single shared process pinned to the non-safety card (the first configured card
-when the safety process is CPU-only). It is controlled by `dedicated_post_processing`:
+The post-processing lane is a single shared process pinned to one card for the life of the worker. On a
+multi-card host the card is chosen at the lane's first spawn: safety's card is excluded when safety is on a
+GPU and another card exists, and among the rest the worker prefers a card carrying no other auxiliary lane,
+then the largest measured free VRAM, then the lowest index. With no measured reading anywhere the choice
+falls back to the lowest-index eligible card. A single-card host always answers card 0.
+
+The placement is a pin, not a per-start decision. When the lane is stopped and restarted (a whole-card
+residency yielding the card, a reclaim-ladder pause, a crash and replacement) it returns to the card it was
+placed on. Re-deriving the card at each restart would read a card map the pause itself distorted: with
+safety held off-GPU during a reclaim, safety's card looks like the emptiest one, and the lane restarts on
+top of the tenants it was placed away from. Only a card leaving the driven set (a hot-reload dropping it)
+gives up the pin, and the re-placement then pins in turn. If safety later comes back onto a card an
+auxiliary lane holds, the lane stays where it is and the worker logs one line naming the lanes and the card;
+moving a live lane is a scheduling decision, not a lifecycle one.
+
+The lane is controlled by `dedicated_post_processing`:
 
 - `auto` (default): the lane runs whenever post-processing is allowed (`allow_post_processing`).
 - `on`: the lane always runs.

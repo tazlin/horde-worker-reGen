@@ -2092,7 +2092,7 @@ class HordeWorkerProcessManager:
             )
             for index in device_indices
         }
-        # Parsed by analysis/log_signatures.py (per_card_concurrency, per_card_concurrency_entry): change the message and the registry together.
+        # Log contract: analysis/log_signatures.py (per_card_concurrency, per_card_concurrency_entry).
         logger.debug(f"Resolved per-card concurrency: {per_card_concurrency}")
 
         if mp_primitives is None:
@@ -2195,7 +2195,7 @@ class HordeWorkerProcessManager:
             total_intake = sum(
                 effective_configs[index].queue_size + effective_configs[index].max_threads for index in device_indices
             )
-            # Parsed by analysis/log_signatures.py (driving_cards, per_card_intake): change the message and the registry together.
+            # Log contract: analysis/log_signatures.py (driving_cards, per_card_intake).
             logger.info(
                 f"Driving {len(card_runtimes)} cards, each with its own inference process pool; "
                 f"max_threads/queue_size apply per card. Worker-wide intake budget: {total_intake} job(s) "

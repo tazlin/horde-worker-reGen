@@ -425,7 +425,7 @@ class JobSubmitter:
         if new_submit.completed_job_info.state != GENERATION_STATE.faulted:
             # The job id and model name are formatting arguments: they are server-supplied, and a colorized
             # emission parses only its template for colour tags, so neither can be read as a directive.
-            # Parsed by analysis/log_signatures.py (submitted_generation): change the message and the registry together.
+            # Log contract: analysis/log_signatures.py (submitted_generation).
             logger.opt(colors=True).success(
                 "Submitted generation {} (model: "
                 "<u>{})</u> "
@@ -447,7 +447,7 @@ class JobSubmitter:
                 self._num_job_slowdowns += 1
         # If the job was faulted, log an error
         else:
-            # Parsed by analysis/log_signatures.py (fault_reported): change the message and the registry together.
+            # Log contract: analysis/log_signatures.py (fault_reported).
             logger.error(
                 f"{new_submit.job_id} faulted. Reported fault to the horde. "
                 f"Job popped {time_taken} seconds ago and took "

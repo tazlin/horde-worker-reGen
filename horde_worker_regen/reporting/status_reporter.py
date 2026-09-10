@@ -169,7 +169,7 @@ class StatusReporter:
             logging_function = logger.opt(colors=True).success
 
         # Print header
-        # Parsed by analysis/log_signatures.py (status_header): change the message and the registry together.
+        # Log contract: analysis/log_signatures.py (status_header).
         logging_function("<fg #dddddd>" + str("^" * 80) + "</>")
 
         # Print API messages
@@ -378,7 +378,7 @@ class StatusReporter:
             # contain markup), so per-entry colour tags here would print literally rather than render.
             jobs.append(f"<{shortened_id}: {x.model}>")
 
-        # Parsed by analysis/log_signatures.py (status_jobs, queue_entry): change the message and the registry together.
+        # Log contract: analysis/log_signatures.py (status_jobs, queue_entry).
         logging_function("  Jobs: {}", ", ".join(jobs))
 
         logger.debug(f"Active models: {active_models}")
