@@ -166,7 +166,8 @@ depend on this queue-gated cycle running; see
 2. **Look-ahead**: `get_next_job_and_process(information_only=True)` peeks at the next runnable job to
    decide heavy-model/batch blocking. This method is called _twice_ per cycle (peek, then launch) and
    must agree with itself; line-skip decisions (an already-resident job jumping ahead of a head whose
-   model is still loading, or filling a slot whose process is busy sampling) are cached in
+   model is still loading, filling a slot whose process is busy sampling, or, on a multi-GPU host, running
+   on another card while the head's own card cannot seat it) are cached in
    `_pending_line_skip` to keep the two calls consistent.
 3. **No worker-wide blocking rule**: nothing serializes the pool ahead of dispatch. A controlnet
    workflow (`qr_code`), a batch, and a card-demanding model are all priced per card against measured

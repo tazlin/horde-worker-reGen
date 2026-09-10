@@ -7,6 +7,7 @@ policy). A single-GPU scheduler keeps the original card-agnostic lookup, so rout
 
 from __future__ import annotations
 
+import dataclasses
 from unittest.mock import Mock
 
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -54,10 +55,11 @@ def _make_scheduler(
     *,
     process_map: ProcessMap,
     card_runtimes: dict | None,
+    max_threads: int = 2,
 ) -> InferenceScheduler:
     """Build an InferenceScheduler with a given process map and per-card runtime plan."""
     bridge_data = make_mock_bridge_data()
-    bridge_data.max_threads = 2
+    bridge_data.max_threads = max_threads
     return InferenceScheduler(
         state=WorkerState(),
         process_map=process_map,
@@ -598,3 +600,337 @@ class TestDuplicateCopyEscape:
         scheduler = self._scheduler(process_map)
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         assert await _duplicate_may_serve(scheduler, job) is False
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Cross-card dispatch: a head that cannot be seated must not withhold seating on the worker's other cards
+# ----------------------------------------------------------------------------------------------------------
+
+_ALL_MODELS = ["stable_diffusion", "model_a", "model_b", "model_c", "model_d", "model_e"]
+
+
+def _uniform_cards(count: int, *, max_concurrent_inference: int = 1) -> dict:
+    """``count`` identical cards, each serving every model in ``_ALL_MODELS`` under its own concurrency cap."""
+    cards: dict = {}
+    for index in range(count):
+        config = _card_config(models=_ALL_MODELS, max_pixels=5_000_000)
+        # The card's effective config carries the same thread count its semaphores were sized for, as the
+        # real per-card plan derives both from one figure.
+        config.max_threads = max_concurrent_inference
+        cards.update(
+            make_test_card_runtimes(
+                device_indices=(index,),
+                config=config,
+                max_concurrent_inference=max_concurrent_inference,
+                target_process_count=2,
+            ),
+        )
+    return cards
+
+
+def _lane(process_id: int, *, device_index: int, model: str | None) -> HordeProcessInfo:
+    """An idle inference lane on ``device_index`` holding ``model``'s weights."""
+    return make_mock_process_info(process_id, model_name=model, device_index=device_index)
+
+
+async def _queue(scheduler: InferenceScheduler, *models: str) -> list[ImageGenerateJobPopResponse]:
+    """Pop one job per model, in order, so the first is the dispatch head."""
+    jobs = []
+    for model in models:
+        job = make_job_pop_response(model=model, width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, job)
+        jobs.append(job)
+    return jobs
+
+
+async def _seat(
+    scheduler: InferenceScheduler,
+    job: ImageGenerateJobPopResponse,
+    process: HordeProcessInfo,
+) -> None:
+    """Put ``job`` in progress on ``process``, as a committed dispatch leaves the world."""
+    process.record_inference_ownership(job, attempt_ordinal=0)
+    process.last_process_state = HordeProcessState.INFERENCE_STARTING
+    await scheduler._job_tracker.mark_inference_started(job, device_index=process.device_index)
+
+
+async def _drain_one_cycle(scheduler: InferenceScheduler) -> list[tuple[ImageGenerateJobPopResponse, int]]:
+    """Every (job, card) selection one scheduling cycle's dispatch loop would commit, in order.
+
+    Stands in for ``while await start_inference()``: each selection is seated exactly as a committed dispatch
+    leaves the world, so the next call sees the card it filled. Bounded by the queue length, so a selector
+    that never stops handing out the same job fails as a hang rather than passing.
+    """
+    scheduler.begin_scheduling_cycle()
+    seated: list[tuple[ImageGenerateJobPopResponse, int]] = []
+    for _attempt in range(len(scheduler._job_tracker.jobs_pending_inference) + 1):
+        selection = await scheduler.get_next_job_and_process()
+        if selection is None:
+            return seated
+        await _seat(scheduler, selection.next_job, selection.process_with_model)
+        seated.append((selection.next_job, selection.process_with_model.device_index))
+        scheduler._pending_line_skip = None
+    raise AssertionError("the dispatch loop kept selecting past the whole queue")
+
+
+class TestWorkerWideConcurrencyCeiling:
+    """The worker's concurrent-sampling ceiling is the sum of its cards', not one card's figure."""
+
+    def test_single_card_ceiling_is_the_live_thread_cap(self) -> None:
+        """One card keeps the pre-multi-GPU answer: the live effective max_threads."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: _lane(0, device_index=0, model="stable_diffusion")}),
+            card_runtimes=_uniform_cards(1, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        assert scheduler.worker_wide_concurrency_ceiling() == 2
+
+    def test_ceiling_sums_every_driven_card(self) -> None:
+        """Eight cards at one thread each admit eight concurrent jobs, not one."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: _lane(0, device_index=0, model="stable_diffusion")}),
+            card_runtimes=_uniform_cards(8, max_concurrent_inference=1),
+            max_threads=1,
+        )
+        assert scheduler.worker_wide_concurrency_ceiling() == 8
+        assert scheduler._max_jobs_in_progress_allowed() == 8
+        assert scheduler._max_jobs_in_progress_allowed(card=scheduler._card_runtimes[3]) == 1
+
+    def test_a_lowered_live_cap_lowers_every_card(self) -> None:
+        """A runtime thread reduction reaches the sum: four cards at two threads fall to four."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: _lane(0, device_index=0, model="stable_diffusion")}),
+            card_runtimes=_uniform_cards(4, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        assert scheduler.worker_wide_concurrency_ceiling() == 8
+
+        scheduler._runtime_config.set_effective_max_threads(1)
+
+        assert scheduler.worker_wide_concurrency_ceiling() == 4
+
+
+class TestCrossCardDispatch:
+    """A head parked on one card leaves every other card free to take work from further down the queue."""
+
+    async def test_every_free_card_is_filled_in_one_cycle(self) -> None:
+        """Best case: four idle cards each holding a queued model take one job apiece in a single cycle."""
+        process_map = ProcessMap(
+            {index: _lane(index, device_index=index, model=f"model_{letter}") for index, letter in enumerate("abcd")},
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_uniform_cards(4),
+            max_threads=1,
+        )
+        await _queue(scheduler, "model_a", "model_b", "model_c", "model_d")
+
+        seated = await _drain_one_cycle(scheduler)
+
+        assert [card for _job, card in seated] == [0, 1, 2, 3]
+
+    async def test_a_busy_head_lane_does_not_hold_the_other_cards(self) -> None:
+        """Worst case: the head's only copy is on a busy lane; every other card still takes its own job."""
+        head_lane = _lane(0, device_index=0, model="model_a")
+        process_map = ProcessMap(
+            {
+                0: head_lane,
+                1: _lane(1, device_index=1, model="model_b"),
+                2: _lane(2, device_index=2, model="model_c"),
+                3: _lane(3, device_index=3, model="model_d"),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(4), max_threads=1)
+        blocking_job, head, *_followers = await _queue(scheduler, "model_a", "model_a", "model_b", "model_c")
+        await _seat(scheduler, blocking_job, head_lane)
+
+        seated = await _drain_one_cycle(scheduler)
+
+        assert [card for _job, card in seated] == [1, 2]
+        assert head in scheduler._job_tracker.jobs_pending_inference
+        assert scheduler._affinity_skip_state.skip_count == 0
+
+    async def test_a_cold_head_does_not_hold_the_other_cards(self) -> None:
+        """With the head's model resident nowhere, more than one card's worth of resident work still runs.
+
+        A cold head is counted against the whole worker's ceiling rather than one card's, so this is what the
+        per-card sum buys: the first bypass fills one card, and the second is only reachable because the
+        ceiling is the pool's rather than a single card's thread count.
+        """
+        process_map = ProcessMap(
+            {
+                0: _lane(0, device_index=0, model=None),
+                1: _lane(1, device_index=1, model="model_b"),
+                2: _lane(2, device_index=2, model="model_c"),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(3), max_threads=1)
+        cold_head, *_followers = await _queue(scheduler, "model_a", "model_b", "model_c")
+
+        seated = await _drain_one_cycle(scheduler)
+
+        assert [card for _job, card in seated] == [1, 2]
+        assert cold_head in scheduler._job_tracker.jobs_pending_inference
+        assert scheduler._affinity_skip_state.skip_count == 0
+
+    async def test_the_head_card_is_left_to_the_head(self) -> None:
+        """A job resident on an idle lane of the head's own card is not seated ahead of the head.
+
+        The head's card carries a sibling that has taken its one sampling slot, so the head waits for that
+        slot rather than for its own lane. Both the card's cap and the head's claim on it refuse the
+        candidate, and the second card's job is what runs instead.
+        """
+        head_lane = _lane(0, device_index=0, model="model_a")
+        sibling_lane = _lane(1, device_index=0, model="model_b")
+        process_map = ProcessMap(
+            {
+                0: head_lane,
+                1: sibling_lane,
+                2: _lane(2, device_index=1, model="model_c"),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2), max_threads=1)
+        sibling_job, head, same_card_candidate, other_card_candidate = await _queue(
+            scheduler,
+            "model_b",
+            "model_a",
+            "model_b",
+            "model_c",
+        )
+        await _seat(scheduler, sibling_job, sibling_lane)
+        # The sibling's lane is busy, but the head's own lane is idle and holds the head's model.
+        assert head_lane.can_accept_job()
+
+        selection = await scheduler.get_next_job_and_process()
+
+        assert selection is not None
+        assert selection.next_job is other_card_candidate
+        assert selection.process_with_model.device_index == 1
+        assert same_card_candidate in scheduler._job_tracker.jobs_pending_inference
+        assert head in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_every_card_at_cap_dispatches_nothing(self) -> None:
+        """With every card's sampling slot taken, selection returns nothing and the dispatch loop ends."""
+        lanes = {index: _lane(index, device_index=index, model=f"model_{letter}") for index, letter in enumerate("ab")}
+        process_map = ProcessMap(lanes)
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2), max_threads=1)
+        running_a, running_b, *_pending = await _queue(scheduler, "model_a", "model_b", "model_a", "model_b")
+        await _seat(scheduler, running_a, lanes[0])
+        await _seat(scheduler, running_b, lanes[1])
+
+        assert await scheduler.get_next_job_and_process() is None
+        assert await scheduler.start_inference() is False
+
+    async def test_a_candidate_resident_only_on_an_ineligible_card_is_skipped(self) -> None:
+        """Cross-card seating obeys card eligibility: an unservable candidate is passed for the next one."""
+        head_lane = _lane(0, device_index=0, model="model_a")
+        process_map = ProcessMap(
+            {
+                0: head_lane,
+                1: _lane(1, device_index=1, model="model_b"),
+                2: _lane(2, device_index=2, model="model_c"),
+            },
+        )
+        card_runtimes = _uniform_cards(3)
+        # Card 1 cannot serve any job of this size, so its resident copy of model_b is unreachable.
+        card_runtimes[1] = dataclasses.replace(
+            card_runtimes[1],
+            config=_card_config(models=_ALL_MODELS, max_pixels=1000),
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=card_runtimes, max_threads=1)
+        blocking_job, _head, ineligible_candidate, servable_candidate = await _queue(
+            scheduler,
+            "model_a",
+            "model_a",
+            "model_b",
+            "model_c",
+        )
+        await _seat(scheduler, blocking_job, head_lane)
+
+        selection = await scheduler.get_next_job_and_process()
+
+        assert selection is not None
+        assert selection.next_job is servable_candidate
+        assert selection.process_with_model.device_index == 2
+        assert ineligible_candidate in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_an_exclusive_job_suppresses_only_its_own_card(self) -> None:
+        """An exclusively-admitted job holds its card to itself; the worker's other cards keep dispatching.
+
+        Card 1 has room under its cap and an idle lane already holding the candidate's model, so only the
+        exclusive hold can refuse it; card 2 shows the suppression did not spread to the rest of the pool.
+        """
+        head_lane = _lane(0, device_index=0, model="model_a")
+        exclusive_lane = _lane(1, device_index=1, model="model_b")
+        process_map = ProcessMap(
+            {
+                0: head_lane,
+                1: exclusive_lane,
+                2: _lane(2, device_index=2, model="model_c"),
+                3: _lane(3, device_index=1, model="model_b"),
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_uniform_cards(3, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        blocking_job, _head, exclusive_job, suppressed_candidate, free_card_candidate = await _queue(
+            scheduler,
+            "model_a",
+            "model_a",
+            "model_b",
+            "model_b",
+            "model_c",
+        )
+        await _seat(scheduler, blocking_job, head_lane)
+        await _seat(scheduler, exclusive_job, exclusive_lane)
+        scheduler._job_tracker.mark_admitted_exclusive(exclusive_job, device_index=1)
+
+        selection = await scheduler.get_next_job_and_process()
+
+        assert selection is not None
+        assert selection.next_job is free_card_candidate
+        assert selection.process_with_model.device_index == 2
+        assert suppressed_candidate in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_the_look_ahead_and_the_dispatch_call_agree(self) -> None:
+        """The cache contract: both calls in a cycle name the same pair, and the peek changes nothing."""
+        head_lane = _lane(0, device_index=0, model="model_a")
+        process_map = ProcessMap(
+            {
+                0: head_lane,
+                1: _lane(1, device_index=1, model="model_b"),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2), max_threads=1)
+        blocking_job, head, candidate = await _queue(scheduler, "model_a", "model_a", "model_b")
+        await _seat(scheduler, blocking_job, head_lane)
+
+        peeked = await scheduler.get_next_job_and_process(information_only=True)
+        launched = await scheduler.get_next_job_and_process()
+
+        assert peeked is not None and launched is not None
+        assert peeked.next_job is candidate
+        assert launched.next_job is candidate
+        assert launched.process_with_model.device_index == 1
+        assert launched.line_skip is not None
+        assert launched.line_skip.reason == "cross_card"
+        assert launched.line_skip.displaced_job is head
+        assert candidate in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_a_single_card_head_at_its_cap_still_dispatches_nothing(self) -> None:
+        """Single-GPU parity: one card at its cap withholds dispatch exactly as it always has."""
+        head_lane = _lane(0, device_index=0, model="model_a")
+        process_map = ProcessMap(
+            {
+                0: head_lane,
+                1: _lane(1, device_index=0, model="model_b"),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(1), max_threads=1)
+        blocking_job, _head, _candidate = await _queue(scheduler, "model_a", "model_a", "model_b")
+        await _seat(scheduler, blocking_job, head_lane)
+
+        assert scheduler._multi_gpu_routing_active is False
+        assert await scheduler.get_next_job_and_process() is None

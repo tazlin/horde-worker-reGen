@@ -392,16 +392,24 @@ still usable. It is pure and table-testable, with no scheduler imports.
 ### The line-skip cache
 
 `get_next_job_and_process` is called twice per cycle: once to peek and once to
-launch. It can let a later job skip ahead of the queue head for two healthy
+launch. It can let a later job skip ahead of the queue head for three healthy
 reasons: the head's model is still loading (or is resident only on a
 disaggregation-pinned lane it is waiting to reuse), so an already-resident
-distinct-model job runs on the free process in the meantime; or the head's own
-process is busy sampling, so a distinct already-resident model fills the
-otherwise-idle slot. Both decisions depend on transient process state, so the
+distinct-model job runs on the free process in the meantime (`resident_bypass`);
+the head's own process is busy sampling, so a distinct already-resident model
+fills the otherwise-idle slot (`diversity`); or, on a worker driving several
+cards, the head's card cannot seat it at all and another card can run a later job
+right now (`cross_card`). All three depend on transient process state, so the
 chosen skip is cached in `_pending_line_skip` and returned on the launch call.
 Without this cache the launch call could pick a different job and waste the
 peek's decision. The head keeps its queue position and dispatches once its
 process frees.
+
+Only `resident_bypass` spends the head's affinity skip budget, which bounds how
+long a head may be passed for the lane it is waiting on. A `diversity` fill and a
+`cross_card` dispatch both leave the window untouched: neither takes capacity the
+head is queued for, and `cross_card` lands on a different card entirely, so the
+head's own card is left free for it.
 
 ### Staging a pin-waiting head ahead of its sampler
 

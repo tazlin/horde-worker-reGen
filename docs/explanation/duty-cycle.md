@@ -219,6 +219,11 @@ exactly one named reason the slot stayed empty, so the shares sum to 100% of `ca
 slot attribution (capacity 2): sampling 61%, overlap_headway 17%, no_local_work 12%, model_loading 6%
 ```
 
+The capacity in that line is every sampling slot the worker owns: one card's `max_threads` on a single-GPU
+host, and the sum over driven cards on a multi-GPU one, since each card runs its own pool under its own copy
+of the setting. A head held by its own card's cap while other cards keep dispatching is attributed to
+`concurrency_cap` and says which card, so a per-card park is not read as a worker-wide one.
+
 `no_local_work` is supply-side (no queued job wanted the slot: horde demand or a pop governor, which
 the pop-governor registry names). Every other bucket is a scheduler gate, derived by the same
 classification that explains a parked head

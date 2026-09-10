@@ -78,6 +78,30 @@ the RAM reclaim sequence behind a RAM miss (`_apply_ram_verdict`), dispatch sele
 (`get_next_job_and_process`) and the dispatch holds (`_dispatch_residency_reconciliation_holds`). Each is
 actuation over the same collaborators and will take the same shape.
 
+### Dispatch selection
+
+`get_next_job_and_process` walks the pending queue in placement order and returns at most one job and the
+process it runs on, plus a `LineSkip` when the job chosen is not the head. The concurrency cap it compares
+against is the head's **card**, not the worker: each card has its own process pool, its own inference
+semaphore and its own copy of `max_threads`, so the worker-wide ceiling is the sum over driven cards
+(`worker_wide_concurrency_ceiling`).
+
+A head that cannot be seated therefore blocks only its own card. Where the worker drives more than one, the
+walk resumes and the first job another card can serve immediately is dispatched instead
+(`LineSkip(reason="cross_card")`). The head's own card is excluded, so nothing takes the capacity it is
+queued for; a cold head excludes no card, because a preload it could take is admitted earlier in the same
+cycle and ends the cycle before any dispatch is attempted. The three line-skip reasons differ in what they
+cost the head:
+
+| Reason | When | Effect on the head's affinity skip window |
+| --- | --- | --- |
+| `resident_bypass` | the head's model is not resident and a resident-model job passes it | counted; bounded by the skip budget and the anti-starvation override |
+| `diversity` | the head's own lane is busy sampling its model, and a distinct model is resident and idle | untouched |
+| `cross_card` | the head's card cannot seat it, and another card can run a later job now | untouched: the dispatch takes nothing the head is waiting for |
+
+A single-GPU worker takes none of the per-card branches: the cap is the worker-wide one it always was, and
+`cross_card` never arises.
+
 ## One job through the preload pass
 
 ```mermaid

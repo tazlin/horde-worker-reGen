@@ -228,9 +228,11 @@ class LineSkip(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     displaced_job: ImageGenerateJobPopResponse
     """The earlier-queued job that the chosen job jumped ahead of."""
-    reason: Literal["diversity", "resident_bypass"]
-    """Why the displaced job was passed: ``diversity`` (its process is busy sampling) or ``resident_bypass``
-    (its model is not yet resident and a resident-model job passed it under the affinity skip budget)."""
+    reason: Literal["diversity", "resident_bypass", "cross_card"]
+    """Why the displaced job was passed: ``diversity`` (its process is busy sampling), ``resident_bypass``
+    (its model is not yet resident and a resident-model job passed it under the affinity skip budget), or
+    ``cross_card`` (the displaced job's own card cannot seat it, and the chosen job runs on a different card
+    whose idle capacity it does not compete for). Only ``resident_bypass`` spends the head's skip budget."""
 
 
 class NextJobAndProcess(BaseModel):

@@ -98,8 +98,16 @@ their sum:
 - The **megapixelstep budget** (how much work-in-magnitude may be pending before pops pause) is the sum of
   every card's performance-mode figure (15 normal / 60 moderate / 80 high), each card contributing per its
   own effective mode.
+- The **concurrent-sampling ceiling** (how many jobs may sample at once across the whole worker) is the sum
+  of every card's `max_threads`. Eight cards at `max_threads: 1` run 8 concurrent jobs, not 1.
 - A model busy sampling on one card may be **loaded a second time onto an idle card** when queued demand
   warrants it; the VRAM budget and displacement guards still gate the load.
+
+Dispatch selection follows the same rule. The head of the queue can only be seated on a card that can serve
+it, so a head whose card is at its own `max_threads`, whose resident lane is busy, or whose model is not
+loaded anywhere yet is a fact about **one** card. The scheduler carries on down the queue and seats the
+first job another card can run immediately; the head keeps its queue position and its claim on the card it
+is waiting for. The card the head waits on is left alone, so nothing takes the capacity it is queued for.
 
 At startup the worker logs how the per-card figures compose ("Driving N cards, each with its own inference
 process pool …" and the megapixelstep budget line), so the effective worker-wide appetite is always stated

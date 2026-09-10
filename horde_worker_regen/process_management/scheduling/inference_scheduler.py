@@ -847,8 +847,35 @@ class InferenceScheduler:
 
     @property
     def _max_concurrent_inference_processes(self) -> int:
-        """The live concurrent-inference cap (effective ``max_threads``), bounded by the ceiling."""
+        """The live concurrent-inference cap (effective ``max_threads``), bounded by the ceiling.
+
+        This is one card's worth of concurrency: ``max_threads`` is a per-card figure, and every driven card
+        runs its own process pool sized by it. For the whole worker's ceiling use
+        :meth:`worker_wide_concurrency_ceiling`.
+        """
         return self._runtime_config.effective_max_threads
+
+    def worker_wide_concurrency_ceiling(self) -> int:
+        """The number of jobs this worker may have sampling at once across every card it drives.
+
+        On a single-GPU host this is the live concurrent-inference cap unchanged. Each driven card has its
+        own process pool, its own inference semaphore and its own copy of ``max_threads``, so the worker-wide
+        answer on a multi-card host is the sum over cards; using one card's figure for the whole worker caps
+        the worker at a single card's work no matter how many cards sit idle.
+
+        The live cap (which a supervisor or governor can lower at runtime) is a single worker-wide number:
+        no per-card live value exists. It is therefore applied to every card as the same absolute change
+        from that card's configured ``max_threads``, floored at one job per card and bounded by what the
+        card's semaphores were provisioned for.
+        """
+        live_cap = self._runtime_config.effective_max_threads
+        if not self._multi_gpu_routing_active:
+            return live_cap
+        thread_delta = live_cap - self._runtime_config.bridge_data.max_threads
+        return sum(
+            max(1, min(card.max_concurrent_inference, card.config.max_threads + thread_delta))
+            for card in self._card_runtimes.values()
+        )
 
     def _expected_sampling_seconds(
         self,
@@ -3657,6 +3684,28 @@ class InferenceScheduler:
             )
 
         # Resident on an idle process: the interesting case. Name the gate that is holding dispatch.
+        # A card is its own concurrency domain, so on a multi-card host the head is parked by its *own*
+        # card's cap while every other card keeps dispatching. Naming that first stops a per-card park
+        # reading as a worker-wide one and sending an operator after max_threads.
+        head_card = self._card_runtimes.get(process.device_index) if self._multi_gpu_routing_active else None
+        if head_card is not None:
+            jobs_on_head_card = len(self._jobs_in_progress_on_card(head_card.device_index))
+            head_card_cap = self._max_jobs_in_progress_allowed(card=head_card)
+            if jobs_on_head_card >= head_card_cap:
+                if self._job_tracker.has_exclusive_job_in_progress(head_card.device_index) and not (
+                    self._job_tracker.is_admitted_exclusive(head)
+                ):
+                    return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
+                        f"its model is resident and idle on process {process.process_id}, but an exclusively-"
+                        f"admitted over-budget job has card {head_card.device_index} to itself "
+                        f"(on_card={jobs_on_head_card})"
+                    )
+                return SlotDutyBucket.CONCURRENCY_CAP, (
+                    f"its model is resident and idle on process {process.process_id}, but card "
+                    f"{head_card.device_index} is at its own concurrency cap (on_card={jobs_on_head_card}, "
+                    f"cap={head_card_cap}); the worker's other cards are free to dispatch"
+                )
+
         in_progress = len(self._job_tracker.jobs_in_progress)
         cap = self._max_jobs_in_progress_allowed()
         if in_progress >= cap:
@@ -3842,7 +3891,10 @@ class InferenceScheduler:
         holding it, or waiting its turn for a slot) attributes the empty sampling slot to ``CLEARANCE_HOLD``.
         Without the lease dispatch is the sampling moment, so busy is the in-progress count exactly as before.
         """
-        capacity = max(int(self._max_concurrent_inference_processes or 0), 0)
+        # The slots priced here are every sampling slot the worker owns, and the in-progress count compared
+        # against them is worker-wide, so the capacity is the sum over driven cards (one card's figure on a
+        # single-GPU host).
+        capacity = max(int(self.worker_wide_concurrency_ceiling() or 0), 0)
         in_progress = self._job_tracker.jobs_in_progress
 
         if self._clearance_lease_active():
@@ -5190,10 +5242,12 @@ class InferenceScheduler:
         Args:
             card: When the worker drives more than one card, the card this decision is scoped to: its
                 own sampling-slot and process ceilings are used so the big card's spare threads never
-                inflate a small card's allowance. ``None`` keeps the worker-wide global ceilings, which
-                is exactly the single-GPU case (byte-identical to before). The free-VRAM staging
-                headroom is that card's own measured free; ``None`` reads the worker-wide (tightest-card)
-                figure.
+                inflate a small card's allowance. ``None`` asks for the whole worker's ceiling, which on
+                one card is the global figure exactly as before and on several is the per-card sum
+                (:meth:`worker_wide_concurrency_ceiling`); a single card's figure would otherwise stand in
+                for the whole fleet and hold every idle card at one card's worth of work. The free-VRAM
+                staging headroom is that card's own measured free; ``None`` reads the worker-wide
+                (tightest-card) figure.
         """
         # An exclusive admit suppresses only its planned card once routing has attributed it. Before attribution
         # (and on the worker-wide single-GPU path), the conservative worker-wide answer still blocks every card.
@@ -5210,7 +5264,7 @@ class InferenceScheduler:
             concurrent_ceiling = card.max_concurrent_inference
             process_ceiling = card.target_process_count
         else:
-            concurrent_ceiling = self._max_concurrent_inference_processes
+            concurrent_ceiling = self.worker_wide_concurrency_ceiling()
             process_ceiling = self._max_inference_processes
 
         base = concurrent_ceiling
@@ -5549,6 +5603,7 @@ class InferenceScheduler:
                         f"process is {state}.",
                     )
                 case StaleEntryReason.DISPLACED:
+                    # Parsed by analysis/log_signatures.py (displaced_entry_expired): change the message and the registry together.
                     logger.warning(
                         f"Expiring displaced entry for {entry.model} on process {entry.process_id}: "
                         f"the slot now holds {entry.holder_model}.",
@@ -5653,6 +5708,7 @@ class InferenceScheduler:
 
         self._preload_delay_notified = False
         self._clear_head_starvation_timer()
+        # Parsed by analysis/log_signatures.py (model_preloading): change the message and the registry together.
         logger.debug(f"Preloading model {job.model} on process {available_process.process_id}")
         logger.debug(f"Available inference processes: {self._process_map}")
         only_active_models = {
@@ -7224,6 +7280,7 @@ class InferenceScheduler:
                 process.last_process_state == HordeProcessState.PRELOADED_MODEL
                 and process.loaded_horde_model_name not in pending_models
             ):
+                # Parsed by analysis/log_signatures.py (preload_cleared): change the message and the registry together.
                 logger.debug(
                     f"Clearing preloaded model {process.loaded_horde_model_name} "
                     f"from process {process.process_id} as it is no longer needed",
@@ -7633,16 +7690,112 @@ class InferenceScheduler:
                 continue
             if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
                 continue
-            candidate_process = self.resident_process_for_job(candidate_job)
-            if candidate_process is None or not candidate_process.can_accept_job():
-                continue
-            if not self._concurrent_overlap_allowed(
-                candidate_job,
-                target_device_index=candidate_process.device_index,
-            ):
+            candidate_process = self._seatable_resident_process(candidate_job)
+            if candidate_process is None:
                 continue
             return candidate_job, candidate_process
         return None
+
+    def _seatable_resident_process(
+        self,
+        candidate_job: ImageGenerateJobPopResponse,
+    ) -> HordeProcessInfo | None:
+        """The idle resident process ``candidate_job`` could be dispatched onto this instant, else None.
+
+        One statement of "this job can be seated right now", shared by the diversity fill and the cross-card
+        fallback so the two can never reach different answers: the job's model is resident on a process that
+        can take work, that process's card admits the overlap, and -- where the worker drives more than one
+        card -- that card is under its own concurrency cap and carries no exclusive job holding it. The
+        per-card legs are inert on a single-GPU host, whose caller has already compared the worker-wide
+        count against the worker-wide cap, so a one-card answer is the resident-and-idle question exactly as
+        it was before cards were routed separately.
+        """
+        candidate_process = self.resident_process_for_job(candidate_job)
+        if candidate_process is None or not candidate_process.can_accept_job():
+            return None
+        candidate_device_index = candidate_process.device_index
+        if self._multi_gpu_routing_active:
+            candidate_card = self._card_runtimes.get(candidate_device_index)
+            if candidate_card is None:
+                return None
+            if not self._job_tracker.is_admitted_exclusive(candidate_job) and (
+                self._job_tracker.has_exclusive_job_in_progress(candidate_device_index)
+                or self._exclusive_dispatch_suppression_active(candidate_device_index)
+            ):
+                return None
+            if len(self._jobs_in_progress_on_card(candidate_device_index)) >= self._max_jobs_in_progress_allowed(
+                card=candidate_card,
+            ):
+                return None
+        if not self._concurrent_overlap_allowed(candidate_job, target_device_index=candidate_device_index):
+            return None
+        return candidate_process
+
+    def _select_cross_card_job(
+        self,
+        head_job: ImageGenerateJobPopResponse,
+        candidates: list[ImageGenerateJobPopResponse],
+        *,
+        head_device_index: int | None,
+    ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
+        """A pending job seatable on a card other than the head's, when the head itself cannot be seated.
+
+        Cards are independent sampling domains, so a head that has to wait -- its own card at that card's
+        cap, its resident lane busy, or its model not resident anywhere yet -- is a fact about one card.
+        Returning nothing at that point would idle every other card for as long as the head waits, which on
+        a host with many cards is nearly the whole fleet. This resumes the placement-order walk and returns
+        the first job that another card can serve immediately.
+
+        The head's own card is excluded outright. Where the head is waiting for a lane there, that card's
+        capacity is the head's to claim the moment it frees, and its cap would refuse the candidate anyway;
+        excluding it says so directly rather than relying on the arithmetic. A cold head names no card, and
+        needs none excluded: a preload it could take runs earlier in the same cycle and ends the cycle before
+        any dispatch is attempted, so nothing seated here can take the slot its load was going to use.
+
+        The head keeps its queue position, and the skip costs it nothing: the affinity skip budget bounds a
+        head being passed *for the lane it is waiting on*, and a dispatch onto another card takes nothing
+        from it (see the ``cross_card`` line-skip reason, which the dispatch path deliberately does not
+        count).
+        """
+        if not self._multi_gpu_routing_active:
+            return None
+        for candidate_job in candidates:
+            if candidate_job is head_job or candidate_job.model is None:
+                continue
+            # A degraded retry must run isolated (as in the diversity and resident-bypass paths), so it is
+            # never seated beside other work.
+            if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
+                continue
+            candidate_process = self._seatable_resident_process(candidate_job)
+            if candidate_process is None or candidate_process.device_index == head_device_index:
+                continue
+            return candidate_job, candidate_process
+        return None
+
+    def _cross_card_selection(
+        self,
+        head_job: ImageGenerateJobPopResponse,
+        candidates: list[ImageGenerateJobPopResponse],
+        *,
+        head_device_index: int | None,
+    ) -> NextJobAndProcess | None:
+        """Build (and cache) the cross-card line-skip for an unseatable head, or None if no card can help.
+
+        The cache is set here for the same reason the ordinary line-skip path sets it: selection runs twice
+        per cycle (a look-ahead and the real dispatch) and both calls must name the same pair. Nothing is
+        mutated beyond that cache, so the look-ahead stays free of side effects.
+        """
+        seated = self._select_cross_card_job(head_job, candidates, head_device_index=head_device_index)
+        if seated is None:
+            return None
+        candidate_job, candidate_process = seated
+        selection = NextJobAndProcess(
+            next_job=candidate_job,
+            process_with_model=candidate_process,
+            line_skip=LineSkip(displaced_job=head_job, reason="cross_card"),
+        )
+        self._pending_line_skip = selection
+        return selection
 
     @property
     def _multi_gpu_routing_active(self) -> bool:
@@ -8090,6 +8243,11 @@ class InferenceScheduler:
         cached in ``self._pending_line_skip`` and returned on the second call. The
         cache is cleared at the start of each scheduling cycle (see
         :meth:`run_scheduling_cycle`) and at the end of :meth:`start_inference`.
+
+        A head that cannot be seated stops dispatch only for its own card. Where the worker drives more than
+        one, each point below that would return nothing instead resumes the placement-order walk for work
+        another card can take now (:meth:`_cross_card_selection`); the head keeps its position, its claim on
+        the card it waits for, and its skip budget.
         """
         cached = self._pending_line_skip
         if cached is not None:
@@ -8172,7 +8330,14 @@ class InferenceScheduler:
                     "Dispatch held at the concurrency cap while an exclusive in-progress job requires isolation "
                     f"(jobs_in_progress={jobs_in_progress_count}, cap={max_jobs_allowed}).",
                 )
-            return None
+            # The cap that stopped the head belongs to the head's card. Every other card has its own, so the
+            # queue is walked on for work another card can take now; the head keeps its position and its
+            # claim on the card it is waiting for.
+            return self._cross_card_selection(
+                next_job,
+                next_n_jobs,
+                head_device_index=process_with_model.device_index if process_with_model is not None else None,
+            )
 
         if process_with_model is None:
             if next_job.model is None:
@@ -8250,6 +8415,12 @@ class InferenceScheduler:
                         break
 
             if process_with_model is None:
+                # The head is cold and stays that way this cycle. It names no card of its own, so nothing is
+                # withheld from it by seating another card's already-resident work; resolved once here and
+                # returned from each branch below, so the head's own handling (pin staging, missing-model
+                # recovery) still runs first and unchanged.
+                cross_card_selection = self._cross_card_selection(next_job, next_n_jobs, head_device_index=None)
+
                 if pinned_resident is not None:
                     # The head's only resident copy is on a disaggregation-pinned sampler lane. Never fund a
                     # fresh preload (it cannot fit beside the pinned residents and would wedge the card); hold
@@ -8262,7 +8433,7 @@ class InferenceScheduler:
                     # the disaggregated pipeline now with no sampler; it binds the lane when the pin releases.
                     if not information_only and self._stage_ahead_of_pin_enabled:
                         await self._stage_head_ahead_of_pin(next_job, pinned_resident)
-                    return None
+                    return cross_card_selection
 
                 next_job_model = next_job.model
                 if next_job_model is None:
@@ -8273,16 +8444,16 @@ class InferenceScheduler:
                 # residency and latch the missing-model flag against a card that is serving. The job needs
                 # its own copy on an eligible card, which the preload pass admits.
                 if self._resident_only_on_ineligible_cards(next_job):
-                    return None
+                    return cross_card_selection
 
                 if (
                     self._preload_delay_notified
                     or self._horde_model_map.is_model_loading(next_job_model)
                     or information_only
                 ):
-                    return None
+                    return cross_card_selection
                 await self._handle_process_missing(next_job)
-                return None
+                return cross_card_selection
 
         if not process_with_model.can_accept_job():
             # The head's own process is busy sampling its model, so the head cannot run yet. Rather than
@@ -8293,7 +8464,13 @@ class InferenceScheduler:
             # jobs still waits for the busy process rather than duplicating its model).
             diversity = self._select_idle_thread_diversity_job(next_job, next_n_jobs)
             if diversity is None:
-                return None
+                # Nothing distinct fits beside the head's busy lane. The head is waiting on that one card,
+                # so the rest of the fleet is still free to take resident work from further down the queue.
+                return self._cross_card_selection(
+                    next_job,
+                    next_n_jobs,
+                    head_device_index=process_with_model.device_index,
+                )
             diversity_job, diversity_process = diversity
             line_skip = LineSkip(displaced_job=next_job, reason="diversity")
             next_job = diversity_job
@@ -9401,6 +9578,7 @@ class InferenceScheduler:
             f"with sampler {next_job.payload.sampler_name} for a batch of {next_job.payload.n_iter}",
         )
 
+        # Parsed by analysis/log_signatures.py (batch_ids, batch_id_entry): change the message and the registry together.
         logger.debug(f"All Batch IDs: {next_job.ids}")
 
     async def _stage_head_ahead_of_pin(
@@ -10329,7 +10507,9 @@ class InferenceScheduler:
         # (never in get_next_job_and_process, which runs twice a cycle and must stay pure for information_only).
         # A resident_bypass skip is counted against the displaced head; a direct head dispatch (no line-skip)
         # closes the window. A diversity line-skip leaves the window untouched: the head is still pending, its
-        # process merely busy, so it is not being aged by the affinity path.
+        # process merely busy, so it is not being aged by the affinity path. A cross_card skip is untouched for
+        # the same reason and a stronger one: it lands on a card the head is not waiting for, so it neither
+        # delays the head nor spends any part of the window that bounds how long a head may be passed.
         # A placement reorder is counted the same way. The promoted job arrives here as the head (no line-skip
         # was needed to reach it), so without this the direct-dispatch branch below would reset the window every
         # time and the ceiling could never accumulate: a head could then be passed without bound. Seating a job
@@ -10365,8 +10545,14 @@ class InferenceScheduler:
                     budget_seconds=affinity_budget_seconds(self._state.recent_job_ttl),
                     max_skips=_AFFINITY_MAX_SKIPS,
                 )
+            elif line_skip.reason == "cross_card":
+                skip_detail = (
+                    "the displaced job's card cannot seat it right now, and this job runs on a different card "
+                    "whose capacity the displaced job is not waiting for"
+                )
             else:
                 skip_detail = "the displaced job's process is busy sampling its own model"
+            # Parsed by analysis/log_signatures.py (line_skip): change the message and the registry together.
             logger.info(
                 f"Job {next_job.id_} skipped the line ({line_skip.reason}) and will run on process "
                 f"{process_with_model.process_id} ahead of job {line_skip.displaced_job.id_}: {skip_detail}.",
@@ -10397,6 +10583,7 @@ class InferenceScheduler:
         # Past every hold/fault gate: this job is dispatching now, so emit the start logging here rather than
         # before the reclaim decision (where a deferred or faulted job would mislead the log as "starting").
         color_format_string = "<fg #f0beff>{message}</>"
+        # Parsed by analysis/log_signatures.py (inference_dispatched): change the message and the registry together.
         logger.opt(colors=True).info(
             color_format_string,
             message=f"Starting inference for job {str(next_job.id_)[:8]} on process {process_with_model.process_id}",

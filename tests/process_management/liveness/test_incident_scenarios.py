@@ -3114,3 +3114,155 @@ async def test_u_a_staged_job_is_not_credited_with_weights_it_has_not_loaded() -
         f"fitting. {world.state_dump()}"
     )
     assert world.dispatch_tick(head) is None, f"{context}: the head sampled without a grant. {world.state_dump()}"
+
+
+# --------------------------------------------------------------------------------------------------------
+# Cross-card dispatch: a head parked on one card's cap must not withhold seating on every other card
+# --------------------------------------------------------------------------------------------------------
+
+_FOUR_CARD_PIXELS = dict.fromkeys(range(4), 4_194_304)
+"""Four identical cards: no eligibility axis differs, so which card serves a job is decided by residency
+alone and any serialization the row shows is the dispatch selector's own."""
+
+_FOUR_CARD_MODELS = (_SD15, _SD15_OTHER, _SDXL, _SDXL_OTHER)
+"""One model class per card, each seeded on that card's first lane, so every card can serve queued work the
+instant it is asked to."""
+
+_FOUR_CARD_PENDING_PER_CLASS = 2
+"""Pending jobs kept queued per class, so the queue always holds work for every card and a card that idles
+is idling against work it could have taken."""
+
+_FOUR_CARD_SHAPE = (1024, 1024)
+_FOUR_CARD_STEPS = 100
+"""The traffic's shape: a megapixel job of enough steps that a sampling window spans many ticks.
+
+The world attempts one dispatch per tick at ``max_threads`` of one, so a job that finishes inside a tick can
+never be joined by a second and the pool's concurrency would be one however the selector behaved. Work long
+beside the tick is what makes how many cards are in use observable at all."""
+
+_FOUR_CARD_FILL_TICKS = 10
+"""Ticks the pool has to reach full concurrency.
+
+One dispatch per tick means four cards need four ticks at best; this is comfortably past that and far short
+of the first job completing, which keeps the reorder that seats retained copies out of the result. What it
+excludes is a worker that never runs more than one card's worth of work."""
+
+_FOUR_CARD_TICK_SECONDS = 0.5
+"""How much clock one tick of this row advances, short beside a sampling window for the reason above."""
+
+_FOUR_CARD_TICKS = 60
+"""Ticks the row runs for, long enough that a card carrying none of the work shows as duty it never earned."""
+
+_FOUR_CARD_DUTY_FLOOR = 0.20
+"""Fraction of its own slot-time each card must spend sampling.
+
+The positive half of the verdict: a pool that reaches full concurrency once and then serializes again would
+satisfy a peak-concurrency claim alone. Each card serves one class off weights it already holds, so this is a
+modest share of the sampling its lane could do."""
+
+
+def _four_card_world() -> _DispatchWorld:
+    """Four independent cards, two lanes each, one sampling slot per card, one resident model per card.
+
+    The operator posture the failure was found on: ``max_threads`` and ``queue_size`` of one per card, so a
+    single running job takes its card's only sampling slot while the card's second lane and every other card
+    stay free. Whole-card residency is off and no card's config differs, so nothing but the dispatch selector
+    decides how much of the pool is used.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=8,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        tick_seconds=_FOUR_CARD_TICK_SECONDS,
+        card_max_pixels=_FOUR_CARD_PIXELS,
+    )
+    for lane_id, model in enumerate(_FOUR_CARD_MODELS):
+        world.seed_resident(lane_id, model, in_vram=True)
+        assert world.card_of_lane(lane_id) == lane_id, (
+            "precondition: each seeded copy must sit on a card of its own, so every card can serve queued work"
+        )
+    return world
+
+
+async def _drive_four_card_traffic(world: _DispatchWorld) -> list[int]:
+    """Keep every class queued for the whole run and record how many jobs were sampling at each tick.
+
+    The head is always a job for the class seeded on card 0, so as soon as one of those is running the head's
+    own card is at its cap for the rest of the run and every further dispatch has to be onto another card.
+
+    Returns:
+        The number of jobs in progress after each tick, in order.
+    """
+    width, height = _FOUR_CARD_SHAPE
+    concurrency: list[int] = []
+    for _ in range(_FOUR_CARD_TICKS):
+        for model in _FOUR_CARD_MODELS:
+            # Filled class by class in this order, so the head's own class is always the oldest pending work
+            # and the head is a job for card 0 for the whole run.
+            while (
+                sum(1 for job in world.job_tracker.jobs_pending_inference if job.model == model.name)
+                < _FOUR_CARD_PENDING_PER_CLASS
+            ):
+                await world.pop(
+                    make_job_pop_response(model.name, width=width, height=height, ddim_steps=_FOUR_CARD_STEPS),
+                )
+        await world.step()
+        concurrency.append(len(world.job_tracker.jobs_in_progress))
+    return concurrency
+
+
+def _assert_the_whole_pool_was_used(world: _DispatchWorld, concurrency: list[int], *, context: str) -> None:
+    """Assert every card carried its own work rather than one card carrying the run."""
+    reached = max(concurrency[:_FOUR_CARD_FILL_TICKS], default=0)
+    assert reached >= len(_FOUR_CARD_PIXELS), (
+        f"{context}: the pool ran at most {reached} job(s) at once over its first {_FOUR_CARD_FILL_TICKS} "
+        f"ticks, with {len(_FOUR_CARD_PIXELS)} cards each holding a queued model on an idle lane. "
+        f"{world.state_dump()}"
+    )
+    for device_index in sorted(_FOUR_CARD_PIXELS):
+        assert_duty_floor_on_card(world, device_index, _FOUR_CARD_DUTY_FLOOR, context=context)
+
+
+async def test_s_a_head_parked_on_its_own_cards_cap_does_not_hold_the_other_cards() -> None:
+    """Four cards each holding a queued model all sample, though the head's card is at its cap throughout.
+
+    The failure this encodes: dispatch selection took only the placement-order head, scoped the concurrency
+    cap to that head's card, and returned nothing when the card was full. Nothing else was ever tried, so one
+    busy card stopped the whole worker: on an eight-card host fourteen lanes idled with jobs pending whose
+    models were already resident on them, and the pop queue drained through a single card's throughput.
+
+    Read as one statement: a card is its own sampling domain, so a head that cannot be seated is a fact about
+    one card. Its consequences are that concurrency reaches the card count rather than one, that every card
+    earns its own duty, and that the head keeps its place in the queue while it waits for its own card.
+    """
+    world = _four_card_world()
+
+    concurrency = await _drive_four_card_traffic(world)
+
+    _assert_the_whole_pool_was_used(world, concurrency, context="four-card dispatch")
+    assert_never_idle_with_fitting_work(world, context="four-card dispatch")
+
+
+async def test_s_defect_reinjection_a_head_bound_selector_serializes_the_whole_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the cross-card walk removed, the same pool runs one job at a time behind its parked head.
+
+    Reinjected at the selector alone: the per-card cap, the routing and the eligibility rules are production's
+    throughout, and the only thing taken away is resuming the queue walk when the head's card cannot seat it.
+    What fails is how much of the pool is used, which is the whole of this defect.
+    """
+    monkeypatch.setattr(
+        InferenceScheduler,
+        "_select_cross_card_job",
+        lambda *_args, **_kwargs: None,
+    )
+    world = _four_card_world()
+
+    concurrency = await _drive_four_card_traffic(world)
+
+    with pytest.raises(AssertionError, match="the pool ran at most"):
+        _assert_the_whole_pool_was_used(world, concurrency, context="head-bound selector")
