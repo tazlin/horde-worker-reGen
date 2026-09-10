@@ -16,6 +16,9 @@ Critical public members:
 * [`preload_concurrency_blocked`]
   [horde_worker_regen.process_management.scheduling.governance.preload_admission.preload_concurrency_blocked]:
   the per-device model-load serialization gate.
+* [`select_follower_room_process_id`]
+  [horde_worker_regen.process_management.scheduling.governance.preload_admission.select_follower_room_process_id]:
+  which protected idle lane a queued follower's copy may displace, ranked by outstanding demand.
 * ``decide_ram_reclaim_outcome``: what an exhausted system-RAM reclamation pass resolves to.
 """
 
@@ -38,6 +41,7 @@ __all__ = [
     "compute_preload_disallowed_processes",
     "decide_ram_reclaim_outcome",
     "preload_concurrency_blocked",
+    "select_follower_room_process_id",
     "select_head_room_process_id",
 ]
 
@@ -91,6 +95,11 @@ class PreloadSlotSnapshot:
     """The horde model resident on the slot, or None when it is empty."""
     can_accept_job: bool
     """Whether the slot can take work right now (idle and healthy)."""
+    retained_resident_since: float | None = None
+    """When the slot's retention episode began, or None when it holds nothing stamped.
+
+    The dispatch-recency reading the demand tie-break reads: an episode starts when a job leaves the slot
+    holding its weights, so an older stamp is a slot whose model has gone longer without work."""
 
 
 def compute_preload_disallowed_processes(
@@ -167,6 +176,56 @@ def select_head_room_process_id(
         return 2
 
     return min(candidates, key=_displacement_cost).process_id
+
+
+def select_follower_room_process_id(
+    slots: tuple[PreloadSlotSnapshot, ...],
+    *,
+    loading_model_demand: int,
+    model_demand: Mapping[str, int],
+) -> int | None:
+    """Return the idle slot a queued follower's copy may displace, or None when none is worth taking.
+
+    Copies follow demand. The affinity guard protects the last copy of every wanted model, and a resident
+    model is wanted, so on a pool with a model on every lane it protects every lane: a job whose own model is
+    resident only where it is busy then finds no target at all and waits for a sampling window on one card
+    while other cards idle. The queue head escapes that through its own room fallback; a follower has no
+    escape, and a burst is made of followers.
+
+    The trade this ranks is between two models' outstanding work, and it is taken only when the loading model
+    has strictly more of it than the resident one. Among the lanes that qualify it takes the least demanded,
+    then the one whose model has gone longest without work, then the lowest id. What the displaced model
+    loses is a weight upload, not a disk read: the child keeps the checkpoint in its host RAM cache, so the
+    lane is re-served from RAM when its own job arrives.
+
+    The caller narrows ``slots`` to the lanes a displacement may consider at all: idle, on a card eligible for
+    this job and under its sampling cap (a copy that cannot sample buys nothing), never carrying live work,
+    and never the head's own copy. The ceiling on how many copies the loading model may end up with is the
+    duplicate bound the caller has already applied, so nothing here re-states it.
+
+    Args:
+        slots: The lanes a displacement may consider, already narrowed by the caller.
+        loading_model_demand: Pending and in-progress jobs naming the model being loaded.
+        model_demand: Pending and in-progress jobs naming each candidate lane's resident model.
+
+    Returns:
+        The slot to load onto, or None when no lane's model is less wanted than the loading one.
+    """
+
+    def _demand(slot: PreloadSlotSnapshot) -> int:
+        return 0 if slot.model_name is None else model_demand.get(slot.model_name, 0)
+
+    candidates = [slot for slot in slots if _demand(slot) < loading_model_demand]
+    if not candidates:
+        return None
+
+    def _displacement_key(slot: PreloadSlotSnapshot) -> tuple[int, float, int]:
+        # An unstamped hold has no known age, and a lane holding nothing the scheduler promised to keep is the
+        # cheapest thing to take, so both sort as the least recently dispatched.
+        held_since = slot.retained_resident_since
+        return (_demand(slot), held_since if held_since is not None else float("-inf"), slot.process_id)
+
+    return min(candidates, key=_displacement_key).process_id
 
 
 _STICKY_CARD_RANK = 0

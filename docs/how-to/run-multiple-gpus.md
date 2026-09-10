@@ -116,11 +116,19 @@ their sum:
   copy on its sibling lane could not sample until the running job ends. Copies are capped at the model's own
   outstanding jobs and at one per card, so a burst of one model cannot take the whole pool and leave the next
   model's job reloading from disk wherever it lands.
-- On a multi-card worker, a lane holding a model that **no queued job names and nothing has demanded
-  recently** is treated as spare capacity and may be loaded over. Otherwise a worker with a model per lane
-  protects every lane, and a model the queue is backed up on can never earn a second copy. Any model a
-  pending or in-progress job names keeps its lane, as does one the worker served within a window derived from
-  the horde's recent job ttl. On a single card residency alone still counts, so nothing changes there.
+- The displacement guard counts a model as **wanted while it is resident on any lane**, whichever card that
+  lane is on, so a worker holding a distinct model per lane protects every lane and ordinary target selection
+  finds a backed-up model nowhere to put a second copy.
+- **Copies follow demand** where that leaves a queued job no lane at all: a job whose model is resident only
+  where it is busy may displace one idle lane whose resident model has strictly fewer outstanding jobs than
+  its own, taking the least demanded of them, then the one whose model has gone longest without work. The
+  lane must be on a card under its `max_threads` (a copy that cannot sample buys nothing), must not hold a
+  model a running job is using, and is never the queue head's own copy. The displaced model keeps its
+  host-RAM copy, so its next job pays a weight upload rather than a disk read, and the total number of copies
+  is still capped at the model's outstanding jobs and at one per card. Single-card workers are untouched.
+- Separately from that guard, a **residency grace period** keeps a finished job's weights on the card for a
+  window derived from the horde's recent job ttl, so a follow-on job for the same model is served without
+  re-uploading. That window governs eviction, not which lane a load may displace; the two are independent.
 
 Dispatch selection follows the same rule. The head of the queue can only be seated on a card that can serve
 it, so a head whose card is at its own `max_threads`, whose resident lane is busy, or whose model is not

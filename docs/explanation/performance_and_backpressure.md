@@ -394,6 +394,19 @@ A model counts as *wanted* while it is resident on an inference slot or while a 
 in-progress job names it. The lane count `affinity_active` compares that set against is the worker's
 whole pool, summed across every card, because a model's home is a lane anywhere on the host.
 
+On a multi-GPU host the guard has a bound: a pool holding a distinct model on every lane protects
+every lane, and a job whose own model is resident only where it is busy then finds no preload target
+at all. The queue head escapes through its own room fallback; a follower has none. Copies therefore
+follow demand. When such a job is owed a copy (`duplicate_copy_may_serve`, so every eligible copy is
+busy and the copy bound is not yet met),
+[`select_follower_room_target`][horde_worker_regen.process_management.scheduling.admission.preload]
+may displace one protected idle lane, choosing among lanes whose resident model has *strictly* fewer
+outstanding jobs than the loading one: the least demanded, then the one whose model has gone longest
+without work, then the lowest slot id. It never takes a lane carrying live work, a lane on a card
+already at its sampling cap (a copy there could not run), or a head's own copy. The displaced model
+keeps its host-RAM copy, so what it loses is a weight upload rather than a disk read, and the ceiling
+on how many copies the loading model ends with is `duplicate_copies_permitted` and nothing further.
+
 ### The line-skip cache
 
 `get_next_job_and_process` is called twice per cycle: once to peek and once to

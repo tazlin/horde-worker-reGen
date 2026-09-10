@@ -26,7 +26,11 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     preload_head,
     select_preload_target,
 )
-from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
+from horde_worker_regen.process_management.scheduling.governance.preload_admission import (
+    AdmissionDecision,
+    PreloadSlotSnapshot,
+    select_follower_room_process_id,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -328,6 +332,168 @@ class TestTargetSelectionAgreesWithTheScheduler:
         head = snapshot.queue.jobs[str(jobs[0].id_)]
 
         assert preload.head_is_starving(snapshot, head) is scheduler._head_aged_past_anti_starvation(jobs[0])
+
+
+class TestFollowerRoomSelection:
+    """A follower whose only copies are busy may displace an idle lane the queue wants less."""
+
+    @staticmethod
+    async def _pool(
+        *,
+        pending: list[str],
+        in_progress: list[str] | None = None,
+        residents: dict[int, tuple[str | None, int, bool]],
+        card_indices: tuple[int, ...] = (0, 1),
+    ) -> tuple[InferenceScheduler, list[ImageGenerateJobPopResponse]]:
+        """A multi-card pool whose lanes are ``process_id -> (model, device index, busy)``.
+
+        Every card serves every class this pool names, so a job's eligibility never decides a row that is
+        about which lane may make room.
+        """
+        served = sorted({*pending, *(in_progress or []), *(model for model, _, _ in residents.values() if model)})
+        config = make_mock_bridge_data(image_models_to_load=served)
+        slots = {
+            process_id: make_mock_process_info(
+                process_id,
+                model_name=model,
+                device_index=device_index,
+                state=HordeProcessState.INFERENCE_STARTING if busy else HordeProcessState.WAITING_FOR_JOB,
+            )
+            for process_id, (model, device_index, busy) in residents.items()
+        }
+        scheduler, jobs = await _worker(
+            slots=slots,
+            pending=pending,
+            in_progress=in_progress,
+            bridge_data=config,
+        )
+        scheduler._card_runtimes = make_test_card_runtimes(device_indices=card_indices, config=config)
+        return scheduler, jobs
+
+    async def test_one_card_never_offers_follower_room(self) -> None:
+        """On a single card a duplicate is pure waste, so the rule is a no-op there by construction."""
+        busy = _slot(0, model="hot", state=HordeProcessState.INFERENCE_STARTING)
+        idle = _slot(1, model="cold")
+        scheduler, jobs = await _worker(slots={0: busy, 1: idle}, pending=["hot", "hot", "hot", "cold"])
+        snapshot = scheduler.snapshot()
+
+        assert snapshot.multi_gpu_routing_active is False
+        assert preload.select_follower_room_target(snapshot, str(jobs[0].id_), head_job_id=None) is None
+
+    async def test_the_least_wanted_idle_copy_makes_room(self) -> None:
+        """Three jobs against one busy copy displace the idle lane whose class has one job outstanding."""
+        scheduler, jobs = await self._pool(
+            pending=["hot", "hot", "hot", "cold"],
+            residents={0: ("hot", 0, True), 1: ("cold", 1, False)},
+        )
+        snapshot = scheduler.snapshot()
+
+        assert preload.duplicate_copy_may_serve(snapshot, str(jobs[0].id_)) is True
+        assert preload.select_follower_room_target(snapshot, str(jobs[1].id_), head_job_id=None) == 1
+
+    async def test_an_equally_wanted_idle_copy_is_left_alone(self) -> None:
+        """With as many jobs queued for the resident class as for the loading one, the follower waits."""
+        scheduler, jobs = await self._pool(
+            pending=["hot", "hot", "cold", "cold"],
+            residents={0: ("hot", 0, True), 1: ("cold", 1, False)},
+        )
+
+        assert preload.select_follower_room_target(scheduler.snapshot(), str(jobs[1].id_), head_job_id=None) is None
+
+    async def test_the_heads_own_copy_is_never_taken(self) -> None:
+        """The queue head's warm copy is the one the horde is waiting on, so it is spared however cold it is."""
+        scheduler, jobs = await self._pool(
+            pending=["cold", "hot", "hot", "hot"],
+            residents={0: ("hot", 0, True), 1: ("cold", 1, False)},
+        )
+        snapshot = scheduler.snapshot()
+
+        assert snapshot.queue.jobs[snapshot.queue.pending_in_pop_order[0]].model == "cold"
+        assert preload.select_follower_room_target(snapshot, str(jobs[1].id_), head_job_id=None) is None
+
+    async def test_a_model_an_in_progress_job_is_using_is_never_taken(self) -> None:
+        """A second copy of a running model is live work, so its idle lane is not room."""
+        scheduler, jobs = await self._pool(
+            pending=["hot", "hot", "hot"],
+            in_progress=["warm"],
+            residents={0: ("hot", 0, True), 1: ("warm", 1, False), 2: ("warm", 2, True)},
+            card_indices=(0, 1, 2),
+        )
+
+        assert preload.select_follower_room_target(scheduler.snapshot(), str(jobs[0].id_), head_job_id=None) is None
+
+    async def test_a_card_at_its_sampling_cap_offers_no_room(self) -> None:
+        """A copy on a card that cannot start it would be weights the card paid for and cannot use."""
+        scheduler, jobs = await self._pool(
+            pending=["hot", "hot", "hot", "cold"],
+            residents={0: ("hot", 0, True), 1: ("cold", 1, False), 2: ("other", 1, True)},
+        )
+
+        assert preload.select_follower_room_target(scheduler.snapshot(), str(jobs[1].id_), head_job_id=None) is None
+
+    async def test_the_copy_bound_keeps_the_rule_from_being_reached(self) -> None:
+        """One job outstanding earns one copy, so a resident-but-busy model is called loaded and waits."""
+        scheduler, jobs = await self._pool(
+            pending=["hot"],
+            residents={0: ("hot", 0, True), 1: ("cold", 1, False)},
+        )
+        snapshot = scheduler.snapshot()
+
+        assert preload.duplicate_copy_may_serve(snapshot, str(jobs[0].id_)) is False
+        plan = _decide(scheduler, jobs[0])
+        assert plan.decision is AdmissionDecision.ALREADY_LOADED
+
+    def test_equal_demand_breaks_to_the_least_recently_dispatched(self) -> None:
+        """Two equally wanted idle copies: the one whose model has gone longest without work gives way."""
+        recent = PreloadSlotSnapshot(
+            process_id=1,
+            model_name="recent",
+            can_accept_job=True,
+            retained_resident_since=900.0,
+        )
+        stale = PreloadSlotSnapshot(
+            process_id=2,
+            model_name="stale",
+            can_accept_job=True,
+            retained_resident_since=100.0,
+        )
+
+        chosen = select_follower_room_process_id(
+            (recent, stale),
+            loading_model_demand=3,
+            model_demand={"recent": 1, "stale": 1},
+        )
+
+        assert chosen == 2
+
+    def test_an_unstamped_hold_is_the_cheapest_thing_to_take(self) -> None:
+        """A lane holding nothing the scheduler promised to keep gives way before a stamped retention."""
+        stamped = PreloadSlotSnapshot(
+            process_id=1,
+            model_name="stamped",
+            can_accept_job=True,
+            retained_resident_since=100.0,
+        )
+        unstamped = PreloadSlotSnapshot(process_id=2, model_name="unstamped", can_accept_job=True)
+
+        chosen = select_follower_room_process_id(
+            (stamped, unstamped),
+            loading_model_demand=3,
+            model_demand={"stamped": 1, "unstamped": 1},
+        )
+
+        assert chosen == 2
+
+    def test_nothing_less_wanted_yields_no_room(self) -> None:
+        """The rule is a comparison of two models' outstanding work, and it refuses a tie."""
+        assert (
+            select_follower_room_process_id(
+                (PreloadSlotSnapshot(process_id=1, model_name="cold", can_accept_job=True),),
+                loading_model_demand=2,
+                model_demand={"cold": 2},
+            )
+            is None
+        )
 
 
 class TestRamAdmission:

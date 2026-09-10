@@ -47,6 +47,7 @@ from horde_worker_regen.process_management.scheduling.governance.preload_admissi
     card_preload_order,
     compute_preload_disallowed_processes,
     preload_concurrency_blocked,
+    select_follower_room_process_id,
     select_head_room_process_id,
 )
 
@@ -481,6 +482,83 @@ def select_head_room_target(snapshot: SchedulingSnapshot, job_id: str) -> int | 
     )
 
 
+def cards_under_sampling_cap(snapshot: SchedulingSnapshot) -> frozenset[int]:
+    """The cards running fewer inference jobs than their sampling cap, so a copy landing there can run."""
+    return frozenset(
+        device_index
+        for device_index in snapshot.cards
+        if device_index is not None
+        and card_inference_load(snapshot, device_index) < card_concurrency_cap(snapshot, device_index)
+    )
+
+
+def models_spared_from_displacement(snapshot: SchedulingSnapshot, head_job_id: str | None) -> frozenset[str]:
+    """The models a follower's copy may never displace: the queue's head and the pass's own head.
+
+    Both are the job the worker is next committed to serving. The queue's own first job is the one the horde
+    is waiting on, and the preload pass's head is the one the budget escalates for; taking either's warm copy
+    to serve a job behind it is the priority inversion :func:`slots_holding_the_head_model` already refuses on
+    the ordinary path.
+    """
+    head_ids = (next(iter(snapshot.queue.pending_in_pop_order), None), head_job_id)
+    return frozenset(
+        model
+        for head_id in head_ids
+        if head_id is not None and (model := snapshot.queue.jobs[head_id].model) is not None
+    )
+
+
+def select_follower_room_target(
+    snapshot: SchedulingSnapshot,
+    job_id: str,
+    *,
+    head_job_id: str | None,
+) -> int | None:
+    """An idle lane holding a less wanted model that a queued follower's copy may displace, or None.
+
+    Multi-GPU only, and only for a job whose model is resident but busy everywhere it may run
+    (:func:`duplicate_copy_may_serve`), whose bound on copies has already been applied. Candidate lanes are
+    idle, on a card eligible for this job and still under its sampling cap, hold no model an in-progress job
+    is using, are not being drained for RAM reclaim, are not a pinned disaggregation sampler, and do not carry
+    a head's copy. :func:`select_follower_room_process_id` ranks what is left by outstanding demand.
+    """
+    job = snapshot.queue.jobs[job_id]
+    if not snapshot.multi_gpu_routing_active or job.model is None:
+        return None
+    eligible = job.eligible_cards & cards_under_sampling_cap(snapshot)
+    if not eligible:
+        return None
+    spared = models_spared_from_displacement(snapshot, head_job_id)
+    live = pricing.in_progress_models(snapshot)
+    candidates = tuple(
+        PreloadSlotSnapshot(
+            process_id=slot.process_id,
+            model_name=slot.model,
+            can_accept_job=slot.can_accept_job,
+            retained_resident_since=slot.retained_resident_since,
+        )
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE
+        and slot.device_index in eligible
+        and slot.can_accept_job
+        and not slot.reserved_for_disaggregation
+        and slot.process_id not in snapshot.draining_process_ids
+        and slot.model not in live
+        and slot.model not in spared
+    )
+    if not candidates:
+        return None
+    return select_follower_room_process_id(
+        candidates,
+        loading_model_demand=model_demand_count(snapshot, job.model),
+        model_demand={
+            slot.model_name: model_demand_count(snapshot, slot.model_name)
+            for slot in candidates
+            if slot.model_name is not None
+        },
+    )
+
+
 def preload_disallowed_processes(snapshot: SchedulingSnapshot, job: JobSnapshot) -> set[int]:
     """The slots this job's preload may not displace.
 
@@ -530,10 +608,10 @@ def decide_preload_gates(
 
     The gates, in order: aux preparation (yields to a sibling able to sample), unserviceable (faults),
     quarantine (faults), already resident for this job's routing, the absolute RAM danger floor, target
-    selection over the disallowed set with the head-room fallback, the exclusive-job hold on the target's
-    card, the pending post-processing hold on the lane's card, the aux-gated occupied-slot refusal, the growth
-    hold, cycle-on-model-change (replaces the child), and the per-card load serialization gate. An admitting
-    plan names the target; the budget step follows.
+    selection over the disallowed set with the head-room and follower-room fallbacks, the exclusive-job hold on
+    the target's card, the pending post-processing hold on the lane's card, the aux-gated occupied-slot refusal,
+    the growth hold, cycle-on-model-change (replaces the child), and the per-card load serialization gate. An
+    admitting plan names the target; the budget step follows.
 
     Args:
         snapshot: The cycle's snapshot.
@@ -607,6 +685,7 @@ def decide_preload_gates(
 
     is_head_blocker = head_job_id is not None and job_id == head_job_id
     disallowed = frozenset(preload_disallowed_processes(snapshot, job))
+    admit_reason = "gates passed"
     target = select_preload_target(snapshot, job_id, disallowed)
     if target is None and is_head_blocker:
         # Affinity is provisioned against the inference-process ceiling, so with more resident models than
@@ -615,6 +694,15 @@ def decide_preload_gates(
         # work. A slot retaining weights a queued job reuses is not spared here: the placement order has
         # already moved that job ahead of this one.
         target = select_head_room_target(snapshot, job_id)
+    if target is None and duplicate_copy_may_serve(snapshot, job_id):
+        # The same guard starves a follower with no fallback of its own: a job whose model is resident only on
+        # lanes that are busy is owed a copy, and on a full pool every lane holds the last copy of some wanted
+        # model, so target selection finds nothing. Copies follow demand, so a lane whose model the queue is
+        # asking for less than this one may be taken. Reached only after the head's own fallback has declined,
+        # which considers strictly more lanes, so this can only ever add a target for a follower.
+        target = select_follower_room_target(snapshot, job_id, head_job_id=head_job_id)
+        if target is not None:
+            admit_reason = "gates passed (displacing a less wanted idle copy)"
     if target is None:
         return plan(
             AdmissionDecision.NO_TARGET,
@@ -693,7 +781,7 @@ def decide_preload_gates(
 
     return plan(
         AdmissionDecision.ADMIT,
-        "gates passed",
+        admit_reason,
         target=target,
         is_head_blocker=is_head_blocker,
         disallowed=disallowed,

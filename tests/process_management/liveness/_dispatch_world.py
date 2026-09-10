@@ -182,6 +182,22 @@ _SDXL_OTHER = _ModelClass("sdxl_b", "sdxl-checkpoint-b", KNOWN_IMAGE_GENERATION_
 _FLUX = _ModelClass("flux", "Flux.1-Schnell fp8 (Compact)", KNOWN_IMAGE_GENERATION_BASELINE.flux_1, 11500.0)
 
 _MODEL_CLASSES = (_SD15, _SD15_OTHER, _SDXL, _SDXL_OTHER, _FLUX)
+"""The pool of classes every row serves unless it asks for more (``extra_model_classes``)."""
+
+_SD15_C = _ModelClass("sd15_c", "sd15-checkpoint-c", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SD15_D = _ModelClass("sd15_d", "sd15-checkpoint-d", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SD15_E = _ModelClass("sd15_e", "sd15-checkpoint-e", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SD15_F = _ModelClass("sd15_f", "sd15-checkpoint-f", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+
+_FILLER_MODEL_CLASSES = (_SD15_C, _SD15_D, _SD15_E, _SD15_F)
+"""Interchangeable small classes for a row that needs more distinct models than lanes on one card.
+
+Model->process affinity protects the last copy of every wanted model, so a row about a fully-protected pool
+needs one distinct class per lane. They are opt-in per world rather than part of the default pool because
+every row's advertised set and every card's served set are built from that pool."""
+
+_KNOWN_MODEL_CLASSES = (*_MODEL_CLASSES, *_FILLER_MODEL_CLASSES)
+"""Every class the world can resolve weights and timings for, whatever pool a given row serves."""
 
 _SAFETY_PROCESS_ID = 100
 _POST_PROCESS_LANE_ID = 200
@@ -594,6 +610,7 @@ class _DispatchWorld:
         post_process_card_index: int = 0,
         post_processing_chain_ticks: int = 0,
         preload_ends_dispatch: bool = False,
+        extra_model_classes: tuple[_ModelClass, ...] = (),
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -721,6 +738,9 @@ class _DispatchWorld:
                 cycle shape a worker had before preload and dispatch were separated; kept as an opt-in so a
                 row can state what it costs, and off everywhere else because it is not what the control loop
                 does.
+            extra_model_classes: Classes this row serves beyond the default pool, so a row needing more
+                distinct models than the pool holds can have them without widening every other row's
+                advertised and served sets. Empty is the pool every other row runs on.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -762,11 +782,12 @@ class _DispatchWorld:
         self.preload_idle_ticks: list[int] = []
         """Ticks where staging a model cost a lane that had work waiting for it.
 
-        A tick lands here when the parent sent a preload, some pending job already had a lane holding its
-        model and free to take it on a card under its sampling cap, and nothing was dispatched. Moving weights
-        for a future job and starting a job whose weights are already there are independent, so a cycle that
-        does the first must not skip the second: every entry is a sampling window a card lost for no reason
-        the workload required."""
+        A tick lands here when the parent sent a preload, some pending job the dispatch gate was not holding
+        already had a lane holding its model and free to take it on a card under its sampling cap, and nothing
+        was dispatched. Moving weights for a future job and starting a job whose weights are already there are
+        independent, so a cycle that does the first must not skip the second: every entry is a sampling window
+        a card lost for no reason the workload required. A job under a dispatch hold is excluded because the
+        gate declined it on its own terms, which is not a window a preload took."""
         self._clearance_waiting_since: dict[str, float] = {}
         """Per staged job, the world-clock instant its child began waiting on its clearance permit.
 
@@ -924,9 +945,11 @@ class _DispatchWorld:
         self._scale_down_selector._process_map = self._process_map
         self._scale_down_selector._job_tracker = self._job_tracker
 
+        self._model_classes = (*_MODEL_CLASSES, *extra_model_classes)
+        """The classes this row serves: what it advertises, and what every card's config is built from."""
         reference: dict[str, ImageGenerationModelRecord] = {
             model.name: make_mock_model_reference_record(model.name, baseline=model.baseline)
-            for model in _MODEL_CLASSES
+            for model in self._model_classes
         }
         self._reference = reference
         """The image model reference the scheduler prices from, kept so the world can hand it to the
@@ -948,7 +971,7 @@ class _DispatchWorld:
             unload_models_from_vram_often=unload_models_from_vram_often,
             legacy_comfy_vram_unload=legacy_comfy_vram_unload,
             gpu_sampling_lease_enabled=clearance_lease,
-            image_models_to_load=[model.name for model in _MODEL_CLASSES],
+            image_models_to_load=[model.name for model in self._model_classes],
         )
         self.offers: dict[int, frozenset[str]] = {}
         """What the worker would have advertised at the end of each tick, through the real claim seam."""
@@ -964,7 +987,7 @@ class _DispatchWorld:
                 card_config = make_mock_bridge_data(
                     max_threads=max_threads,
                     queue_size=queue_depth,
-                    image_models_to_load=[model.name for model in _MODEL_CLASSES],
+                    image_models_to_load=[model.name for model in self._model_classes],
                     max_pixels=max_pixels,
                     # safety_on_gpu is a per-card permission read off the effective card config, so a card
                     # here carries the same answer the global config gives (no per-card delta in this world).
@@ -1520,7 +1543,7 @@ class _DispatchWorld:
         vary. The other narrowings are the pop suite's subject.
         """
         return offer_under_pop_claim(
-            frozenset(model.name for model in _MODEL_CLASSES),
+            frozenset(model.name for model in self._model_classes),
             claim=self._scheduler.whole_card_pop_claim(),
         )
 
@@ -1775,16 +1798,22 @@ class _DispatchWorld:
             await self._job_tracker.begin_post_processing(job_info, process_id=-1, process_launch_identifier=1)
             await self._job_tracker.queue_for_safety_post_processed(job_info)
 
-    def _a_pending_job_could_be_seated(self) -> bool:
-        """Whether some pending job has a lane it could start on right now.
+    def _pending_jobs_that_could_be_seated(self) -> set[str]:
+        """The pending jobs that have a lane they could start on right now, by job id.
 
         A lane qualifies when it already holds the job's model, is free to take work, and sits on a card
         running fewer jobs than that card's own sampling cap. No weights need to move for such a job to
-        start, so a cycle that ends without dispatching leaves a lane idle that had work waiting for it.
+        start, so a cycle that ends without dispatching one of these leaves a lane idle that had work
+        waiting for it.
+
+        Job ids rather than a single verdict, because seatability is only half the question: a job the
+        dispatch gate is holding is not seatable however free its lane is, and the gate records that hold
+        while its own pass runs, after this is read.
         """
         cap = max(1, int(self._scheduler._runtime_config.bridge_data.max_threads))
+        seatable: set[str] = set()
         for job in self._job_tracker.jobs_pending_inference:
-            if job.model is None:
+            if job.model is None or job.id_ is None:
                 continue
             for lane in self._process_map.values():
                 if lane.process_type is not HordeProcessType.INFERENCE:
@@ -1794,8 +1823,21 @@ class _DispatchWorld:
                 if lane.device_index is None:
                     continue
                 if self._process_map.card_inference_load(lane.device_index) < cap:
-                    return True
-        return False
+                    seatable.add(str(job.id_))
+                    break
+        return seatable
+
+    def _dispatch_held_job_ids(self) -> set[str]:
+        """The pending jobs the dispatch gate is currently holding, as the gate's own ledger records them.
+
+        A residency-reconciliation hold parks a job whose materialisation would leave less than the head's
+        demand, and a post-processing defer hold parks one whose peak would collide with a waiting chain.
+        Both are the gate declining to seat a job for a reason of its own, so neither is a lane a preload
+        took. The clearance holds in the same ledger are about jobs already staged, so they say nothing
+        about a pending one.
+        """
+        holds = self._scheduler._dispatch_holds
+        return set(holds.hold_since) | set(holds.pp_defer_holds)
 
     async def _dispatch_until_full(self) -> int:
         """Dispatch onto free lanes, recording the tick each job first reached sampling.
@@ -2502,13 +2544,16 @@ class _DispatchWorld:
         # Read before the preload is commanded, not after: staging can take the very lane that was ready to
         # be dispatched to, and once it has, the lane the cycle owed a job to is indistinguishable from one
         # that never had work waiting for it.
-        could_have_seated = self._a_pending_job_could_be_seated()
+        could_have_seated = self._pending_jobs_that_could_be_seated()
         preloaded = self._scheduler.preload_models()
         self._begin_started_preloads()
         if preloaded and self.preload_ends_dispatch:
             dispatched = 0
         else:
             dispatched = await self._dispatch_until_full()
+        # A job the dispatch gate held is one it refused for a reason of its own, so its idle lane is not a
+        # window the preload cost. The holds are read after the pass, which is where the gate records them.
+        could_have_seated -= self._dispatch_held_job_ids()
         if preloaded and could_have_seated and dispatched == 0:
             self.preload_idle_ticks.append(self.tick)
         for device_index in self._card_totals:
@@ -3083,7 +3128,7 @@ def _make_mock_lifecycle(world: _DispatchWorld) -> Mock:
 
 def _model_by_name(name: str) -> _ModelClass | None:
     """Resolve a model class from its reference name."""
-    for model in _MODEL_CLASSES:
+    for model in _KNOWN_MODEL_CLASSES:
         if model.name == name:
             return model
     return None

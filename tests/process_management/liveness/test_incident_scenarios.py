@@ -135,6 +135,7 @@ The failures encoded here:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -180,8 +181,13 @@ from tests.process_management.liveness._dispatch_world import (
     _CARD_16GB,
     _CARD_24GB,
     _CHILD_FREE_MARGIN_MB,
+    _FILLER_MODEL_CLASSES,
     _FLUX,
     _SD15,
+    _SD15_C,
+    _SD15_D,
+    _SD15_E,
+    _SD15_F,
     _SD15_OTHER,
     _SDXL,
     _SDXL_OTHER,
@@ -3620,3 +3626,275 @@ async def test_v_defect_reinjection_sticky_placement_stacks_copies_on_the_busy_c
 
     with pytest.raises(AssertionError, match="the pool ran at most|under the"):
         _assert_the_burst_reached_the_free_cards(world, concurrency, context="sticky placement")
+
+
+# --------------------------------------------------------------------------------------------------------
+# Copies follow demand: a follower's model reaches an idle card whose own model nothing is asking for
+# --------------------------------------------------------------------------------------------------------
+
+_ROOM_PIXELS = {0: 2_097_152, 1: 1_048_576, 2: 1_048_576, 3: 1_048_576}
+"""Card 0 alone can serve the head's resolution; every card can serve the followers'.
+
+The head has to stay a head for the row to say anything: a job any card could take is seated on another card
+by the cross-card walk the moment its own card is full, and the queue behind it then supplies a new head. A
+resolution only its own card serves is what pins it, and it is an operator posture rather than a contrivance:
+cards of different sizes carry different ``max_pixels``."""
+
+_ROOM_RESIDENTS = (
+    _SD15,
+    _SD15_C,
+    _SD15_E,
+    _SDXL,
+    _SD15_OTHER,
+    _SD15_D,
+    _SD15_F,
+    _SDXL_OTHER,
+)
+"""One distinct class per lane, in lane order, so every lane holds the last copy of a wanted model.
+
+Lanes are pinned round-robin over the four cards, so entries 0-3 are each card's first lane and 4-7 its
+second. Model->process affinity protects the last copy of every wanted model and a resident model is wanted,
+so at this width every lane in the pool is a protected displacement target."""
+
+_ROOM_HOT = _SD15_C
+"""The class the followers are made of, resident on card 1's first lane alone."""
+
+_ROOM_CARD_ZERO_PAIR = (_SD15, _SD15_OTHER)
+"""The two classes on card 0. The first samples for the whole run and the second is the pending queue head:
+at a sampling cap of one the head cannot be seated, and because its own copy sits idle on the card it is not
+owed a copy either, so it holds the head of the queue asking for nothing. That is what keeps the hot jobs
+behind it followers, which is the only position from which the head-room fallback is unavailable to them."""
+
+_ROOM_IDLE_CARDS = (2, 3)
+"""The cards whose classes are asked for once and never again, so they are the room a follower can be given."""
+
+_ROOM_HOT_PENDING = 6
+_ROOM_SHAPE = (1024, 1024)
+_ROOM_STEPS = 100
+_ROOM_CARD_ZERO_SHAPE = (1024, 2048)
+"""The resolution only card 0 serves, so card 0's own pair never leaves it."""
+_ROOM_CARD_ZERO_STEPS = 600
+"""Steps enough that card 0's sampling job outlasts the run, so its card never comes under its cap and the
+class queued behind it never stops being the head. A head that is seated is replaced by whatever is next in
+the queue, and here that would be a follower, which would hand the followers the escape the row is about."""
+_ROOM_STARTER_SHAPE = (512, 512)
+_ROOM_STARTER_STEPS = 10
+"""The one job each idle card's classes are asked for: small enough to drain inside a tick, so those cards are
+free for the rest of the run while their weights stay resident and protected."""
+
+_ROOM_TICK_SECONDS = 0.5
+_ROOM_TICKS = 80
+_ROOM_SPREAD_TICKS = 40
+"""Ticks the followers have to reach the idle cards. One preload leaves per cycle and a checkpoint takes
+several ticks to land, so two copies need a dozen ticks at best; this is comfortably past that."""
+
+_ROOM_DUTY_FLOOR = 0.15
+"""Fraction of its own slot-time each card must spend sampling once the followers have reached it."""
+
+_ROOM_UPLOAD_CEILING = 12
+"""Weight uploads the whole run may pay for.
+
+Converging costs one upload per lane the followers take, on top of the pool's own first fill. A run that
+displaced a model and then reloaded it against the job that displaced it would sit at the dispatch count
+instead, so the ceiling is what separates demand-following from thrash."""
+
+_ROOM_STARVED_TICK_CEILING = 12
+"""Ticks that may end with hot jobs queued while a card away from theirs holds no sampling job at all.
+
+Some are unavoidable: the pool fills over the first few ticks and one preload leaves per cycle, so the room a
+follower is given takes a checkpoint load to arrive. What must not stand is the run spending itself in that
+state, which is what the defect does for every one of its ticks."""
+
+
+def _room_world() -> _DispatchWorld:
+    """Four cards, two lanes each, one sampling slot per card, and a distinct resident class on every lane."""
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=8,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        tick_seconds=_ROOM_TICK_SECONDS,
+        card_max_pixels=_ROOM_PIXELS,
+        extra_model_classes=_FILLER_MODEL_CLASSES,
+    )
+    for lane_id, model in enumerate(_ROOM_RESIDENTS):
+        world.seed_resident(lane_id, model, in_vram=True)
+    assert world.card_of_lane(1) == 1, "precondition: the hot class must start on card 1 and nowhere else"
+    return world
+
+
+def _outstanding(world: _DispatchWorld, model: _ModelClass) -> int:
+    """How many jobs for ``model`` the worker holds, pending or in progress: the class's outstanding demand."""
+    pending = sum(1 for job in world.job_tracker.jobs_pending_inference if job.model == model.name)
+    in_progress = sum(1 for job in world.job_tracker.jobs_in_progress if job.model == model.name)
+    return pending + in_progress
+
+
+def _cards_with_no_sampling_job(world: _DispatchWorld) -> set[int]:
+    """The cards holding no in-progress job, so both their lanes are free to be given one."""
+    busy: set[int] = set()
+    for job in world.job_tracker.jobs_in_progress:
+        lane_id = world.lane_serving(job)
+        if lane_id is not None:
+            busy.add(world.card_of_lane(lane_id))
+    return set(_ROOM_PIXELS) - busy
+
+
+@dataclass
+class _RoomRun:
+    """What one run of the follower-room traffic looked like, tick by tick."""
+
+    concurrency: list[int] = field(default_factory=list)
+    """Jobs sampling at the end of each tick."""
+    hot_copies: list[int] = field(default_factory=list)
+    """Lanes holding the hot class's weights at the end of each tick."""
+    starved_ticks: list[int] = field(default_factory=list)
+    """Ticks that ended with hot jobs still queued while a card away from card 1 had no sampling job."""
+
+
+async def _drive_room_traffic(world: _DispatchWorld) -> _RoomRun:
+    """Queue the head, the followers and the one-shot jobs that make every resident wanted, then run.
+
+    The queue is filled once in a fixed order: card 0's two classes, the first of which takes that card's only
+    sampling slot for the whole run and the second of which is then the permanent head; the six followers for
+    the hot class; and one job for each remaining resident, so every lane's model is referenced by work rather
+    than by residency alone. From then on only the followers are topped up, to their depth.
+    """
+    width, height = _ROOM_SHAPE
+    card_zero_width, card_zero_height = _ROOM_CARD_ZERO_SHAPE
+    starter_width, starter_height = _ROOM_STARTER_SHAPE
+    run = _RoomRun()
+    for tick_index in range(_ROOM_TICKS):
+        if tick_index == 0:
+            for model in _ROOM_CARD_ZERO_PAIR:
+                await world.pop(
+                    make_job_pop_response(
+                        model.name,
+                        width=card_zero_width,
+                        height=card_zero_height,
+                        ddim_steps=_ROOM_CARD_ZERO_STEPS,
+                    ),
+                )
+            for _ in range(_ROOM_HOT_PENDING):
+                await world.pop(
+                    make_job_pop_response(_ROOM_HOT.name, width=width, height=height, ddim_steps=_ROOM_STEPS),
+                )
+            for model in (_SD15_D, _SD15_E, _SD15_F, _SDXL, _SDXL_OTHER):
+                await world.pop(
+                    make_job_pop_response(
+                        model.name,
+                        width=starter_width,
+                        height=starter_height,
+                        ddim_steps=_ROOM_STARTER_STEPS,
+                    ),
+                )
+        else:
+            while _outstanding(world, _ROOM_HOT) < _ROOM_HOT_PENDING:
+                await world.pop(
+                    make_job_pop_response(_ROOM_HOT.name, width=width, height=height, ddim_steps=_ROOM_STEPS),
+                )
+        await world.step()
+        run.concurrency.append(len(world.job_tracker.jobs_in_progress))
+        run.hot_copies.append(len(world.vram_resident_lanes(_ROOM_HOT.name)))
+        hot_queued = any(job.model == _ROOM_HOT.name for job in world.job_tracker.jobs_pending_inference)
+        if hot_queued and _cards_with_no_sampling_job(world) - {1}:
+            run.starved_ticks.append(world.tick)
+    return run
+
+
+def _assert_the_followers_reached_the_idle_cards(world: _DispatchWorld, run: _RoomRun, *, context: str) -> None:
+    """Assert the hot class earned lanes on the cards whose own classes nothing was asking for."""
+    reached = max(run.concurrency[:_ROOM_SPREAD_TICKS], default=0)
+    assert reached >= len(_ROOM_PIXELS), (
+        f"{context}: the pool ran at most {reached} job(s) at once over its first {_ROOM_SPREAD_TICKS} ticks, "
+        f"with {len(_ROOM_PIXELS)} cards, two of them holding nothing the queue wants, and "
+        f"{_ROOM_HOT_PENDING} jobs queued for a class only one card held. {world.state_dump()}"
+    )
+    carrying = {world.card_of_lane(lane_id) for lane_id in world.vram_resident_lanes(_ROOM_HOT.name)}
+    assert set(_ROOM_IDLE_CARDS) <= carrying, (
+        f"{context}: the hot class ended on cards {sorted(carrying)}, so it never reached "
+        f"{list(_ROOM_IDLE_CARDS)}, which held only classes nothing was asking for. {world.state_dump()}"
+    )
+    for device_index in sorted(_ROOM_PIXELS):
+        assert_duty_floor_on_card(world, device_index, _ROOM_DUTY_FLOOR, context=context)
+
+
+def _assert_the_followers_stopped_waiting_on_one_card(
+    world: _DispatchWorld,
+    run: _RoomRun,
+    *,
+    context: str,
+) -> None:
+    """Assert the run did not spend itself with hot jobs queued and a card away from theirs holding nothing."""
+    assert len(run.starved_ticks) <= _ROOM_STARVED_TICK_CEILING, (
+        f"{context}: {len(run.starved_ticks)} of {_ROOM_TICKS} ticks ended with hot jobs queued while a card "
+        f"other than the one holding their class had no sampling job at all, at tick(s) "
+        f"{run.starved_ticks[:10]}. {world.state_dump()}"
+    )
+
+
+async def test_w_a_follower_takes_room_from_a_model_nothing_is_asking_for() -> None:
+    """A queue of one class reaches idle cards though every lane in the pool is affinity-protected.
+
+    The failure this encodes: model->process affinity protects the last copy of every wanted model, and a
+    resident model counts as wanted, so a pool holding a distinct model on every lane protects every lane. A
+    job whose own model is resident only where it is busy then finds no preload target at all. The queue head
+    escapes that through its own room fallback; a follower has none, and a burst is made of followers. Measured
+    on this shape: the hot class held one copy for all eighty ticks, no preload was ever commanded for it,
+    concurrency sat at two on a four-card pool, and the two cards holding classes nobody was asking for spent
+    under three percent of their slot-time sampling while six jobs queued.
+
+    Read as one statement: copies follow demand. Its consequences are that concurrency reaches the card count,
+    that the idle cards end the run carrying the class the queue was waiting on, that every card earns its own
+    duty, and that the trade costs a bounded number of weight uploads rather than a reload per job.
+    """
+    world = _room_world()
+
+    run = await _drive_room_traffic(world)
+
+    _assert_the_followers_reached_the_idle_cards(world, run, context="follower room")
+    _assert_the_followers_stopped_waiting_on_one_card(world, run, context="follower room")
+
+
+async def test_w_the_room_a_follower_takes_is_paid_for_once() -> None:
+    """Displacing a less wanted copy costs one weight upload per lane taken, not one per job.
+
+    The escape's own failure mode is thrash: a model displaced for a follower, reloaded against its own next
+    job, and displaced again. Nothing here re-demands the displaced classes, and the head's card is spared
+    outright, so converging is a fixed cost the run pays once.
+    """
+    world = _room_world()
+
+    await _drive_room_traffic(world)
+
+    assert world.weight_uploads <= _ROOM_UPLOAD_CEILING, (
+        f"paid once: {world.weight_uploads} weight uploads over {world.completed_jobs} completed jobs. "
+        f"{world.state_dump()}"
+    )
+    for model in _ROOM_CARD_ZERO_PAIR:
+        assert world.vram_resident_lanes(model.name), (
+            f"paid once: card 0's {model.name} was displaced while its own job was outstanding, so the room "
+            f"taken for the followers reached the head's own card. {world.state_dump()}"
+        )
+
+
+async def test_w_defect_reinjection_a_protected_pool_starves_its_followers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the follower-room selector removed, the same queue drains through the one card that holds it.
+
+    Reinjected at the selector alone: the duplicate escape, the copy bounds, the placement ranking, the
+    head-room fallback and every gate below are production's, and the only thing taken away is a follower's
+    ability to displace a copy the queue wants less than its own.
+    """
+    monkeypatch.setattr(preload_mod, "select_follower_room_target", lambda *_args, **_kwargs: None)
+    world = _room_world()
+
+    run = await _drive_room_traffic(world)
+
+    with pytest.raises(AssertionError, match="the pool ran at most|never reached|under the"):
+        _assert_the_followers_reached_the_idle_cards(world, run, context="no follower room")
+    with pytest.raises(AssertionError, match="ended with hot jobs queued"):
+        _assert_the_followers_stopped_waiting_on_one_card(world, run, context="no follower room")

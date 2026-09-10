@@ -82,6 +82,11 @@ class SlotSnapshot:
     allocated_mb: int | None
     ram_usage_bytes: int
     retained_resident_model: str | None
+    retained_resident_since: float | None
+    """When the slot's retention episode began, or None when it holds nothing (or nothing stamped it yet).
+
+    The only dispatch-recency reading the slot carries: a retention episode starts when a job leaves the slot
+    holding its weights, so an older stamp is a slot whose model has gone longer without work."""
     retention_granted_model: str | None
     is_busy: bool
     can_accept_job: bool
@@ -403,6 +408,7 @@ def snapshot_slot(
         allocated_mb=process_info.process_allocated_mb,
         ram_usage_bytes=process_info.ram_usage_bytes,
         retained_resident_model=process_info.retained_resident_model,
+        retained_resident_since=process_info.retained_resident_since,
         retention_granted_model=process_info.retention_granted_model,
         is_busy=process_info.is_process_busy(),
         can_accept_job=process_info.can_accept_job(),
