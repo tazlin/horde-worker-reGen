@@ -56,7 +56,7 @@ from tests.analysis.test_detectors import (
     _soft_reset,
     _whole_card_reserve,
 )
-from tests.analysis.test_dispatch_detectors import _multi_card_session
+from tests.analysis.test_dispatch_detectors import _multi_card_session, _safety_stage_session
 from tests.analysis.test_dispatch_detectors import _stamp as _lifecycle_stamp
 from tests.analysis.test_job_lifecycle import (
     driving_cards,
@@ -345,6 +345,12 @@ CONTRACTS: dict[str, Contract] = {
     "detect_safety_stage_stall": Contract(
         bridge=_bridge(_safety_lost_result("13:01:00.000"), _safety_requeue("13:01:46.000")),
         severity=Severity.WARNING,
+    ),
+    "detect_safety_stage_capacity": Contract(
+        # An eight-card fleet finishing a job every two seconds against a 1.2s check, with the
+        # finished->safety wait growing past the time the same jobs spent generating.
+        bridge=_safety_stage_session(waits=[2.0 + index * 1.5 for index in range(40)]),
+        severity=Severity.CRITICAL,
     ),
     "detect_head_dispatch_stall": Contract(
         bridge=_bridge(_dispatch_stall("13:01:00.000", reason=_DISPATCH_BUG_REASON)),

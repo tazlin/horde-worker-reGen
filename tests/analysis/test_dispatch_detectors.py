@@ -8,6 +8,7 @@ card is full utilisation) or on a multi-card worker whose dispatch does spread.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from horde_worker_regen.analysis.correlate import build_session_context
 from horde_worker_regen.analysis.detectors import Finding, Severity, run_detectors
 from horde_worker_regen.analysis.sessions import segment_sessions
 from tests.analysis.test_job_lifecycle import (
+    auxiliary_lane_safety_sharing,
     bridge,
     driving_cards,
     inference_dispatched,
@@ -27,6 +29,7 @@ from tests.analysis.test_job_lifecycle import (
     popped_job,
     post_process_lane_started,
     preload_cleared,
+    safety_checked,
     safety_lane_started,
     status_block,
     utilities_lane_started,
@@ -295,6 +298,31 @@ class TestLanePlacement:
         )["lane_placement"]
         assert "alongside the safety lane" in finding.verdict
 
+    def test_quotes_the_workers_own_sharing_notice_when_the_session_carries_one(self, tmp_path: Path) -> None:
+        """The edge-triggered INFO dates the sharing to a safety restore, which the occupancy map cannot."""
+        finding = diagnose(
+            tmp_path,
+            bridge(
+                driving_cards(_stamp(0), cards=4),
+                safety_lane_started(_stamp(0)),
+                post_process_lane_started(_stamp(0), process=1, device=0),
+                auxiliary_lane_safety_sharing(_stamp(600), lanes="post-processing", device=0),
+            ),
+        )["lane_placement"]
+        assert "now share device 0" in " ".join(finding.evidence)
+
+    def test_the_sharing_notice_alone_does_not_trigger_the_finding(self, tmp_path: Path) -> None:
+        """The line corroborates a placement the occupancy map already shows; it is not its own trigger."""
+        assert "lane_placement" not in diagnose(
+            tmp_path,
+            bridge(
+                driving_cards(_stamp(0), cards=4),
+                safety_lane_started(_stamp(0)),
+                post_process_lane_started(_stamp(0), process=1, device=2),
+                auxiliary_lane_safety_sharing(_stamp(600), lanes="post-processing", device=2),
+            ),
+        )
+
     def test_silent_when_auxiliary_lanes_stay_put_off_card_zero(self, tmp_path: Path) -> None:
         """Stable placement away from the safety card is the intended arrangement."""
         assert "lane_placement" not in diagnose(
@@ -324,6 +352,95 @@ class TestLanePlacement:
             tmp_path,
             bridge(safety_lane_started(_stamp(0)), post_process_lane_started(_stamp(0), process=1, device=0)),
         )
+
+
+def _safety_stage_session(
+    *,
+    waits: Sequence[float],
+    cards: int = 8,
+    check_seconds: float = 1.2,
+    finish_interval: float = 2.0,
+    generation_seconds: float = 16.0,
+    with_safety_lines: bool = True,
+) -> str:
+    """A fleet finishing a job every ``finish_interval`` seconds, each waiting ``waits[i]`` for safety.
+
+    One job per entry in ``waits``. The cards only set the finish rate here: what the detector weighs is
+    that rate against the single checker's own median check duration.
+    """
+    lines: list[str] = []
+    if cards > 1:
+        lines.append(driving_cards(_stamp(0), cards=cards))
+        fleet_lines, lane_card = _fleet(cards, lanes_per_card=1)
+        lines.extend(fleet_lines)
+        lanes = sorted(lane_card)
+    else:
+        lines.append(inference_lane_started(_stamp(0), process=3, device=0))
+        lanes = [3]
+    lines.append(safety_lane_started(_stamp(0)))
+
+    for index, wait in enumerate(waits):
+        job_id = _job_id(index)
+        finished = 100.0 + index * finish_interval
+        lane = lanes[index % len(lanes)]
+        model = _MODELS[index % len(_MODELS)]
+        lines.append(popped_job(_stamp(finished - generation_seconds - 5), job_id=job_id, model=model))
+        lines.append(inference_dispatched(_stamp(finished - generation_seconds), job_id=job_id, process=lane))
+        lines.append(
+            inference_finished(
+                _stamp(finished),
+                job_id=job_id,
+                model=model,
+                process=lane,
+                seconds=generation_seconds,
+            ),
+        )
+        if with_safety_lines:
+            lines.append(safety_checked(_stamp(finished + wait), job_id=job_id, seconds=check_seconds))
+    return bridge(sorted(lines))
+
+
+class TestSafetyStageCapacity:
+    """One safety process serving a whole fleet, and the queue that forms once it is the serial stage."""
+
+    def test_fires_when_the_fleet_outruns_the_single_checker(self, tmp_path: Path) -> None:
+        """Eight cards finishing every 2s against a 1.2s check: the wait grows until it dwarfs sampling."""
+        session = _safety_stage_session(waits=[2.0 + index * 1.5 for index in range(40)])
+        finding = diagnose(tmp_path, session)["safety_stage_capacity"]
+        assert finding.severity is Severity.CRITICAL
+        assert "8 cards" in finding.verdict
+        # Demand, capacity and the wait are all named, each from the session's own numbers.
+        assert "0.50 job(s) per second" in finding.verdict
+        assert "0.83 per second" in finding.verdict
+        assert "1.20s per check" in finding.verdict
+        assert "costs more wall clock than the GPUs do" in finding.verdict
+        joined = " ".join(finding.evidence)
+        assert "finished->safety wait" in joined
+        assert "safety_on_gpu" in finding.remediation
+        assert "max_power will not help" in finding.remediation
+
+    def test_silent_when_the_wait_is_about_one_check(self, tmp_path: Path) -> None:
+        """A checker keeping up costs each job one check duration; that is the stage working, not queuing."""
+        session = _safety_stage_session(waits=[1.2] * 40)
+        assert "safety_stage_capacity" not in diagnose(tmp_path, session)
+
+    def test_silent_on_a_single_card_worker(self, tmp_path: Path) -> None:
+        """One card cannot outrun the checker: whatever it waits for, it is not a fleet's finish rate."""
+        session = _safety_stage_session(waits=[2.0 + index * 1.5 for index in range(40)], cards=1)
+        assert "safety_stage_capacity" not in diagnose(tmp_path, session)
+
+    def test_silent_without_safety_lines(self, tmp_path: Path) -> None:
+        """With no check durations there is no capacity to compare a finish rate against."""
+        session = _safety_stage_session(
+            waits=[2.0 + index * 1.5 for index in range(40)],
+            with_safety_lines=False,
+        )
+        assert "safety_stage_capacity" not in diagnose(tmp_path, session)
+
+    def test_silent_on_too_few_checked_jobs(self, tmp_path: Path) -> None:
+        """A handful of checks is a warm-up; the first cold check alone would set the median."""
+        session = _safety_stage_session(waits=[2.0 + index * 1.5 for index in range(6)])
+        assert "safety_stage_capacity" not in diagnose(tmp_path, session)
 
 
 class TestParentLoopStall:

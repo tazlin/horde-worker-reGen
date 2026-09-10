@@ -560,7 +560,8 @@ model-reference read that faulted a running sample, a pop that named no model, a
 slot it is loaded onto, and the horde repeatedly refusing this worker's pops) and emits the child's
 exception as the root cause where it can. Every session also carries a census of the jobs it faulted,
 with each one's model and cause. Every finding id, with its severity and what it means, is catalogued in
-[Log findings](log_findings.md). See
+[Log findings](log_findings.md); a finding whose remedy needs background prints a `see:` line naming the
+docs page that explains the subsystem behind it. See
 [Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-recovery-storm-from-the-logs).
 
 Findings quote the worker's own words wherever the log carries them, and only fall back to listing

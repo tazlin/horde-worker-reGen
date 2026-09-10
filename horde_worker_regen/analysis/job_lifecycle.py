@@ -186,6 +186,18 @@ class JobRecord:
         return (self.submitted_at - self.inference_finished_at).total_seconds()
 
     @property
+    def finished_to_safety_seconds(self) -> float | None:
+        """Seconds from inference finishing to the safety verdict: the queue in front of the checker.
+
+        This is the first half of :attr:`post_inference_seconds`, and the half that is a queue rather than
+        work: it is the wait before the check, so it grows with how far behind the safety stage is while
+        the check itself costs the same. Attributing a long post-inference wait needs the two apart.
+        """
+        if self.inference_finished_at is None or self.safety_checked_at is None:
+            return None
+        return (self.safety_checked_at - self.inference_finished_at).total_seconds()
+
+    @property
     def faulted(self) -> bool:
         """Whether the job faulted at any point, whether or not the fault reached the horde."""
         return self.faulted_at is not None or self.fault_reported

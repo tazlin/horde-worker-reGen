@@ -181,6 +181,17 @@ def safety_lane_started(ts: str, *, process: int = 0) -> str:
     )
 
 
+def auxiliary_lane_safety_sharing(ts: str, *, lanes: str = "post-processing", device: int = 1) -> str:
+    """process_lifecycle._note_auxiliary_lane_safety_sharing: safety came back to a pinned lane's card."""
+    return _line(
+        ts,
+        "INFO",
+        "horde_worker_regen.process_management.lifecycle.process_lifecycle:_note_auxiliary_lane_safety_sharing:1363",
+        f"The safety process and the {lanes} lane(s) now share device {device}; the lane(s) stay on the "
+        f"card they were placed on.",
+    )
+
+
 def driving_cards(ts: str, *, cards: int, processes_per_card: int = 1) -> str:
     """process_manager._build_card_runtimes: the multi-card boot summary and the intake budget."""
     per_card = ", ".join(

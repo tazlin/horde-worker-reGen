@@ -196,6 +196,20 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.lifecycle.process_lifecycle:start_safety_processes",
         sample="Started safety process (id: 0)",
     ),
+    _signature(
+        "auxiliary_lane_safety_sharing",
+        r"The safety process and the (?P<lanes>.+?) lane\(s\) now share device (?P<device>\d+)",
+        emitter="process_management.lifecycle.process_lifecycle:_note_auxiliary_lane_safety_sharing",
+        sample=(
+            "The safety process and the post-processing lane(s) now share device 1; the lane(s) stay on "
+            "the card they were placed on."
+        ),
+        dry_run_reason=(
+            "edge-triggered when safety returns to a card a pinned auxiliary lane already holds, which "
+            "needs a pause and restore of the safety process on a multi-card host; the dry-run harness "
+            "does neither"
+        ),
+    ),
     # --- Worker-wide shape ---
     _signature(
         "driving_cards",

@@ -1360,6 +1360,7 @@ class ProcessLifecycleManager:
         self._auxiliary_lane_safety_sharing_notice = current_sharing
         if current_sharing is None:
             return
+        # Log contract: analysis/log_signatures.py (auxiliary_lane_safety_sharing).
         logger.info(
             f"The safety process and the {' and '.join(sharing_lanes)} lane(s) now share device "
             f"{safety_card}; the lane(s) stay on the card they were placed on.",

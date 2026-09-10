@@ -15,6 +15,11 @@ Severity is the sort order of the report, not a queue: **critical** findings com
 sustained pattern); those are marked *varies*. Findings are for problems, so a healthy subsystem emits
 nothing at all: the absence of `parent_loop_stall` means the parent loop was fine.
 
+Where acting on a remedy needs background the finding cannot carry inline, its spec names a deep-dive
+page (`FindingSpec.reference_page`), printed under the remedy as a `see:` line and carried in the JSON
+output as `reference_page`. A test asserts every such path is a page that exists, so the column here
+stays a summary and the link stays live.
+
 For how the detectors, the log lines they read, and the dashboard stay in step, see
 [Log diagnostics contract](../explanation/log_diagnostics_contract.md). For the commands, see
 [CLI → `horde-log`](cli.md#horde-log).
@@ -58,6 +63,7 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 | `slow_generation_drop_spiral` | varies | The horde aborted generations as too slow. The verdict is attributed from the lifecycle split: pop->dispatch aging points at scheduling, finished->submit aging at pipeline balance, and slow generation itself at GPU/config. A capture without dispatch/finish lines says the wait could not be located. | Follow the attribution, not the abort: lowering max_power only helps the generation case. |
 | `post_processing_deferral_starvation` | varies | The post-processing admission gate deferred the same job every scheduling tick with no lane completion afterwards. | The gate's VRAM reserve cannot be met; free headroom on that card or move the lane. |
 | `safety_stage_stall` | varies | The safety stage lost verdicts or backed up enough to requeue jobs. | Enable `safety_on_gpu` so safety is not CPU-bound, or add safety capacity. |
+| `safety_stage_capacity` | varies | A multi-card worker finished jobs at a rate approaching what its single safety process can check, and the median finished->safety wait ran well past one check duration. Critical once that wait exceeds the median generation time. | Inference scales with the cards and safety does not. Enable `safety_on_gpu` and add safety capacity; lowering `max_power` or `queue_size` shrinks the work, not the per-check cost. |
 | `pop_liveness_full_queue` | critical | The local job queue was full and stopped draining: the worker held work and served none of it. | The most severe liveness signal there is. Take the dispatch or process-lifecycle finding alongside it. |
 | `parent_loop_stall` | varies | The parent drained no child IPC messages for longer than the session's own status-print cadence allows. Nothing dispatches, completes or submits while that loop is stopped. | Find what blocked the asyncio thread: a synchronous disk scan, model-reference read, or an untimed network call. `horde-log timeline` over the gap shows what came just before. |
 | `lane_placement` | warning | An auxiliary lane (post-processing, utilities, safety) re-spawned onto a different card than it held, or stacked onto card 0 alongside GPU safety while other cards were free. | Read that card's duty and free VRAM against the rest of the fleet before blaming the GPU. Pin the auxiliary lanes if the placement was not intended. |

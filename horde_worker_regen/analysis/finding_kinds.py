@@ -67,6 +67,7 @@ class FindingKind(enum.StrEnum):
     SLOW_GENERATION_DROP_SPIRAL = "slow_generation_drop_spiral"
     POST_PROCESSING_DEFERRAL_STARVATION = "post_processing_deferral_starvation"
     SAFETY_STAGE_STALL = "safety_stage_stall"
+    SAFETY_STAGE_CAPACITY = "safety_stage_capacity"
     POP_LIVENESS_FULL_QUEUE = "pop_liveness_full_queue"
     PARENT_LOOP_STALL = "parent_loop_stall"
     LANE_PLACEMENT = "lane_placement"
@@ -92,12 +93,21 @@ class FindingSpec:
     ``remediation`` is the advice that holds for every emit of the kind. Where the fix genuinely depends
     on what was measured, it is empty and the detector supplies the whole text as an addendum; where both
     are present the rendered remediation is the invariant followed by the addendum.
+
+    ``see_also`` points at another diagnosis; ``reference_page`` points at prose. They are separate fields
+    because they are checked differently: a cross-reference has to name a declared kind, a reference page
+    has to be a file that exists, and a kind whose fix needs background has both.
     """
 
     kind: FindingKind
     title: str
     remediation: str = ""
     see_also: FindingKind | None = None
+    reference_page: str | None = None
+    """A repo-relative path to the docs page that explains the subsystem behind this diagnosis.
+
+    Set it where acting on the remediation needs background the finding cannot carry inline; a test
+    asserts the page is on disk, so a moved or renamed page fails rather than printing a dead path."""
 
 
 def _spec_table(*specs: FindingSpec) -> Mapping[FindingKind, FindingSpec]:
@@ -158,6 +168,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.POST_PROCESSING_VRAM_STALL,
         title="Post-processing stalled on an over-committed card",
+        reference_page="docs/explanation/performance_and_backpressure.md",
     ),
     FindingSpec(
         kind=FindingKind.ORPHAN_WEDGE,
@@ -316,10 +327,25 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "stopgap, lower resident VRAM on the lane's card or disable post-processing on this worker."
         ),
         see_also=FindingKind.POST_PROCESSING_VRAM_STALL,
+        reference_page="docs/explanation/process_lanes_and_chaining.md",
     ),
     FindingSpec(
         kind=FindingKind.SAFETY_STAGE_STALL,
         title="Safety stage stalled (lost verdicts / backlog)",
+    ),
+    FindingSpec(
+        kind=FindingKind.SAFETY_STAGE_CAPACITY,
+        title="One safety process behind more finishes than it can check",
+        remediation=(
+            "Safety is one process for the whole worker, so its throughput is fixed while the fleet's "
+            "finish rate scales with the cards. Give it more capacity: enable safety_on_gpu so a check "
+            "costs a fraction of its CPU time, and raise the number of safety processes if the build "
+            "supports it. Lowering max_power will not help, and neither will lowering queue_size: both "
+            "shrink the work, not the per-check cost, and a slower fleet still hands every image to the "
+            "same single checker."
+        ),
+        see_also=FindingKind.SAFETY_STAGE_STALL,
+        reference_page="docs/explanation/process_lanes_and_chaining.md",
     ),
     FindingSpec(
         kind=FindingKind.POP_LIVENESS_FULL_QUEUE,
@@ -449,6 +475,11 @@ class Finding:
     def title(self) -> str:
         """This emit's headline: its own wording where it has one, otherwise the catalogue name."""
         return self.title_override or self.spec.title
+
+    @property
+    def reference_page(self) -> str | None:
+        """The docs page explaining this kind's subsystem, or None where the remediation stands alone."""
+        return self.spec.reference_page
 
     @property
     def remediation(self) -> str:

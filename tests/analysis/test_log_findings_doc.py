@@ -13,7 +13,8 @@ from pathlib import Path
 
 from horde_worker_regen.analysis.finding_kinds import FINDING_SPECS, FindingKind
 
-_FINDINGS_DOC = Path(__file__).resolve().parents[2] / "docs" / "reference" / "log_findings.md"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FINDINGS_DOC = _REPO_ROOT / "docs" / "reference" / "log_findings.md"
 
 
 def _catalogued_ids() -> set[str]:
@@ -45,6 +46,20 @@ def test_the_catalogue_names_no_retired_id() -> None:
     declared = {kind.value for kind in FINDING_SPECS}
     stale = sorted(_catalogued_ids() - declared)
     assert not stale, f"catalogued ids no kind declares: {stale}"
+
+
+def test_every_reference_page_exists() -> None:
+    """A spec's deep-dive page is printed to an operator, so it must be a page that is actually there.
+
+    The path is repo-relative and hand-written, so a page renamed or moved elsewhere in the docs tree
+    would otherwise reach the report as a dead link.
+    """
+    missing = sorted(
+        f"{kind.value} -> {spec.reference_page}"
+        for kind, spec in FINDING_SPECS.items()
+        if spec.reference_page is not None and not (_REPO_ROOT / spec.reference_page).is_file()
+    )
+    assert not missing, f"FindingSpec.reference_page values that name no file: {missing}"
 
 
 def test_every_kind_has_a_spec() -> None:

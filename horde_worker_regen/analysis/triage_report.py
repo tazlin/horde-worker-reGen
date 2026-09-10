@@ -156,6 +156,7 @@ def finding_to_dict(finding: Finding) -> dict[str, object]:
         "remediation": finding.remediation,
         "evidence": finding.evidence,
         "see_also": finding.see_also.value if finding.see_also is not None else None,
+        "reference_page": finding.reference_page,
     }
 
 
@@ -179,6 +180,8 @@ def render_findings(session: WorkerSession, findings: list[Finding]) -> str:
             blocks.append(f"    -> {finding.remediation}")
         if finding.see_also:
             blocks.append(f"    see also: {finding.see_also}")
+        if finding.reference_page:
+            blocks.append(f"    see: {finding.reference_page}")
     return "\n".join(blocks)
 
 

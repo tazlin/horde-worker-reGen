@@ -31,8 +31,9 @@ from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
 from .correlate import RecoveryDiagnostic, SessionContext, find_child_crash
 from .finding_kinds import Finding, FindingKind, Severity
 from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_LABELS
-from .job_lifecycle import JobLifecycleModel, LaneRole, job_lifecycle_for
+from .job_lifecycle import JobLifecycleModel, LaneRole, job_lifecycle_for, percentile
 from .log_ingest import LogRecord
+from .log_signatures import pattern_for
 from .sessions import SessionEndReason
 
 # Signatures over orchestrator message text.
@@ -2963,6 +2964,12 @@ _SAFETY_GPU_DEVICE_INDEX = 0
 """The card the safety lane occupies when it runs on the GPU. Its spawn line carries no device index, so
 this is the only way to reason about what shares a card with it."""
 
+_AUX_LANE_SAFETY_SHARING_RE = pattern_for("auxiliary_lane_safety_sharing")
+"""The worker's own edge-triggered disclosure that safety came back to a card a pinned lane holds.
+
+It corroborates the stacking the occupancy map already shows, and it carries what the map cannot: the
+moment the sharing began, which is a pause/restore of the safety process rather than a placement choice."""
+
 
 def detect_lane_placement(context: SessionContext) -> list[Finding]:
     """Auxiliary lanes that moved cards mid-session, or that stacked onto the safety lane's card.
@@ -2988,6 +2995,11 @@ def detect_lane_placement(context: SessionContext) -> list[Finding]:
         return []
 
     evidence: list[str] = []
+    # The worker's own notice, where the session carries one: it dates the sharing to a safety
+    # pause/restore rather than to where the lane was first placed. Corroboration only, since the
+    # occupancy map above is what decides whether there is anything to report.
+    sharing_notices = _matching(context.session.records, _AUX_LANE_SAFETY_SHARING_RE)
+    evidence.extend(_evidence(record) for record in sharing_notices[:3])
     for migration in migrations:
         stamp = migration.timestamp.strftime("%H:%M:%S") if migration.timestamp else "--:--:--"
         evidence.append(
@@ -3071,6 +3083,111 @@ def detect_parent_loop_stall(context: SessionContext) -> list[Finding]:
     ]
 
 
+_SAFETY_CAPACITY_MIN_CHECKED_JOBS = 10
+"""How many checked jobs a session needs before its check duration and wait medians mean anything.
+
+Below this a single cold first check or one slow upload dominates every figure the detector reads."""
+
+_SAFETY_CAPACITY_DEMAND_FRACTION = 0.5
+"""The share of the checker's capacity the fleet's finish rate has to reach before a queue is expected.
+
+Safety is a single server with no batching, so arrivals that are bursty (several cards finishing within
+the same second, which is exactly what a spread fleet does) build a queue well before the mean arrival
+rate reaches the service rate. Half of capacity is where that starts to show as a standing wait."""
+
+_SAFETY_CAPACITY_WAIT_MARGIN = 2.0
+"""How many check durations the observed wait must exceed before it is a queue rather than the check.
+
+A job that arrives at an idle checker waits nothing and is done in one check duration; the margin keeps a
+session whose waits are simply one check long from being read as a backlog."""
+
+
+def detect_safety_stage_capacity(context: SessionContext) -> list[Finding]:
+    """A multi-card fleet finishing inference faster than the one safety process can check the results.
+
+    Safety is one process for the whole worker while inference scales with the cards, so the two stages
+    scale differently: N cards at one job per generation time hand images to a checker whose throughput is
+    fixed at one check per check duration. Past the point where the finish rate approaches that
+    throughput, every further card adds queue rather than output, and the cost lands on the finished->
+    safety wait, which is invisible in the generation time an operator is most likely to look at.
+
+    All three figures come from the session itself: the demand from its own finish stamps over the span
+    they cover, the capacity from the median of its own safety check durations, and the margin the wait
+    has to clear from that same check duration. Nothing here is sized to a particular card count or a
+    particular checker, so a two-card CPU-safety host and a sixteen-card GPU-safety one are judged by the
+    same rule. It is silent on a single-card worker, where one card cannot outrun the checker by
+    definition, and on a capture whose safety lines are absent, where the wait cannot be located at all.
+    """
+    lifecycle = job_lifecycle_for(context)
+    card_count = lifecycle.card_count
+    if card_count is None or card_count < 2:
+        return []
+
+    checks: list[float] = []
+    waits: list[float] = []
+    finishes: list[datetime] = []
+    for job in lifecycle.jobs.values():
+        if job.safety_seconds is not None:
+            checks.append(job.safety_seconds)
+        wait = job.finished_to_safety_seconds
+        if wait is not None:
+            waits.append(wait)
+        if job.inference_finished_at is not None:
+            finishes.append(job.inference_finished_at)
+    finishes.sort()
+
+    if len(checks) < _SAFETY_CAPACITY_MIN_CHECKED_JOBS or len(waits) < _SAFETY_CAPACITY_MIN_CHECKED_JOBS:
+        return []
+    if len(finishes) < 2:
+        return []
+
+    busy_span = (finishes[-1] - finishes[0]).total_seconds()
+    median_check = _median(checks)
+    median_wait = _median(waits)
+    if busy_span <= 0 or median_check is None or median_check <= 0 or median_wait is None:
+        return []
+
+    capacity = 1 / median_check
+    demand = (len(finishes) - 1) / busy_span
+    if demand < capacity * _SAFETY_CAPACITY_DEMAND_FRACTION:
+        return []
+    if median_wait <= median_check * _SAFETY_CAPACITY_WAIT_MARGIN:
+        return []
+
+    generation = lifecycle.wait_segments()[1].median
+    severity = Severity.CRITICAL if generation is not None and median_wait > generation else Severity.WARNING
+    generation_clause = (
+        f" That wait is {'longer' if severity is Severity.CRITICAL else 'shorter'} than the median "
+        f"{generation:.1f}s the same jobs spent generating, so the checker "
+        f"{'costs more wall clock than the GPUs do' if severity is Severity.CRITICAL else 'is eating into it'}."
+        if generation is not None
+        else ""
+    )
+
+    return [
+        Finding(
+            kind=FindingKind.SAFETY_STAGE_CAPACITY,
+            severity=severity,
+            verdict=(
+                f"Across {card_count} cards the worker finished {demand:.2f} job(s) per second while its "
+                f"single safety process could check {capacity:.2f} per second (a median {median_check:.2f}s "
+                f"per check), so results queued in front of it: the median job waited {median_wait:.1f}s "
+                f"between inference finishing and its safety verdict, against a check that costs "
+                f"{median_check:.2f}s.{generation_clause} Inference scales with the cards and safety does "
+                f"not, so this gap widens with every card added."
+            ),
+            evidence=[
+                f"demand: {len(finishes)} inference finish(es) over {busy_span / 60:.0f} min "
+                f"({demand:.2f}/s) across {card_count} card(s)",
+                f"capacity: {len(checks)} safety check(s), median {median_check:.2f}s "
+                f"(p90 {percentile(checks, 0.9) or 0:.2f}s), so {capacity:.2f} check(s)/s",
+                f"finished->safety wait: median {median_wait:.1f}s (p90 {percentile(waits, 0.9) or 0:.1f}s) "
+                f"over {len(waits)} job(s)",
+            ],
+        ),
+    ]
+
+
 DETECTORS: list[Detector] = [
     detect_crash_on_start_loop,
     detect_empty_model_pop_cascade,
@@ -3086,6 +3203,7 @@ DETECTORS: list[Detector] = [
     detect_model_churn,
     detect_lane_placement,
     detect_safety_stage_stall,
+    detect_safety_stage_capacity,
     detect_whole_card_convergence_wedge,
     detect_whole_card_nonhead_residency_starvation,
     detect_whole_card_residency_churn,

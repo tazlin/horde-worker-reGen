@@ -142,9 +142,11 @@ the diagnosis is **declared before it is detected**:
 
 1. Add a `FindingKind` member in `finding_kinds.py` whose value is the printed id `<name>`, and a
    `FindingSpec` for it in `FINDING_SPECS`: the catalogue title, the remediation that holds for every
-   emit of the kind, and the `see_also` kind a reader should turn to next. Both cross-references and
-   catalogue coverage are checked against this table, so a link that goes nowhere fails a test rather
-   than reaching an operator.
+   emit of the kind, the `see_also` kind a reader should turn to next, and, where acting on the
+   remediation needs background, the `reference_page` that explains the subsystem (a repo-relative docs
+   path, rendered as a `see:` line). Cross-references, catalogue coverage and the existence of every
+   reference page are checked against this table, so a link that goes nowhere fails a test rather than
+   reaching an operator.
 2. Write `detect_<name>(context) -> list[Finding]` in `detectors.py`, returning a finding with
    `kind=FindingKind.<NAME>`. Read job-shaped facts through `job_lifecycle_for(context)`; if you need a
    log line the model does not carry, register its pattern in `log_signatures.py` first.
