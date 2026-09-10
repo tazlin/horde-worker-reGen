@@ -106,8 +106,9 @@ pattern and the sample in the same change and re-run the analysis contract tests
 Three tests hold the two ends of that contract:
 
 - **The literal pin** (`test_log_signatures.py`): every registered pattern still matches its recorded
-  sample, and no pattern in the lifecycle parser is missing from the registry, so a new parser cannot
-  be added without a sample and an emitter.
+  sample, and no pattern in the lifecycle parser or the detectors is missing from the registry (aside
+  from an explicit, reasoned allowlist for the few that are not worker-line signatures in their own
+  right), so a new parser cannot be added without a sample and an emitter.
 - **The live half** (`test_log_contract_dry_run.py`, marked `slow`): the worker is run through the
   dry-run harness, and every pattern the run can exercise must match a line that run actually wrote.
   This is the test that goes red when an emitting f-string is reworded. A line a dry run structurally

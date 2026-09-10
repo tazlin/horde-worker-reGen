@@ -37,16 +37,16 @@ from .log_signatures import pattern_for
 from .sessions import SessionEndReason
 
 # Signatures over orchestrator message text.
-_QUARANTINE_RE = re.compile(r"quarantined \(crash on start")
-_SOFT_RESET_RE = re.compile(r"Save-our-ship soft reset")
+_QUARANTINE_RE = pattern_for("quarantine")
+_SOFT_RESET_RE = pattern_for("soft_reset")
 
 _WEDGE_ESCALATION_RE = re.compile(r"(Queue deadlock detected|Deadlock detected|Save-our-ship)")
 """The worker declaring the queue stopped, or its recovery ladder acting on that declaration.
 
 A hold that self-clears is ordinary packing; a hold whose own window contains one of these lines did not
 self-clear, whatever its per-hold text says, because the worker had already escalated past it."""
-_POOLS_RECOVERED_RE = re.compile(r"pools recovered.*limp-by cleared")
-_ABANDON_SHIP_RE = re.compile(r"abandoning ship|cannot restore a working process pool")
+_POOLS_RECOVERED_RE = pattern_for("pools_recovered")
+_ABANDON_SHIP_RE = pattern_for("abandon_ship")
 # The live worker reclaims-and-retries on this same fingerprint; keep the signature single-sourced.
 _OOM_RE = OOM_TEXT_RE
 # A faulted-inference result names its model and the failing node in a stable shape:
@@ -54,44 +54,39 @@ _OOM_RE = OOM_TEXT_RE
 # Both the OOM and the file-descriptor detectors read the model off this to name the culprit, because the
 # outer "Pipeline failed to run ... produced no results" wrapper is identical across unrelated root causes.
 _FAULT_MODEL_RE = re.compile(r"Model: (?P<model>.+?)\. Error:")
-_FAULTED_ON_PROCESS_RE = re.compile(r"faulted on process (?P<pid>\d+)")
+_FAULTED_ON_PROCESS_RE = pattern_for("faulted_on_process")
 # The same slot-side fault, keyed on the job it names. Producer:
 # ``message_dispatcher._handle_faulted_inference_result``.
-_FAULTED_ON_PROCESS_JOB_RE = re.compile(r"Job (?P<job>[0-9a-fA-F-]{8,}) faulted on process (?P<pid>\d+)")
+_FAULTED_ON_PROCESS_JOB_RE = pattern_for("faulted_on_process_job")
 # The terminal per-job fault the worker reports to the horde. Producer:
 # ``job_submitter.submit_single_generation``. This is the surface the horde's own faulted counter follows,
 # so it is what a census must agree with; the slot-side line above is the same job seen earlier.
-_FAULT_REPORTED_RE = re.compile(r"(?P<job>[0-9a-fA-F-]{8,}) faulted\. Reported fault to the horde\.")
+_FAULT_REPORTED_RE = pattern_for("fault_reported")
 # The pop line that binds a job id to the model it was popped for. Producer: ``job_popper.api_job_pop``.
-_POPPED_JOB_RE = re.compile(r"Popped job (?P<job>\S+) .*?\(model: (?P<model>.+?), batch:")
+_POPPED_JOB_RE = pattern_for("popped_job_model")
 # The safety watchdog faulting a named job it could not check. Producer:
 # ``worker_recovery_coordinator`` (the id-anchored form of :data:`_SAFETY_UNRECOVERABLE_RE`).
-_SAFETY_UNRECOVERABLE_JOB_RE = re.compile(r"Job (?P<job>\S+) could not be safety-checked")
+_SAFETY_UNRECOVERABLE_JOB_RE = pattern_for("safety_unrecoverable_job")
 # The retry suffix on a slot-side fault. Producer: the same dispatcher handler, which words a bounded
 # retry as "requeued for another attempt" (or a degraded, isolated one). An attempt that came back for a
 # retry is not a job the horde lost, so a census that counts it over-reports what the session dropped.
-_FAULT_REQUEUED_RE = re.compile(r"requeued for (?:a degraded, isolated|another) attempt")
+_FAULT_REQUEUED_RE = pattern_for("fault_requeued_suffix")
 # A disaggregated pipeline stage faulting a named job. Producer:
 # ``inference_process._run_sample_stage``, which runs only on the disaggregated path, so the phrase is
 # specific to it rather than to monolithic inference.
-_STAGE_FAULT_RE = re.compile(r"(?P<stage>\w[\w -]*) stage faulted for job (?P<job>\S+?):")
+_STAGE_FAULT_RE = pattern_for("stage_fault")
 # The model-reference read that failed under an in-flight sample, and the cache-staleness lines that
 # attribute it. Producers: ``horde_model_reference`` (raised into the stage fault above) and the replica
 # backend's ``needs_refresh`` disclosure.
-_MODEL_REFERENCE_UNREADABLE_RE = re.compile(
-    r"Model reference for category (?P<category>\S+) not found or could not be parsed",
-)
-_MODEL_REFERENCE_STALE_RE = re.compile(r"needs refresh|cache is stale")
+_MODEL_REFERENCE_UNREADABLE_RE = pattern_for("model_reference_unreadable")
+_MODEL_REFERENCE_STALE_RE = pattern_for("model_reference_stale")
 # The worker's most severe liveness signal: the local queue full and motionless. Producer:
 # ``process_manager._full_queue_frozen_line``, logged at ERROR on a repeat clock.
-_POP_LIVENESS_FROZEN_RE = re.compile(r"Pop liveness: the local job queue has been full and not draining")
-_POP_LIVENESS_FROZEN_FIELDS_RE = re.compile(
-    r"Pop liveness: the local job queue has been full and not draining for (?P<seconds>\d+)s "
-    r"\((?P<waiting>\d+) accepted job\(s\) waiting, head model '(?P<model>[^']*)'\)",
-)
+_POP_LIVENESS_FROZEN_RE = pattern_for("pop_liveness_frozen")
+_POP_LIVENESS_FROZEN_FIELDS_RE = pattern_for("pop_liveness_frozen_fields")
 # The whole-card residency governor's ENTER parenthetical names the model holding the card. Producer:
 # ``PopGovernorRegistry`` via the scheduler's residency spell.
-_RESIDENCY_GOVERNOR_MODEL_RE = re.compile(r"Pop governor ENTER: whole_card_residency \((?P<model>.+?) holds the card")
+_RESIDENCY_GOVERNOR_MODEL_RE = pattern_for("residency_governor_model")
 # The CUDA allocator's own accounting from an OOM message: how little was free, and the sibling processes
 # co-resident on the card. Several siblings each holding GiB with almost nothing free is the over-admission
 # fingerprint (many models sharing one card), distinct from a single model that simply will not fit.
@@ -104,90 +99,85 @@ _FD_EXHAUSTION_RE = re.compile(r"Too many open files(?! in system)")
 # The resource whose open() was refused, naming where the exhaustion bit: a /proc probe (psutil's
 # free-RAM read, or the child's own /proc/<pid>/stat control-message read) or a checkpoint/LoRA .safetensors.
 _FD_RESOURCE_RE = re.compile(r"Too many open files: '(?P<path>[^']+)'|open file <(?P<file>[^>]+)> in read-only mode")
-_NO_IMAGES_RE = re.compile(r"no images were produced|no images produced")
+_NO_IMAGES_RE = pattern_for("no_images")
 # The in-progress orphan watchdog names itself in its punt line ("...(orphaned-job watchdog).") rather
 # than using the words "orphaned in-progress", so the watchdog tag is the signature that actually
 # matches the emitted text; the other alternatives stay for forward-compatibility and the ledger reason.
-_ORPHAN_RE = re.compile(r"orphaned? in-progress|punt(?:ing|ed) (?:an? )?orphan|orphaned-job watchdog")
+_ORPHAN_RE = pattern_for("orphaned_job_punt")
 # The horde rejecting a pop because it forced the worker into maintenance, and the (server-supplied)
 # reason it gives. "dropping too many jobs" is the worker's own fault and the actionable case; any other
 # maintenance (operator-set, key issue) is informational.
-_MAINTENANCE_POP_RE = re.compile(r"Failed to pop job \(Maintenance Mode\)")
-_DROPPING_JOBS_RE = re.compile(r"dropping too many jobs")
+_MAINTENANCE_POP_RE = pattern_for("maintenance_pop")
+_DROPPING_JOBS_RE = pattern_for("dropping_jobs_reason")
 # Save-our-ship faulting unservable backlog jobs (the "dropped jobs" the horde counts against the worker).
-_GIVE_UP_RE = re.compile(r"gave up on (\d+) unservable job")
+_GIVE_UP_RE = pattern_for("give_up")
 # The scheduler starving: the VRAM budget deferred the head-of-queue on an idle device, with the
 # starvation duration and the free VRAM that proves the budget was over-conservative.
 _FORCE_ADMIT_RE = re.compile(r"budget-deferred on an idle device for (\d+)s")
 _DEVICE_FREE_VRAM_RE = re.compile(r"device_free_vram=(\d+)MB")
 # The worker self-pausing pops after three consecutive faults.
-_CONSECUTIVE_PAUSE_RE = re.compile(r"Too many consecutive failed jobs, pausing job pops")
+_CONSECUTIVE_PAUSE_RE = pattern_for("consecutive_pause")
 # The horde aborting a generation server-side because the worker submitted it after the per-job deadline
 # (the verbatim server message the submitter logs). Each such abort is a faulted job the horde counts
 # against the worker, and a *sustained* run of them is the slow-generation death spiral that ends in
 # forced maintenance, distinct from save-our-ship give-ups.
-_SERVER_SLOW_ABORT_RE = re.compile(r"took too long to process and has been aborted")
+_SERVER_SLOW_ABORT_RE = pattern_for("server_slow_abort")
 # The worker-side corroboration: the inference grader flagging a job running N-times its expected
 # sampling time, with the residency snapshot (free VRAM) that fingerprints an over-committed device.
-_SLOWDOWN_GRADE_RE = re.compile(r"is ([\d.]+)x its expected sampling time")
+_SLOWDOWN_GRADE_RE = pattern_for("slowdown_grade")
 # The wall-clock the safety stage took per check; a high average is the safety stage being the pipeline
 # bottleneck (e.g. CPU safety with safety_on_gpu off).
-_SAFETY_DURATION_RE = re.compile(r"took ([\d.]+) seconds to check safety")
+_SAFETY_DURATION_RE = pattern_for("safety_check_duration")
 # Safety-stage stall signals. A verdict that never returned strands a job in SAFETY_CHECKING; the worker
 # now re-checks it (requeue), faults it with no image when the pipeline cannot check it (unrecoverable),
 # soft-pauses pops while safety is unreliable, and throttles intake when the safety backlog is too deep.
 # The dispatcher's "none was found" is the original lost-result signal that strands the job.
-_SAFETY_REQUEUE_RE = re.compile(r"requeued it for a fresh safety check")
-_SAFETY_UNRECOVERABLE_RE = re.compile(r"could not be safety-checked")
-_SAFETY_SOFT_PAUSE_RE = re.compile(r"Soft-pausing job pops.*safety could not check a result")
-_SAFETY_BACKPRESSURE_RE = re.compile(r"Withholding job pops: post-inference safety backlog (\d+) >= cap (\d+)")
-_LOST_SAFETY_RESULT_RE = re.compile(r"Expected to find a completed job .* none was found")
+_SAFETY_REQUEUE_RE = pattern_for("safety_requeue")
+_SAFETY_UNRECOVERABLE_RE = pattern_for("safety_unrecoverable")
+_SAFETY_SOFT_PAUSE_RE = pattern_for("safety_soft_pause")
+_SAFETY_BACKPRESSURE_RE = pattern_for("safety_backpressure")
+_LOST_SAFETY_RESULT_RE = pattern_for("lost_safety_result")
 # The scheduler explaining why a head-of-queue job is not dispatching despite pending work. The
 # "no matching gate" variant is the scheduler-bug-shaped stall (model resident and idle, nothing blocking
 # it, yet nothing dispatched).
-_DISPATCH_STALL_RE = re.compile(r"Inference dispatch stalled: head ")
-_DISPATCH_STALL_BUG_RE = re.compile(r"dispatch was withheld with no matching gate")
+_DISPATCH_STALL_RE = pattern_for("dispatch_stall")
+_DISPATCH_STALL_BUG_RE = pattern_for("dispatch_stall_no_gate")
 # The dispatch residency-reconciliation hold: the scheduler is holding a resident-idle head while it evicts
 # an idle sibling's VRAM so the head's on-device materialisation fits the card. This is a benign, self-
 # clearing swap-churn wait, not a scheduler bug, so it is excluded from the gate-less-stall detector and
 # surfaced on its own as a GPU-uptime duty cost. The model and parked seconds ride the stall wrapper.
-_DISPATCH_STALL_RECONCILE_RE = re.compile(r"held to reconcile residency")
-_DISPATCH_STALL_FIELDS_RE = re.compile(
-    r"Inference dispatch stalled: head \S+ \((?P<model>.+?)\) has been parked (?P<parked>\d+)s:",
-)
+_DISPATCH_STALL_RECONCILE_RE = pattern_for("dispatch_stall_reconcile")
+_DISPATCH_STALL_FIELDS_RE = pattern_for("dispatch_stall_fields")
 # The whole-card residency convergence deadlock: a heavy head is pre-staged and waiting for sole residency,
 # but an idle sibling holds a model that is still queued behind it, so the scale-down guard protects that
 # sibling from the teardown and the residency never collapses. The head is parked until the recovery
 # supervisor soft-resets the pools. This is a distinct, nameable root cause (not a generic dispatch-path bug),
 # so it gets its own detector; the phrase is the worker's _diagnose_dispatch_stall attribution for it.
-_WHOLE_CARD_WEDGE_RE = re.compile(r"whole-card residency stuck: cannot reach sole residency")
+_WHOLE_CARD_WEDGE_RE = pattern_for("whole_card_wedge")
 # A whole-card residency granted to a model that is not the head of the queue: it reserves the card and tears
 # its siblings down, so the actual head (a different model) cannot load and starves. Reads as a generic
 # VRAM-budget defer (the card looks idle) unless attributed to the held non-head residency, so it gets its own
 # detector keyed on the worker's _diagnose_dispatch_stall phrase for it.
-_WHOLE_CARD_NONHEAD_RE = re.compile(r"whole-card residency is held for non-head model")
+_WHOLE_CARD_NONHEAD_RE = pattern_for("whole_card_nonhead")
 # A whole-card residency being established: the worker reserved the device for a model, tearing the process
 # pool down to fewer contexts (and cycling safety off-GPU). One is routine; many in a session is reservation
 # churn: the signature of models being driven onto the whole-card path that do not need it (on a high-VRAM
 # card a model whose weights are a small fraction of total VRAM co-resides, so a teardown demand for it usually
 # means the per-context overhead was over-counted). The phrase is the worker's establish-announce line.
-_WHOLE_CARD_ESTABLISH_RE = re.compile(r"Whole-card residency: reserving the device for")
+_WHOLE_CARD_ESTABLISH_RE = pattern_for("whole_card_establish")
 # The same line's own figures. Producer: ``inference_scheduler._establish_whole_card_residency``, whose
 # f-string words the counts as "(inference processes {current} -> {after} of {max}, target {target})"; the
 # residency snapshot appended after it carries ``device_free_vram=<N>MB`` (:data:`_DEVICE_FREE_VRAM_RE`).
 # Reading them is what separates a reservation that reduced the pool from one whose target was already met.
-_WHOLE_CARD_ESTABLISH_FIELDS_RE = re.compile(
-    r"Whole-card residency: reserving the device for (?P<model>.+?) \(inference processes "
-    r"(?P<current>\d+) -> (?P<after>\d+) of (?P<total>\d+), target (?P<target>\d+)\)",
-)
+_WHOLE_CARD_ESTABLISH_FIELDS_RE = pattern_for("whole_card_establish_fields")
 # The establishment-time forecast the dispatch path discloses. Producer:
 # ``inference_scheduler._log_stream_forecast``. The bracketed measurement block and the trailing decision
 # flags have grown fields over time, so each figure is matched independently and simply stays absent in an
 # older capture rather than failing the whole parse.
-_STREAM_FORECAST_RE = re.compile(r"Stream forecast for (?P<model>.+?): ")
-_FORECAST_MARGINAL_RE = re.compile(r"marginal/ctx=(?P<marginal>[\d?]+)MB\(src=(?P<source>\w+)")
-_FORECAST_UNRECLAIMABLE_RE = re.compile(r"unreclaimable=(?P<unreclaimable>[\d.]+)MB")
-_FORECAST_REDUCTION_RE = re.compile(r"needs_process_count_reduction=(?P<reduction>True|False)")
+_STREAM_FORECAST_RE = pattern_for("stream_forecast")
+_FORECAST_MARGINAL_RE = pattern_for("forecast_marginal")
+_FORECAST_UNRECLAIMABLE_RE = pattern_for("forecast_unreclaimable")
+_FORECAST_REDUCTION_RE = pattern_for("forecast_reduction")
 # A pop that arrived with no model name, and the two worker generations' treatment of it. The older
 # generation had no boundary check, so the blank identity travelled: it was preloaded as a literal empty
 # name (``inference_scheduler._send_preload``), ended the slot it was sent to (the recovery reason from
@@ -195,39 +185,35 @@ _FORECAST_REDUCTION_RE = re.compile(r"needs_process_count_reduction=(?P<reductio
 # (``record_model_incident``), after which every later job for it was refused
 # (``_attempt_preload_for_job``). Each of those lines carries the empty name verbatim, which is what makes
 # the blank identity recognizable at all.
-_EMPTY_MODEL_POP_RE = re.compile(r"Popped job (?P<job>\S+) .*\(model: , ")
-_BLANK_PRELOAD_RE = re.compile(r"Preloading model {2}on process (?P<pid>\d+)")
-_BLANK_MODEL_QUARANTINE_RE = re.compile(r"Model {2}caused (?P<count>\d+) (?P<kind>\w+) incident\(s\)")
-_BLANK_QUARANTINE_SKIP_RE = re.compile(r"Skipping preload of quarantined model ;")
+_EMPTY_MODEL_POP_RE = pattern_for("empty_model_pop")
+_BLANK_PRELOAD_RE = pattern_for("blank_preload")
+_BLANK_MODEL_QUARANTINE_RE = pattern_for("blank_model_quarantine")
+_BLANK_QUARANTINE_SKIP_RE = pattern_for("blank_quarantine_skip")
 # The newer generation contains the same input at the boundary and never lets it reach a slot. Producers:
 # ``job_popper._reject_malformed_pop``, ``inference_process._preload_model``, and
 # ``process_lifecycle.record_model_incident``. A capture carrying these instead of the cascade above shows
 # the containment working, so the count is a rate rather than a fault.
-_MALFORMED_POP_REJECTED_RE = re.compile(
-    r"Popped job (?P<job>\S+) carries no model name \(got .*?\); returning it to the horde",
-)
-_BLANK_PRELOAD_REFUSED_RE = re.compile(r"Refusing to preload a blank model name")
-_BLANK_INCIDENT_REFUSED_RE = re.compile(r"incident reported against a blank model name")
+_MALFORMED_POP_REJECTED_RE = pattern_for("malformed_pop_rejected")
+_BLANK_PRELOAD_REFUSED_RE = pattern_for("blank_preload_refused")
+_BLANK_INCIDENT_REFUSED_RE = pattern_for("blank_incident_refused")
 # A slot replaced because loading a model ended it, naming the model. Producer: ``process_lifecycle``'s
 # recovery reason. The name is captured (and may be empty) so repeated deaths can be grouped by model: a
 # checkpoint that kills every slot it touches is a loop no per-slot breaker catches.
 # Greedy to the reason's closing paren: model names carry their own parentheses ("AlbedoBase XL (SDXL)"),
 # which a non-greedy match truncates at the first one.
-_LOAD_FAILURE_MODEL_RE = re.compile(r"inference process replaced \(failed to load model (?P<model>.*)\)$")
+_LOAD_FAILURE_MODEL_RE = pattern_for("load_failure_model")
 # The horde rejecting a pop, quoting its own message. Producer:
 # ``job_popper._handle_pop_error_response``. The message is what distinguishes an operator-fixable
 # rejection (an account limit) from a transient server fault, and it is otherwise never surfaced.
-_POP_API_ERROR_RE = re.compile(r"Failed to pop job \(API Error\): message='(?P<message>[^']*)'")
-_POP_API_ERROR_CODE_RE = re.compile(r"rc='(?P<code>[^']*)'")
+_POP_API_ERROR_RE = pattern_for("pop_api_error")
+_POP_API_ERROR_CODE_RE = pattern_for("pop_api_error_code")
 # The parent's own safety-placement actuator, and the consequence of using it. Producers:
 # ``process_lifecycle.pause_safety_on_gpu`` / ``restore_safety_on_gpu`` (which name the initiating
 # subsystem rather than a fixed phrase) and ``message_dispatcher._classify_retired_launch_message``. A
 # verdict dropped because its launch was retired is the mechanism by which a placement cycle strands a job,
 # so the pair together is an attribution rather than a guess.
-_SAFETY_PLACEMENT_CYCLE_RE = re.compile(
-    r"(?P<owner>[\w -]+): (?:moving the safety process off-GPU|restoring the safety process to the GPU)",
-)
-_RETIRED_SAFETY_RESULT_RE = re.compile(r"Ignoring result message from retired safety process")
+_SAFETY_PLACEMENT_CYCLE_RE = pattern_for("safety_placement_cycle")
+_RETIRED_SAFETY_RESULT_RE = pattern_for("retired_safety_result")
 # A child that died installing or repairing the shared ComfyUI environment rather than importing the
 # inference stack. Concurrent cold starts clone into one environment directory, and a half-written clone
 # leaves the tree in a state a later checkout refuses; the fix is the directory, never the torch install.
@@ -237,15 +223,13 @@ _GIT_ENVIRONMENT_FAILURE_RE = re.compile(
 # The worker declining to reserve the card for a model whose teardown demand it does not trust (a card-light
 # model on a host with no measured per-context cost). Surfaced as the positive counterpart: it confirms the
 # trust gate is actively preventing reservation churn rather than the churn simply being absent.
-_WHOLE_CARD_DECLINED_RE = re.compile(r"Declined a whole-card residency for")
+_WHOLE_CARD_DECLINED_RE = pattern_for("whole_card_declined")
 # A whole-card residency claiming the worker's pop offer: while the claim stands the worker advertises only
 # the resident model, so nothing else can arrive. The claim is invisible in the job stream (it changes what
 # the horde is asked for, not what the worker does with what arrives), so the edges are the only record of it.
 # Both phrases are the scheduler's verbatim engage/release disclosures.
-_POP_CLAIM_ENGAGED_RE = re.compile(r"Whole-card pop claim engaged for (?P<model>.+?): advertising that model alone")
-_POP_CLAIM_RELEASED_RE = re.compile(
-    r"Whole-card pop claim released for (?P<model>.+?): (?P<release>[^;]+); advertising the full pool again",
-)
+_POP_CLAIM_ENGAGED_RE = pattern_for("pop_claim_engaged")
+_POP_CLAIM_RELEASED_RE = pattern_for("pop_claim_released")
 _POP_CLAIM_CAP_RELEASE = "the maximum hold elapsed"
 """The release phrase for the maximum hold: the claim outlasted its window rather than ending on its own.
 
@@ -255,17 +239,13 @@ the claim was still narrowing the offer when the cap had to stop it."""
 # The stuck-step watchdog reaping a slot whose ComfyUI generation looped on one sampling step. The slot
 # kept heart-beating (so the silence watchdog stayed blind), which is exactly why this needs its own
 # detector rather than folding into a generic hang. The phrase is the worker's verbatim reap line.
-_STUCK_STEP_RE = re.compile(r"stuck on a non-advancing sampling step|stuck-step watchdog")
+_STUCK_STEP_RE = pattern_for("stuck_step")
 
 # The post-processing-stage watchdog reaping a slot that went silent. Older workers reported this as
 # INFERENCE_POST_PROCESSING; dedicated-lane workers report POST_PROCESS / POST_PROCESSING. The peak is still
 # an upscaler/face-fixer allocation landing after sampling, concurrent with warm inference siblings.
-_POST_PROCESSING_STALL_RE = re.compile(r"seems to be stuck post processing")
-_DEDICATED_POST_PROCESS_RE = re.compile(
-    r"(?:last_process_state=HordeProcessState\.(?:INFERENCE_POST_PROCESSING|POST_PROCESSING)\b|"
-    r"Post-processing (?:job|for job|finished for job) [0-9a-fA-F]{8})",
-    re.IGNORECASE,
-)
+_POST_PROCESSING_STALL_RE = pattern_for("post_processing_stall")
+_DEDICATED_POST_PROCESS_RE = pattern_for("dedicated_post_process_activity")
 """Proof that the dedicated post-processing lane actually ran a job.
 
 The lane's stage transition and its result both reach the parent through the message dispatcher, which
@@ -279,11 +259,11 @@ proves no lane activity."""
 # session's readouts as warnings; the leading "Free VRAM: N MB" value is the only signal of an actually low
 # reading. The genuinely-alarming below-reserve streaming warning is a distinct, throttled WARNING line with
 # no colon after "Free VRAM" (see :data:`_LOW_VRAM_RESERVE_WARN_RE`).
-_LOW_VRAM_READOUT_RE = re.compile(r"Free VRAM: (?P<free_mb>\d+) MB")
+_LOW_VRAM_READOUT_RE = pattern_for("low_vram_readout")
 # hordelib's throttled warning that measured free VRAM fell below the inference working-set reserve, so a
 # sampling step must stream activations over the bus and run several times slower. This is the alarming
 # signal (it fires only under the reserve, already rate-limited), so it counts directly.
-_LOW_VRAM_RESERVE_WARN_RE = re.compile(r"Free VRAM \d+ MB is below the \d+ MB inference reserve")
+_LOW_VRAM_RESERVE_WARN_RE = pattern_for("low_vram_reserve_warning")
 # A free-VRAM readout at or below this counts as a genuine low-VRAM dip. Chosen against the 16GB cards this
 # lane runs on: their steady-state readouts sit near 9-10GB free, and a sampling working set needs a few GB,
 # so a reading under 4GB free is approaching the driver's streaming cliff rather than routine headroom. This
@@ -294,12 +274,12 @@ _LOW_FREE_VRAM_MB_THRESHOLD = 4096
 # line is the operator advisory: it confirms the spiral reached the self-protective latch (post-processing is
 # now off until restart), so a session carrying it is escalated and the remediation points at the restart +
 # downgrade. The phrase is the worker's verbatim breaker-trip line (process_manager).
-_POST_PROCESSING_BREAKER_RE = re.compile(r"Post-processing fault breaker tripped")
+_POST_PROCESSING_BREAKER_RE = pattern_for("post_processing_breaker_tripped")
 # The parent's measured WDDM demand-paging verdict: worker child allocations demoted to system memory. This is
 # the direct proof that co-resident work drove the device past its real headroom, so it corroborates a
 # post-processing/inference overlap as a genuine stall rather than admitted co-residency. The phrase is the
 # inference scheduler's verbatim rising-edge line (note_wddm_paging).
-_WDDM_PAGING_RE = re.compile(r"WDDM demand-paging detected on worker processes")
+_WDDM_PAGING_RE = pattern_for("wddm_paging")
 
 # A median pop->submit latency this many times the median generation time means jobs are aging somewhere
 # other than generation. Which stage that is comes from the lifecycle split, never from this ratio alone.
@@ -686,8 +666,8 @@ _RECONCILE_HOLD_RATE_WARNING_PER_HOUR = 30.0
 _RECONCILE_HOLD_PARKED_FRACTION_WARNING = 0.05
 
 
-_PP_DEFER_RE = re.compile(r"Deferring post-processing for job ([0-9a-f][0-9a-f-]{7,35})")
-_PP_FINISHED_RE = re.compile(r"Post-processing finished for job")
+_PP_DEFER_RE = pattern_for("post_processing_deferred")
+_PP_FINISHED_RE = pattern_for("post_processing_finished")
 
 # A handful of deferrals is healthy backpressure while a transient VRAM spike passes; the same job
 # deferred this many times means its headroom condition is structurally unsatisfiable on this card.
@@ -1085,10 +1065,8 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
     ]
 
 
-_HEAD_STARVATION_MODEL_RE = re.compile(
-    r"Head-of-queue (?P<model>.+?) deferred (?P<seconds>\d+)s >= \d+s with no verified progress",
-)
-_HEAD_STARVATION_AVAILABLE_RE = re.compile(r"device-free (?P<free>\d+)")
+_HEAD_STARVATION_MODEL_RE = pattern_for("head_starvation_model")
+_HEAD_STARVATION_AVAILABLE_RE = pattern_for("head_starvation_available")
 _HEAD_STARVATION_IDLE_WINDOW_SECONDS = 120.0
 """Repeated head starvation whose device-idle span reaches this reads as a persistent, not transient, stall."""
 _HEAD_STARVATION_MIN_DIAGNOSTICS = 2
