@@ -15,7 +15,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Input, RichLog, Select, Static
 
 from horde_worker_regen.app_state import OverviewViewMode
-from horde_worker_regen.tui.log_tailer import LOG_DIR, BridgeLog, LogFollower, discover_bridge_logs_grouped
+from horde_worker_regen.tui.log_tailer import BridgeLog, LogFollower, default_log_dir, discover_bridge_logs_grouped
 from horde_worker_regen.tui.responsive import PHONE_BAND_MAX_WIDTH
 
 _LEVEL_RANK: dict[str, int] = {
@@ -388,7 +388,7 @@ class LogsView(Vertical):
 
         out = Path(f"horde_support_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
         try:
-            result = build_support_bundle(LOG_DIR, out)
+            result = build_support_bundle(default_log_dir(), out)
         except Exception as error:  # noqa: BLE001 - report any failure to the operator, never crash the TUI
             self.app.call_from_thread(self._notify_bundle_error, error)
             return

@@ -32,7 +32,7 @@ from textual.widgets import Button, Label, LoadingIndicator, Rule, Select, Stati
 
 from horde_worker_regen.analysis.detectors import Finding, Severity
 from horde_worker_regen.tui.formatters import human_duration
-from horde_worker_regen.tui.log_tailer import LOG_DIR
+from horde_worker_regen.tui.log_tailer import default_log_dir
 
 if TYPE_CHECKING:
     from horde_worker_regen.analysis.diagnose import SessionDiagnosisView
@@ -246,7 +246,7 @@ class DiagnosticsView(Vertical):
         self._set_status(f"Analyzing {scope}…")
         self.query_one("#diag-results", Static).update(
             Text(
-                f"Analyzing {scope} in {LOG_DIR}/…\n"
+                f"Analyzing {scope} in {default_log_dir()}/…\n"
                 "This can take a few seconds on a large log. The worker does not need to be running.",
                 style="bold",
             ),
@@ -275,7 +275,7 @@ class DiagnosticsView(Vertical):
         loop = asyncio.get_running_loop()
         try:
             views = await loop.run_in_executor(
-                self._analysis_executor(), diagnose_views_for, LOG_DIR, recent, active_only
+                self._analysis_executor(), diagnose_views_for, default_log_dir(), recent, active_only
             )
         except Exception as error:  # noqa: BLE001 - never let a triage failure crash the TUI
             self._on_analysis_error(error)
@@ -311,10 +311,10 @@ class DiagnosticsView(Vertical):
         self._refresh_timing()
         if not results:
             self.query_one("#diag-session", Select).disabled = True
-            self._set_status(f"No worker sessions found in {LOG_DIR}.")
+            self._set_status(f"No worker sessions found in {default_log_dir()}.")
             self.query_one("#diag-results", Static).update(
                 Text(
-                    f"No logs found in {LOG_DIR}/. Start the worker to generate logs, then run analysis.",
+                    f"No logs found in {default_log_dir()}/. Start the worker to generate logs, then run analysis.",
                     style="grey50",
                 ),
             )

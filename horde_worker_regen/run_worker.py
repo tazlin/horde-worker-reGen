@@ -14,6 +14,8 @@ from typing import override
 import regex as re
 from loguru import logger
 
+from horde_worker_regen.run_root import abort_sentinel_path, describe_run_root, logs_dir
+
 
 def _configure_worker_event_loop_policy() -> None:
     """Select the Windows loop needed by worker networking, without mutating importing frontends.
@@ -259,9 +261,7 @@ def _redirect_streams_to_file(path: str) -> None:
     and loguru's ``sys.__stdout__`` console sink; if it is unavailable we fall back to the
     Python-level reassignment alone.
     """
-    from pathlib import Path
-
-    Path("logs").mkdir(exist_ok=True)
+    logs_dir(create=True)
     # Intentionally kept open for the process lifetime: it backs fds 1/2 via dup2 below.
     stream = open(path, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
     with contextlib.suppress(Exception):
@@ -366,14 +366,15 @@ def _prepare_runtime(options: WorkerLaunchOptions, *, supervised: bool = False) 
 
     if supervised:
         # Redirect before anything prints, so not even the start-method banner leaks to the TUI.
-        _redirect_streams_to_file("logs/bridge_main_console.log")
+        _redirect_streams_to_file(str(logs_dir(create=True) / "bridge_main_console.log"))
 
-    if os.path.exists(".abort"):
+    if abort_sentinel_path().exists():
         with logger.catch(reraise=True):
-            os.remove(".abort")
+            abort_sentinel_path().unlink()
             logger.debug("Removed .abort file")
 
     print(f"Multiprocessing start method: {multiprocessing.get_start_method()}")
+    print(describe_run_root())
 
     os.environ["HORDE_SDK_DISABLE_CUSTOM_SINKS"] = "1"
 

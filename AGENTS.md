@@ -145,8 +145,9 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   reaching for a stopwatch.
 - **Rerun the failure, not the band.** Every `FAILED` line carries a node id; rerun exactly that
   (quote parametrized ids verbatim). One chaos seed replays via `HORDE_CHAOS_SEEDS=<seed>`. Tee long
-  runs to a file once and grep the tee. One pytest invocation per working copy: concurrent suites in
-  the same checkout abort each other.
+  runs to a file once and grep the tee. Concurrent pytest runs in one checkout are safe: every test gets
+  its own run root (`HORDE_WORKER_RUN_ROOT`, set by an autouse fixture), so the `.abort` sentinel, `logs/`
+  and the state directory never collide. Keep CPU contention in mind for timing-sensitive rows.
 - **Wait on a run, do not poll it.** Run pytest at full verbosity (never `-q`) redirected to a tee, in the
   foreground with a timeout, or once in the background and then wait for its completion. Sleep-and-tail
   loops and monitors on the tee are forbidden; an empty tee is a buffered redirect, not a hang, so check
@@ -295,9 +296,10 @@ These fail as interactions, not as units, so component tests stay green through 
 
 ## Working conventions
 
-- **Do not run tests or builds during a soak or live run in the same checkout.** The harness watches a
-  `.abort` file in the working directory, so a test run kills the worker, and the CPU contention ruins
-  the measurement.
+- **Do not run tests or builds during a soak or live run in the same checkout.** The CPU contention ruins
+  the measurement. (Tests no longer share the live run's `.abort` sentinel or `logs/`: each test has its
+  own run root. A live worker launched in the checkout still watches the checkout's `.abort`, so never
+  drop one there to stop a test.)
 
 ## See also
 

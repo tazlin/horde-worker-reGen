@@ -20,9 +20,10 @@ it. Writes are synchronous (no ``enqueue``) so a crash never loses the last buff
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 
 from loguru import logger
+
+from horde_worker_regen.run_root import logs_dir
 
 _PLAIN_FORMAT = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
 """Mirror of hordelib's plain file format so the Logs tab parses the level token the same way."""
@@ -59,7 +60,7 @@ def setup_supervisor_file_logging(role: str, *, quiet_console: bool = False) -> 
         the supervisor from starting, so all failures are swallowed.
     """
     try:
-        log_path = Path("logs") / f"bridge_{role}.log"
+        log_path = logs_dir() / f"bridge_{role}.log"
         log_path.parent.mkdir(exist_ok=True)
         if quiet_console:
             # The default handler writes to stderr, which a full-screen Textual app owns; remove it so

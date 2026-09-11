@@ -47,6 +47,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SupervisorControlMessage,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.run_root import logs_dir
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 
 DEFAULT_INTERVAL_SECONDS = 5.0
@@ -914,7 +915,7 @@ def main(argv: list[str] | None = None) -> None:
     attach = AttachSupervisor(
         supervisor,
         session_dir=session_dir,
-        log_dir=Path("logs"),
+        log_dir=logs_dir(),
         interval=args.interval,
         watch_runner=ThreadedWatchRunner(),
     )

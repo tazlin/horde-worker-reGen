@@ -31,7 +31,6 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from multiprocessing.managers import SyncManager
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -98,6 +97,8 @@ from horde_worker_regen.process_management.simulation.fake_worker_processes impo
 from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
 from horde_worker_regen.process_management.simulation.sim_vram import SimVramLedger
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
+from horde_worker_regen.run_root import abort_sentinel_path
+from horde_worker_regen.run_root import logs_dir as run_logs_dir
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 
 if TYPE_CHECKING:
@@ -1585,11 +1586,10 @@ def _cleanup_stale_abort_file() -> None:
     and aborts immediately if it exists.  Leaving one behind guarantees the next
     harness run will exit instantly with zero jobs processed.
     """
-    cwd = os.getcwd()
-    abort_path = os.path.join(cwd, ".abort")
-    if os.path.exists(abort_path):
+    abort_path = abort_sentinel_path()
+    if abort_path.exists():
         logger.warning(f"Removing stale .abort file from {abort_path}")
-        os.remove(abort_path)
+        abort_path.unlink()
 
 
 def _apply_production_worker_env(process_mode: HarnessProcessMode) -> None:
@@ -1700,8 +1700,7 @@ def _arm_harness_log_sink() -> None:
             logger.remove(_HARNESS_LOG_SINK_ID)
         _HARNESS_LOG_SINK_ID = None
     try:
-        logs_dir = Path("logs")
-        logs_dir.mkdir(exist_ok=True)
+        logs_dir = run_logs_dir(create=True)
         _HARNESS_LOG_SINK_ID = logger.add(
             logs_dir / "bridge_harness.log",
             level="DEBUG",

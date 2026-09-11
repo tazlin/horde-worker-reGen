@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
-_LOG_DIR = Path("logs")
+from horde_worker_regen.run_root import logs_dir
 
 # The conventional final "ExceptionClass: message" line of a Python traceback, for lifting the root
 # cause out of a startup-crash file. Kept here (not imported from the analysis package) so the worker's
@@ -101,7 +101,7 @@ def enable_child_faulthandler(role: str) -> None:
 
 def _fault_path(role: str) -> Path:
     """The role's fault file path."""
-    return _LOG_DIR / f"bridge_{role}.faulthandler"
+    return logs_dir() / f"bridge_{role}.faulthandler"
 
 
 def _arm_faulthandler(role: str) -> bool:
@@ -114,7 +114,7 @@ def _arm_faulthandler(role: str) -> bool:
         bool: Whether capture is armed on a freshly opened handle.
     """
     try:
-        _LOG_DIR.mkdir(exist_ok=True)
+        logs_dir(create=True)
         fault_path = _fault_path(role)
         _close_open_handle(role)
         _roll_oversized_fault_file(fault_path, role=role)
@@ -273,8 +273,7 @@ def write_startup_crash(
         launch_identifier: The parent-assigned launch counter for this slot, if known.
     """
     try:
-        _LOG_DIR.mkdir(exist_ok=True)
-        path = _LOG_DIR / f"bridge_{role}_startup.log"
+        path = logs_dir(create=True) / f"bridge_{role}_startup.log"
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         identity = ""
@@ -303,7 +302,7 @@ def read_last_startup_crash(role: str, *, max_bytes: int = 8192) -> str | None:
         max_bytes: How many trailing bytes of the crash file to scan.
     """
     try:
-        path = _LOG_DIR / f"bridge_{role}_startup.log"
+        path = logs_dir() / f"bridge_{role}_startup.log"
         if not path.is_file():
             return None
         size = path.stat().st_size

@@ -63,6 +63,7 @@ from horde_worker_regen.process_management.scheduling.performance_model import (
 )
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
+from horde_worker_regen.run_root import logs_dir
 
 
 class PauseOwner(enum.StrEnum):
@@ -1627,9 +1628,7 @@ class ProcessLifecycleManager:
         so a multi-GPU deployment (one lane per device) does not interleave two lanes into one file. Matches
         the ``bridge_utilities_<slot>.log`` family declared in :mod:`horde_worker_regen.log_file_registry`.
         """
-        from pathlib import Path
-
-        log_dir = Path("logs")
+        log_dir = logs_dir()
         with contextlib.suppress(Exception):
             log_dir.mkdir(exist_ok=True)
         return str(log_dir / f"bridge_utilities_{process_id}.log")

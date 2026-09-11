@@ -224,10 +224,21 @@ and orphan cleanup across crashes. These are covered in full in
 
 ## The `.abort` file
 
-Writing any content to `.abort` in the worker's working directory triggers an
+Writing any content to `.abort` in the worker's run root triggers an
 immediate abort on the next control-loop tick. This is a convenience for
 external process managers (systemd, Docker, etc.) that can't send signals
 easily.
+
+The run root is the working directory unless `HORDE_WORKER_RUN_ROOT` names
+another directory. The sentinel, the `logs/` directory and the
+`.horde_worker_regen/` state directory all live under it, and spawned children
+inherit the variable, so a parent and its children always agree on where to
+look. The worker logs the resolved root once per process at startup (at INFO
+when the variable is set, with a warning if the directory is missing or not
+writable), so a file that landed in an unexpected place is traceable from the
+top of the log. Two runs that share a working directory used to couple through
+these paths (one run's abort stopped the other); giving each run its own root
+is what lets the test suite run its worker fleets side by side.
 
 ## See also
 

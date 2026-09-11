@@ -1,6 +1,8 @@
 # Logs
 
-The worker writes logs to the `logs/` directory. The dashboard's **Logs** tab reads these same files,
+The worker writes logs to the `logs/` directory under its run root: the working directory, unless
+`HORDE_WORKER_RUN_ROOT` names another (see [the `.abort` file](../explanation/shutdown_and_faults.md#the-abort-file)
+for what else lives under it). The dashboard's **Logs** tab reads these same files,
 and the **Diagnostics** tab runs the [`horde-log diagnose`](cli.md#horde-log) detectors over
 them to surface what went wrong, without you needing a shell. See
 [How the diagnostics stay in sync](../explanation/log_diagnostics_contract.md) for how a detector, the

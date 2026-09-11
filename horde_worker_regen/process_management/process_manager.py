@@ -256,6 +256,7 @@ from horde_worker_regen.process_management.workers.safety_orchestrator import Sa
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
+from horde_worker_regen.run_root import abort_sentinel_path
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers, mean_across_cards
@@ -5208,7 +5209,7 @@ class HordeWorkerProcessManager:
                     return
                 # Watch for an externally-created .abort file as a signal-less
                 # abort trigger (e.g. for process managers that cannot send signals).
-                if os.path.exists(".abort"):
+                if abort_sentinel_path().exists():
                     logger.warning("Found .abort file; aborting immediately")
                     self._abort()
                     break

@@ -1,7 +1,9 @@
 """Configures pytest and creates fixtures."""
 
 # import hordelib
+import itertools
 import os
+import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +11,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 from loguru import logger
+
+from horde_worker_regen.run_root import RUN_ROOT_ENV_VAR
 
 if TYPE_CHECKING:
     from horde_worker_regen.benchmark.report import MachineInfo
@@ -231,6 +235,36 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 item.add_marker(skip_regen)
 
     items.sort(key=_run_order_rank)
+    shuffle_seed = config.getoption("--shuffle-seed")
+    if shuffle_seed is not None:
+        # A deliberate shake-out of order dependencies: the fastest-first phases keep their relative order
+        # (a cheap break still surfaces first), and the rows inside each phase run in a seeded random order
+        # so a test that silently relies on what ran before it fails here rather than under xdist. The seed
+        # is printed in the header so a red run replays with the same order.
+        rng = random.Random(shuffle_seed)
+        ordered: list[pytest.Item] = []
+        for _rank, group in itertools.groupby(items, key=_run_order_rank):
+            phase = list(group)
+            rng.shuffle(phase)
+            ordered.extend(phase)
+        items[:] = ordered
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register ``--shuffle-seed``, the opt-in seeded shuffle within each run-order phase."""
+    parser.addoption(
+        "--shuffle-seed",
+        action="store",
+        type=int,
+        default=None,
+        help="Shuffle the tests within each run-order phase with this seed, to surface order dependencies.",
+    )
+
+
+def pytest_report_header(config: pytest.Config) -> list[str]:
+    """Name the shuffle seed in the run header so a red run can be replayed in the same order."""
+    shuffle_seed = config.getoption("--shuffle-seed")
+    return [f"shuffle seed: {shuffle_seed}"] if shuffle_seed is not None else []
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -238,3 +272,17 @@ def init_hordelib() -> None:
     """Initialise hordelib for the tests."""
     # hordelib.initialise() # FIXME
     logger.warning("hordelib.initialise() not called")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_run_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test runs under its own run root, so no two tests share a sentinel, a log file or a state dir.
+
+    The worker resolves its ``.abort`` sentinel, ``logs/`` and ``.horde_worker_regen/`` through
+    ``HORDE_WORKER_RUN_ROOT``, and spawned children inherit the variable. The working directory moves too,
+    because hordelib's own sinks and anything else still writing a bare relative path resolve against it.
+    This is what lets concurrent pytest runs, and xdist workers, share one checkout without one test's
+    abort stopping another's worker.
+    """
+    monkeypatch.setenv(RUN_ROOT_ENV_VAR, str(tmp_path))
+    monkeypatch.chdir(tmp_path)

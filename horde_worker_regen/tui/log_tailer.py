@@ -11,6 +11,8 @@ import dataclasses
 import re
 from pathlib import Path
 
+from horde_worker_regen.run_root import logs_dir
+
 _TAIL_BYTES = 256 * 1024
 """Hard ceiling on how many trailing bytes a single read may pull into memory.
 
@@ -21,11 +23,16 @@ absolute byte cap, not a percentage of the file, so the bound holds regardless o
 _MAX_LINES_PER_POLL = 1000
 """Cap lines emitted per poll so a rotation or large catch-up can't flood the UI."""
 
-LOG_DIR = Path("logs")
+
+def default_log_dir() -> Path:
+    """The run's ``logs/`` directory, resolved when asked so a relocated run root is honoured."""
+    return logs_dir()
 
 
-def discover_bridge_logs(log_dir: Path = LOG_DIR) -> list[Path]:
+def discover_bridge_logs(log_dir: Path | None = None) -> list[Path]:
     """Return the main bridge log followed by any subprocess bridge logs, in stable order."""
+    if log_dir is None:
+        log_dir = default_log_dir()
     if not log_dir.exists():
         return []
     result: list[Path] = []
@@ -93,7 +100,7 @@ def _process_sort_key(process_key: str) -> tuple[int, int, str]:
     return (3, 0, process_key)
 
 
-def discover_bridge_logs_grouped(log_dir: Path = LOG_DIR) -> dict[str, list[BridgeLog]]:
+def discover_bridge_logs_grouped(log_dir: Path | None = None) -> dict[str, list[BridgeLog]]:
     """Group all ``bridge*.log`` files by writing process.
 
     Returns an ordered mapping (main, console, numbered subprocesses, then others) of process key to
@@ -101,6 +108,8 @@ def discover_bridge_logs_grouped(log_dir: Path = LOG_DIR) -> dict[str, list[Brid
     the logs view present one entry per process and tuck the dated rotations behind a history selector
     instead of listing every rotated file as a confusing top-level peer.
     """
+    if log_dir is None:
+        log_dir = default_log_dir()
     if not log_dir.exists():
         return {}
     grouped: dict[str, list[BridgeLog]] = {}

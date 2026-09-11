@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from horde_worker_regen.run_root import run_root
+
 if TYPE_CHECKING:
     from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
 
@@ -234,8 +236,8 @@ class WorkerAppState(BaseModel):
 
 
 def default_app_state_dir() -> Path:
-    """Return the grouped state directory in the current working directory."""
-    return Path.cwd() / APP_STATE_DIR_NAME
+    """Return the grouped state directory under the run root (the working directory unless relocated)."""
+    return run_root() / APP_STATE_DIR_NAME
 
 
 def default_app_state_path() -> Path:

@@ -15,6 +15,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.run_root import abort_sentinel_path
 
 _SHUTDOWN_GRACE_BASE_SECONDS = 20.0
 """Minimum grace before the force-kill backstop fires, regardless of outstanding work."""
@@ -105,7 +106,7 @@ class ShutdownManager:
 
     def abort(self) -> None:
         """Exit as soon as possible, aborting all processes and jobs immediately."""
-        with logger.catch(), open(".abort", "w") as f:
+        with logger.catch(), open(abort_sentinel_path(), "w") as f:
             f.write("")
 
         self._job_tracker._purge_jobs()

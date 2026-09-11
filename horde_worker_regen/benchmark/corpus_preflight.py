@@ -53,6 +53,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     LearnedFootprintStore,
     ResolutionBucket,
 )
+from horde_worker_regen.run_root import abort_sentinel_path
 
 HORDELIB_DISTRIBUTION = "horde_engine"
 """Distribution name behind the ``hordelib`` import name; its metadata carries the ComfyUI pins."""
@@ -405,7 +406,7 @@ def _live_worker_reason() -> str | None:
     ``.abort`` sentinel a stopping worker writes, and the owned-pid registry, whose records name a still
     running child when its pid and creation time both still match.
     """
-    if Path(".abort").exists():
+    if abort_sentinel_path().exists():
         return "a .abort sentinel is present in the working directory"
 
     try:

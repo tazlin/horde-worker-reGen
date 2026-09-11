@@ -37,6 +37,7 @@ from horde_worker_regen._guarded_purge import (
     guarded_purge_directory,
 )
 from horde_worker_regen.log_file_registry import is_worker_log_file
+from horde_worker_regen.run_root import logs_dir
 
 __all__ = [
     "_BYTES_PER_GB",
@@ -51,7 +52,7 @@ LogPurgeResult = PurgeResult
 
 
 def purge_log_directory(
-    log_dir: Path | str = Path("logs"),
+    log_dir: Path | str | None = None,
     *,
     max_age_days: float,
     max_total_gb: float,
@@ -71,6 +72,8 @@ def purge_log_directory(
     Returns:
         A :class:`LogPurgeResult` summarising what was removed.
     """
+    if log_dir is None:
+        log_dir = logs_dir()
     return guarded_purge_directory(
         log_dir,
         recognizer=is_worker_log_file,
@@ -84,7 +87,7 @@ def purge_worker_logs_safely(
     *,
     max_age_days: float,
     max_total_gb: float,
-    log_dir: Path | str = Path("logs"),
+    log_dir: Path | str | None = None,
 ) -> None:
     """Run :func:`purge_log_directory`, swallowing any error so log hygiene can never block startup."""
     try:
