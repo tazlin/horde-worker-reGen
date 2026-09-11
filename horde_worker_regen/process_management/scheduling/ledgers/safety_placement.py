@@ -85,12 +85,12 @@ class SafetyPlacementInputs:
     governor_state: GovernorState
     safety_footprint_mb: float
     reclaimable_idle_mb: float = 0.0
-    """Device memory (MB) idle inference processes on the card hold as retained residents.
+    """Device memory (MB) idle inference processes on the card hold in resident weights.
 
-    Those weights are kept warm on a grant the reclaim ladder and the clearance gate revoke the moment a peak needs
-    the room, so for placement they are room the card can produce within a tick, not room it lacks. Counting them
-    as used arms a demotion for as long as retention holds a resident and keeps the restore forecast from ever
-    passing on a card that retains between jobs."""
+    Whether kept warm under a retention grant or simply left loaded after the last job, those weights leave the
+    moment an idle-model eviction asks, so for placement they are room the card can produce within a tick, not
+    room it lacks. Counting them as used arms a demotion for as long as a resident sits idle and keeps the restore
+    forecast from ever passing on a card that holds models between jobs."""
 
     def available_mb(self) -> float | None:
         """The measured free plus what idle retained residents would return; None without a measurement."""

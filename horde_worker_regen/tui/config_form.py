@@ -1758,6 +1758,51 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "VRAM budget",
         "Proactively give a model that needs most of this card sole residency before it streams.",
     ),
+    ConfigField(
+        "whole_card_models",
+        "Whole-card models",
+        FieldKind.STR_LIST,
+        "VRAM budget",
+        "Models that must have this card to themselves whatever their measured footprint says, by name or "
+        "baseline id.",
+    ),
+    ConfigField(
+        "vram_admission_noise_mb",
+        "VRAM admission margin",
+        FieldKind.INT,
+        "VRAM budget",
+        "MB subtracted from measured free VRAM before a load is judged to fit. Lower it (or set 0) to admit a "
+        "model you have seen run with the card to itself; raise it for headroom against spikes.",
+        minimum=0,
+        unit="MB",
+    ),
+    ConfigField(
+        "measured_load_probe_seconds",
+        "Measured-load probe wait",
+        FieldKind.INT,
+        "VRAM budget",
+        "Seconds the next job may starve with nothing left to reclaim before one real load is admitted to let "
+        "the card decide. 0 probes at once.",
+        minimum=0,
+        maximum=600,
+        unit="s",
+    ),
+    ConfigField(
+        "starved_head_lane_reclaim",
+        "Starved job may stop idle lanes",
+        FieldKind.BOOL,
+        "VRAM budget",
+        "Let a job that has starved past the grace stop an idle service lane (post-processing, safety off the "
+        "GPU, image utilities) to make room, cheapest first. Off leaves it to the measured-load probe.",
+    ),
+    ConfigField(
+        "starved_head_utilities_pause",
+        "Starved job may stop the utilities lane",
+        FieldKind.BOOL,
+        "VRAM budget",
+        "Include the image-utilities lane among the lanes a starved job may stop. It is the last rung and "
+        "costs that service a restart.",
+    ),
 ]
 
 

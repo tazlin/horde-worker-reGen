@@ -550,6 +550,7 @@ class VerifiedReclaimLadder:
         actuator: ReclaimLadderActuator,
         ladder_builder: Callable[[], tuple[ReclaimRung, ...]],
         context_restore_ready: bool = True,
+        lane_restore_ready: bool = True,
         now: float | None = None,
     ) -> None:
         """Advance the reclaim episode for one card by one governor sample.
@@ -587,7 +588,12 @@ class VerifiedReclaimLadder:
                 is exactly why the card reads HEALTHY: unwinding on the first healthy sample regrows the
                 context, re-inflates the footprint, and buys the next reduction, which is a cold start per
                 cycle for no net change. The caller supplies the dwell and the evidence that the demand the
-                reduction was made for has cleared; lane rungs are unaffected.
+                reduction was made for has cleared.
+            lane_restore_ready: Whether a lane pause may be unwound this sample. A pause taken for a starved
+                head returns the lane's context so that head can be admitted; restarting the lane while the
+                head is still parked re-adds the context the pause removed, and the next cycle pauses it again,
+                a stop and a cold start per cycle with the queue served by nobody. The caller supplies the
+                evidence that no head is parked behind the pause.
             now: The monotonic-scale instant of this sample, which every verification budget and the safety
                 rung's cooldown are measured on. Defaults to :func:`time.monotonic`; a caller that drives the
                 control loop on its own clock passes that clock so the budgets are measured on the same
@@ -605,6 +611,7 @@ class VerifiedReclaimLadder:
                         episode,
                         actuator,
                         context_restore_ready=context_restore_ready,
+                        lane_restore_ready=lane_restore_ready,
                     ):
                         self._episodes.pop(key, None)
                         continue
@@ -893,6 +900,7 @@ class VerifiedReclaimLadder:
         actuator: ReclaimLadderActuator,
         *,
         context_restore_ready: bool = True,
+        lane_restore_ready: bool = True,
     ) -> bool:
         """Undo everything this episode owes the card, in reverse order of the actions taken (LIFO unwind).
 
@@ -914,6 +922,9 @@ class VerifiedReclaimLadder:
         retained: list[RestoreObligation] = []
         for obligation in reversed(episode.restore_obligations):
             if isinstance(obligation, ContextReduction) and not context_restore_ready:
+                retained.append(obligation)
+                continue
+            if isinstance(obligation, ReclaimRung) and not lane_restore_ready:
                 retained.append(obligation)
                 continue
             if not unwind_restore_obligation(obligation, actuator):

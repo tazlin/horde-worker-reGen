@@ -12,11 +12,12 @@ Marked ``slow`` because the harness spawns real child processes for the protocol
 Lines a dry run cannot produce carry a ``dry_run_reason`` in the registry and are exempted here; the
 literal pin still covers them. Today those are the two fault lines (this scenario completes every job),
 the submit success line (``dry_run_skip_api`` returns before it), the per-step sampling readout (the
-fake children report no step progress), and three lines a short deterministic run reaches only through
-a scheduling race (a cleared preload, a displaced-entry expiry, and a line skip). Everything else is
-exercised, including the multi-card plan line: the harness is given a synthetic two-card topology, a
-post-processing job so the post-processing lane spawns, and ``unload_models_from_vram_often`` so a lane
-drops its model between jobs.
+fake children report no step progress), and four lines a short deterministic run reaches only through
+a scheduling race (a cleared preload, a displaced-entry expiry, a line skip, and a post-processing
+deferral, which needs sampling in progress on the lane's card at the moment its job finishes). Everything
+else is exercised, including the multi-card plan line: the harness is given a synthetic two-card topology,
+a post-processing job so the post-processing lane spawns, three models over two lanes so a lane replaces
+its resident model, and ``unload_models_from_vram_often`` so a lane drops its model from VRAM between jobs.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ pytestmark = pytest.mark.slow
 
 _MODEL = "Deliberate"
 _SECOND_MODEL = "Anything Diffusion"
+_THIRD_MODEL = "stable_diffusion"
 _LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
 
 
@@ -65,15 +67,14 @@ def _two_card_resources() -> SystemResources:
 
 
 def _scenario() -> list[ImageGenerateJobPopResponse]:
-    """Two alternating models plus a post-processing job, so every reachable line has a producer.
+    """Three models rotating over two lanes plus a post-processing job, so every reachable line has a producer.
 
-    The models alternate to make the scheduler preload and unload between jobs, and the
-    post-processing job is what makes the worker spawn its post-processing lane at all.
+    Three models on two lanes force a lane to replace its resident model at least once however the scheduler
+    routes the jobs, which is what makes the full-unload line reachable; two models would settle one per lane
+    and never unload. The post-processing job is what makes the worker spawn its post-processing lane at all.
     """
-    jobs = [
-        make_canned_job(_MODEL if index % 2 == 0 else _SECOND_MODEL, width=512, height=512, ddim_steps=8)
-        for index in range(8)
-    ]
+    rotation = (_MODEL, _SECOND_MODEL, _THIRD_MODEL)
+    jobs = [make_canned_job(rotation[index % 3], width=512, height=512, ddim_steps=8) for index in range(8)]
     jobs.insert(2, make_canned_job(_MODEL, width=512, height=512, ddim_steps=8, post_processing=["RealESRGAN_x4plus"]))
     return jobs
 

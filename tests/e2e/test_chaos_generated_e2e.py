@@ -52,6 +52,7 @@ from horde_worker_regen.harness import (
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager, SystemResources
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.resources.vram_arbiter import _STARVATION_DIAGNOSTIC_SECONDS
 from horde_worker_regen.process_management.simulation._canned_scenarios import ArrivalSchedule, make_canned_job
 from horde_worker_regen.process_management.simulation.chaos_scenarios import (
     DISCLOSED_BOUNDS,
@@ -213,12 +214,27 @@ def _fault_profile(scenario: ChaosScenario) -> FaultProfile | None:
     return FaultProfile(**fields)  # type: ignore[arg-type]
 
 
+def _measured_load_horizon_seconds(scenario: ChaosScenario) -> float:
+    """The wait a whole-card head may legitimately spend before the arbiter admits its one measured load.
+
+    A whole-card model on the smallest card that serves it sits within prediction error of the card, and the
+    service lanes' contexts (charged on the real children, absent from the closed-loop world) push the
+    shortfall past the band the arbiter probes quickly on. The design then holds the head for the starvation
+    diagnostic horizon before one real load decides, so a row carrying such a head budgets that wait. Rows
+    without a whole-card head add nothing.
+    """
+    if any(job.model.weight_rank >= 2 for job in scenario.jobs):
+        return _STARVATION_DIAGNOSTIC_SECONDS
+    return 0.0
+
+
 def _timeout_seconds(scenario: ChaosScenario) -> float:
     """Return the wall-clock budget for the whole run, derived from the scenario's shape."""
     budget = (
         _BASE_TIMEOUT_SECONDS
         + _TIMEOUT_SECONDS_PER_JOB * scenario.job_count
         + _TIMEOUT_SECONDS_PER_EVENT * len(scenario.child_events())
+        + _measured_load_horizon_seconds(scenario)
     )
     return budget * _SPAWN_SLOWDOWN
 
@@ -230,6 +246,7 @@ def _queue_wait_bound_seconds(scenario: ChaosScenario) -> float:
         _QUEUE_WAIT_BASE_SECONDS
         + _QUEUE_WAIT_SECONDS_PER_JOB * sequential
         + _QUEUE_WAIT_SECONDS_PER_EVENT * len(scenario.child_events())
+        + _measured_load_horizon_seconds(scenario)
     )
     return budget * _SPAWN_SLOWDOWN
 

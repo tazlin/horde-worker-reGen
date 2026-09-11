@@ -455,7 +455,10 @@ class HordeWorkerTUI(App[None]):
         Binding("alt+ctrl+shift+left", "swipe_config_previous", "", show=False, priority=True),
         Binding("alt+ctrl+shift+right", "swipe_config_next", "", show=False, priority=True),
         Binding("alt+ctrl+shift+up", "toggle_main_tabs", "", show=False, priority=True),
-        Binding("alt+ctrl+shift+down", "command_palette", "", show=False, priority=True),
+        # Routed through a wrapper action on purpose: Textual adds its own ctrl+p "palette" binding only
+        # when nothing in the app already targets the command_palette action, and that binding is the one
+        # the Footer renders on the right. A private binding aimed straight at the action removes both.
+        Binding("alt+ctrl+shift+down", "open_command_palette", "", show=False, priority=True),
     ]
 
     def __init__(
@@ -1519,6 +1522,10 @@ class HordeWorkerTUI(App[None]):
     def action_swipe_config_next(self) -> None:
         """Move Config's nested tab strip right for the served client's swipe command."""
         self._cycle_served_tabs("#config-subtabs", direction=1)
+
+    def action_open_command_palette(self) -> None:
+        """Open the command palette from the served phone client's bottom dock."""
+        self.action_command_palette()
 
     def action_toggle_main_tabs(self) -> None:
         """Hide or restore the main strip from the served phone client's bottom dock."""

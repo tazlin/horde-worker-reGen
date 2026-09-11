@@ -1358,7 +1358,14 @@ class FakePostProcessProcess(HordeProcess):
 
     @override
     def cleanup_for_exit(self) -> None:
-        """No resources to release; report the final state like the real process."""
+        """Return the lane's context to the simulated card, then report the final state like the real process.
+
+        A real lane's CUDA context leaves with its process; without this the ledger keeps charging a context
+        for a lane the parent has stopped, so a pause taken to make room for a starved head returns nothing and
+        the head stays parked on memory nothing holds.
+        """
+        if self._sim_vram_ledger is not None:
+            self._sim_vram_ledger.set_context_overhead(self.device_index, self.process_id, 0.0)
         self.send_process_state_change_message(
             process_state=HordeProcessState.PROCESS_ENDED,
             info="Process ended",

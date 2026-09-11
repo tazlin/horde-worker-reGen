@@ -964,7 +964,13 @@ def build_harness_model_reference(
 
 
 def _build_harness_system_resources() -> SystemResources:
-    """Fake hardware info so the harness never probes torch/psutil in the main process."""
+    """Fake hardware info so the harness never probes torch/psutil in the main process.
+
+    The per-process context overhead is the same figure the fake children charge on the simulated card, so
+    the forecast's sibling-context arithmetic sees a probed host rather than an unmeasured one. Unmeasured,
+    the weight-dominance predicate defaults to "needs the whole card", which sends every ordinary swap on
+    this 8 GB card through the whole-card residency and its pop monopoly.
+    """
     return SystemResources(
         total_ram_bytes=32 * 1024 * 1024 * 1024,
         device_map=TorchDeviceMap(
@@ -976,6 +982,7 @@ def _build_harness_system_resources() -> SystemResources:
                 ),
             },
         ),
+        per_process_overhead_mb=int(_DEFAULT_SIM_CONTEXT_MB),
     )
 
 
@@ -1185,6 +1192,9 @@ def build_harness_process_manager(
             post_process_kwargs["fault_profile"] = config.post_process_fault_profile
         if sim_vram_ledger is not None:
             post_process_kwargs["sim_vram_ledger"] = sim_vram_ledger
+            # The lane's context is charged at the same marginal figure the parent's admission model books for
+            # it, so a pause taken to make room for a starved head returns on the card what the arbiter promised.
+            post_process_kwargs["sim_context_mb"] = sim_context_mb
         post_process_entry_point = (
             functools.partial(start_fake_post_process_process, **post_process_kwargs)
             if post_process_kwargs
@@ -2023,20 +2033,27 @@ def _collect_run_diagnostics(
         diags.append("No jobs were ever popped; check canned_job_source or process availability")
 
     if num_forms_expected > 0:
+        # Every entry here is a problem statement: a clean run reports none, and callers assert on that. So
+        # the alchemy tally and the host-RAM reading are recorded only when they explain something (forms
+        # left unfinished, intake paused, RAM under pressure), never as a status line on a run that finished.
         coordinator = manager._alchemy_coordinator
-        diags.append(
-            "Alchemy progress: "
-            f"completed={coordinator.num_canned_forms_completed}, "
-            f"faulted={coordinator.num_canned_forms_faulted}, "
-            f"pending={coordinator.num_forms_pending}, "
-            f"in_flight={coordinator.num_forms_in_flight}, "
-            f"awaiting_submit={coordinator.num_forms_awaiting_submit}, expected={num_forms_expected}",
-        )
-        if manager._state.self_throttle_paused or manager._state.ram_pressure_pop_hold:
+        forms_settled = coordinator.num_canned_forms_completed + coordinator.num_canned_forms_faulted
+        intake_paused = manager._state.self_throttle_paused or manager._state.ram_pressure_pop_hold
+        ram_snapshot = manager._inference_scheduler.latest_host_memory_governance_snapshot()
+        ram_pressured = ram_snapshot is not None and ram_snapshot.verdict.under_pressure
+        if forms_settled < num_forms_expected or intake_paused or ram_pressured:
+            diags.append(
+                "Alchemy progress: "
+                f"completed={coordinator.num_canned_forms_completed}, "
+                f"faulted={coordinator.num_canned_forms_faulted}, "
+                f"pending={coordinator.num_forms_pending}, "
+                f"in_flight={coordinator.num_forms_in_flight}, "
+                f"awaiting_submit={coordinator.num_forms_awaiting_submit}, expected={num_forms_expected}",
+            )
+        if intake_paused:
             reason = manager._state.self_throttle_pause_reason or "RAM-pressure pop hold"
             diags.append(f"Workload intake is paused: {reason}")
-        ram_snapshot = manager._inference_scheduler.latest_host_memory_governance_snapshot()
-        if ram_snapshot is not None:
+        if ram_snapshot is not None and (forms_settled < num_forms_expected or ram_pressured):
             diags.append(
                 f"Host RAM: available={ram_snapshot.verdict.available_mb}, "
                 f"danger_floor={ram_snapshot.verdict.floor_mb:.0f} MB, "

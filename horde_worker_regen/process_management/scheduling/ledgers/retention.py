@@ -164,18 +164,21 @@ def sibling_retained_resident_present(
     )
 
 
-def idle_retained_resident_mb(processes: Iterable[HordeProcessInfo], device_index: int | None) -> float:
-    """Device memory (MB) idle inference slots on a card hold under a retention grant.
+def idle_resident_reclaimable_mb(processes: Iterable[HordeProcessInfo], device_index: int | None) -> float:
+    """Device memory (MB) idle inference slots on a card hold in resident weights an eviction would return.
 
-    Priced by each slot's measured allocator reservation, which is what an eviction returns. A retained slot
-    with no reservation reading adds nothing, and a busy slot's weights are in use rather than reclaimable.
+    Counts a slot whether its resident sits under a retention grant or was simply left loaded after its last job
+    (the budget-off regime grants no retention, yet the weights stay on the card until something asks for the
+    slot); both are unloaded by the same idle-model eviction. Priced by each slot's measured allocator
+    reservation, which is what that eviction returns. A slot with no reservation reading adds nothing, and a
+    busy slot's weights are in use rather than reclaimable.
     """
     return sum(
         float(p.process_reserved_mb)
         for p in processes
         if p.process_type == HordeProcessType.INFERENCE
         and _on_card(p, device_index)
-        and p.retained_resident_model is not None
+        and (p.retained_resident_model is not None or p.loaded_horde_model_name is not None)
         and not p.is_process_busy()
         and p.process_reserved_mb is not None
     )

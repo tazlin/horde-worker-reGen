@@ -21,7 +21,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.retention import (
     RetentionFit,
     RetentionLedger,
     idle_lane_component_charges_mb,
-    idle_retained_resident_mb,
+    idle_resident_reclaimable_mb,
     retained_resident_charges_mb,
     sibling_context_count,
     sibling_retained_resident_present,
@@ -251,13 +251,21 @@ class TestCardArithmetic:
         assert sibling_retained_resident_present([target, other_card], target_id=1, device_index=0) is False
         assert sibling_retained_resident_present([target, other_card], target_id=1, device_index=None) is True
 
-    def test_idle_retained_resident_mb_prices_reservations_of_idle_retainers(self) -> None:
+    def test_idle_resident_reclaimable_mb_prices_reservations_of_idle_retainers(self) -> None:
         """Busy slots, unreserved slots and non-inference processes add nothing."""
         idle = _slot(1, retained="a", reserved_mb=3000)
         busy = _slot(2, retained="b", reserved_mb=3000, busy=True)
         unread = _slot(3, retained="c", reserved_mb=None)
         lane = _slot(4, retained="d", reserved_mb=3000, process_type=HordeProcessType.POST_PROCESS)
-        assert idle_retained_resident_mb([idle, busy, unread, lane], None) == 3000.0
+        assert idle_resident_reclaimable_mb([idle, busy, unread, lane], None) == 3000.0
+
+    def test_a_model_left_loaded_without_a_grant_is_reclaimable_too(self) -> None:
+        """The budget-off regime grants no retention, yet the weights stay on the card; eviction returns them."""
+        ungranted = _slot(1, reserved_mb=2500)
+        ungranted.loaded_horde_model_name = "a"
+        empty = _slot(2, reserved_mb=2500)
+        empty.loaded_horde_model_name = None
+        assert idle_resident_reclaimable_mb([ungranted, empty], None) == 2500.0
 
     def test_idle_lane_component_charges_skip_target_and_busy_lanes(self) -> None:
         """Held components are charged for idle lanes other than the target."""

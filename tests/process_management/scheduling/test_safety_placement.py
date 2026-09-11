@@ -46,7 +46,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 )
 from horde_worker_regen.process_management.scheduling import inference_scheduler as sched_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.scheduling.ledgers.retention import idle_retained_resident_mb
+from horde_worker_regen.process_management.scheduling.ledgers.retention import idle_resident_reclaimable_mb
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     SAFETY_GPU_LOAD_CHARGE_MB,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
@@ -1168,14 +1168,14 @@ class TestReclaimableIdleResidents:
         scheduler = self._card_scheduler(monkeypatch)
         self._idle_retained_slot(scheduler, reserved_mb=3200)
         scheduler._process_map[1].last_process_state = HordeProcessState.INFERENCE_STARTING
-        assert idle_retained_resident_mb(scheduler._process_map.values(), 0) == 0.0
+        assert idle_resident_reclaimable_mb(scheduler._process_map.values(), 0) == 0.0
 
     def test_a_retained_slot_without_a_reservation_reading_adds_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Missing telemetry never inflates the room."""
         scheduler = self._card_scheduler(monkeypatch)
         self._idle_retained_slot(scheduler, reserved_mb=3200)
         scheduler._process_map[1].process_reserved_mb = None
-        assert idle_retained_resident_mb(scheduler._process_map.values(), 0) == 0.0
+        assert idle_resident_reclaimable_mb(scheduler._process_map.values(), 0) == 0.0
 
     def test_the_restore_forecast_counts_reclaimable_room(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A card retaining a resident between jobs can still earn its safety process back."""
@@ -1187,7 +1187,11 @@ class TestReclaimableIdleResidents:
         scheduler._process_map.get_free_vram_mb = Mock(return_value=1400.0)
         assert scheduler._safety_placement_inputs(0).restore_headroom_fits() is True
 
+        # A model left loaded without a grant (the budget-off regime) is evicted by the same actuator, so it is
+        # room too; only a slot holding nothing stops counting.
         scheduler._process_map[1].retained_resident_model = None
+        assert scheduler._safety_placement_inputs(0).restore_headroom_fits() is True
+        scheduler._process_map[1].loaded_horde_model_name = None
         assert scheduler._safety_placement_inputs(0).restore_headroom_fits() is False
 
 

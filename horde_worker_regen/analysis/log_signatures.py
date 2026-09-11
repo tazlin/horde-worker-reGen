@@ -939,6 +939,7 @@ _SIGNATURE_LIST: list[LogSignature] = [
             "Deferring post-processing for job 3b678c36-1282-44b4-b062-f416ed7a1ba7: its chain (2629MB) "
             "cannot share the card with the sampling in progress; waiting for the card."
         ),
+        dry_run_reason=_NOT_DETERMINISTIC,
     ),
     _signature(
         "post_processing_finished",

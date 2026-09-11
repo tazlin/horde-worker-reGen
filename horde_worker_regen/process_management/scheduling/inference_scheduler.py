@@ -241,7 +241,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.retention import (
     RetentionLedger,
     RetentionUnpriceable,
     idle_lane_component_charges_mb,
-    idle_retained_resident_mb,
+    idle_resident_reclaimable_mb,
     retained_resident_charges_mb,
     sibling_context_count,
     sibling_retained_resident_present,
@@ -1611,7 +1611,7 @@ class InferenceScheduler:
             noise_buffer_mb=self._admission_margin_mb(device_index, total_vram_mb),
             governor_state=self.governor_state(device_index),
             safety_footprint_mb=self._safety_footprint_mb(),
-            reclaimable_idle_mb=idle_retained_resident_mb(self._process_map.values(), device_index),
+            reclaimable_idle_mb=idle_resident_reclaimable_mb(self._process_map.values(), device_index),
         )
 
     def _safety_placement_dwell_seconds(self) -> float:
@@ -1730,7 +1730,7 @@ class InferenceScheduler:
                 return
             if ledger.post_processing_defers_restore(pp_backlog_depth):
                 return
-            if self.is_vram_growth_held(safety_card) or not self._arbiter_admits_safety_gpu_load(safety_card):
+            if self.is_vram_growth_held(safety_card):
                 return
             pause_owner = self._process_lifecycle.safety_pause_owner
             if pause_owner is None:
@@ -1740,12 +1740,26 @@ class InferenceScheduler:
                 self._safety_placement_restore_dwell_seconds(),
             ):
                 # A pause taken because the card was short of memory is part of why the instantaneous gates
-                # above now pass: the memory it returned is the memory they are reading. Restoring on that alone
+                # now pass: the memory it returned is the memory they are reading. Restoring on that alone
                 # hands the card straight back into the pressure that evicted safety, and each round trip ends
                 # the safety process twice. The forecast headroom clock is the evidence that the room is durable
                 # and covers the peak the card is committed to. A whole-card residency's pause is not in this
                 # set: it ends when its own model drains, and holding its restore to a memory forecast would
                 # leave a card that hosts one heavy resident without an on-GPU safety process for the session.
+                return
+            if not self._arbiter_admits_safety_gpu_load(safety_card):
+                # The forecast counts idle retained residents as room the card can produce, and it has held for
+                # the dwell, but the arbiter prices the load against measured free alone and nothing else asks
+                # the residents to leave once the queue is empty. Without this, a card that retains between
+                # jobs keeps safety on the CPU for the rest of the session. One eviction per cycle, coldest
+                # first, never a model a queued or running job needs; the next cycle re-asks the arbiter.
+                victim = self.reclaim_coldest_idle_resident(device_index=safety_card)
+                if victim is not None:
+                    logger.info(
+                        f"Runtime safety placement: unloaded idle resident model {victim} from card {safety_card} "
+                        "(its RAM copy is kept) so the safety process can return to the GPU "
+                        f"({inputs.describe()})."
+                    )
                 return
             headroom_since = ledger.headroom_since or self._clock()
             if not self._process_lifecycle.restore_safety_on_gpu(owner=pause_owner):
@@ -7100,14 +7114,15 @@ class InferenceScheduler:
             dwell_seconds=retention.RETENTION_STALE_HOLD_SECONDS,
         )
 
-    def reclaim_idle_resident_for_post_processing(self, *, device_index: int | None = None) -> str | None:
-        """Unload the coldest idle resident model's VRAM to make room for a post-processing peak; return its name.
+    def reclaim_coldest_idle_resident(self, *, device_index: int | None = None) -> str | None:
+        """Unload the coldest idle resident model's VRAM to make room for another tenant; return its name.
 
         Picks the least-recently-demanded idle inference resident whose model no pending or in-progress job
         needs, and unloads its weights to RAM (the RAM copy is retained, so a later job re-stages it cheaply).
         Returns the unloaded model's name, or None when no such momentarily-idle resident exists (every resident
         is busy, is already unloading, or is a queued/in-progress job's model, so yielding one would only force
-        an immediate reload).
+        an immediate reload). The post-processing lane's headroom reclaim and the safety process's return to
+        the GPU both buy their room here.
 
         ``device_index`` scopes the search to one card on a multi-GPU host; None considers every card.
         """

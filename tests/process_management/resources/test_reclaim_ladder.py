@@ -853,6 +853,38 @@ class TestStarvedHeadLanePauseObligation:
         assert actuator.calls == [("restore_pp", None), ("restore_utilities", None)]
         assert engine.episode_holds_paused_lane(0) is False
 
+    def test_a_lane_pause_holds_while_a_head_is_parked(self) -> None:
+        """A HEALTHY sample does not restart a lane the caller says a parked head still needs gone.
+
+        Restarting it would re-add the context the pause removed and the next cycle would pause it again, a
+        stop and a cold start per cycle; the obligation survives until the caller reports no head parked.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        engine.record_lane_pause(0, ReclaimRungKind.PAUSE_PP_LANE, tenant_label="post_process_lane", promised_mb=487.0)
+        engine.on_tick(
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=actuator,
+            ladder_builder=tuple,
+            lane_restore_ready=False,
+        )
+        assert actuator.calls == []
+        assert engine.episode_holds_paused_lane(0) is True
+        engine.on_tick(
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=actuator,
+            ladder_builder=tuple,
+            lane_restore_ready=True,
+        )
+        assert actuator.calls == [("restore_pp", None)]
+        assert engine.episode_holds_paused_lane(0) is False
+
     def test_a_non_lane_kind_is_never_booked(self) -> None:
         """Only lane-pause rungs have a restore to book; anything else is ignored."""
         engine = VerifiedReclaimLadder()

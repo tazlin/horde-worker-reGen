@@ -2740,7 +2740,7 @@ class HordeWorkerProcessManager:
         window = self.bridge_data.post_processing_fault_window_seconds
         if now - self._last_post_processing_reclaim_at < window:
             return
-        victim_model = self._inference_scheduler.reclaim_idle_resident_for_post_processing()
+        victim_model = self._inference_scheduler.reclaim_coldest_idle_resident()
         if victim_model is None:
             return
         self._last_post_processing_reclaim_at = now
@@ -3683,6 +3683,9 @@ class HordeWorkerProcessManager:
                     self._inference_scheduler.build_reclaim_ladder_candidates(dev),
                 ),
                 context_restore_ready=self._context_restore_ready(device_index),
+                # A lane paused to admit a parked head comes back only once no head is parked: restarting it
+                # underneath the head re-adds the context the pause removed, and the next cycle pauses it again.
+                lane_restore_ready=not self._inference_scheduler.head_of_queue_is_parked(),
             )
 
             # Defence in depth: restore a reclaim-ladder service-lane pause that has lost its restore owner (no
