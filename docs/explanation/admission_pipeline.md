@@ -60,7 +60,9 @@ flowchart TD
 
 Both branches off `begin_scheduling_cycle` run every cycle. A preload stages one model onto one slot of one
 card, and the lanes already holding resident weights are idle while it does, so dispatch is not withheld for
-it; the preload pass's own ceiling of one send per cycle is what bounds the pair.
+it; the preload pass's own ceiling of one send per cycle is what bounds the pair. The dispatch branch loops
+until nothing more can start, and a gate withholding one selected job is not that: on a multi-card worker the
+walk resumes for work another card can take (see [Dispatch selection](#dispatch-selection)).
 
 ## Where each decision lives
 
@@ -116,6 +118,19 @@ the card the barred head's load is aimed at, because the escape it is waiting fo
 best-effort admit) is judged per card; a barred head that names no card keeps the fleet-wide withholding, as
 no single card's draining can be shown to admit it. **Degraded-retry isolation** compares against the jobs
 sampling on the card the retry would land on, since the VRAM pressure it is avoiding is that card's.
+
+A gate that withholds the selected job does not end the cycle's dispatch loop. `start_inference` distinguishes
+three outcomes: a dispatch, nothing selectable, and a selected job withheld. The third is a fact about one
+card, so the withheld job is recorded (which gate, which card, in the dispatch-hold ledger's cycle declines)
+and the placement-order walk resumes through the same cross-card path, seating work another card can take
+now. The withheld job keeps its queue position and its gate keeps its clocks; it is simply not offered again
+until the next cycle re-asks its gate, and the card it was aimed at is excluded for the rest of the cycle on
+the same ground as the head's own. The exclusion is discarded in `begin_scheduling_cycle` and never persists.
+On one card the resumed walk has no other card to offer, so a withheld head ends the loop exactly as before.
+
+The decline record is what the dispatch-stall explainer reads before reporting an unexplained stall, so a
+parked head names the gate that withheld it. Each gate takes a `SlotDutyBucket` member, which is the same
+vocabulary the slot-duty accounting and the stall text already use.
 
 ### Continuing the preload pass across cards
 

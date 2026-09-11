@@ -788,6 +788,11 @@ class _DispatchWorld:
         independent, so a cycle that does the first must not skip the second: every entry is a sampling window
         a card lost for no reason the workload required. A job under a dispatch hold is excluded because the
         gate declined it on its own terms, which is not a window a preload took."""
+        self.dispatch_declines: dict[int, dict[str, str]] = {}
+        """Per tick, the jobs this cycle's dispatch pass withheld and the gate that withheld each.
+
+        The scheduler's own record, read after the pass, so a row that finds a lane idle can quote the gate
+        that made it so rather than inferring one."""
         self._clearance_waiting_since: dict[str, float] = {}
         """Per staged job, the world-clock instant its child began waiting on its clearance permit.
 
@@ -2556,6 +2561,12 @@ class _DispatchWorld:
         could_have_seated -= self._dispatch_held_job_ids()
         if preloaded and could_have_seated and dispatched == 0:
             self.preload_idle_ticks.append(self.tick)
+        declines = self._scheduler.dispatch_holds.cycle_declines
+        if declines:
+            self.dispatch_declines[self.tick] = {
+                job_id: f"{decline.bucket.value} on card {decline.device_index}: {decline.detail}"
+                for job_id, decline in declines.items()
+            }
         for device_index in self._card_totals:
             self.min_card_free_mb[device_index] = min(
                 self.min_card_free_mb[device_index],

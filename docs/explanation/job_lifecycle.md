@@ -198,7 +198,12 @@ control-loop tick for it. One preload per cycle remains the ceiling. One cycle:
    stalled in-flight transfer faults); the periodic reconcile sweep is the liveness that heals a lost or
    dropped request.
 5. **`start_inference()`**: sends `START_INFERENCE` with the full `ImageGenerateJobPopResponse`; on
-   success `JobTracker.mark_inference_started` moves the job to `INFERENCE_IN_PROGRESS`. By the
+   success `JobTracker.mark_inference_started` moves the job to `INFERENCE_IN_PROGRESS`. It has three
+   outcomes, not two: a dispatch, nothing selectable, and a selected job a gate withheld. The dispatch loop
+   runs until nothing more can start, and a withheld job is not that: the gate that withheld it and the card
+   it was aimed at are recorded for the cycle, and selection resumes for work another card can take now. The
+   withheld job keeps its queue position and its gate keeps its clocks; the record is discarded at the next
+   `begin_scheduling_cycle`. On a single-GPU host there is no other card, so a withheld head ends the loop. By the
    [dual-presence rule](job_state_machine.md#the-stage-dual-presence-rule) it stays visible in the
    `jobs_pending_inference` view until the result arrives. On send failure the job faults straight to
    `PENDING_SUBMIT` (`handle_job_fault`). A successful send records typed execution ownership containing the

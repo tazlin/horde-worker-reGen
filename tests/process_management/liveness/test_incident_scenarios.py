@@ -130,6 +130,11 @@ The failures encoded here:
   rather than seeking a card that could serve it. Hot classes drained through a single lane while the rest of
   the pool idled. That is the ``burst placement`` scenario, and its reinjection is sticky placement that
   ignores the serving card's capacity.
+- **One card's held head stopped every card.** A dispatch gate that withholds the selected job decides
+  against the one card that job would have landed on, but the cycle's dispatch loop read the withheld
+  selection as "nothing more can start" and ended. Every other card's already-resident, already-seatable work
+  then sat out the cycle, with no line logged and nothing in the queue to explain it. That is the ``held
+  head`` scenario, and its reinjection is the loop ending on the first withheld dispatch.
 """
 
 from __future__ import annotations
@@ -210,6 +215,9 @@ from tests.process_management.liveness._world_assertions import (
     assert_no_unservable_dispatch_hold,
     duty_fraction,
 )
+
+pytestmark = pytest.mark.closed_loop
+"""Every row here drives the real scheduler over the simulated world for many ticks."""
 
 _TICK_SECONDS = 2.0
 """Seconds of simulated time per scheduling tick.
@@ -3313,12 +3321,17 @@ Each such card serves one class off weights it already holds and is never the la
 run is a reason for it to idle. A pool that reaches full concurrency once and then serializes fails this."""
 
 
-def _chain_world(*, preload_ends_dispatch: bool = False) -> _DispatchWorld:
-    """Four cards, two lanes each, one sampling slot per card, and a backlogged lane on card 1."""
+def _chain_world(*, max_threads: int = 1, preload_ends_dispatch: bool = False) -> _DispatchWorld:
+    """Four cards, two lanes each, ``max_threads`` sampling slots per card, and a backlogged lane on card 1.
+
+    ``max_threads`` defaults to one sampling slot per card, the posture the chain rows were written against.
+    Raising it is a supported aggressive operator setting and puts both of a card's lanes in play at once,
+    which is what makes a dispatch gate's hold on one lane observable against the other cards' ready work.
+    """
     world = _DispatchWorld(
         card=_CARD_24GB,
         lane_count=8,
-        max_threads=1,
+        max_threads=max_threads,
         queue_depth=1,
         whole_card_enabled=False,
         closed_loop=True,
@@ -3377,10 +3390,12 @@ def _assert_no_staging_tick_cost_a_ready_lane(world: _DispatchWorld, *, context:
     by then every card is holding work, so the forbidden state never arises to be counted. Zero here means
     the run never hit it, not that the run could have.
     """
+    withheld = {tick: world.dispatch_declines.get(tick, {}) for tick in world.preload_idle_ticks[:5]}
     assert not world.preload_idle_ticks, (
         f"{context}: {len(world.preload_idle_ticks)} cycle(s) staged a model and dispatched nothing while a "
         f"pending job already had a free lane holding its model on a card under its cap, at tick(s) "
-        f"{world.preload_idle_ticks[:5]}. {world.state_dump()}"
+        f"{world.preload_idle_ticks[:5]}; the gates those cycles' dispatch passes named: {withheld}. "
+        f"{world.state_dump()}"
     )
 
 
@@ -3424,6 +3439,75 @@ async def test_t_a_staged_model_does_not_stop_the_cards_that_were_ready_to_sampl
     assert not world.job_tracker.jobs_pending_post_processing, (
         f"backlogged lane: chains were still pending at the end of the run, so the hold that gives the lane "
         f"its window never let it drain. {world.state_dump()}"
+    )
+
+
+_CHAIN_AGGRESSIVE_THREADS = 2
+"""Sampling slots per card for the paired row.
+
+Both of a card's lanes can sample at once, which is what puts a dispatch gate's hold on one of them in play:
+at one slot per card a held lane is a card with nothing else to give, so the loop ending on it costs that card
+alone and the rest of the pool is unaffected."""
+
+
+def _make_a_hold_end_the_dispatch_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore the behaviour the fix removed: the first withheld job ends the cycle's dispatch loop.
+
+    The narrowest possible reinjection. Every gate keeps its own verdict and its own bookkeeping; only the
+    re-selection that follows a withheld dispatch is taken away, by refusing to select again once this cycle
+    has withheld anything. That is exactly what "a hold ends the loop" was.
+    """
+    select = InferenceScheduler.get_next_job_and_process
+
+    async def nothing_more_after_a_hold(
+        self: InferenceScheduler,
+        information_only: bool = False,
+    ) -> NextJobAndProcess | None:
+        if self.dispatch_holds.cycle_declines:
+            return None
+        return await select(self, information_only)
+
+    monkeypatch.setattr(InferenceScheduler, "get_next_job_and_process", nothing_more_after_a_hold)
+
+
+async def test_t2_a_staged_model_does_not_stop_the_cards_that_were_ready_to_sample() -> None:
+    """At two sampling slots per card, a gate holding one lane leaves every other card free to sample.
+
+    The failure this encodes: a dispatch gate that withheld the selected job ended the cycle's dispatch loop
+    for the whole worker. The head is chosen worker-wide, so its hold is decided against one card, and the
+    loop then read that one card's answer as "nothing more can start". Every other card's already-resident,
+    already-seatable work sat out the cycle behind it, with no line logged and nothing in the queue to explain
+    it.
+
+    The chain workload reaches it because the residency-reconciliation gate needs the VRAM budget live and a
+    card with a second lane in play: at one slot per card the head's lane is the card's only lane, so a hold on
+    it withholds nothing another card was going to get. This row is the same traffic at the aggressive setting
+    where both lanes count, and the claim is the one row t makes: no cycle that staged a model may skip a
+    dispatch some lane was already able to take.
+    """
+    world = _chain_world(max_threads=_CHAIN_AGGRESSIVE_THREADS)
+
+    await _drive_chain_traffic(world)
+
+    _assert_no_staging_tick_cost_a_ready_lane(world, context="two sampling slots per card")
+    _assert_the_cards_away_from_the_lane_kept_serving(world, context="two sampling slots per card")
+
+
+async def test_t2_defect_reinjection_a_held_head_ends_the_dispatch_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the re-selection removed, a withheld head idles the lanes that were ready to sample.
+
+    The pair's other half. Everything else about the run is identical, so a cycle counted here is one whose
+    only difference is that the withheld job ended the loop instead of being routed around.
+    """
+    _make_a_hold_end_the_dispatch_loop(monkeypatch)
+    world = _chain_world(max_threads=_CHAIN_AGGRESSIVE_THREADS)
+
+    await _drive_chain_traffic(world)
+
+    assert world.preload_idle_ticks, (
+        "with a withheld dispatch ending the cycle's loop, no cycle staged a model while a pending job "
+        "already had a free lane holding its model on a card under its cap: the row's premise is gone, so "
+        f"the fixed worker's empty result proves nothing. {world.state_dump()}"
     )
 
 

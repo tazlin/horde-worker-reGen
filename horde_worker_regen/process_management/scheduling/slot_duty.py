@@ -68,6 +68,14 @@ class SlotDutyBucket(StrEnum):
     materialisation did not yet fit measured device truth. The waiter is cleared once eviction makes room (or
     it degrades into unpriced sampling via the lease-acquire timeout); a real, nameable slot-park attributed to
     the clearance gate rather than the gate-less ``UNEXPLAINED`` scheduler stall."""
+    HEAD_PRIORITY_BARRIER = "head_priority_barrier"
+    """The head-priority barrier withheld the dispatch so the card the starved head's load is aimed at drains
+    to the no-live-consumer admit. The withheld job keeps its queue position and runs once the barrier
+    releases."""
+    AUX_PREPARATION = "aux_preparation"
+    """The selected job's auxiliary models (LoRAs, textual inversions) were still being placed on disk, so it
+    held no lane and could not sample. Selection already skips such a job; this is the terminal backstop that
+    keeps one from seizing a lane by any path."""
     UNEXPLAINED = "unexplained"
     """No gate claimed the empty slot: the scheduler-stall-shaped case worth reporting."""
 

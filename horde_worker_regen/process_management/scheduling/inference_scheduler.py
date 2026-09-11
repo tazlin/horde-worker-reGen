@@ -210,6 +210,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
 from horde_worker_regen.process_management.scheduling.ledgers import retention
 from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import (
     DISPATCH_HOLD_LIVENESS_SECONDS,
+    DispatchDecline,
     DispatchHoldLedger,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
@@ -3811,6 +3812,17 @@ class InferenceScheduler:
                 "reconcile residency (returning retained weights): a sibling slot holds model weights across "
                 "jobs that this job's materialisation cannot fit beside, and it dispatches once the card gives "
                 "them back"
+            )
+
+        # Before reporting a gate-less stall, read what the dispatch pass itself recorded. Every gate that
+        # withholds a selected job stamps its decline for the cycle, so a head this cycle declined is named by
+        # the gate that did it rather than reported as unexplained. The record is the pass's own, so the two
+        # can never disagree, and it carries no ticking quantity, so the reason stays comparable across cycles.
+        declined = self._dispatch_holds.cycle_declines.get(str(head.id_)) if head.id_ is not None else None
+        if declined is not None:
+            return declined.bucket, (
+                f"its model is resident and idle on process {process.process_id}, but this cycle's dispatch "
+                f"pass withheld it: {declined.detail}"
             )
 
         return SlotDutyBucket.UNEXPLAINED, (
@@ -7801,7 +7813,9 @@ class InferenceScheduler:
 
         The head's own card is excluded outright. Where the head is waiting for a lane there, that card's
         capacity is the head's to claim the moment it frees, and its cap would refuse the candidate anyway;
-        excluding it says so directly rather than relying on the arithmetic.
+        excluding it says so directly rather than relying on the arithmetic. Any card a dispatch gate has
+        already withheld a job from this cycle is excluded for the same reason, and the withheld jobs
+        themselves are never re-offered: their gates have answered for this cycle.
 
         A cold head names no card of its own, but it may already have a load in flight, and a cycle preloads
         *and* dispatches. The card carrying that load is excluded too (:meth:`_cards_loading_model`): seating
@@ -7817,8 +7831,13 @@ class InferenceScheduler:
         if not self._multi_gpu_routing_active:
             return None
         excluded_cards = {head_device_index} if head_device_index is not None else self._cards_loading_model(head_job)
+        # Every card a gate has already withheld a dispatch from this cycle is excluded on the same ground as
+        # the head's own: that capacity belongs to the job waiting on it the moment its gate releases.
+        excluded_cards |= self._dispatch_holds.declined_cards()
         for candidate_job in candidates:
             if candidate_job is head_job or candidate_job.model is None:
+                continue
+            if candidate_job.id_ is not None and str(candidate_job.id_) in self._dispatch_holds.cycle_declines:
                 continue
             # A degraded retry must run isolated (as in the diversity and resident-bypass paths), so it is
             # never seated beside other work.
@@ -8334,6 +8353,12 @@ class InferenceScheduler:
         check is the premise-level guard consulted where the cache is spent.
         """
         cached_job = cached.next_job
+        cached_job_id = str(cached_job.id_) if cached_job.id_ is not None else None
+        if cached_job_id is not None and cached_job_id in self._dispatch_holds.cycle_declines:
+            # A gate withheld this pair after it was cached. Re-offering it would re-ask the gate that has
+            # already answered for this cycle, and the dispatch loop would never reach the work another card
+            # can still take.
+            return False
         return (
             cached_job in self._job_tracker.jobs_pending_inference
             and cached_job not in self._job_tracker.jobs_in_progress
@@ -8387,6 +8412,11 @@ class InferenceScheduler:
                 continue
             if next_job is None:
                 next_job = job
+            if job.id_ is not None and str(job.id_) in self._dispatch_holds.cycle_declines:
+                # A gate withheld this job earlier in this cycle. It keeps its queue position, its holds keep
+                # their clocks, and it is still the head if it was; it is simply not offered again until the
+                # next cycle re-asks its gate, so the rest of the pass cannot loop on the same verdict.
+                continue
             next_n_jobs.append(job)
 
         if next_job is None:
@@ -8394,6 +8424,19 @@ class InferenceScheduler:
 
         if next_job.model is None:
             raise ValueError(f"next_job.model is None ({next_job})")
+
+        declined_head = (
+            self._dispatch_holds.cycle_declines.get(str(next_job.id_)) if next_job.id_ is not None else None
+        )
+        if declined_head is not None:
+            # The head's own dispatch was withheld this cycle, which is a fact about the card it would have
+            # landed on. Resume the placement-order walk for work another card can take now, exactly as the
+            # cap and cold-head sites do; the head's own gates are not re-asked, so nothing is charged twice.
+            return self._cross_card_selection(
+                next_job,
+                next_n_jobs,
+                head_device_index=declined_head.device_index,
+            )
 
         if (unserviceable_reason := self._unserviceable_job_reason(next_job)) is not None:
             if not information_only:
@@ -10612,15 +10655,49 @@ class InferenceScheduler:
         that can dispatch here are ones accepted before the stop. They are given a chance to finish,
         bounded by the per-job-scaled shutdown grace and the force-kill backstop; whatever genuinely
         cannot finish in time is still fault-reported so the horde reissues it promptly.
+
+        Three outcomes, not two. A dispatch happens, or nothing selectable is left, or a gate withholds the
+        job that was selected. The third is a fact about one card: the withheld job keeps its queue position
+        and its gate keeps its clocks, while every other card's ready work is still runnable this cycle. So a
+        withheld selection is recorded and the walk resumes for work another card can take, rather than
+        reading as "nothing more can start" and idling the fleet behind one held head. On a single-GPU host
+        the resumed walk has nowhere else to look and returns nothing, which is the original behaviour: a
+        held head ends the loop.
         """
         next_job_and_process = await self.get_next_job_and_process()
 
-        if next_job_and_process is None:
-            return False
+        while next_job_and_process is not None:
+            withheld = self._dispatch_withheld_by(next_job_and_process)
+            if withheld is None:
+                await self._commit_dispatch(next_job_and_process)
+                return True
+            self._dispatch_holds.note_decline(withheld)
+            if not self._multi_gpu_routing_active:
+                return False
+            next_job_and_process = await self.get_next_job_and_process()
 
-        bridge_data = self._runtime_config.bridge_data
+        return False
+
+    def _dispatch_withheld_by(self, next_job_and_process: NextJobAndProcess) -> DispatchDecline | None:
+        """The gate withholding this selected dispatch, or None when every gate passes and it may commit.
+
+        One place to ask "may this pair run right now", so the dispatch loop can tell a withheld selection
+        from an empty queue and route around the first without re-deriving any gate's arithmetic. The gates
+        keep their own bookkeeping (the barrier's edge-triggered notice, the post-processing defer record, the
+        residency and retention hold ledgers) exactly as they had it; what is added is the named record the
+        stall explainer and the rest of the cycle read.
+        """
         process_with_model = next_job_and_process.process_with_model
         next_job = next_job_and_process.next_job
+
+        def withheld(bucket: SlotDutyBucket, detail: str) -> DispatchDecline:
+            """Name this gate's refusal of ``next_job``, against the card the dispatch would have landed on."""
+            return DispatchDecline(
+                job_id=str(next_job.id_),
+                bucket=bucket,
+                device_index=process_with_model.device_index,
+                detail=detail,
+            )
 
         if self._head_admission.barrier_withholds(
             str(next_job.id_) if next_job.id_ is not None else None,
@@ -10636,24 +10713,35 @@ class InferenceScheduler:
                     str(next_job.id_)[:8],
                 )
                 self._head_admission.barrier_withhold_logged = True
-            return False
+            return withheld(
+                SlotDutyBucket.HEAD_PRIORITY_BARRIER,
+                "the head-priority barrier is withholding dispatch onto that card so its running jobs drain "
+                "and the starved head reaches its best-effort admit",
+            )
 
         if next_job_and_process.line_skip is None and self._job_tracker.job_requires_aux_preparation(next_job):
             # An unprepared aux job is not dispatchable: it holds no lane and no VRAM reservation while the
             # pop-time prefetch pipeline places its LoRAs/TIs on disk and clears its preparation gate. It is
             # already skipped by dispatch selection and preload admission, so a fitting sibling flows past it;
             # this remains as the terminal gate so such a job can never seize a lane by any path.
-            return False
+            return withheld(
+                SlotDutyBucket.AUX_PREPARATION,
+                "its auxiliary models are still being placed on disk, so it holds no lane and cannot sample",
+            )
 
-        degraded_dispatch = self._job_tracker.is_degraded_dispatch_pending(next_job)
-        if degraded_dispatch and self._jobs_in_progress_in_dispatch_scope(process_with_model.device_index):
+        if self._job_tracker.is_degraded_dispatch_pending(next_job) and self._jobs_in_progress_in_dispatch_scope(
+            process_with_model.device_index,
+        ):
             # A degraded retry (after a resource/OOM failure) runs in isolation to minimise VRAM
             # pressure: defer it until no other job is sampling. It keeps its head-of-queue position, so
             # it dispatches as soon as the in-flight jobs drain rather than being starved. The pressure it
             # avoids is on the card it would land on, so on a multi-card worker it waits for that card only:
             # a sibling card's sampling neither shares its allocator nor its device memory, and waiting for
             # the whole fleet to be empty would leave the retry unrunnable for as long as any card has work.
-            return False
+            return withheld(
+                SlotDutyBucket.DEGRADED_ISOLATION_PENDING,
+                "its next dispatch must run degraded/isolated and is waiting for the card to clear of other work",
+            )
 
         if self._prestaged_whole_card_not_ready(next_job):
             # The head was pre-staged into RAM while another job held the device; sampling commits its
@@ -10661,7 +10749,11 @@ class InferenceScheduler:
             # (idle siblings stopped, safety off-GPU, the card drained) before it starts. Otherwise a
             # lingering sibling context would force its first step to stream over the bus. It keeps its
             # head-of-queue position, so it dispatches the moment the residency converges.
-            return False
+            return withheld(
+                SlotDutyBucket.WHOLE_CARD_CONVERGENCE,
+                "its pre-staged whole-card residency has not finished collapsing to sole residency, and "
+                "sampling before it does would stream its first step over the bus",
+            )
 
         post_processing_deferred = self._should_defer_dispatch_for_post_processing(
             next_job,
@@ -10671,7 +10763,11 @@ class InferenceScheduler:
         if post_processing_deferred:
             # Post-processing either holds the card or is waiting for the active sampler to drain, and this
             # job's sampling peak cannot share the card with it.
-            return False
+            return withheld(
+                SlotDutyBucket.POST_PROCESSING_DEFER,
+                "an in-flight post-processing chain's committed VRAM and this job's sampling peak cannot "
+                "share the card, and it dispatches once the chain releases the device",
+            )
 
         line_skip = next_job_and_process.line_skip
         if self._budget_active() and self._dispatch_residency_reconciliation_holds(
@@ -10695,15 +10791,39 @@ class InferenceScheduler:
             # single reclaim owner evicts the idle residents, and re-ask next pass once the arbiter verifies the
             # reclaimed room fits it. This is the seam where RAM-staged weights actually commit to VRAM, which
             # neither the preload nor the second-sampler admission consult.
-            return False
+            return withheld(
+                SlotDutyBucket.RESIDENCY_RECONCILIATION,
+                "its materialisation would over-commit the card until an idle resident is evicted, and it "
+                "dispatches once that eviction frees room",
+            )
 
         if self._retained_resident_dispatch_holds(next_job, process_with_model):
             # Weights another slot holds across jobs occupy the card this dispatch would load into. The job
             # keeps its head-of-queue position while they are asked back, and dispatches once the card has
             # evidenced the free rather than the moment the request went out.
-            return False
+            return withheld(
+                SlotDutyBucket.RESIDENCY_RECONCILIATION,
+                "a sibling slot holds model weights across jobs that this job's materialisation cannot fit "
+                "beside, and it dispatches once the card gives them back",
+            )
 
-        # Every hold gate above is passed, so this dispatch is committed: advance the affinity skip window here
+        return None
+
+    async def _commit_dispatch(self, next_job_and_process: NextJobAndProcess) -> None:
+        """Dispatch a selection every gate has passed: record the pass, disclose it, and send the start.
+
+        Split from the gate ladder so a withheld selection can be routed around without any part of the
+        commit running. Everything here is downstream of the last gate and unchanged by that split: the
+        affinity window advances only on a committed dispatch, and the start logging fires only once the job
+        is genuinely going.
+        """
+        bridge_data = self._runtime_config.bridge_data
+        process_with_model = next_job_and_process.process_with_model
+        next_job = next_job_and_process.next_job
+        line_skip = next_job_and_process.line_skip
+        degraded_dispatch = self._job_tracker.is_degraded_dispatch_pending(next_job)
+
+        # Every hold gate is passed, so this dispatch is committed: advance the affinity skip window here
         # (never in get_next_job_and_process, which runs twice a cycle and must stay pure for information_only).
         # A resident_bypass skip is counted against the displaced head; a direct head dispatch (no line-skip)
         # closes the window. A diversity line-skip leaves the window untouched: the head is still pending, its
@@ -10803,8 +10923,6 @@ class InferenceScheduler:
         # A job dispatched: any prior stall reason is now stale. Clear it so the
         # orchestrator intent's "Holding dispatch" does not stick after the stall resolves.
         self._head_admission.clear_stall()
-
-        return True
 
     def _compute_wanted_models(self) -> set[str]:
         """The set of models the worker is actively serving right now.
@@ -11416,8 +11534,13 @@ class InferenceScheduler:
         weights back, and a cached pair naming a lane that holds nothing is undispatchable while suppressing
         selection of every job that is dispatchable. It is therefore scoped to the cycle rather than revalidated,
         and every driver of :meth:`preload_models` / :meth:`start_inference` must open its cycle here.
+
+        The cycle's dispatch declines are discarded for the same reason and with the same scope. A gate that
+        withheld a selected job last cycle is re-asked this cycle against the state the child reports have
+        just applied, so carrying its verdict over would route work around a gate that has since released.
         """
         self._pending_line_skip = None
+        self._dispatch_holds.clear_cycle_declines()
 
     async def run_scheduling_cycle(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
         """Run a single scheduling cycle: preload, start inference, unload.

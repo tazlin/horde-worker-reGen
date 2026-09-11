@@ -8,6 +8,10 @@ over-commit the card at the clearance moment. Each is bookkeeping the gate alrea
 lets the stall classifier, the recovery supervisor and the liveness watchdog read the gate's own truthful state
 instead of re-deriving it.
 
+Alongside them it owns the current cycle's dispatch declines: which gate withheld each job the dispatch pass
+selected, so the pass can route around a withheld job instead of re-asking the gate, and the stall explainer
+can name the gate rather than reporting an unexplained stall.
+
 This module owns the per-job hold records and the session counters. The scheduler decides the holds, records
 the resource-state transitions and decision events, and issues the evictions.
 """
@@ -19,6 +23,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from horde_worker_regen.process_management.resources.run_metrics import FlatScalarMap
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 
 DISPATCH_HOLD_LIVENESS_SECONDS = 190.0
 """How long a head's residency-reconciliation hold keeps the recovery supervisor from reading an idle card with
@@ -61,6 +66,27 @@ class AbandonedHold:
     room_inputs: FlatScalarMap
 
 
+@dataclass(frozen=True)
+class DispatchDecline:
+    """Why one gate withheld a job the dispatch pass had already selected, within one scheduling cycle.
+
+    A dispatch that is withheld leaves the selected job undispatched without concluding anything: the job
+    keeps its queue position and every clock the gate owns. Naming the gate that did it turns "the scheduler
+    returned nothing" into a fact a reader can act on, and lets the rest of the cycle route around the
+    withheld job instead of re-asking the same gate.
+    """
+
+    job_id: str
+    bucket: SlotDutyBucket
+    """The duty-attribution member naming the gate, so the stall text, the slot accounting and this record all
+    name one cause."""
+    device_index: int | None
+    """The card the withheld dispatch would have landed on; None where the slot names no device."""
+    detail: str
+    """The gate's own words for what it is waiting on. Carries no quantity that advances with the clock, so
+    successive cycles can be compared for a changed cause."""
+
+
 class DispatchHoldLedger:
     """Per-job hold records and session counters for the dispatch, post-processing defer and clearance gates."""
 
@@ -91,6 +117,28 @@ class DispatchHoldLedger:
         """Per job: accumulated held seconds from closed clearance-hold spans, and the live span's start or
         None. Closed spans are kept until the job leaves the in-progress set so a resolved hold still widens
         the liveness grace it already consumed."""
+        self.cycle_declines: dict[str, DispatchDecline] = {}
+        """The jobs a dispatch gate withheld during the scheduling cycle now running, keyed by job id. Scoped
+        to the cycle and discarded at its start, so it states what this pass decided and never a stale verdict
+        the world has moved past."""
+
+    # ---- per-cycle dispatch declines
+
+    def note_decline(self, decline: DispatchDecline) -> None:
+        """Record that a gate withheld ``decline.job_id`` this cycle, replacing any earlier record for it."""
+        self.cycle_declines[decline.job_id] = decline
+
+    def clear_cycle_declines(self) -> None:
+        """Discard the cycle's decline records, which the next cycle re-derives from its own gate passes."""
+        self.cycle_declines.clear()
+
+    def declined_cards(self) -> set[int]:
+        """The cards a withheld dispatch was aimed at this cycle.
+
+        A card whose dispatch a gate has already withheld is the withheld job's to claim as soon as its gate
+        releases, so seating a later job there takes exactly the capacity the wait is for.
+        """
+        return {decline.device_index for decline in self.cycle_declines.values() if decline.device_index is not None}
 
     # ---- dispatch residency holds
 

@@ -938,6 +938,42 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at=_DISPATCH_STALL_OBSERVABLE,
     ),
     GateEntry(
+        key="head_priority_barrier",
+        surface=GateSurface.DISPATCH_STALL,
+        kind=GateKind.HOLD,
+        subsystem="process_management.scheduling.inference_scheduler",
+        engaged_by=(
+            "a starved head has latched the head-priority barrier, so every dispatch but its own onto the card "
+            "its load is aimed at is withheld while that card drains"
+        ),
+        released_by=(
+            "the barrier releasing, which happens when reclaim makes progress for the barred head or the "
+            "drained card admits its preload"
+        ),
+        bound_seconds=180.0,
+        bound_source="head_admission.HEAD_RAM_DEFER_BARRIER_CAP_SECONDS",
+        backstop="the barrier cap, past which the barred head is declined for reissue and the barrier lifts",
+        observable_at=_DISPATCH_STALL_OBSERVABLE,
+    ),
+    GateEntry(
+        key="aux_preparation",
+        surface=GateSurface.DISPATCH_STALL,
+        kind=GateKind.HOLD,
+        subsystem="process_management.scheduling.inference_scheduler",
+        engaged_by=(
+            "the selected job's auxiliary models are still being placed on disk by the pop-time prefetch "
+            "pipeline, so it holds no lane and cannot sample"
+        ),
+        released_by="the prefetch pipeline clearing the job's preparation gate",
+        bound_seconds=None,
+        bound_source="the aux download's own duration",
+        backstop=(
+            "the aux-download deadline, which faults a preparation that will never conclude; selection skips "
+            "such a job meanwhile, so a fitting sibling is dispatched instead of idling the lane"
+        ),
+        observable_at=_DISPATCH_STALL_OBSERVABLE,
+    ),
+    GateEntry(
         key="unexplained",
         surface=GateSurface.DISPATCH_STALL,
         kind=GateKind.HOLD,

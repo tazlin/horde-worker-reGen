@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 from unittest.mock import Mock
 
+import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
@@ -35,6 +36,8 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     record_affinity_skip,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import DispatchDecline
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -1430,3 +1433,403 @@ class TestHeadPriorityBarrierForAColdHead:
 
         assert started is False
         assert eligible_card_candidate in scheduler._job_tracker.jobs_pending_inference
+
+
+def _withhold_for_residency_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler: InferenceScheduler,
+    *jobs: ImageGenerateJobPopResponse,
+) -> None:
+    """Make the dispatch residency-reconciliation gate withhold exactly ``jobs``.
+
+    The gate's own arithmetic (the arbiter verdict, the eviction it issues, the room it prices a displaced
+    head at) has tests of its own; what is under test here is what the dispatch loop does once a gate has said
+    no, so the verdict is supplied directly and the pricing is kept inert.
+    """
+    held = {str(job.id_) for job in jobs}
+    monkeypatch.setattr(scheduler, "_budget_active", lambda: True)
+    monkeypatch.setattr(scheduler, "_displaced_head_outstanding_mb", lambda _job, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "_dispatch_residency_reconciliation_holds",
+        lambda next_job, _process, **_kwargs: str(next_job.id_) in held,
+    )
+
+
+def _withhold_for_post_processing(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler: InferenceScheduler,
+    *jobs: ImageGenerateJobPopResponse,
+) -> None:
+    """Make the post-processing co-residency defer gate withhold exactly ``jobs``."""
+    held = {str(job.id_) for job in jobs}
+    monkeypatch.setattr(
+        scheduler,
+        "_should_defer_dispatch_for_post_processing",
+        lambda next_job, *, process_with_model: str(next_job.id_) in held,
+    )
+
+
+def _withhold_for_retained_residents(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler: InferenceScheduler,
+    *jobs: ImageGenerateJobPopResponse,
+) -> None:
+    """Make the retained-resident dispatch gate withhold exactly ``jobs``."""
+    held = {str(job.id_) for job in jobs}
+    monkeypatch.setattr(
+        scheduler,
+        "_retained_resident_dispatch_holds",
+        lambda next_job, _process: str(next_job.id_) in held,
+    )
+
+
+class TestAWithheldDispatchDoesNotEndTheCycle:
+    """A gate that withholds the selected job speaks for one card; the rest of the fleet keeps dispatching."""
+
+    async def test_one_card_still_ends_the_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Single-GPU parity: with one card a withheld head ends the dispatch loop, exactly as it always has.
+
+        There is nowhere else for the resumed walk to look, so the fix is inert here by construction rather
+        than by a flag: the cross-card walk is the only re-selection, and it has no other card to offer.
+        """
+        scheduler = _make_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: _lane(0, device_index=0, model="model_a"),
+                    1: _lane(1, device_index=0, model="model_b"),
+                },
+            ),
+            card_runtimes=_uniform_cards(1, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        head, follower = await _queue(scheduler, "model_a", "model_b")
+        _withhold_for_residency_reconciliation(monkeypatch, scheduler, head)
+
+        assert scheduler._multi_gpu_routing_active is False
+        assert await scheduler.start_inference() is False
+        assert head in scheduler._job_tracker.jobs_pending_inference
+        assert follower in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_another_cards_resident_work_runs_in_the_same_cycle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Best case: the head is withheld on card 0 and card 1's resident job dispatches on the same pass."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: _lane(0, device_index=0, model="model_a"),
+                    1: _lane(1, device_index=1, model="model_b"),
+                    2: _lane(2, device_index=2, model="model_c"),
+                },
+            ),
+            card_runtimes=_uniform_cards(3),
+            max_threads=1,
+        )
+        head, follower, _third = await _queue(scheduler, "model_a", "model_b", "model_c")
+        _withhold_for_residency_reconciliation(monkeypatch, scheduler, head)
+
+        started = await scheduler.start_inference()
+
+        assert started is True
+        assert follower in scheduler._job_tracker.jobs_in_progress
+        assert head in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_work_only_on_the_withheld_card_dispatches_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worst case: every seatable job sits on the withheld head's own card, so the loop ends empty.
+
+        That card's capacity is the withheld head's to claim the moment its gate releases, so seating a
+        follower there would take exactly what the wait is for. The call returning at all is the no-spin half
+        of the claim: a re-selection that kept offering the same job would hang rather than fail.
+        """
+        scheduler = _make_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: _lane(0, device_index=0, model="model_a"),
+                    1: _lane(1, device_index=0, model="model_b"),
+                    2: _lane(2, device_index=1, model="model_c"),
+                },
+            ),
+            card_runtimes=_uniform_cards(2, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        head, same_card_follower = await _queue(scheduler, "model_a", "model_b")
+        _withhold_for_residency_reconciliation(monkeypatch, scheduler, head)
+
+        assert await scheduler.start_inference() is False
+        assert same_card_follower in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_a_post_processing_defer_leaves_the_other_cards_alone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Corner: the head is deferred behind a chain on its own card; another card's job still runs."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: _lane(0, device_index=0, model="model_a"),
+                    1: _lane(1, device_index=1, model="model_b"),
+                },
+            ),
+            card_runtimes=_uniform_cards(2),
+            max_threads=1,
+        )
+        head, follower = await _queue(scheduler, "model_a", "model_b")
+        _withhold_for_post_processing(monkeypatch, scheduler, head)
+
+        assert await scheduler.start_inference() is True
+        assert follower in scheduler._job_tracker.jobs_in_progress
+        assert head in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_a_retained_resident_hold_leaves_the_other_cards_alone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Corner: the head waits for a sibling's retained weights on its card; another card's job runs."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: _lane(0, device_index=0, model="model_a"),
+                    1: _lane(1, device_index=1, model="model_b"),
+                },
+            ),
+            card_runtimes=_uniform_cards(2),
+            max_threads=1,
+        )
+        head, follower = await _queue(scheduler, "model_a", "model_b")
+        _withhold_for_retained_residents(monkeypatch, scheduler, head)
+
+        assert await scheduler.start_inference() is True
+        assert follower in scheduler._job_tracker.jobs_in_progress
+        assert head in scheduler._job_tracker.jobs_pending_inference
+
+    async def test_two_withheld_jobs_in_one_cycle_reach_the_third(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Corner: two gates fire in sequence within one pass; both are excluded and the third job runs."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: _lane(0, device_index=0, model="model_a"),
+                    1: _lane(1, device_index=1, model="model_b"),
+                    2: _lane(2, device_index=2, model="model_c"),
+                },
+            ),
+            card_runtimes=_uniform_cards(3),
+            max_threads=1,
+        )
+        scheduler.begin_scheduling_cycle()
+        head, second, third = await _queue(scheduler, "model_a", "model_b", "model_c")
+        _withhold_for_residency_reconciliation(monkeypatch, scheduler, head, second)
+
+        assert await scheduler.start_inference() is True
+        assert third in scheduler._job_tracker.jobs_in_progress
+        assert set(scheduler.dispatch_holds.cycle_declines) == {str(head.id_), str(second.id_)}
+        # Nothing is left that another card can take, so the loop ends rather than re-offering a job whose
+        # gate has already answered for this cycle.
+        assert await scheduler.start_inference() is False
+
+    async def test_the_look_ahead_and_the_dispatch_call_agree_after_an_exclusion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Edge: once jobs are excluded, both selection calls of the cycle still give one answer."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: _lane(0, device_index=0, model="model_a"),
+                    1: _lane(1, device_index=1, model="model_b"),
+                },
+            ),
+            card_runtimes=_uniform_cards(2),
+            max_threads=1,
+        )
+        scheduler.begin_scheduling_cycle()
+        head, follower = await _queue(scheduler, "model_a", "model_b")
+        _withhold_for_residency_reconciliation(monkeypatch, scheduler, head, follower)
+
+        assert await scheduler.start_inference() is False
+
+        peeked = await scheduler.get_next_job_and_process(information_only=True)
+        selected = await scheduler.get_next_job_and_process()
+
+        assert peeked is None
+        assert selected is None
+
+    async def test_the_exclusion_does_not_survive_the_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Edge: the next cycle re-asks the gate, so a released hold dispatches rather than staying excluded."""
+        scheduler = _make_scheduler(
+            process_map=ProcessMap(
+                {
+                    0: _lane(0, device_index=0, model="model_a"),
+                    1: _lane(1, device_index=1, model="model_b"),
+                },
+            ),
+            card_runtimes=_uniform_cards(2),
+            max_threads=1,
+        )
+        scheduler.begin_scheduling_cycle()
+        head, _follower = await _queue(scheduler, "model_a", "model_b")
+        _withhold_for_residency_reconciliation(monkeypatch, scheduler, head)
+
+        await scheduler.start_inference()
+        assert str(head.id_) in scheduler.dispatch_holds.cycle_declines
+
+        scheduler.begin_scheduling_cycle()
+
+        assert scheduler.dispatch_holds.cycle_declines == {}
+        selection = await scheduler.get_next_job_and_process()
+        assert selection is not None
+        assert selection.next_job is head
+
+
+class TestEveryWithheldDispatchIsRecorded:
+    """A dispatch declined with no record is a stall nothing can explain, so each gate names itself."""
+
+    async def _decline_for(
+        self,
+        scheduler: InferenceScheduler,
+        job: ImageGenerateJobPopResponse,
+    ) -> DispatchDecline:
+        """Run one dispatch pass that must dispatch nothing, and return the record it made for ``job``."""
+        assert await scheduler.start_inference() is False
+        decline = scheduler.dispatch_holds.cycle_declines.get(str(job.id_))
+        assert decline is not None, f"no decline recorded; declines: {scheduler.dispatch_holds.cycle_declines}"
+        return decline
+
+    def _one_card_scheduler(self, *lanes: tuple[int, str]) -> InferenceScheduler:
+        """A single-card worker whose every lane is idle and holds the named model."""
+        return _make_scheduler(
+            process_map=ProcessMap(
+                {process_id: _lane(process_id, device_index=0, model=model) for process_id, model in lanes},
+            ),
+            card_runtimes=_uniform_cards(1, max_concurrent_inference=2),
+            max_threads=2,
+        )
+
+    async def test_the_head_priority_barrier_names_itself(self) -> None:
+        """A dispatch withheld to drain the card for a starved head is recorded as the barrier's."""
+        head_lane = _lane(0, device_index=0, model="model_a")
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: head_lane, 1: _lane(1, device_index=0, model="model_c")}),
+            card_runtimes=_uniform_cards(1, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        scheduler.begin_scheduling_cycle()
+        blocking_job, head, same_card_candidate = await _queue(scheduler, "model_a", "model_a", "model_c")
+        await _seat(scheduler, blocking_job, head_lane)
+        scheduler._head_admission.engage_barrier(str(head.id_))
+
+        decline = await self._decline_for(scheduler, same_card_candidate)
+
+        assert decline.bucket is SlotDutyBucket.HEAD_PRIORITY_BARRIER
+        assert decline.device_index == 0
+
+    async def test_an_unprepared_aux_job_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The terminal aux gate records its refusal, so a lane held for a prefetch is never unexplained.
+
+        Selection reads the same preparation flag and skips an unprepared job, so the gate is reachable only
+        by a job whose files went missing between the walk that chose it and the gate that asks again. The
+        pair is therefore selected first and the flag set afterwards, and the gate ladder is asked directly:
+        a whole pass cannot be driven into this state, because selection would refuse the job before the
+        terminal gate ever saw it.
+        """
+        scheduler = self._one_card_scheduler((0, "model_a"))
+        scheduler.begin_scheduling_cycle()
+        (head,) = await _queue(scheduler, "model_a")
+        selection = await scheduler.get_next_job_and_process()
+        assert selection is not None
+        assert selection.next_job is head
+        assert selection.line_skip is None
+        monkeypatch.setattr(scheduler._job_tracker, "job_requires_aux_preparation", lambda job: job is head)
+
+        decline = scheduler._dispatch_withheld_by(selection)
+
+        assert decline is not None
+        assert decline.bucket is SlotDutyBucket.AUX_PREPARATION
+
+    async def test_a_degraded_retry_names_itself(self) -> None:
+        """An isolated retry waiting for its card to clear is recorded as the isolation wait it is."""
+        retry_lane = _lane(0, device_index=0, model="model_a")
+        sibling_lane = _lane(1, device_index=0, model="model_b")
+        scheduler = _make_scheduler(
+            process_map=ProcessMap({0: retry_lane, 1: sibling_lane}),
+            card_runtimes=_uniform_cards(1, max_concurrent_inference=2),
+            max_threads=2,
+        )
+        scheduler.begin_scheduling_cycle()
+        retry_job, sibling_job = await _queue(scheduler, "model_a", "model_b")
+        await _seat(scheduler, sibling_job, sibling_lane)
+        tracked = scheduler._job_tracker.get_tracked_job(retry_job.id_)
+        assert tracked is not None
+        tracked.needs_degraded_dispatch = True
+
+        decline = await self._decline_for(scheduler, retry_job)
+
+        assert decline.bucket is SlotDutyBucket.DEGRADED_ISOLATION_PENDING
+
+    async def test_a_whole_card_prestage_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pre-staged head waiting for sole residency is recorded as the convergence wait."""
+        scheduler = self._one_card_scheduler((0, "model_a"))
+        scheduler.begin_scheduling_cycle()
+        (head,) = await _queue(scheduler, "model_a")
+        monkeypatch.setattr(scheduler, "_prestaged_whole_card_not_ready", lambda _job: True)
+
+        decline = await self._decline_for(scheduler, head)
+
+        assert decline.bucket is SlotDutyBucket.WHOLE_CARD_CONVERGENCE
+
+    async def test_a_post_processing_defer_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A head deferred behind a post-processing chain is recorded as that defer."""
+        scheduler = self._one_card_scheduler((0, "model_a"))
+        scheduler.begin_scheduling_cycle()
+        (head,) = await _queue(scheduler, "model_a")
+        _withhold_for_post_processing(monkeypatch, scheduler, head)
+
+        decline = await self._decline_for(scheduler, head)
+
+        assert decline.bucket is SlotDutyBucket.POST_PROCESSING_DEFER
+
+    async def test_a_residency_reconciliation_hold_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A head whose materialisation would over-commit the card is recorded as the reconciliation wait."""
+        scheduler = self._one_card_scheduler((0, "model_a"))
+        scheduler.begin_scheduling_cycle()
+        (head,) = await _queue(scheduler, "model_a")
+        _withhold_for_residency_reconciliation(monkeypatch, scheduler, head)
+
+        decline = await self._decline_for(scheduler, head)
+
+        assert decline.bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
+
+    async def test_a_retained_resident_hold_names_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A head waiting for a sibling's retained weights is recorded in the same reconciliation bucket."""
+        scheduler = self._one_card_scheduler((0, "model_a"))
+        scheduler.begin_scheduling_cycle()
+        (head,) = await _queue(scheduler, "model_a")
+        _withhold_for_retained_residents(monkeypatch, scheduler, head)
+
+        decline = await self._decline_for(scheduler, head)
+
+        assert decline.bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
+
+    async def test_the_stall_explainer_names_the_gate_that_withheld_the_head(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The explainer reads the pass's own record, so a withheld head is never reported as unexplained."""
+        scheduler = self._one_card_scheduler((0, "model_a"))
+        scheduler.begin_scheduling_cycle()
+        (head,) = await _queue(scheduler, "model_a")
+        _withhold_for_residency_reconciliation(monkeypatch, scheduler, head)
+
+        await self._decline_for(scheduler, head)
+        bucket, reason = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION
+        assert "over-commit the card" in reason
+        assert "no matching gate" not in reason

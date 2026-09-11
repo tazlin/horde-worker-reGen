@@ -272,7 +272,11 @@ async def test_backfill_retries_after_measured_vram_recovers() -> None:
     assert head_process.last_control_flag is not HordeControlFlag.START_INFERENCE
 
     free_mb["value"] = 12_348.0
+    # The recovered reading belongs to a later cycle, so open one: the frozen arbiter is re-primed and the
+    # cycle-scoped selection state (the line-skip cache, the gates' declines) is discarded, which is what lets
+    # the held job be re-asked against the new reading rather than routed around for the rest of this cycle.
     scheduler._vram_arbiter = None
+    scheduler.begin_scheduling_cycle()
     assert await scheduler.start_inference() is True
     assert tracker.jobs_in_progress == (backfill,)
 

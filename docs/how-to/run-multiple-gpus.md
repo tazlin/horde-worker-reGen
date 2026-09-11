@@ -137,7 +137,7 @@ first job another card can run immediately; the head keeps its queue position an
 is waiting for. The card the head waits on is left alone, so nothing takes the capacity it is queued for,
 and where the head is cold with a load already in flight, the card carrying that load is left alone too.
 
-Four more worker-wide behaviours are per card for the same reason:
+Five more worker-wide behaviours are per card for the same reason:
 
 - A scheduling cycle **preloads and dispatches**. Staging a model onto one slot of one card no longer costs
   every other card a control-loop tick; one preload per cycle is still the ceiling.
@@ -148,6 +148,10 @@ Four more worker-wide behaviours are per card for the same reason:
   about the host (the RAM danger floor) or about the head's own escalation still stops everything.
 - The **head-priority barrier** withholds dispatch only onto the card the starved head's load is aimed at,
   and a **degraded retry** waits for its own card to empty rather than for the whole worker.
+- A **dispatch a gate withholds** stops that job's card, not the cycle. The withheld job keeps its queue
+  position and its card is left to it, while the dispatch loop goes on seating work the other cards can run
+  now. This matters most at an aggressive `max_threads`, where a card has a second lane free for a hold to
+  strand.
 
 At startup the worker logs how the per-card figures compose ("Driving N cards, each with its own inference
 process pool …" and the megapixelstep budget line), so the effective worker-wide appetite is always stated
