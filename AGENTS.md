@@ -49,7 +49,9 @@ answers "is a multi-GPU worker actually using its cards"); `timeline` is the raw
 event stream; `bundle` builds a redacted zip for a maintainer. Every finding id is catalogued in
 [docs/reference/log_findings.md](docs/reference/log_findings.md).
 
-**When a session needs a hand-rolled script, the tool needs a finding: add it there.** And the log lines
+**When a session needs a hand-rolled script, the tool needs a finding: add it there.** The copy a finding
+shows a reader follows [docs/how-to/write-a-finding.md](docs/how-to/write-a-finding.md), enforced by
+`tests/analysis/test_finding_copy_style.py`. And the log lines
 `horde_worker_regen/analysis/` parses are a contract, registered in `analysis/log_signatures.py` with
 their emitting sites. Before changing a log message in `process_management/`, grep that registry; if the
 line is registered, update the pattern, the sample, and any detector in the same change, then re-run
