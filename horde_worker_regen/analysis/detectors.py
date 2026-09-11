@@ -437,34 +437,30 @@ def detect_crash_on_start_loop(context: SessionContext) -> list[Finding]:
 
     cause = max(exceptions, key=lambda exc: exceptions[exc]) if exceptions else None
     git_failure = any(_GIT_ENVIRONMENT_FAILURE_RE.search(text) for text in crash_texts)
-    verdict = (
-        f"{len(crashing)} inference start(s) across {len({r.process_id for r in crashing})} slot(s) crashed before "
-        "reaching readiness"
-    )
+    starts = len(crashing)
+    processes = len({r.process_id for r in crashing})
     if cause is not None and git_failure:
-        verdict += f"; the child raised `{cause}` while preparing the shared ComfyUI environment."
+        verdict = (
+            f'{starts} image process starts across {processes} processes crashed with "{cause}" while '
+            "preparing the shared ComfyUI environment."
+        )
         remediation = (
-            "The child died installing or repairing the shared ComfyUI environment, not importing the "
-            "inference stack, so nothing about this worker's Python packages is implicated. Several children "
-            "cold-starting at once clone custom nodes into the same environment directory; a clone "
-            "interrupted partway leaves files a later checkout will not overwrite, and every child after it "
-            "fails the same way. Clear the environment directory named in the failure and let one start "
-            "rebuild it. Newer hordelib serialises this preparation and repairs a half-written tree itself, "
-            "so an upgrade prevents the recurrence."
+            "Delete the environment directory named in the error and start the worker again so one process "
+            "rebuilds it. Your Python packages are not the problem. Updating hordelib prevents a repeat, since "
+            "newer versions prepare that directory one process at a time and repair a half-written one."
         )
     elif cause is not None:
-        verdict += f"; the child raised `{cause}`."
+        verdict = f'{starts} image process starts across {processes} processes crashed with "{cause}".'
         remediation = (
-            f"The inference subprocess fails during hordelib/ComfyUI init with `{cause}`. Fix that "
-            "environment fault (e.g. reinstall a CUDA-enabled torch if it reports torch was not compiled "
-            "with CUDA); the worker cannot serve until the children start."
+            f'Fix the environment fault behind "{cause}". If it says torch was not compiled with CUDA, '
+            "reinstall a CUDA-enabled torch."
         )
     else:
-        verdict += " (no child traceback found to attribute)."
-        remediation = (
-            "Inspect the affected slot's bridge_inference_<N>_startup.log for the failing import/exception; "
-            "the parent only sees a nonzero exit code."
+        verdict = (
+            f"{starts} image process starts across {processes} processes crashed before they were ready, and "
+            "no start-up log names the error."
         )
+        remediation = "Open the process's start-up log in the logs folder and look for the failing import or error."
     return [
         Finding(
             kind=FindingKind.CRASH_ON_START_LOOP,
@@ -494,10 +490,9 @@ def detect_doomed_pool_no_giveup(context: SessionContext) -> list[Finding]:
         return []
 
     verdict = (
-        f"The pool quarantined and was soft-reset {len(soft_resets)} time(s), recovering "
-        f"{len(recovered)} time(s), and reached {session.peak_process_recoveries} process recoveries, but the "
-        f"worker never abandoned ship (it ended via {session.end_reason}). A deterministically-doomed pool "
-        "flapped between soft reset and re-crash instead of self-terminating."
+        f"The worker rebuilt its crashed image processes {len(soft_resets)} times and restarted a process "
+        f"{session.peak_process_recoveries} times without ever stopping itself, and the session ended as "
+        f'"{session.end_reason}".'
     )
     return [
         Finding(
@@ -518,11 +513,7 @@ def detect_gave_up_clean(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.GAVE_UP_CLEAN,
             severity=Severity.INFO,
-            headline=(
-                "Save-our-ship abandoned ship and self-terminated after soft resets could not restore a "
-                "working pool. This is the intended bail-out, not a hang; see the crash-on-start finding "
-                "for why the pool was unrecoverable."
-            ),
+            headline="The worker stopped itself after rebuilding its image processes could not restore a working one.",
             evidence=[_evidence(abandon[0])],
         ),
     ]
@@ -538,11 +529,8 @@ def detect_stuck_inference_step(context: SessionContext) -> list[Finding]:
             kind=FindingKind.STUCK_INFERENCE_STEP,
             severity=Severity.WARNING,
             headline=(
-                f"{len(stuck)} time(s) an inference slot looped on a single sampling step (in practice the "
-                "final step) and never returned a result, while still emitting heartbeats. The slot was not "
-                "silent, so the per-step silence timeout could not catch it; the stuck-step watchdog reaped "
-                "it on the child's non-advancing-repeat count instead. Each occurrence stranded the in-flight "
-                "job and held the slot's VRAM until the reap."
+                f"{len(stuck)} times an image process repeated one sampling step without finishing and was "
+                "restarted, losing the job it was running."
             ),
             evidence=[_evidence(r) for r in stuck[:4]],
         ),
@@ -597,60 +585,39 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
             Finding(
                 kind=FindingKind.POST_PROCESSING_VRAM_STALL,
                 severity=Severity.INFO,
-                title_override="Post-processing co-resident with sampling (admitted)",
+                title_override="Post-processing shared the card and nothing stalled",
                 headline=(
-                    f"Dedicated post-processing activity coincided with {len(low_vram_warnings)} child "
-                    "low-free-VRAM reading(s), but nothing corroborated a stall: no post-processing watchdog "
-                    "reap, no WDDM demand-paging, and no reading below the inference reserve. The scheduler "
-                    "admits sampling and post-processing co-residency when measured device truth affords it, "
-                    "so this is admitted co-residency operating as intended, not a stall. Recorded for audit."
+                    f"Post-processing ran while free VRAM was low {len(low_vram_warnings)} times, and nothing stalled."
                 ),
-                action_addendum=(
-                    "No action needed: this is admitted co-residency, not an over-commit. If throughput "
-                    "actually degrades, look for a corroborating signal (a post-processing watchdog reap, a "
-                    "WDDM demand-paging verdict, or a below-inference-reserve streaming warning), which "
-                    "escalates this finding to a warning."
-                ),
+                action_addendum="No action needed.",
                 evidence=[_evidence(r) for r in (dedicated_activity[:2] + low_vram_warnings[:2])],
             ),
         ]
+    outcome = ""
+    if dropped > 0 or forced_maintenance:
+        outcome = f", {dropped} jobs were dropped" + (
+            " and the horde put the worker into maintenance" if forced_maintenance else ""
+        )
     verdict = (
-        f"{len(stalls)} post-processing watchdog reap(s), {len(low_vram_warnings)} child low-free-VRAM "
-        "warning(s), and dedicated post-processing activity were observed in the same session. The "
-        "upscaler/face-fixer peak that lands after sampling was competing with inference models and CUDA "
-        "contexts on the same card, pushing ComfyUI toward tiled/streaming execution instead of fast in-VRAM "
-        "sampling. ComfyUI can only release this process's own cache; sibling process models and contexts are "
-        "reclaimable only by the orchestrator."
+        f"Post-processing stalled {len(stalls)} times while free VRAM was low {len(low_vram_warnings)} times{outcome}."
     )
     if breaker_trips:
-        verdict += (
-            " The self-protective breaker tripped: post-processing is now disabled on this worker for the rest "
-            "of the session (it kept being handed jobs it could not host)."
+        action = (
+            "Post-processing is already off for the rest of this session and comes back on its own once free "
+            "VRAM recovers. If the card cannot get there, turn on the VRAM budget, or lower `max_threads` or "
+            "`queue_size`."
         )
-    if dropped > 0 or forced_maintenance:
-        verdict += f" It escalated: {dropped} backlog job(s) were faulted" + (
-            " and the horde forced the worker into maintenance." if forced_maintenance else "."
+    else:
+        action = (
+            "Turn on the VRAM budget. As a stopgap, lower `max_threads` or `queue_size`, or turn off "
+            "post-processing on this card."
         )
     return [
         Finding(
             kind=FindingKind.POST_PROCESSING_VRAM_STALL,
             severity=Severity.CRITICAL if escalated else Severity.WARNING,
             headline=verdict,
-            action_addendum=(
-                "Run with the VRAM budget enabled on a build where the dedicated post-processing lane "
-                "participates in committed-reserve accounting and idle VRAM reclaim. As a stopgap, lower "
-                "concurrency/queue or disable post-processing on this card; a 4x upscale needs several GB "
-                "free at peak that a multi-context card may not spare. The "
-                "`post_processing_fault_breaker_enabled` breaker disables post-processing automatically after "
-                "repeated stalls so the worker stops feeding the forced-maintenance spiral"
-                + (
-                    "; it has already tripped here. It re-enables on its own once the card's measured free VRAM "
-                    "recovers above the post-processing peak; downgrade settings (or restart) if the card cannot "
-                    "reach that headroom."
-                    if breaker_trips
-                    else "."
-                )
-            ),
+            action_addendum=action,
             evidence=[_evidence(r) for r in (stalls[:4] + low_vram_warnings[:4] + breaker_trips[:1])]
             + [_evidence(r.record) for r in post_processing_recoveries[:2]],
         ),
@@ -895,11 +862,7 @@ def detect_orphan_wedge(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.ORPHAN_WEDGE,
             severity=Severity.WARNING,
-            headline=(
-                f"{len(orphans)} job(s) were punted as orphaned in-progress with no owning live slot. A "
-                "recurring orphan storm means something upstream keeps stranding jobs (often a GPU that "
-                "hangs each inference)."
-            ),
+            headline=f"{len(orphans)} jobs were dropped because the process running each one had disappeared.",
             evidence=[_evidence(r) for r in orphans[:4]],
         ),
     ]
@@ -2524,24 +2487,18 @@ def detect_empty_model_pop_cascade(context: SessionContext) -> list[Finding]:
         return []
 
     if uncontained:
-        verdict = (
-            f"{len(empty_pops)} pop(s) arrived with no model name and were queued as if the empty name were a "
-            f"model: it was preloaded {len(blank_preloads)} time(s) and cost {len(blank_deaths)} child "
-            "death(s), each one a slot ending on a load it could never complete."
+        blocked = (
+            f", and block the blank name {len(blank_quarantines)} times"
+            if blank_quarantines or quarantine_skips
+            else ""
         )
-        if blank_quarantines or quarantine_skips:
-            verdict += (
-                f" The empty name then crossed the per-model incident threshold and was quarantined "
-                f"{len(blank_quarantines)} time(s), after which {len(quarantine_skips)} further job(s) were "
-                "refused against it. The quarantine set is holding an identity no job can ever satisfy and no "
-                "load can ever clear."
-            )
+        verdict = (
+            f"{len(empty_pops)} blank job offers made the worker load a nameless model {len(blank_preloads)} "
+            f"times, crash {len(blank_deaths)} image processes{blocked}."
+        )
         remediation = (
-            "Nothing about the models on this host is at fault: the worker accepted a malformed pop response "
-            "and spent the pool on it. Upgrade the worker; newer versions contain and fault these at the pop "
-            "boundary, handing the job straight back for reissue without preloading it, without ending a "
-            "slot, and without counting it against any model. Until then the pool churn and the poisoned "
-            "quarantine will recur for every such pop."
+            "Update the worker. Newer versions hand a blank offer straight back without loading anything or "
+            "crashing a process. Your models are not at fault."
         )
         severity = Severity.CRITICAL
         evidence = (
@@ -2551,25 +2508,10 @@ def detect_empty_model_pop_cascade(context: SessionContext) -> list[Finding]:
         evidence_lines = [_evidence(r) for r in evidence[0]] + [_evidence(r) for r in evidence[1]]
     else:
         verdict = (
-            f"{len(rejected)} malformed pop(s) carrying no model name were rejected at the pop boundary and "
-            "handed back for reissue, so the cascade is contained: nothing was preloaded and no slot was "
-            "spent on them."
+            f"{len(rejected)} job offers arrived with no model name and the worker handed each one back "
+            "without loading anything or losing a process."
         )
-        if refused_preloads:
-            verdict += (
-                f" A blank preload still reached a child {len(refused_preloads)} time(s), which refused it and "
-                "stayed available rather than ending."
-            )
-        if refused_incidents:
-            verdict += (
-                f" {len(refused_incidents)} incident(s) reported against the blank name were refused, keeping "
-                "it out of the quarantine set."
-            )
-        remediation = (
-            "No worker-side fix is needed; the containment is doing its job. The rate is the thing to watch: "
-            "each rejection is a job this worker was offered and could not serve, so a sustained rate is lost "
-            "throughput and is worth raising with the horde as malformed pop responses."
-        )
+        remediation = "Each refused offer is a job this worker could not serve, so watch the rate."
         severity = Severity.WARNING
         evidence_lines = [_evidence(r) for r in (rejected[:2] + refused_preloads[:1] + refused_incidents[:1])]
 
@@ -2625,17 +2567,9 @@ def detect_preload_kills_child_loop(context: SessionContext) -> list[Finding]:
             kind=FindingKind.PRELOAD_KILLS_CHILD_LOOP,
             severity=Severity.CRITICAL,
             headline=(
-                f"Loading {model} ended the inference child {len(deaths)} time(s) across slot(s) "
-                f"{_clause_join([str(slot) for slot in slots])}. The failing element is the model, not any one "
-                "slot: it is re-dispatched to a fresh slot each time, so no per-slot breaker sees a pattern "
-                "while the pool is rebuilt around it." + (f" Also seen for {_clause_join(others)}." if others else "")
-            ),
-            action_addendum=(
-                f"Take {model} out of the served model set and re-download it; a checkpoint that ends the "
-                "process during load is normally truncated or corrupt on disk, which a size or hash check "
-                "against the model reference will show. If the file verifies, the load path cannot host it on "
-                "this build and the model still has to come out of rotation until that is resolved. Each "
-                "attempt costs a child and the jobs that child was holding."
+                f'Loading "{model}" crashed an image process {len(deaths)} times across processes '
+                f"{_clause_join([str(slot) for slot in slots])}"
+                + (f', and "{_clause_join(others)}" did the same.' if others else ".")
             ),
             evidence=[_evidence(recovery.record) for recovery in deaths[:3]],
         ),

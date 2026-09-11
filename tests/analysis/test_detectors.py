@@ -1632,7 +1632,7 @@ class TestPostProcessingVramStall:
         findings = _diagnose(tmp_path, self._bridge(self._stall("16:53:42.000"), self._breaker("16:55:00.000")))
         finding = findings["post_processing_vram_stall"]
         assert finding.severity is Severity.CRITICAL
-        assert "breaker tripped" in finding.headline
+        assert "already off" in finding.action
 
     def test_breaker_only_still_fires(self, tmp_path: Path) -> None:
         """The detector fires on a breaker-only session (the planner-fault path leaves no stall line)."""
@@ -1658,8 +1658,8 @@ class TestPostProcessingVramStall:
         findings = _diagnose(tmp_path, bridge, {"bridge_1.log": child})
         finding = findings["post_processing_vram_stall"]
         assert finding.severity is Severity.INFO
-        assert "admitted co-residency" in finding.headline
-        assert "low-free-VRAM" in finding.headline
+        assert "nothing stalled" in finding.headline
+        assert "free VRAM was low" in finding.headline
 
     def test_wddm_paging_corroborates_warning(self, tmp_path: Path) -> None:
         """A WDDM demand-paging verdict in the window corroborates the overlap and keeps the warning."""
@@ -1767,7 +1767,7 @@ class TestPostProcessingVramStall:
         bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
         finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
         assert finding.severity is Severity.INFO
-        assert "2 child low-free-VRAM" in finding.headline
+        assert "low 2 times" in finding.headline
 
     def test_reserve_warning_is_alarming_and_counts(self, tmp_path: Path) -> None:
         """The below-inference-reserve streaming warning corroborates the overlap and keeps the warning."""
@@ -1782,7 +1782,7 @@ class TestPostProcessingVramStall:
         bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
         finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
         assert finding.severity is Severity.WARNING
-        assert "1 child low-free-VRAM" in finding.headline
+        assert "low 1 times" in finding.headline
 
     def test_silent_without_signals(self, tmp_path: Path) -> None:
         """A crash-on-start recovery is not a post-processing stall, so the detector stays silent."""
@@ -2028,10 +2028,10 @@ class TestEmptyModelPopCascade:
         )
         finding = findings["empty_model_pop_cascade"]
         assert finding.severity is Severity.CRITICAL
-        assert "2 pop(s)" in finding.headline
-        assert "2 child death(s)" in finding.headline
-        assert "quarantin" in finding.headline
-        assert "upgrade" in finding.action.lower()
+        assert "2 blank job offers" in finding.headline
+        assert "crash 2 image processes" in finding.headline
+        assert "block the blank name" in finding.headline
+        assert "update the worker" in finding.action.lower()
 
     def test_the_contained_form_is_reported_with_its_rate(self, tmp_path: Path) -> None:
         """On a newer capture the same input is rejected at the boundary, and only the rate matters."""
@@ -2045,8 +2045,8 @@ class TestEmptyModelPopCascade:
         )
         finding = findings["empty_model_pop_cascade"]
         assert finding.severity is Severity.WARNING
-        assert "contained" in finding.headline
-        assert "2 malformed pop(s)" in finding.headline
+        assert "handed each one back" in finding.headline
+        assert "2 job offers" in finding.headline
         assert "upgrade" not in finding.action.lower()
 
     def test_a_clean_session_does_not_fire(self, tmp_path: Path) -> None:

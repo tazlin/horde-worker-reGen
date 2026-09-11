@@ -154,58 +154,97 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     # --- Startup and process lifecycle ---
     FindingSpec(
         kind=FindingKind.CRASH_ON_START_LOOP,
-        title="Inference pool crashes on start",
+        title="Image processes crash on start",
+        detail=(
+            "The worker cannot serve jobs until its image processes start. Each process is started again "
+            "after a crash; after repeated crashes the worker stops using it, and when none are left it stops "
+            "itself. The error is lifted from the process's own start-up log, since the parent only sees the "
+            "exit code. When the error came from preparing the shared ComfyUI environment, the usual cause is "
+            "several processes cloning custom nodes into one directory at once. A clone cut off partway leaves "
+            "files no later start will overwrite."
+        ),
     ),
     FindingSpec(
         kind=FindingKind.PRELOAD_KILLS_CHILD_LOOP,
-        title="A model ends every slot it is loaded onto",
+        title="One model crashes every process that loads it",
+        action="Remove the model from your model list, then download it again before adding it back.",
+        detail=(
+            "A process that dies while loading a model is replaced, and the same model is sent to the new "
+            "one, so no single process shows a pattern. Grouping the deaths by model is what reveals it. A "
+            "file that fails a size or hash check against the model reference is corrupt on disk. One that "
+            "verifies cannot be loaded by this build, and has to stay out of rotation until that is resolved."
+        ),
         see_also=FindingKind.EMPTY_MODEL_POP_CASCADE,
     ),
     FindingSpec(
         kind=FindingKind.EMPTY_MODEL_POP_CASCADE,
-        title="Pops with no model name",
+        title="The horde sent jobs with no model name",
+        detail=(
+            "A job offer names the model to run. When the name is blank, a current worker refuses the job "
+            "and never loads a nameless model or counts the blank name against a real one. The rest of the "
+            "model list keeps serving. Each refused offer is still a job this worker could not serve."
+        ),
         see_also=FindingKind.PRELOAD_KILLS_CHILD_LOOP,
     ),
     FindingSpec(
         kind=FindingKind.DOOMED_POOL_NO_GIVEUP,
-        title="Recovery storm never gave up",
-        action=(
-            "Pair with the crash-on-start root cause: the pool cannot recover, so it should give up "
-            "fast. The give-up abort only fires when every slot is quarantined at the exact give-up "
-            "tick, but a soft reset's transient un-quarantine (and a clean window longer than the "
-            "recovery clean streak) keeps that from coinciding, so the worker spins. Make the abort "
-            "latch 'was fully quarantined this episode' rather than sampling the instantaneous state."
+        title="The worker kept restarting processes that could not recover",
+        action="Fix the crash named in the crash-on-start finding, then restart the worker.",
+        detail=(
+            "When every image process has crashed on start the worker is meant to stop itself so a "
+            "supervisor can restart it. Here it kept rebuilding the processes instead. The stop only fires "
+            "when every process is out of use at the same moment, and a rebuild briefly brings one back, so "
+            "the moment never came. Until that is changed in the worker, the crash itself is the fix."
         ),
         see_also=FindingKind.CRASH_ON_START_LOOP,
     ),
     FindingSpec(
         kind=FindingKind.GAVE_UP_CLEAN,
-        title="Worker gave up on an unrecoverable pool",
-        action="No worker action needed beyond fixing the underlying crash cause; the bail-out worked.",
+        title="The worker stopped itself after its processes could not be restored",
+        action="No action needed here. Fix the crash named in the crash-on-start finding.",
+        detail=(
+            "Stopping is the intended outcome when repeated rebuilds cannot restore a working image process: "
+            "a supervisor or service manager can then restart the worker once the cause is fixed. This is "
+            "not a hang."
+        ),
     ),
     FindingSpec(
         kind=FindingKind.STUCK_INFERENCE_STEP,
-        title="Inference wedged on a non-advancing step",
+        title="A job repeated one sampling step and never finished",
         action=(
-            "Recovery worked, but the hang is upstream in ComfyUI/hordelib. The usual trigger is a "
-            "corrupt or incompatible model+LoRA combination: e.g. an SD1.5 LoRA applied to an SDXL "
-            "checkpoint produces a `ERROR lora ... shape ... is invalid` storm and then the pipeline "
-            "hangs at the final step. Check the affected slot's bridge_<N>.log just before the reap for "
-            "that shape-mismatch storm and exclude the offending LoRA/model pairing. If healthy jobs are "
-            "being reaped, raise `inference_stuck_step_repeat_limit`."
+            "Check the process log just before the restart for a LoRA shape error, and stop pairing that "
+            "LoRA with that model. If healthy jobs are being restarted, raise `inference_stuck_step_repeat_limit`."
+        ),
+        detail=(
+            "The process kept reporting the same step, usually the last one, while still sending heartbeats, "
+            "so the silence timeout could not catch it. The stuck-step check restarted it on the repeat count "
+            "instead. The usual trigger is a LoRA built for one model family applied to another, such as an "
+            "SD1.5 LoRA on an SDXL model. The log then shows a burst of shape errors before the final step "
+            "hangs. Each occurrence lost the job in flight and held the process's VRAM until the restart."
         ),
     ),
     FindingSpec(
         kind=FindingKind.POST_PROCESSING_VRAM_STALL,
-        title="Post-processing stalled on an over-committed card",
+        title="Post-processing ran out of room on the card",
+        detail=(
+            "An upscale or face fix peaks after sampling, and that peak competes with the image models and "
+            "the other processes on the same card. When it does not fit, ComfyUI falls back to slower tiled "
+            "or streamed execution or stalls outright. A process can only free its own memory, so making room "
+            "is the worker's job. With the VRAM budget on, the post-processing peak is priced before it starts "
+            "and idle models are unloaded to fit it. The `post_processing_fault_breaker_enabled` breaker turns "
+            "post-processing off after repeated stalls, so the worker stops taking jobs it cannot finish, and "
+            "turns it back on when free memory recovers."
+        ),
         reference_page="docs/explanation/performance_and_backpressure.md",
     ),
     FindingSpec(
         kind=FindingKind.ORPHAN_WEDGE,
-        title="Orphaned in-progress jobs",
-        action=(
-            "Inspect the inference slots for hangs/OOM around these punts; a sustained storm should "
-            "escalate to a soft reset (pool rebuild)."
+        title="Jobs were dropped because their process disappeared",
+        action="Look at the process crash, hang or memory findings above this one and fix those first.",
+        detail=(
+            "A job in progress belongs to one image process. When that process is gone and nothing has "
+            "picked the job up, the worker drops it so the queue can move. A run of these means something "
+            "keeps taking processes out, most often a card that hangs on every job or runs out of memory."
         ),
     ),
     # --- Memory and residency ---

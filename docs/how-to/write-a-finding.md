@@ -33,6 +33,8 @@ The detail layer sits below, collapsed on the dashboard and printed in the CLI:
   the internal term is banned from the plain layer (the test carries the list).
 - Name a config key when the reader has to change it, in backticks, exactly as it appears in the
   config file: `queue_size`. Nothing else goes in backticks except a `horde-log` command.
+- Put text quoted from the log (an error name, a model name) in double quotes. Quoted text is data,
+  not your words, so the word rules do not apply inside it.
 - No brackets, semicolons, dashes as punctuation, or "e.g." in the plain layer. Start a new sentence.
 - Do not tell the reader what the code should do differently. That is a bug report, and it goes in an
   issue or a code comment, never in copy shown to an operator.

@@ -32,7 +32,16 @@ _MAX_WORDS_DETAIL = 30
 _MAX_SENTENCES_HEADLINE = 1
 _MAX_SENTENCES_ACTION = 3
 
-_NOT_YET_REWRITTEN: frozenset[FindingKind] = frozenset(FindingKind)
+_NOT_YET_REWRITTEN: frozenset[FindingKind] = frozenset(FindingKind) - {
+    FindingKind.CRASH_ON_START_LOOP,
+    FindingKind.PRELOAD_KILLS_CHILD_LOOP,
+    FindingKind.EMPTY_MODEL_POP_CASCADE,
+    FindingKind.DOOMED_POOL_NO_GIVEUP,
+    FindingKind.GAVE_UP_CLEAN,
+    FindingKind.STUCK_INFERENCE_STEP,
+    FindingKind.POST_PROCESSING_VRAM_STALL,
+    FindingKind.ORPHAN_WEDGE,
+}
 """Kinds still carrying the pre-guide copy. Remove a kind here in the change that rewrites it."""
 
 _BANNED_PLAIN_WORDS: tuple[str, ...] = (
@@ -119,6 +128,9 @@ _IDENTIFIER = re.compile(
     r"|\b[a-z_]+_<\w+>\.\w+\b"  # a file pattern such as bridge_<N>.log
 )
 _BACKTICKED = re.compile(r"`([^`]+)`")
+_QUOTED = re.compile(r'"[^"]*"')
+"""Text a detector quotes from the log (an exception name, a model name): data, not the writer's words, so
+it is exempt from the identifier, banned-word and punctuation rules. It still counts toward sentence length."""
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 _CONFIG_KEYS: frozenset[str] = frozenset(reGenBridgeData.model_fields)
@@ -130,7 +142,7 @@ def _sentences(text: str) -> list[str]:
 
 
 def _outside_backticks(text: str) -> str:
-    return _BACKTICKED.sub(" ", text)
+    return _QUOTED.sub(" quoted ", _BACKTICKED.sub(" ", text))
 
 
 def _problems(label: str, text: str, *, max_words: int, max_sentences: int | None, plain: bool) -> Iterator[str]:
@@ -161,8 +173,8 @@ def _spec_problems(kind: FindingKind) -> list[str]:
     problems = list(
         _problems("title", spec.title, max_words=_MAX_WORDS_PLAIN, max_sentences=_MAX_SENTENCES_HEADLINE, plain=True)
     )
-    if not spec.action:
-        problems.append("action: empty, say what to do or that no action is needed")
+    # An empty spec action is allowed where every emit words its own (the guide's measured-fix case); the
+    # emitted-copy test then requires the combined "Do this" line to be present.
     problems.extend(
         _problems(
             "action",
@@ -196,16 +208,17 @@ def _emit_problems(finding: Finding) -> list[str]:
                 plain=True,
             )
         )
-    if finding.action_addendum:
-        problems.extend(
-            _problems(
-                "action_addendum",
-                finding.action_addendum,
-                max_words=_MAX_WORDS_PLAIN,
-                max_sentences=_MAX_SENTENCES_ACTION,
-                plain=True,
-            )
+    if not finding.action:
+        problems.append("action: empty, say what to do or that no action is needed")
+    problems.extend(
+        _problems(
+            "action",
+            finding.action,
+            max_words=_MAX_WORDS_PLAIN,
+            max_sentences=_MAX_SENTENCES_ACTION,
+            plain=True,
         )
+    )
     return problems
 
 
@@ -247,6 +260,8 @@ def test_the_rules_catch_what_they_claim_to() -> None:
     """The checker itself: each rule fires on a one-line example and stays quiet on clean copy."""
     clean = "The worker stopped taking jobs for 4 minutes. Raise `queue_size` if this repeats."
     assert not list(_problems("x", clean, max_words=_MAX_WORDS_PLAIN, max_sentences=None, plain=True))
+    quoted = 'Loading "Flux.1-Schnell fp8 (Compact)" crashed with "RuntimeError: head_size mismatch".'
+    assert not list(_problems("x", quoted, max_words=_MAX_WORDS_PLAIN, max_sentences=None, plain=True))
     cases = {
         "internal term": "The head of the queue was parked.",
         "bare identifier": "Set max_batch lower.",

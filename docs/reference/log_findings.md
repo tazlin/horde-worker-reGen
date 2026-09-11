@@ -31,14 +31,14 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 
 | Id | Severity | Fires when | Remedy |
 |----|----------|------------|--------|
-| `crash_on_start_loop` | critical | Inference children crash before reaching readiness, repeatedly. The child's own exception is lifted across the process boundary from its startup log. | Fix what the named exception says. A git clone/checkout failure points at the shared ComfyUI environment directory, not at torch. |
-| `preload_kills_child_loop` | critical | One model ends every slot it is loaded onto: repeated load-failure recoveries naming the same model. | Remove that model from the offered set (or repair its weights) rather than raising timeouts. |
-| `empty_model_pop_cascade` | varies | Pops arrive with no model name, and the blank name propagates into preloads and slot quarantines. | An upstream reference/pop problem; check the model reference and the offered model list. |
-| `doomed_pool_no_giveup` | critical | The recovery ladder flapped through soft resets and quarantines without ever abandoning ship. | The pool cannot be restored; the worker should exit so something restarts it. Fix the underlying crash. |
-| `gave_up_clean` | info | The worker abandoned an unrecoverable pool deliberately. The healthy end of the ladder, recorded so it is not mistaken for a crash. | Nothing; find the cause in the crash finding above it. |
-| `stuck_inference_step` | warning | The stuck-step watchdog reaped a lane reporting the same sampling step without advancing. | Usually a driver/ComfyUI wedge on that card; check for VRAM overcommit and driver state. |
-| `post_processing_vram_stall` | varies | The post-processing lane was reaped mid-stage, or ran co-resident with sampling on an over-committed card. | Give post-processing its own headroom, or move the lane off the contended card. |
-| `orphan_wedge` | warning | The orphaned-job watchdog punted in-progress jobs that had no live inference slot. | A downstream symptom of slot loss; take the process-lifecycle finding above it first. |
+| `crash_on_start_loop` | critical | Image processes crash before they are ready, repeatedly. The error is lifted from the process's own start-up log. | Fix the error it names. A git clone failure points at the shared ComfyUI environment directory, not at torch: delete that directory and let one process rebuild it. |
+| `preload_kills_child_loop` | critical | One model crashes every process that loads it: repeated process deaths naming the same model. | Remove the model from your list and download it again before adding it back. |
+| `empty_model_pop_cascade` | varies | The horde sent job offers with no model name. On an old worker the blank name was loaded, crashed processes and got blocked; a current worker hands the offer back. | Update the worker. If it keeps happening, report it to the horde; your models are not at fault. |
+| `doomed_pool_no_giveup` | critical | The worker kept rebuilding processes that could not recover instead of stopping itself. | Fix the crash the crash-on-start finding names, then restart the worker. |
+| `gave_up_clean` | info | The worker stopped itself after its processes could not be restored. The intended outcome, recorded so it is not mistaken for a crash. | Nothing here; fix the crash the crash-on-start finding names. |
+| `stuck_inference_step` | warning | An image process repeated one sampling step without finishing and was restarted. | Check the process log before the restart for a LoRA shape error and stop pairing that LoRA with that model. |
+| `post_processing_vram_stall` | varies | Post-processing ran out of room on the card: it stalled, or it shared the card with sampling and nothing stalled (info). | Turn on the VRAM budget; as a stopgap lower `max_threads` or `queue_size`, or turn off post-processing on this card. |
+| `orphan_wedge` | warning | Jobs were dropped because the process running each one had disappeared. | A symptom of process loss; fix the crash, hang or memory finding above it first. |
 
 ## Memory and residency
 
