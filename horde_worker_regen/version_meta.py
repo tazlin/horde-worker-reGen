@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import time
+from pathlib import Path
 
 import semver
 from loguru import logger
@@ -35,8 +36,12 @@ class VersionMeta(BaseModel):
 
 
 def get_local_version_meta() -> VersionMeta:
-    """Get the local _version_meta.json file as a `VersionMeta` object."""
-    with open("horde_worker_regen/_version_meta.json") as f:
+    """Get the local _version_meta.json file as a `VersionMeta` object.
+
+    The file ships beside this module, so it is found by the package's own location rather than by a path
+    relative to whatever directory the worker was launched from.
+    """
+    with open(Path(__file__).with_name("_version_meta.json")) as f:
         data = json.load(f)
         return VersionMeta(**data)
 

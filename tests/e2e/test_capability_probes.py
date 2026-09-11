@@ -25,10 +25,18 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.slow
 
 
+_COLD_PROBE: CapabilityProbe = LIGHT_PROBES[0]
+"""The one probe run on a cold worker here.
+
+Every light probe is proven on one warm worker by ``test_capability_warm_reuse``; booting a cold worker
+per probe as well proved the same verdicts at a fleet spawn each. What only a cold run covers is the
+cold path itself (``HarnessConfig.from_scenario`` through a fresh boot), and one probe exercises it."""
+
+
 @pytest.mark.e2e
-@pytest.mark.parametrize("probe", LIGHT_PROBES, ids=lambda probe: probe.capability.slug)
+@pytest.mark.parametrize("probe", [_COLD_PROBE], ids=lambda probe: probe.capability.slug)
 async def test_capability_probe_fake(probe: CapabilityProbe, record_probe_timing: Callable[[str, str], None]) -> None:
-    """Every light probe is PROVEN in fake mode (the synthetic worker completes its jobs cleanly)."""
+    """A light probe is PROVEN on a cold fake-mode worker (the synthetic worker completes its jobs cleanly)."""
     result = await run_capability_probe_async(probe, process_mode="fake")
     if result.timing is not None:
         record_probe_timing(probe.capability.slug, result.timing.summary())

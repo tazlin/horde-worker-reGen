@@ -47,7 +47,10 @@ def test_quiet_console_removes_default_stderr_handler(monkeypatch: pytest.Monkey
             logger.remove(default_id)
     finally:
         logger.remove(sink_id)
-        logger.add(sys.stderr)
+        # Restore a console sink on the real stream, not on ``sys.stderr``: under pytest that name is the
+        # capture buffer, which is closed when this test ends, and a sink left on it makes every later log
+        # write in the process raise "I/O operation on closed file".
+        logger.add(sys.__stderr__)
 
 
 def test_failure_is_swallowed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

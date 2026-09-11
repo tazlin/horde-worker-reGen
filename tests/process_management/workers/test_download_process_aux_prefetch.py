@@ -165,7 +165,7 @@ def _make_process(
     fake_api = types.ModuleType("hordelib.api")
     fake_api.SharedModelManager = SimpleNamespace(manager=fake_manager)  # type: ignore[attr-defined]
     hordelib_stub = sys.modules.get("hordelib") or types.ModuleType("hordelib")
-    hordelib_stub.api = fake_api  # type: ignore[attr-defined]
+    monkeypatch.setattr(hordelib_stub, "api", fake_api, raising=False)
     monkeypatch.setitem(sys.modules, "hordelib", hordelib_stub)
     monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
 

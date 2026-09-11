@@ -15,6 +15,9 @@ from horde_worker_regen.bridge_data.data_model import (
 )
 from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, ConfigFormat
 
+_TEMPLATE = pathlib.Path(__file__).resolve().parents[1] / "bridgeData_template.yaml"
+"""The committed template, anchored on the repo rather than the working directory a test runs under."""
+
 
 class TestLeaseResidencyWarning:
     """The lease only helps under residency, so enabling it with frequent unloads must be detected."""
@@ -52,7 +55,7 @@ class TestLeaseResidencyWarning:
     def test_validator_exercises_warning_path(self) -> None:
         """A lease-on, residency-off config still validates (the validator's warning path runs)."""
         yaml = YAML(typ="safe")
-        with open("bridgeData_template.yaml", encoding="utf-8") as f:
+        with open(str(_TEMPLATE), encoding="utf-8") as f:
             raw = yaml.load(f)
         raw["gpu_sampling_lease_enabled"] = True
         raw["unload_models_from_vram_often"] = True
@@ -115,7 +118,7 @@ class TestLeaseSlotsBelowThreadsWarning:
 def test_bridge_data_yaml() -> None:
     """Test that the bridge data template file can be loaded and parsed as YAML."""
     # bridge_data_filename = "bridgeData.yaml"
-    bridge_data_filename = "bridgeData_template.yaml"
+    bridge_data_filename = str(_TEMPLATE)
     bridge_data_raw: dict[str, JsonValue] | None = None
 
     yaml = YAML(typ="safe")
@@ -149,7 +152,7 @@ def test_ram_safety_defaults() -> None:
 def test_template_matches_ram_safety_defaults() -> None:
     """The shipped template must carry the same RAM-safety defaults as the model (no silent drift)."""
     yaml = YAML(typ="safe")
-    with open("bridgeData_template.yaml", encoding="utf-8") as f:
+    with open(str(_TEMPLATE), encoding="utf-8") as f:
         raw = yaml.load(f)
     parsed = reGenBridgeData.model_validate(raw)
     assert parsed.ram_pressure_pause_percent == 85.0
@@ -172,7 +175,7 @@ def test_bridge_data_loader_yaml_template() -> None:
     bridge_data_loader = BridgeDataLoader()
 
     bridge_data = bridge_data_loader.load(
-        file_path="bridgeData_template.yaml",
+        file_path=str(_TEMPLATE),
         file_format=ConfigFormat.yaml,
     )
 

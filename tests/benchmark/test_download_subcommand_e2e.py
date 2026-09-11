@@ -7,6 +7,7 @@ checks the emitted event sequence. Also covers the stdin control channel and the
 
 from __future__ import annotations
 
+import importlib
 import io
 import sys
 import time
@@ -63,9 +64,11 @@ def _inject_fake_hordelib(monkeypatch: pytest.MonkeyPatch, compvis: RealDownload
         manager=SimpleNamespace(compvis=compvis),
     )
     hordelib_stub = sys.modules.get("hordelib") or types.ModuleType("hordelib")
-    hordelib_stub.api = fake_api  # type: ignore[attr-defined]
+    monkeypatch.setattr(hordelib_stub, "api", fake_api, raising=False)
     monkeypatch.setitem(sys.modules, "hordelib", hordelib_stub)
     monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+    # The package attribute is not restored by setitem; patch it too so the fake cannot outlive the test.
+    monkeypatch.setattr(importlib.import_module("hordelib"), "api", fake_api, raising=False)
 
 
 def test_download_subcommand_fetches_and_emits_event_sequence(

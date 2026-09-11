@@ -1440,7 +1440,9 @@ async def _watch_for_scenario_completion(
                 manager._abort()
                 return True
 
-        jobs_accounted_for = manager._job_tracker.total_num_completed_jobs + manager._job_tracker.num_jobs_faulted
+        # The completed total already includes terminal faults, so it is the accounted-for count on its own;
+        # adding the fault count again ended runs one job early whenever a fault landed before the last pop.
+        jobs_accounted_for = manager._job_tracker.total_num_completed_jobs
         coordinator = manager._alchemy_coordinator
         forms_accounted_for = coordinator.num_canned_forms_completed + coordinator.num_canned_forms_faulted
 
@@ -1873,7 +1875,11 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         if timeline_path:
             gpu_sampler.dump_timeline(timeline_path)
 
-    num_jobs_completed = manager._job_tracker.total_num_completed_jobs
+    # The tracker's completed total counts every job that reached a terminal state, faulted ones included
+    # (a terminal fault raises both counters), so the result's "completed" is that total less the faults;
+    # adding the two would count each fault twice.
+    num_jobs_faulted = manager._job_tracker.num_jobs_faulted
+    num_jobs_completed = max(0, manager._job_tracker.total_num_completed_jobs - num_jobs_faulted)
     num_forms_completed = manager._alchemy_coordinator.num_canned_forms_completed
 
     # A soak generates an open-ended amount of work, so "expected" is whatever it completed;
@@ -1882,7 +1888,6 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_jobs_expected = num_jobs_completed
         num_forms_expected = num_forms_completed
 
-    num_jobs_faulted = manager._job_tracker.num_jobs_faulted
     # The tracker counts a fault only on the submit path, which a dry run never takes, so a job that sampled
     # and faulted at the post-processing lane reads as completed there while its stats record says faulted.
     # The exported records are what a reader of the run will see; the finish line reports the same partition.
@@ -1954,8 +1959,7 @@ def _determine_exit_reason(
         return f"exception: {type(exception_raised).__name__}: {exception_raised}"
     if timed_out:
         return "timed_out"
-    jobs_accounted = manager._job_tracker.total_num_completed_jobs + manager._job_tracker.num_jobs_faulted
-    if jobs_accounted >= num_jobs_expected:
+    if manager._job_tracker.total_num_completed_jobs >= num_jobs_expected:
         return "completed"
     if manager._state.recovery_parked:
         # Reported ahead of the shutdown reason: the park is why the run ended, and the shutdown is how.
@@ -2468,13 +2472,14 @@ class WarmHarnessSession:
         dead_since: float | None = None
         while True:
             await asyncio.sleep(0.1)
-            completed = manager._job_tracker.total_num_completed_jobs - base_completed
-            faulted = manager._job_tracker.num_jobs_faulted - base_faulted
+            # The completed total already includes terminal faults; adding the fault delta would count each
+            # fault twice and end the level one job early.
+            terminal = manager._job_tracker.total_num_completed_jobs - base_completed
             forms_done = (
                 manager._alchemy_coordinator.num_canned_forms_completed
                 + manager._alchemy_coordinator.num_canned_forms_faulted
             )
-            if (completed + faulted) >= num_jobs_expected and forms_done >= num_forms_expected:
+            if terminal >= num_jobs_expected and forms_done >= num_forms_expected:
                 return True
             if time.time() - time_started > timeout_seconds:
                 return False

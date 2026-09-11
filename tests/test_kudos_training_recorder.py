@@ -2,8 +2,6 @@
 
 import json
 import os
-import tempfile
-from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, Mock
@@ -18,10 +16,14 @@ from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRe
 
 
 @pytest.fixture
-def temp_dir() -> Iterator[str]:
-    """Create a temporary directory for testing."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield tmpdir
+def temp_dir(tmp_path: Path) -> str:
+    """A temporary directory for testing.
+
+    pytest's ``tmp_path`` rather than ``tempfile.TemporaryDirectory``: the tests change into the directory,
+    and on Windows a directory that is still the working directory when its context manager tries to
+    remove it raises at teardown. ``tmp_path`` is cleaned up later, outside the test.
+    """
+    return str(tmp_path)
 
 
 @pytest.fixture

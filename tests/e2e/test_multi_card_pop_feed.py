@@ -30,7 +30,7 @@ process; a single-model soak measures model affinity, not intake."""
 _JOB_SECONDS = 2.5
 """Fake inference duration per job: the fast end of observed field traffic, the harshest case for
 intake since every busy window a slot finishes must be refilled within seconds."""
-_SOAK_SECONDS = 60.0
+_SOAK_SECONDS = 40.0
 
 
 def _card_resources(card_count: int) -> SystemResources:

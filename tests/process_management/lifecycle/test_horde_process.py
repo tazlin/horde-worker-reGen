@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import importlib
 import multiprocessing
 import queue
 import sys
@@ -213,6 +214,8 @@ def _install_fake_hordelib_api(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_hordelib.__dict__["api"] = fake_api
     monkeypatch.setitem(sys.modules, "hordelib", fake_hordelib)
     monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+    # The package attribute is not restored by setitem; patch it too so the fake cannot outlive the test.
+    monkeypatch.setattr(importlib.import_module("hordelib"), "api", fake_api, raising=False)
 
 
 def _make_inference_proc_for_progress() -> HordeInferenceProcess:

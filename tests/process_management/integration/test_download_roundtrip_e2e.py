@@ -17,6 +17,7 @@ network beyond loopback.
 
 from __future__ import annotations
 
+import importlib
 import sys
 import types
 from pathlib import Path
@@ -130,6 +131,8 @@ def _make_download_process(
     monkeypatch.setattr(hordelib_stub, "api", fake_api, raising=False)
     monkeypatch.setitem(sys.modules, "hordelib", hordelib_stub)
     monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+    # The package attribute is not restored by setitem; patch it too so the fake cannot outlive the test.
+    monkeypatch.setattr(importlib.import_module("hordelib"), "api", fake_api, raising=False)
 
     ctx = mp.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe()

@@ -57,7 +57,9 @@ async def test_fault_injection_keeps_pipeline_flowing() -> None:
             skip_api=True,
             timeout_seconds=90.0,
             fail_every_n=3,
-            bridge_data_overrides={"max_inference_attempts": 1},
+            # One inference process: the fake counts the jobs it has started per child, so the third and
+            # sixth job fault only when every job runs on the same child.
+            bridge_data_overrides={"max_inference_attempts": 1, "max_threads": 1, "queue_size": 0},
         ),
     )
 

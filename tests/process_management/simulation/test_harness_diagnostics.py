@@ -111,13 +111,13 @@ class TestCleanupStaleAbortFile:
         assert not abort_file.exists()
 
     def test_noop_when_os_remove_raises(self, tmp_path: Path) -> None:
-        """If os.remove fails the exception should propagate so the caller knows cleanup couldn't proceed."""
+        """If the unlink fails the exception should propagate so the caller knows cleanup couldn't proceed."""
         abort_file = tmp_path / ".abort"
         abort_file.write_text("")
 
         with (
             patch("os.getcwd", return_value=str(tmp_path)),
-            patch("os.remove", side_effect=PermissionError("access denied")),
+            patch("pathlib.Path.unlink", side_effect=PermissionError("access denied")),
             pytest.raises(PermissionError),
         ):
             _cleanup_stale_abort_file()

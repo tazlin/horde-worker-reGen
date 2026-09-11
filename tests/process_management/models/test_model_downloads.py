@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import queue
 import subprocess
 import sys
@@ -1076,6 +1077,8 @@ class TestFirstClassAnnotators:
         fake_api = types.ModuleType("hordelib.api")
         fake_api.SharedModelManager = SimpleNamespace(manager=manager)  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+        # The package attribute is not restored by setitem; patch it too so the fake cannot outlive the test.
+        monkeypatch.setattr(importlib.import_module("hordelib"), "api", fake_api, raising=False)
         return manager
 
     def test_missing_annotators_enqueue_per_file_aux_tasks_not_the_opaque_preload(
@@ -1443,6 +1446,8 @@ class TestDownloadProcessConcurrencyFixes:
         fake_api = types.ModuleType("hordelib.api")
         fake_api.SharedModelManager = SimpleNamespace(manager=manager)  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+        # The package attribute is not restored by setitem; patch it too so the fake cannot outlive the test.
+        monkeypatch.setattr(importlib.import_module("hordelib"), "api", fake_api, raising=False)
 
     def test_distinct_models_on_same_manager_download_in_parallel(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Independent AUX files on one manager use the available host-level parallelism."""

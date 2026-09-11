@@ -29,13 +29,15 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import S
 # Real OS child processes and a minute of simulated load: opt-in via -m slow, like the other e2e sims.
 pytestmark = pytest.mark.slow
 
-_SPINE_SECONDS = 60.0
+_SPINE_SECONDS = 20.0
 """How long the measured run generates work for.
 
-Long enough that the expected sample count is a real floor rather than a rounding artefact, and that the
-duty analyzer has adjacent samples to difference on both sides of several completed jobs."""
+Long enough that the expected sample count is a real floor rather than a rounding artefact (a per-second
+cadence over this window, halved by the slack below, still leaves a two-digit floor), and that the duty
+analyzer has adjacent samples to difference on both sides of several completed jobs; the fake jobs take
+milliseconds, so dozens complete inside it."""
 
-_NEGATIVE_CONTROL_SECONDS = 20.0
+_NEGATIVE_CONTROL_SECONDS = 10.0
 """How long the reinjected-defect run generates work for; it only has to establish an absence."""
 
 _SAMPLE_FLOOR_INTERVAL_SECONDS = 1.0

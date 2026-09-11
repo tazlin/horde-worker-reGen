@@ -80,8 +80,12 @@ cycle rather than only when a kill happens to interrupt a small atomic write."""
 _TICK_DEADLINE_SECONDS = 1.5
 """How long a single drain tick may take before it counts as unbounded (the control loop wedged)."""
 
-_SURVIVOR_DEADLINE_SECONDS = 5.0
-"""How long the parent is allowed to drain the surviving writer's message before it counts unreachable."""
+_SURVIVOR_DEADLINE_SECONDS = 20.0
+"""How long the parent is allowed to drain the surviving writer's message before it counts unreachable.
+
+The property is eventual delivery, not latency: a wedged queue never delivers, a healthy one delivers in
+well under a second alone. The allowance is sized for a parallel band, where several workers spawn their
+own children at once and a fresh interpreter can take seconds to reach its first write."""
 
 _CAMPAIGN_CYCLES = 4
 """Fresh kill cycles per campaign. Each cycle is independent (its own queue and writers). With the frame
