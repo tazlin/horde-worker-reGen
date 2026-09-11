@@ -25,7 +25,10 @@ from horde_worker_regen.process_management.resources.device_info import TorchDev
 from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
 
 # Real OS child processes and multi-second sampling windows: opt-in via -m slow, like the other e2e sims.
-pytestmark = pytest.mark.slow
+# Timing-sensitive under CPU contention (a streak asserts one sample stage per job, and a decode drain that
+# runs long under load reroutes a job monolithically), so the rows share one xdist worker under
+# --dist loadgroup rather than running beside each other.
+pytestmark = [pytest.mark.slow, pytest.mark.xdist_group("serial_timing")]
 
 _MODELS = ("Deliberate", "Anything Diffusion")
 _NUM_JOBS = 12

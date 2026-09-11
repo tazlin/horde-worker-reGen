@@ -22,7 +22,9 @@ from horde_worker_regen.process_management.process_manager import SystemResource
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.simulation._canned_scenarios import SoakImageTemplate
 
-pytestmark = [pytest.mark.slow, pytest.mark.e2e]
+# The measured concurrency is a wall-clock figure, so these rows share one xdist worker under
+# --dist loadgroup rather than competing with each other for the CPU.
+pytestmark = [pytest.mark.slow, pytest.mark.e2e, pytest.mark.xdist_group("serial_timing")]
 
 _MODELS = ["Deliberate", "Anything Diffusion", "Anything v5", "AbsoluteReality", "Abyss OrangeMix", "Dreamshaper"]
 """Several small models, so dispatch can spread across cards instead of pinning to one resident
