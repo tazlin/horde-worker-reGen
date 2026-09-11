@@ -166,16 +166,16 @@ class TestMultiCardDispatchSerialization:
         finding = diagnose(tmp_path, _multi_card_session())["multi_card_dispatch_serialization"]
         assert finding.severity is Severity.CRITICAL
         assert "8 cards" in finding.headline
-        assert "2.0 of them" in finding.headline
+        assert "Only 2.0 of the 8 cards" in finding.headline
         # The census, not a guess, is what makes this a scheduling verdict.
         joined = " ".join(finding.evidence)
         assert "sampling concurrency" in joined
         assert "resident on an idle lane on an unoccupied card" in joined
         # The head's model is resident on the lane that is sampling it, so the queue is blocked behind
         # work the rest of the fleet had the capacity to run.
-        assert "had the head's model already resident but every holder's card busy" in finding.headline
-        assert "100%" in finding.headline
-        assert "parent loop was healthy" in finding.headline
+        assert "had the head's model already resident but every holder's card busy" in " ".join(finding.evidence)
+        assert "100%" in " ".join(finding.evidence)
+        assert "parent loop was healthy" in " ".join(finding.evidence)
 
     def test_silent_on_a_single_card_worker(self, tmp_path: Path) -> None:
         """A single-card worker emits no 'Driving N cards' line, and one busy card is not a shortfall."""
@@ -296,7 +296,7 @@ class TestLanePlacement:
                 post_process_lane_started(_stamp(0), process=1, device=0),
             ),
         )["lane_placement"]
-        assert "alongside the safety lane" in finding.headline
+        assert "beside the safety check" in finding.headline
 
     def test_quotes_the_workers_own_sharing_notice_when_the_session_carries_one(self, tmp_path: Path) -> None:
         """The edge-triggered INFO dates the sharing to a safety restore, which the occupancy map cannot."""
@@ -410,14 +410,14 @@ class TestSafetyStageCapacity:
         assert finding.severity is Severity.CRITICAL
         assert "8 cards" in finding.headline
         # Demand, capacity and the wait are all named, each from the session's own numbers.
-        assert "0.50 job(s) per second" in finding.headline
-        assert "0.83 per second" in finding.headline
-        assert "1.20s per check" in finding.headline
-        assert "costs more wall clock than the GPUs do" in finding.headline
+        assert "0.50 jobs a second" in finding.headline
+        assert "handles 0.83" in finding.headline
+        assert "median 1.20s" in " ".join(finding.evidence)
+        assert "longer than the median" in " ".join(finding.evidence)
         joined = " ".join(finding.evidence)
         assert "finished->safety wait" in joined
         assert "safety_on_gpu" in finding.action
-        assert "max_power will not help" in finding.action
+        assert "`max_power` or `queue_size` will not help" in finding.action
 
     def test_silent_when_the_wait_is_about_one_check(self, tmp_path: Path) -> None:
         """A checker keeping up costs each job one check duration; that is the stage working, not queuing."""
@@ -463,8 +463,8 @@ class TestParentLoopStall:
         """Two minutes with no drained message, against a 20s status cadence, is a stalled loop."""
         finding = diagnose(tmp_path, self._session(gap_at=200.0))["parent_loop_stall"]
         assert finding.severity is Severity.CRITICAL
-        assert "drained no child messages" in finding.headline
-        assert "status cadence" in finding.headline
+        assert "stopped reading its workers" in finding.headline
+        assert "status cadence" in " ".join(finding.evidence)
 
     def test_silent_on_a_healthy_loop(self, tmp_path: Path) -> None:
         """A loop that keeps draining produces no finding; findings are for problems."""

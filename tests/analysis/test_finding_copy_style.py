@@ -53,6 +53,15 @@ _NOT_YET_REWRITTEN: frozenset[FindingKind] = frozenset(FindingKind) - {
     FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
     FindingKind.WHOLE_CARD_POP_CLAIM_MONOPOLY,
     FindingKind.MODEL_CHURN,
+    FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
+    FindingKind.HEAD_DISPATCH_STALL,
+    FindingKind.SLOW_GENERATION_DROP_SPIRAL,
+    FindingKind.POST_PROCESSING_DEFERRAL_STARVATION,
+    FindingKind.SAFETY_STAGE_STALL,
+    FindingKind.SAFETY_STAGE_CAPACITY,
+    FindingKind.POP_LIVENESS_FULL_QUEUE,
+    FindingKind.PARENT_LOOP_STALL,
+    FindingKind.LANE_PLACEMENT,
 }
 """Kinds still carrying the pre-guide copy. Remove a kind here in the change that rewrites it."""
 

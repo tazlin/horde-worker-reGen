@@ -427,75 +427,118 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     # --- Dispatch and throughput ---
     FindingSpec(
         kind=FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
-        title="Dispatch is not spreading across the cards",
+        title="Work is not spreading across the cards",
+        action=(
+            "Run `horde-log jobs` for the per-job split and the busy-cards histogram, then report it with the "
+            "log. Lowering `max_power` or `queue_size` only shrinks the queue, it does not spread it."
+        ),
+        detail=(
+            "Jobs were waiting with their model already loaded on an idle process, while that process's card "
+            "ran nothing. The loss is queue wait, not GPU speed. What serialises work across cards is the "
+            "scheduler, not per-card settings. The usual causes are an ordering that will not start a job "
+            "behind the next one on a free card, a whole-card reservation, or a per-card lease."
+        ),
         see_also=FindingKind.MODEL_CHURN,
     ),
     FindingSpec(
         kind=FindingKind.HEAD_DISPATCH_STALL,
-        title="Head-of-queue job repeatedly parked",
+        title="The next job kept being held back",
+        detail=(
+            "The scheduler names the rule that held the next job each time: a concurrency cap, an overlap "
+            "wait, or a load the VRAM budget put off. Sustained, that starves throughput even though nothing "
+            "is stuck. A hold with no rule named is different: the model was loaded on an idle process and "
+            "nothing was in the way, so the scheduler itself is at fault."
+        ),
     ),
     FindingSpec(
         kind=FindingKind.SLOW_GENERATION_DROP_SPIRAL,
-        title="Slow generation is dropping jobs",
+        title="Jobs took too long and were dropped",
+        detail=(
+            "The horde gives each job a deadline. A job that misses it is dropped and counted against the "
+            "worker, and enough drops put the worker into maintenance. Where the time went matters. Waiting "
+            "to start is a scheduling problem, and generation itself is a settings problem. Waiting after "
+            "generation means a stage behind inference, usually the safety check, cannot keep up. The worker "
+            "stops taking new jobs while the safety backlog cannot clear within the deadline, which bounds it."
+        ),
         see_also=FindingKind.FORCED_MAINTENANCE,
     ),
     FindingSpec(
         kind=FindingKind.POST_PROCESSING_DEFERRAL_STARVATION,
-        title="Post-processing lane starved by its admission gate",
+        title="Post-processing waited for room that never came",
         action=(
-            "Verify the admission inputs: device-free VRAM must reflect the lane's card, reservations must "
-            "include only memory not yet materialized in that measurement, the proportional noise margin "
-            "must be applied once, and the per-chain marginal candidate must match measured operation "
-            "costs. A deferred drain head should spend ordinary idle cache/model reclaim first, then may "
-            "temporarily borrow only a verified-idle service-lane context. It must still age out to a "
-            "no-image fault after a bounded wait, and fittable jobs behind it must be allowed to pass. As a "
-            "stopgap, lower resident VRAM on the lane's card or disable post-processing on this worker."
+            "Report it with the log around the wait. As a stopgap, serve fewer models on that card or turn off "
+            "post-processing on this worker."
+        ),
+        detail=(
+            "Post-processing runs on its own process and asks for room on the card before each chain. Here the "
+            "answer stayed no for far longer than any chain could need. Either the room arithmetic was wrong "
+            "for that card, or the job should have been given up on and let the ones behind it pass, and "
+            "neither happened."
         ),
         see_also=FindingKind.POST_PROCESSING_VRAM_STALL,
         reference_page="docs/explanation/process_lanes_and_chaining.md",
     ),
     FindingSpec(
         kind=FindingKind.SAFETY_STAGE_STALL,
-        title="Safety stage stalled (lost verdicts / backlog)",
+        title="The safety check fell behind or lost results",
+        detail=(
+            "Every finished image goes through one safety process before it is sent back. When that process "
+            "loses a result or stops answering, finished work piles up behind it; when the pile is deep enough "
+            "the jobs pass their deadline and are dropped."
+        ),
     ),
     FindingSpec(
         kind=FindingKind.SAFETY_STAGE_CAPACITY,
-        title="One safety process behind more finishes than it can check",
+        title="One safety process cannot keep up with the cards",
         action=(
-            "Safety is one process for the whole worker, so its throughput is fixed while the fleet's "
-            "finish rate scales with the cards. Give it more capacity: enable safety_on_gpu so a check "
-            "costs a fraction of its CPU time, and raise the number of safety processes if the build "
-            "supports it. Lowering max_power will not help, and neither will lowering queue_size: both "
-            "shrink the work, not the per-check cost, and a slower fleet still hands every image to the "
-            "same single checker."
+            "Turn on `safety_on_gpu` so a check takes a fraction of the time. Lowering `max_power` or "
+            "`queue_size` will not help: every image still goes through the same single checker."
+        ),
+        detail=(
+            "Safety is one process for the whole worker, so its rate is fixed while the cards' finish rate "
+            "grows with every card added. Results queue in front of it, and the wait between an image "
+            "finishing and its safety result grows with the gap."
         ),
         see_also=FindingKind.SAFETY_STAGE_STALL,
         reference_page="docs/explanation/process_lanes_and_chaining.md",
     ),
     FindingSpec(
         kind=FindingKind.POP_LIVENESS_FULL_QUEUE,
-        title="Local job queue full and not draining (the worker served nothing)",
+        title="The queue was full and nothing was moving",
+        detail=(
+            "The worker holds a short queue of accepted jobs and asks the horde for more only when it has "
+            "room. A full queue with nothing starting and nothing finishing is a stall, not the worker "
+            "pacing itself. The log names what the next job was waiting for where the scheduler knows."
+        ),
         see_also=FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
     ),
     FindingSpec(
         kind=FindingKind.PARENT_LOOP_STALL,
-        title="The parent loop stopped draining IPC",
+        title="The main process stopped listening to its workers",
         action=(
-            "Find what blocked the loop rather than what it failed to do: a synchronous call on the "
-            "asyncio thread (a model-reference read, a disk scan, a network call without a timeout) is "
-            "the usual cause. The timestamps below bound each gap; `horde-log timeline` over that "
-            "window shows what the parent was doing immediately before it went quiet."
+            "Run `horde-log timeline` over the gap to see what the main process was doing just before it went "
+            "quiet, then report it."
+        ),
+        detail=(
+            "The main process reads messages from every worker process on one loop. A slow call on that "
+            "loop blocks everything behind it, so nothing is started, finished or sent back until it returns. "
+            "The usual culprits are a model reference read, a disk scan or a network call without a timeout. "
+            "The gaps below are bounded by the timestamps around them."
         ),
         see_also=FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
     ),
     FindingSpec(
         kind=FindingKind.LANE_PLACEMENT,
-        title="Auxiliary lanes moved or stacked onto one card",
+        title="Helper processes moved to a different card",
         action=(
-            "Compare the per-card duty and free-VRAM readings for the card(s) named above against the "
-            "rest of the fleet before reading a low duty there as a GPU problem. If the placement was "
-            "not intended, pin the auxiliary lanes (safety_on_gpu and the post-processing/utilities "
-            "device selection) so a re-spawn returns them to the card they were sized for."
+            "Compare that card's duty and free VRAM with the rest before reading its low duty as a GPU "
+            "problem. If the move was not intended, set `safety_on_gpu` and the post-processing card so a "
+            "restart puts them back."
+        ),
+        detail=(
+            "The safety, post-processing and utilities processes are placed on a card when they start. A "
+            "restart can land one on a different card, or stack several on one, and that card's spare "
+            "memory and duty change with them."
         ),
         see_also=FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
     ),

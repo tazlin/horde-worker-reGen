@@ -405,10 +405,10 @@ class TestSlowGenerationDropSpiral:
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
-        assert "3 generation(s)" in finding.headline
+        assert "dropped 3 jobs" in finding.headline
         # It corroborates with the worst slowdown ratio and the lowest free VRAM (the over-commit signature).
         assert "4.1x" in finding.headline
-        assert "5378 MB" in finding.headline
+        assert "5378 MB" in " ".join(finding.evidence)
 
     def test_three_aborts_without_maintenance_is_critical(self, tmp_path: Path) -> None:
         """A spiral is defined by a sustained abort run; it is critical even before maintenance lands."""
@@ -468,11 +468,11 @@ class TestSlowGenerationDropSpiral:
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
-        assert "aged in the post-inference queue" in finding.headline
-        assert "inference-finished->submit" in finding.headline
+        assert "waiting after generation finished" in finding.headline
+        assert "after generation finished" in " ".join(finding.evidence)
         # The remediation must not blame max_power for a pipeline-balance problem.
-        assert "backpressure" in finding.action
-        assert "max_power will not help" in finding.action
+        assert "stops taking new jobs" in finding.detail
+        assert "`max_power` will not help" in finding.action
 
     def test_pre_inference_aging_points_at_scheduling_not_safety(self, tmp_path: Path) -> None:
         """Jobs that wait for a lane, then generate and submit quickly, are a scheduling problem.
@@ -501,8 +501,8 @@ class TestSlowGenerationDropSpiral:
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
-        assert "aged before inference started" in finding.headline
-        assert "pop->dispatch" in finding.headline
+        assert "waiting to start" in finding.headline
+        assert "before the job started" in " ".join(finding.evidence)
         assert "safety" not in finding.title
         assert finding.see_also is FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION
 
@@ -517,8 +517,8 @@ class TestSlowGenerationDropSpiral:
             _server_slow_abort("07:22:00.000"),
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
-        assert "cannot be attributed to a stage" in finding.headline
-        assert "stage not located" in finding.title
+        assert "cannot say where the wait was" in finding.headline
+        assert "cannot say where the time went" in finding.title
 
     def test_genuinely_slow_generation_keeps_gpu_framing(self, tmp_path: Path) -> None:
         """When generation itself is slow (latency ~ generation time), keep the slow-GPU remediation."""
@@ -531,8 +531,8 @@ class TestSlowGenerationDropSpiral:
             _server_slow_abort("07:22:00.000"),
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
-        assert "aged in the post-inference queue" not in finding.headline
-        assert "Reduce max_power" in finding.action
+        assert "waiting after generation" not in finding.headline
+        assert "Lower `max_power`" in finding.action
 
 
 class TestConsecutiveFailurePause:
@@ -1274,7 +1274,7 @@ class TestPopLivenessFullQueue:
         finding = findings["pop_liveness_full_queue"]
         assert finding.severity is Severity.CRITICAL
         assert "Nova Anime XL" in finding.headline
-        assert "120s" in finding.headline
+        assert "120 seconds" in finding.headline
 
     def test_a_concurrent_residency_hold_is_named(self, tmp_path: Path) -> None:
         """A whole-card residency governor spell open across the freeze is the correlation that explains it."""
@@ -1286,8 +1286,8 @@ class TestPopLivenessFullQueue:
                 _residency_governor_exit("07:55:00.000"),
             ),
         )
-        verdict = findings["pop_liveness_full_queue"].headline
-        assert "whole-card residency" in verdict, "the residency holding the card over the freeze must be named"
+        verdict = " ".join(findings["pop_liveness_full_queue"].evidence)
+        assert "reserved for" in verdict, "the residency holding the card over the freeze must be named"
 
     def test_no_open_residency_spell_is_not_correlated(self, tmp_path: Path) -> None:
         """A spell that closed before the freeze is not what is holding the queue, so it is not claimed to be."""
@@ -1823,7 +1823,7 @@ class TestPostProcessingDeferralStarvation:
         finding = findings["post_processing_deferral_starvation"]
         assert finding.severity is Severity.CRITICAL
         assert self._JOB in finding.headline
-        assert "starved the entire lane" in finding.headline
+        assert "no post-processing finished" in finding.headline
 
     def test_storm_with_completions_is_a_warning(self, tmp_path: Path) -> None:
         """A deferral storm while other jobs still complete is head starvation, reported as a warning."""
@@ -2166,9 +2166,9 @@ class TestSafetyStallActuatorNarration:
             ),
         )
         finding = findings["safety_stage_stall"]
-        assert "Reclaim ladder" in finding.headline
-        assert "retired" in finding.headline
-        assert "check the bridge_safety_*.log for crashes" not in finding.action
+        assert "Reclaim ladder" in " ".join(finding.evidence)
+        assert "retired" in " ".join(finding.evidence)
+        assert "safety process log" not in finding.action
         assert any("off-GPU" in line for line in finding.evidence)
 
     def test_without_the_markers_the_candidate_list_remains(self, tmp_path: Path) -> None:
@@ -2176,7 +2176,7 @@ class TestSafetyStallActuatorNarration:
         findings = _diagnose(tmp_path, self._bridge(_safety_unrecoverable("07:52:00.000")))
         finding = findings["safety_stage_stall"]
         assert "Reclaim ladder" not in finding.headline
-        assert "bridge_safety_*.log" in finding.action
+        assert "safety process log" in finding.action
 
 
 class TestCrashOnStartGuidance:
