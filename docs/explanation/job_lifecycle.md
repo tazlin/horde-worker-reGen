@@ -141,6 +141,11 @@ invariant](#pipeline-invariants) depends on),
 `PENDING_INFERENCE` (surfaced through the `jobs_pending_inference`, `jobs_lookup`, and
 `job_pop_timestamps` derived views).
 
+Source-media downloads and their failure metadata apply only to requests that asked for
+image-based processing (img2img, painting, or remix) or ControlNet. Plain txt2img ignores
+unused source-media URLs. This decision uses the original request, so an image request
+that later falls back to txt2img still reports its source failure.
+
 In dry-run (`dry_run_skip_api`), `CannedJobSource` replaces the API call; everything downstream is
 identical. The source receives the same `ImageGenerateJobPopRequest` that would have gone to the Horde.
 Fixed scripted sources replay their next response unchanged, while generating soak sources filter their

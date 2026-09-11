@@ -2863,7 +2863,7 @@ class TestPopPathBoundedAwaits:
     async def test_hanging_source_image_download_faults_the_job(self, _mock_req_cls: Mock) -> None:
         """An unanswered source-image download is abandoned and faulted like an exhausted retry loop."""
         response = make_job_pop_response().model_copy(
-            update={"source_image": "https://example.invalid/source.webp"},
+            update={"source_image": "https://example.invalid/source.webp", "source_processing": "img2img"},
         )
         session = AsyncMock()
         session.submit_request = AsyncMock(return_value=response)

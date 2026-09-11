@@ -11,6 +11,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopResponse,
 )
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
+from horde_sdk.worker.dispatch.ai_horde.image.source_image import SOURCE_IMAGE_REQUIRING_PROCESSING
 from loguru import logger
 
 from horde_worker_regen.consts import MAX_SOURCE_IMAGE_RETRIES
@@ -49,6 +50,12 @@ class SourceImageDownloader:
             data populated.  Download failures are recorded as faults on
             ``self._job_tracker``.
         """
+        if (
+            job_pop_response.source_processing not in SOURCE_IMAGE_REQUIRING_PROCESSING
+            and job_pop_response.payload.control_type is None
+        ):
+            return job_pop_response
+
         if job_pop_response.id_ is None:
             logger.error("Received ImageGenerateJobPopResponse with id_ is None. Please let the devs know!")
             return job_pop_response
@@ -147,6 +154,12 @@ class SourceImageDownloader:
         Callers that abandon a download rather than letting the retry loop exhaust itself use this so the
         job carries the same faults it would have carried had the retries run out.
         """
+        if (
+            job_pop_response.source_processing not in SOURCE_IMAGE_REQUIRING_PROCESSING
+            and job_pop_response.payload.control_type is None
+        ):
+            return
+
         if job_pop_response.id_ is None:
             logger.error("Received ImageGenerateJobPopResponse with id_ is None. Please let the devs know!")
             return

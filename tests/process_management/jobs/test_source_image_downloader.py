@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from horde_worker_regen.consts import MAX_SOURCE_IMAGE_RETRIES
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.jobs.source_image_downloader import SourceImageDownloader
@@ -35,6 +37,8 @@ def _make_job_response(
 ) -> Mock:
     """Create a mock ImageGenerateJobPopResponse with configurable source images."""
     job = Mock()
+    job.source_processing = "img2img"
+    job.payload.control_type = None
     job.id_ = job_id
     job.source_image = source_image
     job.source_mask = source_mask
@@ -315,3 +319,18 @@ class TestRecordDownloadFaults:
         refs = [f.ref for f in faults]
         assert "source_image" in refs
         assert "source_mask" in refs
+
+
+@pytest.mark.parametrize("control_type", [None, "canny"])
+async def test_txt2img_downloads_only_when_controlnet_needs_source(control_type: str | None) -> None:
+    """Unused source URLs cannot cause download metadata, but ControlNet keeps its input."""
+    tracker = Mock(spec=JobTracker)
+    tracker.record_source_image_fault = AsyncMock()
+    downloader = _make_downloader(job_tracker=tracker)
+    job = _make_job_response(source_image="https://example.com/unavailable.png")
+    job.source_processing = "txt2img"
+    job.payload.control_type = control_type
+    await downloader.download_source_images(job)
+    await downloader.record_download_faults(job)
+    assert job.async_download_source_image.call_count == int(control_type is not None)
+    assert tracker.record_source_image_fault.await_count == int(control_type is not None)
