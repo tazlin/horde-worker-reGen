@@ -201,8 +201,11 @@ class DiagnosticsView(Vertical):
         if event.select.id == "diag-scope":
             self._indicate_scope_pending(str(event.value))
             return
-        # The session option values are indices (ints); the isinstance guard also covers the BLANK case.
-        if event.select.id == "diag-session" and isinstance(event.value, int):
+        # The session option values are indices (ints); the isinstance guard also covers the BLANK case. The
+        # message is delivered after the setter that caused it, so one posted by repopulating the selector
+        # can arrive after the operator has already picked another session; a value the selector no longer
+        # holds is that stale message, not a choice.
+        if event.select.id == "diag-session" and isinstance(event.value, int) and event.value == event.select.value:
             self._render_selected(event.value)
 
     def _indicate_scope_pending(self, scope: str) -> None:

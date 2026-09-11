@@ -26,8 +26,10 @@ _SPAWN_SLOWDOWN = 4.0 if sys.platform == "win32" else 1.0
 
 # The bridge-data model enforces sane minimums (e.g. inference_step_timeout >= 15), so a wedge probe
 # cannot lean on tiny watchdog timeouts. Instead it bounds the whole run with a short timeout_seconds:
-# crash detection is immediate (is_alive), and an undetected wedge simply runs out the clock.
-_WEDGE_TIMEOUT_SECONDS = 15.0
+# crash detection is immediate (is_alive), and an undetected wedge simply runs out the clock. The run
+# still pays two process spawns (the pool and the replacement), so the bound scales like the other
+# recovery-bounded budgets where spawning is slow.
+_WEDGE_TIMEOUT_SECONDS = 15.0 * _SPAWN_SLOWDOWN
 
 # Detecting a *hang* (as opposed to a crash, which is caught immediately via is_alive) requires
 # waiting out a full inference_step_timeout of silence. That floor is 15s (the bridge-data minimum), and

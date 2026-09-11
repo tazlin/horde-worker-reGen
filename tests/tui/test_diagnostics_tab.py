@@ -147,10 +147,10 @@ async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pyt
         assert details.collapsed is True
         assert "Evidence" in _text(details.query_one(".finding-detail", Static))
 
-        # Switching to the earlier session re-renders from the cache (no re-parse) without error.
-        view._render_selected(0)
-        assert "Session #0" in _text(view.query_one("#diag-status", Static))
+        # Choosing the earlier session in the selector re-renders from the cache (no re-parse) without error.
+        select.value = 0
         cards = await _wait_for_cards(pilot, view, count=1)
+        assert "Session #0" in _text(view.query_one("#diag-status", Static))
         assert [card.finding.id for card in cards] == ["oom"]
 
 
