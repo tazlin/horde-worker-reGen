@@ -31,3 +31,18 @@ GOVERNOR_LABELS = {
     "model_stickiness": "model stickiness",
 }
 """Machine governor key -> human phrase for report text; an unknown key falls back to the key itself."""
+
+GOVERNOR_PLAIN_PHRASES = {
+    "whole_card_residency": "The whole-card reservation",
+    "large_model_switch": "The wait between large models",
+    "large_model_reentry": "The wait before returning to a large model",
+    "post_inference_backpressure": "The wait for the safety check to catch up",
+    "unservable_model_holdback": "The hold on a model this card cannot run",
+    "consecutive_failure_pause": "The pause after repeated failed jobs",
+    "pop_error_backoff": "The wait after horde errors",
+    "lora_pop_backoff": "The wait after LoRA errors",
+    "self_throttle_pause": "The self-throttle pause",
+    "megapixelstep_wait": "The wait for a large job to finish",
+    "model_stickiness": "Staying on the current model",
+}
+"""Machine governor key -> the plain phrase a finding's headline uses, in the words of the style guide."""

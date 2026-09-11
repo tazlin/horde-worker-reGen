@@ -293,8 +293,8 @@ class TestForcedMaintenance:
         )
         finding = _diagnose(tmp_path, bridge)["forced_maintenance"]
         assert finding.severity is Severity.CRITICAL
-        assert "2 generation(s) as too slow" in finding.headline
-        assert "save-our-ship" not in finding.headline
+        assert "cancelled 2 jobs as too slow" in " ".join(finding.evidence)
+        assert "gave up" not in " ".join(finding.evidence)
         assert finding.see_also is FindingKind.SLOW_GENERATION_DROP_SPIRAL
 
     def test_forced_for_both_drop_kinds_names_both(self, tmp_path: Path) -> None:
@@ -306,8 +306,8 @@ class TestForcedMaintenance:
         )
         finding = _diagnose(tmp_path, bridge)["forced_maintenance"]
         assert finding.severity is Severity.CRITICAL
-        assert "3 backlog job(s)" in finding.headline
-        assert "1 generation(s) as too slow" in finding.headline
+        assert "gave up on 3 queued jobs" in " ".join(finding.evidence)
+        assert "cancelled 1 jobs as too slow" in " ".join(finding.evidence)
 
     def test_counts_enriched_giveup_phrasing(self, tmp_path: Path) -> None:
         """The dropped-job count survives the worker enriching the give-up line with its wedge cause.
@@ -1198,7 +1198,7 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "1 job(s) faulted" in finding.headline
+        assert "1 jobs failed" in finding.headline
         assert any(_GIVEN_UP_JOB[:8] in line for line in finding.evidence)
         assert any("WAI-NSFW-illustrious-SDXL" in line for line in finding.evidence)
 
@@ -1217,9 +1217,9 @@ class TestFaultedJobCensus:
             {"bridge_5.log": _sample_stage_fault("08:01:00.000", job_id=_STAGE_FAULT_JOB)},
         )
         finding = findings["faulted_job_census"]
-        assert "4 job(s) faulted" in finding.headline
+        assert "4 jobs failed" in finding.headline
         for cause in ("give-up backstop", "safety-unrecoverable", "disaggregation stage fault", "process fault"):
-            assert cause in finding.headline, f"{cause} missing from {finding.headline}"
+            assert cause in finding.evidence[0], f"{cause} missing from {finding.evidence[0]}"
 
     def test_a_malformed_pop_is_attributed_not_left_unexplained(self, tmp_path: Path) -> None:
         """A job popped with no model name is unservable at the boundary, so it is named, not bucketed."""
@@ -1231,8 +1231,8 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "malformed pop (no model name)" in finding.headline
-        assert "other" not in finding.headline
+        assert "malformed pop (no model name)" in finding.evidence[0]
+        assert "other" not in finding.evidence[0]
 
     def test_a_requeued_attempt_is_not_a_faulted_job(self, tmp_path: Path) -> None:
         """A slot fault handed back for a retry did not cost the horde a job, so it is not in the census."""
@@ -1244,7 +1244,7 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "1 job(s) faulted" in finding.headline
+        assert "1 jobs failed" in finding.headline
         assert all(_SLOT_FAULT_JOB[:8] not in line for line in finding.evidence)
 
     def test_a_job_is_counted_once_across_both_fault_surfaces(self, tmp_path: Path) -> None:
@@ -1256,7 +1256,7 @@ class TestFaultedJobCensus:
                 _fault_report("08:00:02.000", job_id=_SLOT_FAULT_JOB),
             ),
         )
-        assert "1 job(s) faulted" in findings["faulted_job_census"].headline
+        assert "1 jobs failed" in findings["faulted_job_census"].headline
 
 
 class TestPopLivenessFullQueue:
@@ -1327,7 +1327,7 @@ class TestModelReferenceSampleFault:
         assert _STAGE_FAULT_JOB[:8] in finding.headline or any(
             _STAGE_FAULT_JOB[:8] in line for line in finding.evidence
         )
-        assert "model-reference cache refresh" in finding.action.lower()
+        assert "refreshed while the job ran" in finding.action
 
     def test_a_concurrent_stale_cache_is_reported(self, tmp_path: Path) -> None:
         """The staleness lines around the fault are what attribute it to a refresh, so they are counted."""
@@ -1343,7 +1343,7 @@ class TestModelReferenceSampleFault:
                 ),
             },
         )
-        assert "stale" in findings["model_reference_sample_fault"].headline
+        assert "stale" in " ".join(findings["model_reference_sample_fault"].evidence)
 
     def test_an_unrelated_stage_fault_does_not_fire(self, tmp_path: Path) -> None:
         """Only the model-reference signature counts; other sample-stage faults have their own causes."""
@@ -2122,7 +2122,7 @@ class TestPopApiErrorDominance:
         """The finding names the message the horde sent, its count, and how long it persisted."""
         findings = _diagnose(tmp_path, self._bridge(*self._storm()))
         finding = findings["pop_api_error_dominance"]
-        assert _ACCOUNT_LIMIT_POP_ERROR in finding.headline
+        assert _ACCOUNT_LIMIT_POP_ERROR in finding.evidence[0]
         assert "12" in finding.headline
 
     def test_an_operator_fixable_message_says_so(self, tmp_path: Path) -> None:

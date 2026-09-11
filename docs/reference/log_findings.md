@@ -75,15 +75,15 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 
 | Id | Severity | Fires when | Remedy |
 |----|----------|------------|--------|
-| `forced_maintenance` | varies | The horde put the worker into maintenance (critical), or the operator did (info). | Clearing maintenance without fixing the drop cause just re-triggers it; take the spiral finding first. |
-| `consecutive_failure_pause` | warning | The worker self-paused pops after consecutive faults. | A downstream symptom; the fault census names what actually failed. |
-| `pop_api_error_dominance` | warning | The horde repeatedly refused this worker's pops. The horde's verbatim message is quoted. | Act on the horde's message; most refusals name a config or account condition. |
-| `pop_governor_dominance` | info | One pop governor spell held the offer for a large share of the session. | Expected for a large-model cooldown; a surprise otherwise. |
-| `faulted_job_census` | warning | Any job faulted this session. Lists each one's model and cause. | Take the largest cause first; the causes map to the findings above. |
-| `model_reference_sample_fault` | warning | A running sample faulted on a model reference that could not be read or parsed. | A stale or partially-written reference cache; refresh it. |
+| `forced_maintenance` | varies | The horde put the worker into maintenance after it dropped too many jobs (critical), or the worker was in maintenance for another reason such as the operator setting it (info). | Fix what is dropping jobs before clearing maintenance, or it comes back. The slow-generation or scheduler findings name the cause. |
+| `consecutive_failure_pause` | warning | The worker paused asking for work after three failed jobs in a row. | A symptom of whatever failed the jobs; the failed-jobs finding names them. The pause clears on its own. |
+| `pop_api_error_dominance` | warning | The horde kept refusing this worker's requests for work with the same message, quoted in the evidence. | Do what the message says. Most refusals name a condition on the account or the worker registration that will not clear on its own. |
+| `pop_governor_dominance` | info | One of the worker's own waits (a whole-card reservation, a large-model cooldown, the wait for the safety check) took a large share of the session. | Nothing if throughput was as expected. Otherwise this says where the time went, and the details say which setting each wait follows. |
+| `faulted_job_census` | warning | Any job failed this session. The evidence lists each one's model and cause. | Take the largest cause first; each maps to one of the other findings. |
+| `model_reference_sample_fault` | warning | A job failed because the model list could not be read while it ran. | The job is retried on its own. If it repeats, report it: the model list was being refreshed while the job ran, which is a worker bug. |
 
 ## Session context
 
 | Id | Severity | Fires when | Remedy |
 |----|----------|------------|--------|
-| `session_summary` | varies | Always, once per session. Carries how the session ended, its duration, the peak recovery count, the worker version and model count, and which rotated archives were folded into the parse. | Nothing; it is the header the other findings are read against. |
+| `session_summary` | varies | Always, once per session. Says how the session ended and how long it ran, with the worker version, model count, recovery counts and any rotated archives folded into the parse in the evidence. | Nothing; it is the header the other findings are read against. |

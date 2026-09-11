@@ -9,9 +9,8 @@ The spec text is checked from :data:`FINDING_SPECS` directly. The headline is wr
 per emit, so it is checked from what the detectors actually produce: every detector's golden fixture in
 :mod:`tests.analysis.test_detector_contract` is run and each emitted finding is held to the same rules.
 
-Kinds whose copy has not been rewritten yet are listed in :data:`_NOT_YET_REWRITTEN` and skipped, so
-the module is green from the start and the list is the remaining work; a kind removed from the list is
-held to the guide from then on.
+A kind whose copy is being reworked can be listed in :data:`_NOT_YET_REWRITTEN` and skipped until the
+rewrite lands; a kind not in the list is held to the guide.
 """
 
 from __future__ import annotations
@@ -32,38 +31,8 @@ _MAX_WORDS_DETAIL = 30
 _MAX_SENTENCES_HEADLINE = 1
 _MAX_SENTENCES_ACTION = 3
 
-_NOT_YET_REWRITTEN: frozenset[FindingKind] = frozenset(FindingKind) - {
-    FindingKind.CRASH_ON_START_LOOP,
-    FindingKind.PRELOAD_KILLS_CHILD_LOOP,
-    FindingKind.EMPTY_MODEL_POP_CASCADE,
-    FindingKind.DOOMED_POOL_NO_GIVEUP,
-    FindingKind.GAVE_UP_CLEAN,
-    FindingKind.STUCK_INFERENCE_STEP,
-    FindingKind.POST_PROCESSING_VRAM_STALL,
-    FindingKind.ORPHAN_WEDGE,
-    FindingKind.OOM,
-    FindingKind.SWALLOWED_OOM,
-    FindingKind.FILE_DESCRIPTOR_EXHAUSTION,
-    FindingKind.SCHEDULER_STARVATION_WEDGE,
-    FindingKind.UNSATISFIABLE_HEAD_STARVATION,
-    FindingKind.RESIDENCY_RECONCILIATION_HOLDS,
-    FindingKind.WHOLE_CARD_CONVERGENCE_WEDGE,
-    FindingKind.WHOLE_CARD_NONHEAD_RESIDENCY_STARVATION,
-    FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
-    FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
-    FindingKind.WHOLE_CARD_POP_CLAIM_MONOPOLY,
-    FindingKind.MODEL_CHURN,
-    FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
-    FindingKind.HEAD_DISPATCH_STALL,
-    FindingKind.SLOW_GENERATION_DROP_SPIRAL,
-    FindingKind.POST_PROCESSING_DEFERRAL_STARVATION,
-    FindingKind.SAFETY_STAGE_STALL,
-    FindingKind.SAFETY_STAGE_CAPACITY,
-    FindingKind.POP_LIVENESS_FULL_QUEUE,
-    FindingKind.PARENT_LOOP_STALL,
-    FindingKind.LANE_PLACEMENT,
-}
-"""Kinds still carrying the pre-guide copy. Remove a kind here in the change that rewrites it."""
+_NOT_YET_REWRITTEN: frozenset[FindingKind] = frozenset()
+"""Kinds whose copy is mid-rewrite and temporarily exempt. Empty when every kind follows the guide."""
 
 _BANNED_PLAIN_WORDS: tuple[str, ...] = (
     # Internal mechanisms with a plain-word equivalent.

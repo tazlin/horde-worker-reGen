@@ -545,53 +545,77 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     # --- Pops, faults, and the horde ---
     FindingSpec(
         kind=FindingKind.FORCED_MAINTENANCE,
-        title="Horde forced the worker into maintenance",
+        title="The horde put the worker into maintenance",
+        detail=(
+            "The horde puts a worker into maintenance after it drops too many jobs, and refuses its requests "
+            "for work until maintenance is cleared. Maintenance is the horde's response to the drops, not the "
+            "fault itself, so clearing it without fixing the cause triggers it again."
+        ),
     ),
     FindingSpec(
         kind=FindingKind.CONSECUTIVE_FAILURE_PAUSE,
-        title="Worker self-paused on consecutive faults",
+        title="The worker paused after several failed jobs in a row",
         action=(
-            "Find the fault source (the starvation-wedge / recovery / OOM findings); the pause clears on its "
-            "own but will re-trigger until the faults stop."
+            "Find what is failing the jobs in the other findings. The pause clears on its own but comes back "
+            "until the failures stop."
+        ),
+        detail=(
+            "After three failed jobs in a row the worker stops asking for work for a short while, so a "
+            "broken worker does not keep taking jobs it will drop. The pause is a symptom of whatever "
+            "failed the jobs."
         ),
     ),
     FindingSpec(
         kind=FindingKind.POP_API_ERROR_DOMINANCE,
-        title="The horde repeatedly refused this worker's pops",
+        title="The horde kept refusing this worker's requests for work",
+        detail=(
+            "A worker that is refused work looks idle from every internal signal: the queue is empty and "
+            "nothing misbehaves. The horde says why in the refusal itself, and that message is the only "
+            "place the reason exists. The same message repeated is a standing condition, not a blip."
+        ),
         see_also=FindingKind.POP_GOVERNOR_DOMINANCE,
     ),
     FindingSpec(
         kind=FindingKind.POP_GOVERNOR_DOMINANCE,
-        title="A pop governor shaped much of the session",
+        title="One of the worker's own waits took much of the session",
         action=(
-            "If throughput was lower than expected, this names where the time went. Whole-card residency or "
-            "the large-model limiters point at the model mix and their configured durations "
-            "(whole_card_residency_cooldown_seconds, large_model_switch_min_seconds, "
-            "large_model_reentry_cooldown_seconds); backpressure points at a slow safety stage; the "
-            "unservable holdback points at a model the device cannot run."
+            "Nothing to do if throughput was as expected. Otherwise this says where the time went, and the "
+            "details say which setting each wait follows."
+        ),
+        detail=(
+            "These waits are the worker pacing itself, not faults. The whole-card and large-model waits "
+            "follow the model mix and `whole_card_residency_cooldown_seconds`, "
+            "`large_model_switch_min_seconds` and `large_model_reentry_cooldown_seconds`. The safety wait "
+            "means the safety check is slower than the cards. The unservable hold means a model this card "
+            "cannot run stayed in the list."
         ),
     ),
     FindingSpec(
         kind=FindingKind.FAULTED_JOB_CENSUS,
-        title="Jobs faulted this session",
+        title="Jobs failed this session",
         action=(
-            "Faulted jobs are reissued by the horde and counted against this worker; a sustained rate "
-            "drives forced maintenance. Take the largest cause first: a give-up backstop count means the "
-            "scheduler wedged and the recovery path drained the backlog rather than serving it, a "
-            "safety-unrecoverable count means results were produced but could not be checked, and a "
-            "process-fault count points at the slot that ran them."
+            "Take the largest cause first. Each cause maps to one of the other findings, and a steady failure "
+            "rate leads to forced maintenance."
+        ),
+        detail=(
+            "The horde reissues each failed job and counts it against this worker. A give-up count means the "
+            "scheduler stalled and the worker dropped its backlog to recover. A safety count means images "
+            "were made but could not be checked. A process fault count points at the process that ran them."
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
     ),
     FindingSpec(
         kind=FindingKind.MODEL_REFERENCE_SAMPLE_FAULT,
-        title="Sample stage faulted on an unreadable model reference",
+        title="A job failed because the model list could not be read",
         action=(
-            "The model-reference cache refresh is racing an in-flight sample: the child re-reads a category "
-            "while the cache is rewriting it. Hold the reference the job was admitted with for the life of "
-            "the job (or make the refresh atomic from a reader's point of view) so a background refresh "
-            "cannot fault work already running. Check the horde_model_reference cache path for the affected "
-            "category and confirm it is readable and not being rewritten by a second process."
+            "The job is retried on its own and can still finish. If it repeats, report it: the model list "
+            "was being refreshed while the job ran, which is a worker bug. Check that nothing else is "
+            "writing the model reference cache folder."
+        ),
+        detail=(
+            "The model reference is loaded once and refreshed in the background when its files change on "
+            "disk. A refresh that lands mid-job leaves the process asking for a file the cache is "
+            "rewriting. The job then fails on a read error unrelated to the model, the card or the prompt."
         ),
         see_also=FindingKind.FAULTED_JOB_CENSUS,
     ),
@@ -599,6 +623,12 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.SESSION_SUMMARY,
         title="Session summary",
+        action="Nothing to do here. The other findings are read against this session.",
+        detail=(
+            "Always present. It says how the session ended and how long it ran. The worker version, model "
+            "count and process recovery counts are in the evidence, so the other findings are read against "
+            "the right span of log."
+        ),
     ),
 )
 

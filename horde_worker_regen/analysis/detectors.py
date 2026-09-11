@@ -30,7 +30,7 @@ from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
 
 from .correlate import RecoveryDiagnostic, SessionContext, find_child_crash
 from .finding_kinds import SEVERITY_ORDER, Finding, FindingKind, Severity
-from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_LABELS
+from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_LABELS, GOVERNOR_PLAIN_PHRASES
 from .job_lifecycle import JobLifecycleModel, LaneRole, job_lifecycle_for, percentile
 from .log_ingest import LogRecord
 from .log_signatures import pattern_for
@@ -878,17 +878,17 @@ def _describe_drops(records: list[LogRecord]) -> str:
     aborts = _count_server_slow_aborts(records)
     if giveups and aborts:
         return (
-            f" The worker faulted {giveups} backlog job(s) via save-our-ship give-up and the horde aborted "
-            f"{aborts} generation(s) as too slow just before."
+            f"Just before, the worker gave up on {giveups} queued jobs and the horde cancelled {aborts} jobs "
+            "as too slow."
         )
     if aborts:
         return (
-            f" The horde aborted {aborts} generation(s) as too slow ('took too long to process') just "
-            "before; the worker was generating slower than the horde's per-job deadline."
+            f"Just before, the horde cancelled {aborts} jobs as too slow: the worker was generating slower than "
+            "the horde's per-job deadline."
         )
     if giveups:
-        return f" The worker faulted {giveups} backlog job(s) via save-our-ship give-up just before."
-    return " investigate which jobs the worker faulted in the lead-up."
+        return f"Just before, the worker gave up on {giveups} queued jobs."
+    return "The log does not say which jobs were dropped."
 
 
 def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
@@ -907,6 +907,7 @@ def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
     forced_for_drops = any(_DROPPING_JOBS_RE.search(record.full_text) for record in maintenance)
     if forced_for_drops:
         drop_clause = _describe_drops(context.session.records)
+        dropped = _total_dropped_jobs(context.session.records) + _count_server_slow_aborts(context.session.records)
         # Point the operator at whichever upstream finding actually applies: a slow-generation spiral and a
         # scheduler wedge produce the same maintenance symptom but call for opposite fixes.
         see_also = FindingKind.SLOW_GENERATION_DROP_SPIRAL if slow_aborts else FindingKind.SCHEDULER_STARVATION_WEDGE
@@ -915,18 +916,20 @@ def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
                 kind=FindingKind.FORCED_MAINTENANCE,
                 severity=Severity.CRITICAL,
                 headline=(
-                    f"The horde rejected {len(maintenance)} pop(s) with forced maintenance because the worker "
-                    f"dropped too many jobs.{drop_clause} Maintenance is the server's response to those drops, "
-                    "not the underlying fault."
+                    f"The horde put the worker into maintenance after it dropped {dropped} jobs, and refused "
+                    f"{len(maintenance)} requests for work."
+                    if dropped
+                    else (
+                        "The horde put the worker into maintenance for dropping jobs, and refused "
+                        f"{len(maintenance)} requests for work."
+                    )
                 ),
                 action_addendum=(
-                    "Fix what is dropping jobs (see the slow-generation / starvation-wedge / recovery findings) "
-                    "rather than just clearing maintenance; it will re-trigger. If the worker is generating too "
-                    "slowly, reduce max_power, max_threads, queue_size, or max_batch (and put models on an SSD); "
-                    "if the cause is a self-inflicted scheduler wedge, reduce churn "
-                    "(unload_models_from_vram_often / high_performance_mode)."
+                    "Fix what is dropping jobs before clearing maintenance, or it comes back. For slow "
+                    "generation lower `max_power`, `max_threads`, `queue_size` or `max_batch`. For a scheduler "
+                    "stall turn off `unload_models_from_vram_often` and `high_performance_mode`."
                 ),
-                evidence=[_evidence(r) for r in (maintenance[:1] + giveups[:1] + slow_aborts[:1])],
+                evidence=[drop_clause] + [_evidence(r) for r in (maintenance[:1] + giveups[:1] + slow_aborts[:1])],
                 see_also=see_also,
             ),
         ]
@@ -934,14 +937,14 @@ def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.FORCED_MAINTENANCE,
             severity=Severity.INFO,
-            title_override="Worker was in maintenance mode",
+            title_override="The worker was in maintenance mode",
             headline=(
-                f"The horde rejected {len(maintenance)} pop(s) with maintenance mode, but not for dropped jobs "
-                "(likely operator-set or an API-key/credentials issue)."
+                f"The horde refused {len(maintenance)} requests for work because the worker was in maintenance, "
+                "but not for dropped jobs."
             ),
             action_addendum=(
-                "If unexpected, unpause the worker in the horde UI and confirm the API key is set; otherwise no "
-                "action is needed."
+                "If you did not set maintenance yourself, clear it on the horde's worker page and check the API "
+                "key. Otherwise nothing to do."
             ),
             evidence=[_evidence(maintenance[0])],
         ),
@@ -1268,10 +1271,7 @@ def detect_consecutive_failure_pause(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.CONSECUTIVE_FAILURE_PAUSE,
             severity=Severity.WARNING,
-            headline=(
-                f"The worker paused job pops {len(pauses)} time(s) after three consecutive faulted jobs. This is "
-                "the worker protecting itself, downstream of whatever kept faulting jobs."
-            ),
+            headline=f"The worker paused asking for work {len(pauses)} times after three failed jobs in a row.",
             evidence=[_evidence(r) for r in pauses[:3]],
         ),
     ]
@@ -2042,8 +2042,9 @@ def detect_pop_governor_dominance(context: SessionContext) -> list[Finding]:
     )
     if not dominant:
         return []
+    top_name, top_seconds = dominant[0]
     phrases = [
-        f"{GOVERNOR_LABELS.get(name, name)} ({seconds / duration * 100:.0f}% of the session, {seconds / 60:.1f} min)"
+        f"{GOVERNOR_LABELS.get(name, name)}: {seconds / duration * 100:.0f}% of the session, {seconds / 60:.1f} min"
         for name, seconds in dominant
     ]
     return [
@@ -2051,11 +2052,10 @@ def detect_pop_governor_dominance(context: SessionContext) -> list[Finding]:
             kind=FindingKind.POP_GOVERNOR_DOMINANCE,
             severity=Severity.INFO,
             headline=(
-                "The worker spent a large share of the session with a pop/scheduling governor engaged: "
-                + "; ".join(phrases)
-                + ". This is not a fault, but it is the dominant lever on throughput for this session."
+                f"{GOVERNOR_PLAIN_PHRASES.get(top_name, top_name)} held the worker back for "
+                f"{top_seconds / duration * 100:.0f}% of the session, {top_seconds / 60:.1f} minutes."
             ),
-            evidence=[_evidence(r) for r in _matching(session.records, GOVERNOR_ENTER_RE)[:3]],
+            evidence=phrases + [_evidence(r) for r in _matching(session.records, GOVERNOR_ENTER_RE)[:3]],
         ),
     ]
 
@@ -2195,11 +2195,10 @@ def detect_faulted_job_census(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.FAULTED_JOB_CENSUS,
             severity=Severity.WARNING,
-            headline=(
-                f"{len(faults)} job(s) faulted this session, by cause: {breakdown}."
-                + (f" Across model(s): {_clause_join(models)}." if models else "")
-            ),
-            evidence=[fault.describe() for fault in faults[:8]],
+            headline=f"{len(faults)} jobs failed this session.",
+            evidence=[f"By cause: {breakdown}."]
+            + ([f"Models: {_clause_join(models)}."] if models else [])
+            + [fault.describe() for fault in faults[:8]],
         ),
     ]
 
@@ -2314,23 +2313,21 @@ def detect_model_reference_sample_fault(context: SessionContext) -> list[Finding
         [m.group("category") for record in faults if (m := _MODEL_REFERENCE_UNREADABLE_RE.search(record.message))],
     )
     jobs = _distinct_ordered([m.group("job") for record in faults if (m := _STAGE_FAULT_RE.search(record.message))])
+    quoted_categories = [f'"{category}"' for category in categories]
     return [
         Finding(
             kind=FindingKind.MODEL_REFERENCE_SAMPLE_FAULT,
             severity=Severity.WARNING,
             headline=(
-                f"{len(faults)} sample stage(s) faulted because the {_clause_join(categories)} model reference "
-                f"could not be read, affecting job(s) {_clause_join([job[:8] for job in jobs[:4]])}. The attempt "
-                "was lost to a data-availability error, not to anything about the model or the device (a retry "
-                "can still save the job, at the cost of the work already done)."
-                + (
-                    f" {len(stale)} cache-staleness line(s) sit alongside them, so a reference refresh was in "
-                    "flight while the sample ran."
-                    if stale
-                    else ""
-                )
+                f"{len(faults)} jobs failed because the {_clause_join(quoted_categories)} model list could not be "
+                f"read, affecting jobs {_clause_join([job[:8] for job in jobs[:4]])}."
             ),
-            evidence=[_evidence(record) for record in faults[:3]],
+            evidence=(
+                [f"{len(stale)} stale-cache lines sit alongside them, so a reference refresh was in flight."]
+                if stale
+                else []
+            )
+            + [_evidence(record) for record in faults[:3]],
         ),
     ]
 
@@ -2506,7 +2503,7 @@ def detect_pop_api_error_dominance(context: SessionContext) -> list[Finding]:
     code = code_match.group("code") if code_match is not None else None
     first, last = occurrences[0].timestamp, occurrences[-1].timestamp
     span = (last - first).total_seconds() if first is not None and last is not None else None
-    span_text = f" over {span / 60:.0f} minute(s)" if span is not None and span >= 60 else ""
+    span_text = f" over {span / 60:.0f} minutes" if span is not None and span >= 60 else ""
     operator_fixable = bool(_OPERATOR_FIXABLE_POP_ERRORS.search(message))
     others = len(by_message) - 1
 
@@ -2515,54 +2512,63 @@ def detect_pop_api_error_dominance(context: SessionContext) -> list[Finding]:
             kind=FindingKind.POP_API_ERROR_DOMINANCE,
             severity=Severity.WARNING,
             headline=(
-                f"The horde rejected {len(occurrences)} pop(s){span_text} with the same message: "
-                f'"{message}"'
-                + (f" (rc={code})." if code else ".")
-                + " While that stands the worker is not being offered work, so an idle worker and a quiet job "
-                "stream are the expected consequence rather than a local fault."
-                + (f" {others} other pop error message(s) also occurred." if others > 0 else "")
+                f"The horde refused {len(occurrences)} requests for work{span_text}, always with the same message."
             ),
             action_addendum=(
                 (
-                    "This rejection will not clear on its own: it is a condition on the account or the worker "
-                    "registration, not a server fault, so the worker will keep being refused until it is "
-                    "changed. Act on what the message says (worker count or naming against the account, the "
-                    "API key, or a maintenance flag), then confirm pops resume."
+                    "This will not clear on its own, since it is about the account or the worker registration. "
+                    "Do what the message says about the worker count or name, the API key, or the maintenance "
+                    "flag. Then check that jobs resume."
                 )
                 if operator_fixable
                 else (
-                    "This reads as a transient server-side or rate-limit rejection, which normally clears "
-                    "without intervention; the worker already backs off and retries. If it persists across "
-                    "restarts, check the horde's status before changing anything locally."
+                    "This reads as a transient server-side or rate-limit refusal and normally clears by itself. "
+                    "The worker already backs off and retries. If it continues across restarts, check the "
+                    "horde's status before changing anything locally."
                 )
             ),
-            evidence=[_evidence(record) for record in (occurrences[:1] + occurrences[-1:])],
+            evidence=[f'The message: "{message}".']
+            + ([f"The horde's error code was {code}."] if code else [])
+            + ([f"{others} other refusal messages also occurred."] if others > 0 else [])
+            + [_evidence(record) for record in (occurrences[:1] + occurrences[-1:])],
         ),
     ]
+
+
+_SESSION_END_PHRASES: dict[SessionEndReason, str] = {
+    SessionEndReason.CLEAN_EXIT: "ended with a normal shutdown",
+    SessionEndReason.GAVE_UP_ABORTED: "stopped itself after its processes could not be restored",
+    SessionEndReason.ABORTED: "was stopped by the abort file",
+    SessionEndReason.SUPERVISOR_SHUTDOWN: "was shut down from the dashboard",
+    SessionEndReason.KILLED_OR_CRASHED: "was killed or crashed without shutting down",
+    SessionEndReason.STILL_RUNNING: "is still running",
+}
+"""How each end reason reads in the summary's headline."""
 
 
 def detect_session_summary(context: SessionContext) -> list[Finding]:
     """An always-present rollup: how the session ended and its recovery/fault headline numbers."""
     session = context.session
     duration = session.duration_seconds
-    duration_text = f"{duration / 60:.1f} min" if duration is not None else "unknown duration"
+    duration_text = f"{duration / 60:.1f} minutes" if duration is not None else "an unknown time"
     severity = Severity.WARNING if session.end_reason is SessionEndReason.KILLED_OR_CRASHED else Severity.INFO
     return [
         Finding(
             kind=FindingKind.SESSION_SUMMARY,
             severity=severity,
-            headline=(
-                f"Ended via {session.end_reason} after {duration_text}; peak process recoveries "
-                f"{session.peak_process_recoveries}; {len(context.recoveries)} recovery diagnostic(s); "
-                f"version v{session.version or '?'}, {session.num_models or '?'} models, "
-                f"{session.max_threads or '?'} thread(s)."
-                # A parent log rotates by size mid-run, so which archives were read decides the span every
-                # figure above is measured over. Naming them keeps that attributable.
-                + (
-                    f" Rotation: {context.bundle.rotation_stitch.describe()}."
-                    if context.bundle.rotation_stitch is not None
-                    else ""
-                )
+            headline=f"The session ran for {duration_text} and {_SESSION_END_PHRASES[session.end_reason]}.",
+            evidence=[
+                f"Peak process recoveries {session.peak_process_recoveries}, "
+                f"{len(context.recoveries)} recovery diagnostics.",
+                f"Version v{session.version or '?'}, {session.num_models or '?'} models, "
+                f"{session.max_threads or '?'} threads.",
+            ]
+            # A parent log rotates by size mid-run, so which archives were read decides the span every
+            # figure above is measured over. Naming them keeps that attributable.
+            + (
+                [f"Rotation: {context.bundle.rotation_stitch.describe()}."]
+                if context.bundle.rotation_stitch is not None
+                else []
             ),
         ),
     ]
