@@ -26,11 +26,37 @@ from dataclasses import dataclass, field
 
 
 class Severity(enum.StrEnum):
-    """How urgent a finding is; also its sort key (critical first)."""
+    """How urgent a finding is; also its sort key (critical first).
+
+    The reader sees an action word for each level (see :data:`SEVERITY_BADGE_WORDS`); the values here are
+    the ids the JSON output and the catalogue carry.
+    """
 
     CRITICAL = "critical"
+    """The worker is losing work or will be paused by the horde."""
     WARNING = "warning"
+    """Something is wrong or wasteful and the reader should look."""
+    SUGGESTION = "suggestion"
+    """Nothing is wrong; a change would likely earn more."""
     INFO = "info"
+    """Context the reader may want; no action."""
+
+
+SEVERITY_ORDER: Mapping[Severity, int] = {
+    Severity.CRITICAL: 0,
+    Severity.WARNING: 1,
+    Severity.SUGGESTION: 2,
+    Severity.INFO: 3,
+}
+"""The report's sort key: most urgent first."""
+
+SEVERITY_BADGE_WORDS: Mapping[Severity, str] = {
+    Severity.CRITICAL: "Fix now",
+    Severity.WARNING: "Check",
+    Severity.SUGGESTION: "Try",
+    Severity.INFO: "Note",
+}
+"""What the badge says to the reader: what to do with the finding, not a level name to decode."""
 
 
 class FindingKind(enum.StrEnum):
@@ -90,9 +116,12 @@ class FindingSpec:
     severity (a wedge versus the same gate merely parking a head) passes its own title at the emit site;
     the spec's stays the name the catalogue and the cross-references use.
 
-    ``remediation`` is the advice that holds for every emit of the kind. Where the fix genuinely depends
-    on what was measured, it is empty and the detector supplies the whole text as an addendum; where both
-    are present the rendered remediation is the invariant followed by the addendum.
+    A finding shows two layers. The plain layer is the headline the detector writes per emit and the
+    "Do this" line: ``action`` is the part of that line that holds for every emit of the kind. Where the
+    fix genuinely depends on what was measured, it is empty and the detector supplies the whole text as an
+    addendum; where both are present the rendered line is the invariant followed by the addendum.
+    ``detail`` is the detail layer's prose: what is going on underneath, in the same voice but free to name
+    the subsystem; the CLI prints it and the dashboard collapses it.
 
     ``see_also`` points at another diagnosis; ``reference_page`` points at prose. They are separate fields
     because they are checked differently: a cross-reference has to name a declared kind, a reference page
@@ -101,7 +130,8 @@ class FindingSpec:
 
     kind: FindingKind
     title: str
-    remediation: str = ""
+    action: str = ""
+    detail: str = ""
     see_also: FindingKind | None = None
     reference_page: str | None = None
     """A repo-relative path to the docs page that explains the subsystem behind this diagnosis.
@@ -139,7 +169,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.DOOMED_POOL_NO_GIVEUP,
         title="Recovery storm never gave up",
-        remediation=(
+        action=(
             "Pair with the crash-on-start root cause: the pool cannot recover, so it should give up "
             "fast. The give-up abort only fires when every slot is quarantined at the exact give-up "
             "tick, but a soft reset's transient un-quarantine (and a clean window longer than the "
@@ -151,12 +181,12 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.GAVE_UP_CLEAN,
         title="Worker gave up on an unrecoverable pool",
-        remediation="No worker action needed beyond fixing the underlying crash cause; the bail-out worked.",
+        action="No worker action needed beyond fixing the underlying crash cause; the bail-out worked.",
     ),
     FindingSpec(
         kind=FindingKind.STUCK_INFERENCE_STEP,
         title="Inference wedged on a non-advancing step",
-        remediation=(
+        action=(
             "Recovery worked, but the hang is upstream in ComfyUI/hordelib. The usual trigger is a "
             "corrupt or incompatible model+LoRA combination: e.g. an SD1.5 LoRA applied to an SDXL "
             "checkpoint produces a `ERROR lora ... shape ... is invalid` storm and then the pipeline "
@@ -173,7 +203,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.ORPHAN_WEDGE,
         title="Orphaned in-progress jobs",
-        remediation=(
+        action=(
             "Inspect the inference slots for hangs/OOM around these punts; a sustained storm should "
             "escalate to a soft reset (pool rebuild)."
         ),
@@ -182,7 +212,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.OOM,
         title="GPU out-of-memory faults",
-        remediation=(
+        action=(
             "Reduce concurrency/queue or enable a more conservative VRAM budget; if these recur under "
             "a budget that should fit, suspect over-admission of a heavy head (Flux fp8 / SDXL). The "
             "named co-residency and free-VRAM figures say which: several co-resident processes with "
@@ -193,7 +223,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.SWALLOWED_OOM,
         title="Jobs faulted with 'no images produced'",
-        remediation=(
+        action=(
             "Check VRAM headroom around these faults; if memory-bound, treat 'no images produced' as a "
             "resource failure so the self-throttle/breaker engages."
         ),
@@ -201,7 +231,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.FILE_DESCRIPTOR_EXHAUSTION,
         title="Inference process exhausted its file-descriptor limit (EMFILE)",
-        remediation=(
+        action=(
             "Treat this as a descriptor leak, not memory pressure: reducing concurrency or the VRAM "
             "budget will not help. As an immediate stopgap, raise the worker's soft descriptor limit "
             "(ulimit -n, or LimitNOFILE= in the systemd unit) so a slow leak takes far longer to reach "
@@ -219,7 +249,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,
         title="Head-of-queue model persistently starved on an idle device",
-        remediation=(
+        action=(
             "Confirm the named model actually fits this device (its resident weights plus activation "
             "working set against measured device-free VRAM); a head that never admits despite an idle, "
             "ample-VRAM device points at an over-conservative per-process overhead or an unsatisfiable "
@@ -238,7 +268,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_CONVERGENCE_WEDGE,
         title="Whole-card residency cannot reach sole residency (a sibling or service lane pins the teardown)",
-        remediation=(
+        action=(
             "Capture the surrounding scheduling logs and the process map: the stall line names what pinned "
             "the teardown (a sibling process and its queued model, or a lane). A recurrence points at the "
             "whole-card teardown failing to stop an eligible sibling or failing to order a lane pause. As an "
@@ -250,7 +280,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_NONHEAD_RESIDENCY_STARVATION,
         title="Whole-card residency held for a non-head model starved the queue head",
-        remediation=(
+        action=(
             "The whole-card residency must only be granted to the head (next-to-dispatch) job; a deeper-queue "
             "heavy model should defer until it becomes the head rather than reserving the card. If this "
             "recurs, capture the residency establish/pre-stage lines and the queue order to confirm which "
@@ -266,7 +296,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
         title="Whole-card residency claimed the pop offer",
-        remediation=(
+        action=(
             "Nothing to do if the claims match the heavy work this worker exists to serve. If they are "
             "long and frequent for a model the operator did not intend to specialise in, the levers are "
             "the served model set and whole_card_residency_max_hold_seconds, which caps how long one "
@@ -277,7 +307,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_POP_CLAIM_MONOPOLY,
         title="Whole-card pop claim held to its cap while other models' work waited",
-        remediation=(
+        action=(
             "Decide whether this worker should specialise. If it should, the parked models do not belong in "
             "its served set and removing them ends the contention. If it should serve a mix, lower "
             "whole_card_residency_max_hold_seconds so a residency gives the intake back sooner, or take the "
@@ -288,7 +318,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.MODEL_CHURN,
         title="Model weights churning through the lanes",
-        remediation=(
+        action=(
             "Each turn costs a load off disk and the eviction that made room for it, and the cleared "
             "preloads are that cost paid for nothing. Give retention a chance to pay off: check that "
             "unload_models_from_vram_often is not forcing an eviction after every job, that the model "
@@ -317,7 +347,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.POST_PROCESSING_DEFERRAL_STARVATION,
         title="Post-processing lane starved by its admission gate",
-        remediation=(
+        action=(
             "Verify the admission inputs: device-free VRAM must reflect the lane's card, reservations must "
             "include only memory not yet materialized in that measurement, the proportional noise margin "
             "must be applied once, and the per-chain marginal candidate must match measured operation "
@@ -336,7 +366,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.SAFETY_STAGE_CAPACITY,
         title="One safety process behind more finishes than it can check",
-        remediation=(
+        action=(
             "Safety is one process for the whole worker, so its throughput is fixed while the fleet's "
             "finish rate scales with the cards. Give it more capacity: enable safety_on_gpu so a check "
             "costs a fraction of its CPU time, and raise the number of safety processes if the build "
@@ -355,7 +385,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.PARENT_LOOP_STALL,
         title="The parent loop stopped draining IPC",
-        remediation=(
+        action=(
             "Find what blocked the loop rather than what it failed to do: a synchronous call on the "
             "asyncio thread (a model-reference read, a disk scan, a network call without a timeout) is "
             "the usual cause. The timestamps below bound each gap; `horde-log timeline` over that "
@@ -366,7 +396,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.LANE_PLACEMENT,
         title="Auxiliary lanes moved or stacked onto one card",
-        remediation=(
+        action=(
             "Compare the per-card duty and free-VRAM readings for the card(s) named above against the "
             "rest of the fleet before reading a low duty there as a GPU problem. If the placement was "
             "not intended, pin the auxiliary lanes (safety_on_gpu and the post-processing/utilities "
@@ -382,7 +412,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.CONSECUTIVE_FAILURE_PAUSE,
         title="Worker self-paused on consecutive faults",
-        remediation=(
+        action=(
             "Find the fault source (the starvation-wedge / recovery / OOM findings); the pause clears on its "
             "own but will re-trigger until the faults stop."
         ),
@@ -395,7 +425,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.POP_GOVERNOR_DOMINANCE,
         title="A pop governor shaped much of the session",
-        remediation=(
+        action=(
             "If throughput was lower than expected, this names where the time went. Whole-card residency or "
             "the large-model limiters point at the model mix and their configured durations "
             "(whole_card_residency_cooldown_seconds, large_model_switch_min_seconds, "
@@ -406,7 +436,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.FAULTED_JOB_CENSUS,
         title="Jobs faulted this session",
-        remediation=(
+        action=(
             "Faulted jobs are reissued by the horde and counted against this worker; a sustained rate "
             "drives forced maintenance. Take the largest cause first: a give-up backstop count means the "
             "scheduler wedged and the recovery path drained the backlog rather than serving it, a "
@@ -418,7 +448,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.MODEL_REFERENCE_SAMPLE_FAULT,
         title="Sample stage faulted on an unreadable model reference",
-        remediation=(
+        action=(
             "The model-reference cache refresh is racing an in-flight sample: the child re-reads a category "
             "while the cache is rewriting it. Hold the reference the job was admitted with for the life of "
             "the job (or make the refresh atomic from a reader's point of view) so a background refresh "
@@ -437,20 +467,20 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
 
 @dataclass
 class Finding:
-    """Represents one diagnosis of a session: the verdict, the evidence, and what to do about it.
+    """Represents one diagnosis of a session: the headline, the evidence, and what to do about it.
 
     The kind carries everything constant about the diagnosis (see :data:`FINDING_SPECS`); the fields here
-    carry what the session itself produced. ``verdict`` is always written at the emit site because it
-    narrates the measurement.
+    carry what the session itself produced. ``headline`` is always written at the emit site because it
+    carries the measurement: one sentence saying what happened, with the numbers and names.
     """
 
     kind: FindingKind
     severity: Severity
-    verdict: str
+    headline: str
     title_override: str | None = None
     """A headline this emit words differently from the catalogue name, for a kind whose severities read as
     different incidents (a head parked behind a gate versus one with no gate at all)."""
-    remediation_addendum: str | None = None
+    action_addendum: str | None = None
     """The part of the fix that depends on what was measured, appended to the spec's invariant advice."""
     evidence: list[str] = field(default_factory=list)
     see_also: FindingKind | None = None
@@ -482,11 +512,21 @@ class Finding:
         return self.spec.reference_page
 
     @property
-    def remediation(self) -> str:
-        """The full fix: the kind's invariant advice followed by whatever this emit added to it."""
-        invariant = self.spec.remediation
-        if not self.remediation_addendum:
+    def action(self) -> str:
+        """The "Do this" line: the kind's invariant advice followed by whatever this emit added to it."""
+        invariant = self.spec.action
+        if not self.action_addendum:
             return invariant
         if not invariant:
-            return self.remediation_addendum
-        return f"{invariant} {self.remediation_addendum}"
+            return self.action_addendum
+        return f"{invariant} {self.action_addendum}"
+
+    @property
+    def detail(self) -> str:
+        """The detail layer's prose for this kind, or an empty string where the plain layer says it all."""
+        return self.spec.detail
+
+    @property
+    def badge(self) -> str:
+        """The action word the reader sees for this finding's severity."""
+        return SEVERITY_BADGE_WORDS[self.severity]

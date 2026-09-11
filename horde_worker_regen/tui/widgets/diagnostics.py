@@ -3,9 +3,10 @@
 This is the in-TUI equivalent of ``horde-log diagnose``: it calls the same first-class facade
 (:func:`horde_worker_regen.analysis.diagnose.diagnose`) and renders the structured
 :class:`~horde_worker_regen.analysis.detectors.Finding` objects it returns. Findings are rendered
-*generically* from their fields (severity, title, verdict, evidence, remediation) rather than per
+*generically* from their fields (severity, title, headline, action, detail, evidence) rather than per
 incident class, so a newly-added detector appears here with no change to this widget; the only
-coupling to the analysis layer is the shape of ``Finding``.
+coupling to the analysis layer is the shape of ``Finding``. Each finding is a card whose plain layer
+(badge, title, headline, "Do this") is always visible and whose detail layer is collapsed under it.
 
 The analysis parses an append-across-restarts log and runs every detector, which is CPU-bound and can
 take seconds. On a thread the GIL would starve the TUI event loop, so each pass runs in a worker
@@ -22,13 +23,11 @@ from concurrent.futures import Executor, ProcessPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from rich.console import Group
-from rich.panel import Panel
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
-from textual.widgets import Button, Label, LoadingIndicator, Rule, Select, Static
+from textual.widgets import Button, Collapsible, Label, LoadingIndicator, Rule, Select, Static
 
 from horde_worker_regen.analysis.detectors import Finding, Severity
 from horde_worker_regen.tui.formatters import human_duration
@@ -60,19 +59,115 @@ _SCOPE_LABELS: dict[str, str] = {
 # The default scope on first open: a quick, bounded pass that never looks hung on a long history.
 _DEFAULT_SCOPE = "recent"
 
-# Presentation-only mapping of a finding's severity to a badge label and colour. Kept in the view
-# (not the analysis layer) because it is a display choice; severities themselves come from the
-# analysis ``Severity`` enum, so a new severity surfaces here as the fallback badge until styled.
-_SEVERITY_BADGE: dict[Severity, tuple[str, str]] = {
-    Severity.CRITICAL: ("CRITICAL", "bold white on red"),
-    Severity.WARNING: ("WARNING", "black on yellow"),
-    Severity.INFO: ("INFO", "black on cyan"),
+# Presentation-only mapping of a finding's severity to badge and border colours. The badge word itself
+# comes from the analysis layer (``Finding.badge``) so the CLI and the dashboard say the same thing; the
+# colours are a display choice, so a new severity surfaces here in the fallback grey until styled.
+_SEVERITY_BADGE_STYLE: dict[Severity, str] = {
+    Severity.CRITICAL: "bold white on red",
+    Severity.WARNING: "black on yellow",
+    Severity.SUGGESTION: "black on green",
+    Severity.INFO: "black on cyan",
 }
 _SEVERITY_BORDER: dict[Severity, str] = {
     Severity.CRITICAL: "red",
     Severity.WARNING: "yellow",
+    Severity.SUGGESTION: "green",
     Severity.INFO: "cyan",
 }
+
+
+class FindingCard(Vertical):
+    """One finding: the badge and title, the headline and the "Do this" line, and its details folded away.
+
+    The plain layer is always visible so a reader has the answer without a click; the detail layer (the
+    mechanism, the evidence, the cross-references) sits in a collapsed section under it. Enter or a click
+    on the section's header opens it, and the focus order walks from one finding to the next.
+    """
+
+    DEFAULT_CSS = """
+    FindingCard {
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 0 1;
+        border: round $panel;
+    }
+    FindingCard .finding-header {
+        height: auto;
+    }
+    FindingCard .finding-headline {
+        height: auto;
+        margin: 0 0 0 1;
+    }
+    FindingCard .finding-action {
+        height: auto;
+        margin: 0 0 0 1;
+    }
+    FindingCard Collapsible {
+        margin: 0;
+        padding: 0;
+        border: none;
+    }
+    FindingCard CollapsibleTitle {
+        padding: 0 1;
+        color: $text-muted;
+    }
+    FindingCard .finding-detail {
+        height: auto;
+        margin: 0 0 0 1;
+    }
+    """
+
+    def __init__(self, finding: Finding) -> None:
+        """Hold the finding this card shows."""
+        super().__init__()
+        self.finding = finding
+
+    def compose(self) -> ComposeResult:
+        """Lay out the plain layer, then the collapsed detail layer when the finding has one."""
+        finding = self.finding
+        badge_style = _SEVERITY_BADGE_STYLE.get(finding.severity, "bold")
+        yield Static(
+            Text.assemble((f" {finding.badge} ", badge_style), ("  ", ""), (finding.title, "bold")),
+            classes="finding-header",
+        )
+        yield Static(Text(finding.headline), classes="finding-headline")
+        if finding.action:
+            yield Static(
+                Text.assemble(("Do this: ", "bold green"), (finding.action, "green")),
+                classes="finding-action",
+            )
+        detail = self._detail_text(finding)
+        if detail is not None:
+            with Collapsible(title="Details", collapsed=True):
+                yield Static(detail, classes="finding-detail")
+
+    def on_mount(self) -> None:
+        """Colour the border by severity once the widget has styles to set."""
+        self.styles.border = ("round", _SEVERITY_BORDER.get(self.finding.severity, "grey50"))
+
+    @staticmethod
+    def _detail_text(finding: Finding) -> Text | None:
+        """The detail layer as one block: the prose, the evidence, the cross-reference and the docs page."""
+        parts: list[Text] = []
+        if finding.detail:
+            parts.append(Text(finding.detail))
+        if finding.evidence:
+            evidence = Text("Evidence", style="grey46 bold")
+            for line in finding.evidence:
+                evidence.append(f"\n  • {line}", style="grey58")
+            parts.append(evidence)
+        if finding.see_also:
+            parts.append(Text(f"See also: {finding.see_also}", style="grey50 italic"))
+        if finding.reference_page:
+            parts.append(Text(f"More: {finding.reference_page}", style="grey50 italic"))
+        if not parts:
+            return None
+        joined = Text()
+        for index, part in enumerate(parts):
+            if index:
+                joined.append("\n\n")
+            joined.append_text(part)
+        return joined
 
 
 class DiagnosticsView(Vertical):
@@ -174,14 +269,17 @@ class DiagnosticsView(Vertical):
         yield Static(id="diag-status")
         yield Static(id="diag-timing")
         yield LoadingIndicator(id="diag-loading")
-        with VerticalScroll():
-            yield Static(id="diag-results")
+        with VerticalScroll(id="diag-results"):
+            # One persistent message line and one container for the cards: a removal is asynchronous in
+            # Textual, so re-mounting a same-id message right after removing it collides with itself.
+            yield Static(id="diag-results-message")
+            yield Vertical(id="diag-results-cards")
 
     def on_mount(self) -> None:
         """Show the idle hint, and tick a clock so the analysis age (and staleness) stays current."""
         self.query_one("#diag-maintenance-clock").display = False
         self._set_status("Choose a scope, then press Run analysis (works whether or not the worker is running).")
-        self.query_one("#diag-results", Static).update(
+        self._show_results_message(
             Text("No analysis yet; press Run analysis to triage the worker logs.", style="grey50"),
         )
         # A 1s tick keeps the "now" clock and the age/staleness readout live without re-parsing; it only
@@ -244,7 +342,7 @@ class DiagnosticsView(Vertical):
         self.query_one("#diag-loading", LoadingIndicator).display = True
         scope = self._scope_text(recent)
         self._set_status(f"Analyzing {scope}…")
-        self.query_one("#diag-results", Static).update(
+        self._show_results_message(
             Text(
                 f"Analyzing {scope} in {default_log_dir()}/…\n"
                 "This can take a few seconds on a large log. The worker does not need to be running.",
@@ -312,7 +410,7 @@ class DiagnosticsView(Vertical):
         if not results:
             self.query_one("#diag-session", Select).disabled = True
             self._set_status(f"No worker sessions found in {default_log_dir()}.")
-            self.query_one("#diag-results", Static).update(
+            self._show_results_message(
                 Text(
                     f"No logs found in {default_log_dir()}/. Start the worker to generate logs, then run analysis.",
                     style="grey50",
@@ -366,9 +464,8 @@ class DiagnosticsView(Vertical):
     def _render_selected(self, session_index: int) -> None:
         """Render the findings for the session with ``session_index`` from the cache."""
         diagnosis = next((d for d in self._diagnoses if d.session.index == session_index), None)
-        results = self.query_one("#diag-results", Static)
         if diagnosis is None:
-            results.update(Text("Session no longer available; run analysis again.", style="grey50"))
+            self._show_results_message(Text("Session no longer available; run analysis again.", style="grey50"))
             return
         session = diagnosis.session
         scope_label = _SCOPE_LABELS.get(self._analyzed_scope or "", "")
@@ -377,46 +474,19 @@ class DiagnosticsView(Vertical):
             f"Scope: {scope_label}. Change scope or Run analysis to refresh.",
         )
         if not diagnosis.findings:
-            results.update(Text("No findings; this session looks clean.", style="green"))
+            self._show_results_message(Text("No findings; this session looks clean.", style="green"))
             return
-        results.update(Group(*(self._render_finding(finding) for finding in diagnosis.findings)))
+        self.query_one("#diag-results-message", Static).display = False
+        cards = self.query_one("#diag-results-cards", Vertical)
+        cards.remove_children()
+        cards.mount_all(FindingCard(finding) for finding in diagnosis.findings)
 
-    def _render_finding(self, finding: Finding) -> Panel:
-        """Render one finding as a severity-bordered panel with the diagnosis and the fix set apart.
-
-        The three parts get distinct visual treatments so the *diagnosis* (what went wrong) is never
-        confused with the *suggestion* (what to do): the verdict reads as plain body text, the evidence
-        is a dim sub-block, and the remediation is a green, separately-headed "Suggested fix" block.
-        """
-        label, badge_style = _SEVERITY_BADGE.get(finding.severity, (finding.severity.value.upper(), "bold"))
-        border = _SEVERITY_BORDER.get(finding.severity, "grey50")
-
-        sections: list[Text] = [Text.assemble(("Diagnosis  ", "grey46 bold"), (finding.verdict, "default"))]
-        if finding.evidence:
-            evidence = Text("Evidence", style="grey46 bold")
-            for line in finding.evidence:
-                evidence.append(f"\n  • {line}", style="grey58")
-            sections.append(evidence)
-        if finding.remediation:
-            fix = Text()
-            fix.append("→ Suggested fix\n", style="bold green")
-            fix.append(f"   {finding.remediation}", style="green")
-            sections.append(fix)
-        if finding.see_also:
-            sections.append(Text(f"see also: {finding.see_also}", style="grey50 italic"))
-
-        title = Text.assemble((f" {label} ", badge_style), ("  ", ""), (finding.title, "bold"))
-        return Panel(Group(*self._blank_separated(sections)), title=title, title_align="left", border_style=border)
-
-    @staticmethod
-    def _blank_separated(sections: list[Text]) -> list[Text]:
-        """Interleave a blank line between sections so the diagnosis/evidence/fix blocks read apart."""
-        spaced: list[Text] = []
-        for index, section in enumerate(sections):
-            if index:
-                spaced.append(Text(""))
-            spaced.append(section)
-        return spaced
+    def _show_results_message(self, message: Text) -> None:
+        """Replace the results with one message line (nothing analysed yet, analysing, no logs, no session)."""
+        self.query_one("#diag-results-cards", Vertical).remove_children()
+        line = self.query_one("#diag-results-message", Static)
+        line.update(message)
+        line.display = True
 
     def _refresh_timing(self) -> None:
         """Update the one-line timing readout and the maintenance-mode duration banner every second."""

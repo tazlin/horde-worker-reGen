@@ -42,8 +42,8 @@ class TestUnsatisfiableHeadStarvation:
         assert "unsatisfiable_head_starvation" in findings
         finding = findings["unsatisfiable_head_starvation"]
         assert finding.severity is Severity.CRITICAL
-        assert "AlbedoBase XL" in finding.verdict
-        assert "280s" in finding.verdict  # the measured starvation arithmetic from the log line
+        assert "AlbedoBase XL" in finding.headline
+        assert "280s" in finding.headline  # the measured starvation arithmetic from the log line
 
     def test_warns_when_give_up_resolves_it(self, tmp_path: Path) -> None:
         """A save-our-ship give-up within the window downgrades the finding to a warning."""

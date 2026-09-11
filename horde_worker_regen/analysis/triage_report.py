@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .bundle import RotationStitch
 from .correlate import TimelineEntry
-from .detectors import Finding, Severity
+from .detectors import Finding
 from .job_lifecycle import JobLifecycleModel, JobRecord
 from .sessions import WorkerSession
 
@@ -143,17 +143,16 @@ def render_timeline(entries: list[TimelineEntry]) -> str:
     return "\n".join(lines)
 
 
-_SEVERITY_MARK = {Severity.CRITICAL: "[!!]", Severity.WARNING: "[! ]", Severity.INFO: "[i ]"}
-
-
 def finding_to_dict(finding: Finding) -> dict[str, object]:
-    """A JSON-serializable finding."""
+    """A JSON-serializable finding: the plain layer, the detail layer, and the cross-references."""
     return {
         "id": finding.id,
         "severity": str(finding.severity),
+        "badge": finding.badge,
         "title": finding.title,
-        "verdict": finding.verdict,
-        "remediation": finding.remediation,
+        "headline": finding.headline,
+        "action": finding.action,
+        "detail": finding.detail,
         "evidence": finding.evidence,
         "see_also": finding.see_also.value if finding.see_also is not None else None,
         "reference_page": finding.reference_page,
@@ -161,7 +160,11 @@ def finding_to_dict(finding: Finding) -> dict[str, object]:
 
 
 def render_findings(session: WorkerSession, findings: list[Finding]) -> str:
-    """A per-session diagnosis block: each finding's verdict, evidence, and remediation."""
+    """A per-session block: each finding's badge and title, its headline and "Do this" line, then the detail.
+
+    The plain layer comes first so a reader who stops after two lines has the answer; the detail layer
+    (the mechanism, the evidence, the cross-references) follows for whoever reads on.
+    """
     span, duration = _fmt_session_span(session)
     header = f"=== Session #{session.index}  {span}  ({duration})  {session.end_reason} ==="
     note = _start_bound_note(session)
@@ -171,17 +174,18 @@ def render_findings(session: WorkerSession, findings: list[Finding]) -> str:
         return header + "\n  (no findings)"
     blocks = [header]
     for finding in findings:
-        mark = _SEVERITY_MARK.get(finding.severity, "[? ]")
-        blocks.append(f"\n{mark} {finding.title}  ({finding.id})")
-        blocks.append(f"    {finding.verdict}")
+        blocks.append(f"\n[{finding.badge}] {finding.title}  ({finding.id})")
+        blocks.append(f"    {finding.headline}")
+        if finding.action:
+            blocks.append(f"    Do this: {finding.action}")
+        if finding.detail:
+            blocks.append(f"    Detail: {finding.detail}")
         for line in finding.evidence:
             blocks.append(f"      - {line}")
-        if finding.remediation:
-            blocks.append(f"    -> {finding.remediation}")
         if finding.see_also:
             blocks.append(f"    see also: {finding.see_also}")
         if finding.reference_page:
-            blocks.append(f"    see: {finding.reference_page}")
+            blocks.append(f"    more: {finding.reference_page}")
     return "\n".join(blocks)
 
 

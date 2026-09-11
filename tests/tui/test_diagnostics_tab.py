@@ -13,14 +13,14 @@ from pathlib import Path
 
 import pytest
 from rich.text import Text
-from textual.widgets import Select, Static, TabbedContent
+from textual.widgets import Collapsible, Select, Static, TabbedContent
 
 from horde_worker_regen.analysis.detectors import Finding, FindingKind, Severity
 from horde_worker_regen.analysis.diagnose import SessionDiagnosisView, SessionSummary
 from horde_worker_regen.app_state import AppStateStore
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.tui.app import HordeWorkerTUI
-from horde_worker_regen.tui.widgets.diagnostics import DiagnosticsView
+from horde_worker_regen.tui.widgets.diagnostics import DiagnosticsView, FindingCard
 from tests.tui._fake_supervisor import FakeSupervisor
 
 pytestmark = pytest.mark.slow
@@ -45,8 +45,9 @@ def _finding(kind: FindingKind, severity: Severity) -> Finding:
         kind=kind,
         severity=severity,
         title_override=f"Title for {kind.value}",
-        verdict=f"Verdict for {kind.value}",
-        remediation_addendum=f"Fix {kind.value}",
+        headline=f"Headline for {kind.value}",
+        action_addendum=f"Fix {kind.value}",
+        evidence=[f"evidence line for {kind.value}"],
     )
 
 
@@ -120,9 +121,23 @@ async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pyt
         assert select.disabled is False
         assert select.value == 1
 
+        # Each finding is a card: badge and title, headline and "Do this" visible, details collapsed.
+        await pilot.pause()
+        cards = list(view.query(FindingCard))
+        assert [card.finding.id for card in cards] == ["forced_maintenance", "session_summary"]
+        header = _text(cards[0].query_one(".finding-header", Static))
+        assert cards[0].finding.badge in header and cards[0].finding.title in header
+        assert _text(cards[0].query_one(".finding-headline", Static)) == cards[0].finding.headline
+        assert "Do this: " in _text(cards[0].query_one(".finding-action", Static))
+        details = cards[0].query_one(Collapsible)
+        assert details.collapsed is True
+        assert "Evidence" in _text(details.query_one(".finding-detail", Static))
+
         # Switching to the earlier session re-renders from the cache (no re-parse) without error.
         view._render_selected(0)
+        await pilot.pause()
         assert "Session #0" in _text(view.query_one("#diag-status", Static))
+        assert [card.finding.id for card in view.query(FindingCard)] == ["oom"]
 
 
 async def test_diagnostics_tab_empty_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,7 +151,7 @@ async def test_diagnostics_tab_empty_state(tmp_path: Path, monkeypatch: pytest.M
 
         assert "No worker sessions" in status
         assert view.query_one("#diag-session", Select).disabled is True
-        assert "No logs found" in _text(view.query_one("#diag-results", Static))
+        assert "No logs found" in _text(view.query_one("#diag-results-message", Static))
 
 
 async def test_scope_change_defers_until_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

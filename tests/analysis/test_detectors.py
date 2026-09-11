@@ -70,7 +70,7 @@ class TestCrashOnStart:
         )
         findings = _diagnose(tmp_path, bridge, {"bridge_inference_1_startup.log": _TRACEBACK})
         assert "crash_on_start_loop" in findings
-        assert "Torch not compiled with CUDA enabled" in findings["crash_on_start_loop"].verdict
+        assert "Torch not compiled with CUDA enabled" in findings["crash_on_start_loop"].headline
         assert findings["crash_on_start_loop"].severity is Severity.CRITICAL
 
 
@@ -156,7 +156,7 @@ class TestStuckInferenceStep:
         assert "stuck_inference_step" in findings
         finding = findings["stuck_inference_step"]
         assert finding.severity is Severity.WARNING
-        assert "lora" in finding.remediation.lower()
+        assert "lora" in finding.action.lower()
 
     def test_silent_without_a_reap(self, tmp_path: Path) -> None:
         """No reap line means no finding (the detector keys on the watchdog's own emit)."""
@@ -266,7 +266,7 @@ class TestForcedMaintenance:
         assert "forced_maintenance" in findings
         assert findings["forced_maintenance"].severity is Severity.CRITICAL
         # The verdict accounts for the jobs the worker dropped (4 + 4), the reason the horde stepped in.
-        assert "8" in findings["forced_maintenance"].verdict
+        assert "8" in findings["forced_maintenance"].headline
 
     def test_generic_maintenance_is_not_critical(self, tmp_path: Path) -> None:
         """Maintenance not attributed to dropped jobs (e.g. operator-set) is informational, not critical."""
@@ -293,8 +293,8 @@ class TestForcedMaintenance:
         )
         finding = _diagnose(tmp_path, bridge)["forced_maintenance"]
         assert finding.severity is Severity.CRITICAL
-        assert "2 generation(s) as too slow" in finding.verdict
-        assert "save-our-ship" not in finding.verdict
+        assert "2 generation(s) as too slow" in finding.headline
+        assert "save-our-ship" not in finding.headline
         assert finding.see_also is FindingKind.SLOW_GENERATION_DROP_SPIRAL
 
     def test_forced_for_both_drop_kinds_names_both(self, tmp_path: Path) -> None:
@@ -306,8 +306,8 @@ class TestForcedMaintenance:
         )
         finding = _diagnose(tmp_path, bridge)["forced_maintenance"]
         assert finding.severity is Severity.CRITICAL
-        assert "3 backlog job(s)" in finding.verdict
-        assert "1 generation(s) as too slow" in finding.verdict
+        assert "3 backlog job(s)" in finding.headline
+        assert "1 generation(s) as too slow" in finding.headline
 
     def test_counts_enriched_giveup_phrasing(self, tmp_path: Path) -> None:
         """The dropped-job count survives the worker enriching the give-up line with its wedge cause.
@@ -323,7 +323,7 @@ class TestForcedMaintenance:
         )
         findings = _diagnose(tmp_path, self._bridge(enriched, _maintenance_pop("15:19:10.000")))
         assert findings["forced_maintenance"].severity is Severity.CRITICAL
-        assert "4" in findings["forced_maintenance"].verdict
+        assert "4" in findings["forced_maintenance"].headline
 
 
 class TestSchedulerStarvationWedge:
@@ -354,8 +354,8 @@ class TestSchedulerStarvationWedge:
         finding = findings["scheduler_starvation_wedge"]
         assert finding.severity is Severity.CRITICAL
         # It reports the ample free VRAM (the budget's mistake) and the starvation duration.
-        assert "19179" in finding.verdict
-        assert "110" in finding.verdict
+        assert "19179" in finding.headline
+        assert "110" in finding.headline
 
     def test_transient_starvation_is_warning(self, tmp_path: Path) -> None:
         """A lone starvation diagnostic that cleared without a soft reset is a near-miss warning, not critical."""
@@ -405,10 +405,10 @@ class TestSlowGenerationDropSpiral:
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
-        assert "3 generation(s)" in finding.verdict
+        assert "3 generation(s)" in finding.headline
         # It corroborates with the worst slowdown ratio and the lowest free VRAM (the over-commit signature).
-        assert "4.1x" in finding.verdict
-        assert "5378 MB" in finding.verdict
+        assert "4.1x" in finding.headline
+        assert "5378 MB" in finding.headline
 
     def test_three_aborts_without_maintenance_is_critical(self, tmp_path: Path) -> None:
         """A spiral is defined by a sustained abort run; it is critical even before maintenance lands."""
@@ -433,7 +433,7 @@ class TestSlowGenerationDropSpiral:
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
-        assert "expected sampling time" not in finding.verdict
+        assert "expected sampling time" not in finding.headline
 
     def test_silent_without_aborts(self, tmp_path: Path) -> None:
         """A worker that grades slow jobs but never has one server-aborted produces no spiral finding."""
@@ -468,11 +468,11 @@ class TestSlowGenerationDropSpiral:
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
-        assert "aged in the post-inference queue" in finding.verdict
-        assert "inference-finished->submit" in finding.verdict
+        assert "aged in the post-inference queue" in finding.headline
+        assert "inference-finished->submit" in finding.headline
         # The remediation must not blame max_power for a pipeline-balance problem.
-        assert "backpressure" in finding.remediation
-        assert "max_power will not help" in finding.remediation
+        assert "backpressure" in finding.action
+        assert "max_power will not help" in finding.action
 
     def test_pre_inference_aging_points_at_scheduling_not_safety(self, tmp_path: Path) -> None:
         """Jobs that wait for a lane, then generate and submit quickly, are a scheduling problem.
@@ -501,8 +501,8 @@ class TestSlowGenerationDropSpiral:
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
-        assert "aged before inference started" in finding.verdict
-        assert "pop->dispatch" in finding.verdict
+        assert "aged before inference started" in finding.headline
+        assert "pop->dispatch" in finding.headline
         assert "safety" not in finding.title
         assert finding.see_also is FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION
 
@@ -517,7 +517,7 @@ class TestSlowGenerationDropSpiral:
             _server_slow_abort("07:22:00.000"),
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
-        assert "cannot be attributed to a stage" in finding.verdict
+        assert "cannot be attributed to a stage" in finding.headline
         assert "stage not located" in finding.title
 
     def test_genuinely_slow_generation_keeps_gpu_framing(self, tmp_path: Path) -> None:
@@ -531,8 +531,8 @@ class TestSlowGenerationDropSpiral:
             _server_slow_abort("07:22:00.000"),
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
-        assert "aged in the post-inference queue" not in finding.verdict
-        assert "Reduce max_power" in finding.remediation
+        assert "aged in the post-inference queue" not in finding.headline
+        assert "Reduce max_power" in finding.action
 
 
 class TestConsecutiveFailurePause:
@@ -624,7 +624,7 @@ class TestResourceFindings:
         bridge = "\n".join([f"2026-06-24 18:00:00.000 | DEBUG | x:y:1 - {_STARTUP}", _oom_coresident("18:00:10.000")])
         findings = _diagnose(tmp_path, bridge)
         assert "oom" in findings
-        verdict = findings["oom"].verdict
+        verdict = findings["oom"].headline
         assert "Z-Image-Turbo" in verdict
         assert "slot(s) 4" in verdict
         # Two sibling "Process N has ..." lines + the faulting process itself == 3 co-resident.
@@ -656,12 +656,12 @@ class TestResourceFindings:
         assert "file_descriptor_exhaustion" in findings
         fd = findings["file_descriptor_exhaustion"]
         assert fd.severity is Severity.CRITICAL
-        assert "WAI-NSFW-illustrious-SDXL" in fd.verdict
-        assert "slot(s) 3" in fd.verdict
-        assert "/proc/meminfo" in fd.verdict
-        assert "replaced" in fd.verdict
+        assert "WAI-NSFW-illustrious-SDXL" in fd.headline
+        assert "slot(s) 3" in fd.headline
+        assert "/proc/meminfo" in fd.headline
+        assert "replaced" in fd.headline
         # The mechanism note that keeps a maintainer from mistaking it for an OOM.
-        assert "descriptor leak" in fd.verdict
+        assert "descriptor leak" in fd.headline
 
     def test_fd_exhaustion_and_oom_are_distinct(self, tmp_path: Path) -> None:
         """A descriptor-exhaustion session raises no OOM finding, and vice versa (no cross-contamination)."""
@@ -1114,7 +1114,7 @@ class TestWholeCardResidencyChurn:
                 _whole_card_reserve("07:57:46.000", current=4, after=3, target=3, free_mb=11000),
             ),
         )
-        verdict = findings["whole_card_residency_churn"].verdict
+        verdict = findings["whole_card_residency_churn"].headline
         assert "4 -> 3" in verdict, "the live/after process counts must be reported"
         assert "9443" in verdict and "11000" in verdict, "the device_free_vram range must be reported"
 
@@ -1129,13 +1129,13 @@ class TestWholeCardResidencyChurn:
             ),
         )
         finding = findings["whole_card_residency_churn"]
-        assert finding.verdict.startswith("Every one of the 3 reservation(s)"), finding.verdict
-        assert "demanded no reduction" in finding.verdict
-        assert "target 21" in finding.verdict
-        assert "unmeasured marginal" not in finding.remediation, (
+        assert finding.headline.startswith("Every one of the 3 reservation(s)"), finding.headline
+        assert "demanded no reduction" in finding.headline
+        assert "target 21" in finding.headline
+        assert "unmeasured marginal" not in finding.action, (
             "an incoherent claim must not be blamed on an unmeasured per-context marginal"
         )
-        assert "target" in finding.remediation
+        assert "target" in finding.action
 
     def test_a_measured_marginal_suppresses_the_unmeasured_remediation(self, tmp_path: Path) -> None:
         """With ``src=probe`` in the forecast, the per-context marginal is measured, so that fix is wrong."""
@@ -1149,10 +1149,10 @@ class TestWholeCardResidencyChurn:
             ),
         )
         finding = findings["whole_card_residency_churn"]
-        assert "unmeasured marginal" not in finding.verdict
-        assert "measured" in finding.remediation
-        assert "276MB" in finding.verdict, "the measured marginal must be quoted"
-        assert "1450" in finding.verdict, "the unreclaimable charge behind the reduction must be quoted"
+        assert "unmeasured marginal" not in finding.headline
+        assert "measured" in finding.action
+        assert "276MB" in finding.headline, "the measured marginal must be quoted"
+        assert "1450" in finding.headline, "the unreclaimable charge behind the reduction must be quoted"
 
     def test_a_seeded_marginal_keeps_the_unmeasured_remediation(self, tmp_path: Path) -> None:
         """Only a seeded source means nothing was measured, which is when that remediation is true."""
@@ -1165,8 +1165,8 @@ class TestWholeCardResidencyChurn:
                 _whole_card_reserve("07:57:46.000"),
             ),
         )
-        assert "measured" in findings["whole_card_residency_churn"].remediation
-        assert "unmeasured" in findings["whole_card_residency_churn"].verdict
+        assert "measured" in findings["whole_card_residency_churn"].action
+        assert "unmeasured" in findings["whole_card_residency_churn"].headline
 
 
 _GIVEN_UP_JOB = "34ce8495-7820-4af5-9723-b411698ff27f"
@@ -1199,7 +1199,7 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "1 job(s) faulted" in finding.verdict
+        assert "1 job(s) faulted" in finding.headline
         assert any(_GIVEN_UP_JOB[:8] in line for line in finding.evidence)
         assert any("WAI-NSFW-illustrious-SDXL" in line for line in finding.evidence)
 
@@ -1218,9 +1218,9 @@ class TestFaultedJobCensus:
             {"bridge_5.log": _sample_stage_fault("08:01:00.000", job_id=_STAGE_FAULT_JOB)},
         )
         finding = findings["faulted_job_census"]
-        assert "4 job(s) faulted" in finding.verdict
+        assert "4 job(s) faulted" in finding.headline
         for cause in ("give-up backstop", "safety-unrecoverable", "disaggregation stage fault", "process fault"):
-            assert cause in finding.verdict, f"{cause} missing from {finding.verdict}"
+            assert cause in finding.headline, f"{cause} missing from {finding.headline}"
 
     def test_a_malformed_pop_is_attributed_not_left_unexplained(self, tmp_path: Path) -> None:
         """A job popped with no model name is unservable at the boundary, so it is named, not bucketed."""
@@ -1232,8 +1232,8 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "malformed pop (no model name)" in finding.verdict
-        assert "other" not in finding.verdict
+        assert "malformed pop (no model name)" in finding.headline
+        assert "other" not in finding.headline
 
     def test_a_requeued_attempt_is_not_a_faulted_job(self, tmp_path: Path) -> None:
         """A slot fault handed back for a retry did not cost the horde a job, so it is not in the census."""
@@ -1245,7 +1245,7 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "1 job(s) faulted" in finding.verdict
+        assert "1 job(s) faulted" in finding.headline
         assert all(_SLOT_FAULT_JOB[:8] not in line for line in finding.evidence)
 
     def test_a_job_is_counted_once_across_both_fault_surfaces(self, tmp_path: Path) -> None:
@@ -1257,7 +1257,7 @@ class TestFaultedJobCensus:
                 _fault_report("08:00:02.000", job_id=_SLOT_FAULT_JOB),
             ),
         )
-        assert "1 job(s) faulted" in findings["faulted_job_census"].verdict
+        assert "1 job(s) faulted" in findings["faulted_job_census"].headline
 
 
 class TestPopLivenessFullQueue:
@@ -1274,8 +1274,8 @@ class TestPopLivenessFullQueue:
         findings = _diagnose(tmp_path, self._bridge(_full_queue_frozen("07:52:00.000")))
         finding = findings["pop_liveness_full_queue"]
         assert finding.severity is Severity.CRITICAL
-        assert "Nova Anime XL" in finding.verdict
-        assert "120s" in finding.verdict
+        assert "Nova Anime XL" in finding.headline
+        assert "120s" in finding.headline
 
     def test_a_concurrent_residency_hold_is_named(self, tmp_path: Path) -> None:
         """A whole-card residency governor spell open across the freeze is the correlation that explains it."""
@@ -1287,7 +1287,7 @@ class TestPopLivenessFullQueue:
                 _residency_governor_exit("07:55:00.000"),
             ),
         )
-        verdict = findings["pop_liveness_full_queue"].verdict
+        verdict = findings["pop_liveness_full_queue"].headline
         assert "whole-card residency" in verdict, "the residency holding the card over the freeze must be named"
 
     def test_no_open_residency_spell_is_not_correlated(self, tmp_path: Path) -> None:
@@ -1300,7 +1300,7 @@ class TestPopLivenessFullQueue:
                 _full_queue_frozen("07:52:00.000"),
             ),
         )
-        assert "whole-card residency" not in findings["pop_liveness_full_queue"].verdict
+        assert "whole-card residency" not in findings["pop_liveness_full_queue"].headline
 
     def test_a_healthy_session_does_not_fire(self, tmp_path: Path) -> None:
         """No frozen-queue disclosure, no finding."""
@@ -1325,10 +1325,10 @@ class TestModelReferenceSampleFault:
         )
         finding = findings["model_reference_sample_fault"]
         assert finding.severity is Severity.WARNING
-        assert _STAGE_FAULT_JOB[:8] in finding.verdict or any(
+        assert _STAGE_FAULT_JOB[:8] in finding.headline or any(
             _STAGE_FAULT_JOB[:8] in line for line in finding.evidence
         )
-        assert "model-reference cache refresh" in finding.remediation.lower()
+        assert "model-reference cache refresh" in finding.action.lower()
 
     def test_a_concurrent_stale_cache_is_reported(self, tmp_path: Path) -> None:
         """The staleness lines around the fault are what attribute it to a refresh, so they are counted."""
@@ -1344,7 +1344,7 @@ class TestModelReferenceSampleFault:
                 ),
             },
         )
-        assert "stale" in findings["model_reference_sample_fault"].verdict
+        assert "stale" in findings["model_reference_sample_fault"].headline
 
     def test_an_unrelated_stage_fault_does_not_fire(self, tmp_path: Path) -> None:
         """Only the model-reference signature counts; other sample-stage faults have their own causes."""
@@ -1383,14 +1383,14 @@ class TestWholeCardPopClaim:
         )
         finding = findings["whole_card_pop_claim_episodes"]
         assert finding.severity is Severity.INFO
-        assert _FLUX in finding.verdict
-        assert "no further work" in finding.verdict
-        assert "120s" in finding.verdict
+        assert _FLUX in finding.headline
+        assert "no further work" in finding.headline
+        assert "120s" in finding.headline
 
     def test_a_claim_still_standing_at_the_end_is_reported(self, tmp_path: Path) -> None:
         """A session that ended inside a claim still says the offer was narrowed and by what."""
         findings = _diagnose(tmp_path, self._bridge(_pop_claim_engaged("07:51:00.000")))
-        assert "still standing" in findings["whole_card_pop_claim_episodes"].verdict
+        assert "still standing" in findings["whole_card_pop_claim_episodes"].headline
 
     def test_no_claim_lines_report_nothing(self, tmp_path: Path) -> None:
         """A worker whose residencies never claim the offer produces no episode finding at all."""
@@ -1412,7 +1412,7 @@ class TestWholeCardPopClaim:
         )
         finding = findings["whole_card_pop_claim_monopoly"]
         assert finding.severity is Severity.WARNING
-        assert "Juggernaut XL" in finding.verdict
+        assert "Juggernaut XL" in finding.headline
         assert finding.see_also is FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES
 
     def test_cap_ends_with_nothing_else_queued_are_not_a_monopoly(self, tmp_path: Path) -> None:
@@ -1540,7 +1540,7 @@ class TestResidencyReconciliationHolds:
         findings = _diagnose(tmp_path, bridge)
         assert "residency_reconciliation_holds" in findings
         assert findings["residency_reconciliation_holds"].severity is Severity.INFO
-        verdict = findings["residency_reconciliation_holds"].verdict
+        verdict = findings["residency_reconciliation_holds"].headline
         assert "AlbedoBase XL (SDXL)" in verdict
         assert "CyberRealistic Pony" in verdict
 
@@ -1632,7 +1632,7 @@ class TestPostProcessingVramStall:
         findings = _diagnose(tmp_path, self._bridge(self._stall("16:53:42.000"), self._breaker("16:55:00.000")))
         finding = findings["post_processing_vram_stall"]
         assert finding.severity is Severity.CRITICAL
-        assert "breaker tripped" in finding.verdict
+        assert "breaker tripped" in finding.headline
 
     def test_breaker_only_still_fires(self, tmp_path: Path) -> None:
         """The detector fires on a breaker-only session (the planner-fault path leaves no stall line)."""
@@ -1658,8 +1658,8 @@ class TestPostProcessingVramStall:
         findings = _diagnose(tmp_path, bridge, {"bridge_1.log": child})
         finding = findings["post_processing_vram_stall"]
         assert finding.severity is Severity.INFO
-        assert "admitted co-residency" in finding.verdict
-        assert "low-free-VRAM" in finding.verdict
+        assert "admitted co-residency" in finding.headline
+        assert "low-free-VRAM" in finding.headline
 
     def test_wddm_paging_corroborates_warning(self, tmp_path: Path) -> None:
         """A WDDM demand-paging verdict in the window corroborates the overlap and keeps the warning."""
@@ -1767,7 +1767,7 @@ class TestPostProcessingVramStall:
         bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
         finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
         assert finding.severity is Severity.INFO
-        assert "2 child low-free-VRAM" in finding.verdict
+        assert "2 child low-free-VRAM" in finding.headline
 
     def test_reserve_warning_is_alarming_and_counts(self, tmp_path: Path) -> None:
         """The below-inference-reserve streaming warning corroborates the overlap and keeps the warning."""
@@ -1782,7 +1782,7 @@ class TestPostProcessingVramStall:
         bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
         finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
         assert finding.severity is Severity.WARNING
-        assert "1 child low-free-VRAM" in finding.verdict
+        assert "1 child low-free-VRAM" in finding.headline
 
     def test_silent_without_signals(self, tmp_path: Path) -> None:
         """A crash-on-start recovery is not a post-processing stall, so the detector stays silent."""
@@ -1823,8 +1823,8 @@ class TestPostProcessingDeferralStarvation:
         findings = _diagnose(tmp_path, self._bridge(*self._defer_storm(40)))
         finding = findings["post_processing_deferral_starvation"]
         assert finding.severity is Severity.CRITICAL
-        assert self._JOB in finding.verdict
-        assert "starved the entire lane" in finding.verdict
+        assert self._JOB in finding.headline
+        assert "starved the entire lane" in finding.headline
 
     def test_storm_with_completions_is_a_warning(self, tmp_path: Path) -> None:
         """A deferral storm while other jobs still complete is head starvation, reported as a warning."""
@@ -2028,10 +2028,10 @@ class TestEmptyModelPopCascade:
         )
         finding = findings["empty_model_pop_cascade"]
         assert finding.severity is Severity.CRITICAL
-        assert "2 pop(s)" in finding.verdict
-        assert "2 child death(s)" in finding.verdict
-        assert "quarantin" in finding.verdict
-        assert "upgrade" in finding.remediation.lower()
+        assert "2 pop(s)" in finding.headline
+        assert "2 child death(s)" in finding.headline
+        assert "quarantin" in finding.headline
+        assert "upgrade" in finding.action.lower()
 
     def test_the_contained_form_is_reported_with_its_rate(self, tmp_path: Path) -> None:
         """On a newer capture the same input is rejected at the boundary, and only the rate matters."""
@@ -2045,9 +2045,9 @@ class TestEmptyModelPopCascade:
         )
         finding = findings["empty_model_pop_cascade"]
         assert finding.severity is Severity.WARNING
-        assert "contained" in finding.verdict
-        assert "2 malformed pop(s)" in finding.verdict
-        assert "upgrade" not in finding.remediation.lower()
+        assert "contained" in finding.headline
+        assert "2 malformed pop(s)" in finding.headline
+        assert "upgrade" not in finding.action.lower()
 
     def test_a_clean_session_does_not_fire(self, tmp_path: Path) -> None:
         """No blank identity anywhere means no finding."""
@@ -2074,8 +2074,8 @@ class TestPreloadKillsChildLoop:
             ),
         )
         finding = findings["preload_kills_child_loop"]
-        assert "AlbedoBase XL (SDXL)" in finding.verdict
-        assert "3" in finding.verdict
+        assert "AlbedoBase XL (SDXL)" in finding.headline
+        assert "3" in finding.headline
 
     def test_deaths_spread_across_models_do_not_fire(self, tmp_path: Path) -> None:
         """One death each for three models is pool churn, not a poisoned checkpoint."""
@@ -2123,13 +2123,13 @@ class TestPopApiErrorDominance:
         """The finding names the message the horde sent, its count, and how long it persisted."""
         findings = _diagnose(tmp_path, self._bridge(*self._storm()))
         finding = findings["pop_api_error_dominance"]
-        assert _ACCOUNT_LIMIT_POP_ERROR in finding.verdict
-        assert "12" in finding.verdict
+        assert _ACCOUNT_LIMIT_POP_ERROR in finding.headline
+        assert "12" in finding.headline
 
     def test_an_operator_fixable_message_says_so(self, tmp_path: Path) -> None:
         """An account-limit rejection will not clear on its own, so the remediation must not say to wait."""
         findings = _diagnose(tmp_path, self._bridge(*self._storm()))
-        assert "will not clear on its own" in findings["pop_api_error_dominance"].remediation
+        assert "will not clear on its own" in findings["pop_api_error_dominance"].action
 
     def test_a_transient_message_is_keyed_differently(self, tmp_path: Path) -> None:
         """A server-side error is expected to clear, so it gets the transient remediation."""
@@ -2137,7 +2137,7 @@ class TestPopApiErrorDominance:
             tmp_path,
             self._bridge(*self._storm("Internal Server Error", code="ServerError")),
         )
-        remediation = findings["pop_api_error_dominance"].remediation
+        remediation = findings["pop_api_error_dominance"].action
         assert "will not clear on its own" not in remediation
         assert "transient" in remediation
 
@@ -2167,17 +2167,17 @@ class TestSafetyStallActuatorNarration:
             ),
         )
         finding = findings["safety_stage_stall"]
-        assert "Reclaim ladder" in finding.verdict
-        assert "retired" in finding.verdict
-        assert "check the bridge_safety_*.log for crashes" not in finding.remediation
+        assert "Reclaim ladder" in finding.headline
+        assert "retired" in finding.headline
+        assert "check the bridge_safety_*.log for crashes" not in finding.action
         assert any("off-GPU" in line for line in finding.evidence)
 
     def test_without_the_markers_the_candidate_list_remains(self, tmp_path: Path) -> None:
         """With no actuator evidence the finding must not invent one; the candidate causes stay."""
         findings = _diagnose(tmp_path, self._bridge(_safety_unrecoverable("07:52:00.000")))
         finding = findings["safety_stage_stall"]
-        assert "Reclaim ladder" not in finding.verdict
-        assert "bridge_safety_*.log" in finding.remediation
+        assert "Reclaim ladder" not in finding.headline
+        assert "bridge_safety_*.log" in finding.action
 
 
 class TestCrashOnStartGuidance:
@@ -2202,7 +2202,7 @@ class TestCrashOnStartGuidance:
     def test_a_git_failure_points_at_the_shared_environment(self, tmp_path: Path) -> None:
         """A clone/checkout failure is a contended shared ComfyUI environment, not a torch problem."""
         findings = _diagnose(tmp_path, self._bridge(), {"bridge_inference_5_startup.log": _GIT_ENV_TRACEBACK})
-        remediation = findings["crash_on_start_loop"].remediation
+        remediation = findings["crash_on_start_loop"].action
         assert "environment directory" in remediation
         assert "torch" not in remediation.lower()
 
@@ -2216,7 +2216,7 @@ class TestCrashOnStartGuidance:
             ],
         )
         findings = _diagnose(tmp_path, bridge, {"bridge_inference_1_startup.log": _TRACEBACK})
-        assert "torch" in findings["crash_on_start_loop"].remediation.lower()
+        assert "torch" in findings["crash_on_start_loop"].action.lower()
 
 
 class TestDedicatedPostProcessMarkers:

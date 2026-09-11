@@ -11,8 +11,11 @@ outlive the kind it describes. The "Fires when" and "Remedy" columns are written
 lifted from the detector's own remediation text, so they are maintained here rather than generated.
 
 Severity is the sort order of the report, not a queue: **critical** findings come first, then
-**warning**, then **info**. Some detectors pick their severity from the evidence (a one-off versus a
-sustained pattern); those are marked *varies*. Findings are for problems, so a healthy subsystem emits
+**warning**, then **suggestion**, then **info**. The reader sees an action word rather than the level
+name: `Fix now` (critical: the worker is losing work or will be paused), `Check` (warning: something is
+wrong or wasteful), `Try` (suggestion: nothing is wrong, a change would likely earn more) and `Note`
+(info: context, no action). The JSON output carries both, as `severity` and `badge`. Some detectors pick
+their severity from the evidence (a one-off versus a sustained pattern); those are marked *varies*. Findings are for problems, so a healthy subsystem emits
 nothing at all: the absence of `parent_loop_stall` means the parent loop was fine.
 
 Where acting on a remedy needs background the finding cannot carry inline, its spec names a deep-dive

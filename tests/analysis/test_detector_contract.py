@@ -529,7 +529,7 @@ def test_the_printed_id_survives_the_json_round_trip() -> None:
     from horde_worker_regen.analysis.triage_report import finding_to_dict
 
     for kind in FindingKind:
-        payload = finding_to_dict(Finding(kind=kind, severity=Severity.INFO, verdict="v"))
+        payload = finding_to_dict(Finding(kind=kind, severity=Severity.INFO, headline="v"))
         assert payload["id"] == kind.value
         assert json.loads(json.dumps(payload))["id"] == kind.value
 
@@ -537,45 +537,45 @@ def test_the_printed_id_survives_the_json_round_trip() -> None:
 def test_the_remediation_is_the_invariant_advice_plus_the_measured_part() -> None:
     """A kind's declared advice is always present; the detector's addendum follows it."""
     spec = FINDING_SPECS[FindingKind.OOM]
-    assert spec.remediation, "this test needs a kind whose advice is declared, not per-emit"
+    assert spec.action, "this test needs a kind whose advice is declared, not per-emit"
 
-    without_addendum = Finding(kind=FindingKind.OOM, severity=Severity.CRITICAL, verdict="v")
-    assert without_addendum.remediation == spec.remediation
+    without_addendum = Finding(kind=FindingKind.OOM, severity=Severity.CRITICAL, headline="v")
+    assert without_addendum.action == spec.action
 
     with_addendum = Finding(
         kind=FindingKind.OOM,
         severity=Severity.CRITICAL,
-        verdict="v",
-        remediation_addendum="Card 2 is the one that faulted.",
+        headline="v",
+        action_addendum="Card 2 is the one that faulted.",
     )
-    assert with_addendum.remediation == f"{spec.remediation} Card 2 is the one that faulted."
+    assert with_addendum.action == f"{spec.action} Card 2 is the one that faulted."
 
 
 def test_a_kind_with_no_declared_advice_renders_only_the_addendum() -> None:
     """Where the whole fix depends on the measurement, nothing is prefixed to it."""
     spec = FINDING_SPECS[FindingKind.SAFETY_STAGE_STALL]
-    assert spec.remediation == "", "this test needs a kind whose advice is written per-emit"
+    assert spec.action == "", "this test needs a kind whose advice is written per-emit"
 
     finding = Finding(
         kind=FindingKind.SAFETY_STAGE_STALL,
         severity=Severity.WARNING,
-        verdict="v",
-        remediation_addendum="Stabilise the safety process.",
+        headline="v",
+        action_addendum="Stabilise the safety process.",
     )
-    assert finding.remediation == "Stabilise the safety process."
+    assert finding.action == "Stabilise the safety process."
 
 
 def test_an_emit_falls_back_to_the_declared_title_and_cross_reference() -> None:
     """The catalogue name and cross-reference are used unless the emit site words its own."""
     spec = FINDING_SPECS[FindingKind.HEAD_DISPATCH_STALL]
-    default = Finding(kind=FindingKind.HEAD_DISPATCH_STALL, severity=Severity.WARNING, verdict="v")
+    default = Finding(kind=FindingKind.HEAD_DISPATCH_STALL, severity=Severity.WARNING, headline="v")
     assert default.title == spec.title
     assert default.see_also == spec.see_also
 
     overridden = Finding(
         kind=FindingKind.HEAD_DISPATCH_STALL,
         severity=Severity.CRITICAL,
-        verdict="v",
+        headline="v",
         title_override="Head-of-queue job not dispatching (no blocking gate)",
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
     )

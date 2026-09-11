@@ -161,25 +161,26 @@ def _spec_problems(kind: FindingKind) -> list[str]:
     problems = list(
         _problems("title", spec.title, max_words=_MAX_WORDS_PLAIN, max_sentences=_MAX_SENTENCES_HEADLINE, plain=True)
     )
-    if not spec.remediation:
-        problems.append("remediation: empty, say what to do or that no action is needed")
+    if not spec.action:
+        problems.append("action: empty, say what to do or that no action is needed")
     problems.extend(
         _problems(
-            "remediation",
-            spec.remediation,
+            "action",
+            spec.action,
             max_words=_MAX_WORDS_PLAIN,
             max_sentences=_MAX_SENTENCES_ACTION,
             plain=True,
         )
     )
+    problems.extend(_problems("detail", spec.detail, max_words=_MAX_WORDS_DETAIL, max_sentences=None, plain=False))
     return problems
 
 
 def _emit_problems(finding: Finding) -> list[str]:
     problems = list(
         _problems(
-            "verdict",
-            finding.verdict,
+            "headline",
+            finding.headline,
             max_words=_MAX_WORDS_PLAIN,
             max_sentences=_MAX_SENTENCES_HEADLINE,
             plain=True,
@@ -195,11 +196,11 @@ def _emit_problems(finding: Finding) -> list[str]:
                 plain=True,
             )
         )
-    if finding.remediation_addendum:
+    if finding.action_addendum:
         problems.extend(
             _problems(
-                "remediation_addendum",
-                finding.remediation_addendum,
+                "action_addendum",
+                finding.action_addendum,
                 max_words=_MAX_WORDS_PLAIN,
                 max_sentences=_MAX_SENTENCES_ACTION,
                 plain=True,

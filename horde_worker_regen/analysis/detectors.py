@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
 
 from .correlate import RecoveryDiagnostic, SessionContext, find_child_crash
-from .finding_kinds import Finding, FindingKind, Severity
+from .finding_kinds import SEVERITY_ORDER, Finding, FindingKind, Severity
 from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_LABELS
 from .job_lifecycle import JobLifecycleModel, LaneRole, job_lifecycle_for, percentile
 from .log_ingest import LogRecord
@@ -330,9 +330,6 @@ _SOFT_RESET_FLAP_THRESHOLD = 2
 _RECOVERY_STORM_THRESHOLD = 5
 
 
-_SEVERITY_ORDER = {Severity.CRITICAL: 0, Severity.WARNING: 1, Severity.INFO: 2}
-
-
 Detector = Callable[[SessionContext], "list[Finding]"]
 
 
@@ -472,8 +469,8 @@ def detect_crash_on_start_loop(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.CRASH_ON_START_LOOP,
             severity=Severity.CRITICAL,
-            verdict=verdict,
-            remediation_addendum=remediation,
+            headline=verdict,
+            action_addendum=remediation,
             evidence=evidence[:6] or [_evidence(crashing[0].record)],
         ),
     ]
@@ -506,7 +503,7 @@ def detect_doomed_pool_no_giveup(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.DOOMED_POOL_NO_GIVEUP,
             severity=Severity.CRITICAL,
-            verdict=verdict,
+            headline=verdict,
             evidence=[_evidence(r) for r in (soft_resets[:2] + recovered[:1] + quarantined[:1])],
         ),
     ]
@@ -521,7 +518,7 @@ def detect_gave_up_clean(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.GAVE_UP_CLEAN,
             severity=Severity.INFO,
-            verdict=(
+            headline=(
                 "Save-our-ship abandoned ship and self-terminated after soft resets could not restore a "
                 "working pool. This is the intended bail-out, not a hang; see the crash-on-start finding "
                 "for why the pool was unrecoverable."
@@ -540,7 +537,7 @@ def detect_stuck_inference_step(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.STUCK_INFERENCE_STEP,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"{len(stuck)} time(s) an inference slot looped on a single sampling step (in practice the "
                 "final step) and never returned a result, while still emitting heartbeats. The slot was not "
                 "silent, so the per-step silence timeout could not catch it; the stuck-step watchdog reaped "
@@ -601,14 +598,14 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
                 kind=FindingKind.POST_PROCESSING_VRAM_STALL,
                 severity=Severity.INFO,
                 title_override="Post-processing co-resident with sampling (admitted)",
-                verdict=(
+                headline=(
                     f"Dedicated post-processing activity coincided with {len(low_vram_warnings)} child "
                     "low-free-VRAM reading(s), but nothing corroborated a stall: no post-processing watchdog "
                     "reap, no WDDM demand-paging, and no reading below the inference reserve. The scheduler "
                     "admits sampling and post-processing co-residency when measured device truth affords it, "
                     "so this is admitted co-residency operating as intended, not a stall. Recorded for audit."
                 ),
-                remediation_addendum=(
+                action_addendum=(
                     "No action needed: this is admitted co-residency, not an over-commit. If throughput "
                     "actually degrades, look for a corroborating signal (a post-processing watchdog reap, a "
                     "WDDM demand-paging verdict, or a below-inference-reserve streaming warning), which "
@@ -638,8 +635,8 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.POST_PROCESSING_VRAM_STALL,
             severity=Severity.CRITICAL if escalated else Severity.WARNING,
-            verdict=verdict,
-            remediation_addendum=(
+            headline=verdict,
+            action_addendum=(
                 "Run with the VRAM budget enabled on a build where the dedicated post-processing lane "
                 "participates in committed-reserve accounting and idle VRAM reclaim. As a stopgap, lower "
                 "concurrency/queue or disable post-processing on this card; a 4x upscale needs several GB "
@@ -723,7 +720,7 @@ def detect_post_processing_deferral_starvation(context: SessionContext) -> list[
         Finding(
             kind=FindingKind.POST_PROCESSING_DEFERRAL_STARVATION,
             severity=Severity.CRITICAL if starved and lane_fully_starved else Severity.WARNING,
-            verdict=verdict,
+            headline=verdict,
             evidence=[_evidence(r) for r in (worst[:2] + worst[-2:])],
         ),
     ]
@@ -798,7 +795,7 @@ def detect_oom(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.OOM,
             severity=Severity.CRITICAL,
-            verdict=verdict,
+            headline=verdict,
             evidence=[_evidence(r) for r in oom[:4]],
         ),
     ]
@@ -857,7 +854,7 @@ def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.FILE_DESCRIPTOR_EXHAUSTION,
             severity=Severity.CRITICAL,
-            verdict=(
+            headline=(
                 f"An inference process hit its per-process file-descriptor ceiling (errno 24, EMFILE) "
                 f"{len(faults)} time(s){slot_clause}{model_clause}{window_clause}. Once over RLIMIT_NOFILE "
                 f"every open() is refused, so the process faults every job while still heart-beating (the "
@@ -879,7 +876,7 @@ def detect_swallowed_oom(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.SWALLOWED_OOM,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"{len(no_images)} job(s) faulted with a generic 'no images produced' message. ComfyUI can "
                 "swallow a CUDA OOM into this generic failure, so the resource-failure breaker may never "
                 "fire even though the cause was memory pressure."
@@ -898,7 +895,7 @@ def detect_orphan_wedge(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.ORPHAN_WEDGE,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"{len(orphans)} job(s) were punted as orphaned in-progress with no owning live slot. A "
                 "recurring orphan storm means something upstream keeps stranding jobs (often a GPU that "
                 "hangs each inference)."
@@ -971,12 +968,12 @@ def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
             Finding(
                 kind=FindingKind.FORCED_MAINTENANCE,
                 severity=Severity.CRITICAL,
-                verdict=(
+                headline=(
                     f"The horde rejected {len(maintenance)} pop(s) with forced maintenance because the worker "
                     f"dropped too many jobs.{drop_clause} Maintenance is the server's response to those drops, "
                     "not the underlying fault."
                 ),
-                remediation_addendum=(
+                action_addendum=(
                     "Fix what is dropping jobs (see the slow-generation / starvation-wedge / recovery findings) "
                     "rather than just clearing maintenance; it will re-trigger. If the worker is generating too "
                     "slowly, reduce max_power, max_threads, queue_size, or max_batch (and put models on an SSD); "
@@ -992,11 +989,11 @@ def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
             kind=FindingKind.FORCED_MAINTENANCE,
             severity=Severity.INFO,
             title_override="Worker was in maintenance mode",
-            verdict=(
+            headline=(
                 f"The horde rejected {len(maintenance)} pop(s) with maintenance mode, but not for dropped jobs "
                 "(likely operator-set or an API-key/credentials issue)."
             ),
-            remediation_addendum=(
+            action_addendum=(
                 "If unexpected, unpause the worker in the horde UI and confirm the API key is set; otherwise no "
                 "action is needed."
             ),
@@ -1032,13 +1029,13 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
             Finding(
                 kind=FindingKind.SCHEDULER_STARVATION_WEDGE,
                 severity=Severity.CRITICAL,
-                verdict=(
+                headline=(
                     f"The VRAM budget deferred head-of-queue job(s) on an idle device for up to {max_starved}s"
                     f"{free_hint}, far more headroom than the head needed. The starved queue deadlocked, the "
                     f"recovery supervisor soft-reset the pools {len(soft_resets)} time(s) and faulted {dropped} "
                     "backlog job(s). Those faults are what the horde counts as dropped jobs."
                 ),
-                remediation_addendum=(
+                action_addendum=(
                     "The budget was over-conservative for this device (free VRAM was ample), most often because "
                     "rapid idle-process cycling left no settled baseline to size per-process overhead from. "
                     "Reduce churn (unload_models_from_vram_often / high_performance_mode) or relax the VRAM "
@@ -1053,12 +1050,12 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
             kind=FindingKind.SCHEDULER_STARVATION_WEDGE,
             severity=Severity.WARNING,
             title_override="Head-of-queue budget starvation (recovered)",
-            verdict=(
+            headline=(
                 f"The VRAM budget deferred head-of-queue job(s) on an idle device for up to {max_starved}s"
                 f"{free_hint}, but the wedge cleared before it escalated to a soft reset. A near-miss: "
                 "the budget is close to starving the scheduler on this device."
             ),
-            remediation_addendum=(
+            action_addendum=(
                 "Watch for recurrence under load; if it escalates to soft resets and faulted jobs, treat it as a "
                 "wedge (reduce process churn or relax the VRAM budget)."
             ),
@@ -1135,7 +1132,7 @@ def detect_unsatisfiable_head_starvation(context: SessionContext) -> list[Findin
         Finding(
             kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,
             severity=Severity.WARNING if resolved else Severity.CRITICAL,
-            verdict=verdict,
+            headline=verdict,
             evidence=[_evidence(record) for record, _ in (entries[:2] + entries[-1:])],
         ),
     ]
@@ -1189,12 +1186,12 @@ def _aging_finding(
                 kind=FindingKind.SLOW_GENERATION_DROP_SPIRAL,
                 severity=severity,
                 title_override="Jobs aging outside generation (stage not located)",
-                verdict=(
+                headline=(
                     f"{lead}. This capture carries no dispatch or inference-finished lines, so the wait "
                     f"cannot be attributed to a stage: it may be pre-inference queue wait (a scheduling "
                     f"problem) or post-inference backlog (a pipeline-balance problem).{tail}"
                 ),
-                remediation_addendum=(
+                action_addendum=(
                     "Re-capture with the orchestrator at DEBUG so the 'Starting inference for job' and "
                     "'Inference finished for job' lines are present, then re-run `horde-log jobs` to see "
                     "which of the three segments holds the wait. Lowering max_power is not indicated: "
@@ -1217,11 +1214,11 @@ def _aging_finding(
                 kind=FindingKind.SLOW_GENERATION_DROP_SPIRAL,
                 severity=severity,
                 title_override="Jobs waiting for dispatch (not slow generation)",
-                verdict=(
+                headline=(
                     f"{lead},{split_clause}: they aged before inference started, waiting for the scheduler "
                     f"to seat them, not in generation and not in the post-inference queue.{tail}"
                 ),
-                remediation_addendum=(
+                action_addendum=(
                     "This is a scheduling problem, not a too-aggressive GPU config, so lowering max_power "
                     "will not help and neither will speeding up the safety stage. Look at what held "
                     "dispatch: parked-head stalls ('Inference dispatch stalled'), pop governors holding the "
@@ -1245,12 +1242,12 @@ def _aging_finding(
             kind=FindingKind.SLOW_GENERATION_DROP_SPIRAL,
             severity=severity,
             title_override="Jobs aging in the pipeline queue (not slow generation)",
-            verdict=(
+            headline=(
                 f"{lead},{split_clause}: they aged in the post-inference queue, not in generation."
                 f"{safety_clause} A downstream stage (typically the single, often CPU-bound, safety "
                 f"process) is slower than inference, so its backlog grows until jobs exceed their ttl.{tail}"
             ),
-            remediation_addendum=(
+            action_addendum=(
                 "This is a pipeline-balance problem, not a too-aggressive GPU config, so lowering "
                 "max_power will not help. The worker now applies post-inference backpressure (it stops "
                 "popping while the safety backlog cannot clear within the job ttl), which bounds this; if "
@@ -1335,8 +1332,8 @@ def detect_slow_generation_drop_spiral(context: SessionContext) -> list[Finding]
             kind=FindingKind.SLOW_GENERATION_DROP_SPIRAL,
             severity=severity,
             title_override=None if spiral else "Generations aborted as too slow",
-            verdict=base_verdict + slow_clause + tail,
-            remediation_addendum=(
+            headline=base_verdict + slow_clause + tail,
+            action_addendum=(
                 "The worker cannot finish jobs within the horde's deadline. Reduce max_power (smaller "
                 "resolution / fewer steps), max_threads, queue_size, and/or max_batch so each job completes "
                 "in time; put models on an SSD and free VRAM/RAM so the device is not over-committed. This is "
@@ -1357,7 +1354,7 @@ def detect_consecutive_failure_pause(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.CONSECUTIVE_FAILURE_PAUSE,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"The worker paused job pops {len(pauses)} time(s) after three consecutive faulted jobs. This is "
                 "the worker protecting itself, downstream of whatever kept faulting jobs."
             ),
@@ -1490,8 +1487,8 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.SAFETY_STAGE_STALL,
             severity=severity,
-            verdict=verdict,
-            remediation_addendum=remediation,
+            headline=verdict,
+            action_addendum=remediation,
             evidence=[_evidence(r) for r in evidence[:4]],
             see_also=FindingKind.FORCED_MAINTENANCE if escalated else None,
         ),
@@ -1517,7 +1514,7 @@ def detect_whole_card_convergence_wedge(context: SessionContext) -> list[Finding
         Finding(
             kind=FindingKind.WHOLE_CARD_CONVERGENCE_WEDGE,
             severity=Severity.CRITICAL,
-            verdict=(
+            headline=(
                 f"A pre-staged whole-card head was parked {len(wedges)} time(s) because something the residency's "
                 "teardown gate waits on never left the card: an idle sibling process still holding a model queued "
                 "behind the head, or a service lane (component or post-processing) whose context the gate requires "
@@ -1552,7 +1549,7 @@ def detect_whole_card_nonhead_residency_starvation(context: SessionContext) -> l
         Finding(
             kind=FindingKind.WHOLE_CARD_NONHEAD_RESIDENCY_STARVATION,
             severity=Severity.CRITICAL if escalated else Severity.WARNING,
-            verdict=(
+            headline=(
                 f"The head of the queue was parked {len(starvations)} time(s) because a whole-card residency was "
                 "held for a different (non-head) model, which reserved the card and tore down the processes "
                 "serving the head. "
@@ -1735,7 +1732,7 @@ def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
             severity=Severity.CRITICAL if escalated or all_incoherent else Severity.WARNING,
-            verdict=(
+            headline=(
                 headline
                 + _claim_figures_text(claims, count=len(establishes))
                 + (f" {forecast.describe()}" if forecast is not None else "")
@@ -1752,7 +1749,7 @@ def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
                     else ""
                 )
             ),
-            remediation_addendum=_churn_remediation(
+            action_addendum=_churn_remediation(
                 all_incoherent=all_incoherent,
                 unmeasured_marginal=unmeasured_marginal,
                 forecast=forecast,
@@ -1914,7 +1911,7 @@ def detect_whole_card_pop_claim_episodes(context: SessionContext) -> list[Findin
         Finding(
             kind=FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
             severity=Severity.INFO,
-            verdict=(
+            headline=(
                 f"A whole-card residency narrowed the worker's advertised model set to its own model "
                 f"{len(episodes)} time(s) this session. Per model: {model_breakdown}. How each ended: "
                 f"{release_breakdown}.{held_text} While a claim stands the horde is only asked for that model, "
@@ -1957,7 +1954,7 @@ def detect_whole_card_pop_claim_monopoly(context: SessionContext) -> list[Findin
         Finding(
             kind=FindingKind.WHOLE_CARD_POP_CLAIM_MONOPOLY,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"{len(squeezing)} pop claim(s) ran to the maximum hold rather than releasing on their own, and "
                 f"each did so with another model's head parked behind it. Claimed by: {', '.join(claimants)}. "
                 f"Heads parked meanwhile: {starved_breakdown}. A claim that has to be ended by its cap was still "
@@ -1998,12 +1995,12 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
                 kind=FindingKind.HEAD_DISPATCH_STALL,
                 severity=Severity.CRITICAL,
                 title_override="Head-of-queue job not dispatching (no blocking gate)",
-                verdict=(
+                headline=(
                     f"The scheduler reported a parked head {len(bug_stalls)} time(s) whose model was resident on "
                     "an idle process with no gate holding it, yet nothing dispatched. That is a scheduler stall "
                     "(not a budget or concurrency decision) and can wedge the queue into dropped jobs."
                 ),
-                remediation_addendum=(
+                action_addendum=(
                     "Capture the surrounding scheduling logs and process map: a model-resident, idle-process head "
                     "that will not dispatch points to a dispatch-path bug (e.g. an eviction that clears the head's "
                     "resident model just before dispatch under unload_models_from_vram_often). Reduce churn as a "
@@ -2017,12 +2014,12 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.HEAD_DISPATCH_STALL,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"The head of the queue was parked (not dispatching) {len(stalls)} time(s), each explained by a "
                 "known gate (concurrency cap, overlap headway, keep-single-inference, or a deferred preload). "
                 "Sustained, this starves throughput even though it is not a hard wedge."
             ),
-            remediation_addendum=(
+            action_addendum=(
                 "If throughput is low, the named gate is the lever: review max_threads / batch settings, the "
                 "overlap-headway behaviour, or the VRAM budget that is deferring the preload."
             ),
@@ -2092,7 +2089,7 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
         Finding(
             kind=FindingKind.RESIDENCY_RECONCILIATION_HOLDS,
             severity=Severity.WARNING if escalated else Severity.INFO,
-            verdict=(
+            headline=(
                 f"The scheduler held a resident head's dispatch to reconcile residency {len(holds)} time(s) "
                 f"(~{holds_per_hour:.0f}/hour), evicting an idle sibling's VRAM so the head's materialisation "
                 f"fit the card before it committed. Per model: {model_breakdown}. Roughly {parked_seconds_total:.0f}s "
@@ -2112,7 +2109,7 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
                     )
                 )
             ),
-            remediation_addendum=(
+            action_addendum=(
                 "Treat this as a wedge rather than churn: find what held the card across the span (an idle "
                 "lane's component tenancy and a slot parked on a preload are both holders no job boundary "
                 "returns) and confirm the hold actually issued a reclaim against it."
@@ -2194,7 +2191,7 @@ def detect_pop_governor_dominance(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.POP_GOVERNOR_DOMINANCE,
             severity=Severity.INFO,
-            verdict=(
+            headline=(
                 "The worker spent a large share of the session with a pop/scheduling governor engaged: "
                 + "; ".join(phrases)
                 + ". This is not a fault, but it is the dominant lever on throughput for this session."
@@ -2339,7 +2336,7 @@ def detect_faulted_job_census(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.FAULTED_JOB_CENSUS,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"{len(faults)} job(s) faulted this session, by cause: {breakdown}."
                 + (f" Across model(s): {_clause_join(models)}." if models else "")
             ),
@@ -2401,7 +2398,7 @@ def detect_pop_liveness_full_queue(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.POP_LIVENESS_FULL_QUEUE,
             severity=Severity.CRITICAL,
-            verdict=(
+            headline=(
                 f"The local queue was reported full and motionless {len(frozen)} time(s), for as long as "
                 f"{worst}s with nothing dispatched and nothing completed"
                 + (f", head model {_clause_join(_distinct_ordered(heads))}" if heads else "")
@@ -2415,7 +2412,7 @@ def detect_pop_liveness_full_queue(context: SessionContext) -> list[Finding]:
                     else ""
                 )
             ),
-            remediation_addendum=(
+            action_addendum=(
                 "Find what the head was waiting for over that span: the disclosure names the scheduler's own "
                 "block reason where it has one."
                 + (
@@ -2473,7 +2470,7 @@ def detect_model_reference_sample_fault(context: SessionContext) -> list[Finding
         Finding(
             kind=FindingKind.MODEL_REFERENCE_SAMPLE_FAULT,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"{len(faults)} sample stage(s) faulted because the {_clause_join(categories)} model reference "
                 f"could not be read, affecting job(s) {_clause_join([job[:8] for job in jobs[:4]])}. The attempt "
                 "was lost to a data-availability error, not to anything about the model or the device (a retry "
@@ -2580,8 +2577,8 @@ def detect_empty_model_pop_cascade(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.EMPTY_MODEL_POP_CASCADE,
             severity=severity,
-            verdict=verdict,
-            remediation_addendum=remediation,
+            headline=verdict,
+            action_addendum=remediation,
             evidence=evidence_lines,
         ),
     ]
@@ -2627,13 +2624,13 @@ def detect_preload_kills_child_loop(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.PRELOAD_KILLS_CHILD_LOOP,
             severity=Severity.CRITICAL,
-            verdict=(
+            headline=(
                 f"Loading {model} ended the inference child {len(deaths)} time(s) across slot(s) "
                 f"{_clause_join([str(slot) for slot in slots])}. The failing element is the model, not any one "
                 "slot: it is re-dispatched to a fresh slot each time, so no per-slot breaker sees a pattern "
                 "while the pool is rebuilt around it." + (f" Also seen for {_clause_join(others)}." if others else "")
             ),
-            remediation_addendum=(
+            action_addendum=(
                 f"Take {model} out of the served model set and re-download it; a checkpoint that ends the "
                 "process during load is normally truncated or corrupt on disk, which a size or hash check "
                 "against the model reference will show. If the file verifies, the load path cannot host it on "
@@ -2698,7 +2695,7 @@ def detect_pop_api_error_dominance(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.POP_API_ERROR_DOMINANCE,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 f"The horde rejected {len(occurrences)} pop(s){span_text} with the same message: "
                 f'"{message}"'
                 + (f" (rc={code})." if code else ".")
@@ -2706,7 +2703,7 @@ def detect_pop_api_error_dominance(context: SessionContext) -> list[Finding]:
                 "stream are the expected consequence rather than a local fault."
                 + (f" {others} other pop error message(s) also occurred." if others > 0 else "")
             ),
-            remediation_addendum=(
+            action_addendum=(
                 (
                     "This rejection will not clear on its own: it is a condition on the account or the worker "
                     "registration, not a server fault, so the worker will keep being refused until it is "
@@ -2735,7 +2732,7 @@ def detect_session_summary(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.SESSION_SUMMARY,
             severity=severity,
-            verdict=(
+            headline=(
                 f"Ended via {session.end_reason} after {duration_text}; peak process recoveries "
                 f"{session.peak_process_recoveries}; {len(context.recoveries)} recovery diagnostic(s); "
                 f"version v{session.version or '?'}, {session.num_models or '?'} models, "
@@ -2863,7 +2860,7 @@ def detect_multi_card_dispatch_serialization(context: SessionContext) -> list[Fi
         Finding(
             kind=FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
             severity=severity,
-            verdict=(
+            headline=(
                 f"The worker drives {card_count} cards but only {mean_busy:.1f} of them held an in-flight "
                 f"job on average, while the pending queue sat at a median {census.median_pending:.0f} job(s) "
                 f"(intake budget {budget}) with a median {census.median_idle_lanes:.0f} idle lane(s). Jobs "
@@ -2871,7 +2868,7 @@ def detect_multi_card_dispatch_serialization(context: SessionContext) -> list[Fi
                 f"{inference_segment.median or 0:.0f}s of generation, so the loss is queue wait, not GPU "
                 f"speed.{head_clause}{loop_clause}"
             ),
-            remediation_addendum=(
+            action_addendum=(
                 "The fleet had seats the scheduler did not use: a median "
                 f"{census.median_seatable_pending:.0f} pending job(s) per status print already had their "
                 "model resident on an idle lane whose card was running nothing. Look at what serialises "
@@ -2914,7 +2911,7 @@ def detect_model_churn(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.MODEL_CHURN,
             severity=severity,
-            verdict=(
+            headline=(
                 f"Over {dispatches} dispatch(es) the worker preloaded {movement.preloads} model(s) "
                 f"({preload_ratio:.2f} per dispatch) and unloaded {movement.unloads} "
                 f"({unload_ratio:.2f} per dispatch), and cleared {movement.cleared_preloads} preload(s) "
@@ -3005,7 +3002,7 @@ def detect_lane_placement(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.LANE_PLACEMENT,
             severity=Severity.WARNING,
-            verdict=(
+            headline=(
                 " ".join(verdict_parts)
                 + " Auxiliary lanes hold VRAM and compute on whichever card they land on, so where they sit "
                 "changes what that card's inference lane can fit and how fast it samples."
@@ -3047,7 +3044,7 @@ def detect_parent_loop_stall(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.PARENT_LOOP_STALL,
             severity=severity,
-            verdict=(
+            headline=(
                 f"The parent drained no child messages for {len(drain.gaps_over_threshold)} stretch(es) "
                 f"longer than {drain.threshold_seconds:.0f}s ({cadence_clause}), the worst "
                 f"{worst:.0f}s, {stalled_seconds:.0f}s in total. Nothing dispatches, completes or submits "
@@ -3146,7 +3143,7 @@ def detect_safety_stage_capacity(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.SAFETY_STAGE_CAPACITY,
             severity=severity,
-            verdict=(
+            headline=(
                 f"Across {card_count} cards the worker finished {demand:.2f} job(s) per second while its "
                 f"single safety process could check {capacity:.2f} per second (a median {median_check:.2f}s "
                 f"per check), so results queued in front of it: the median job waited {median_wait:.1f}s "
@@ -3214,5 +3211,5 @@ def run_detectors(context: SessionContext) -> list[Finding]:
             findings.extend(detector(context))
         except Exception:  # noqa: BLE001 - a broken detector must not sink the whole report.
             continue
-    findings.sort(key=lambda finding: _SEVERITY_ORDER[finding.severity])
+    findings.sort(key=lambda finding: SEVERITY_ORDER[finding.severity])
     return findings

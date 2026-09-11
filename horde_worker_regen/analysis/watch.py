@@ -56,11 +56,11 @@ def watch_pass(bundle: LogBundle, state: WatchState) -> tuple[list[str], WatchSt
         alerts.append(f"--- session #{session.index} started (v{session.version or '?'}) ---")
 
     for finding in run_detectors(build_session_context(session, bundle)):
-        if finding.severity is Severity.INFO or finding.id in seen:
+        if finding.severity in (Severity.INFO, Severity.SUGGESTION) or finding.id in seen:
             continue
         seen.add(finding.id)
         stamp = datetime.now().strftime("%H:%M:%S")
-        alerts.append(f"{stamp}  [{finding.severity}] {finding.title}: {finding.verdict}")
+        alerts.append(f"{stamp}  [{finding.badge}] {finding.title}: {finding.headline}")
 
     if session.peak_process_recoveries > baseline_recoveries:
         alerts.append(f"process recoveries rose to {session.peak_process_recoveries}")

@@ -62,11 +62,16 @@ it calls the facade directly, in-process, on a background thread.
 ## The TUI renders findings generically
 
 The Diagnostics tab does **not** have per-incident display code. It reads a `Finding`'s `severity`,
-`title`, `verdict`, `evidence`, `remediation` and `see_also` and renders them the same way regardless of
-which detector produced them, exactly as the Insights tab renders its recommendations. Three of those
-are properties resolved against the finding's kind, so the tab needs no knowledge of the spec table: the
-only thing it knows about the analysis layer is the *shape* of `Finding` and the `Severity` enum used to
-colour the badge.
+`title`, `headline`, `action`, `detail`, `evidence` and `see_also` and renders them the same way
+regardless of which detector produced them. A finding has two layers: the plain layer (the badge word,
+the title, the one-sentence headline and the "Do this" line) is always visible, and the detail layer
+(the mechanism prose, the evidence, the cross-reference, the docs page) is collapsed under it in the
+dashboard and printed after it by the CLI. Several of those fields are properties resolved against the
+finding's kind, so the tab needs no knowledge of the spec table: the only thing it knows about the
+analysis layer is the *shape* of `Finding` and the `Severity` enum used to colour the badge. The badge
+word itself (`Fix now`, `Check`, `Try`, `Note`) comes from the analysis layer so the CLI and the
+dashboard say the same thing. How the copy in each layer is written is the subject of
+[Write a finding](../how-to/write-a-finding.md).
 
 The practical consequence: **a new detector appears in the dashboard with no change to the TUI.** The
 detector &harr; presentation seam has no per-detector surface to maintain.
@@ -142,12 +147,12 @@ The contract reduces the work of a new incident class to four touches, all in th
 the diagnosis is **declared before it is detected**:
 
 1. Add a `FindingKind` member in `finding_kinds.py` whose value is the printed id `<name>`, and a
-   `FindingSpec` for it in `FINDING_SPECS`: the catalogue title, the remediation that holds for every
-   emit of the kind, the `see_also` kind a reader should turn to next, and, where acting on the
-   remediation needs background, the `reference_page` that explains the subsystem (a repo-relative docs
-   path, rendered as a `see:` line). Cross-references, catalogue coverage and the existence of every
-   reference page are checked against this table, so a link that goes nowhere fails a test rather than
-   reaching an operator.
+   `FindingSpec` for it in `FINDING_SPECS`: the catalogue title, the `action` ("Do this" line) that
+   holds for every emit of the kind, the `detail` prose for the detail layer, the `see_also` kind a
+   reader should turn to next, and, where acting on the advice needs background, the `reference_page`
+   that explains the subsystem (a repo-relative docs path, rendered as a `more:` line). Cross-references,
+   catalogue coverage and the existence of every reference page are checked against this table, so a
+   link that goes nowhere fails a test rather than reaching an operator.
 2. Write `detect_<name>(context) -> list[Finding]` in `detectors.py`, returning a finding with
    `kind=FindingKind.<NAME>`. Read job-shaped facts through `job_lifecycle_for(context)`; if you need a
    log line the model does not carry, register its pattern in `log_signatures.py` first.
@@ -155,11 +160,11 @@ the diagnosis is **declared before it is detected**:
 4. Add a golden-line fixture for it in `test_detector_contract.py`, and an entry in
    [Log findings](../reference/log_findings.md).
 
-What the detector writes at the emit site is only what the session produced: the `verdict` (which
-narrates the measurement and is never templated), the evidence, the severity, and — where the fix
-genuinely depends on what was measured — a `remediation_addendum` appended to the spec's advice. A kind
-whose severities read as different incidents may pass a `title_override`; the spec's title stays the
-catalogue name. Where every emit words its own fix, the spec's `remediation` is empty and the addendum
+What the detector writes at the emit site is only what the session produced: the `headline` (one
+sentence with the measurement in it, never templated), the evidence, the severity, and, where the fix
+genuinely depends on what was measured, an `action_addendum` appended to the spec's "Do this" line. A
+kind whose severities read as different incidents may pass a `title_override`; the spec's title stays
+the catalogue name. Where every emit words its own fix, the spec's `action` is empty and the addendum
 carries it.
 
 The CLI and the Diagnostics tab pick it up with no changes. Step 4's two halves are the manual
