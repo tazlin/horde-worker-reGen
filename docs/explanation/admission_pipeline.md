@@ -251,6 +251,11 @@ decision reads the view; the act site updates the ledger.
   scenarios and diffs their decision, resource-state, actuation and child-message traces against
   `golden/*.json`. A behaviour change that is intended regenerates them with `-m golden_regen` and explains
   the diff in the commit; anything else the diff surfaces is a regression.
+- **Prove throughput.** `test_x_a_bundle_shaped_fleet_keeps_its_cards_busy` in
+  `tests/process_management/liveness/test_incident_scenarios.py` runs the multi-card rules together over a
+  fleet-shaped workload (eight cards of two lanes, a dozen classes, a deep queue, a post-processing lane) and
+  holds it to a concurrency mean, a per-card duty floor and a pop-to-dispatch median, so a regression in any
+  one rule shows as throughput lost rather than only in that rule's own row.
 
 ## See also
 

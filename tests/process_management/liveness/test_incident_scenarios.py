@@ -135,14 +135,23 @@ The failures encoded here:
   selection as "nothing more can start" and ended. Every other card's already-resident, already-seatable work
   then sat out the cycle, with no line logged and nothing in the queue to explain it. That is the ``held
   head`` scenario, and its reinjection is the loop ending on the first withheld dispatch.
+
+The last scenario is not one failure but all of them at once: the ``bundle-shaped fleet`` row runs the
+multi-card rules together over the workload shape they were diagnosed from, eight cards of two lanes serving
+a dozen classes with a deep queue and a post-processing lane, and states what that fleet's throughput has to
+be. A regression in any one of the rules above shows there as cards left idle and jobs left queued, which is
+what an operator sees, rather than only in the row that isolates it.
 """
 
 from __future__ import annotations
 
+import random
+import statistics
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import pytest
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeInferenceControlMessage, HordeProcessState
@@ -188,13 +197,18 @@ from tests.process_management.liveness._dispatch_world import (
     _CHILD_FREE_MARGIN_MB,
     _FILLER_MODEL_CLASSES,
     _FLUX,
+    _ROTATION_MODEL_CLASSES,
     _SD15,
     _SD15_C,
     _SD15_D,
     _SD15_E,
     _SD15_F,
+    _SD15_G,
+    _SD15_H,
+    _SD15_I,
     _SD15_OTHER,
     _SDXL,
+    _SDXL_C,
     _SDXL_OTHER,
     _CardClass,
     _DispatchWorld,
@@ -3670,11 +3684,11 @@ async def test_v_the_copies_a_burst_earns_are_bounded() -> None:
         f"bounded burst: the only copy of {_BURST_WARM.name} was displaced while a job for it was queued, so "
         f"making room for the burst reached work the queue still wanted. {world.state_dump()}"
     )
-    # One load per lane the burst takes is the whole cost of converging; a pool that reloaded per job would
-    # sit at the job count instead.
-    assert len(world.preloads_commanded) <= 2 * len(_BURST_RESIDENTS), (
-        f"bounded burst: {len(world.preloads_commanded)} preloads over the run "
-        f"({[entry[2] for entry in world.preloads_commanded]}). {world.state_dump()}"
+    # One load per card is the whole cost of converging, and the burst's own card already holds its class;
+    # the run comes in at three. A pool that reloaded per job would sit at the job count instead.
+    assert len(world.preloads_commanded) <= len(_BURST_PIXELS), (
+        f"bounded burst: {len(world.preloads_commanded)} preloads over the run for {len(_BURST_PIXELS)} "
+        f"cards ({[entry[2] for entry in world.preloads_commanded]}). {world.state_dump()}"
     )
 
 
@@ -3957,6 +3971,12 @@ async def test_w_the_room_a_follower_takes_is_paid_for_once() -> None:
         f"paid once: {world.weight_uploads} weight uploads over {world.completed_jobs} completed jobs. "
         f"{world.state_dump()}"
     )
+    # The commands behind those uploads: one per card at most, and the run pays two, one for each idle card
+    # the followers reach. A copy displaced and reloaded would show here before it showed in the uploads.
+    assert len(world.preloads_commanded) <= len(_ROOM_PIXELS), (
+        f"paid once: {len(world.preloads_commanded)} preloads commanded for {len(_ROOM_PIXELS)} cards "
+        f"({[entry[2] for entry in world.preloads_commanded]}). {world.state_dump()}"
+    )
     for model in _ROOM_CARD_ZERO_PAIR:
         assert world.vram_resident_lanes(model.name), (
             f"paid once: card 0's {model.name} was displaced while its own job was outstanding, so the room "
@@ -3982,3 +4002,398 @@ async def test_w_defect_reinjection_a_protected_pool_starves_its_followers(
         _assert_the_followers_reached_the_idle_cards(world, run, context="no follower room")
     with pytest.raises(AssertionError, match="ended with hot jobs queued"):
         _assert_the_followers_stopped_waiting_on_one_card(world, run, context="no follower room")
+
+
+# --------------------------------------------------------------------------------------------------------
+# The composite: a fleet-shaped workload with every multi-card rule in play at once
+# --------------------------------------------------------------------------------------------------------
+
+_BUNDLE_CARDS = 8
+_BUNDLE_LANES_PER_CARD = 2
+"""Eight cards of two lanes at one sampling slot each: the fleet shape every row above was diagnosed from."""
+
+_BUNDLE_PIXELS = dict.fromkeys(range(_BUNDLE_CARDS), 4_194_304)
+"""No card differs in what it may serve, so an idle card here is one the scheduler chose to leave idle."""
+
+_BUNDLE_CHAIN_CARD = 7
+"""The card the one post-processing lane is pinned to: one card competes with waiting chains, seven do not."""
+
+_BUNDLE_CHAIN_TICKS = 6
+"""Ticks a chain sits pending before the lane takes it, so the third of the run's jobs that carry
+post-processing leave a standing backlog rather than draining on arrival."""
+
+_BUNDLE_QUEUE_DEPTH = 16
+"""Jobs the worker holds at once, topped back up whenever the pending queue falls below it."""
+
+_BUNDLE_ROTATION = (
+    _SD15,
+    _SD15_OTHER,
+    _SD15_C,
+    _SDXL,
+    _SD15_D,
+    _SD15_E,
+    _SD15_F,
+    _SDXL_OTHER,
+    _SD15_G,
+    _SD15_H,
+    _SD15_I,
+    _SDXL_C,
+)
+"""The dozen classes this fleet's traffic is drawn from, of two weight classes.
+
+Its first eight are seeded one per card, so the run opens with every card able to serve and the remaining
+four have to be loaded onto lanes that are already holding something."""
+
+_BUNDLE_SHAPE = (1024, 1024)
+_BUNDLE_SD15_STEPS = 254
+_BUNDLE_SDXL_STEPS = 87
+_BUNDLE_SAMPLE_SECONDS = 16.0
+"""The sampling window every job in this row gets, whatever its class.
+
+Steps are chosen per class to land on it (254 small-class steps at 0.06 s and 87 large-class steps at
+0.175 s, over a megapixel, are each within a twentieth of a second of it), so the waits below are multiples
+of one number rather than of whichever class a given job happened to be. It is also roughly what a
+megapixel generation costs a consumer card, which is what makes a wait stated in generations meaningful."""
+
+_BUNDLE_SEED = 20260910
+_BUNDLE_RESIDENT_BIAS = 0.75
+"""How often an arriving job names a model the fleet is already holding.
+
+The horde narrows its offer to what a worker advertises and a worker advertises what it has, so most pops
+come back for something resident; the rest are the model changes the fleet has to load for. Standing the
+bias in the arrival sequence rather than in a simulated popper keeps the world's intake what every other row
+here uses, and makes the residency mix a property of the traffic the row is written against."""
+
+_BUNDLE_POST_PROCESSING_SHARE = 1.0 / 3.0
+"""How much of the traffic carries a post-processing chain, and so competes for the single lane."""
+
+_BUNDLE_ARRIVAL_COUNT = 256
+"""Length of the pinned arrival sequence, cycled if a run outlasts it: comfortably more than the jobs a run
+of this length pops, so the sequence is a fixed script rather than a generator running beside the world."""
+
+
+def _bundle_steps(model: _ModelClass) -> int:
+    """The step count that gives ``model`` the row's common sampling window."""
+    if model.baseline is KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1:
+        return _BUNDLE_SD15_STEPS
+    return _BUNDLE_SDXL_STEPS
+
+
+def _bundle_arrival_sequence() -> tuple[tuple[_ModelClass, bool], ...]:
+    """Build the run's arrival script once: each job's model, and whether it carries post-processing.
+
+    A recency window stands in for what the fleet is holding: the last as many models named as the pool has
+    lanes, opened with the classes seeded resident. Most arrivals are drawn from that window and the rest
+    uniformly from the whole rotation, which is what puts a model change in the traffic at the rate a
+    resident-narrowed offer leaves. Drawn once at import from a fixed seed, so every run of the row sees the
+    same jobs in the same order.
+    """
+    rng = random.Random(_BUNDLE_SEED)
+    lanes = _BUNDLE_CARDS * _BUNDLE_LANES_PER_CARD
+    recent = list(_BUNDLE_ROTATION[:_BUNDLE_CARDS])
+    arrivals: list[tuple[_ModelClass, bool]] = []
+    for _ in range(_BUNDLE_ARRIVAL_COUNT):
+        model = rng.choice(recent) if rng.random() < _BUNDLE_RESIDENT_BIAS else rng.choice(_BUNDLE_ROTATION)
+        recent.append(model)
+        del recent[:-lanes]
+        arrivals.append((model, rng.random() < _BUNDLE_POST_PROCESSING_SHARE))
+    return tuple(arrivals)
+
+
+_BUNDLE_ARRIVALS = _bundle_arrival_sequence()
+
+_BUNDLE_TICK_SECONDS = 1.0
+"""How much clock one tick advances: a sixteenth of a sampling window, so a card's occupancy and the fleet's
+concurrency are both sampled many times inside one job."""
+
+_BUNDLE_TICKS = 460
+"""Ticks the row runs for. The world attempts one dispatch per tick, so the fleet's eight slots turn over at
+about four tenths of a dispatch per tick and this is what it takes to put the run's job floor behind it."""
+
+_BUNDLE_WARMUP_TICKS = 40
+"""Ticks allowed for the pool to fill before any steady-state figure is read.
+
+Eight slots at one dispatch per tick need eight ticks at best, and the classes resident nowhere need a
+checkpoint load on top. This is past both and inside the first jobs' completions, so what follows it is a
+fleet at work rather than a fleet starting up."""
+
+_BUNDLE_JOB_FLOOR = 150
+"""Completed jobs the run must put behind it, so its medians and duty figures are made of a real sample."""
+
+_BUNDLE_CONCURRENCY_FLOOR = 6.0
+"""Cards the fleet must average, of eight, once it is warm. Measured here: 7.1.
+
+A time-weighted mean rather than a peak: a pool that touches eight cards once and then serializes is the
+failure every multi-card row above is about, and only a mean can tell it from a pool that stays wide. The
+reinjection below averages 3.7 on the same traffic."""
+
+_BUNDLE_CARD_DUTY_FLOOR = 0.50
+"""Fraction of its own post-warm-up time each card must spend sampling. Measured here: 0.52 to 0.74.
+
+One slot per card, so this is the card's own lane sampling for half the clock. A job's window is sixteen
+seconds against a decode tail of one or two and a three-second checkpoint load whenever its class changes,
+so a card given work as it frees sits well above this; half is the line under which the card is waiting on
+the scheduler rather than on the workload. The weakest card is the one seeded with a large-class model,
+which pays the longer load and the longer decode. The reinjection takes its weakest card to 0.11."""
+
+_BUNDLE_UPLOAD_RATIO_CEILING = 1.10
+"""Weight uploads the run may pay per completed job. Measured here: 0.97.
+
+With the measured budget off, retention is inactive by design: no grant is made, so every dispatch commits
+its own weights and one upload per job is what this posture costs. What the ceiling excludes is a job paying
+more than that, which is a copy displaced and re-fetched inside one job's life. The margin over one is for
+the dispatches still in flight when the run ends, which are uploads no completion is counted for yet. The
+retained-copy claim belongs to the rows that run with the budget on."""
+
+_BUNDLE_PRELOAD_RATIO_CEILING = 0.90
+"""Preload commands the run may send per completed job. Measured here: 0.65.
+
+The load the rotation actually costs, as against the per-dispatch commit above: a dozen classes over sixteen
+lanes converges, so most jobs find their class already on a lane and only a model change sends a command. A
+fleet trading copies would send one for most of its dispatches."""
+
+_BUNDLE_WAIT_MEDIAN_GENERATIONS = 2.0
+"""Generations a job may typically wait between being popped and reaching a lane. Measured here: 1.4.
+
+The bundle's own median was five and a half, which is a queue draining through one or two cards while the
+rest of the fleet idles. Holding sixteen jobs over eight sampling slots is itself about one generation of
+queue (the worker's held count includes the jobs already sampling), so a fleet running wide cannot seat the
+median job inside one generation however well it dispatches; twice that is what separates a queue that is
+merely deep from one draining through part of the fleet. The reinjection sits at 4.0."""
+
+_BUNDLE_WAIT_CEILING_GENERATIONS = 5.0
+"""Generations the worst-placed job may wait. Measured here: 3.7.
+
+A job arriving behind a full queue is owed its round of it, and behind a model change it is owed that load
+as well. This is that with margin, which the maximum of a run needs more than its median does: one job
+placed behind an unlucky sequence of arrivals moves it and nothing else. The reinjection reaches 6.3."""
+
+
+@dataclass
+class _BundleRun:
+    """What one run of the fleet-shaped traffic looked like, tick by tick and job by job."""
+
+    cards_sampling: list[int] = field(default_factory=list)
+    """Cards holding an in-progress job at the end of each tick."""
+    waits: dict[str, float] = field(default_factory=dict)
+    """Per dispatched job, the seconds between its pop and the tick it reached sampling."""
+    warm_card_seconds: dict[int, float] = field(default_factory=dict)
+    """Per card, the sampling seconds it had earned by the warm-up cut."""
+    warm_from: float = 0.0
+    """The world clock at the warm-up cut, which every steady-state figure here is measured from."""
+
+    def mean_cards_sampling(self) -> float:
+        """The time-weighted mean number of cards carrying work after the cut.
+
+        Ticks are of equal length, so the mean over ticks is the time-weighted mean.
+        """
+        warm = self.cards_sampling[_BUNDLE_WARMUP_TICKS:]
+        return statistics.fmean(warm) if warm else 0.0
+
+    def warm_duty_on_card(self, world: _DispatchWorld, device_index: int) -> float:
+        """The fraction of the post-warm-up run one card's single sampling slot spent sampling."""
+        elapsed = max(1e-9, world.now - self.warm_from)
+        earned = world.sampling_slot_seconds_by_card[device_index] - self.warm_card_seconds.get(device_index, 0.0)
+        return earned / elapsed
+
+
+def _bundle_world() -> _DispatchWorld:
+    """Eight cards, two lanes each, one sampling slot per card, and the measured VRAM budget switched off.
+
+    The operator posture the support bundle was taken from: a wide fleet with the budget off, a deep intake
+    queue, a dozen classes in rotation and one post-processing lane. Whole-card residency is off and no
+    card's config differs, so nothing but admission, placement and dispatch decides how much of the fleet
+    earns.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=_BUNDLE_CARDS * _BUNDLE_LANES_PER_CARD,
+        max_threads=1,
+        queue_depth=_BUNDLE_QUEUE_DEPTH,
+        whole_card_enabled=False,
+        enable_vram_budget=False,
+        closed_loop=True,
+        service_contexts=True,
+        tick_seconds=_BUNDLE_TICK_SECONDS,
+        card_max_pixels=_BUNDLE_PIXELS,
+        post_process_card_index=_BUNDLE_CHAIN_CARD,
+        post_processing_chain_ticks=_BUNDLE_CHAIN_TICKS,
+        extra_model_classes=(*_FILLER_MODEL_CLASSES, *_ROTATION_MODEL_CLASSES),
+    )
+    for lane_id, model in enumerate(_BUNDLE_ROTATION[:_BUNDLE_CARDS]):
+        world.seed_resident(lane_id, model, in_vram=True)
+        assert world.card_of_lane(lane_id) == lane_id, (
+            "precondition: each seeded class must sit on a card of its own, so every card opens able to serve"
+        )
+    return world
+
+
+async def _drive_bundle_traffic(world: _DispatchWorld) -> _BundleRun:
+    """Keep the intake queue full from the pinned arrival script and record the fleet's shape each tick.
+
+    Intake is FIFO and fixed: whenever the pending queue falls below its depth it is topped up from the next
+    entries of the script, so what the worker is offered never depends on what it has done with what it was
+    already given.
+    """
+    width, height = _BUNDLE_SHAPE
+    run = _BundleRun()
+    popped_at: dict[str, int] = {}
+    arrivals = 0
+    for _ in range(_BUNDLE_TICKS):
+        while len(world.job_tracker.jobs_pending_inference) < _BUNDLE_QUEUE_DEPTH:
+            model, post_processed = _BUNDLE_ARRIVALS[arrivals % len(_BUNDLE_ARRIVALS)]
+            arrivals += 1
+            job = make_job_pop_response(
+                model.name,
+                width=width,
+                height=height,
+                ddim_steps=_bundle_steps(model),
+                post_processing=["RealESRGAN_x4plus"] if post_processed else None,
+            )
+            await world.pop(job)
+            popped_at[str(job.id_)] = world.tick
+        await world.step()
+        busy: set[int] = set()
+        for job in world.job_tracker.jobs_in_progress:
+            lane_id = world.lane_serving(job)
+            if lane_id is not None:
+                busy.add(world.card_of_lane(lane_id))
+        run.cards_sampling.append(len(busy))
+        if world.tick == _BUNDLE_WARMUP_TICKS:
+            run.warm_card_seconds = dict(world.sampling_slot_seconds_by_card)
+            run.warm_from = world.now
+    run.waits = {
+        job_id: (dispatch_tick - popped_tick) * _BUNDLE_TICK_SECONDS
+        for job_id, popped_tick in popped_at.items()
+        if (dispatch_tick := world.first_dispatch.get(job_id)) is not None
+    }
+    return run
+
+
+def _assert_the_fleet_ran_its_workload(world: _DispatchWorld, *, context: str) -> None:
+    """Assert the run put enough work behind it for its steady-state figures to mean anything."""
+    assert world.completed_jobs >= _BUNDLE_JOB_FLOOR, (
+        f"{context}: {world.completed_jobs} jobs completed over {_BUNDLE_TICKS} ticks, under the "
+        f"{_BUNDLE_JOB_FLOOR} the row's medians and duty figures are read from. {world.state_dump()}"
+    )
+
+
+def _assert_the_fleet_kept_its_cards_busy(world: _DispatchWorld, run: _BundleRun, *, context: str) -> None:
+    """Assert the warm fleet ran wide, and that every card in it earned its own share."""
+    mean_cards = run.mean_cards_sampling()
+    assert mean_cards >= _BUNDLE_CONCURRENCY_FLOOR, (
+        f"{context}: the fleet averaged {mean_cards:.1f} of {_BUNDLE_CARDS} cards carrying work over the "
+        f"{len(run.cards_sampling) - _BUNDLE_WARMUP_TICKS} ticks after warm-up, under the "
+        f"{_BUNDLE_CONCURRENCY_FLOOR:.1f} floor, with a {_BUNDLE_QUEUE_DEPTH}-deep queue held full "
+        f"throughout. {world.state_dump()}"
+    )
+    for device_index in sorted(_BUNDLE_PIXELS):
+        duty = run.warm_duty_on_card(world, device_index)
+        assert duty >= _BUNDLE_CARD_DUTY_FLOOR, (
+            f"{context}: card {device_index} sampled {duty:.0%} of the run after warm-up, under the "
+            f"{_BUNDLE_CARD_DUTY_FLOOR:.0%} floor its own lane was expected to hold while the queue was "
+            f"never empty. {world.state_dump()}"
+        )
+
+
+def _assert_no_job_waited_on_the_fleet(world: _DispatchWorld, run: _BundleRun, *, context: str) -> None:
+    """Assert the queue's wait is a generation rather than a backlog, for the median job and the worst one."""
+    assert run.waits, f"{context}: no job reached a lane at all. {world.state_dump()}"
+    median = statistics.median(run.waits.values())
+    assert median < _BUNDLE_WAIT_MEDIAN_GENERATIONS * _BUNDLE_SAMPLE_SECONDS, (
+        f"{context}: the median job waited {median:.1f}s between its pop and its lane, "
+        f"{median / _BUNDLE_SAMPLE_SECONDS:.1f} generations, at or over the "
+        f"{_BUNDLE_WAIT_MEDIAN_GENERATIONS:.1f} the fleet is held to over {len(run.waits)} dispatched jobs. "
+        f"{world.state_dump()}"
+    )
+    worst = max(run.waits.values())
+    assert worst < _BUNDLE_WAIT_CEILING_GENERATIONS * _BUNDLE_SAMPLE_SECONDS, (
+        f"{context}: one job waited {worst:.1f}s for a lane, {worst / _BUNDLE_SAMPLE_SECONDS:.1f} "
+        f"generations, at or over the {_BUNDLE_WAIT_CEILING_GENERATIONS:.1f} a job at the back of a "
+        f"{_BUNDLE_QUEUE_DEPTH}-deep queue is owed. {world.state_dump()}"
+    )
+
+
+def _assert_the_fleet_paid_for_its_weights_once(world: _DispatchWorld, *, context: str) -> None:
+    """Assert residency converged on the rotation instead of trading copies job by job."""
+    completed = max(1, world.completed_jobs)
+    upload_ratio = world.weight_uploads / completed
+    assert upload_ratio <= _BUNDLE_UPLOAD_RATIO_CEILING, (
+        f"{context}: {world.weight_uploads} weight uploads over {world.completed_jobs} completed jobs "
+        f"({upload_ratio:.2f} per job), over the {_BUNDLE_UPLOAD_RATIO_CEILING:.2f} ceiling, so a job's "
+        f"weights are being fetched more than once. {world.state_dump()}"
+    )
+    preload_ratio = len(world.preloads_commanded) / completed
+    assert preload_ratio <= _BUNDLE_PRELOAD_RATIO_CEILING, (
+        f"{context}: {len(world.preloads_commanded)} preloads commanded over {world.completed_jobs} "
+        f"completed jobs ({preload_ratio:.2f} per job), over the {_BUNDLE_PRELOAD_RATIO_CEILING:.2f} "
+        f"ceiling, so the fleet is trading copies rather than holding its rotation. {world.state_dump()}"
+    )
+    assert not world.preload_idle_ticks, (
+        f"{context}: {len(world.preload_idle_ticks)} cycle(s) staged a model and dispatched nothing while a "
+        f"pending job already had a free lane holding its model on a card under its cap, at tick(s) "
+        f"{world.preload_idle_ticks[:5]}. {world.state_dump()}"
+    )
+
+
+async def test_x_a_bundle_shaped_fleet_keeps_its_cards_busy() -> None:
+    """A fleet-shaped workload keeps every card earning, and seats its median job inside one generation.
+
+    Every row above isolates one mechanism. This one runs them together on the shape they were all
+    diagnosed from: eight cards of two lanes at one sampling slot each, the measured VRAM budget off, a
+    sixteen-deep intake queue, a dozen classes in rotation of which most arrivals name one the fleet is
+    already holding, a third of the traffic carrying post-processing onto a single pinned lane, and a
+    generation that takes about sixteen seconds. Under the scheduler that shape was reported against, one to
+    three cards ran at a time and the median job waited five and a half generations for a lane.
+
+    Read as one statement: a fleet given work is a fleet at work. Its consequences are that the warm run
+    averages most of its cards rather than peaking at them once, that each card earns its own duty, that the
+    queue's wait is a round of the queue rather than a backlog, that residency converges on the rotation
+    instead of trading copies, and that no cycle spends a ready lane on a load. Measured on this shape: 160
+    jobs, 7.1 of 8 cards averaged once warm, every card between 52% and 74% duty, a median wait of 1.4
+    generations against a worst of 3.7, 0.97 weight uploads and 0.65 preloads per completed job, and no cycle
+    that staged a model while a ready lane went unseated.
+
+    The row is composite by design: a regression in any of the rules the rows above isolate shows here as
+    throughput lost rather than only in that rule's own row.
+
+    What this does not model: the horde's own offer response (the arrival script stands in for it), real
+    checkpoint load times and disk behaviour, safety-check latency, and WDDM's paging cliff. Its intake also
+    follows the worker's own accounting, where the held count covers the jobs already sampling, so sixteen
+    held is about eight queued behind eight running. It is a throughput claim about the scheduler over a card
+    whose physics are the world's, not a benchmark.
+    """
+    world = _bundle_world()
+
+    run = await _drive_bundle_traffic(world)
+
+    context = "bundle-shaped fleet"
+    _assert_the_fleet_ran_its_workload(world, context=context)
+    _assert_the_fleet_kept_its_cards_busy(world, run, context=context)
+    _assert_no_job_waited_on_the_fleet(world, run, context=context)
+    _assert_the_fleet_paid_for_its_weights_once(world, context=context)
+
+
+async def test_x_defect_reinjection_a_head_bound_selector_stalls_the_whole_fleet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the cross-card walk removed, the same traffic runs behind its head and the queue backs up.
+
+    Reinjected at the selector alone, as the four-card row does: every gate, price and placement rule is
+    production's and the only thing taken away is resuming the queue walk when the head's card cannot seat
+    it. That single change is what the bundle's fleet-wide stall was, and both of this row's throughput
+    claims are made of it.
+    """
+    monkeypatch.setattr(
+        InferenceScheduler,
+        "_select_cross_card_job",
+        lambda *_args, **_kwargs: None,
+    )
+    world = _bundle_world()
+
+    run = await _drive_bundle_traffic(world)
+
+    with pytest.raises(AssertionError, match="cards carrying work|sampled"):
+        _assert_the_fleet_kept_its_cards_busy(world, run, context="head-bound selector")
+    with pytest.raises(AssertionError, match="the median job waited"):
+        _assert_no_job_waited_on_the_fleet(world, run, context="head-bound selector")

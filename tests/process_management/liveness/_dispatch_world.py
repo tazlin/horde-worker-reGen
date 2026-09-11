@@ -196,7 +196,19 @@ Model->process affinity protects the last copy of every wanted model, so a row a
 needs one distinct class per lane. They are opt-in per world rather than part of the default pool because
 every row's advertised set and every card's served set are built from that pool."""
 
-_KNOWN_MODEL_CLASSES = (*_MODEL_CLASSES, *_FILLER_MODEL_CLASSES)
+_SD15_G = _ModelClass("sd15_g", "sd15-checkpoint-g", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SD15_H = _ModelClass("sd15_h", "sd15-checkpoint-h", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SD15_I = _ModelClass("sd15_i", "sd15-checkpoint-i", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SDXL_C = _ModelClass("sdxl_c", "sdxl-checkpoint-c", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
+
+_ROTATION_MODEL_CLASSES = (_SD15_G, _SD15_H, _SD15_I, _SDXL_C)
+"""Further classes for a row whose rotation is wider than the pool and the fillers together.
+
+A fleet holds a rotation of a dozen or so classes across its cards at any moment, which is more than either
+group above supplies, and the second weight class in here keeps such a rotation from being uniform: a card's
+residency decisions are only interesting where what it holds costs different amounts."""
+
+_KNOWN_MODEL_CLASSES = (*_MODEL_CLASSES, *_FILLER_MODEL_CLASSES, *_ROTATION_MODEL_CLASSES)
 """Every class the world can resolve weights and timings for, whatever pool a given row serves."""
 
 _SAFETY_PROCESS_ID = 100
@@ -779,6 +791,12 @@ class _DispatchWorld:
 
         A weight upload the run paid for. A row that asserts a placement rule spreads copies rather than
         thrashing them reads its cost here."""
+        self._preload_commands_standing: set[tuple[int, str]] = set()
+        """The load commands the parent's map was carrying at the previous tick, as (lane, model).
+
+        What separates one command from the same command still standing: an entry that was there last tick is
+        the same send, while a lane newly named for a model is a send of its own however long the lane has
+        been the target of some other load."""
         self.preload_idle_ticks: list[int] = []
         """Ticks where staging a model cost a lane that had work waiting for it.
 
@@ -1672,23 +1690,33 @@ class _DispatchWorld:
         The command is booked against the world clock rather than applied to the lane: a lane reports the load
         only once its report latency has passed, so the parent's optimistic map entry and the slot's own state
         can disagree for as long as a real child's wake takes.
+
+        Counting a command and materialising it are separate questions. A lane already holding another model's
+        staged copy takes the command and is not given a second pending load, but the parent sent it and the
+        weights it names are a cost the run committed to, so it is counted either way; the materialisation
+        guard below decides only what the world's card then does about it.
         """
+        commanded: set[tuple[int, str]] = set()
         for name, info in list(self._model_map.root.items()):
             if info.horde_model_load_state != ModelLoadState.LOADING or info.process_id is None:
-                continue
-            if info.process_id in self._loading or info.process_id in self._staged_mb:
                 continue
             model = _model_by_name(name)
             if model is None:
                 continue
+            command = (info.process_id, name)
+            commanded.add(command)
+            if command not in self._preload_commands_standing:
+                self.preloads_commanded.append((self.tick, info.process_id, name))
+            if info.process_id in self._loading or info.process_id in self._staged_mb:
+                continue
             report_at = self.now + self.preload_report_latency_seconds
-            self.preloads_commanded.append((self.tick, info.process_id, name))
             self._loading[info.process_id] = _PendingPreload(
                 model=name,
                 weights_mb=self._actual_charge_mb(model.weights_mb),
                 report_at=report_at,
                 ready_at=report_at + self.preload_latency_seconds,
             )
+        self._preload_commands_standing = commanded
         self._advance_preloads()
 
     def _advance_preloads(self) -> None:
@@ -1814,11 +1842,16 @@ class _DispatchWorld:
         Job ids rather than a single verdict, because seatability is only half the question: a job the
         dispatch gate is holding is not seatable however free its lane is, and the gate records that hold
         while its own pass runs, after this is read.
+
+        The tracker's pending-inference view deliberately keeps a job in it while that job is sampling, so a
+        job already in progress is excluded here as the scheduler's own placement walk excludes it: a running
+        job is not work some other lane could have been given.
         """
         cap = max(1, int(self._scheduler._runtime_config.bridge_data.max_threads))
+        in_progress = {str(job.id_) for job in self._job_tracker.jobs_in_progress}
         seatable: set[str] = set()
         for job in self._job_tracker.jobs_pending_inference:
-            if job.model is None or job.id_ is None:
+            if job.model is None or job.id_ is None or str(job.id_) in in_progress:
                 continue
             for lane in self._process_map.values():
                 if lane.process_type is not HordeProcessType.INFERENCE:
