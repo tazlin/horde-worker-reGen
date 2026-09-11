@@ -20,7 +20,8 @@ from horde_worker_regen.analysis.diagnose import SessionDiagnosisView, SessionSu
 from horde_worker_regen.app_state import AppStateStore
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.tui.app import HordeWorkerTUI
-from horde_worker_regen.tui.widgets.diagnostics import DiagnosticsView, FindingCard
+from horde_worker_regen.tui.widgets.diagnostics import DiagnosticsView
+from horde_worker_regen.tui.widgets.finding_card import FindingCard
 from tests.tui._fake_supervisor import FakeSupervisor
 
 pytestmark = pytest.mark.slow

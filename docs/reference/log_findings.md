@@ -1,7 +1,7 @@
 # Log findings
 
-Every finding `horde-log diagnose` can emit, with the id it prints, the severity it carries, what makes
-it fire, and what to do about it. The id is the stable handle: it is what the JSON output keys on, what
+Every finding `horde-log diagnose` can emit, and every one the dashboard's Insights tab reads off the
+running worker, with the id it prints, the severity it carries, what makes it fire, and what to do about it. The id is the stable handle: it is what the JSON output keys on, what
 the dashboard's Diagnostics tab shows, and what a `see also:` line points at.
 
 The ids are declared as `FindingKind` members in `horde_worker_regen/analysis/finding_kinds.py`, one
@@ -87,3 +87,23 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 | Id | Severity | Fires when | Remedy |
 |----|----------|------------|--------|
 | `session_summary` | varies | Always, once per session. Says how the session ended and how long it ran, with the worker version, model count, recovery counts and any rotated archives folded into the parse in the evidence. | Nothing; it is the header the other findings are read against. |
+
+## Live dashboard
+
+These are read from the running worker's state by the dashboard's Insights tab, never from a log, so
+`horde-log diagnose` does not emit them. The Insights tab also shows `consecutive_failure_pause` when
+the worker has paused itself and `forced_maintenance` (as a note) while maintenance is on. They use the
+same card, badge words and copy rules as the log findings, and their thresholds live in
+`horde_worker_regen/tui/recommendations.py`.
+
+| Id | Severity | Fires when | Remedy |
+|----|----------|------------|--------|
+| `fault_rate` | warning | More than a tenth of this session's finished jobs failed, over at least ten jobs. | Check the Logs tab for the cause. Drop the models that fail most, or lower `max_power` or `max_batch`. |
+| `vram_pressure` | warning | A process's peak VRAM use is within a few percent of the card's total. | Lower `max_batch` or `max_power`, or turn off `safety_on_gpu`, so the card keeps room. |
+| `low_duty_cycle` | suggestion | The GPU was sampling under half the time while work was waiting. | Raise `max_threads` or `queue_size` so a second job can load while one runs; otherwise put models on an SSD and keep the list short. |
+| `low_demand_idle` | suggestion | More than ten minutes of the session had no jobs available. | Offer more models or raise `max_power` to be offered more jobs. |
+| `extra_slow_batching` | suggestion | `extra_slow_worker` is on with `max_batch` above 1. | Set `max_batch` to 1. |
+| `model_pool_off_swaps` | suggestion | The pool is off and the session has recorded several model loads that pushed another model out. | Try the model pool or its demand-following preset; leave it off if variety is the point. |
+| `model_pool_stale_demand` | warning | The pool's demand reading is over fifteen minutes old. | Check the worker's connection to the horde; the pool holds its seats until a fresh reading arrives. |
+| `model_pool_unproductive_seats` | suggestion | A seat keeps getting empty requests, or has matched nothing in ten minutes since seating. | Review the pinned models, or turn on the ranker in the `model_pool` settings. |
+| `model_pool_resident_matches` | info | A seat matched a job while its model was already loaded in the last few minutes, and no pool issue is outstanding. | Nothing; the pool is doing its job. |

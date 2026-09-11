@@ -331,11 +331,15 @@ config reload.
 
 ### Insights
 
-Live recommendations drawn from what this worker measured: low GPU duty cycle, VRAM pressure, fault
-rate, idle time, configuration mismatches, and model-pool guidance, plus a recent-activity rollup.
+Live findings drawn from what this worker measured: low GPU duty cycle, VRAM pressure, fault rate,
+idle time, configuration mismatches, and model-pool guidance, plus a recent-activity rollup. Each finding
+is the same card the Diagnostics tab uses: a badge saying what to do with it, a one-line headline, a
+"Do this" line, and a collapsed "Details" section. The catalogue in
+[Findings](../reference/log_findings.md#live-dashboard) lists them. When nothing is worth saying the
+panel says the worker looks healthy.
 
 The **Model pool** panel is always present. With the pool off it reads `Model pool: off` and notes the
-throughput-versus-variety trade, and a recommendation appears only after measured `model_swap` churn.
+throughput-versus-variety trade, and a finding appears only after measured `model_swap` churn.
 With the pool on it lists each seat, its measured readiness (`resident`, `cold`, or `empty`), dwell,
 last pop-match age and whether that match was resident, empty pops, rescue countdown, the most recent
 routed lane, the demand-snapshot age, and the benched models. It flags stale demand and seats that keep

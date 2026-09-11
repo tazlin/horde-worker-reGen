@@ -1,4 +1,10 @@
-"""The insights view: actionable recommendations plus a recent-activity summary."""
+"""The insights view: live findings plus a recent-activity summary.
+
+The findings come from :func:`horde_worker_regen.tui.recommendations.analyze` over the latest worker
+snapshot and are shown with the same card the Diagnostics tab uses for a log finding, so the two tabs
+read alike. Snapshots arrive every few seconds; the cards are rebuilt only when the findings change, so
+an open "Details" section stays open while the numbers behind it stand.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +13,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static
 
+from horde_worker_regen.analysis.finding_kinds import Finding
 from horde_worker_regen.process_management.ipc.supervisor_channel import ModelPoolSnapshot, WorkerStateSnapshot
 from horde_worker_regen.tui.formatters import human_bytes, human_duration
 from horde_worker_regen.tui.recommendations import analyze
+from horde_worker_regen.tui.widgets.finding_card import FindingCard
 
 _SEAT_SOURCE_GLYPHS: dict[str, tuple[str, str]] = {
     "MANUAL": ("M", "yellow"),
@@ -26,20 +34,72 @@ _BENCH_ROWS_SHOWN = 3
 
 
 class InsightsView(VerticalScroll):
-    """Live recommendations plus a recent-activity rollup and a benchmark pointer."""
+    """Live findings plus a recent-activity rollup and a benchmark pointer."""
+
+    DEFAULT_CSS = """
+    InsightsView #insights-findings {
+        height: auto;
+        border: round $accent;
+        border-title-color: $accent;
+        padding: 0 1;
+        margin: 0 0 1 0;
+    }
+    InsightsView #insights-findings-message {
+        height: auto;
+    }
+    InsightsView #insights-findings-cards {
+        height: auto;
+    }
+    """
+
+    def __init__(self) -> None:
+        """Start with no findings shown and no card generation issued."""
+        super().__init__()
+        self._shown_findings: list[tuple[str, str, str, str]] = []
+        self._cards_generation = 0
 
     def compose(self) -> ComposeResult:
-        """Hold the recommendations, activity, model-pool, and benchmark-hint panels."""
-        yield Static(id="insights-recommendations")
+        """Hold the findings, activity, model-pool, and benchmark-hint panels."""
+        with Vertical(id="insights-findings") as findings:
+            findings.border_title = "Findings"
+            yield Static(
+                Text("Waiting for the first worker snapshot.", style="grey50"), id="insights-findings-message"
+            )
+            yield Vertical(id="insights-findings-cards")
         yield Static(id="insights-activity")
         yield Static(id="insights-model-pool")
         yield Static(self._benchmark_hint(), id="insights-benchmark")
 
     def update_snapshot(self, snapshot: WorkerStateSnapshot) -> None:
-        """Recompute recommendations, the activity summary, and the model-pool panel from a snapshot."""
-        self.query_one("#insights-recommendations", Static).update(self._render_recommendations(snapshot))
+        """Recompute the findings, the activity summary, and the model-pool panel from a snapshot."""
+        self._update_findings(analyze(snapshot))
         self.query_one("#insights-activity", Static).update(self._render_activity(snapshot))
         self._update_model_pool(snapshot.model_pool)
+
+    def _update_findings(self, findings: list[Finding]) -> None:
+        """Show the findings as cards, rebuilding them only when what they say has changed."""
+        shown = [(finding.id, finding.severity.value, finding.headline, finding.action) for finding in findings]
+        if shown == self._shown_findings:
+            return
+        self._shown_findings = shown
+        message = self.query_one("#insights-findings-message", Static)
+        if not findings:
+            message.update(Text("No issues found. The worker looks healthy.", style="green"))
+        message.display = not findings
+        # Removal is asynchronous in Textual, so the mount runs as the next callback on this widget's own
+        # queue and awaits the removal first; a render superseded by a newer snapshot mounts nothing.
+        self._cards_generation += 1
+        self.call_next(self._mount_cards, findings, self._cards_generation)
+
+    async def _mount_cards(self, findings: list[Finding], generation: int) -> None:
+        """Replace the cards container's children with one card per finding, in order."""
+        if generation != self._cards_generation:
+            return
+        cards = self.query_one("#insights-findings-cards", Vertical)
+        await cards.remove_children()
+        if generation != self._cards_generation:
+            return
+        await cards.mount_all(FindingCard(finding) for finding in findings)
 
     def _update_model_pool(self, pool: ModelPoolSnapshot | None) -> None:
         """Render the model-pool panel, showing a one-line off-state with guidance when the pool is disabled."""
@@ -68,19 +128,6 @@ class InsightsView(VerticalScroll):
             ),
         )
         return Panel(body, title="Model pool", title_align="left", border_style="grey37")
-
-    def _render_recommendations(self, snapshot: WorkerStateSnapshot) -> Panel:
-        """Render the recommendation list as a bordered panel."""
-        rows = []
-        for item in analyze(snapshot):
-            badge = Text(f" {item.severity.label} ", style=item.severity.colour)
-            rows.append(
-                Group(
-                    Text.assemble(badge, ("  ", ""), (item.title, "bold")),
-                    Text(f"    {item.detail}", style="grey70"),
-                ),
-            )
-        return Panel(Group(*rows), title="Recommendations", title_align="left", border_style="cyan")
 
     def _render_activity(self, snapshot: WorkerStateSnapshot) -> Panel:
         """Render a rollup of recent finished jobs."""

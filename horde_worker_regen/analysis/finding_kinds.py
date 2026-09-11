@@ -107,6 +107,17 @@ class FindingKind(enum.StrEnum):
 
     SESSION_SUMMARY = "session_summary"
 
+    # Read from the running worker's state by the dashboard's Insights tab, never from a log.
+    FAULT_RATE = "fault_rate"
+    VRAM_PRESSURE = "vram_pressure"
+    LOW_DUTY_CYCLE = "low_duty_cycle"
+    LOW_DEMAND_IDLE = "low_demand_idle"
+    EXTRA_SLOW_BATCHING = "extra_slow_batching"
+    MODEL_POOL_OFF_SWAPS = "model_pool_off_swaps"
+    MODEL_POOL_STALE_DEMAND = "model_pool_stale_demand"
+    MODEL_POOL_UNPRODUCTIVE_SEATS = "model_pool_unproductive_seats"
+    MODEL_POOL_RESIDENT_MATCHES = "model_pool_resident_matches"
+
 
 @dataclass(frozen=True)
 class FindingSpec:
@@ -628,6 +639,107 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "Always present. It says how the session ended and how long it ran. The worker version, model "
             "count and process recovery counts are in the evidence, so the other findings are read against "
             "the right span of log."
+        ),
+    ),
+    # --- Live dashboard (read from the running worker, not the log) ---
+    FindingSpec(
+        kind=FindingKind.FAULT_RATE,
+        title="Many jobs are failing",
+        action=(
+            "Check the Logs tab for the cause. Drop the models that fail most, or lower `max_power` or `max_batch`."
+        ),
+        detail=(
+            "The failed share is measured over this session's finished jobs. The horde reissues each failed "
+            "job and counts it against the worker, and a steady rate leads to forced maintenance."
+        ),
+        see_also=FindingKind.FAULTED_JOB_CENSUS,
+    ),
+    FindingSpec(
+        kind=FindingKind.VRAM_PRESSURE,
+        title="A process is close to filling the card",
+        action=(
+            "Lower `max_batch` or `max_power`, or turn off `safety_on_gpu`, so the card keeps room and "
+            "out-of-memory faults stay away."
+        ),
+        detail=(
+            "The reading is the process's peak use against the card's total. Near the top, one larger job or "
+            "a second model tips the card into an out-of-memory fault."
+        ),
+        see_also=FindingKind.OOM,
+    ),
+    FindingSpec(
+        kind=FindingKind.LOW_DUTY_CYCLE,
+        title="The GPU is idle between jobs",
+        detail=(
+            "Duty cycle is the share of time the card spends sampling. With work waiting, a low share means "
+            "jobs wait on model loads or on the stages before and after sampling rather than on the card."
+        ),
+        reference_page="docs/explanation/duty-cycle.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.LOW_DEMAND_IDLE,
+        title="The worker has little work to do",
+        action="Offer more models or raise `max_power` to be offered more jobs.",
+        detail=(
+            "Time with no jobs available is counted across the session. The horde offers jobs by what the "
+            "worker can serve, so a wider model list or larger jobs bring more."
+        ),
+    ),
+    FindingSpec(
+        kind=FindingKind.EXTRA_SLOW_BATCHING,
+        title="Batching on an extra-slow worker",
+        action="Set `max_batch` to 1.",
+        detail=(
+            "`extra_slow_worker` tells the horde to send this worker easy jobs, but `max_batch` above 1 lets "
+            "it take batches that run for a long time and risk the deadline."
+        ),
+    ),
+    FindingSpec(
+        kind=FindingKind.MODEL_POOL_OFF_SWAPS,
+        title="Models keep swapping with the model pool off",
+        action=(
+            "Try the model pool or its demand-following preset. Leave it off if serving a wide variety of "
+            "models is the point."
+        ),
+        detail=(
+            "The session counter records loads that pushed another model out. The pool steers requests "
+            "toward a small set of seated models, which cuts swaps while they stay loaded at the cost of "
+            "variety."
+        ),
+        see_also=FindingKind.MODEL_CHURN,
+    ),
+    FindingSpec(
+        kind=FindingKind.MODEL_POOL_STALE_DEMAND,
+        title="The model pool's demand reading is stale",
+        action=(
+            "Check the worker's connection to the horde. Until a fresh reading arrives the pool keeps its "
+            "current seats rather than re-ranking them."
+        ),
+        detail=(
+            "The pool ranks models by horde demand, refreshed on a timer. An old reading means the ranker "
+            "is acting on a frozen signal."
+        ),
+    ),
+    FindingSpec(
+        kind=FindingKind.MODEL_POOL_UNPRODUCTIVE_SEATS,
+        title="Model pool seats are not getting work",
+        action=(
+            "Review the pinned models, or turn on the ranker in the `model_pool` settings so the seats go "
+            "to models with demand."
+        ),
+        detail=(
+            "A seat is charged when its requests come back empty or when it has matched nothing since "
+            "seating, and enough charge demotes it. Persistent empties mean the horde has little demand "
+            "for that model on this card."
+        ),
+    ),
+    FindingSpec(
+        kind=FindingKind.MODEL_POOL_RESIDENT_MATCHES,
+        title="The model pool is matching jobs to loaded models",
+        action="Nothing to do. The pool is doing its job.",
+        detail=(
+            "A match counted here was accepted while its model was already loaded, so no cold load was "
+            "paid. Job completion is tracked separately."
         ),
     ),
 )
