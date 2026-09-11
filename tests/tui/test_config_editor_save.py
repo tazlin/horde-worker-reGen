@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,20 @@ def _plain(static: Static) -> str:
     """Return visible Static content without Rich styling."""
     renderable = static.render()
     return renderable.plain if isinstance(renderable, Text) else str(renderable)
+
+
+async def _wait_until(pilot: object, condition: Callable[[], bool], *, what: str) -> None:
+    """Drive the app until ``condition`` holds.
+
+    A widget change reaches its handler through the message queue, so how many pauses it takes depends on
+    the host's load, not on the code under test.
+    """
+    for _ in range(200):
+        await pilot.pause()  # type: ignore[attr-defined]
+        if condition():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {what}")
 
 
 @pytest.mark.e2e
@@ -511,9 +527,8 @@ async def test_live_validation_warnings_are_persistent_before_save(tmp_path: Pat
         assert warning_strip.display is False
 
         editor.query_one("#cfg-allow_img2img", Switch).value = False
-        await pilot.pause()
+        await _wait_until(pilot, lambda: warning_strip.display, what="the warning strip to show")
 
-        assert warning_strip.display is True
         assert "Blocking config issue" in _plain(warning_strip)
         assert "inpainting requires" in _plain(warning_strip)
 
