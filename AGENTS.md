@@ -136,6 +136,9 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   scenarios, golden traces, the bounded matrix, the chaos core slice): they are in the default sweep, ordered
   after the rest of `process_management`, and cost seconds each, so an iteration gate is
   `-m "not closed_loop"` plus the rows named for the change, and the whole band runs once before a commit.
+  That whole-band run takes `-n auto` (`pytest-xdist`, a dev dependency that is never on by default) on its
+  own selection; `CONTRIBUTING.md` carries the command and the two caveats, chiefly that the suite's
+  fastest-first run order is a serial property.
   Every run prints its thirty slowest tests (`--durations` is in `addopts`); read them off the tee before
   reaching for a stopwatch.
 - **Rerun the failure, not the band.** Every `FAILED` line carries a node id; rerun exactly that
