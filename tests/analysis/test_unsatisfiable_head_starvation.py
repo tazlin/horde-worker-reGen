@@ -43,7 +43,7 @@ class TestUnsatisfiableHeadStarvation:
         finding = findings["unsatisfiable_head_starvation"]
         assert finding.severity is Severity.CRITICAL
         assert "AlbedoBase XL" in finding.headline
-        assert "280s" in finding.headline  # the measured starvation arithmetic from the log line
+        assert "280s" in " ".join(finding.evidence)  # the measured starvation arithmetic from the log line
 
     def test_warns_when_give_up_resolves_it(self, tmp_path: Path) -> None:
         """A save-our-ship give-up within the window downgrades the finding to a warning."""
@@ -75,9 +75,9 @@ class TestWatchIntegration:
         (tmp_path / "bridge.log").write_text(_bridge(), encoding="utf-8")
         bundle = LogBundle.from_path(tmp_path)
         alerts, state = watch_pass(bundle, WatchState())
-        assert any("persistently starved" in alert.lower() for alert in alerts)
+        assert any("held back" in alert.lower() for alert in alerts)
         alerts_again, _ = watch_pass(bundle, state)
-        assert not any("persistently starved" in alert.lower() for alert in alerts_again)
+        assert not any("held back" in alert.lower() for alert in alerts_again)
 
     def test_absent_on_healthy_logs(self, tmp_path: Path) -> None:
         """A healthy session (no head starvation) produces no starvation alert."""
@@ -86,4 +86,4 @@ class TestWatchIntegration:
             encoding="utf-8",
         )
         alerts, _ = watch_pass(LogBundle.from_path(tmp_path), WatchState())
-        assert not any("persistently starved" in alert.lower() for alert in alerts)
+        assert not any("held back" in alert.lower() for alert in alerts)

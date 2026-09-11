@@ -741,22 +741,18 @@ def detect_oom(context: SessionContext) -> list[Finding]:
     sibling_counts = [len(_OOM_SIBLING_RE.findall(r.message)) for r in oom]
     max_siblings = max(sibling_counts, default=0)
 
-    verdict = f"{len(oom)} out-of-memory fault(s) during the session"
+    verdict = f"{len(oom)} out-of-memory faults"
     if models:
-        verdict += f", faulting {_clause_join([f'`{m}`' for m in models])}"
+        verdict += f" on {_clause_join([f'"{m}"' for m in models])}"
     if slots:
-        verdict += f" on slot(s) {_clause_join([str(s) for s in slots])}"
-    verdict += "."
+        verdict += f" in processes {_clause_join([str(s) for s in slots])}"
     if free_vrams:
-        verdict += f" The allocator reported as little as {min(free_vrams):.0f} MiB free at the fault"
+        verdict += f", with as little as {min(free_vrams):.0f} MiB free"
         if max_siblings:
             # A sibling count here is (co-resident processes) - 1 (the message excludes the faulting
             # process's own line), so +1 to state the total sharing the card.
-            verdict += (
-                f", with {max_siblings + 1} processes co-resident on the card: the over-admission "
-                "fingerprint (many models sharing one device), not a single model too large to fit"
-            )
-        verdict += "."
+            verdict += f" and {max_siblings + 1} processes sharing the card"
+    verdict += "."
 
     return [
         Finding(
@@ -797,7 +793,7 @@ def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
     )
     timestamps = [r.timestamp for r in faults if r.timestamp is not None]
     window_minutes = (timestamps[-1] - timestamps[0]).total_seconds() / 60 if len(timestamps) >= 2 else 0.0
-    window_clause = f" over a {window_minutes:.0f}-minute poisoned window" if window_minutes >= 1 else ""
+    window_clause = f" over {window_minutes:.0f} minutes" if window_minutes >= 1 else ""
 
     # A recovery that replaced the affected slot after the leak (the "failed to load model" path), which is
     # the only thing that clears the poisoned process; naming it confirms the slot was eventually recycled.
@@ -806,15 +802,15 @@ def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
         None,
     )
 
-    slot_clause = f" on slot(s) {_clause_join([str(s) for s in slots])}" if slots else ""
-    model_clause = f" serving {_clause_join([f'`{m}`' for m in models])}" if models else ""
+    slot_clause = f" in processes {_clause_join([str(s) for s in slots])}" if slots else ""
+    model_clause = f" while serving {_clause_join([f'"{m}"' for m in models])}" if models else ""
     resource_clause = (
-        f" The refused opens include {_clause_join([f'`{path}`' for path in resources[:4]])}." if resources else ""
+        f"The refused opens include {_clause_join([f'"{path}"' for path in resources[:4]])}. " if resources else ""
     )
     recovery_clause = (
-        f" The recovery supervisor eventually replaced the slot ({recovery.reason})."
+        f'The worker replaced the process, giving "{recovery.reason}".'
         if recovery is not None
-        else " No slot replacement was recorded, so the process may have stayed poisoned until the session ended."
+        else "No replacement was recorded, so the process may have stayed broken until the session ended."
     )
 
     return [
@@ -822,14 +818,12 @@ def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
             kind=FindingKind.FILE_DESCRIPTOR_EXHAUSTION,
             severity=Severity.CRITICAL,
             headline=(
-                f"An inference process hit its per-process file-descriptor ceiling (errno 24, EMFILE) "
-                f"{len(faults)} time(s){slot_clause}{model_clause}{window_clause}. Once over RLIMIT_NOFILE "
-                f"every open() is refused, so the process faults every job while still heart-beating (the "
-                f"silence watchdog cannot see it).{resource_clause}{recovery_clause} The named model is "
-                "whatever was running when the ceiling was hit, not the cause: this is a descriptor leak, "
-                "distinct from a CUDA OOM despite sharing the generic 'produced no results' fault text."
+                f"A process ran out of file handles {len(faults)} times{slot_clause}{model_clause}{window_clause}."
             ),
-            evidence=[_evidence(r) for r in faults[:4]] + ([_evidence(recovery.record)] if recovery else []),
+            action_addendum=recovery_clause,
+            evidence=([resource_clause.strip()] if resource_clause else [])
+            + [_evidence(r) for r in faults[:4]]
+            + ([_evidence(recovery.record)] if recovery else []),
         ),
     ]
 
@@ -843,11 +837,7 @@ def detect_swallowed_oom(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.SWALLOWED_OOM,
             severity=Severity.WARNING,
-            headline=(
-                f"{len(no_images)} job(s) faulted with a generic 'no images produced' message. ComfyUI can "
-                "swallow a CUDA OOM into this generic failure, so the resource-failure breaker may never "
-                "fire even though the cause was memory pressure."
-            ),
+            headline=f'{len(no_images)} jobs failed with a plain "no images produced" message and no cause given.',
             evidence=[_evidence(r) for r in no_images[:4]],
         ),
     ]
@@ -981,7 +971,7 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
     durations = [int(m.group("seconds")) for r in starved if (m := _HEAD_STARVATION_MODEL_RE.search(r.message))]
     free_vrams = [int(m.group("free")) for r in starved if (m := _HEAD_STARVATION_AVAILABLE_RE.search(r.message))]
     max_starved = max(durations) if durations else 0
-    free_hint = f" with as much as {max(free_vrams)} MB free VRAM on the device" if free_vrams else ""
+    free_hint = f" with as much as {max(free_vrams)} MB free" if free_vrams else ""
 
     soft_resets = _matching(context.session.records, _SOFT_RESET_RE)
     dropped = _total_dropped_jobs(context.session.records)
@@ -993,18 +983,11 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
                 kind=FindingKind.SCHEDULER_STARVATION_WEDGE,
                 severity=Severity.CRITICAL,
                 headline=(
-                    f"The VRAM budget deferred head-of-queue job(s) on an idle device for up to {max_starved}s"
-                    f"{free_hint}, far more headroom than the head needed. The starved queue deadlocked, the "
-                    f"recovery supervisor soft-reset the pools {len(soft_resets)} time(s) and faulted {dropped} "
-                    "backlog job(s). Those faults are what the horde counts as dropped jobs."
+                    f"The VRAM budget held the next job back for up to {max_starved} seconds on an idle card, "
+                    f"then rebuilt the processes and dropped {dropped} jobs."
                 ),
-                action_addendum=(
-                    "The budget was over-conservative for this device (free VRAM was ample), most often because "
-                    "rapid idle-process cycling left no settled baseline to size per-process overhead from. "
-                    "Reduce churn (unload_models_from_vram_often / high_performance_mode) or relax the VRAM "
-                    "budget so the head admits before the starvation timer trips the supervisor."
-                ),
-                evidence=[_evidence(r) for r in (starved[:2] + soft_resets[:1])],
+                evidence=[f"Rebuilt {len(soft_resets)} times{free_hint}."]
+                + [_evidence(r) for r in (starved[:2] + soft_resets[:1])],
                 see_also=FindingKind.FORCED_MAINTENANCE,
             ),
         ]
@@ -1012,17 +995,13 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.SCHEDULER_STARVATION_WEDGE,
             severity=Severity.WARNING,
-            title_override="Head-of-queue budget starvation (recovered)",
+            title_override="The VRAM budget held the next job back, then let it through",
             headline=(
-                f"The VRAM budget deferred head-of-queue job(s) on an idle device for up to {max_starved}s"
-                f"{free_hint}, but the wedge cleared before it escalated to a soft reset. A near-miss: "
-                "the budget is close to starving the scheduler on this device."
+                f"The VRAM budget held the next job back for up to {max_starved} seconds on an idle card, "
+                "then let it through."
             ),
-            action_addendum=(
-                "Watch for recurrence under load; if it escalates to soft resets and faulted jobs, treat it as a "
-                "wedge (reduce process churn or relax the VRAM budget)."
-            ),
-            evidence=[_evidence(r) for r in starved[:3]],
+            action_addendum="Watch for it under load.",
+            evidence=([f"Held back{free_hint}."] if free_hint else []) + [_evidence(r) for r in starved[:3]],
         ),
     ]
 
@@ -1067,7 +1046,7 @@ def detect_unsatisfiable_head_starvation(context: SessionContext) -> list[Findin
     free_vrams = [
         int(m.group("free")) for record, _ in entries if (m := _HEAD_STARVATION_AVAILABLE_RE.search(record.message))
     ]
-    free_hint = f", with as much as {max(free_vrams)} MB free VRAM on the device" if free_vrams else ""
+    free_hint = f" with as much as {max(free_vrams)} MB free" if free_vrams else ""
 
     storm_start = min(timestamps) if timestamps else None
     corrective = _matching(context.session.records, _GIVE_UP_RE) + _matching(
@@ -1079,24 +1058,17 @@ def detect_unsatisfiable_head_starvation(context: SessionContext) -> list[Findin
         for record in corrective
     )
 
+    outcome = "the worker eventually gave up or paused" if resolved else "nothing ever cleared it"
     verdict = (
-        f"Head-of-queue `{model}` was deferred with no verified progress {len(entries)} time(s) over "
-        f"{idle_window:.0f}s (up to {max_starved}s starved{free_hint}): far more headroom and time than the "
-        "head needed. The same model kept reaching the head and being deferred on an idle device."
+        f'"{model}" was held back {len(entries)} times over {idle_window:.0f} seconds on an idle card, and {outcome}.'
     )
-    if resolved:
-        verdict += " The worker eventually gave up on the backlog or paused pops, so it did not stay silently wedged."
-    else:
-        verdict += (
-            " No give-up or pop-hold ever cleared it within the window: the head is effectively unschedulable "
-            "and the queue is silently wedged behind it."
-        )
+    stretch = f"Held back for up to {max_starved}s at a stretch{free_hint}."
     return [
         Finding(
             kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,
             severity=Severity.WARNING if resolved else Severity.CRITICAL,
             headline=verdict,
-            evidence=[_evidence(record) for record, _ in (entries[:2] + entries[-1:])],
+            evidence=[stretch] + [_evidence(record) for record, _ in (entries[:2] + entries[-1:])],
         ),
     ]
 
@@ -1478,13 +1450,8 @@ def detect_whole_card_convergence_wedge(context: SessionContext) -> list[Finding
             kind=FindingKind.WHOLE_CARD_CONVERGENCE_WEDGE,
             severity=Severity.CRITICAL,
             headline=(
-                f"A pre-staged whole-card head was parked {len(wedges)} time(s) because something the residency's "
-                "teardown gate waits on never left the card: an idle sibling process still holding a model queued "
-                "behind the head, or a service lane (component or post-processing) whose context the gate requires "
-                "gone. The residency never collapsed to sole residency and the head was deferred until the recovery "
-                "supervisor acted. The convergence is meant to stop that sibling (sparing only the head's holder) "
-                "and to order every lane the gate waits on off-GPU, so this indicates the convergence teardown did "
-                "not engage for this process/queue shape."
+                f"A model that needs the whole card was refused {len(wedges)} times because something never "
+                "left the card to make room."
             ),
             evidence=[_evidence(r) for r in wedges[:3]],
         ),
@@ -1513,14 +1480,12 @@ def detect_whole_card_nonhead_residency_starvation(context: SessionContext) -> l
             kind=FindingKind.WHOLE_CARD_NONHEAD_RESIDENCY_STARVATION,
             severity=Severity.CRITICAL if escalated else Severity.WARNING,
             headline=(
-                f"The head of the queue was parked {len(starvations)} time(s) because a whole-card residency was "
-                "held for a different (non-head) model, which reserved the card and tore down the processes "
-                "serving the head. "
+                f"The next job was held back {len(starvations)} times while the card was reserved for a job "
+                "behind it"
                 + (
-                    f"The starved queue deadlocked, the recovery supervisor soft-reset the pools "
-                    f"{len(soft_resets)} time(s) and faulted {dropped} backlog job(s)."
+                    f", then rebuilt and dropped {dropped} jobs."
                     if escalated
-                    else "Force-admit or a drain broke it before it escalated to a soft reset."
+                    else ", and the stall cleared on its own."
                 )
             ),
             evidence=[_evidence(r) for r in (starvations[:2] + soft_resets[:1])],
@@ -1674,50 +1639,34 @@ def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
     all_incoherent = bool(claims) and len(incoherent) == len(claims)
     unmeasured_marginal = forecast is not None and forecast.marginal_is_seeded
 
-    headline = (
-        (
-            f"Every one of the {len(claims)} reservation(s) that stated its arithmetic demanded no reduction: "
-            f"the target process count was at or above the live count (e.g. {incoherent[0].counts_text}), so the "
-            "claim reserved the card without the teardown it was granted for. The claim is structurally "
-            "incoherent, not merely over-eager. "
-        )
-        if all_incoherent
-        else (
-            f"The whole card was reserved {len(establishes)} time(s) this session, each time reducing the live "
-            "process count and cycling safety off the GPU, then restoring them. Sustained reservation churn is "
-            "the signature of a model being given the card that does not need it; on a high-VRAM card a model "
-            "whose weights are a small fraction of total VRAM co-resides, so a teardown demand for it usually "
-            "means the per-context overhead was over-counted"
-            + (" (an unmeasured marginal). " if unmeasured_marginal else ". ")
-        )
+    outcome = (
+        f", until the worker rebuilt its processes {len(soft_resets)} times and dropped {dropped} jobs"
+        if escalated
+        else ""
     )
+    figures = [_claim_figures_text(claims, count=len(establishes))]
+    if all_incoherent:
+        figures.append(
+            f"Every reservation that stated its arithmetic demanded no reduction: the target process count was "
+            f"at or above the live count (for example {incoherent[0].counts_text})."
+        )
+    if forecast is not None:
+        figures.append(forecast.describe())
+        if forecast.unreclaimable_mb is not None:
+            figures.append(f"The forecast counts {forecast.unreclaimable_mb:.0f} MB as memory no teardown can return.")
+    if declined:
+        figures.append(f"The trust gate declined {len(declined)} further reservations.")
     return [
         Finding(
             kind=FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
             severity=Severity.CRITICAL if escalated or all_incoherent else Severity.WARNING,
-            headline=(
-                headline
-                + _claim_figures_text(claims, count=len(establishes))
-                + (f" {forecast.describe()}" if forecast is not None else "")
-                + (
-                    f" It escalated: the recovery supervisor soft-reset the pools {len(soft_resets)} time(s) and "
-                    f"faulted {dropped} backlog job(s)."
-                    if escalated
-                    else " It did not escalate to a soft reset here, but the reload + safety cycling caps throughput."
-                )
-                + (
-                    f" The trust gate declined {len(declined)} further reservation(s), so it is actively damping "
-                    "the churn."
-                    if declined
-                    else ""
-                )
-            ),
+            headline=f"The whole card was reserved and released {len(establishes)} times this session{outcome}.",
             action_addendum=_churn_remediation(
                 all_incoherent=all_incoherent,
                 unmeasured_marginal=unmeasured_marginal,
                 forecast=forecast,
             ),
-            evidence=[_evidence(r) for r in (establishes[:2] + soft_resets[:1])],
+            evidence=figures + [_evidence(r) for r in establishes[:3]],
         ),
     ]
 
@@ -1728,37 +1677,31 @@ def _churn_remediation(
     unmeasured_marginal: bool,
     forecast: _StreamForecast | None,
 ) -> str:
-    """The fix keyed to what the parsed figures actually show, rather than to one assumed cause.
+    """The "Do this" line keyed to what the parsed figures show, rather than to one assumed cause.
 
     Blaming an unmeasured per-additional-context marginal is only true when the forecast says the marginal
     is seeded (nothing measurable); with a probe or idle-floor source it is measured, and asserting
     otherwise sends an operator after a number that is already correct.
     """
     if all_incoherent:
+        unreclaimable = (
+            f" The forecast counts {forecast.unreclaimable_mb:.0f} MB as memory no teardown can return."
+            if forecast is not None and forecast.unreclaimable_mb is not None
+            else ""
+        )
         return (
-            "The target process count is at or above the live count, so the reservation cannot free anything "
-            "by tearing siblings down: fix the target the forecast derives before tuning any VRAM figure. "
-            "Check how the residency target is computed against the live process count, and whether the "
-            "deficit driving it is made of charges a teardown cannot return"
-            + (
-                f" (the forecast attributes {forecast.unreclaimable_mb:.0f}MB as unreclaimable)."
-                if forecast is not None and forecast.unreclaimable_mb is not None
-                else "."
-            )
+            "Report it: the reservation could not free anything, since the process count it asked for was "
+            f"already met.{unreclaimable}"
         )
     if unmeasured_marginal:
         return (
-            "The forecast is pricing additional contexts from a seeded constant, so nothing was measured. "
-            "Get the per-additional-context VRAM cost measured (the probe's second-context delta or a clean "
-            "all-idle baseline), so the structural free-VRAM floor is not the one-time runtime cost "
-            "multiplied by the process count. A correctly measured marginal lets a small-weight model "
-            "co-reside instead of reserving the card."
+            "Let the worker measure what each extra process costs: run the start-up probe, or leave the "
+            "worker idle with every process up so it can read a clean baseline. Until then it charges a "
+            "guessed figure per process and gives the card to models that do not need it."
         )
     return (
-        "The per-additional-context cost is measured, so the reservations are not the unmeasured-marginal "
-        "case: confirm the reserved models are genuinely card-filling for this card, and check what the "
-        "forecast charges as unreclaimable, since that deduction is what a teardown cannot give back and so "
-        "is what keeps demanding the card."
+        "Check that the models being given the whole card really need it on this card. If they do not, "
+        "report it with the log around a reservation."
     )
 
 
@@ -1875,12 +1818,11 @@ def detect_whole_card_pop_claim_episodes(context: SessionContext) -> list[Findin
             kind=FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
             severity=Severity.INFO,
             headline=(
-                f"A whole-card residency narrowed the worker's advertised model set to its own model "
-                f"{len(episodes)} time(s) this session. Per model: {model_breakdown}. How each ended: "
-                f"{release_breakdown}.{held_text} While a claim stands the horde is only asked for that model, "
-                "which is what keeps the resident weights on the card."
+                f"The worker asked the horde for one model only {len(episodes)} times this session while that "
+                "model held the card."
             ),
-            evidence=[_evidence(episode.engaged) for episode in episodes[:3]],
+            evidence=[f"By model: {model_breakdown}.", f"How each ended: {release_breakdown}.{held_text}"]
+            + [_evidence(episode.engaged) for episode in episodes[:3]],
         ),
     ]
 
@@ -1918,13 +1860,11 @@ def detect_whole_card_pop_claim_monopoly(context: SessionContext) -> list[Findin
             kind=FindingKind.WHOLE_CARD_POP_CLAIM_MONOPOLY,
             severity=Severity.WARNING,
             headline=(
-                f"{len(squeezing)} pop claim(s) ran to the maximum hold rather than releasing on their own, and "
-                f"each did so with another model's head parked behind it. Claimed by: {', '.join(claimants)}. "
-                f"Heads parked meanwhile: {starved_breakdown}. A claim that has to be ended by its cap was still "
-                "asking the horde for one model only while the queue held work it would not admit, so accepted "
-                "jobs aged behind a narrowed offer."
+                f"{len(squeezing)} times the worker kept asking for one model until the hold cap stopped it, "
+                "while jobs for other models waited."
             ),
-            evidence=[_evidence(episode.engaged) for episode, _parked in squeezing[:3]],
+            evidence=[f"Claimed by: {', '.join(claimants)}.", f"Jobs waiting meanwhile: {starved_breakdown}."]
+            + [_evidence(episode.engaged) for episode, _parked in squeezing[:3]],
         ),
     ]
 
@@ -2053,36 +1993,26 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
             kind=FindingKind.RESIDENCY_RECONCILIATION_HOLDS,
             severity=Severity.WARNING if escalated else Severity.INFO,
             headline=(
-                f"The scheduler held a resident head's dispatch to reconcile residency {len(holds)} time(s) "
-                f"(~{holds_per_hour:.0f}/hour), evicting an idle sibling's VRAM so the head's materialisation "
-                f"fit the card before it committed. Per model: {model_breakdown}. Roughly {parked_seconds_total:.0f}s "
-                f"of head parking was observed across these holds"
-                + (f" (~{parked_fraction:.0%} of the session)." if duration else ".")
-                + (
-                    " These holds did not self-clear: the worker declared the queue deadlocked (or ran a "
-                    f"recovery remedy) {len(wedge_lines)} time(s) inside the same span, so the room the hold "
-                    "was waiting for never arrived and something else had to break the stall."
-                    if wedged
-                    else " This is the swap-churn cost of packing more models onto the card than fit at peak, "
-                    "not a scheduler wedge: each hold self-clears once the eviction frees room."
-                    + (
-                        " Sustained at this volume it is a real throughput and GPU-uptime drag."
-                        if escalated
-                        else " At this volume it is a benign, low-cost duty note."
-                    )
-                )
+                f"The worker paused {len(holds)} times to unload an idle model before the next job, about "
+                f"{holds_per_hour:.0f} an hour and {parked_seconds_total:.0f} seconds in total"
+                + (f", and {len(wedge_lines)} of those pauses never cleared." if wedged else ".")
             ),
             action_addendum=(
-                "Treat this as a wedge rather than churn: find what held the card across the span (an idle "
-                "lane's component tenancy and a slot parked on a preload are both holders no job boundary "
-                "returns) and confirm the hold actually issued a reclaim against it."
+                "Something held the card that no job finishing gives back. Capture the log around the pause "
+                "and report it."
                 if wedged
-                else "If this volume is high, reduce the co-resident model pressure that forces the "
-                "evictions: lower the served model set or concurrency for this VRAM size, or confirm the "
-                "per-context VRAM cost is measured so the card is not over-packed at peak. A handful of "
-                "holds is normal headroom management and needs no action."
+                else (
+                    "Serve fewer models at once, or lower `max_threads` or `queue_size`, so the card is not "
+                    "packed past what fits at peak."
+                    if escalated
+                    else "No action needed at this volume."
+                )
             ),
-            evidence=[_evidence(r) for r in holds[:3]],
+            evidence=[
+                f"Pauses by model: {model_breakdown}."
+                + (f" Parked for {parked_fraction:.0%} of the session." if duration else ""),
+            ]
+            + [_evidence(r) for r in holds[:3]],
         ),
     ]
 
@@ -2846,18 +2776,15 @@ def detect_model_churn(context: SessionContext) -> list[Finding]:
             kind=FindingKind.MODEL_CHURN,
             severity=severity,
             headline=(
-                f"Over {dispatches} dispatch(es) the worker preloaded {movement.preloads} model(s) "
-                f"({preload_ratio:.2f} per dispatch) and unloaded {movement.unloads} "
-                f"({unload_ratio:.2f} per dispatch), and cleared {movement.cleared_preloads} preload(s) "
-                f"({cleared_ratio:.2f} per dispatch) as no longer needed before they ran. A lane that keeps "
-                f"its model runs the next job for it for free, so this much movement means the resident set "
-                f"is turning over faster than the work is."
+                f"Over {dispatches} jobs the worker loaded {movement.preloads} models and unloaded "
+                f"{movement.unloads}, and {movement.cleared_preloads} of those loads were thrown away before "
+                "they ran."
             ),
             evidence=[
-                f"preloads {movement.preloads}, unloads {movement.unloads}, "
-                f"cleared preloads {movement.cleared_preloads}, displaced-entry expiries "
-                f"{movement.displaced_expiries}, model->system-RAM moves {movement.moved_to_system_ram} "
-                f"against {dispatches} dispatch(es)",
+                f"loads {movement.preloads} ({preload_ratio:.2f} per job), unloads {movement.unloads} "
+                f"({unload_ratio:.2f} per job), loads cleared before use {movement.cleared_preloads} "
+                f"({cleared_ratio:.2f} per job), displaced-entry expiries {movement.displaced_expiries}, "
+                f"model to system RAM moves {movement.moved_to_system_ram}, against {dispatches} jobs",
             ],
         ),
     ]

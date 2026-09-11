@@ -250,121 +250,177 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     # --- Memory and residency ---
     FindingSpec(
         kind=FindingKind.OOM,
-        title="GPU out-of-memory faults",
+        title="The card ran out of memory",
         action=(
-            "Reduce concurrency/queue or enable a more conservative VRAM budget; if these recur under "
-            "a budget that should fit, suspect over-admission of a heavy head (Flux fp8 / SDXL). The "
-            "named co-residency and free-VRAM figures say which: several co-resident processes with "
-            "near-zero free VRAM points at too many models admitted onto one card, not at the faulting "
-            "model being individually oversized."
+            "Lower `max_threads` or `queue_size`, or turn on the VRAM budget. If several processes were "
+            "sharing the card with almost nothing free, fewer models at once is the fix, not a smaller model."
+        ),
+        detail=(
+            "The allocator's own message names the model that faulted and the other processes holding "
+            "memory on the card at that moment. Many processes with near-zero free memory means too many "
+            "models were admitted onto one card. One process with plenty free elsewhere means that model "
+            "alone is too large for the card."
         ),
     ),
     FindingSpec(
         kind=FindingKind.SWALLOWED_OOM,
-        title="Jobs faulted with 'no images produced'",
+        title="Jobs failed with no images and no reason given",
         action=(
-            "Check VRAM headroom around these faults; if memory-bound, treat 'no images produced' as a "
-            "resource failure so the self-throttle/breaker engages."
+            "Check free VRAM around these failures. If the card was full, treat them as out-of-memory faults "
+            "and lower `max_threads` or `queue_size`."
+        ),
+        detail=(
+            'ComfyUI can report an out-of-memory error as a plain "no images were produced" failure. The '
+            "worker's own memory-failure protection keys on the real error, so it may never engage even "
+            "though memory was the cause."
         ),
     ),
     FindingSpec(
         kind=FindingKind.FILE_DESCRIPTOR_EXHAUSTION,
-        title="Inference process exhausted its file-descriptor limit (EMFILE)",
+        title="A process ran out of file handles",
         action=(
-            "Treat this as a descriptor leak, not memory pressure: reducing concurrency or the VRAM "
-            "budget will not help. As an immediate stopgap, raise the worker's soft descriptor limit "
-            "(ulimit -n, or LimitNOFILE= in the systemd unit) so a slow leak takes far longer to reach "
-            "the ceiling. The real fix is to find what leaks descriptors in the inference child; these "
-            "logs cannot pinpoint it because the worker emits no descriptor-headroom telemetry, so add "
-            "RLIMIT_NOFILE headroom to the per-process status line (alongside the free-RAM/VRAM figures) "
-            "so the next occurrence names the leaking growth. This fault is POSIX-specific (Windows has "
-            "no RLIMIT_NOFILE and a far higher handle ceiling), so it is a concern for Linux hosts."
+            'Raise the open-file limit as a stopgap, with "ulimit -n" or "LimitNOFILE" in the service '
+            "unit. Lowering memory settings will not help."
+        ),
+        detail=(
+            "The leak is in the worker and these logs cannot say where, so it is worth reporting. "
+            "Once a process passes its open-file limit every file open is refused, so it fails every job "
+            "while still sending heartbeats, and the silence check cannot see it. The model named is "
+            "whatever was running when the limit was hit, not the cause. The fault text is the same plain "
+            '"produced no results" an out-of-memory fault uses, which is why this is easy to misread. The '
+            "worker reports no open-file headroom yet, so the growth cannot be traced from the log. Windows "
+            "has a far higher handle ceiling, so this is a Linux concern."
         ),
     ),
     FindingSpec(
         kind=FindingKind.SCHEDULER_STARVATION_WEDGE,
-        title="Scheduler wedged on VRAM-budget over-deferral",
+        title="The VRAM budget held the next job back on an idle card",
+        action=(
+            "Relax the VRAM budget, or turn off `unload_models_from_vram_often` and `high_performance_mode` to "
+            "reduce swapping. Either lets the next job in before the wait triggers a rebuild."
+        ),
+        detail=(
+            "The budget refused to load the next job's model even though the card had plenty free. That "
+            "usually happens when processes are cycling so fast that the budget never sees a settled baseline "
+            "to size each process from, so it over-charges every load. When the wait runs long enough the "
+            "worker rebuilds its processes and drops the queued jobs, which the horde counts as dropped."
+        ),
     ),
     FindingSpec(
         kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,
-        title="Head-of-queue model persistently starved on an idle device",
+        title="One model kept being held back on an idle card",
         action=(
-            "Confirm the named model actually fits this device (its resident weights plus activation "
-            "working set against measured device-free VRAM); a head that never admits despite an idle, "
-            "ample-VRAM device points at an over-conservative per-process overhead or an unsatisfiable "
-            "budget for that model. Reduce process churn (unload_models_from_vram_often / "
-            "high_performance_mode) so a settled baseline sizes the overhead, relax the VRAM budget, or "
-            "drop the model if the device genuinely cannot host it. A give-up / pop-hold should bound the "
-            "wait so the head cannot starve the queue indefinitely."
+            "Check that the named model fits this card with room to run. If it does, relax the VRAM budget "
+            "or turn off `unload_models_from_vram_often` and `high_performance_mode`. If it does not, remove "
+            "the model."
+        ),
+        detail=(
+            "The same model kept reaching the front of the queue and being refused a load while the card sat "
+            "idle with memory to spare. Either the budget charges each process more than it costs, or the "
+            "model genuinely cannot fit beside what the card holds. Over-charging happens when processes "
+            "cycle so fast that no settled baseline exists to size them from. A bounded wait is meant to give "
+            "up on such a job so the queue moves; when nothing ever cleared it, the queue was stuck behind it."
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
     ),
     FindingSpec(
         kind=FindingKind.RESIDENCY_RECONCILIATION_HOLDS,
-        title="Dispatch held to reconcile residency (idle-VRAM eviction swap-churn)",
+        title="The worker paused to make room before running the next job",
+        detail=(
+            "The next job's model is loaded, but its working set will not fit beside an idle neighbour's "
+            "model. The worker unloads that neighbour first and waits for the room to appear. Each pause is a "
+            "swap paid for holding more models than the card fits at peak. A few are normal. Many are a "
+            "throughput cost, and a pause that never clears means the room never came and something else "
+            "had to break the stall."
+        ),
         see_also=FindingKind.HEAD_DISPATCH_STALL,
     ),
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_CONVERGENCE_WEDGE,
-        title="Whole-card residency cannot reach sole residency (a sibling or service lane pins the teardown)",
+        title="A model that needs the whole card could not get it",
         action=(
-            "Capture the surrounding scheduling logs and the process map: the stall line names what pinned "
-            "the teardown (a sibling process and its queued model, or a lane). A recurrence points at the "
-            "whole-card teardown failing to stop an eligible sibling or failing to order a lane pause. As an "
-            "operational stopgap, reducing queue_size or avoiding a heavy whole-card model alongside a deep "
-            "same-cycle queue lowers the odds of hitting this shape."
+            "Capture the log around the stall and report it. As a stopgap, lower `queue_size`, or do not "
+            "serve a whole-card model beside a deep queue of others."
+        ),
+        detail=(
+            "A whole-card model, such as Flux, is loaded into a spare process while the worker clears the "
+            "rest of the card for it. Here something never left: an idle process still holding a model that "
+            "is queued behind it, or a service process the clearing waits on. The card never emptied, the "
+            "job was refused every cycle, and in the end the worker rebuilt its processes. The clearing is "
+            "meant to stop exactly that neighbour, so this shape means it did not engage."
         ),
         see_also=FindingKind.HEAD_DISPATCH_STALL,
     ),
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_NONHEAD_RESIDENCY_STARVATION,
-        title="Whole-card residency held for a non-head model starved the queue head",
+        title="The card was reserved for a job that was not next in line",
         action=(
-            "The whole-card residency must only be granted to the head (next-to-dispatch) job; a deeper-queue "
-            "heavy model should defer until it becomes the head rather than reserving the card. If this "
-            "recurs, capture the residency establish/pre-stage lines and the queue order to confirm which "
-            "model claimed the card while a different head was pending."
+            "Capture the log around the stall and report it. The worker should only reserve the card for the next job."
+        ),
+        detail=(
+            "Reserving the whole card tears down the neighbouring processes. Granting that to a job further "
+            "back in the queue removes the processes serving the jobs ahead of it. The next job then has "
+            "nowhere to run while the card is held for a turn that has not come. The queue stops, and if "
+            "nothing breaks the stall the worker rebuilds its processes and drops the backlog."
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
     ),
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
-        title="Whole-card residency reserved and restored repeatedly (reservation churn)",
+        title="The whole card was reserved and released over and over",
+        detail=(
+            "Reserving the whole card reduces the running processes and moves the safety check off the GPU; "
+            "releasing it reverses both. A few times a session is a deliberate hold. Many times is thrash. "
+            "On a large card that usually means a model that does not need the whole card is being given it, "
+            "since each extra process was charged too much memory. Each round trip costs a "
+            "model reload and a safety restart, and paired with rebuilt processes or dropped jobs it is the "
+            "reservation feeding a stall."
+        ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
     ),
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
-        title="Whole-card residency claimed the pop offer",
+        title="The worker asked the horde for one model only while it held the card",
         action=(
-            "Nothing to do if the claims match the heavy work this worker exists to serve. If they are "
-            "long and frequent for a model the operator did not intend to specialise in, the levers are "
-            "the served model set and whole_card_residency_max_hold_seconds, which caps how long one "
-            "residency may own the intake."
+            "Nothing to do if that is the heavy work this worker is for. If the claims are long and frequent "
+            "for a model you did not mean to specialise in, trim the model list or lower "
+            "`whole_card_residency_max_hold_seconds`."
+        ),
+        detail=(
+            "While a whole-card model holds the card, the worker offers only that model to the horde so the "
+            "loaded weights keep earning. The claim ends when the horde runs out of that model's jobs or when "
+            "the hold cap is reached."
         ),
         see_also=FindingKind.WHOLE_CARD_POP_CLAIM_MONOPOLY,
     ),
     FindingSpec(
         kind=FindingKind.WHOLE_CARD_POP_CLAIM_MONOPOLY,
-        title="Whole-card pop claim held to its cap while other models' work waited",
+        title="Other jobs waited while the worker kept asking for one model",
         action=(
-            "Decide whether this worker should specialise. If it should, the parked models do not belong in "
-            "its served set and removing them ends the contention. If it should serve a mix, lower "
-            "whole_card_residency_max_hold_seconds so a residency gives the intake back sooner, or take the "
-            "claimed model out of the pool if it can only run with the whole card."
+            "Decide whether this worker should specialise. If yes, remove the waiting models from its list. "
+            "If it should serve a mix, lower `whole_card_residency_max_hold_seconds`, or drop the model that "
+            "needs the whole card."
+        ),
+        detail=(
+            "A claim on the offer is meant to end on its own when the horde runs out of that model's jobs. "
+            "One that runs to the hold cap was still narrowing the offer when the cap stopped it. Doing that "
+            "repeatedly while other models' jobs sat waiting means accepted work aged behind an offer that "
+            "would not take anything to relieve it."
         ),
         see_also=FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
     ),
     FindingSpec(
         kind=FindingKind.MODEL_CHURN,
-        title="Model weights churning through the lanes",
+        title="Models were loaded and unloaded far more often than jobs ran",
         action=(
-            "Each turn costs a load off disk and the eviction that made room for it, and the cleared "
-            "preloads are that cost paid for nothing. Give retention a chance to pay off: check that "
-            "unload_models_from_vram_often is not forcing an eviction after every job, that the model "
-            "pool (or a narrower model list) keeps the offered set within what the lanes can hold, and "
-            "that the queue is deep enough for same-model jobs to batch onto one lane. On a multi-card "
-            "host, dispatch that will not spread across cards forces the same few lanes to serve every "
-            "model in the queue, which shows up here as churn."
+            "Turn off `unload_models_from_vram_often`. Serve fewer models, or use the model pool, so the "
+            "offered set fits the card. Raise `queue_size` so jobs for one model can run back to back."
+        ),
+        detail=(
+            "A process that keeps its model runs the next job for it at no cost. Every swap costs a load from "
+            "disk and the unload that made room for it, and a load cleared before it ran is that cost paid "
+            "for nothing. On a multi-card host, work that will not spread across the cards forces the same few "
+            "processes to serve every model in the queue, which shows up here as churn."
         ),
         see_also=FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
     ),

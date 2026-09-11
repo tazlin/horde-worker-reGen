@@ -247,6 +247,8 @@ class DiagnosticsView(Vertical):
         """The scope key of the pass currently running (recorded so the result can be labelled by it)."""
         self._analyzed_scope: str | None = None
         """The scope key the displayed results were computed with; None until the first run completes."""
+        self._cards_generation = 0
+        """Bumped per render so a mount queued for a superseded render mounts nothing."""
 
     def compose(self) -> ComposeResult:
         """Lay out the session selector, the run button, a status line, and the scrollable results."""
@@ -477,9 +479,22 @@ class DiagnosticsView(Vertical):
             self._show_results_message(Text("No findings; this session looks clean.", style="green"))
             return
         self.query_one("#diag-results-message", Static).display = False
+        # Removal is asynchronous in Textual; mounting straight after it would race the removal and show the
+        # cards twice when a session is rendered twice in quick succession (analysis done, then a selector
+        # change). The mount runs as the next callback on this widget's own queue, awaiting the removal
+        # first; a render that has been superseded by the time it runs mounts nothing.
+        self._cards_generation += 1
+        self.call_next(self._mount_cards, list(diagnosis.findings), self._cards_generation)
+
+    async def _mount_cards(self, findings: list[Finding], generation: int) -> None:
+        """Replace the cards container's children with one card per finding, in order."""
+        if generation != self._cards_generation:
+            return
         cards = self.query_one("#diag-results-cards", Vertical)
-        cards.remove_children()
-        cards.mount_all(FindingCard(finding) for finding in diagnosis.findings)
+        await cards.remove_children()
+        if generation != self._cards_generation:
+            return
+        await cards.mount_all(FindingCard(finding) for finding in findings)
 
     def _show_results_message(self, message: Text) -> None:
         """Replace the results with one message line (nothing analysed yet, analysing, no logs, no session)."""

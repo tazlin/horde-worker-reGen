@@ -354,7 +354,7 @@ class TestSchedulerStarvationWedge:
         finding = findings["scheduler_starvation_wedge"]
         assert finding.severity is Severity.CRITICAL
         # It reports the ample free VRAM (the budget's mistake) and the starvation duration.
-        assert "19179" in finding.headline
+        assert "19179" in " ".join(finding.evidence)
         assert "110" in finding.headline
 
     def test_transient_starvation_is_warning(self, tmp_path: Path) -> None:
@@ -626,9 +626,9 @@ class TestResourceFindings:
         assert "oom" in findings
         verdict = findings["oom"].headline
         assert "Z-Image-Turbo" in verdict
-        assert "slot(s) 4" in verdict
+        assert "processes 4" in verdict
         # Two sibling "Process N has ..." lines + the faulting process itself == 3 co-resident.
-        assert "3 processes co-resident" in verdict
+        assert "3 processes sharing the card" in verdict
         assert "194 MiB free" in verdict
 
     def test_fd_exhaustion_detected(self, tmp_path: Path) -> None:
@@ -657,11 +657,11 @@ class TestResourceFindings:
         fd = findings["file_descriptor_exhaustion"]
         assert fd.severity is Severity.CRITICAL
         assert "WAI-NSFW-illustrious-SDXL" in fd.headline
-        assert "slot(s) 3" in fd.headline
-        assert "/proc/meminfo" in fd.headline
-        assert "replaced" in fd.headline
+        assert "processes 3" in fd.headline
+        assert any("/proc/meminfo" in line for line in fd.evidence)
+        assert "replaced" in fd.action
         # The mechanism note that keeps a maintainer from mistaking it for an OOM.
-        assert "descriptor leak" in fd.headline
+        assert "file handles" in fd.headline
 
     def test_fd_exhaustion_and_oom_are_distinct(self, tmp_path: Path) -> None:
         """A descriptor-exhaustion session raises no OOM finding, and vice versa (no cross-contamination)."""
@@ -1114,7 +1114,7 @@ class TestWholeCardResidencyChurn:
                 _whole_card_reserve("07:57:46.000", current=4, after=3, target=3, free_mb=11000),
             ),
         )
-        verdict = findings["whole_card_residency_churn"].headline
+        verdict = " ".join(findings["whole_card_residency_churn"].evidence)
         assert "4 -> 3" in verdict, "the live/after process counts must be reported"
         assert "9443" in verdict and "11000" in verdict, "the device_free_vram range must be reported"
 
@@ -1129,13 +1129,13 @@ class TestWholeCardResidencyChurn:
             ),
         )
         finding = findings["whole_card_residency_churn"]
-        assert finding.headline.startswith("Every one of the 3 reservation(s)"), finding.headline
-        assert "demanded no reduction" in finding.headline
-        assert "target 21" in finding.headline
+        figures = " ".join(finding.evidence)
+        assert "demanded no reduction" in figures, figures
+        assert "target 21" in figures
         assert "unmeasured marginal" not in finding.action, (
             "an incoherent claim must not be blamed on an unmeasured per-context marginal"
         )
-        assert "target" in finding.action
+        assert "already met" in finding.action
 
     def test_a_measured_marginal_suppresses_the_unmeasured_remediation(self, tmp_path: Path) -> None:
         """With ``src=probe`` in the forecast, the per-context marginal is measured, so that fix is wrong."""
@@ -1150,9 +1150,9 @@ class TestWholeCardResidencyChurn:
         )
         finding = findings["whole_card_residency_churn"]
         assert "unmeasured marginal" not in finding.headline
-        assert "measured" in finding.action
-        assert "276MB" in finding.headline, "the measured marginal must be quoted"
-        assert "1450" in finding.headline, "the unreclaimable charge behind the reduction must be quoted"
+        assert "really need it" in finding.action
+        assert "276MB" in " ".join(finding.evidence), "the measured marginal must be quoted"
+        assert "1450" in " ".join(finding.evidence), "the unreclaimable charge behind the reduction must be quoted"
 
     def test_a_seeded_marginal_keeps_the_unmeasured_remediation(self, tmp_path: Path) -> None:
         """Only a seeded source means nothing was measured, which is when that remediation is true."""
@@ -1165,8 +1165,7 @@ class TestWholeCardResidencyChurn:
                 _whole_card_reserve("07:57:46.000"),
             ),
         )
-        assert "measured" in findings["whole_card_residency_churn"].action
-        assert "unmeasured" in findings["whole_card_residency_churn"].headline
+        assert "guessed figure" in findings["whole_card_residency_churn"].action
 
 
 _GIVEN_UP_JOB = "34ce8495-7820-4af5-9723-b411698ff27f"
@@ -1383,14 +1382,14 @@ class TestWholeCardPopClaim:
         )
         finding = findings["whole_card_pop_claim_episodes"]
         assert finding.severity is Severity.INFO
-        assert _FLUX in finding.headline
-        assert "no further work" in finding.headline
-        assert "120s" in finding.headline
+        assert _FLUX in " ".join(finding.evidence)
+        assert "no further work" in " ".join(finding.evidence)
+        assert "120s" in " ".join(finding.evidence)
 
     def test_a_claim_still_standing_at_the_end_is_reported(self, tmp_path: Path) -> None:
         """A session that ended inside a claim still says the offer was narrowed and by what."""
         findings = _diagnose(tmp_path, self._bridge(_pop_claim_engaged("07:51:00.000")))
-        assert "still standing" in findings["whole_card_pop_claim_episodes"].headline
+        assert "still standing" in " ".join(findings["whole_card_pop_claim_episodes"].evidence)
 
     def test_no_claim_lines_report_nothing(self, tmp_path: Path) -> None:
         """A worker whose residencies never claim the offer produces no episode finding at all."""
@@ -1412,7 +1411,7 @@ class TestWholeCardPopClaim:
         )
         finding = findings["whole_card_pop_claim_monopoly"]
         assert finding.severity is Severity.WARNING
-        assert "Juggernaut XL" in finding.headline
+        assert "Juggernaut XL" in " ".join(finding.evidence)
         assert finding.see_also is FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES
 
     def test_cap_ends_with_nothing_else_queued_are_not_a_monopoly(self, tmp_path: Path) -> None:
@@ -1540,7 +1539,7 @@ class TestResidencyReconciliationHolds:
         findings = _diagnose(tmp_path, bridge)
         assert "residency_reconciliation_holds" in findings
         assert findings["residency_reconciliation_holds"].severity is Severity.INFO
-        verdict = findings["residency_reconciliation_holds"].headline
+        verdict = " ".join(findings["residency_reconciliation_holds"].evidence)
         assert "AlbedoBase XL (SDXL)" in verdict
         assert "CyberRealistic Pony" in verdict
 

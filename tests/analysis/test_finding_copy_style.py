@@ -41,6 +41,18 @@ _NOT_YET_REWRITTEN: frozenset[FindingKind] = frozenset(FindingKind) - {
     FindingKind.STUCK_INFERENCE_STEP,
     FindingKind.POST_PROCESSING_VRAM_STALL,
     FindingKind.ORPHAN_WEDGE,
+    FindingKind.OOM,
+    FindingKind.SWALLOWED_OOM,
+    FindingKind.FILE_DESCRIPTOR_EXHAUSTION,
+    FindingKind.SCHEDULER_STARVATION_WEDGE,
+    FindingKind.UNSATISFIABLE_HEAD_STARVATION,
+    FindingKind.RESIDENCY_RECONCILIATION_HOLDS,
+    FindingKind.WHOLE_CARD_CONVERGENCE_WEDGE,
+    FindingKind.WHOLE_CARD_NONHEAD_RESIDENCY_STARVATION,
+    FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
+    FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
+    FindingKind.WHOLE_CARD_POP_CLAIM_MONOPOLY,
+    FindingKind.MODEL_CHURN,
 }
 """Kinds still carrying the pre-guide copy. Remove a kind here in the change that rewrites it."""
 

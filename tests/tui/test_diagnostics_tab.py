@@ -51,6 +51,19 @@ def _finding(kind: FindingKind, severity: Severity) -> Finding:
     )
 
 
+async def _wait_for_cards(pilot: object, view: DiagnosticsView, *, count: int) -> list[FindingCard]:
+    """Wait until exactly ``count`` finding cards are mounted with their children composed, then return them."""
+    for _ in range(300):
+        await pilot.pause()  # type: ignore[attr-defined]
+        cards = list(view.query(FindingCard))
+        if len(cards) == count and all(card.query(".finding-header") for card in cards):
+            return cards
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"expected {count} composed finding cards, have {[c.finding.id for c in view.query(FindingCard)]}"
+    )
+
+
 def _text(widget: Static) -> str:
     """The plain text a Static is currently rendering."""
     rendered = widget.render()
@@ -121,9 +134,9 @@ async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pyt
         assert select.disabled is False
         assert select.value == 1
 
-        # Each finding is a card: badge and title, headline and "Do this" visible, details collapsed.
-        await pilot.pause()
-        cards = list(view.query(FindingCard))
+        # Each finding is a card: badge and title, headline and "Do this" visible, details collapsed. The
+        # cards mount through a worker, so wait until they have composed their children.
+        cards = await _wait_for_cards(pilot, view, count=2)
         assert [card.finding.id for card in cards] == ["forced_maintenance", "session_summary"]
         header = _text(cards[0].query_one(".finding-header", Static))
         assert cards[0].finding.badge in header and cards[0].finding.title in header
@@ -135,9 +148,9 @@ async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pyt
 
         # Switching to the earlier session re-renders from the cache (no re-parse) without error.
         view._render_selected(0)
-        await pilot.pause()
         assert "Session #0" in _text(view.query_one("#diag-status", Static))
-        assert [card.finding.id for card in view.query(FindingCard)] == ["oom"]
+        cards = await _wait_for_cards(pilot, view, count=1)
+        assert [card.finding.id for card in cards] == ["oom"]
 
 
 async def test_diagnostics_tab_empty_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

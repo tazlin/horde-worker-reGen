@@ -250,7 +250,7 @@ class TestModelChurn:
         """A preload for every other job means the resident set turns over faster than the queue."""
         finding = diagnose(tmp_path, self._session(dispatches=40, preloads=20, cleared=5))["model_churn"]
         assert finding.severity is Severity.WARNING
-        assert "0.50 per dispatch" in finding.headline
+        assert "0.50 per job" in " ".join(finding.evidence)
 
     def test_is_critical_when_preloads_outnumber_dispatches(self, tmp_path: Path) -> None:
         """More model changes than jobs is thrash, not turnover."""
