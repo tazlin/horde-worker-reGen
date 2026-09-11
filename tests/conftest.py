@@ -105,6 +105,9 @@ _ORDER_PHASES_FIRST: tuple[_OrderPhase, ...] = (
 # applied; add a new slow namespace by appending an _OrderPhase, no other change required.
 _ORDER_PHASES_LAST: tuple[_OrderPhase, ...] = (
     _OrderPhase("process_management", packages=frozenset({"process_management"})),
+    # The simulator rows cost seconds each; they run after the rest of their namespace so a unit break
+    # surfaces before the closed-loop band starts.
+    _OrderPhase("closed_loop", markers=frozenset({"closed_loop"})),
     _OrderPhase("tui", packages=frozenset({"tui"})),
     _OrderPhase("bridge_data", module_prefixes=("test_bridge_data",)),
     _OrderPhase("analysis", packages=frozenset({"analysis"})),

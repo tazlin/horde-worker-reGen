@@ -81,6 +81,9 @@ from tests.process_management.liveness._world_assertions import (
     assert_no_unservable_dispatch_hold,
 )
 
+pytestmark = pytest.mark.closed_loop
+"""Every row here drives the real scheduler over the simulated world for many ticks."""
+
 # --------------------------------------------------------------------------------------------------------
 # Axis values
 # --------------------------------------------------------------------------------------------------------

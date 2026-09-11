@@ -132,7 +132,12 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   the `HORDE_CHAOS_SEEDS` replay/widen override. `golden_regen` is a fourth opt-in band, and the only one
   that writes: it rewrites the committed scheduler traces under
   `tests/process_management/liveness/golden/` (`-m golden_regen`), so a regeneration is always a reviewed
-  diff. The default sweep compares against them instead.
+  diff. The default sweep compares against them instead. `closed_loop` marks the simulator rows (incident
+  scenarios, golden traces, the bounded matrix, the chaos core slice): they are in the default sweep, ordered
+  after the rest of `process_management`, and cost seconds each, so an iteration gate is
+  `-m "not closed_loop"` plus the rows named for the change, and the whole band runs once before a commit.
+  Every run prints its thirty slowest tests (`--durations` is in `addopts`); read them off the tee before
+  reaching for a stopwatch.
 - **Rerun the failure, not the band.** Every `FAILED` line carries a node id; rerun exactly that
   (quote parametrized ids verbatim). One chaos seed replays via `HORDE_CHAOS_SEEDS=<seed>`. Tee long
   runs to a file once and grep the tee. One pytest invocation per working copy: concurrent suites in

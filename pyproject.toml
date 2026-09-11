@@ -282,7 +282,9 @@ extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py", "docs/haidra-asse
 convention = "google"
 
 [tool.pytest.ini_options]
-addopts = "-p pytest_asyncio"
+# --durations: every tee'd run records its slowest tests, so a slow band is measured from the run that
+# exposed it rather than re-run to find out.
+addopts = "-p pytest_asyncio --durations=30"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 # Per-test ceiling (pytest-timeout), far above any legitimate test: a test that spawns real child
@@ -303,4 +305,5 @@ markers = [
     "network: needs a real network connection to the AI Horde or other external service; opt-in via -m network, skipped otherwise",
     "chaos_sweep: the full generated wedge-liveness chaos sweep (hundreds of seeded scenarios); opt-in via -m chaos_sweep, skipped otherwise, and run as a pre-release gate and nightly",
     "golden_regen: rewrites the committed golden scheduler traces instead of comparing against them; opt-in via -m golden_regen, skipped otherwise so a regeneration is always a reviewed diff",
+    "closed_loop: drives the real scheduler over the simulated dispatch world for many ticks (seconds per row); in the default sweep and ordered after the rest of process_management, so an iteration gate can exclude the band with -m \"not closed_loop\" and name the rows it needs",
 ]

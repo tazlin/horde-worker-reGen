@@ -58,6 +58,9 @@ from tests.process_management.liveness._dispatch_world import (
 )
 from tests.process_management.liveness._world_assertions import assert_governor_never_reached
 
+pytestmark = pytest.mark.closed_loop
+"""Every row here drives the real scheduler over the simulated world for many ticks."""
+
 _TICK_SECONDS = 2.0
 """Seconds of simulated time per scheduling tick, short enough that a job's load, sample and decode phases are
 each sampled several times rather than stepped over in one advance."""

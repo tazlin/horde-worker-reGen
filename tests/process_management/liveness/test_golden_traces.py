@@ -41,6 +41,9 @@ from tests.process_management.liveness._dispatch_world import (
 )
 from tests.process_management.liveness.golden_trace import TraceRecorder, diff, serialise
 
+pytestmark = pytest.mark.closed_loop
+"""Every row here drives the real scheduler over the simulated world for many ticks."""
+
 GOLDEN_DIR = Path(__file__).parent / "golden"
 """Where the committed traces live, one JSON file per row."""
 

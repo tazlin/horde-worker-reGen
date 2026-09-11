@@ -31,6 +31,8 @@
     * `-m gpu` runs the tests that need a real accelerator; they auto-skip when no CUDA device is present.
     * `-m chaos_sweep` runs the generated wedge-liveness chaos sweep. See below; the default sweep runs its representative core slice instead.
 * `-m "slow or gpu"` runs both opt-in bands at once. CI runs the fast sweep and the `slow` band as separate steps, so the full-lifecycle coverage is exercised on every push.
+* `closed_loop` marks the simulator rows under `tests/process_management/liveness/` (incident scenarios, golden traces, the bounded dispatch matrix, the chaos core slice). They stay in the default sweep and run after the rest of `process_management`, but each costs seconds, so while iterating on a scheduling change run `-m "not closed_loop"` plus the rows the change names, and run the whole band once before committing.
+* Every run prints its thirty slowest tests (`--durations=30` is in `addopts`), so the tee of any run answers "what was slow" without a second run.
 
 ### The generated chaos sweep (pre-release gate)
 
