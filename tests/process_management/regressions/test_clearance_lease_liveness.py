@@ -517,6 +517,9 @@ class TestClearanceNetsTheWaiterOwnStagingCharge:
                 enable_vram_budget=True,
                 vram_reserve_mb=2048,
                 ram_reserve_mb=4096,
+                # The room fixture below is expressed against this exact margin. Pin it so the test varies
+                # only staged-credit accounting, not the production platform default (5% WDDM, 2.5% Linux).
+                vram_admission_noise_mb=noise_mb,
             ),
             job_tracker=job_tracker,
             device_free_mb=self._PEAK_MB + noise_mb + room_beyond_peak_mb,

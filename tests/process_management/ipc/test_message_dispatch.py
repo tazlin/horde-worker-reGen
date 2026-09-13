@@ -327,9 +327,13 @@ class TestReceiveAndHandleProcessMessages:
         process_info = make_mock_process_info(3, model_name="stable_diffusion")
         process_info.process_launch_identifier = 0
         process_info.last_process_state = HordeProcessState.INFERENCE_COMPLETE
-        process_info.last_process_state_started_at = time.time()
         process_info.last_job_referenced = job
-        process_info.current_inference_started_at = time.time() - 5.0
+        ownership = process_info.inference_ownership
+        assert ownership is not None
+        # Ownership is taken at dispatch; the active state being closed began afterward. Stamp that order
+        # explicitly so the assertion does not depend on the host clock's resolution.
+        process_info.last_process_state_started_at = ownership.recorded_at + 1.0
+        process_info.current_inference_started_at = ownership.recorded_at - 5.0
         process_map = ProcessMap({3: process_info})
         message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker)
 

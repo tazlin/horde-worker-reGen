@@ -14,6 +14,11 @@ written against: a dispatched job occupies its lane for exactly one tick, weight
 committed, and the device-free governor is never sampled (so every card reads HEALTHY). It answers questions
 about admission, routing and residency ordering, and it deliberately says nothing about time.
 
+Every world pins the admission margin to the conservative 5% device-noise buffer. Production deliberately
+uses a smaller default on platforms with a stable device-wide free reading, but host-platform policy is not
+an axis in these scheduler scenarios; leaving it implicit would make the same virtual card have different
+physics on Windows and Linux. The platform policy itself is covered by the admission-margin unit tests.
+
 ``closed_loop=True`` closes the loop between policy and the card. The parent's device-free governor and the
 verified reclaim ladder join the tick, a dispatched job occupies its lane for derived load, sample and decode
 phases, sampling charges a transient peak to the card for its window, and the scheduler's retention grants
@@ -985,6 +990,9 @@ class _DispatchWorld:
             whole_card_residency_safety_off_gpu=safety_off_gpu_allowed,
             safety_on_gpu=service_contexts,
             vram_reserve_mb=0,
+            # These are virtual-card scenarios, not host-platform scenarios. Pin the WDDM/conservative
+            # physics the world was authored against so its holds and golden traces are identical on Linux.
+            vram_admission_noise_mb=admission_noise_buffer_mb(card.total_mb),
             ram_reserve_mb=8192.0,
             vram_per_process_overhead_mb=_FIRST_CONTEXT_MB,
             whole_card_residency_cooldown_seconds=cooldown_seconds,
@@ -1012,6 +1020,8 @@ class _DispatchWorld:
                     queue_size=queue_depth,
                     image_models_to_load=[model.name for model in self._model_classes],
                     max_pixels=max_pixels,
+                    # Keep a routed card on the same explicit virtual-card physics as the global config.
+                    vram_admission_noise_mb=admission_noise_buffer_mb(card.total_mb),
                     # safety_on_gpu is a per-card permission read off the effective card config, so a card
                     # here carries the same answer the global config gives (no per-card delta in this world).
                     safety_on_gpu=service_contexts,
