@@ -54,7 +54,7 @@ python-preference = "managed"
 # pinned 3.12 interpreter (llvmlite follows numba up to a 3.12-wheel version automatically).
 # onnxruntime-gpu is pinned to one version so the CUDA-12 (cu126) and CUDA-13 (cu130/cu132) builds stay on
 # the same release; both onnxruntime's CUDA-12 index and PyPI carry 1.27.0.
-constraint-dependencies = ["torch==2.12.1", "torchvision==0.27.1", "numba>=0.60", "onnxruntime-gpu==1.27.0"]
+constraint-dependencies = ["torch==2.14.0", "torchvision==0.29.0", "numba>=0.60", "onnxruntime-gpu==1.27.0"]
 # The build extras are mutually exclusive, exactly like the root pyproject, so one lock carries all four.
 conflicts = [
     [
