@@ -678,15 +678,23 @@ def test_empty_process_map_is_not_declared_all_unresponsive() -> None:
     assert plm._hung_processes_detected is False
 
 
-def test_broadcast_reload_model_database_targets_inference_and_download() -> None:
-    """The reload broadcast reaches every inference process and the download process."""
+def test_broadcast_reload_model_database_targets_inference_post_process_and_download() -> None:
+    """The reload broadcast reaches every inference process, the post-processing lane and the download process.
+
+    The post-processing lane resolves upscalers and face fixers from the same references, so a model the
+    download process just placed becomes usable there only through this broadcast.
+    """
     from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeControlMessage
 
     process_map = ProcessMap({})
     inf0 = make_mock_process_info(0)
     inf1 = make_mock_process_info(1)
+    post_process = make_mock_process_info(2, process_type=HordeProcessType.POST_PROCESS, model_name=None)
+    safety = make_mock_process_info(3, process_type=HordeProcessType.SAFETY, model_name=None)
     process_map[0] = inf0
     process_map[1] = inf1
+    process_map[2] = post_process
+    process_map[3] = safety
 
     plm = _make_plm(process_map=process_map)
     download_info = make_mock_process_info(9000, process_type=HordeProcessType.DOWNLOAD, model_name=None)
@@ -694,7 +702,8 @@ def test_broadcast_reload_model_database_targets_inference_and_download() -> Non
 
     plm.broadcast_reload_model_database()
 
-    for proc in (inf0, inf1, download_info):
+    safety.pipe_connection.send.assert_not_called()  # type: ignore
+    for proc in (inf0, inf1, post_process, download_info):
         proc.pipe_connection.send.assert_called_once()  # type: ignore
         sent = proc.pipe_connection.send.call_args.args[0]  # pyrefly: ignore
         assert isinstance(sent, HordeControlMessage)

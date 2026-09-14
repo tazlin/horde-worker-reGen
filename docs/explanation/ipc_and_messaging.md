@@ -128,9 +128,6 @@ stateDiagram-v2
     PROCESS_STARTING --> WAITING_FOR_JOB
     WAITING_FOR_JOB --> DOWNLOADING_MODEL
     DOWNLOADING_MODEL --> DOWNLOAD_COMPLETE
-    DOWNLOADING_MODEL --> DOWNLOADING_AUX_MODEL
-    DOWNLOADING_AUX_MODEL --> DOWNLOAD_AUX_COMPLETE
-    DOWNLOAD_AUX_COMPLETE --> PRELOADING_MODEL
     DOWNLOAD_COMPLETE --> PRELOADING_MODEL
     PRELOADING_MODEL --> PRELOADED_MODEL
     PRELOADED_MODEL --> WAITING_FOR_JOB
@@ -157,7 +154,7 @@ stateDiagram-v2
 > `INFERENCE_PRIMED` while it stages its pipeline and waits for the GPU sampling lease,
 > and advances to `INFERENCE_STARTING` only on the first sampling step (so `INFERENCE_STARTING`
 > means the denoise loop is actually running, not merely dispatched). Many intermediate states
-> (e.g. `PRELOADED_MODEL`, `DOWNLOAD_AUX_COMPLETE`) can also transition directly
+> (e.g. `PRELOADED_MODEL`, `DOWNLOAD_COMPLETE`) can also transition directly
 > back to `WAITING_FOR_JOB` or to `INFERENCE_PRIMED`. The alchemy states
 > (`ALCHEMY_STARTING` → `ALCHEMY_COMPLETE` / `ALCHEMY_FAILED`, reported by both
 > inference and safety processes while running a form) and a few other edges are
@@ -189,8 +186,9 @@ bookkeeping before the child acknowledges:
 
 1. Sending `PRELOAD_MODEL` → parent marks the model `LOADING` in
    `HordeModelMap`.
-2. Sending `PREPARE_AUX_MODELS` → parent marks the target process
-   `DOWNLOADING_AUX_MODEL`, but deliberately leaves the job pending and creates no sampling reservation.
+2. Sending a `HordeAuxPrefetchControlMessage` to the download process for a job's LoRAs and
+   textual inversions → the job stays pending with no lane and no sampling reservation until the
+   files land (see [pop-time auxiliary prefetch](model_downloads.md#pop-time-auxiliary-prefetch)).
 3. Sending `START_INFERENCE` → parent adds the job to `jobs_in_progress` and
    sets the process state to `JOB_RECEIVED`.
 4. Sending `UNLOAD_MODELS_FROM_VRAM` → parent marks the model as no longer in

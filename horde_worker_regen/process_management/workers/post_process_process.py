@@ -59,6 +59,18 @@ else:
 _T = TypeVar("_T")
 
 
+class PostProcessorNotOnDiskError(RuntimeError):
+    """A post-processor the model reference knows has no weight on disk, so the lane cannot run it."""
+
+    def __init__(self, model_name: str) -> None:
+        """Name the missing model in the message the job's fault carries."""
+        super().__init__(
+            f"post-processor {model_name!r} is in the model reference but not on disk; the download process "
+            "fetches it",
+        )
+        self.model_name = model_name
+
+
 def _sort_facefixers_last(post_processing: list[str]) -> list[str]:
     """Return the requested post-processors with face-fixers ordered after upscalers.
 
@@ -173,6 +185,7 @@ class HordePostProcessProcess(HordeProcess):
             # Upscales can run for many seconds; a heartbeat per operation keeps the parent's liveness
             # view fresh so a legitimately busy post-processing pass is not mistaken for a hung process.
             self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+            self._require_post_processor_on_disk(operation)
             result = self._horde.post_process(
                 {
                     "model": operation,
@@ -295,6 +308,7 @@ class HordePostProcessProcess(HordeProcess):
         if classify_post_processor(form.form) is None:
             raise ValueError(f"Unknown alchemy form for post-processing process: {form.form}")
 
+        self._require_post_processor_on_disk(form.form)
         source_image = PIL.Image.open(io.BytesIO(form.source_image_bytes))
         result = self._horde.post_process(
             {
@@ -405,7 +419,49 @@ class HordePostProcessProcess(HordeProcess):
         self.send_memory_report_message(include_vram=True)
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
+    def reload_model_database(self) -> None:
+        """Reload the model managers' references from disk (no download).
+
+        Sent by the parent after it refreshes the reference, or after the download process places a
+        model, so an upscaler or face fixer that just landed resolves here without a restart.
+        """
+        if self._dry_run_skip_post_processing or self._shared_model_manager is None:
+            return
+        try:
+            self._shared_model_manager.manager.reload_database()
+            logger.info("Reloaded model database from disk")
+        except Exception as e:  # noqa: BLE001 - a reload failure must not crash the post-processing lane
+            logger.error(f"Failed to reload model database: {type(e).__name__}: {e}")
+
+    def _require_post_processor_on_disk(self, model_name: str) -> None:
+        """Raise if a post-processor the reference knows is not on disk, before hordelib would download it.
+
+        The download process is the only place weights are fetched: a transfer inside this lane would run
+        under the job's own time bound and show no progress. A name no manager owns is left to hordelib to
+        reject; a dry-run lane has no managers to consult.
+
+        Raises:
+            PostProcessorNotOnDiskError: The model is in a reference but its file is absent.
+        """
+        if self._dry_run_skip_post_processing or self._shared_model_manager is None:
+            return
+        from horde_model_reference import MODEL_REFERENCE_CATEGORY
+
+        managers = self._shared_model_manager.manager.get_model_manager_instances(
+            [MODEL_REFERENCE_CATEGORY.codeformer, MODEL_REFERENCE_CATEGORY.esrgan, MODEL_REFERENCE_CATEGORY.gfpgan],
+        )
+        for manager in managers:
+            if model_name not in manager.model_reference:
+                continue
+            if not manager.is_model_available(model_name):
+                raise PostProcessorNotOnDiskError(model_name)
+            return
+
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
+        if message.control_flag == HordeControlFlag.RELOAD_MODEL_DATABASE:
+            self.reload_model_database()
+            return
+
         if message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
             self.unload_models_from_vram()
             return

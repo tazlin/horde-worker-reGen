@@ -2431,6 +2431,10 @@ class ProcessLifecycleManager:
         message = HordeControlMessage(control_flag=HordeControlFlag.RELOAD_MODEL_DATABASE)
         for process_info in self._process_map.get_inference_processes():
             process_info.safe_send_message(message)
+        # The post-processing lane resolves upscalers and face fixers from the same references, so a model
+        # the download process just placed is visible to it only after it reloads too.
+        for process_info in self._process_map.get_post_process_processes():
+            process_info.safe_send_message(message)
         if self._download_process_info is not None:
             self._download_process_info.safe_send_message(message)
 

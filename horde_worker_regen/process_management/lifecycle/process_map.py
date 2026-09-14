@@ -1119,6 +1119,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """Return a list of all inference processes."""
         return [p for p in self.values() if p.process_type == HordeProcessType.INFERENCE]
 
+    def get_post_process_processes(self) -> list[HordeProcessInfo]:
+        """Return a list of all post-processing lane processes."""
+        return [p for p in self.values() if p.process_type == HordeProcessType.POST_PROCESS]
+
     def get_first_available_inference_process(
         self,
         disallowed_processes: list[int] | None = None,

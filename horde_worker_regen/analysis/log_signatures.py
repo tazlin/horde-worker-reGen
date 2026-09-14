@@ -890,6 +890,26 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason="the dry-run contract scenario's fake post-processing lane never goes silent",
     ),
     _signature(
+        "alchemy_form_stall",
+        r"seems to be stuck running an alchemy form",
+        emitter="process_management.lifecycle.process_lifecycle:replace_hung_processes",
+        sample="Process 1 seems to be stuck running an alchemy form (no progress for 123s); replacing it.",
+        dry_run_reason="the dry-run contract scenario's fake post-processing lane finishes every alchemy form",
+    ),
+    _signature(
+        "post_processor_missing",
+        r"PostProcessorNotOnDiskError: ",
+        emitter=(
+            "process_management.workers.post_process_process:_run_post_processing and _run_graph_alchemy, "
+            "raised by _require_post_processor_on_disk"
+        ),
+        sample=(
+            "Post-processing failed for job 0123abcd: PostProcessorNotOnDiskError: post-processor "
+            "'RealESRGAN_x4plus' is in the model reference but not on disk; the download process fetches it"
+        ),
+        dry_run_reason="the dry-run post-processing lane consults no model managers",
+    ),
+    _signature(
         "dedicated_post_process_activity",
         r"(?:last_process_state=HordeProcessState\.(?:INFERENCE_POST_PROCESSING|POST_PROCESSING)\b|"
         r"Post-processing (?:job|for job|finished for job) [0-9a-fA-F]{8})",

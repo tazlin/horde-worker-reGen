@@ -90,10 +90,14 @@ timeout:
 | -------------------------------- | -------------------------------------- | -------------------------------------- |
 | Mid-inference                    | `inference_step_timeout`               | `20s` base, widened as described below |
 | Preloading a model / starting up | `preload_timeout`                      | `150s`                                 |
-| Downloading an auxiliary model   | `download_timeout`                     | LoRA download budget + 1s              |
 | Post-processing                  | `post_process_timeout + 3 × max_batch` | `120s + 3 × max_batch`                 |
 | Running an alchemy form          | `post_process_timeout + 3 × max_batch` | `120s + 3 × max_batch`                 |
-(`process_timeout` and these timeouts are affected by performance modes.)
+(`process_timeout` and these timeouts are affected by performance modes.) No child
+process downloads model weights: the post-processing lane faults a job whose
+upscaler or face fixer is not on disk, and the download process fetches it, so no
+stuck-downloading row exists. `download_timeout` bounds a popped job's wait for its
+auxiliary prefetch instead (see
+[Model downloads](model_downloads.md#pop-time-auxiliary-prefetch)).
 
 The mid-inference timeout is not a single flat value. Before a job's first
 sampling step (its `last_current_step` is still `None`) the slot is doing

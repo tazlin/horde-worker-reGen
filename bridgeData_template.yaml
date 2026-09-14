@@ -581,7 +581,8 @@ contended_step_timeout: 120
 # earlier step a few times before advancing.
 inference_stuck_step_repeat_limit: 20
 
-# Maximum time (seconds) to allow an auxiliary model (LoRA, etc.) to download before it is killed.
+# How long (seconds) a popped job may wait for its LoRAs and textual inversions to download before it is
+# faulted. A transfer still moving at the deadline is given up to two more budgets. Nothing is killed on it.
 download_timeout: 121
 
 # How many times a single job may be dispatched to inference before it is reported faulted.

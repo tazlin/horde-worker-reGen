@@ -707,7 +707,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     post_process_timeout: int = Field(default=120, ge=15)
 
     download_timeout: int = Field(default=TOTAL_LORA_DOWNLOAD_TIMEOUT + 1)
-    """The maximum amount of time to allow an aux model to download before it is killed"""
+    """How long a popped job may wait for its LoRAs and textual inversions to download, in seconds.
+
+    The budget for the job's dispatch hold; a transfer still moving when it expires is given up to two more
+    budgets before the job is faulted. No process is killed on it."""
 
     download_rate_limit_kbps: int | None = Field(default=None, ge=0)
     """Cap background model downloads to this many KB/s (None or 0 means unlimited).

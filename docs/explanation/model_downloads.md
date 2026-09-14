@@ -64,6 +64,13 @@ download process can never wedge startup: the worker can still run inference on
 whatever is already present. It is started and stopped by the
 `ProcessLifecycleManager` (`start_download_process` / `end_download_process`).
 
+It is also the only process that fetches model weights. The post-processing lane
+checks that an upscaler or face fixer is on disk before it runs one and faults the
+job with the model named when it is not, rather than downloading inside the lane
+under the job's own time bound; the reconcile below then fetches it. When a
+download lands, the parent tells the inference processes and the post-processing
+lane to reload their references, so the new file resolves there without a restart.
+
 Every per-file fetch (image **and** auxiliary) goes through the same validated
 download in
 [`model_download_core`][horde_worker_regen.model_download_core]: after the fetch it
