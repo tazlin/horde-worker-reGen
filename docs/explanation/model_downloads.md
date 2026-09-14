@@ -64,6 +64,13 @@ download process can never wedge startup: the worker can still run inference on
 whatever is already present. It is started and stopped by the
 `ProcessLifecycleManager` (`start_download_process` / `end_download_process`).
 
+Its startup scan also tidies one kind of leftover: a file a record routes into a
+sibling folder (the face-restoration helper weights every face fixer opens from
+`gfpgan/`) that an older library fetched into the record's own folder instead. Once
+the routed copy is present and the same size, the stray and its checksum sidecar are
+deleted, so a worker that pulled the duplicate before upgrading is not charged twice
+for one weight.
+
 It is also the only process that fetches model weights. The post-processing lane
 checks that an upscaler or face fixer is on disk before it runs one and faults the
 job with the model named when it is not, rather than downloading inside the lane

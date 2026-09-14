@@ -25,6 +25,7 @@ rate-limit changes take effect mid-download (the worker loop is blocked inside t
 from __future__ import annotations
 
 import contextlib
+import filecmp
 import os
 import signal
 import subprocess
@@ -1030,6 +1031,7 @@ class HordeDownloadProcess(HordeProcess):
 
         self._send_status(DownloadPhase.SCANNING, scan_complete=False, force=True)
         self._migrate_hub_cache()
+        self._remove_stray_routed_copies()
         self._refresh_present()
         # Cheap existence probe so a warm worker reports the safety models present in its first
         # authoritative report; the safety process then starts immediately instead of being deferred.
@@ -1594,6 +1596,69 @@ class HordeDownloadProcess(HordeProcess):
                 exclusive=True,
             ),
         )
+
+    def _remove_stray_routed_copies(self) -> None:
+        """Delete a copy of a routed component that an older library left in the record's own folder.
+
+        A record can declare a file that belongs in a sibling folder (the face-restoration helper weights
+        every face fixer opens from ``gfpgan/``). A library released before that routing existed fetched
+        such a file into the record's category folder instead, where nothing ever reads it. The stray and
+        its checksum sidecar are removed only when the routed copy is a regular file with identical bytes, so
+        nothing is lost by the delete. Runs once per session, during the startup scan.
+
+        Paths are resolved against the manager's own folder (the same root hordelib reads and writes, made
+        absolute here), the routed entry must have the exact ``../<folder>/<name>`` shape the layout module
+        produces, and a stray that is a symlink or resolves to the routed copy itself is never touched.
+        """
+        from hordelib.api import SharedModelManager
+
+        manager = SharedModelManager.manager
+        for manager_key in _FEATURE_MANAGER_KEYS:
+            sub_manager = _aux_sub_manager(manager, manager_key)
+            if sub_manager is None:
+                continue
+            category_folder = Path(sub_manager.model_folder_path).resolve()
+            for model_name in sub_manager.model_reference:
+                try:
+                    file_entries = sub_manager.get_model_filenames(model_name)
+                except ValueError:
+                    continue
+                for entry in file_entries:
+                    stray = self._stray_routed_copy(category_folder, Path(str(entry["file_path"])))
+                    if stray is None:
+                        continue
+                    try:
+                        stray.unlink()
+                        sidecar = stray.with_suffix(".sha256")
+                        if sidecar.is_file() and not sidecar.is_symlink():
+                            sidecar.unlink()
+                    except OSError as e:
+                        logger.warning(f"Download process: could not remove stray copy {stray}: {e}")
+                        continue
+                    logger.info(
+                        f"Download process: removed {stray}, a copy left by an earlier library; {model_name} "
+                        f"reads {stray.name} from its routed folder",
+                    )
+
+    @staticmethod
+    def _stray_routed_copy(category_folder: Path, relative_path: Path) -> Path | None:
+        """Return the deletable stray for one resolved file entry, or None when there is nothing to remove.
+
+        ``relative_path`` is what hordelib resolves for the entry: ``<name>`` for a file in the record's own
+        folder (never a candidate) or ``../<folder>/<name>`` for a routed component.
+        """
+        parts = relative_path.parts
+        if len(parts) != 3 or parts[0] != ".." or parts[2] in ("", ".", ".."):
+            return None
+        routed = (category_folder / relative_path).resolve()
+        stray = category_folder / parts[2]
+        if stray.is_symlink() or not stray.is_file() or not routed.is_file():
+            return None
+        if stray.resolve() == routed or stray.parent != category_folder:
+            return None
+        if stray.stat().st_size != routed.stat().st_size or not filecmp.cmp(stray, routed, shallow=False):
+            return None
+        return stray
 
     def _post_processor_presence(self, manager: ModelManager) -> tuple[list[str] | None, bool | None]:
         """Return the post-processors on disk and validated, by reference key, plus the all-present verdict.
