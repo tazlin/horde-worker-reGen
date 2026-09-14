@@ -233,3 +233,140 @@ def test_read_stamp_returns_none_on_malformed(tmp_path: Path) -> None:
 
     stamp_path.write_text("{not json", encoding="utf-8")
     assert utilities_env.read_utilities_stamp(tmp_path) is None
+
+
+# --- torch hold (a held main env defers provisioning) -----------------------------------------------
+
+
+def _write_torch_lock(root: Path, *versions: str) -> None:
+    """Write a minimal utilities lock with one ``torch`` package entry per *versions* entry."""
+    body = "\n".join(f'[[package]]\nname = "torch"\nversion = "{version}"\n' for version in versions)
+    lock = paths.utilities_lock_file(root)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(body, encoding="utf-8")
+
+
+def _install_main_env_torch(root: Path, version: str) -> None:
+    """Create a fake main venv whose site-packages holds a *version* torch dist-info."""
+    site = paths.venv_dir(root) / "Lib" / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    (site / f"torch-{version}.dist-info").mkdir()
+
+
+def test_locked_torch_version_selects_the_requested_build(tmp_path: Path) -> None:
+    """A per-build lock reports the exact entry selected by the backend token."""
+    _write_torch_lock(tmp_path, "2.14.0+cu126", "2.14.0+cu132", "2.14.0+cpu")
+    assert utilities_env.locked_torch_version(backend_token="cu132", root=tmp_path) == "2.14.0+cu132"
+
+
+def test_locked_torch_version_does_not_borrow_another_backends_release(tmp_path: Path) -> None:
+    """A backend uses its own lock entry when build releases differ."""
+    _write_torch_lock(tmp_path, "2.14.0+cu132", "2.13.0+cu126")
+    assert utilities_env.locked_torch_version(backend_token="cu126", root=tmp_path) == "2.13.0+cu126"
+    _write_torch_lock(tmp_path, "2.13.0+cu126", "2.14.0+cu132")
+    assert utilities_env.locked_torch_version(backend_token="cu126", root=tmp_path) == "2.13.0+cu126"
+
+
+def test_locked_torch_version_ignores_similarly_named_packages(tmp_path: Path) -> None:
+    """Only the ``torch`` package counts: torchdiffeq/torchsde share the prefix but are not torch."""
+    lock = paths.utilities_lock_file(tmp_path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(
+        '[[package]]\nname = "torchdiffeq"\nversion = "9.9.9"\n'
+        '[[package]]\nname = "torch"\nversion = "2.14.0+cu132"\n',
+        encoding="utf-8",
+    )
+    assert utilities_env.locked_torch_version(backend_token="cu132", root=tmp_path) == "2.14.0+cu132"
+
+
+def test_locked_torch_version_is_none_without_a_lock(tmp_path: Path) -> None:
+    """No committed utilities lock means there is no pin to hold anything against."""
+    assert utilities_env.locked_torch_version(backend_token="cu132", root=tmp_path) is None
+
+
+@pytest.mark.parametrize("body", ["", '[[package]]\nname = "torch"\n'])
+def test_locked_torch_version_is_none_without_a_version_entry(tmp_path: Path, body: str) -> None:
+    """An empty or version-less lock yields None so it can never block provisioning."""
+    lock = paths.utilities_lock_file(tmp_path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(body, encoding="utf-8")
+    assert utilities_env.locked_torch_version(backend_token="cu132", root=tmp_path) is None
+
+
+def test_locked_torch_version_warns_and_returns_none_when_malformed(tmp_path: Path) -> None:
+    """A malformed lock reports why its torch pin cannot be read and does not block provisioning."""
+    lock = paths.utilities_lock_file(tmp_path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("utilities-lock\n", encoding="utf-8")
+
+    with pytest.warns(UserWarning, match="Could not read the image-utilities lock's torch version"):
+        assert utilities_env.locked_torch_version(backend_token="cu132", root=tmp_path) is None
+
+
+def test_torch_hold_when_the_main_env_has_not_taken_the_locked_torch(tmp_path: Path) -> None:
+    """A main venv behind the utilities lock is a hold: the lane must not fetch the declined torch."""
+    _install_main_env_torch(tmp_path, "2.12.1+cu132")
+    _write_torch_lock(tmp_path, "2.14.0+cu132")
+
+    hold = utilities_env.torch_hold(backend_token="cu132", root=tmp_path)
+
+    assert hold == utilities_env.TorchHold(installed_version="2.12.1+cu132", locked_version="2.14.0+cu132")
+
+
+def test_torch_hold_is_none_once_the_main_env_took_the_locked_release(tmp_path: Path) -> None:
+    """The same release and selected build clear the hold."""
+    _install_main_env_torch(tmp_path, "2.14.0+cu132")
+    _write_torch_lock(tmp_path, "2.14.0+cu132")
+    assert utilities_env.torch_hold(backend_token="cu132", root=tmp_path) is None
+
+
+def test_torch_hold_detects_a_different_build_of_the_locked_release(tmp_path: Path) -> None:
+    """A different local build defers provisioning even when its public release matches the lock."""
+    _install_main_env_torch(tmp_path, "2.14.0+cu126")
+    _write_torch_lock(tmp_path, "2.14.0+cu132")
+
+    hold = utilities_env.torch_hold(backend_token="cu132", root=tmp_path)
+
+    assert hold == utilities_env.TorchHold(installed_version="2.14.0+cu126", locked_version="2.14.0+cu132")
+
+
+def test_torch_hold_detects_a_different_build_with_equivalent_release_spelling(tmp_path: Path) -> None:
+    """Equivalent public releases do not hide a different local build."""
+    _install_main_env_torch(tmp_path, "2.14+cu126")
+    _write_torch_lock(tmp_path, "2.14.0+cu132")
+
+    hold = utilities_env.torch_hold(backend_token="cu132", root=tmp_path)
+
+    assert hold == utilities_env.TorchHold(installed_version="2.14+cu126", locked_version="2.14.0+cu132")
+
+
+def test_torch_hold_detects_a_prerelease_behind_the_locked_final(tmp_path: Path) -> None:
+    """A release candidate remains behind its final release and therefore defers provisioning."""
+    _install_main_env_torch(tmp_path, "2.14.0rc1+cu132")
+    _write_torch_lock(tmp_path, "2.14.0+cu132")
+
+    hold = utilities_env.torch_hold(backend_token="cu132", root=tmp_path)
+
+    assert hold == utilities_env.TorchHold(installed_version="2.14.0rc1+cu132", locked_version="2.14.0+cu132")
+
+
+def test_torch_hold_detects_when_the_main_env_is_ahead(tmp_path: Path) -> None:
+    """A main venv ahead of the lock defers rather than downloading a second, older torch build."""
+    _install_main_env_torch(tmp_path, "2.15.0+cu132")
+    _write_torch_lock(tmp_path, "2.14.0+cu132")
+
+    hold = utilities_env.torch_hold(backend_token="cu132", root=tmp_path)
+
+    assert hold == utilities_env.TorchHold(installed_version="2.15.0+cu132", locked_version="2.14.0+cu132")
+
+
+def test_torch_hold_is_none_without_an_installed_torch(tmp_path: Path) -> None:
+    """A venv with no torch yet cannot be held against the lock."""
+    _write_torch_lock(tmp_path, "2.14.0+cu132")
+    assert utilities_env.torch_hold(backend_token="cu132", root=tmp_path) is None
+
+
+def test_torch_hold_is_none_without_a_readable_lock(tmp_path: Path) -> None:
+    """An unreadable lock pin cannot defer anything."""
+    _install_main_env_torch(tmp_path, "2.12.1+cu132")
+    assert utilities_env.torch_hold(backend_token="cu132", root=tmp_path) is None

@@ -142,21 +142,65 @@ def _public_version(version: str) -> str:
     return version.split("+", 1)[0]
 
 
-def _version_tuple(version: str) -> tuple[int, ...]:
-    """Parse a PEP 440-subset release into a tuple of ints for comparison (local/pre segments dropped)."""
-    release = _public_version(version).split("!", 1)[-1]
-    parts: list[int] = []
-    for piece in release.split("."):
-        match = re.match(r"\d+", piece)
-        if not match:
-            break
-        parts.append(int(match.group()))
-    return tuple(parts) or (0,)
+_VERSION_PATTERN: re.Pattern[str] = re.compile(
+    r"^(?:(?P<epoch>\d+)!)?"
+    r"(?P<release>\d+(?:\.\d+)*)"
+    r"(?:(?P<prerelease_kind>a|b|rc)(?P<prerelease_number>\d+))?$",
+    re.IGNORECASE,
+)
+_RELEASE_PREFIX_PATTERN: re.Pattern[str] = re.compile(r"^(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)")
+_PRERELEASE_ORDER: dict[str, int] = {"a": 0, "b": 1, "rc": 2}
+_FINAL_RELEASE_ORDER: int = 3
+
+
+def _version_parts(version: str) -> tuple[int, tuple[int, ...], int, int] | None:
+    """Parse the release and common prerelease portion of a PEP 440 version."""
+    match = _VERSION_PATTERN.fullmatch(_public_version(version))
+    if match is None:
+        return None
+    release = tuple(int(piece) for piece in match.group("release").split("."))
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]
+    prerelease_kind = match.group("prerelease_kind")
+    prerelease_order = _FINAL_RELEASE_ORDER
+    prerelease_number = 0
+    if prerelease_kind is not None:
+        prerelease_order = _PRERELEASE_ORDER[prerelease_kind.lower()]
+        prerelease_number = int(match.group("prerelease_number"))
+    return int(match.group("epoch") or 0), release, prerelease_order, prerelease_number
+
+
+def _release_parts(version: str) -> tuple[int, tuple[int, ...]]:
+    """Return the numeric release prefix used as a fallback for unsupported suffixes."""
+    match = _RELEASE_PREFIX_PATTERN.match(_public_version(version))
+    if match is None:
+        return 0, (0,)
+    release = tuple(int(piece) for piece in match.group("release").split("."))
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]
+    return int(match.group("epoch") or 0), release
 
 
 def version_at_least(installed: str, target: str) -> bool:
-    """Return whether *installed* is >= *target* comparing the PEP 440-subset release (local segment ignored)."""
-    return _version_tuple(installed) >= _version_tuple(target)
+    """Return whether *installed* is at least *target* under the supported PEP 440 subset.
+
+    Local build segments are ignored. Numeric releases, epochs, and the common ``a``/``b``/``rc``
+    prereleases are ordered according to PEP 440; trailing release zeros compare equally. Other suffixes use
+    their numeric release prefix, preserving the bootstrap's historical fallback without requiring the
+    third-party ``packaging`` module in this standard-library-only module.
+
+    Args:
+        installed: The installed package version.
+        target: The version that the installed package must meet or exceed.
+
+    Returns:
+        Whether the installed version meets or exceeds the target.
+    """
+    installed_parts = _version_parts(installed)
+    target_parts = _version_parts(target)
+    if installed_parts is None or target_parts is None:
+        return _release_parts(installed) >= _release_parts(target)
+    return installed_parts >= target_parts
 
 
 def is_large(name: str) -> bool:
@@ -226,11 +270,7 @@ def parse_dry_run(output: str) -> list[PackageChange]:
         to_version = added.get(name)
         from_version = removed.get(name)
         if to_version is not None and from_version is not None:
-            kind = (
-                ChangeKind.UPGRADE
-                if _version_tuple(to_version) >= _version_tuple(from_version)
-                else ChangeKind.DOWNGRADE
-            )
+            kind = ChangeKind.UPGRADE if version_at_least(to_version, from_version) else ChangeKind.DOWNGRADE
         elif to_version is not None:
             kind = ChangeKind.INSTALL
         else:

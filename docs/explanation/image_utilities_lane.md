@@ -38,6 +38,12 @@ that never received the `requirements/utilities/` directory), the bootstrap warn
 rather than skipping silently, so the cause is diagnosable instead of surfacing only as a missing interpreter
 at start.
 
+Provisioning is also deferred while the worker's own environment is limping along on an older torch than the
+utilities lock pins (a held optional update): syncing the lane from that lock would download the very torch
+the hold declined, and leave the two environments on different builds. The deferral ends by itself, on the
+first sync that takes the newer torch. An existing utilities venv remains unchanged during the deferral; if
+the venv has not been provisioned yet, the capabilities that need it remain unavailable until then.
+
 Provisioning from a lock is what makes the two environments share a single download. A locked sync installs
 strictly from the lockfile's recorded sources and never re-resolves, so it is deterministic (identical wheels
 on every machine), reuses the main `.venv`'s already-cached torch/CUDA stack from the peered uv cache, and

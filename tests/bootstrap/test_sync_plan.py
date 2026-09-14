@@ -25,12 +25,14 @@ Would install 4 packages
 
 
 def test_version_tuple_strips_local_and_compares() -> None:
-    """Version comparison strips local (+cuXXX) segments and tolerates trailing non-numeric pieces."""
+    """Version comparison strips local segments and orders supported PEP 440 releases correctly."""
     assert sync_plan.version_at_least("2.12.1+cu132", "2.12.1")
     assert sync_plan.version_at_least("2.12.1+cu132", "2.11.0")
     assert not sync_plan.version_at_least("2.11.0+cu132", "2.12.0")
-    # A trailing non-numeric segment (e.g. an rc) is truncated, not crashed on.
-    assert sync_plan.version_at_least("2.12.0rc1", "2.12.0")
+    assert not sync_plan.version_at_least("2.12.0rc1", "2.12.0")
+    assert sync_plan.version_at_least("2.12.0", "2.12.0rc1")
+    assert sync_plan.version_at_least("2.12", "2.12.0")
+    assert sync_plan.version_at_least("2.12.0.post1", "2.12.0")
 
 
 def test_parse_dry_run_classifies_changes() -> None:

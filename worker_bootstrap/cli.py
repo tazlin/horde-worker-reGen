@@ -187,8 +187,10 @@ def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOp
     worker runs without it, so its provisioning is post-success and non-fatal (a failure warns but never
     turns an otherwise-complete install into a reported failure, mirroring :func:`_maybe_prune`). It is
     skipped entirely when the resolved feature set is empty (nothing wants it), when a matching stamp shows
-    it is already current, or when it is disabled via ``--skip-utilities`` /
-    ``HORDE_WORKER_SKIP_UTILITIES``.
+    it is already current, when it is disabled via ``--skip-utilities`` /
+    ``HORDE_WORKER_SKIP_UTILITIES``, or while the worker environment's torch differs from the build the
+    utilities lock pins (:func:`worker_bootstrap.utilities_env.torch_hold`): a held update or backend mismatch
+    must not fetch a second accelerator stack for the lane.
 
     A wanted-but-absent utilities lock is reported rather than silently skipped when the backend is one that
     ships the utilities project by policy (see :func:`worker_bootstrap.backend.expects_utilities_lock`): its
@@ -214,6 +216,15 @@ def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOp
             )
         return
     if not utilities_env.needs_provision(backend_token=token, root=root):
+        return
+    hold = utilities_env.torch_hold(backend_token=token, root=root)
+    if hold is not None:
+        print(
+            f"Deferring the image-utilities capability venv: the worker environment is on torch "
+            f"{hold.installed_version} while the image-utilities lock pins {hold.locked_version}. It is "
+            f"provisioned by the first sync that installs the matching torch build.",
+            flush=True,
+        )
         return
     print("Provisioning the image-utilities capability venv (a separate environment)...", flush=True)
     try:

@@ -98,3 +98,4 @@ torch-hold controls.
 | Platform uv bootstrap and launcher generation | `runtime.cmd`, `runtime.sh`, `worker_bootstrap/updater.py`, `launchers_need_refresh` | `tests/test_uv_version_consistency.py`, `tests/test_self_updater.py` |
 | Isolated subprocess environment and locked sync | `worker_bootstrap/runner.py`, `build_child_env`, `uv_sync` | `tests/bootstrap/test_runner.py` |
 | Persistent paths and lock fingerprint | `worker_bootstrap/paths.py`, `data_root`, `sync_stamp_file` | `tests/bootstrap/test_paths.py`, `tests/bootstrap/test_cli.py` |
+| Image-utilities venv provisioning, and its deferral while the worker env holds an older torch | `worker_bootstrap/utilities_env.py`, `plan_utilities_provision`, `torch_hold`, `needs_provision`; `worker_bootstrap/cli.py`, `_maybe_provision_utilities` | `tests/bootstrap/test_utilities_env.py`, `tests/bootstrap/test_cli.py` |

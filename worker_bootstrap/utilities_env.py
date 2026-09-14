@@ -17,6 +17,8 @@ owns the pure, side-effect-light pieces of keeping that venv in step:
   the utilities venv is wanted at all.
 - :func:`needs_provision` compares the recorded stamp against the current utilities lock so an up-to-date
   venv is left untouched.
+- :func:`torch_hold` reports a worker environment that is limping along on an older torch than the
+  utilities lock pins, which defers provisioning so the held torch is not fetched a second time.
 
 Like the rest of the bootstrap brain, this module is standard-library only (see
 ``tests/bootstrap/test_stdlib_only.py``): it runs via ``uv run --script`` before any project venv exists.
@@ -26,18 +28,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+import tomllib
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
-from worker_bootstrap import backend, paths
+from worker_bootstrap import backend, paths, sync_plan
 
 __all__ = [
     "UTILITIES_PYTHON_VERSION",
+    "TorchHold",
     "UtilitiesProvisionError",
     "UtilitiesStamp",
+    "locked_torch_version",
     "needs_provision",
     "plan_utilities_provision",
     "read_utilities_stamp",
+    "torch_hold",
     "utilities_provision_wanted",
     "write_utilities_stamp",
 ]
@@ -177,6 +185,101 @@ def write_utilities_stamp(*, backend_token: str, root: Path | None = None) -> No
     path = paths.utilities_stamp_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(stamp.to_dict(), indent=2), encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class TorchHold:
+    """Represents a worker torch installation that does not match the utilities lock target.
+
+    Attributes:
+        installed_version: The torch version installed in the worker's own venv, local build tag included
+            (e.g. ``2.12.1+cu132``).
+        locked_version: The torch build the utilities environment would install (e.g. ``2.14.0+cu132``).
+    """
+
+    installed_version: str
+    locked_version: str
+
+
+def _torch_local_build(backend_token: str) -> str:
+    """Return the local-version suffix used by the selected torch wheel index."""
+    if backend_token == "cpu" and sys.platform == "darwin":
+        return ""
+    return f"+{backend_token}"
+
+
+def locked_torch_version(*, backend_token: str, root: Path | None = None) -> str | None:
+    """Return the torch build the utilities lock resolves for a backend, or None when unknown.
+
+    The utilities project routes torch to a per-build wheel index, so its lock carries one ``torch`` entry
+    per build (``2.14.0+cu126``, ``2.14.0+cpu``, ...). Only the entry whose local build matches
+    ``backend_token`` is considered; CPU wheels on macOS have no local suffix. If duplicate matching entries
+    exist, the newest wins independent of lock order. None means "cannot tell" (absent or unparseable lock,
+    no matching torch entry), which callers read as "no hold": a lock the bootstrap cannot parse must never
+    block provisioning.
+
+    Args:
+        backend_token: The selected torch build token (for example, ``cu132`` or ``cpu``).
+        root: The install root (defaults to :func:`worker_bootstrap.paths.install_root`).
+
+    Returns:
+        The newest resolved torch build for the backend, or None when the lock has no matching readable entry.
+    """
+    try:
+        with paths.utilities_lock_file(root).open("rb") as handle:
+            lock_data = tomllib.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        warnings.warn(f"Could not read the image-utilities lock's torch version: {error}", stacklevel=2)
+        return None
+    locked_packages = lock_data.get("package")
+    if not isinstance(locked_packages, list):
+        return None
+    expected_local_build = _torch_local_build(backend_token)
+    matching_torch_versions: list[str] = []
+    for locked_package in locked_packages:
+        if not isinstance(locked_package, dict) or locked_package.get("name") != "torch":
+            continue
+        package_version = locked_package.get("version")
+        if not isinstance(package_version, str) or not package_version:
+            continue
+        _, separator, local_build = package_version.partition("+")
+        package_local_build = f"+{local_build}" if separator else ""
+        if package_local_build.lower() == expected_local_build.lower():
+            matching_torch_versions.append(package_version)
+    newest_torch_version: str | None = None
+    for torch_version in matching_torch_versions:
+        if newest_torch_version is None or sync_plan.version_at_least(torch_version, newest_torch_version):
+            newest_torch_version = torch_version
+    return newest_torch_version
+
+
+def torch_hold(*, backend_token: str, root: Path | None = None) -> TorchHold | None:
+    """Return the torch hold that defers utilities provisioning, or None when there is no hold.
+
+    The worker's own environment can be left on an older torch on purpose (limping along through a large
+    optional upgrade) while the regenerated utilities lock pins the newer one. Syncing the lane from that lock
+    would download the very torch the hold declined and leave the two environments on different builds, so
+    provisioning waits for a matching main-environment build. Any known mismatch is deferred, including a
+    different accelerator build or a main environment ahead of the lock; otherwise provisioning would
+    download a second accelerator stack and break the same-build invariant. None whenever either version is
+    unknown, so neither an unreadable lock nor a venv without torch can block provisioning.
+
+    Args:
+        backend_token: The selected torch build token (for example, ``cu132`` or ``cpu``).
+        root: The install root (defaults to :func:`worker_bootstrap.paths.install_root`).
+
+    Returns:
+        The mismatch that requires deferral, or None when utilities provisioning may proceed.
+    """
+    installed_torch_version = sync_plan.installed_versions(paths.venv_dir(root)).get("torch")
+    locked_torch_build = locked_torch_version(backend_token=backend_token, root=root)
+    if installed_torch_version is None or locked_torch_build is None:
+        return None
+    if installed_torch_version.lower() == locked_torch_build.lower():
+        return None
+    return TorchHold(installed_version=installed_torch_version, locked_version=locked_torch_build)
 
 
 def needs_provision(*, backend_token: str, root: Path | None = None) -> bool:

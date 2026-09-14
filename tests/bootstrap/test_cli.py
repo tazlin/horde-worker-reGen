@@ -770,11 +770,25 @@ def test_sync_amd_windows_profile_uses_rocm_path(
 # --- utilities-venv provisioning wire-in (after a successful sync) ---------------------------------
 
 
-def _write_utilities_lock(root: Path) -> None:
-    """Write a stand-in utilities uv.lock so provisioning has a lock to sync from."""
+def _write_utilities_lock(root: Path, *, torch_version: str | None = None) -> None:
+    """Write a stand-in utilities uv.lock so provisioning has a lock to sync from.
+
+    The default body is valid minimal TOML: provisioning only needs a lock to exist. Passing
+    *torch_version* writes a parseable lock carrying one ``torch`` entry, which is what the hold check reads.
+    """
     lock = paths.utilities_lock_file(root)
     lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("utilities-lock\n", encoding="utf-8")
+    body = "version = 1\n"
+    if torch_version is not None:
+        body = f'[[package]]\nname = "torch"\nversion = "{torch_version}"\n'
+    lock.write_text(body, encoding="utf-8")
+
+
+def _install_main_env_torch(root: Path, version: str) -> None:
+    """Record an installed torch in the fake main venv so the hold check has a version to compare."""
+    site = paths.venv_dir(root) / "Lib" / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    (site / f"torch-{version}.dist-info").mkdir()
 
 
 def test_sync_provisions_utilities_when_wanted_and_pinned(
@@ -909,6 +923,62 @@ def test_maybe_provision_lean_backend_missing_lock_is_silent(
     assert capsys.readouterr().err == ""
 
 
+def test_maybe_provision_defers_while_the_main_env_holds_an_older_torch(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A held main venv defers the utilities venv instead of fetching the declined torch a second time.
+
+    The regenerated utilities lock pins the newer torch, so syncing it would download that torch for the lane
+    while the worker stays on the held one: a second multi-GB copy, on a different build. Provisioning waits
+    for the sync that takes the newer torch, and says so rather than leaving a stale lane unexplained.
+    """
+    root, _ = env
+    _write_utilities_lock(root, torch_version="2.14.0+cu132")
+    _install_main_env_torch(root, "2.12.1+cu132")
+    called: list[bool] = []
+    monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: called.append(True))
+    options = cli._SyncOptions(
+        preview=False,
+        hold=True,
+        confirm_threshold_bytes=0,
+        headless_policy="proceed",
+        prune=False,
+        skip_utilities=False,
+    )
+
+    cli._maybe_provision_utilities("UV", root, "cu132", options)
+
+    assert called == []
+    out = capsys.readouterr().out
+    assert "2.12.1+cu132" in out
+    assert "2.14.0+cu132" in out
+
+
+def test_maybe_provision_runs_once_the_main_env_took_the_locked_torch(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deferral ends by itself: a main venv on the pinned release provisions the lane as usual."""
+    root, _ = env
+    _write_utilities_lock(root, torch_version="2.14.0+cu132")
+    _install_main_env_torch(root, "2.14.0+cu132")
+    called: list[str] = []
+    monkeypatch.setattr(
+        cli.runner, "provision_utilities", lambda uv, *, backend_token, **kw: called.append(backend_token)
+    )
+    options = cli._SyncOptions(
+        preview=False,
+        hold=True,
+        confirm_threshold_bytes=0,
+        headless_policy="proceed",
+        prune=False,
+        skip_utilities=False,
+    )
+
+    cli._maybe_provision_utilities("UV", root, "cu132", options)
+
+    assert called == ["cu132"]
+
+
 # --- preview / hold / prune path (existing .venv, so the dry-run preview runs) ---------------------
 
 _TORCH_BUMP_DRY_RUN = (
@@ -958,6 +1028,29 @@ def test_sync_hold_refused_when_upgrade_mandatory(env: tuple[Path, list], monkey
     _fake_preview(monkeypatch, calls, dry_run_output=_TORCH_BUMP_DRY_RUN, hold_feasible_rc=1)
     assert cli.main(["sync", "--hold-torch"]) == 0
     assert calls == [("sync", "cu126")]  # forced full upgrade, never the held path
+
+
+def test_sync_hold_defers_the_utilities_venv(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A held sync covers both environments: the utilities venv is not synced onto the declined torch.
+
+    One hold, one download: the lane has to wait for the sync that takes the newer torch, otherwise the
+    update the operator asked to make cheap would pull the multi-GB torch anyway, for the second venv.
+    """
+    root, calls = env
+    _make_venv(root)
+    _install_main_env_torch(root, "2.12.1+cu126")
+    _write_utilities_lock(root, torch_version="2.14.0+cu126")
+    _fake_preview(monkeypatch, calls, dry_run_output=_TORCH_BUMP_DRY_RUN, hold_feasible_rc=0)
+    provisioned: list[bool] = []
+    monkeypatch.setattr(cli.runner, "provision_utilities", lambda *a, **k: provisioned.append(True))
+
+    assert cli.main(["sync", "--hold-torch"]) == 0
+
+    assert calls == [("held", "cu126")]
+    assert provisioned == []
+    assert "Deferring the image-utilities capability venv" in capsys.readouterr().out
 
 
 def test_sync_prunes_only_when_cache_owned(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:

@@ -49,7 +49,7 @@ These flags work with both `update` and `update-runtime`.
 |------|--------|
 | `--backend BUILD` | Select `cu126`, `cu130`, `cu132`, `cpu`, `rocm`, or `rocm-windows`. |
 | `--cu126`, `--cu130`, `--cu132`, `--cpu`, `--rocm`, `--rocm-windows` | Shortcuts for `--backend BUILD`. |
-| `--hold-torch` | Keep the installed torch and torchvision when the new dependency graph permits it. |
+| `--hold-torch` | Keep the installed torch and torchvision when the new dependency graph permits it. The image-utilities venv is deferred with it, so the held torch is not downloaded a second time. |
 | `--no-hold-torch` | Take the locked torch and torchvision versions. |
 | `--no-sync-preview` | Skip the dependency-change preview. |
 | `--confirm-above-mb N` | Prompt before an optional download larger than `N` MB. The default is 1500 MB. |
@@ -59,7 +59,9 @@ These flags work with both `update` and `update-runtime`.
 | `--cache-mode isolated\|shared` | Use the worker-owned cache or uv's system cache. Shared caches are never pruned automatically. |
 
 The normal sync uses the locked dependency versions. A requested torch hold drops the lock only for the
-held resolution and succeeds only when all current dependency requirements still resolve.
+held resolution and succeeds only when all current dependency requirements still resolve. The
+image-utilities venv is left unchanged until a sync takes the newer torch. When that venv does not exist yet,
+its capabilities remain unavailable during the hold.
 
 ### Release channels
 

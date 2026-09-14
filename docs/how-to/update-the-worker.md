@@ -85,7 +85,9 @@ You can always update later by running `update.cmd` or `./update.sh`.
 
 The updater previews large dependency changes before downloading them. PyTorch is usually the largest
 item. When prompted, choose **Upgrade** to continue, **Hold** to keep the installed PyTorch when compatible,
-or **Cancel** to leave the environment unchanged.
+or **Cancel** to leave the environment unchanged. A hold leaves an existing image-utilities venv unchanged,
+so nothing downloads PyTorch a second time. If that venv does not exist yet, its capabilities remain
+unavailable until the update that takes the newer PyTorch provisions it.
 
 To request the compatible hold directly, run:
 
