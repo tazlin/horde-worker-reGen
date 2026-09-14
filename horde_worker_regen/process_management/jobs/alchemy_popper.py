@@ -75,6 +75,11 @@ from horde_worker_regen.process_management.jobs.job_models import PendingAlchemy
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.model_availability import (
+    UNKNOWN_POST_PROCESSOR_PRESENCE,
+    ModelAvailability,
+    PostProcessorPresence,
+)
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind, capability_for_alchemy_form
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource
@@ -176,17 +181,51 @@ normal Horde API latency.
 """
 
 
+def lane_bound_post_processor_candidates() -> list[str]:
+    """Return every upscaler and face fixer the worker may offer, beta names gated on server support.
+
+    Newly-added (beta) names are withheld until the server lists them: it rejects the whole pop if offered
+    an unknown post-processor. The gate is fail-closed until probed, so the worker ships ahead of go-live
+    and begins offering them within the probe TTL once the server catches up. The long-standing names are
+    in every server's enum and are never gated. The beta names are offered straight from the worker-known
+    set so the worker does not have to wait on an SDK release that lists them (the pop/submit wire models
+    accept unknown names as plain strings; hordelib classifies them via its own SDK).
+    """
+    candidates: list[str] = []
+    sdk_upscalers = [m.value for m in KNOWN_UPSCALERS if m != KNOWN_UPSCALERS.BACKEND_DEFAULT]
+    extra_beta_upscalers = [u for u in sorted(WORKER_KNOWN_BETA_UPSCALERS) if u not in sdk_upscalers]
+    for upscaler_value in (*sdk_upscalers, *extra_beta_upscalers):
+        if upscaler_value in WORKER_KNOWN_BETA_UPSCALERS and not server_supports_interrogation_form(upscaler_value):
+            continue
+        candidates.append(upscaler_value)
+    sdk_facefixers = [m.value for m in KNOWN_FACEFIXERS if m != KNOWN_FACEFIXERS.BACKEND_DEFAULT]
+    extra_beta_facefixers = [f for f in sorted(WORKER_KNOWN_BETA_FACEFIXERS) if f not in sdk_facefixers]
+    for facefixer_value in (*sdk_facefixers, *extra_beta_facefixers):
+        if facefixer_value in WORKER_KNOWN_BETA_FACEFIXERS and not server_supports_interrogation_form(
+            facefixer_value,
+        ):
+            continue
+        candidates.append(facefixer_value)
+    return candidates
+
+
 def expand_offered_forms(
     bridge_data: reGenBridgeData,
     *,
     utilities_lane_healthy: bool = True,
     post_process_lane_healthy: bool = True,
     annotation_types: frozenset[str] = frozenset(),
+    presence: PostProcessorPresence = UNKNOWN_POST_PROCESSOR_PRESENCE,
 ) -> list[str]:
     """Expand the bridge-data `forms` config into the individual form names the API expects.
 
     "post-process" expands to every known upscaler, facefixer, and strip_background,
     mirroring the legacy alchemist. Caption requires the explicit BLIP opt-in.
+
+    ``presence`` withholds a post-processor whose model the download process reports absent: an upscaler or
+    face fixer missing from a known set, background removal without its weight, caption without its model.
+    A part that is unknown withholds nothing, so config-only callers and workers without a download process
+    keep offering what their configuration says.
 
     ``strip_background`` runs only on the out-of-venv image-utilities lane and has no in-graph fallback,
     so it is offered only when that lane is both provisioned (:func:`strip_background_available`) and
@@ -202,7 +241,11 @@ def expand_offered_forms(
     offered: list[str] = []
     configured = configured_alchemy_forms(bridge_data.forms)
 
-    if KNOWN_ALCHEMY_FORMS.caption in configured and bridge_data.alchemy_caption_enabled:
+    if (
+        KNOWN_ALCHEMY_FORMS.caption in configured
+        and bridge_data.alchemy_caption_enabled
+        and presence.caption is not False
+    ):
         offered.append(KNOWN_ALCHEMY_FORMS.caption.value)
     if KNOWN_ALCHEMY_FORMS.interrogation in configured:
         offered.append(KNOWN_ALCHEMY_FORMS.interrogation.value)
@@ -243,42 +286,24 @@ def expand_offered_forms(
     ):
         offered.append(KNOWN_ALCHEMY_FORMS.annotation.value)
     if KNOWN_ALCHEMY_FORMS.post_process in configured:
-        # Newly-added (beta) upscalers are withheld until the server lists them: it rejects the whole
-        # pop if offered an unknown post-processor. The gate is fail-closed until probed, so the worker
-        # ships ahead of go-live and begins offering them within the probe TTL once the server catches
-        # up. The long-standing upscalers are in every server's enum and are never gated. The beta names
-        # are also offered straight from the worker-known set so the worker does not have to wait on an
-        # SDK release that lists them in KNOWN_UPSCALERS (the pop/submit wire models accept unknown
-        # upscaler names as plain strings; hordelib classifies them via its own SDK).
         # Upscalers and face-fixers are the lane-bound half of the expansion: only the post-processing lane
-        # serves either, so both are dropped together while it is down. strip_background below runs on the
-        # separate image-utilities lane and keeps its own gate.
+        # serves either, so both are dropped together while it is down, and each is dropped on its own while
+        # its model is known to be missing. strip_background below runs on the separate image-utilities lane
+        # and keeps its own gate.
         if post_process_lane_healthy:
-            sdk_upscalers = [m.value for m in KNOWN_UPSCALERS if m != KNOWN_UPSCALERS.BACKEND_DEFAULT]
-            extra_beta_upscalers = [u for u in sorted(WORKER_KNOWN_BETA_UPSCALERS) if u not in sdk_upscalers]
-            for upscaler_value in (*sdk_upscalers, *extra_beta_upscalers):
-                if upscaler_value in WORKER_KNOWN_BETA_UPSCALERS and not server_supports_interrogation_form(
-                    upscaler_value,
-                ):
-                    continue
-                offered.append(upscaler_value)
-            # Face-fixers gate identically to the beta upscalers above: a newly-added face restorer is
-            # withheld until the server lists it, since one unknown post-processor rejects the whole pop.
-            # GFPGAN/CodeFormers are in every server's enum and are never gated. The beta names are also
-            # offered from the worker-known set so offering does not wait on an SDK release that lists them.
-            sdk_facefixers = [m.value for m in KNOWN_FACEFIXERS if m != KNOWN_FACEFIXERS.BACKEND_DEFAULT]
-            extra_beta_facefixers = [f for f in sorted(WORKER_KNOWN_BETA_FACEFIXERS) if f not in sdk_facefixers]
-            for facefixer_value in (*sdk_facefixers, *extra_beta_facefixers):
-                if facefixer_value in WORKER_KNOWN_BETA_FACEFIXERS and not server_supports_interrogation_form(
-                    facefixer_value,
-                ):
-                    continue
-                offered.append(facefixer_value)
+            offered.extend(
+                name
+                for name in lane_bound_post_processor_candidates()
+                if presence.lane_bound is None or name in presence.lane_bound
+            )
         # strip_background runs only on the image-utilities lane (no in-graph fallback); drop just it when
-        # that lane is not provisioned or is momentarily down. Upscalers/face-fixers above are pure torch
-        # and stay on offer. Unlike image-generation post-processing, alchemy forms are enumerated per-form,
-        # so this granular drop is possible.
-        if strip_background_available() and utilities_lane_healthy:
+        # that lane is not provisioned, is momentarily down, or its weight is known to be missing.
+        # Upscalers/face-fixers above are pure torch and stay on offer. Unlike image-generation
+        # post-processing, alchemy forms are enumerated per-form, so this granular drop is possible.
+        strip_background_servable = (
+            strip_background_available() and utilities_lane_healthy and presence.strip_background is not False
+        )
+        if strip_background_servable:
             offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS)
         else:
             offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS if not is_strip_background_form(m.value))
@@ -347,6 +372,13 @@ class AlchemyCoordinator:
     _runtime_config: RuntimeConfig
     _api_sessions: ApiSessions
 
+    _annotation_types_provider: Callable[[], frozenset[str]] | None = None
+    """Class-level default so a coordinator built without its constructor offers no annotation types."""
+    _model_availability: ModelAvailability | None = None
+    """Class-level default so a coordinator built without its constructor withholds nothing for presence."""
+    _withheld_post_processors: frozenset[str] = frozenset()
+    """The lane-bound post-processors last withheld for a missing model; logged when it changes."""
+
     _pending_forms: deque[AlchemyFormSpec]
     _in_flight: dict[str, AlchemyFormSpec]
     """Forms dispatched to a child process, keyed by form_id, awaiting a result message."""
@@ -392,6 +424,7 @@ class AlchemyCoordinator:
         canned_alchemy_source: CannedAlchemySource | None = None,
         run_metrics: WorkerRunMetrics | None = None,
         annotation_types_provider: Callable[[], frozenset[str]] | None = None,
+        model_availability: ModelAvailability | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators.
 
@@ -411,6 +444,8 @@ class AlchemyCoordinator:
                 pop->submit timing, and outcome) so alchemy gets the same recent-jobs and rollup
                 observability image generation has. ``None`` (unit tests) disables that recording.
             annotation_types_provider: Return the control types currently servable by utilities lanes.
+            model_availability: The shared on-disk availability, read for which post-processors are present
+                so a form whose model is missing is not offered. ``None`` (unit tests) withholds nothing.
         """
         self._state = state
         self._process_map = process_map
@@ -422,6 +457,8 @@ class AlchemyCoordinator:
         self._canned_alchemy_source = canned_alchemy_source
         self._run_metrics = run_metrics
         self._annotation_types_provider = annotation_types_provider
+        self._model_availability = model_availability
+        self._withheld_post_processors = frozenset()
         self.num_canned_forms_completed = 0
         self.num_canned_forms_faulted = 0
         self.num_forms_submitted = 0
@@ -606,6 +643,7 @@ class AlchemyCoordinator:
             utilities_lane_healthy=self._utilities_lane_healthy(),
             post_process_lane_healthy=self._post_process_lane_healthy(),
             annotation_types=self._annotation_types(),
+            presence=self._post_processor_presence(),
         )
         if not offered:
             return False
@@ -659,11 +697,37 @@ class AlchemyCoordinator:
         matching every type, so offering the form without a servable, nameable type would draw work no lane
         here can produce.
         """
-        provider = getattr(self, "_annotation_types_provider", None)
-        if provider is None:
+        if self._annotation_types_provider is None:
             return frozenset()
         nameable = {member.value for member in KNOWN_ANNOTATION_CONTROL_TYPES}
-        return frozenset(control_type for control_type in provider() if control_type in nameable)
+        return frozenset(
+            control_type for control_type in self._annotation_types_provider() if control_type in nameable
+        )
+
+    def _post_processor_presence(self) -> PostProcessorPresence:
+        """Return which post-processors the download process reports on disk; unknown withholds nothing."""
+        if self._model_availability is None:
+            return UNKNOWN_POST_PROCESSOR_PRESENCE
+        return self._model_availability.post_processor_presence
+
+    def _note_withheld_post_processors(self, presence: PostProcessorPresence) -> None:
+        """Log once each time the set of post-processors withheld for a missing model changes."""
+        if presence.lane_bound is None:
+            withheld: frozenset[str] = frozenset()
+        else:
+            withheld = frozenset(
+                name for name in lane_bound_post_processor_candidates() if name not in presence.lane_bound
+            )
+        if withheld == self._withheld_post_processors:
+            return
+        self._withheld_post_processors = withheld
+        if withheld:
+            logger.info(
+                f"Alchemy: withholding {len(withheld)} post-processor(s) whose model is not on disk yet: "
+                f"{', '.join(sorted(withheld))}",
+            )
+        else:
+            logger.info("Alchemy: every configured post-processor's model is on disk; all are offered.")
 
     def _has_spare_image_lane(self) -> bool:
         """Return True if an idle inference lane exists beyond what queued image jobs need."""
@@ -878,6 +942,8 @@ class AlchemyCoordinator:
         bridge_data = self.bridge_data
 
         annotation_types = self._annotation_types()
+        presence = self._post_processor_presence()
+        self._note_withheld_post_processors(presence)
         pop_request = _AlchemyPopRequest(
             apikey=bridge_data.api_key,
             name=bridge_data.alchemist_name,
@@ -888,6 +954,7 @@ class AlchemyCoordinator:
                 utilities_lane_healthy=self._utilities_lane_healthy(),
                 post_process_lane_healthy=self._post_process_lane_healthy(),
                 annotation_types=annotation_types,
+                presence=presence,
             ),
             annotation_types=sorted(annotation_types) or None,
             amount=max(bridge_data.queue_size, 1),

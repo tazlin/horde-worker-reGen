@@ -1954,6 +1954,94 @@ class TestFeaturePresenceValidation:
         assert process._manager_all_present(manager_obj, "controlnet") is offline_present
 
 
+class TestPostProcessorPresenceProbe:
+    """What the download process reports about each individual post-processor, for the alchemy offer.
+
+    Alchemy enumerates post-processors one by one, so the probe reports the names it found rather than a
+    single feature-level verdict. It returns the all-present verdict from the same walk, so the per-model
+    offer and the feature-level readiness can never disagree about the same file.
+    """
+
+    def _process(self) -> HordeDownloadProcess:
+        return HordeDownloadProcess(
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_message_queue=queue.Queue(),  # type: ignore[arg-type]
+            pipe_connection=Mock(),
+            disk_lock=Mock(),
+            download_bandwidth_semaphore=Mock(),
+            process_launch_identifier=0,
+        )
+
+    @staticmethod
+    def _sub_manager(on_disk: dict[str, bool], checksum: dict[str, bool | None] | None = None) -> object:
+        """A fake post-processing sub-manager whose reference is ``on_disk``'s keys.
+
+        ``on_disk`` is the existence answer; ``checksum`` is what ``validate_model`` returns per name
+        (True verifies, False is a file that fails its checksum, absent/None means the record has none).
+        """
+        verdicts = checksum or {}
+        return SimpleNamespace(
+            model_reference=dict.fromkeys(on_disk, object()),
+            model_folder_path="/aux",
+            is_model_available=lambda name: on_disk.get(name, False),
+            get_model_download=lambda name: [{"file_url": f"https://example.invalid/{name}"}],
+            validate_model=lambda name, skip_checksum=False: verdicts.get(name),
+        )
+
+    @staticmethod
+    def _manager(
+        *,
+        gfpgan: object | None = None,
+        esrgan: object | None = None,
+        codeformer: object | None = None,
+    ) -> object:
+        """A fake ``ModelManager`` exposing only the post-processing sub-managers the probe walks."""
+        return SimpleNamespace(gfpgan=gfpgan, esrgan=esrgan, codeformer=codeformer)
+
+    def test_every_validated_model_is_reported_present(self) -> None:
+        """With every reference key on disk and valid, the probe names them all and reports all-present."""
+        manager = self._manager(
+            gfpgan=self._sub_manager({"GFPGAN": True}, {"GFPGAN": True}),
+            esrgan=self._sub_manager({"RealESRGAN_x4plus": True}),
+        )
+        present, all_present = self._process()._post_processor_presence(manager)  # type: ignore[arg-type]
+
+        assert present == ["GFPGAN", "RealESRGAN_x4plus"]
+        assert all_present is True
+
+    def test_a_model_failing_its_checksum_is_left_out(self) -> None:
+        """A post-processor on disk whose checksum fails is not reported present, and drops all-present.
+
+        Existence alone would offer a truncated or corrupt weight that then faults at job time, so the
+        name is withheld until the file is re-fetched.
+        """
+        manager = self._manager(
+            esrgan=self._sub_manager(
+                {"RealESRGAN_x4plus": True, "4x_AnimeSharp": True},
+                {"RealESRGAN_x4plus": True, "4x_AnimeSharp": False},
+            ),
+        )
+        present, all_present = self._process()._post_processor_presence(manager)  # type: ignore[arg-type]
+
+        assert present == ["RealESRGAN_x4plus"]
+        assert all_present is False
+
+    def test_a_model_not_on_disk_is_left_out(self) -> None:
+        """A reference key with no file behind it is absent from the present set and drops all-present."""
+        manager = self._manager(esrgan=self._sub_manager({"RealESRGAN_x4plus": True, "4x_AnimeSharp": False}))
+        present, all_present = self._process()._post_processor_presence(manager)  # type: ignore[arg-type]
+
+        assert present == ["RealESRGAN_x4plus"]
+        assert all_present is False
+
+    def test_no_post_processing_manager_reports_unknown(self) -> None:
+        """With no post-processing manager loaded both answers are None, which withholds nothing."""
+        present, all_present = self._process()._post_processor_presence(self._manager())  # type: ignore[arg-type]
+
+        assert present is None
+        assert all_present is None
+
+
 class TestDownloadProcessConcurrencyFixes:
     """The threaded download path's correctness guards: destination locking, retry, bandwidth, pool growth."""
 
@@ -2236,6 +2324,26 @@ class TestDownloadMessageRoundTrips:
         assert restored == status
         assert restored.current is not None and restored.current.percent == 25.0
 
+    def test_post_processor_presence_round_trip(self) -> None:
+        """The per-post-processor presence fields survive a model_dump/model_validate round trip."""
+        message = _availability_message(
+            ["a"],
+            post_processors_present=["GFPGAN", "RealESRGAN_x4plus"],
+            strip_background_present=False,
+            caption_model_present=True,
+        )
+        restored = HordeDownloadAvailabilityMessage.model_validate(message.model_dump())
+        assert restored.post_processors_present == ["GFPGAN", "RealESRGAN_x4plus"]
+        assert restored.strip_background_present is False
+        assert restored.caption_model_present is True
+
+    def test_unreported_post_processor_presence_round_trips_as_unknown(self) -> None:
+        """A report that carries no presence fields restores as unknown rather than as "nothing present"."""
+        restored = HordeDownloadAvailabilityMessage.model_validate(_availability_message(["a"]).model_dump())
+        assert restored.post_processors_present is None
+        assert restored.strip_background_present is None
+        assert restored.caption_model_present is None
+
     def test_supervisor_rate_limit_command_round_trip(self) -> None:
         """The SET_DOWNLOAD_RATE_LIMIT command carries its KB/s value through serialization."""
         message = SupervisorControlMessage(
@@ -2255,6 +2363,46 @@ class TestDownloadMessageRoundTrips:
         restored = SupervisorControlMessage.model_validate(message.model_dump())
         assert restored.command is SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY
         assert restored.download_priority_policy is DownloadPriorityPolicy.PARALLEL
+
+
+class TestPostProcessorPresenceReachesAvailability:
+    """The download process's per-post-processor report lands on the availability the alchemy offer reads."""
+
+    def _manager(self) -> Mock:
+        manager = make_testable_process_manager(image_models_to_load=["a"])  # type: ignore[arg-type]
+        manager._process_lifecycle = Mock(download_process_info=None)
+        manager._process_lifecycle._num_process_recoveries = 0
+        manager._process_lifecycle._num_slowdown_events = 0
+        manager._process_lifecycle._paging_victim_replacements = 0
+        manager._download_coordinator._process_lifecycle = manager._process_lifecycle
+        return manager  # type: ignore[return-value]
+
+    def test_reported_presence_lands_on_model_availability(self) -> None:
+        """A report naming the post-processors on disk becomes the presence the alchemy offer gates on."""
+        manager = self._manager()
+        manager._download_coordinator.on_download_availability(
+            _availability_message(
+                ["a"],
+                post_processors_present=["GFPGAN"],
+                strip_background_present=False,
+                caption_model_present=True,
+            ),
+        )
+
+        presence = manager._model_availability.post_processor_presence
+        assert presence.lane_bound == frozenset({"GFPGAN"})
+        assert presence.strip_background is False
+        assert presence.caption is True
+
+    def test_report_without_presence_fields_lands_as_unknown(self) -> None:
+        """A report that could not probe leaves every part unknown, so the offer withholds nothing."""
+        manager = self._manager()
+        manager._download_coordinator.on_download_availability(_availability_message(["a"]))
+
+        presence = manager._model_availability.post_processor_presence
+        assert presence.lane_bound is None
+        assert presence.strip_background is None
+        assert presence.caption is None
 
 
 class TestSupervisorPriorityPolicyCommand:

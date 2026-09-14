@@ -2001,6 +2001,7 @@ class HordeWorkerProcessManager:
             canned_alchemy_source=canned_alchemy_source,
             run_metrics=self._run_metrics,
             annotation_types_provider=self._servable_control_types,
+            model_availability=self._model_availability,
         )
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
         self._message_dispatcher.set_annotation_result_handler(self._on_annotation_result)

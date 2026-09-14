@@ -435,6 +435,13 @@ class HordeDownloadAvailabilityMessage(HordeProcessMessage):
     post_processing_present: bool | None = None
     """On-disk readiness of the post-processing feature (the GFPGAN/ESRGAN/CodeFormer models), or None
     when undeterminable."""
+    post_processors_present: list[str] | None = None
+    """The upscalers and face fixers on disk and validated, by reference key, or None when the probe could
+    not run. The alchemy offer withholds a lane-bound post-processor missing from a known set."""
+    strip_background_present: bool | None = None
+    """Whether the background-removal weight is in the utilities lane's cache, or None when unknown."""
+    caption_model_present: bool | None = None
+    """Whether the caption model is in the shared hub cache, or None when unknown."""
     controlnet_failed: bool = False
     """True once the ControlNet annotator verify has permanently failed (the detector checkpoints download
     but do not run, even after one re-fetch). ControlNet is then withheld and the operator is notified;

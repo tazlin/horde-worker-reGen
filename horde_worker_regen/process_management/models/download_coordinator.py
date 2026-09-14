@@ -15,7 +15,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import Downloa
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.desired_state import DesiredState
-from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.models.model_availability import ModelAvailability, PostProcessorPresence
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 
 
@@ -98,6 +98,13 @@ class ModelDownloadCoordinator:
             controlnet_present=message.controlnet_present,
             sdxl_controlnet_present=message.sdxl_controlnet_present,
             post_processing_present=message.post_processing_present,
+            post_processor_presence=PostProcessorPresence(
+                lane_bound=(
+                    frozenset(message.post_processors_present) if message.post_processors_present is not None else None
+                ),
+                strip_background=message.strip_background_present,
+                caption=message.caption_model_present,
+            ),
             controlnet_failed=message.controlnet_failed,
         )
 

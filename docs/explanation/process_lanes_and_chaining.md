@@ -178,6 +178,10 @@ upscaler and face-fixer forms from its offer (`strip_background` runs on the ima
 own gate). Otherwise the horde keeps sending work nothing can serve, and those jobs strand until the orphan
 watchdog requeues them a bounded number of times and then faults them without images.
 
+While the lane is up, the alchemy offer is gated a second time, per model: an upscaler or face fixer is
+offered only once the download process reports its weight on disk and validated, so a worker still fetching
+its post-processing weights offers the ones it holds rather than all or none.
+
 Both readings are **derived live** from whether a lane is up rather than latched at pause time. Restore
 ownership is the reason: whoever paused the lane owns bringing it back, and a latch would leave the offer gated
 on some other party clearing state it does not own. The whole-card residency path additionally sets its

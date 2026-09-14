@@ -24,10 +24,12 @@ from horde_worker_regen.process_management.jobs.alchemy_popper import (
     _AlchemyPopRequest,
     _AlchemySubmitRequest,
     expand_offered_forms,
+    lane_bound_post_processor_candidates,
     required_capability,
 )
 from horde_worker_regen.process_management.jobs.job_models import PendingAlchemySubmitJob
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
+from horde_worker_regen.process_management.models.model_availability import PostProcessorPresence
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 
 
@@ -271,6 +273,77 @@ class TestExpandOfferedForms:
         assert "GFPGANv1.3" not in offered
         assert "GFPGAN" in offered
         assert "CodeFormers" in offered
+
+    def test_post_processor_missing_from_a_known_set_is_withheld(self) -> None:
+        """A post-processor whose model is not on disk is dropped; its present peers and CLIP forms stay.
+
+        The gate is per model rather than per feature, so one missing upscaler costs the worker that
+        upscaler alone instead of the whole post-process expansion.
+        """
+        presence = PostProcessorPresence(lane_bound=frozenset({"RealESRGAN_x4plus", "CodeFormers"}))
+        offered = expand_offered_forms(self._bridge_data(), presence=presence)
+
+        assert "RealESRGAN_x4plus" in offered
+        assert "CodeFormers" in offered
+        assert "GFPGAN" not in offered
+        assert "4x_AnimeSharp" not in offered
+        assert "interrogation" in offered, "CLIP-stack forms need no post-processor weight"
+        assert "nsfw" in offered
+
+    def test_unknown_presence_withholds_nothing(self) -> None:
+        """An unreported presence gates nothing, so a worker with no download process is unaffected."""
+        offered = expand_offered_forms(self._bridge_data(), presence=PostProcessorPresence())
+
+        for candidate in lane_bound_post_processor_candidates():
+            assert candidate in offered, candidate
+
+    def test_empty_known_set_withholds_every_upscaler_and_face_fixer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A report that nothing is on disk drops every upscaler and face fixer, and nothing else."""
+        monkeypatch.setattr(alchemy_popper, "strip_background_available", lambda: True)
+        offered = expand_offered_forms(self._bridge_data(), presence=PostProcessorPresence(lane_bound=frozenset()))
+
+        for candidate in lane_bound_post_processor_candidates():
+            assert candidate not in offered, candidate
+        assert "strip_background" in offered, "background removal has its own weight and its own gate"
+        assert "interrogation" in offered
+        assert "nsfw" in offered
+
+    def test_beta_name_needs_both_server_support_and_the_model_on_disk(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A beta post-processor is offered only when the server lists it *and* its weight is on disk."""
+        bridge_data = self._bridge_data(forms=["post-process"])
+        without_beta = PostProcessorPresence(lane_bound=frozenset({"RealESRGAN_x4plus"}))
+        with_beta = PostProcessorPresence(lane_bound=frozenset({"RealESRGAN_x4plus", "4xNomos8kSC"}))
+
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)
+        assert "4xNomos8kSC" not in expand_offered_forms(bridge_data, presence=without_beta)
+        assert "4xNomos8kSC" in expand_offered_forms(bridge_data, presence=with_beta)
+
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: False)
+        assert "4xNomos8kSC" not in expand_offered_forms(bridge_data, presence=with_beta)
+
+    def test_strip_background_gates_on_its_own_weight(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Background removal is withheld when its weight is known missing, and offered otherwise."""
+        monkeypatch.setattr(alchemy_popper, "strip_background_available", lambda: True)
+        bridge_data = self._bridge_data(forms=["post-process"])
+
+        withheld = expand_offered_forms(bridge_data, presence=PostProcessorPresence(strip_background=False))
+        assert "strip_background" not in withheld
+        assert "RealESRGAN_x4plus" in withheld, "the torch post-processors do not need the rembg weight"
+
+        present = expand_offered_forms(bridge_data, presence=PostProcessorPresence(strip_background=True))
+        assert "strip_background" in present
+        assert "strip_background" in expand_offered_forms(bridge_data, presence=PostProcessorPresence())
+
+    def test_caption_gates_on_its_own_model(self) -> None:
+        """Caption is withheld while its model is known missing, opt-in or not."""
+        bridge_data = self._bridge_data(alchemy_caption_enabled=True)
+
+        assert "caption" not in expand_offered_forms(bridge_data, presence=PostProcessorPresence(caption=False))
+        assert "caption" in expand_offered_forms(bridge_data, presence=PostProcessorPresence(caption=True))
+        assert "caption" in expand_offered_forms(bridge_data, presence=PostProcessorPresence())
 
     def test_config_accepts_vectorize_but_rejects_typos(self) -> None:
         """The worker's forms validator accepts the worker-known vectorize form yet still rejects typos.

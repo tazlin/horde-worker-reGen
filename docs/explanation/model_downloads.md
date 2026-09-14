@@ -339,6 +339,19 @@ The needs are recomputed on every config reload and forwarded live, so a change
 takes effect without a restart: the reconcile below is what then fetches whatever
 the new needs added.
 
+Alchemy gates finer than a feature. Image generation asks for post-processing as
+one capability, but an alchemy pop enumerates every upscaler and face fixer by
+name, so each is offered only once its own weight is on disk and validates: an
+upscaler whose file is missing, or that is present but fails its checksum, is
+withheld while the rest stay on offer. Background removal and caption gate on
+their own weights the same way, and the CLIP-stack forms need none of them.
+The download process reports the names it found alongside the feature-level
+verdict, from one walk over the same managers, so the two cannot disagree about
+a file. An unknown presence withholds nothing, matching image models and
+features: a worker that pre-downloaded everything, or runs with no download
+process at all, offers what its configuration says. The alchemy coordinator logs
+one line each time the withheld set changes, and one more when it empties.
+
 ## Feature reconcile: queueing what is missing
 
 "Which enabled feature models are not on disk" is asked in one place: a reconcile

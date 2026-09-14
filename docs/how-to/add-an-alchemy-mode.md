@@ -204,6 +204,12 @@ upscaler name is gated the same way a new form is: list it in `WORKER_KNOWN_BETA
 of the server go-live and begin offering the model within the probe TTL once the server catches up,
 with no restart. The long-standing upscalers are in every server's enum and are never gated.
 
+The offer also waits for the weight itself. The download process reports which post-processors are on
+disk and validate, and `expand_offered_forms` drops any name missing from that set while leaving the
+rest on offer, so a new model is advertised only once its file has landed. A beta name therefore needs
+both: the server listing it *and* the weight on disk. An unreported presence (no download process, or
+no report yet) withholds nothing.
+
 ### Checklist (upscaler model)
 
 1. `horde_sdk/generation_parameters/alchemy/consts.py` — add the name to `KNOWN_UPSCALERS` (and mirror
@@ -241,7 +247,8 @@ The weights live in the **`gfpgan`** model reference (which maps to the same `fa
 as `codeformer`), submitted to the PRIMARY service's pending queue and served as beta. The worker opts the
 `gfpgan` category into beta via the `HORDELIB_BETA_MODEL_CATEGORIES` default. Names gate exactly like beta
 upscalers: list them in `WORKER_KNOWN_BETA_FACEFIXERS` and `expand_offered_forms` withholds them until
-`server_supports_interrogation_form` reports the server advertises them. `GFPGAN`/`CodeFormers` are in
+`server_supports_interrogation_form` reports the server advertises them, and, like an upscaler, until the
+weight is on disk. `GFPGAN`/`CodeFormers` are in
 every server's enum and are never gated. Prefer permissively-licensed weights: GFPGAN and RestoreFormer
 are Apache-2.0, whereas CodeFormer and GPEN are non-commercial.
 

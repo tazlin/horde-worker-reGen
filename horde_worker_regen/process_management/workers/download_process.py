@@ -364,6 +364,7 @@ class HordeDownloadProcess(HordeProcess):
         self._controlnet_present: bool | None = None
         self._sdxl_controlnet_present: bool | None = None
         self._post_processing_present: bool | None = None
+        self._post_processors_present: list[str] | None = None
         # Background removal and caption have no hordelib manager; their presence is probed when the
         # reconcile decides whether to fetch them and settled by their own task.
         self._strip_background_present: bool | None = None
@@ -445,6 +446,9 @@ class HordeDownloadProcess(HordeProcess):
             controlnet_present=self._controlnet_present,
             sdxl_controlnet_present=self._sdxl_controlnet_present,
             post_processing_present=self._post_processing_present,
+            post_processors_present=self._post_processors_present,
+            strip_background_present=self._strip_background_present,
+            caption_model_present=self._caption_present,
             controlnet_failed=self._controlnet_killed,
             status=status,
             reference_changed=reference_changed,
@@ -1536,14 +1540,13 @@ class HordeDownloadProcess(HordeProcess):
         else:
             sdxl_controlnet = sdxl_models and miscellaneous and annotators
 
-        post_results = [self._manager_all_present(manager, key) for key in ("gfpgan", "esrgan", "codeformer")]
-        loaded_post = [result for result in post_results if result is not None]
-        post_processing = all(loaded_post) if loaded_post else None
+        post_processors_present, post_processing = self._post_processor_presence(manager)
 
         with self._lock:
             self._controlnet_present = controlnet
             self._sdxl_controlnet_present = sdxl_controlnet
             self._post_processing_present = post_processing
+            self._post_processors_present = post_processors_present
 
         # Once the annotator checkpoints are on disk, confirm (once) that the preprocessors actually run.
         self._maybe_enqueue_annotator_verify(manager, annotators)
@@ -1591,6 +1594,34 @@ class HordeDownloadProcess(HordeProcess):
                 exclusive=True,
             ),
         )
+
+    def _post_processor_presence(self, manager: ModelManager) -> tuple[list[str] | None, bool | None]:
+        """Return the post-processors on disk and validated, by reference key, plus the all-present verdict.
+
+        One walk over the loaded post-processing managers serves both the per-model alchemy offer and the
+        feature-level readiness. Both are None when no post-processing manager is loaded or a probe fails.
+        """
+        present: list[str] = []
+        all_present = True
+        any_loaded = False
+        try:
+            for manager_key, _label in _POST_PROCESSING_MANAGERS:
+                sub_manager = _aux_sub_manager(manager, manager_key)
+                if sub_manager is None:
+                    continue
+                any_loaded = True
+                with self._manager_lock(manager_key):
+                    for model_name in sub_manager.model_reference:
+                        if self._feature_model_present(sub_manager, manager_key, model_name):
+                            present.append(model_name)
+                        else:
+                            all_present = False
+        except Exception as e:  # noqa: BLE001 - presence is best-effort; a probe failure must not crash
+            logger.debug(f"Download process: post-processor presence probe failed: {type(e).__name__}: {e}")
+            return None, None
+        if not any_loaded:
+            return None, None
+        return sorted(present), all_present
 
     def _manager_all_present(
         self,

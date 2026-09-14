@@ -2,12 +2,14 @@
 
 Public members:
     ``ModelAvailability``: single-writer/many-reader holder for the on-disk model set.
+    ``PostProcessorPresence``: which individual post-processors are on disk, for the alchemy offer.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import ADHOC_PREFETCH_FEATURES
@@ -23,6 +25,26 @@ DOWNLOAD_PROGRESS_STALL_SECONDS = 180.0
 Progress is reported per chunk, so a transfer at any usable rate updates far inside this window; only one
 that has genuinely stopped moving falls outside it. That makes the bound independent of link speed, which is
 what lets a very slow but live download be told apart from a dead one without encoding either machine."""
+
+
+@dataclass(frozen=True)
+class PostProcessorPresence:
+    """Represents which post-processors are on disk, as far as the download process could tell.
+
+    Each part is None while unknown, and an unknown part withholds nothing: a worker without a download
+    process keeps offering what its configuration says.
+    """
+
+    lane_bound: frozenset[str] | None = None
+    """The upscalers and face fixers on disk and validated, by reference key."""
+    strip_background: bool | None = None
+    """Whether the background-removal weight is in the utilities lane's cache."""
+    caption: bool | None = None
+    """Whether the caption model is in the shared hub cache."""
+
+
+UNKNOWN_POST_PROCESSOR_PRESENCE = PostProcessorPresence()
+"""The presence of a worker whose download process has not reported."""
 
 
 class ModelAvailability:
@@ -74,6 +96,7 @@ class ModelAvailability:
         self._controlnet_present = None
         self._sdxl_controlnet_present = None
         self._post_processing_present = None
+        self._post_processor_presence = UNKNOWN_POST_PROCESSOR_PRESENCE
         self._controlnet_failed = False
         self._downloader_lost = False
 
@@ -111,6 +134,11 @@ class ModelAvailability:
     def post_processing_present(self) -> bool | None:
         """On-disk readiness of the post-processing feature (GFPGAN/ESRGAN/CodeFormer); None until reported."""
         return self._post_processing_present
+
+    @property
+    def post_processor_presence(self) -> PostProcessorPresence:
+        """Which individual post-processors are on disk, for the alchemy offer; unknown parts gate nothing."""
+        return self._post_processor_presence
 
     @property
     def controlnet_failed(self) -> bool:
@@ -252,6 +280,7 @@ class ModelAvailability:
         controlnet_present: bool | None = None,
         sdxl_controlnet_present: bool | None = None,
         post_processing_present: bool | None = None,
+        post_processor_presence: PostProcessorPresence = UNKNOWN_POST_PROCESSOR_PRESENCE,
         controlnet_failed: bool = False,
     ) -> None:
         """Replace the availability snapshot with a fresh report from the download process."""
@@ -268,6 +297,7 @@ class ModelAvailability:
         self._controlnet_present = controlnet_present
         self._sdxl_controlnet_present = sdxl_controlnet_present
         self._post_processing_present = post_processing_present
+        self._post_processor_presence = post_processor_presence
         self._controlnet_failed = controlnet_failed
         self._note_download_progress(status)
 
