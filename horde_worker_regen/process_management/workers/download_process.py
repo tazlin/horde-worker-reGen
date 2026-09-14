@@ -24,6 +24,7 @@ rate-limit changes take effect mid-download (the worker loop is blocked inside t
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -50,6 +51,7 @@ from multiprocessing.synchronize import Lock, Semaphore
 from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
+from horde_worker_regen.alchemy_forms import DEFAULT_AUXILIARY_FETCH_NEEDS, AuxiliaryFetchNeeds
 from horde_worker_regen.model_download_core import (
     UNKNOWN_DOWNLOAD_HOST,
     ChunkPacer,
@@ -94,6 +96,7 @@ from horde_worker_regen.process_management.models.download_scheduler import (
     LORA_VERSION_MANAGER_KEY,
     TI_MANAGER_KEY,
     DownloadKind,
+    DownloadPriorityPolicy,
     DownloadTask,
     HostAwareDownloadScheduler,
 )
@@ -136,6 +139,49 @@ decided, for this install, whether anything needed carrying across; its presence
 """The module :meth:`HordeDownloadProcess._run_annotator_preload` runs in a child interpreter."""
 
 FEATURE_MISCELLANEOUS = "miscellaneous (SDXL)"
+FEATURE_STRIP_BACKGROUND = "background removal (rembg u2net)"
+FEATURE_CAPTION = "caption (BLIP)"
+
+REMBG_MANAGER_KEY = "rembg"
+"""The ``manager_key`` of the background-removal weight task; it has no hordelib manager behind it."""
+CAPTION_MANAGER_KEY = "caption"
+"""The ``manager_key`` of the caption-model task; it has no hordelib manager behind it."""
+
+_POST_PROCESSING_MANAGERS: tuple[tuple[str, str], ...] = (
+    ("gfpgan", "GFPGAN"),
+    ("esrgan", "ESRGAN"),
+    ("codeformer", "CodeFormer"),
+)
+"""The manager keys behind post-processing, with the label their feature rows carry."""
+
+_FEATURE_MANAGER_KEYS: tuple[str, ...] = (
+    *(key for key, _label in _POST_PROCESSING_MANAGERS),
+    "miscellaneous",
+    "controlnet",
+    "controlnet_annotator",
+)
+"""Every manager whose reference decides which feature models the reconcile may fetch."""
+
+
+def _caption_model_repo() -> str:
+    """Return the hub repository the safety process's interrogator loads its caption model from.
+
+    Read from the interrogator library's own defaults, which the safety process uses unchanged, so the
+    download process can never fetch a different caption model than the one that will be loaded.
+    """
+    from clip_interrogator.clip_interrogator import CAPTION_MODELS, Config
+
+    caption_model_name = Config.caption_model_name
+    if caption_model_name is None:
+        raise RuntimeError("the interrogator library declares no default caption model")
+    return CAPTION_MODELS[caption_model_name]
+
+
+def _huggingface_hub_host() -> str:
+    """Return the hub host, for tagging hub-fetched tasks in the per-host scheduler."""
+    from huggingface_hub.constants import ENDPOINT
+
+    return download_host_for_url(ENDPOINT)
 
 
 def _aux_sub_manager(manager: ModelManager, manager_key: str) -> BaseModelManager | None:
@@ -198,7 +244,7 @@ class HordeDownloadProcess(HordeProcess):
         allow_lora: bool = False,
         allow_controlnet: bool = False,
         allow_sdxl_controlnet: bool = False,
-        allow_post_processing: bool = True,
+        fetch_needs: AuxiliaryFetchNeeds = DEFAULT_AUXILIARY_FETCH_NEEDS,
         purge_loras: bool = False,
         amd_gpu: bool = False,
         directml: int | None = None,
@@ -207,6 +253,7 @@ class HordeDownloadProcess(HordeProcess):
         max_parallel_downloads: int = 4,
         per_host_concurrency: int = 1,
         connections_per_file: int = 4,
+        priority_policy: DownloadPriorityPolicy = DownloadPriorityPolicy.SERVE_FIRST,
     ) -> None:
         """Initialise the download process state (model managers are loaded in the main loop)."""
         super().__init__(
@@ -222,7 +269,7 @@ class HordeDownloadProcess(HordeProcess):
         self._allow_lora = allow_lora
         self._allow_controlnet = allow_controlnet
         self._allow_sdxl_controlnet = allow_sdxl_controlnet
-        self._allow_post_processing = allow_post_processing
+        self._fetch_needs = fetch_needs
         self._purge_loras = purge_loras
         self._amd_gpu = amd_gpu
         self._directml = directml
@@ -243,6 +290,7 @@ class HordeDownloadProcess(HordeProcess):
         # map below so unrelated destinations on one manager can run in parallel. Both maps are created lazily.
         self._manager_locks: dict[str, threading.Lock] = {}
         self._model_download_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._declared_file_download_locks: dict[str, threading.Lock] = {}
         # Per-task retry accounting (keyed by the scheduler dedup key) so a transient fetch failure is
         # re-attempted a bounded number of times instead of being abandoned until the next config reload.
         self._attempts: dict[tuple[DownloadKind, str, str], int] = {}
@@ -261,6 +309,7 @@ class HordeDownloadProcess(HordeProcess):
         self._scheduler = HostAwareDownloadScheduler(
             max_parallel_downloads=max_parallel_downloads,
             per_host_concurrency=per_host_concurrency,
+            priority_policy=priority_policy,
         )
         # The executor pool is grown lazily to the current global limit (never shrunk): an idle thread just
         # blocks cheaply in ``scheduler.acquire``. This is what makes a *live* raise of
@@ -296,8 +345,10 @@ class HordeDownloadProcess(HordeProcess):
         self._executor_seq = 0
         """Monotonic counter for unique executor-thread names across self-heal respawns."""
 
-        self._aux_requested = False
-        self._aux_enqueued = False
+        # The parent's aux request (boot with image models missing, the picker, a gating change) runs the
+        # default-LoRA fetch once and a feature reconcile that retries anything previously given up on.
+        self._aux_pass_requested = False
+        self._default_loras_enqueued = False
         # The safety models (DeepDanbooru + CLIP) are required for every image job, so they are ensured
         # unconditionally (not gated behind the optional aux pass). ``_safety_present`` is reported to the
         # parent, which defers the safety-process launch until it is True; ``_safety_ensured`` guards the
@@ -313,6 +364,10 @@ class HordeDownloadProcess(HordeProcess):
         self._controlnet_present: bool | None = None
         self._sdxl_controlnet_present: bool | None = None
         self._post_processing_present: bool | None = None
+        # Background removal and caption have no hordelib manager; their presence is probed when the
+        # reconcile decides whether to fetch them and settled by their own task.
+        self._strip_background_present: bool | None = None
+        self._caption_present: bool | None = None
         # A feature is offered only once its models are on disk *and* validate: existence alone would offer
         # against a truncated or corrupt pre-existing file (which then faults at job time). A feature model
         # counts as present for readiness only after its checksum verifies (or it has no checksum to verify),
@@ -362,6 +417,8 @@ class HordeDownloadProcess(HordeProcess):
             paused=paused,
             rate_limit_kbps=rate,
             error_message=self._error_message,
+            priority_policy=self._scheduler.policy,
+            startup_focus=self._scheduler.startup_focus,
         )
 
     def _send_status(self, phase: DownloadPhase, *, scan_complete: bool = True, force: bool = False) -> None:
@@ -416,10 +473,10 @@ class HordeDownloadProcess(HordeProcess):
     def _apply_live_gating(self, message: HordeDownloadControlMessage) -> bool:
         """Apply any download-gating flags carried live in a control message; return whether any changed.
 
-        These (nsfw / allow_lora / allow_controlnet / allow_sdxl_controlnet / allow_post_processing / purge)
-        were once construction-time only, so a config change to them restarted the process. They are applied
-        live instead; the caller re-arms the one-shot aux pass when this returns True, so a newly-enabled
-        category (e.g. allow_lora flipped on) is fetched without a restart. Caller holds ``self._lock``.
+        These (nsfw / allow_lora / allow_controlnet / allow_sdxl_controlnet / fetch needs / purge) were once
+        construction-time only, so a config change to them restarted the process. They are applied live
+        instead; the caller re-arms the one-shot aux pass when this returns True, so a newly-enabled category
+        (e.g. allow_lora flipped on) is fetched without a restart. Caller holds ``self._lock``.
         """
         changed = False
         if message.set_nsfw is not None and message.set_nsfw != self._nsfw:
@@ -435,9 +492,8 @@ class HordeDownloadProcess(HordeProcess):
         if new_sdxl is not None and new_sdxl != self._allow_sdxl_controlnet:
             self._allow_sdxl_controlnet = new_sdxl
             changed = True
-        new_pp = message.set_allow_post_processing
-        if new_pp is not None and new_pp != self._allow_post_processing:
-            self._allow_post_processing = new_pp
+        if message.set_fetch_needs is not None and message.set_fetch_needs != self._fetch_needs:
+            self._fetch_needs = message.set_fetch_needs
             changed = True
         if message.set_purge_loras is not None and message.set_purge_loras != self._purge_loras:
             self._purge_loras = message.set_purge_loras
@@ -488,7 +544,7 @@ class HordeDownloadProcess(HordeProcess):
                 staged_or_active.add(model_name)
                 changed = True
             if message.download_aux:
-                self._aux_requested = True
+                self._aux_pass_requested = True
             if message.set_paused is not None and message.set_paused != self._paused:
                 self._paused = message.set_paused
                 changed = True
@@ -496,12 +552,18 @@ class HordeDownloadProcess(HordeProcess):
                 self._rate_limit_kbps = message.set_rate_limit_kbps if message.set_rate_limit_kbps > 0 else None
                 changed = True
             if self._apply_live_gating(message):
-                # Re-arm the one-shot aux pass so a newly-enabled category downloads without a process
-                # restart; the pass is idempotent (present models are skipped), so replaying a toggle is safe.
-                self._aux_requested = True
-                self._aux_enqueued = False
+                # A newly enabled category downloads without a process restart; the pass is idempotent
+                # (present models are skipped), so replaying a toggle is safe.
+                self._aux_pass_requested = True
+                self._default_loras_enqueued = False
                 changed = True
 
+        if message.set_priority_policy is not None and self._scheduler.set_policy(message.set_priority_policy):
+            logger.info(
+                f"Download process: queue order is now '{message.set_priority_policy.value}'; transfers already "
+                "in flight finish as they are.",
+            )
+            self._update_startup_focus()
         if message.set_max_parallel_downloads is not None or message.set_per_host_concurrency is not None:
             # Retune live; a raised limit wakes blocked executor threads to claim newly-admissible tasks.
             self._scheduler.set_limits(
@@ -979,10 +1041,12 @@ class HordeDownloadProcess(HordeProcess):
         logger.info(
             f"Download process ready: parallel={self._desired_executor_threads} "
             f"lora={self._allow_lora} controlnet={self._allow_controlnet} "
-            f"post_processing={self._allow_post_processing} nsfw={self._nsfw}",
+            f"post_processing={self._fetch_needs.post_processing} "
+            f"strip_background={self._fetch_needs.strip_background} caption={self._fetch_needs.caption} "
+            f"nsfw={self._nsfw}",
         )
         self._ensure_executor_threads(self._desired_executor_threads)
-        self._maybe_prefetch_rembg_weight()
+        self._reconcile_feature_tasks(reason="startup scan")
         while not self._end_process:
             try:
                 progressed = self._orchestrate()
@@ -1085,16 +1149,65 @@ class HordeDownloadProcess(HordeProcess):
             present = sorted(compvis.available_models)
         with self._lock:
             self._present = present
+        self._update_startup_focus()
+
+    def _update_startup_focus(self) -> None:
+        """Narrow the queue to what the worker needs to start serving, and widen it once that has landed.
+
+        Critical mass is the safety models plus, on a worker with image models configured, one of them on
+        disk. Until then only those downloads run, one image model at a time, so the first checkpoint takes
+        the whole link. The scheduler ignores the request under the ``parallel`` policy. The flip is logged
+        once in each direction.
+        """
+        with self._lock:
+            safety_present = self._safety_present
+            desired = self._desired_image_models
+            present = set(self._present)
+        image_model_missing = bool(desired) and not (desired & present) if desired is not None else False
+        focus = not safety_present or image_model_missing
+        if not self._scheduler.set_startup_focus(focus):
+            return
+        if self._scheduler.startup_focus:
+            waiting_on = "the safety models" if not safety_present else "the first configured image model"
+            logger.info(f"Download process: startup focus on {waiting_on}; other downloads wait until it lands.")
+        else:
+            logger.info("Download process: the worker can start serving; all queued downloads are now admitted.")
 
     def _reload_model_database(self) -> None:
-        """Reload model manager references from disk (offline) after a parent reference refresh."""
+        """Reload model manager references from disk (offline) after a parent reference refresh.
+
+        A reload whose feature references gained or lost records re-validates the feature files (a record
+        can change what a file is expected to be) and reconciles, so a model added to the reference is
+        fetched without a restart. The parent also broadcasts a reload after this process's own successful
+        downloads; those leave the references unchanged and queue nothing.
+        """
         from hordelib.api import SharedModelManager
 
+        manager = SharedModelManager.manager
+        before = self._feature_reference_keys(manager)
         try:
-            SharedModelManager.manager.reload_database()
+            manager.reload_database()
             logger.info("Download process reloaded model database from disk")
         except Exception as e:  # noqa: BLE001 - a reload failure must not crash the download process
             logger.error(f"Download process failed to reload model database: {type(e).__name__}: {e}")
+            return
+        if self._feature_reference_keys(manager) == before:
+            return
+        with self._lock:
+            self._validated_feature_files.clear()
+            self._invalid_feature_files.clear()
+        self._refresh_feature_presence()
+        self._reconcile_feature_tasks(reason="reference change")
+
+    @staticmethod
+    def _feature_reference_keys(manager: ModelManager) -> dict[str, frozenset[str]]:
+        """Return the record names each loaded feature manager currently holds."""
+        keys: dict[str, frozenset[str]] = {}
+        for manager_key in _FEATURE_MANAGER_KEYS:
+            sub_manager = _aux_sub_manager(manager, manager_key)
+            if sub_manager is not None:
+                keys[manager_key] = frozenset(sub_manager.model_reference)
+        return keys
 
     def _orchestrate(self) -> bool:
         """Build pending work into host-tagged scheduler tasks and emit status; executors do the fetching.
@@ -1117,9 +1230,9 @@ class HordeDownloadProcess(HordeProcess):
             build_safety = not self._safety_enqueued and not self._safety_ensured and not paused
             if build_safety:
                 self._safety_enqueued = True
-            build_aux = self._aux_requested and not self._aux_enqueued and not paused
-            if build_aux:
-                self._aux_enqueued = True
+            run_aux_pass = self._aux_pass_requested and not paused
+            if run_aux_pass:
+                self._aux_pass_requested = False
 
         if reload_requested and self._running_count == 0 and not self._scheduler.has_work():
             with self._lock:
@@ -1136,10 +1249,11 @@ class HordeDownloadProcess(HordeProcess):
         if build_safety:
             self._enqueue_safety_task()
             did = True
-        if build_aux:
-            self._enqueue_aux_tasks()
+        if run_aux_pass:
+            self._enqueue_operator_aux_pass()
             did = True
 
+        self._update_startup_focus()
         downloading = self._scheduler.active_count > 0
         if paused:
             self._send_status(DownloadPhase.PAUSED)
@@ -1203,40 +1317,18 @@ class HordeDownloadProcess(HordeProcess):
             ),
         )
 
-    def _maybe_prefetch_rembg_weight(self) -> None:
-        """Pre-place the rembg ``u2net.onnx`` weight for the image-utilities lane, off the orchestrator thread.
+    def _enqueue_operator_aux_pass(self) -> None:
+        """Run the parent-requested aux pass: the default LoRAs once, then a reconcile that retries everything.
 
-        The capability service runs with downloads disabled, so ``strip_background`` would fault there without
-        this file on disk. It is fetched on a one-shot daemon thread (a ~176MB download must never block the
-        download orchestrator) and gated on ``allow_post_processing``: the AI Horde bundles background removal
-        into the post-processing offer, so a worker not offering post-processing never needs the weight. A
-        cleaner gate would consult ``enable_image_utilities`` directly, but the download process is not handed
-        that flag today; this proxy over-fetches only for a post-processing worker that never enables the lane.
-        Best-effort: any failure is logged and the process continues (the service still surfaces its own
-        missing-model error if the file never lands).
+        The parent asks for this at boot when image models are missing, from the picker, and after a gating
+        change. Each is an explicit request, so models previously given up on are tried again.
         """
-        if not self._allow_post_processing:
-            return
-
-        def _run() -> None:
-            try:
-                from horde_worker_regen.process_management.workers.rembg_prefetch import ensure_u2net_present
-
-                ensure_u2net_present()
-            except Exception as e:  # noqa: BLE001 - a prefetch failure must never crash the download process
-                logger.warning(f"Download process: rembg u2net pre-place failed (continuing): {type(e).__name__} {e}")
-
-        threading.Thread(target=_run, name="download-rembg-prefetch", daemon=True).start()
-
-    def _enqueue_aux_tasks(self) -> None:
-        """Enumerate the enabled aux categories into per-model host-tagged tasks (LoRa/annotators coarse)."""
         from hordelib.api import SharedModelManager
 
         manager = SharedModelManager.manager
-        tasks: list[DownloadTask] = []
-
-        if self._allow_lora and manager.lora is not None:
-            tasks.append(
+        if self._allow_lora and manager.lora is not None and not self._default_loras_enqueued:
+            self._default_loras_enqueued = True
+            self._scheduler.enqueue(
                 DownloadTask(
                     kind=DownloadKind.DEFAULT_LORAS,
                     model_name="default LoRas",
@@ -1245,11 +1337,56 @@ class HordeDownloadProcess(HordeProcess):
                     target_dir=str(manager.lora.model_folder_path),
                 ),
             )
-        if self._allow_post_processing:
-            for manager_key, label in (("gfpgan", "GFPGAN"), ("esrgan", "ESRGAN"), ("codeformer", "CodeFormer")):
+        self._reconcile_feature_tasks(reason="operator request", reset_attempts=True)
+
+    def _reconcile_feature_tasks(self, *, reason: str, reset_attempts: bool = False) -> None:
+        """Queue a download for every enabled feature model that is not on disk.
+
+        Runs after the startup scan, after a reference reload that changed the feature references, on an
+        operator request, and once the safety models land. Present models are never queued, and the
+        scheduler drops anything already queued or in flight, so repeating the reconcile is safe. A model
+        that exhausted its retries, or is waiting out a retry backoff, is left alone unless ``reset_attempts``
+        is set: the operator's explicit request is the one path that tries it again.
+        """
+        from hordelib.api import SharedModelManager
+
+        tasks = self._feature_tasks(SharedModelManager.manager)
+        if reset_attempts:
+            with self._lock:
+                for task in tasks:
+                    self._attempts.pop(task.dedup_key, None)
+                keys = {task.dedup_key for task in tasks}
+                self._pending_retries = [
+                    (due, task) for due, task in self._pending_retries if task.dedup_key not in keys
+                ]
+        else:
+            with self._lock:
+                waiting = {task.dedup_key for _due, task in self._pending_retries}
+                tasks = [
+                    task
+                    for task in tasks
+                    if task.dedup_key not in waiting
+                    and self._attempts.get(task.dedup_key, 0) <= _MAX_DOWNLOAD_ATTEMPTS
+                ]
+        added = self._scheduler.enqueue_many(tasks) if tasks else 0
+        if added:
+            logger.info(f"Download process: {reason}: queued {added} missing feature model download(s)")
+        # Probe presence now so a feature whose models are already on disk is reported ready immediately,
+        # rather than only after the first completed download.
+        self._refresh_feature_presence()
+
+    def _feature_tasks(self, manager: ModelManager) -> list[DownloadTask]:
+        """Return a task for every enabled feature model that is not on disk."""
+        tasks: list[DownloadTask] = []
+        if self._fetch_needs.post_processing:
+            for manager_key, label in _POST_PROCESSING_MANAGERS:
                 post_processor = _aux_sub_manager(manager, manager_key)
                 if post_processor is not None:
                     tasks.extend(self._aux_model_tasks(post_processor, manager_key, _post_processing_feature(label)))
+        if self._fetch_needs.strip_background:
+            tasks.extend(self._u2net_tasks())
+        if self._fetch_needs.caption:
+            tasks.extend(self._caption_tasks())
         if self._allow_sdxl_controlnet and manager.miscellaneous is not None:
             tasks.extend(self._aux_model_tasks(manager.miscellaneous, "miscellaneous", FEATURE_MISCELLANEOUS))
         if self._allow_controlnet and manager.controlnet is not None:
@@ -1265,11 +1402,94 @@ class HordeDownloadProcess(HordeProcess):
                         FEATURE_CONTROLNET_ANNOTATORS,
                     ),
                 )
-        if tasks:
-            self._scheduler.enqueue_many(tasks)
-        # The aux managers are now loaded; probe their presence so a feature whose models are already on
-        # disk is reported ready immediately, rather than only after the first completed download.
-        self._refresh_feature_presence()
+        return tasks
+
+    def _u2net_tasks(self) -> list[DownloadTask]:
+        """Return the background-removal weight task when the weight is absent and there is a cache to fill.
+
+        The image-utilities service runs with downloads disabled, so ``strip_background`` faults there
+        until this process places the weight. With no cache home there is nowhere to place it and presence
+        stays unknown.
+        """
+        from horde_worker_regen.process_management.workers.rembg_prefetch import (
+            U2NET_FILENAME,
+            U2NET_URL,
+            rembg_cache_dir,
+            u2net_present,
+        )
+
+        cache_dir = rembg_cache_dir()
+        if cache_dir is None:
+            return []
+        present = u2net_present()
+        with self._lock:
+            self._strip_background_present = present
+        if present:
+            return []
+        return [
+            DownloadTask(
+                kind=DownloadKind.AUX_MODEL,
+                model_name=U2NET_FILENAME,
+                host=download_host_for_url(U2NET_URL),
+                feature=FEATURE_STRIP_BACKGROUND,
+                manager_key=REMBG_MANAGER_KEY,
+                target_dir=str(cache_dir),
+            ),
+        ]
+
+    def _caption_tasks(self) -> list[DownloadTask]:
+        """Return the caption-model task when BLIP is absent and the CLIP interrogator is already placed.
+
+        The only way to fetch BLIP is to construct the interrogator that also loads CLIP, so the task waits
+        for the safety models rather than racing that download.
+        """
+        present = self._caption_present_on_disk()
+        with self._lock:
+            self._caption_present = present
+        if present or not self._safety_present:
+            return []
+        return [
+            DownloadTask(
+                kind=DownloadKind.AUX_MODEL,
+                model_name=_caption_model_repo(),
+                host=_huggingface_hub_host(),
+                feature=FEATURE_CAPTION,
+                manager_key=CAPTION_MANAGER_KEY,
+            ),
+        ]
+
+    def _caption_present_on_disk(self) -> bool:
+        """Probe whether the caption model's weights are already in the shared hub cache.
+
+        The interrogator loads BLIP through ``transformers`` from the hub cache, so presence is judged the
+        way the hub judges it: the repo's config resolves offline and its snapshot holds a weights file.
+        """
+        from huggingface_hub import try_to_load_from_cache
+
+        cached_config = try_to_load_from_cache(_caption_model_repo(), "config.json")
+        if not isinstance(cached_config, str):
+            return False
+        snapshot = Path(cached_config).parent
+        return any(path.suffix in (".safetensors", ".bin") for path in snapshot.iterdir())
+
+    def _ensure_caption_model_present(self) -> bool:
+        """Place the caption model in the hub cache by constructing the captioning interrogator once.
+
+        This is the same construction the safety process performs on its first caption form, so the two
+        agree on which model is fetched. It loads CLIP and BLIP into this process's RAM for the duration and
+        reports no byte progress; both are released on return. Skipped outright when the weights are cached.
+        """
+        if self._caption_present_on_disk():
+            logger.debug("Download process: caption model weights are already cached")
+            return True
+        from horde_safety.interrogate import get_interrogator
+
+        logger.info(
+            "Download process: fetching the caption (BLIP) model. This reports no byte progress "
+            "(horde_safety fetches and loads it in one step) and can take several minutes.",
+        )
+        get_interrogator()
+        return self._caption_present_on_disk()
 
     def _annotators_present_now(self, manager: ModelManager) -> bool | None:
         """On-disk readiness of the ControlNet annotators (existence-only), tri-state.
@@ -1561,8 +1781,11 @@ class HordeDownloadProcess(HordeProcess):
             # A completed aux download may have made a gated feature ready; recompute so the next report
             # advertises it (or, on a failure mid-set, keeps withholding it).
             self._refresh_feature_presence()
-            with self._lock:
-                self._reference_changed_pending = True
+            if success:
+                # Only a landed file changes what the other processes can load; a failure or an abort
+                # leaves the disk as it was, so it triggers no worker-wide reload.
+                with self._lock:
+                    self._reference_changed_pending = True
 
         if task.kind in (DownloadKind.LORA, DownloadKind.TI):
             # Ad-hoc prefetch reports a per-entry outcome to the requesting job(s); the parent owns the
@@ -1573,6 +1796,9 @@ class HordeDownloadProcess(HordeProcess):
         elif success:
             self._clear_failure(task.model_name)
             self._forget_attempts(task)
+            if task.kind is DownloadKind.SAFETY:
+                # The caption model can only be fetched once CLIP is placed, so it is queued from here.
+                self._reconcile_feature_tasks(reason="safety models landed")
         else:
             self._record_failure(task.model_name, task.feature, reason or "download failed")
             self._maybe_retry(task, reason or "download failed")
@@ -1626,10 +1852,27 @@ class HordeDownloadProcess(HordeProcess):
                     return True
             return False
         if task.kind is DownloadKind.AUX_MODEL:
+            if task.manager_key == REMBG_MANAGER_KEY:
+                from horde_worker_regen.process_management.workers.rembg_prefetch import ensure_u2net_present
+
+                placed = ensure_u2net_present(callback=callback) is not None
+                with self._lock:
+                    self._strip_background_present = placed
+                return placed
+            if task.manager_key == CAPTION_MANAGER_KEY:
+                placed = self._ensure_caption_model_present()
+                with self._lock:
+                    self._caption_present = placed
+                return placed
             aux_manager = _aux_sub_manager(manager, task.manager_key)
             if aux_manager is None:
                 return False
-            with self._model_download_lock(task.manager_key, task.model_name):
+            with self._model_download_lock(task.manager_key, task.model_name), contextlib.ExitStack() as files:
+                # Records under different managers can declare the same file (the face-restoration helper
+                # weights every face fixer shares), so each declared file name is also locked: two tasks
+                # never write one destination at once, and the second finds the file present and skips it.
+                for file_lock in self._declared_file_locks(aux_manager, task.model_name):
+                    files.enter_context(file_lock)
                 # Validated fetch (sha256-where-known, else presence) with a re-download on mismatch, so a
                 # truncated aux file is repaired here instead of being trusted and faulting a later job.
                 return ensure_aux_model_present(
@@ -1681,6 +1924,22 @@ class HordeDownloadProcess(HordeProcess):
                 lock = threading.Lock()
                 self._model_download_locks[key] = lock
             return lock
+
+    def _declared_file_locks(self, manager: BaseModelManager, model_name: str) -> list[threading.Lock]:
+        """Return one lock per file the model's record declares, in a fixed order so holders never deadlock."""
+        try:
+            file_names = sorted({str(entry.get("file_name")) for entry in manager.get_model_download(model_name)})
+        except Exception:  # noqa: BLE001 - an unreadable record still downloads; it just loses the file lock
+            return []
+        with self._lock:
+            locks: list[threading.Lock] = []
+            for file_name in file_names:
+                lock = self._declared_file_download_locks.get(file_name)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._declared_file_download_locks[file_name] = lock
+                locks.append(lock)
+            return locks
 
     def _forget_attempts(self, task: DownloadTask) -> None:
         with self._lock:

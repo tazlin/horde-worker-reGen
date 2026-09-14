@@ -17,7 +17,11 @@ from typing import Protocol
 from unittest.mock import Mock
 
 import pytest
+from loguru import logger
+from pydantic import JsonValue
 
+from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
+from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.model_download_core import ChunkPacer, CompVisLike, DownloadAborted
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
@@ -39,15 +43,24 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 from horde_worker_regen.process_management.jobs.job_popper import _select_models_for_pop
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.models.download_scheduler import DownloadKind, DownloadTask
+from horde_worker_regen.process_management.models.download_scheduler import (
+    DownloadKind,
+    DownloadPriorityPolicy,
+    DownloadTask,
+)
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.simulation.fake_worker_processes import FakeDownloadProcess
 from horde_worker_regen.process_management.workers.download_process import (
+    CAPTION_MANAGER_KEY,
     DOWNLOAD_PROCESS_ID,
+    FEATURE_CAPTION,
     FEATURE_IMAGE_MODEL,
+    FEATURE_LORA,
     FEATURE_SAFETY,
+    FEATURE_STRIP_BACKGROUND,
+    REMBG_MANAGER_KEY,
     HordeDownloadProcess,
     _TaskRuntime,
 )
@@ -393,6 +406,10 @@ class TestConfigReloadTriggersDownloads:
     def _mark_present(self, manager: Mock, present: set[str]) -> None:
         manager._model_availability.update(present=present, currently_downloading=None, pending=(), failed=())
 
+    def _fetch_needs_for(self, config: dict[str, JsonValue]) -> AuxiliaryFetchNeeds:
+        """Derive the auxiliary fetch needs of a config the way a loaded bridgeData.yaml would."""
+        return reGenBridgeData.model_validate(config).auxiliary_fetch_needs
+
     def test_reload_requests_newly_configured_missing_model(self) -> None:
         """Adding a model to the config fetches just the new one, without the heavy aux pass."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
@@ -537,6 +554,65 @@ class TestConfigReloadTriggersDownloads:
 
         manager._process_lifecycle.set_download_gating.assert_not_called()
         manager._process_lifecycle.restart_download_process.assert_not_called()
+
+    def test_reload_taking_up_alchemy_fetches_the_models_its_forms_need(self) -> None:
+        """Turning a worker into an alchemist that upscales makes it fetch the upscalers, without a restart."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+        serves_nothing_auxiliary = self._fetch_needs_for({"dreamer": True, "alchemist": False})
+        assert serves_nothing_auxiliary.post_processing is False
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(
+                image_models_to_load=["a"],
+                auxiliary_fetch_needs=serves_nothing_auxiliary,
+                purge_loras_on_download=False,
+                dry_run_skip_inference=True,
+            ),
+        )
+        manager._process_lifecycle.set_download_gating.reset_mock()
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(
+                image_models_to_load=["a"],
+                auxiliary_fetch_needs=self._fetch_needs_for(
+                    {"dreamer": False, "alchemist": True, "forms": ["post-process"]},
+                ),
+                purge_loras_on_download=False,
+                dry_run_skip_inference=True,
+            ),
+        )
+
+        manager._process_lifecycle.set_download_gating.assert_called_once()
+        assert manager._process_lifecycle.set_download_gating.call_args.kwargs["fetch_needs"].post_processing is True
+        manager._process_lifecycle.restart_download_process.assert_not_called()
+
+    def test_reload_leaving_the_offered_work_alone_forwards_no_fetch_needs(self) -> None:
+        """A reload that changes nothing about what the worker offers does not re-gate the download process."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+        alchemist_needs = self._fetch_needs_for(
+            {"dreamer": False, "alchemist": True, "forms": ["post-process"]},
+        )
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(
+                image_models_to_load=["a"],
+                auxiliary_fetch_needs=alchemist_needs,
+                purge_loras_on_download=False,
+                dry_run_skip_inference=True,
+            ),
+        )
+        manager._process_lifecycle.set_download_gating.reset_mock()
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(
+                image_models_to_load=["a"],
+                auxiliary_fetch_needs=alchemist_needs,
+                purge_loras_on_download=False,
+                dry_run_skip_inference=True,
+            ),
+        )
+
+        manager._process_lifecycle.set_download_gating.assert_not_called()
 
 
 class TestDownloadsOnlyMode:
@@ -998,27 +1074,485 @@ class TestRealDownloadProcessReconcile:
         assert runtime.cancelled is False
 
     def test_live_gating_enable_rearms_the_aux_pass(self) -> None:
-        """Flipping a gating flag on live updates it and re-arms the one-shot aux pass (replaces the restart)."""
+        """Flipping a gating flag on live updates it and requests a fresh aux pass, default LoRAs included."""
         process = self._make_process()
         process._allow_lora = False
-        process._aux_requested = False
-        process._aux_enqueued = True  # the aux pass already ran once
+        process._aux_pass_requested = False
+        process._default_loras_enqueued = True  # the default LoRAs already ran once
 
         process._handle_control_message(HordeDownloadControlMessage(set_allow_lora=True))
 
         assert process._allow_lora is True
-        assert process._aux_requested is True
-        assert process._aux_enqueued is False
+        assert process._aux_pass_requested is True
+        assert process._default_loras_enqueued is False
 
     def test_live_gating_unchanged_value_does_not_rearm_aux(self) -> None:
-        """A gating flag set to its current value is a no-op: the aux pass is not needlessly replayed."""
+        """A gating flag set to its current value is a no-op: no aux pass is requested."""
         process = self._make_process()
         process._allow_lora = True
-        process._aux_enqueued = True
+        process._default_loras_enqueued = True
 
         process._handle_control_message(HordeDownloadControlMessage(set_allow_lora=True))
 
-        assert process._aux_enqueued is True
+        assert process._aux_pass_requested is False
+        assert process._default_loras_enqueued is True
+
+
+class TestFeatureReconcile:
+    """The one feature reconcile: what it queues, what it leaves alone, and what re-runs it.
+
+    The reconcile is the download process's single answer to "which enabled feature models are not on
+    disk". It runs after the startup scan, after a reference reload that changed the feature references,
+    on an operator request, and once the safety models land, and it is safe to repeat: a present model is
+    never queued and the scheduler drops a duplicate of anything already queued or in flight.
+    """
+
+    def _process(
+        self,
+        *,
+        fetch_needs: AuxiliaryFetchNeeds,
+        allow_lora: bool = False,
+    ) -> HordeDownloadProcess:
+        return HordeDownloadProcess(
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_message_queue=queue.Queue(),  # type: ignore[arg-type]
+            pipe_connection=Mock(),
+            disk_lock=Mock(),
+            download_bandwidth_semaphore=Mock(),
+            process_launch_identifier=0,
+            fetch_needs=fetch_needs,
+            allow_lora=allow_lora,
+            allow_controlnet=False,
+            allow_sdxl_controlnet=False,
+        )
+
+    @staticmethod
+    def _sub_manager(on_disk: dict[str, bool]) -> object:
+        """A fake feature sub-manager whose reference is ``on_disk``'s keys, answering presence from its values.
+
+        A test adds a record the way a reference refresh does, by inserting into ``model_reference``; a name
+        absent from ``on_disk`` reads as not on disk. ``validate_calls`` counts the per-file validations the
+        presence refresh performs, so a test can tell a re-validated file from one served out of the cache.
+        """
+        validate_calls: Counter[str] = Counter()
+
+        def validate_model(model_name: str, skip_checksum: bool = False) -> bool | None:
+            validate_calls[model_name] += 1
+            return None  # no checksum in the record, so presence is the verdict
+
+        return SimpleNamespace(
+            model_reference=dict.fromkeys(on_disk, object()),
+            model_folder_path="/aux",
+            is_model_available=lambda name: on_disk.get(name, False),
+            get_model_download=lambda name: [{"file_url": f"https://example.invalid/{name}"}],
+            validate_model=validate_model,
+            validate_calls=validate_calls,
+        )
+
+    def _inject(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        gfpgan: dict[str, bool] | None = None,
+        esrgan: dict[str, bool] | None = None,
+        lora: object | None = None,
+    ) -> SimpleNamespace:
+        """Inject a fake ``SharedModelManager`` exposing the named feature references; return the manager."""
+        manager = SimpleNamespace(
+            compvis=None,
+            lora=lora,
+            gfpgan=self._sub_manager(gfpgan) if gfpgan is not None else None,
+            esrgan=self._sub_manager(esrgan) if esrgan is not None else None,
+            codeformer=None,
+            miscellaneous=None,
+            controlnet=None,
+            controlnet_annotator=None,
+        )
+        fake_api = types.ModuleType("hordelib.api")
+        fake_api.SharedModelManager = SimpleNamespace(manager=manager)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+        # The package attribute is not restored by setitem; patch it too so the fake cannot outlive the test.
+        monkeypatch.setattr(importlib.import_module("hordelib"), "api", fake_api, raising=False)
+        return manager
+
+    @staticmethod
+    def _stub_caption(process: HordeDownloadProcess, monkeypatch: pytest.MonkeyPatch, *, present: bool) -> None:
+        """Answer the caption probes without importing the interrogator or touching the hub cache."""
+        monkeypatch.setattr(process, "_caption_present_on_disk", lambda: present)
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.download_process._caption_model_repo",
+            lambda: "Salesforce/blip-image-captioning-base",
+        )
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.download_process._huggingface_hub_host",
+            lambda: "huggingface.co",
+        )
+
+    @staticmethod
+    def _aux_names(process: HordeDownloadProcess) -> set[str]:
+        """The model names of every queued per-file auxiliary task."""
+        return {
+            task.model_name for task in process._scheduler.pending_snapshot() if task.kind is DownloadKind.AUX_MODEL
+        }
+
+    def test_missing_enabled_models_are_queued_and_present_ones_are_not(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every enabled feature model that is not on disk is queued; a present one, and the LoRAs, are not.
+
+        The default LoRA set is the operator pass's own work, never part of a reconcile, even with the LoRA
+        category enabled and its manager loaded.
+        """
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True), allow_lora=True)
+        self._inject(
+            monkeypatch,
+            gfpgan={"gfpgan_missing": False, "gfpgan_present": True},
+            esrgan={"esrgan_missing": False},
+            lora=SimpleNamespace(model_folder_path="/loras"),
+        )
+
+        process._reconcile_feature_tasks(reason="startup scan")
+
+        tasks = process._scheduler.pending_snapshot()
+        assert {task.model_name for task in tasks} == {"gfpgan_missing", "esrgan_missing"}
+        assert {task.kind for task in tasks} == {DownloadKind.AUX_MODEL}
+        assert {task.manager_key for task in tasks} == {"gfpgan", "esrgan"}
+
+    def test_a_category_whose_need_is_off_queues_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With post-processing not needed, its missing models are left alone rather than fetched."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds())
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+
+        process._reconcile_feature_tasks(reason="startup scan")
+
+        assert process._scheduler.pending_snapshot() == []
+
+    def test_a_model_that_exhausted_its_retries_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A model that ran out of retries is not re-queued by an ordinary reconcile."""
+        from horde_worker_regen.process_management.workers import download_process as dp
+
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+        process._attempts[(DownloadKind.AUX_MODEL, "gfpgan", "gfpgan_missing")] = dp._MAX_DOWNLOAD_ATTEMPTS + 1
+
+        process._reconcile_feature_tasks(reason="startup scan")
+
+        assert process._scheduler.pending_snapshot() == []
+
+    def test_a_model_waiting_out_its_backoff_is_not_re_queued(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A model already waiting for its retry backoff is left where it is, not queued a second time."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+        waiting = DownloadTask(
+            kind=DownloadKind.AUX_MODEL,
+            model_name="gfpgan_missing",
+            host="example.invalid",
+            feature="post-processing (GFPGAN)",
+            manager_key="gfpgan",
+        )
+        process._pending_retries = [(time.monotonic() + 60.0, waiting)]
+
+        process._reconcile_feature_tasks(reason="startup scan")
+
+        assert process._scheduler.pending_snapshot() == []
+        assert len(process._pending_retries) == 1
+
+    def test_an_operator_request_retries_a_given_up_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An operator request queues a model that exhausted its retries, clearing its attempts and backoff."""
+        from horde_worker_regen.process_management.workers import download_process as dp
+
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+        key = (DownloadKind.AUX_MODEL, "gfpgan", "gfpgan_missing")
+        process._attempts[key] = dp._MAX_DOWNLOAD_ATTEMPTS + 1
+        process._pending_retries = [
+            (
+                time.monotonic() + 60.0,
+                DownloadTask(
+                    kind=DownloadKind.AUX_MODEL,
+                    model_name="gfpgan_missing",
+                    host="example.invalid",
+                    feature="post-processing (GFPGAN)",
+                    manager_key="gfpgan",
+                ),
+            ),
+        ]
+
+        process._enqueue_operator_aux_pass()
+
+        assert self._aux_names(process) == {"gfpgan_missing"}
+        assert key not in process._attempts
+        assert process._pending_retries == []
+
+    def test_a_reconcile_that_queued_something_logs_one_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A reconcile that queued work says so once, naming why it ran and how much it queued."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+
+        lines: list[str] = []
+        sink_id = logger.add(lambda message: lines.append(message.record["message"]), level="INFO")
+        try:
+            process._reconcile_feature_tasks(reason="startup scan")
+        finally:
+            logger.remove(sink_id)
+
+        queued_lines = [line for line in lines if "missing feature model" in line]
+        assert len(queued_lines) == 1
+        assert "startup scan" in queued_lines[0]
+
+    def test_a_reconcile_that_queued_nothing_is_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A reconcile with nothing to fetch logs no queued-downloads line, so repeating it is quiet."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_present": True})
+
+        lines: list[str] = []
+        sink_id = logger.add(lambda message: lines.append(message.record["message"]), level="INFO")
+        try:
+            process._reconcile_feature_tasks(reason="startup scan")
+        finally:
+            logger.remove(sink_id)
+
+        assert [line for line in lines if "missing feature model" in line] == []
+
+    def test_a_reload_leaving_the_references_unchanged_queues_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A reload that changed no feature record keeps the validation cache and queues no download.
+
+        The parent broadcasts a reload after this process's own downloads land; those leave the references
+        as they were, so re-hashing every validated file would be pure cost.
+        """
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        manager = self._inject(monkeypatch, gfpgan={"gfpgan_present": True})
+        manager.reload_database = lambda: None
+        process._validated_feature_files.add(("gfpgan", "gfpgan_present"))
+
+        process._reload_model_database()
+
+        assert process._scheduler.pending_snapshot() == []
+        assert ("gfpgan", "gfpgan_present") in process._validated_feature_files
+        assert manager.gfpgan.validate_calls == Counter()  # nothing was re-validated
+
+    def test_a_reload_that_adds_a_record_queues_it_and_drops_the_cache(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A reload that gained a record fetches the new model and re-validates the files it already had.
+
+        A record can change what a file is expected to be, so the cached verdicts are dropped rather than
+        trusted: the file already on disk is checked again on the way to reporting the feature.
+        """
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        manager = self._inject(monkeypatch, gfpgan={"gfpgan_present": True})
+        manager.reload_database = lambda: manager.gfpgan.model_reference.setdefault("gfpgan_new", object())
+        process._validated_feature_files.add(("gfpgan", "gfpgan_present"))
+        process._invalid_feature_files.add(("gfpgan", "gfpgan_corrupt"))
+
+        process._reload_model_database()
+
+        assert self._aux_names(process) == {"gfpgan_new"}
+        assert manager.gfpgan.validate_calls["gfpgan_present"] == 1  # re-validated once, then cached again
+        assert process._invalid_feature_files == set()
+
+    def test_a_successful_task_marks_the_reference_changed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A landed file changes what the other processes can load, so the parent is told to reload."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+        monkeypatch.setattr(process, "_dispatch_task", lambda _task, _callback: True)
+
+        process._run_task(_aux_task("gfpgan_missing", "example.invalid", "gfpgan"))
+
+        assert any(message.reference_changed for message in _drain_availability(process.process_message_queue))
+
+    def test_a_failed_task_does_not_mark_the_reference_changed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failure leaves the disk as it was, so it triggers no worker-wide reload."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+        monkeypatch.setattr(process, "_dispatch_task", lambda _task, _callback: False)
+
+        process._run_task(_aux_task("gfpgan_missing", "example.invalid", "gfpgan"))
+
+        assert not any(message.reference_changed for message in _drain_availability(process.process_message_queue))
+
+    def test_an_aborted_task_does_not_mark_the_reference_changed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An abort (a config removal or a shutdown) places no file, so it triggers no reload either."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+
+        def abort(_task: DownloadTask, _callback: object) -> bool:
+            raise DownloadAborted
+
+        monkeypatch.setattr(process, "_dispatch_task", abort)
+
+        process._run_task(_aux_task("gfpgan_missing", "example.invalid", "gfpgan"))
+
+        assert not any(message.reference_changed for message in _drain_availability(process.process_message_queue))
+
+    def test_landed_safety_models_reconcile_for_the_caption_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The caption model can only be fetched once CLIP is placed, so the safety task queues it on success."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(caption=True))
+        self._inject(monkeypatch)
+        self._stub_caption(process, monkeypatch, present=False)
+
+        def place_safety_models(_task: DownloadTask, _callback: object) -> bool:
+            process._safety_present = True
+            return True
+
+        monkeypatch.setattr(process, "_dispatch_task", place_safety_models)
+
+        process._run_task(
+            DownloadTask(
+                kind=DownloadKind.SAFETY,
+                model_name="safety models",
+                host="example.invalid",
+                feature=FEATURE_SAFETY,
+            ),
+        )
+
+        caption_tasks = [
+            task for task in process._scheduler.pending_snapshot() if task.manager_key == CAPTION_MANAGER_KEY
+        ]
+        assert [task.feature for task in caption_tasks] == [FEATURE_CAPTION]
+
+    def test_the_operator_pass_queues_the_default_loras_once_per_arming(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One arming buys one default-LoRA fetch; a second pass on the same arming queues it again not at all.
+
+        The queue is emptied between the two passes, so the second pass being empty is the one-shot guard
+        rather than the scheduler's own de-duplication.
+        """
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(), allow_lora=True)
+        self._inject(monkeypatch, lora=SimpleNamespace(model_folder_path="/loras"))
+
+        process._enqueue_operator_aux_pass()
+        first_pass = [
+            task for task in process._scheduler.pending_snapshot() if task.kind is DownloadKind.DEFAULT_LORAS
+        ]
+        process._scheduler.prune(keep=lambda task: task.kind is not DownloadKind.DEFAULT_LORAS)
+        process._enqueue_operator_aux_pass()
+
+        assert [task.feature for task in first_pass] == [FEATURE_LORA]
+        assert process._scheduler.pending_snapshot() == []
+
+    def test_a_paused_process_keeps_the_operator_request_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A request that arrives while downloads are paused is honoured when they resume, not dropped."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(post_processing=True))
+        self._inject(monkeypatch, gfpgan={"gfpgan_missing": False})
+        process._safety_enqueued = True  # the one-shot safety task is not what this exercises
+        process._paused = True
+        process._handle_control_message(HordeDownloadControlMessage(download_aux=True))
+
+        process._orchestrate()
+        assert process._aux_pass_requested is True
+        assert self._aux_names(process) == set()
+
+        process._paused = False
+        process._orchestrate()
+
+        assert process._aux_pass_requested is False
+        assert self._aux_names(process) == {"gfpgan_missing"}
+
+    def test_background_removal_queues_the_weight_when_it_is_absent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """With background removal needed and no weight in the cache, the weight is an ordinary queued download."""
+        monkeypatch.setenv("AIWORKER_CACHE_HOME", str(tmp_path))
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(strip_background=True))
+        self._inject(monkeypatch)
+
+        process._reconcile_feature_tasks(reason="startup scan")
+
+        tasks = process._scheduler.pending_snapshot()
+        assert [task.manager_key for task in tasks] == [REMBG_MANAGER_KEY]
+        assert tasks[0].kind is DownloadKind.AUX_MODEL
+        assert tasks[0].feature == FEATURE_STRIP_BACKGROUND
+
+    def test_no_cache_home_queues_no_background_removal_weight(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no isolated cache to fill there is nowhere to place the weight, so nothing is queued."""
+        monkeypatch.delenv("AIWORKER_CACHE_HOME", raising=False)
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(strip_background=True))
+        self._inject(monkeypatch)
+
+        process._reconcile_feature_tasks(reason="startup scan")
+
+        assert process._scheduler.pending_snapshot() == []
+
+    def test_dispatching_the_weight_task_places_it_and_reports_its_bytes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Running the queued weight task pre-places the weight, reporting progress through the task callback."""
+        from horde_worker_regen.process_management.workers import rembg_prefetch
+
+        monkeypatch.setenv("AIWORKER_CACHE_HOME", str(tmp_path))
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(strip_background=True))
+        self._inject(monkeypatch)
+        placed_callbacks: list[object] = []
+
+        def fake_ensure(*, callback: object = None) -> Path:
+            placed_callbacks.append(callback)
+            return tmp_path / rembg_prefetch.U2NET_FILENAME
+
+        monkeypatch.setattr(rembg_prefetch, "ensure_u2net_present", fake_ensure)
+
+        def task_callback(_downloaded: int, _total: int) -> None:
+            return
+
+        task = DownloadTask(
+            kind=DownloadKind.AUX_MODEL,
+            model_name=rembg_prefetch.U2NET_FILENAME,
+            host="github.com",
+            feature=FEATURE_STRIP_BACKGROUND,
+            manager_key=REMBG_MANAGER_KEY,
+        )
+
+        assert process._dispatch_task(task, task_callback) is True
+        assert process._strip_background_present is True
+        assert placed_callbacks == [task_callback]
+
+    def test_the_caption_model_waits_for_the_safety_models(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Nothing is queued for the caption model while CLIP is still missing, so the two do not race."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(caption=True))
+        self._inject(monkeypatch)
+        self._stub_caption(process, monkeypatch, present=False)
+        process._safety_present = False
+
+        process._reconcile_feature_tasks(reason="startup scan")
+
+        assert process._scheduler.pending_snapshot() == []
+
+    def test_the_caption_model_is_queued_once_the_safety_models_are_present(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With the safety models placed and the caption weights absent, the caption model is queued."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(caption=True))
+        self._inject(monkeypatch)
+        self._stub_caption(process, monkeypatch, present=False)
+        process._safety_present = True
+
+        process._reconcile_feature_tasks(reason="safety models landed")
+
+        tasks = process._scheduler.pending_snapshot()
+        assert [task.manager_key for task in tasks] == [CAPTION_MANAGER_KEY]
+        assert tasks[0].kind is DownloadKind.AUX_MODEL
+        assert tasks[0].feature == FEATURE_CAPTION
+
+    def test_a_cached_caption_model_is_not_queued(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Caption weights already in the hub cache are recorded present and never re-fetched."""
+        process = self._process(fetch_needs=AuxiliaryFetchNeeds(caption=True))
+        self._inject(monkeypatch)
+        self._stub_caption(process, monkeypatch, present=True)
+        process._safety_present = True
+
+        process._reconcile_feature_tasks(reason="safety models landed")
+
+        assert process._scheduler.pending_snapshot() == []
+        assert process._caption_present is True
 
 
 class TestFirstClassAnnotators:
@@ -1039,7 +1573,7 @@ class TestFirstClassAnnotators:
             download_bandwidth_semaphore=Mock(),
             process_launch_identifier=0,
             allow_lora=False,
-            allow_post_processing=False,
+            fetch_needs=AuxiliaryFetchNeeds(),
             allow_sdxl_controlnet=False,
             allow_controlnet=True,
         )
@@ -1089,7 +1623,7 @@ class TestFirstClassAnnotators:
         process = self._process()
         self._inject(monkeypatch, annotators_present=False)
 
-        process._enqueue_aux_tasks()
+        process._reconcile_feature_tasks(reason="test")
 
         tasks = process._scheduler.pending_snapshot()
         annotator_tasks = [task for task in tasks if task.manager_key == "controlnet_annotator"]
@@ -1711,6 +2245,47 @@ class TestDownloadMessageRoundTrips:
         restored = SupervisorControlMessage.model_validate(message.model_dump())
         assert restored.command is SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT
         assert restored.download_rate_limit_kbps == 3000
+
+    def test_supervisor_priority_policy_command_round_trip(self) -> None:
+        """The SET_DOWNLOAD_PRIORITY_POLICY command carries its queue order through serialization."""
+        message = SupervisorControlMessage(
+            command=SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY,
+            download_priority_policy=DownloadPriorityPolicy.PARALLEL,
+        )
+        restored = SupervisorControlMessage.model_validate(message.model_dump())
+        assert restored.command is SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY
+        assert restored.download_priority_policy is DownloadPriorityPolicy.PARALLEL
+
+
+class TestSupervisorPriorityPolicyCommand:
+    """Asking the worker to reorder the download queue reaches the download process."""
+
+    def test_command_forwards_the_requested_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The policy the supervisor sends is the policy handed to the download-control forwarder."""
+        manager = make_testable_process_manager()
+        forwarder = Mock()
+        monkeypatch.setattr(manager._process_lifecycle, "set_download_controls", forwarder)
+
+        manager._apply_supervisor_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY,
+                download_priority_policy=DownloadPriorityPolicy.PARALLEL,
+            ),
+        )
+
+        forwarder.assert_called_once_with(priority_policy=DownloadPriorityPolicy.PARALLEL)
+
+    def test_a_command_without_a_policy_changes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A malformed command leaves the queue order as it was rather than guessing a policy."""
+        manager = make_testable_process_manager()
+        forwarder = Mock()
+        monkeypatch.setattr(manager._process_lifecycle, "set_download_controls", forwarder)
+
+        manager._apply_supervisor_command(
+            SupervisorControlMessage(command=SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY),
+        )
+
+        forwarder.assert_not_called()
 
 
 class TestSafetyModelDownloadReporting:

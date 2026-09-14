@@ -9,6 +9,12 @@ accounting and answers "which task may start now?" under two live limits:
   it is the "thread to a single domain too" toggle.
 - ``max_parallel_downloads``: the global ceiling across all hosts (1 restores fully-sequential behaviour).
 
+Order within the queue follows the :class:`DownloadPriorityPolicy`. Under ``serve_first`` (the default)
+tasks are admitted by tier (:class:`DownloadPriority`: safety models, then a popped job's own files, then
+image models, then feature models, then the default LoRAs) and by age within a tier, and a *startup focus*
+can narrow admission to the safety models plus one image model at a time until the worker has what it
+needs to start serving. Under ``parallel`` the queue is first come, first served.
+
 Execution (which manager method actually fetches the bytes, progress reporting, pausing) lives in the
 download process; this module never imports hordelib or touches disk, so the admission policy can be
 unit-tested directly. Coordination uses a :class:`threading.Condition` so executor threads block when
@@ -31,6 +37,8 @@ __all__ = [
     "LORA_VERSION_MANAGER_KEY",
     "TI_MANAGER_KEY",
     "DownloadKind",
+    "DownloadPriority",
+    "DownloadPriorityPolicy",
     "DownloadTask",
     "HostAwareDownloadScheduler",
 ]
@@ -88,6 +96,41 @@ unrelated slow transfer to the same host (a pending job's dispatch gate is waiti
 additionally bounded by the ad-hoc engine's own worker pool, so exempting them cannot stampede a host."""
 
 
+class DownloadPriority(enum.IntEnum):
+    """The admission tiers of the ``serve_first`` policy, lowest value first."""
+
+    SAFETY = 0
+    """The safety models gate every image job, so nothing else is worth a slot before them."""
+    JOB_PREFETCH = 1
+    """A popped job's own LoRAs and textual inversions; the job waits on exactly these."""
+    IMAGE_MODEL = 2
+    """A generation checkpoint; each one that lands adds work the worker can serve."""
+    FEATURE = 3
+    """ControlNet, annotators, post-processing, background removal and caption models."""
+    DEFAULT_LORAS = 4
+    """The curated default-LoRA seed, wanted eventually and never urgently."""
+
+
+_PRIORITY_BY_KIND: dict[DownloadKind, DownloadPriority] = {
+    DownloadKind.SAFETY: DownloadPriority.SAFETY,
+    DownloadKind.LORA: DownloadPriority.JOB_PREFETCH,
+    DownloadKind.TI: DownloadPriority.JOB_PREFETCH,
+    DownloadKind.IMAGE_MODEL: DownloadPriority.IMAGE_MODEL,
+    DownloadKind.AUX_MODEL: DownloadPriority.FEATURE,
+    DownloadKind.ANNOTATOR_VERIFY: DownloadPriority.FEATURE,
+    DownloadKind.DEFAULT_LORAS: DownloadPriority.DEFAULT_LORAS,
+}
+
+
+class DownloadPriorityPolicy(enum.StrEnum):
+    """How the pending queue is ordered."""
+
+    SERVE_FIRST = "serve_first"
+    """Tiered by :class:`DownloadPriority`, with a startup focus until the worker can serve."""
+    PARALLEL = "parallel"
+    """First come, first served, limited only by the host and global concurrency ceilings."""
+
+
 @dataclass(frozen=True)
 class DownloadTask:
     """One unit of download work, tagged with the host it targets for per-host scheduling."""
@@ -116,14 +159,24 @@ class DownloadTask:
         """Identity for de-duplication: the same model under the same manager/kind is one task."""
         return (self.kind, self.manager_key, self.model_name)
 
+    @property
+    def priority(self) -> DownloadPriority:
+        """The admission tier this task belongs to under the ``serve_first`` policy."""
+        return _PRIORITY_BY_KIND[self.kind]
+
 
 @dataclass
 class _State:
     """Mutable scheduler state, guarded by the scheduler's condition lock."""
 
     pending: list[DownloadTask] = field(default_factory=list)
+    """Kept in admission order (see :meth:`HostAwareDownloadScheduler._sort_key`)."""
+    sequence_by_key: dict[tuple[DownloadKind, str, str], int] = field(default_factory=dict)
+    """Arrival order of each pending task, so ties within a tier are served oldest first."""
+    next_sequence: int = 0
     in_flight_by_host: Counter[str] = field(default_factory=Counter)
     in_flight_keys: set[tuple[DownloadKind, str, str]] = field(default_factory=set)
+    in_flight_image_models: int = 0
     active_count: int = 0
     exclusive_in_flight: int = 0
     exclusive_started_at: float | None = None
@@ -146,6 +199,7 @@ class HostAwareDownloadScheduler:
         max_parallel_downloads: int = 4,
         per_host_concurrency: int = 1,
         exclusive_timeout_seconds: float = _DEFAULT_EXCLUSIVE_TIMEOUT_SECONDS,
+        priority_policy: DownloadPriorityPolicy = DownloadPriorityPolicy.SERVE_FIRST,
     ) -> None:
         """Initialise with the global and per-host concurrency ceilings (each clamped to >= 1).
 
@@ -157,7 +211,61 @@ class HostAwareDownloadScheduler:
         self._max_parallel = max(1, max_parallel_downloads)
         self._per_host = max(1, per_host_concurrency)
         self._exclusive_timeout = exclusive_timeout_seconds
+        self._policy = priority_policy
+        self._startup_focus = False
         self._closed = False
+
+    @property
+    def policy(self) -> DownloadPriorityPolicy:
+        """The queue-ordering policy in effect."""
+        with self._cond:
+            return self._policy
+
+    @property
+    def startup_focus(self) -> bool:
+        """Whether admission is narrowed to the safety models plus one image model at a time."""
+        with self._cond:
+            return self._startup_focus
+
+    def set_policy(self, policy: DownloadPriorityPolicy) -> bool:
+        """Switch the ordering policy live, reordering the pending queue; return whether it changed.
+
+        Transfers already in flight finish; only which pending task starts next changes.
+        """
+        with self._cond:
+            if policy is self._policy:
+                return False
+            self._policy = policy
+            self._state.pending.sort(key=self._sort_key)
+            self._cond.notify_all()
+            return True
+
+    def set_startup_focus(self, active: bool) -> bool:
+        """Narrow admission (or widen it back) for the startup focus; return whether it changed.
+
+        Focus only ever applies under ``serve_first``; a ``parallel`` queue never narrows.
+        """
+        with self._cond:
+            active = active and self._policy is DownloadPriorityPolicy.SERVE_FIRST
+            if active == self._startup_focus:
+                return False
+            self._startup_focus = active
+            self._cond.notify_all()
+            return True
+
+    def _sort_key(self, task: DownloadTask) -> tuple[int, int]:
+        """Return a pending task's admission order: tier then arrival, or arrival alone under ``parallel``."""
+        sequence = self._state.sequence_by_key.get(task.dedup_key, 0)
+        if self._policy is DownloadPriorityPolicy.PARALLEL:
+            return (0, sequence)
+        return (int(task.priority), sequence)
+
+    def _insert_pending(self, task: DownloadTask) -> None:
+        """Append *task* in admission order (caller holds the lock)."""
+        self._state.sequence_by_key[task.dedup_key] = self._state.next_sequence
+        self._state.next_sequence += 1
+        self._state.pending.append(task)
+        self._state.pending.sort(key=self._sort_key)
 
     def set_limits(
         self,
@@ -180,7 +288,7 @@ class HostAwareDownloadScheduler:
                 return False
             if any(pending.dedup_key == task.dedup_key for pending in self._state.pending):
                 return False
-            self._state.pending.append(task)
+            self._insert_pending(task)
             self._cond.notify()
             return True
 
@@ -193,7 +301,7 @@ class HostAwareDownloadScheduler:
                     continue
                 if any(pending.dedup_key == task.dedup_key for pending in self._state.pending):
                     continue
-                self._state.pending.append(task)
+                self._insert_pending(task)
                 added += 1
             if added:
                 self._cond.notify_all()
@@ -209,6 +317,8 @@ class HostAwareDownloadScheduler:
             removed = [task for task in self._state.pending if not keep(task)]
             if removed:
                 self._state.pending = [task for task in self._state.pending if keep(task)]
+                for task in removed:
+                    self._state.sequence_by_key.pop(task.dedup_key, None)
             return removed
 
     def acquire(self, *, timeout: float = 0.2) -> DownloadTask | None:
@@ -230,11 +340,14 @@ class HostAwareDownloadScheduler:
                 if task is None:
                     return None
             self._state.pending.remove(task)
+            self._state.sequence_by_key.pop(task.dedup_key, None)
             if task.kind not in HOST_LIMIT_EXEMPT_KINDS:
                 # Exempt kinds neither check nor consume a host slot: counting them would let a slow ad-hoc
                 # prefetch starve the host's ordinary (slot-checked) downloads in reverse.
                 self._state.in_flight_by_host[task.host] += 1
             self._state.in_flight_keys.add(task.dedup_key)
+            if task.kind is DownloadKind.IMAGE_MODEL:
+                self._state.in_flight_image_models += 1
             self._state.active_count += 1
             if task.exclusive:
                 self._state.exclusive_in_flight += 1
@@ -251,6 +364,9 @@ class HostAwareDownloadScheduler:
         task (the annotator preload verify) can never starve a needed download. While an exclusive task is
         in flight no other task is admitted, up to the exclusivity time bound; a non-exclusive task is held
         during that window (see :meth:`_exclusivity_active`).
+
+        Under the startup focus only the safety models, a popped job's own files and a single image model at
+        a time are admitted, so the first checkpoint gets the whole link instead of a share of it.
         """
         if self._state.active_count >= self._max_parallel:
             return None
@@ -263,7 +379,7 @@ class HostAwareDownloadScheduler:
                     first_exclusive = task
                 continue
             pending_non_exclusive = True
-            if exclusivity_active:
+            if exclusivity_active or not self._admitted_under_focus(task):
                 continue
             if task.kind in HOST_LIMIT_EXEMPT_KINDS:
                 return task
@@ -272,6 +388,16 @@ class HostAwareDownloadScheduler:
         if first_exclusive is not None and not pending_non_exclusive and self._state.active_count == 0:
             return first_exclusive
         return None
+
+    def _admitted_under_focus(self, task: DownloadTask) -> bool:
+        """Whether the startup focus lets *task* start now (caller holds the lock)."""
+        if not self._startup_focus:
+            return True
+        if task.priority > DownloadPriority.IMAGE_MODEL:
+            return False
+        if task.kind is DownloadKind.IMAGE_MODEL:
+            return self._state.in_flight_image_models == 0
+        return True
 
     def _exclusivity_active(self) -> bool:
         """Whether an in-flight exclusive task should still block other downloads (caller holds the lock).
@@ -304,6 +430,8 @@ class HostAwareDownloadScheduler:
                     self._state.exclusive_started_at = None
                     self._state.exclusive_timeout_logged = False
             self._state.in_flight_keys.discard(task.dedup_key)
+            if task.kind is DownloadKind.IMAGE_MODEL:
+                self._state.in_flight_image_models = max(0, self._state.in_flight_image_models - 1)
             if task.kind not in HOST_LIMIT_EXEMPT_KINDS:
                 remaining = self._state.in_flight_by_host[task.host] - 1
                 if remaining > 0:

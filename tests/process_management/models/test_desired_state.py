@@ -25,6 +25,18 @@ class TestReconcileWithoutPickerAdditions:
         assert plan.to_cancel == ()
         assert plan.has_work is True
 
+    def test_missing_models_are_fetched_in_the_operator_s_configured_order(self) -> None:
+        """The first model an operator lists is the first one fetched, whatever its name sorts to."""
+        plan = DesiredState().reconcile(configured=["zeta", "alpha", "mid", "alpha"], present=["mid"])
+        assert plan.to_fetch == ("zeta", "alpha")
+
+    def test_picker_additions_are_fetched_after_the_configured_models(self) -> None:
+        """A model the operator picks by hand queues behind the configured list, not ahead of it."""
+        state = DesiredState()
+        state.add_picker_models(["aaa"])
+        plan = state.reconcile(configured=["zeta"], present=[])
+        assert plan.to_fetch == ("zeta", "aaa")
+
     def test_all_present_is_no_work(self) -> None:
         """When every desired model is present there is nothing to fetch or cancel."""
         plan = DesiredState().reconcile(configured=["a", "b"], present=["a", "b"])
@@ -93,12 +105,13 @@ class TestReconcileTakesConfiguredFresh:
 
 
 class TestReconcilePlanShape:
-    """``ReconcilePlan`` is an immutable, sorted, deduplicated diff."""
+    """``ReconcilePlan`` is an immutable, deduplicated diff whose fetch order is the operator's."""
 
-    def test_outputs_are_sorted(self) -> None:
-        """``to_fetch`` is returned in sorted order regardless of input order."""
-        plan = DesiredState().reconcile(configured=["c", "a", "b"], present=[])
-        assert plan.to_fetch == ("a", "b", "c")
+    def test_fetch_keeps_configured_order_and_cancel_is_sorted(self) -> None:
+        """``to_fetch`` follows the configured list; ``to_cancel`` has no order to keep, so it is sorted."""
+        plan = DesiredState().reconcile(configured=["c", "a", "b"], present=[], in_flight=["z", "y"])
+        assert plan.to_fetch == ("c", "a", "b")
+        assert plan.to_cancel == ("y", "z")
 
     def test_plan_is_frozen(self) -> None:
         """The plan is immutable, so a consumer cannot mutate the diff after the fact."""

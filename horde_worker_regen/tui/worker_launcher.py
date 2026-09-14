@@ -38,6 +38,7 @@ from horde_worker_regen.process_management.lifecycle.owned_process_registry impo
     OwnedProcessRegistry,
     kill_process_tree,
 )
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.job_object import WorkerJobObject
 
@@ -888,6 +889,15 @@ class WorkerSupervisor:
             SupervisorControlMessage(
                 command=SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT,
                 download_rate_limit_kbps=rate_limit_kbps,
+            ),
+        )
+
+    def request_set_download_priority_policy(self, policy: DownloadPriorityPolicy) -> bool:
+        """Ask the worker to order the pending download queue by *policy* for the rest of the session."""
+        return self.send_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY,
+                download_priority_policy=policy,
             ),
         )
 

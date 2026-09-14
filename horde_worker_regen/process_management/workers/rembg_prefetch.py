@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import os
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 from loguru import logger
@@ -74,13 +75,14 @@ def u2net_present() -> bool:
     return weight_path.is_file() and _md5_of(weight_path) == U2NET_MD5
 
 
-def ensure_u2net_present() -> Path | None:
+def ensure_u2net_present(*, callback: Callable[[int, int], None] | None = None) -> Path | None:
     """Return the path to the cached ``u2net.onnx``, downloading and verifying it once if absent.
 
     A previously-present file is re-verified by MD5 on every call, so a truncated earlier download is
     re-fetched rather than trusted. Returns None when the cache home is unset (nothing to populate). Raises
     on a checksum mismatch after download so a corrupt upstream file faults loudly rather than reaching the
-    service silently wrong.
+    service silently wrong. ``callback`` receives ``(downloaded_bytes, total_bytes)`` as the transfer
+    progresses; the total is 0 when the server does not send one.
     """
     cache_dir = rembg_cache_dir()
     if cache_dir is None:
@@ -94,7 +96,15 @@ def ensure_u2net_present() -> Path | None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Pre-placing rembg background-removal weight from {U2NET_URL} into {cache_dir}")
     temp_path = weight_path.with_suffix(weight_path.suffix + ".partial")
-    urllib.request.urlretrieve(U2NET_URL, temp_path)  # noqa: S310 - fixed canonical https URL
+
+    def _report(block_count: int, block_size: int, total_size: int) -> None:
+        if callback is not None:
+            callback(
+                min(block_count * block_size, total_size) if total_size > 0 else block_count * block_size,
+                max(total_size, 0),
+            )
+
+    urllib.request.urlretrieve(U2NET_URL, temp_path, reporthook=_report)  # noqa: S310 - fixed canonical https URL
 
     actual = _md5_of(temp_path)
     if actual != U2NET_MD5:

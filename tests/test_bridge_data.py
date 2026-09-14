@@ -8,6 +8,7 @@ from horde_sdk.generic_api.consts import ANON_API_KEY
 from pydantic import JsonValue
 from ruamel.yaml import YAML
 
+from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
 from horde_worker_regen.bridge_data.data_model import (
     _warn_lease_slots_below_threads,
     _warn_lease_without_residency,
@@ -164,6 +165,97 @@ def test_pipeline_disaggregation_config_enables_flag() -> None:
     bridge_data = reGenBridgeData.model_validate({"enable_pipeline_disaggregation": True})
 
     assert bridge_data.enable_pipeline_disaggregation is True
+
+
+class TestPostProcessingLaneAvailability:
+    """Whether a configuration has somewhere to run post-processing at all."""
+
+    def test_lane_turned_off_leaves_nowhere_to_post_process(self) -> None:
+        """An operator who switches the dedicated lane off has no post-processing lane."""
+        bridge_data = reGenBridgeData.model_validate({"dedicated_post_processing": "off"})
+
+        assert bridge_data.post_processing_lane_available is False
+
+    def test_disaggregation_keeps_a_lane_even_when_switched_off(self) -> None:
+        """A disaggregated worker keeps the lane: its jobs have nowhere else to post-process."""
+        bridge_data = reGenBridgeData.model_validate(
+            {"dedicated_post_processing": "off", "enable_pipeline_disaggregation": True},
+        )
+
+        assert bridge_data.post_processing_lane_available is True
+
+    def test_lane_turned_on_is_available(self) -> None:
+        """An operator who switches the dedicated lane on has a post-processing lane."""
+        bridge_data = reGenBridgeData.model_validate({"dedicated_post_processing": "on"})
+
+        assert bridge_data.post_processing_lane_available is True
+
+
+_AUXILIARY_FETCH_NEEDS_CASES = [
+    pytest.param(
+        {"allow_post_processing": True},
+        AuxiliaryFetchNeeds(post_processing=True, strip_background=True),
+        id="image-worker-offering-post-processing-needs-upscalers-and-background-removal",
+    ),
+    pytest.param(
+        {"dreamer": False, "alchemist": True},
+        AuxiliaryFetchNeeds(post_processing=True, strip_background=True),
+        id="alchemist-offering-every-form-needs-upscalers-and-background-removal",
+    ),
+    pytest.param(
+        {"dreamer": False, "alchemist": True, "forms": ["interrogation"]},
+        AuxiliaryFetchNeeds(),
+        id="alchemist-offering-only-interrogation-needs-no-auxiliary-models",
+    ),
+    pytest.param(
+        {"dreamer": False, "alchemist": True, "forms": ["caption"], "alchemy_caption_enabled": True},
+        AuxiliaryFetchNeeds(caption=True),
+        id="alchemist-offering-caption-with-the-opt-in-needs-the-caption-model-only",
+    ),
+    pytest.param(
+        {"dreamer": False, "alchemist": True, "forms": ["caption"]},
+        AuxiliaryFetchNeeds(),
+        id="alchemist-offering-caption-without-the-opt-in-needs-nothing",
+    ),
+    pytest.param(
+        {"allow_post_processing": True, "dedicated_post_processing": "off"},
+        AuxiliaryFetchNeeds(strip_background=True),
+        id="no-post-processing-lane-drops-upscalers-but-keeps-background-removal",
+    ),
+    pytest.param(
+        {
+            "allow_post_processing": True,
+            "dedicated_post_processing": "off",
+            "enable_pipeline_disaggregation": True,
+        },
+        AuxiliaryFetchNeeds(post_processing=True, strip_background=True),
+        id="disaggregation-restores-the-lane-so-upscalers-are-still-needed",
+    ),
+    pytest.param(
+        {"allow_post_processing": True, "enable_image_utilities": False},
+        AuxiliaryFetchNeeds(post_processing=True),
+        id="disabled-image-utilities-drops-background-removal-only",
+    ),
+    pytest.param(
+        {"alchemist": False, "forms": ["post-process"]},
+        AuxiliaryFetchNeeds(),
+        id="forms-left-in-a-config-that-serves-no-alchemy-need-nothing",
+    ),
+]
+
+
+@pytest.mark.parametrize(("config", "expected_needs"), _AUXILIARY_FETCH_NEEDS_CASES)
+def test_auxiliary_fetch_needs_match_what_the_worker_offers(
+    config: dict[str, JsonValue],
+    expected_needs: AuxiliaryFetchNeeds,
+) -> None:
+    """A worker asks for exactly the auxiliary models the work it offers requires, and no others.
+
+    The ids name the operator-visible outcome for each configuration.
+    """
+    bridge_data = reGenBridgeData.model_validate(config)
+
+    assert bridge_data.auxiliary_fetch_needs == expected_needs
 
 
 def test_bridge_data_loader_yaml_template() -> None:

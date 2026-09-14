@@ -185,7 +185,7 @@ class ModelDownloadCoordinator:
             bridge_data.allow_lora,
             bridge_data.allow_controlnet,
             bridge_data.allow_sdxl_controlnet,
-            bridge_data.allow_post_processing,
+            bridge_data.auxiliary_fetch_needs,
             bridge_data.purge_loras_on_download,
         )
 
@@ -202,7 +202,7 @@ class ModelDownloadCoordinator:
             allow_lora=bridge_data.allow_lora,
             allow_controlnet=bridge_data.allow_controlnet,
             allow_sdxl_controlnet=bridge_data.allow_sdxl_controlnet,
-            allow_post_processing=bridge_data.allow_post_processing,
+            fetch_needs=bridge_data.auxiliary_fetch_needs,
             purge_loras=bridge_data.purge_loras_on_download,
         )
 

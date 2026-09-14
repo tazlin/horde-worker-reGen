@@ -21,6 +21,7 @@ from pydantic import TypeAdapter, ValidationError
 from ruamel.yaml import YAML
 
 from horde_worker_regen.bridge_data.custom_models import CustomModelDefinition
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 
 DEFAULT_CONFIG_PATH = Path("bridgeData.yaml")
 
@@ -42,6 +43,10 @@ ALCHEMY_FORMS = (
 )
 
 DEDICATED_POST_PROCESSING_CHOICES = ("auto", "on", "off")
+
+# Derived from the scheduler's own enum (a stdlib/loguru-only module, so the TUI stays import-light)
+# rather than retyped, so a new policy cannot go missing from the editor.
+DOWNLOAD_PRIORITY_POLICY_CHOICES = tuple(policy.value for policy in DownloadPriorityPolicy)
 
 # The reserved placeholder names shipped in bridgeData_template.yaml. The horde rejects a worker that
 # tries to register under one (names are unique horde-wide), so the editor must require the operator to
@@ -829,6 +834,16 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=1,
         maximum=16,
         explicit_default=4,
+    ),
+    ConfigField(
+        "download_priority_policy",
+        "Download queue order",
+        FieldKind.SELECT,
+        "Model downloads",
+        "serve_first fetches the safety models and one image model before the rest, so the worker can start "
+        "serving sooner; parallel is first come, first served. Switchable live from the Downloads tab.",
+        choices=DOWNLOAD_PRIORITY_POLICY_CHOICES,
+        explicit_default=DownloadPriorityPolicy.SERVE_FIRST.value,
     ),
     ConfigField(
         "download_per_host_concurrency",

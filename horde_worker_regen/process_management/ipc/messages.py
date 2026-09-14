@@ -18,7 +18,9 @@ from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
+from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
 from horde_worker_regen.process_management.ipc.supervisor_channel import DownloadStatusSnapshot
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 
 AUX_RESOLVE_FAILED_INFO = "aux-resolve-failed"
 """Marker placed in a faulted inference result's ``info`` when a child cannot resolve a job's auxiliary files.
@@ -725,6 +727,8 @@ class HordeDownloadControlMessage(HordeControlMessage):
     """If not None, retune how many concurrent downloads to a single host are allowed, applied live."""
     set_connections_per_file: int | None = None
     """If not None, retune the max concurrent connections used to fetch a single large file, applied live."""
+    set_priority_policy: DownloadPriorityPolicy | None = None
+    """If not None, switch how the pending queue is ordered, applied live; in-flight transfers finish."""
     set_nsfw: bool | None = None
     """If not None, retune nsfw filtering of the default-LoRa pass live (replaces a download-process restart)."""
     set_allow_lora: bool | None = None
@@ -734,8 +738,9 @@ class HordeDownloadControlMessage(HordeControlMessage):
     """If not None, enable/disable the ControlNet aux category live (re-arms the aux pass when enabling)."""
     set_allow_sdxl_controlnet: bool | None = None
     """If not None, enable/disable the SDXL-ControlNet aux category live (re-arms the aux pass when enabling)."""
-    set_allow_post_processing: bool | None = None
-    """If not None, enable/disable the post-processing aux category live (re-arms the aux pass when enabling)."""
+    set_fetch_needs: AuxiliaryFetchNeeds | None = None
+    """If not None, replace which auxiliary model groups (post-processing, background removal, caption) the
+    process fetches, applied live; a newly needed group re-arms the aux pass."""
     set_purge_loras: bool | None = None
     """If not None, retune whether the default-LoRa pass purges unused LoRas, applied live."""
 

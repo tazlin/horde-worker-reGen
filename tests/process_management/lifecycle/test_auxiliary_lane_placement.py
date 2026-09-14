@@ -409,7 +409,7 @@ def test_a_disabled_post_process_lane_still_answers_its_would_be_card() -> None:
         safety_on_gpu=True,
         utilities_adapters=adapters,
     )
-    plm._runtime_config.bridge_data.post_processing_lane_enabled = False
+    plm._runtime_config.bridge_data.post_processing_lane_available = False
     assert plm.start_safety_processes() is True
 
     assert plm.post_process_lane_enabled() is False

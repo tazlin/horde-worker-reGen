@@ -13,6 +13,7 @@ from horde_model_reference.model_reference_records import ImageGenerationModelRe
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
 from pydantic import JsonValue
 
+from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
@@ -316,6 +317,8 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.allow_inpainting = True
     bd.allow_unsafe_ip = False
     bd.allow_post_processing = True
+    bd.post_processing_lane_available = True
+    bd.auxiliary_fetch_needs = AuxiliaryFetchNeeds(post_processing=True, strip_background=True)
     bd.allow_controlnet = True
     bd.allow_sdxl_controlnet = True
     bd.extra_slow_worker = False

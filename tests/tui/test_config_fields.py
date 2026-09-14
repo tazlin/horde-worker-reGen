@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from horde_worker_regen.process_management.jobs.alchemy_popper import DEFAULT_ALCHEMY_FORMS
+from horde_worker_regen.alchemy_forms import DEFAULT_ALCHEMY_FORMS, normalise_alchemy_form_name
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.tui.config_form import CONFIG_FIELDS, FieldKind, coerce_value
 
 _BY_KEY = {field.key: field for field in CONFIG_FIELDS}
@@ -89,8 +90,13 @@ def test_pipeline_disaggregation_field_is_visible_advanced() -> None:
 
 
 def test_alchemy_forms_include_worker_default_forms() -> None:
-    """The TUI exposes every top-level alchemy form the worker offers by default."""
-    assert set(DEFAULT_ALCHEMY_FORMS) <= set(_BY_KEY["forms"].choices)
+    """The TUI exposes every top-level alchemy form the worker offers by default.
+
+    The form keeps its own template-spelled list so it never imports the SDK; the two are compared through
+    the same normalisation the config loader applies.
+    """
+    offered_choices = {normalise_alchemy_form_name(choice) for choice in _BY_KEY["forms"].choices}
+    assert set(DEFAULT_ALCHEMY_FORMS) <= offered_choices
 
 
 def test_int_bounds_enforced() -> None:
@@ -115,6 +121,19 @@ def test_select_kind_rejects_unknown_choice() -> None:
     assert coerce_value(dedicated, "auto") == "auto"
     with pytest.raises(ValueError, match="auto, on, off"):
         coerce_value(dedicated, "sometimes")
+
+
+def test_download_priority_policy_offers_every_queue_order() -> None:
+    """The queue-order field is a select over the worker's own policies, grouped with the download settings."""
+    field = _BY_KEY["download_priority_policy"]
+
+    assert field.kind is FieldKind.SELECT
+    assert field.section == "Model downloads"
+    assert set(field.choices) == {policy.value for policy in DownloadPriorityPolicy}
+    assert field.default() == DownloadPriorityPolicy.SERVE_FIRST
+    assert coerce_value(field, DownloadPriorityPolicy.PARALLEL.value) == DownloadPriorityPolicy.PARALLEL
+    with pytest.raises(ValueError, match="serve_first, parallel"):
+        coerce_value(field, "whenever")
 
 
 def test_secret_fields_flagged() -> None:

@@ -12,6 +12,7 @@ from multiprocessing.synchronize import Lock, Semaphore
 
 from loguru import logger
 
+from horde_worker_regen.alchemy_forms import DEFAULT_AUXILIARY_FETCH_NEEDS, AuxiliaryFetchNeeds
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
     enable_child_faulthandler,
@@ -19,6 +20,7 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
     write_startup_crash,
 )
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
 
 if TYPE_CHECKING:
@@ -275,7 +277,7 @@ class DownloadProcessEntryPoint(Protocol):
         allow_lora: bool = False,
         allow_controlnet: bool = False,
         allow_sdxl_controlnet: bool = False,
-        allow_post_processing: bool = True,
+        fetch_needs: AuxiliaryFetchNeeds = DEFAULT_AUXILIARY_FETCH_NEEDS,
         purge_loras: bool = False,
         amd_gpu: bool = False,
         directml: int | None = None,
@@ -968,7 +970,7 @@ def start_download_process(
     allow_lora: bool = False,
     allow_controlnet: bool = False,
     allow_sdxl_controlnet: bool = False,
-    allow_post_processing: bool = True,
+    fetch_needs: AuxiliaryFetchNeeds = DEFAULT_AUXILIARY_FETCH_NEEDS,
     purge_loras: bool = False,
     amd_gpu: bool = False,
     directml: int | None = None,
@@ -977,6 +979,7 @@ def start_download_process(
     max_parallel_downloads: int = 4,
     per_host_concurrency: int = 1,
     connections_per_file: int = 4,
+    priority_policy: DownloadPriorityPolicy = DownloadPriorityPolicy.SERVE_FIRST,
 ) -> None:
     """Start the background model-download process.
 
@@ -991,7 +994,8 @@ def start_download_process(
         allow_lora (bool): Whether to fetch the default LoRas during an aux pass. Defaults to False.
         allow_controlnet (bool): Whether to fetch ControlNet models/annotators. Defaults to False.
         allow_sdxl_controlnet (bool): Whether to fetch SDXL ControlNet/miscellaneous models. Defaults to False.
-        allow_post_processing (bool): Whether to fetch post-processing models. Defaults to True.
+        fetch_needs (AuxiliaryFetchNeeds): Which auxiliary model groups (post-processing, background
+            removal, caption) to fetch. Defaults to post-processing and background removal.
         purge_loras (bool): Whether to purge unused LoRas during an aux pass. Defaults to False.
         amd_gpu (bool): Whether this is an AMD GPU. Defaults to False.
         directml (int | None): The DirectML device index, if any. Defaults to None.
@@ -1000,6 +1004,7 @@ def start_download_process(
         max_parallel_downloads (int): Global concurrent-download ceiling across all hosts. Defaults to 4.
         per_host_concurrency (int): Concurrent downloads allowed per source host. Defaults to 1.
         connections_per_file (int): Max concurrent connections used to fetch a single large file. Defaults to 4.
+        priority_policy (DownloadPriorityPolicy): How the pending queue is ordered. Defaults to serve-first.
     """
     enable_child_faulthandler(f"download_{process_id}")
     neutralize_inherited_argv()
@@ -1047,7 +1052,7 @@ def start_download_process(
             allow_lora=allow_lora,
             allow_controlnet=allow_controlnet,
             allow_sdxl_controlnet=allow_sdxl_controlnet,
-            allow_post_processing=allow_post_processing,
+            fetch_needs=fetch_needs,
             purge_loras=purge_loras,
             amd_gpu=amd_gpu,
             directml=directml,
@@ -1056,6 +1061,7 @@ def start_download_process(
             max_parallel_downloads=max_parallel_downloads,
             per_host_concurrency=per_host_concurrency,
             connections_per_file=connections_per_file,
+            priority_policy=priority_policy,
         )
 
         worker_process.main_loop()

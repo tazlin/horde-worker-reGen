@@ -1019,6 +1019,14 @@ strand work:
   with nothing able to place a job's LoRAs or textual inversions on disk, offering
   the capability would only pop work the worker cannot serve.
 
+Within a living downloader, an individual file has its own bounded recovery: a
+failed per-file fetch is retried a few times with a short backoff, and is then
+given up on so a dead link does not consume the download slot again on every
+reference reload. A model in that state stays absent until something explicitly
+asks for it again, which is the model picker or a configuration change that turns
+its category on; either clears its attempt count and retries it from scratch (see
+[Feature reconcile](model_downloads.md#feature-reconcile-queueing-what-is-missing)).
+
 An operator can force a revival of a dead or stuck downloader with the
 `RESTART_PROCESS` supervisor command targeting the download process id, which
 routes to the dedicated download-restart path (the command otherwise addresses

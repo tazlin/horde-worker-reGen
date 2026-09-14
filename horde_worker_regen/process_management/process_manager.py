@@ -56,6 +56,7 @@ from horde_sdk.worker.dispatch.ai_horde.image.source_image import (
 )
 from loguru import logger
 
+from horde_worker_regen.alchemy_forms import DEFAULT_ALCHEMY_FORMS
 from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
 from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig, reGenBridgeData
@@ -127,7 +128,6 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkLedgerStage,
 )
 from horde_worker_regen.process_management.jobs.alchemy_popper import (
-    DEFAULT_ALCHEMY_FORMS,
     AlchemyCoordinator,
     AlchemyFormStatus,
 )
@@ -6331,6 +6331,13 @@ class HordeWorkerProcessManager:
                 limit_label = "unlimited" if rate == 0 else f"{rate} KB/s"
                 logger.info(f"Supervisor set download rate limit to {limit_label}.")
                 self._process_lifecycle.set_download_controls(rate_limit_kbps=rate)
+            case SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY:
+                policy = command.download_priority_policy
+                if policy is None:
+                    logger.warning("SET_DOWNLOAD_PRIORITY_POLICY: no policy given; leaving the queue order alone.")
+                    return
+                logger.info(f"Supervisor set download queue order to '{policy.value}'.")
+                self._process_lifecycle.set_download_controls(priority_policy=policy)
             case SupervisorCommand.DOWNLOADS_ONLY_HOLD:
                 self._download_coordinator.enter_downloads_only_hold()
             case SupervisorCommand.GO_LIVE:
@@ -8057,6 +8064,7 @@ class HordeWorkerProcessManager:
             max_parallel_downloads=self.bridge_data.download_max_parallel_downloads,
             per_host_concurrency=self.bridge_data.download_per_host_concurrency,
             connections_per_file=self.bridge_data.download_connections_per_file,
+            priority_policy=self.bridge_data.download_priority_policy,
         )
         self._download_coordinator.reconcile_downloads(
             run_aux_if_incomplete=False,

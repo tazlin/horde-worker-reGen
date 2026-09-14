@@ -1702,10 +1702,7 @@ class MessageDispatcher:
             non_strip_forms = [form for form in requested_post_processing if not is_strip_background_form(form)]
             has_strip = any(is_strip_background_form(form) for form in requested_post_processing)
             if non_strip_forms:
-                # Disaggregation forces the post-processing lane on regardless of the lane's own config flag,
-                # the same way it forces the VAE lane on, so a disaggregated completion routes to the lane.
-                lane_enabled = bridge_data.post_processing_lane_enabled or bridge_data.enable_pipeline_disaggregation
-                if lane_enabled:
+                if bridge_data.post_processing_lane_available:
                     await self._job_tracker.queue_for_post_processing(job_info)
                     return
                 # The lane is the only path for the pure-torch transforms; with it disabled the job should

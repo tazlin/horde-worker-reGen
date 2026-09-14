@@ -36,11 +36,19 @@ need the current values; no locks, no notifications. The hot-reload is best-effo
 across multiple reads.
 
 A file reload is applied live, including the download subsystem: the pause /
-bandwidth / parallelism controls and the download-gating flags
-(`allow_lora`, `allow_controlnet`, `allow_sdxl_controlnet`,
-`allow_post_processing`, `nsfw`, `purge_loras_on_download`) are forwarded to the
-running download process, which re-arms its one-shot auxiliary pass when a
-category is newly enabled. None of these require a worker or download-process
+bandwidth / parallelism controls, the queue order (`download_priority_policy`,
+also switchable from the Downloads tab), the download-gating flags
+(`allow_lora`, `allow_controlnet`, `allow_sdxl_controlnet`, `nsfw`,
+`purge_loras_on_download`) and the derived auxiliary fetch needs are forwarded
+to the running download process, which queues whatever a newly enabled category
+is missing (see the feature reconcile in
+[Model downloads](model_downloads.md#feature-reconcile-queueing-what-is-missing)).
+The fetch needs say whether post-processing,
+background-removal and caption models are wanted at all; they are derived from
+`allow_post_processing`, the `alchemist` role and its configured `forms`, and
+the `dedicated_post_processing` and `enable_image_utilities` lane switches, so
+an operator who takes up or drops a kind of work gets the matching models
+fetched or left alone. None of these require a worker or download-process
 restart. The set of fields that genuinely cannot change live (worker identity,
 GPU selection, and other structural choices) is small; those need a restart.
 

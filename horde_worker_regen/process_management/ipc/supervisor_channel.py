@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.models.feature_readiness import FeatureReadiness
 
 if TYPE_CHECKING:
@@ -685,6 +686,11 @@ class DownloadStatusSnapshot(BaseModel):
     paused: bool = False
     rate_limit_kbps: int | None = None
     error_message: str | None = None
+    priority_policy: DownloadPriorityPolicy = DownloadPriorityPolicy.SERVE_FIRST
+    """How the pending queue is ordered; switchable live from the Downloads tab."""
+    startup_focus: bool = False
+    """True while only the safety models and one image model at a time are admitted, so the worker can start
+    serving as early as possible; the rest of the queue waits."""
 
 
 class DownloadPlanSummary(BaseModel):
@@ -1361,6 +1367,8 @@ class SupervisorCommand(enum.Enum):
     """Resume held background model downloads."""
     SET_DOWNLOAD_RATE_LIMIT = enum.auto()
     """Set the background-download bandwidth cap in KB/s (0 or None clears the cap)."""
+    SET_DOWNLOAD_PRIORITY_POLICY = enum.auto()
+    """Set how the pending download queue is ordered (serve-first tiers or first come, first served)."""
     DOWNLOADS_ONLY_HOLD = enum.auto()
     """Hold the worker in a download-only posture: keep the download process (and reference refresh)
     running but do not start inference/safety or pop jobs. Lets the operator pre-fetch models without
@@ -1397,6 +1405,8 @@ class SupervisorControlMessage(BaseModel):
     """The new running inference-process count, for :attr:`SupervisorCommand.SET_CONCURRENCY`."""
     download_rate_limit_kbps: int | None = None
     """The new download bandwidth cap in KB/s, for :attr:`SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT`."""
+    download_priority_policy: DownloadPriorityPolicy | None = None
+    """The new download queue order, for :attr:`SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY`."""
     server_maintenance_enabled: bool | None = None
     """The desired server-side maintenance state, for :attr:`SupervisorCommand.SET_SERVER_MAINTENANCE`."""
     download_model_names: list[str] = Field(default_factory=list)

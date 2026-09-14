@@ -1004,17 +1004,16 @@ def test_restore_post_process_lane_starts_it_when_none_running() -> None:
 def test_pause_post_process_lane_is_noop_when_lane_disabled() -> None:
     """With the dedicated lane disabled there is no lane to stop, so the pause is a no-op."""
     plm = _make_plm()
-    plm._runtime_config.bridge_data.post_processing_lane_enabled = False
+    plm._runtime_config.bridge_data.post_processing_lane_available = False
     assert plm.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
     assert plm.is_post_process_gpu_paused is False
 
 
-def test_post_process_lane_forced_on_by_disaggregation() -> None:
-    """Disaggregation forces the post-processing lane on even when its own config flag is off.
+def test_post_process_lane_spawns_only_when_config_makes_it_available() -> None:
+    """The lane spawns exactly when the configuration reports a lane is available.
 
-    A disaggregated job's VAE lane emits raw decoded images and its requested post-processing runs on this
-    lane, so the lane must spawn under disaggregation exactly as the VAE lane does, regardless of
-    ``post_processing_lane_enabled``. Mirrors :func:`vae_lane_enabled` being tied to the disaggregation flag.
+    Whether a lane exists (the ``dedicated_post_processing`` setting, or disaggregation forcing it on) is
+    decided by the bridge data's ``post_processing_lane_available``; the lifecycle only acts on that answer.
     """
     fake_ctx = Mock()
     fake_ctx.get_start_method.return_value = "spawn"
@@ -1023,17 +1022,14 @@ def test_post_process_lane_forced_on_by_disaggregation() -> None:
     fake_ctx.Process.return_value.exitcode = None
 
     plm = _make_plm(ctx=fake_ctx)
-    plm._runtime_config.bridge_data.post_processing_lane_enabled = False
     plm._runtime_config.bridge_data.dry_run_skip_post_processing = False
 
-    # With the lane's own flag off and disaggregation off, the lane stays off (the disjunction's other arm).
-    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = False
+    plm._runtime_config.bridge_data.post_processing_lane_available = False
     assert plm.post_process_lane_enabled() is False
     assert plm.start_post_process_processes() is False
     assert plm._process_map.num_post_process_processes() == 0
 
-    # Turning disaggregation on forces the lane on and spawns it despite the config flag remaining off.
-    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = True
+    plm._runtime_config.bridge_data.post_processing_lane_available = True
     assert plm.post_process_lane_enabled() is True
     assert plm.start_post_process_processes() is True
     assert plm._process_map.num_post_process_processes() == 1

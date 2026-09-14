@@ -6,8 +6,10 @@
     - [Pop-time auxiliary prefetch](#pop-time-auxiliary-prefetch)
     - [Model availability and the pop gate](#model-availability-and-the-pop-gate)
     - [Feature readiness: deps plus models on disk](#feature-readiness-deps-plus-models-on-disk)
+    - [Feature reconcile: queueing what is missing](#feature-reconcile-queueing-what-is-missing)
     - [Planning: what a config implies for disk](#planning-what-a-config-implies-for-disk)
     - [Pause and bandwidth controls](#pause-and-bandwidth-controls)
+    - [Download order: serving first](#download-order-serving-first)
     - [Parallel downloads by host](#parallel-downloads-by-host)
     - [Segmented downloads (connections per file)](#segmented-downloads-connections-per-file)
     - [Download-only mode and the model picker](#download-only-mode-and-the-model-picker)
@@ -326,6 +328,53 @@ inversion prefetch (fetched per job by the download process, see
 [pop-time auxiliary prefetch](#pop-time-auxiliary-prefetch)) and the safety models
 keep their own gating and appear as read-only rows.
 
+Which auxiliary models are fetched at all is a separate question from whether they
+have arrived. The parent derives it from the configuration as
+[`AuxiliaryFetchNeeds`][horde_worker_regen.alchemy_forms.AuxiliaryFetchNeeds]
+(post-processing weights, the background-removal weight, the caption model) and
+hands it to the download process, which fetches only what is asked for. An
+alchemist-only worker therefore gets the models its `forms` require and skips the
+rest, and a dreamer that does not offer post-processing downloads no upscalers.
+The needs are recomputed on every config reload and forwarded live, so a change
+takes effect without a restart: the reconcile below is what then fetches whatever
+the new needs added.
+
+## Feature reconcile: queueing what is missing
+
+"Which enabled feature models are not on disk" is asked in one place: a reconcile
+in the download process. It queues a download for every enabled feature model the
+disk does not already hold, and nothing at all for one it does. Four things run it:
+
+- the startup disk scan, once the model managers have loaded;
+- a model-reference reload whose feature records changed. A reload that left them
+  as they were queues nothing and re-validates nothing, which is the common case:
+  the parent broadcasts a reload after this process's own downloads land, and those
+  change no record;
+- an operator request: the model picker, or a configuration change that turns a
+  category on;
+- the safety models landing, which is what unblocks the caption model.
+
+Repeating it is safe and cheap. A present model is never queued, the scheduler drops
+a duplicate of anything already queued or in flight, and the reconcile logs a line
+only when it actually queued something. The curated default LoRA set is not part of
+it: that is fetched once per operator request, beside the reconcile rather than
+inside it.
+
+What a reconcile deliberately leaves alone is a model that has run out of retries,
+or one still waiting out a retry backoff. A file that failed its bounded retries
+stays given up on, so a dead link is not re-attempted on every reload for the rest
+of the session. An operator request is what re-arms it: the picker or a gating
+change clears its attempt count and drops its pending backoff, and it is tried again
+from scratch.
+
+Background removal and captioning are ordinary queued downloads, so they carry a
+size, a progress bar and a failure row like every other model. The rembg `u2net`
+weight is a plain file transfer into the utilities lane's isolated cache, skipped
+entirely when there is no cache home to place it in. The caption model is the one
+exception to the progress bar: the only way to place it is to construct the
+interrogator that also loads CLIP, so it waits for the safety models to land and
+then reports no bytes while it fetches, which can take several minutes.
+
 ## The required safety models
 
 Every image job is screened before it is submitted, so a worker cannot serve
@@ -414,6 +463,36 @@ without stopping the worker:
 `download_file` exposes a per-chunk progress callback but no native pause or
 rate-limit; the worker implements both inside that callback (block while paused;
 sleep to cap kB/s).
+
+## Download order: serving first
+
+A fresh install can have tens of gigabytes queued: checkpoints, the safety models,
+ControlNet weights and annotators, post-processors. Only a small part of that stands
+between the worker and its first job, so the queue is ordered to land that part
+first. `download_priority_policy` (bridge config) selects the policy:
+
+- `serve_first` (the default) admits pending downloads by tier, oldest first within
+  a tier: the safety models, then the files a popped job is waiting on (its LoRAs
+  and textual inversions), then image models in the order the configuration lists
+  them, then feature models (ControlNet, annotators, post-processing, background
+  removal, caption), then the default LoRA set. The annotator verify keeps running
+  last, as before.
+- `parallel` is first come, first served under the concurrency limits below, which
+  is the ordering the worker used before the policy existed.
+
+Under `serve_first` there is also a **startup focus**. Until the worker holds what
+it needs to start serving (the safety models, plus one of its configured image
+models when it has any), only the safety models, a popped job's own files and a
+single image model at a time are admitted; every other queued download waits. The
+first checkpoint therefore takes the whole link rather than a quarter of it, and
+the worker begins serving that model while the rest of the queue proceeds. The
+focus clears itself the moment those files are present; the Downloads tab says
+when it is on, and the log notes each flip. An alchemist-only worker with no image
+models leaves focus as soon as the safety models land.
+
+The policy is honoured at startup and on config reload, and the Downloads tab
+toggles it live. Switching only changes which pending download starts next:
+transfers already in flight finish as they are.
 
 ## Parallel downloads by host
 

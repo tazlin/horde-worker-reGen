@@ -42,6 +42,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 )
 from horde_sdk.ai_horde_api.apimodels.alchemy.submit import AlchemyJobSubmitResponse
 from horde_sdk.generation_parameters.alchemy.consts import (
+    KNOWN_ALCHEMY_FORMS,
     KNOWN_ANNOTATION_CONTROL_TYPES,
     KNOWN_FACEFIXERS,
     KNOWN_MISC_POST_PROCESSORS,
@@ -51,6 +52,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 )
 from loguru import logger
 
+from horde_worker_regen.alchemy_forms import configured_alchemy_forms
 from horde_worker_regen.capabilities import describe_available, strip_background_available, vectorize_available
 from horde_worker_regen.consts import (
     AESTHETIC_FORM_NAME,
@@ -156,24 +158,6 @@ def required_capability(form: str) -> WorkerCapability:
     return capability_for_alchemy_form(form)
 
 
-DEFAULT_ALCHEMY_FORMS: tuple[str, ...] = (
-    "caption",
-    "nsfw",
-    "interrogation",
-    "post-process",
-    VECTORIZE_FORM_NAME,
-    PALETTE_FORM_NAME,
-    DESCRIBE_FORM_NAME,
-    AESTHETIC_FORM_NAME,
-    "annotation",
-)
-"""Forms an alchemist offers when ``bridge_data.forms`` is left unset (an empty list means "all").
-
-The SDK's ``default_forms`` validator does not fire for the default empty list, so both the dispatch
-path and the dashboard projection fall back to this set. The yaml/legacy spelling is ``post-process``;
-the SDK enum value is ``post_process``.
-"""
-
 _ALCHEMY_CAPABILITIES: tuple[WorkerCapability, ...] = (
     WorkerCapability.ALCHEMY_GRAPH,
     WorkerCapability.ALCHEMY_CLIP,
@@ -216,15 +200,14 @@ def expand_offered_forms(
     ``post_process_lane_healthy`` defaults True for the same config-only callers.
     """
     offered: list[str] = []
-    configured_forms = bridge_data.forms or list(DEFAULT_ALCHEMY_FORMS)
-    configured = {"post-process" if str(form) == "post_process" else str(form) for form in configured_forms}
+    configured = configured_alchemy_forms(bridge_data.forms)
 
-    if "caption" in configured and bridge_data.alchemy_caption_enabled:
-        offered.append("caption")
-    if "interrogation" in configured:
-        offered.append("interrogation")
-    if "nsfw" in configured:
-        offered.append("nsfw")
+    if KNOWN_ALCHEMY_FORMS.caption in configured and bridge_data.alchemy_caption_enabled:
+        offered.append(KNOWN_ALCHEMY_FORMS.caption.value)
+    if KNOWN_ALCHEMY_FORMS.interrogation in configured:
+        offered.append(KNOWN_ALCHEMY_FORMS.interrogation.value)
+    if KNOWN_ALCHEMY_FORMS.nsfw in configured:
+        offered.append(KNOWN_ALCHEMY_FORMS.nsfw.value)
     # vectorize needs both vtracer (the worker-only `vectorize` extra) AND a server that lists the
     # form: a lean install would fault on it, and a server that does not yet support it rejects the
     # whole pop. The server gate is fail-closed until probed, so the worker can ship ahead of the
@@ -253,13 +236,13 @@ def expand_offered_forms(
     if AESTHETIC_FORM_NAME in configured and server_supports_interrogation_form(AESTHETIC_FORM_NAME):
         offered.append(AESTHETIC_FORM_NAME)
     if (
-        "annotation" in configured
+        KNOWN_ALCHEMY_FORMS.annotation in configured
         and utilities_lane_healthy
         and annotation_types
-        and server_supports_interrogation_form("annotation")
+        and server_supports_interrogation_form(KNOWN_ALCHEMY_FORMS.annotation.value)
     ):
-        offered.append("annotation")
-    if "post-process" in configured:
+        offered.append(KNOWN_ALCHEMY_FORMS.annotation.value)
+    if KNOWN_ALCHEMY_FORMS.post_process in configured:
         # Newly-added (beta) upscalers are withheld until the server lists them: it rejects the whole
         # pop if offered an unknown post-processor. The gate is fail-closed until probed, so the worker
         # ships ahead of go-live and begins offering them within the probe TTL once the server catches

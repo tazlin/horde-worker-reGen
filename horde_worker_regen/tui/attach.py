@@ -28,6 +28,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerFatalConfigError,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.tui import socket_protocol as sp
 from horde_worker_regen.tui.worker_launcher import SupervisorStallStats, SupervisorStatus, WorkerProcessMode
 
@@ -154,6 +155,9 @@ class SupervisorLike(Protocol):
 
     def request_download_rate_limit(self, rate_limit_kbps: int) -> bool:
         """Ask the worker to set the download bandwidth cap in KB/s."""
+
+    def request_set_download_priority_policy(self, policy: DownloadPriorityPolicy) -> bool:
+        """Ask the worker to order the pending download queue by this policy."""
 
     def request_downloads_only_hold(self) -> bool:
         """Ask the worker to enter the download-only posture (pre-fetch models, GPU uncommitted)."""
@@ -370,6 +374,15 @@ class AttachedWorkerSupervisor:
             SupervisorControlMessage(
                 command=SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT,
                 download_rate_limit_kbps=rate_limit_kbps,
+            ),
+        )
+
+    def request_set_download_priority_policy(self, policy: DownloadPriorityPolicy) -> bool:
+        """Ask the worker to order the pending download queue by *policy* for the rest of the session."""
+        return self.send_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY,
+                download_priority_policy=policy,
             ),
         )
 

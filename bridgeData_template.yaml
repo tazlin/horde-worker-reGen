@@ -832,6 +832,14 @@ auto_clear_server_maintenance: true
 # Set this to 1 on a slow/unreliable connection to keep resumable, single-stream downloads.
 # download_connections_per_file: 4
 
+# How the queue of pending model downloads is ordered.
+# serve_first fetches the safety models and then the first configured image model on its own, so the worker
+# can start serving as early as possible; the remaining image models, the feature models (ControlNet,
+# post-processing, background removal, caption) and the default LoRAs follow in that order.
+# parallel is first come, first served under the concurrency limits alone.
+# Honored on config reload; switchable live from the Downloads tab.
+download_priority_policy: serve_first
+
 # If true, background model downloads are held until resumed.
 # Honored on config reload; overridable live from the TUI.
 downloads_paused: false

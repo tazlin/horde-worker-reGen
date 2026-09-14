@@ -181,7 +181,6 @@ def _make_process(
     )
     process._safety_present = True
     process._safety_ensured = True
-    process._aux_enqueued = True
     return process
 
 

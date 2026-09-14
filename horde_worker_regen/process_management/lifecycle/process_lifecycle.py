@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 from horde_sdk.ai_horde_api.fields import GenerationID
 
+from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
 from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
@@ -48,6 +49,7 @@ from horde_worker_regen.process_management.lifecycle.owned_process_registry impo
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_sizing import any_offered_model_wants_whole_card
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, soft_floor_mb
@@ -1272,10 +1274,7 @@ class ProcessLifecycleManager:
         lane, so disaggregation requires the lane exactly as it requires the VAE lane (see
         :meth:`vae_lane_enabled`).
         """
-        return (
-            self._runtime_config.bridge_data.post_processing_lane_enabled
-            or self._runtime_config.bridge_data.enable_pipeline_disaggregation
-        )
+        return self._runtime_config.bridge_data.post_processing_lane_available
 
     def _place_auxiliary_lane(self, *, co_tenant_cards: tuple[int, ...]) -> CardRuntime:
         """Return the card best able to host an auxiliary lane placed now.
@@ -2260,7 +2259,7 @@ class ProcessLifecycleManager:
                 "allow_lora": bridge_data.allow_lora,
                 "allow_controlnet": bridge_data.allow_controlnet,
                 "allow_sdxl_controlnet": bridge_data.allow_sdxl_controlnet,
-                "allow_post_processing": bridge_data.allow_post_processing,
+                "fetch_needs": bridge_data.auxiliary_fetch_needs,
                 "purge_loras": bridge_data.purge_loras_on_download,
                 "amd_gpu": self._amd_gpu,
                 "directml": self._directml,
@@ -2269,6 +2268,7 @@ class ProcessLifecycleManager:
                 "max_parallel_downloads": bridge_data.download_max_parallel_downloads,
                 "per_host_concurrency": bridge_data.download_per_host_concurrency,
                 "connections_per_file": bridge_data.download_connections_per_file,
+                "priority_policy": bridge_data.download_priority_policy,
             },
         )
         process.start()
@@ -2352,16 +2352,24 @@ class ProcessLifecycleManager:
         max_parallel_downloads: int | None = None,
         per_host_concurrency: int | None = None,
         connections_per_file: int | None = None,
+        priority_policy: DownloadPriorityPolicy | None = None,
     ) -> None:
-        """Forward live download controls (pause/bandwidth/parallelism) to the download process.
+        """Forward live download controls (pause/bandwidth/parallelism/queue order) to the download process.
 
-        Used by both the config-reload path and the supervisor pause/resume/rate commands. A ``None``
+        Used by both the config-reload path and the supervisor pause/resume/rate/order commands. A ``None``
         argument leaves that control unchanged; ``rate_limit_kbps`` of 0 (or negative) clears the cap.
         No-op if no download process is running, or if every argument is ``None``.
         """
         if self._download_process_info is None:
             return
-        controls = (paused, rate_limit_kbps, max_parallel_downloads, per_host_concurrency, connections_per_file)
+        controls = (
+            paused,
+            rate_limit_kbps,
+            max_parallel_downloads,
+            per_host_concurrency,
+            connections_per_file,
+            priority_policy,
+        )
         if all(arg is None for arg in controls):
             return
         self._download_process_info.safe_send_message(
@@ -2373,6 +2381,7 @@ class ProcessLifecycleManager:
                 set_max_parallel_downloads=max_parallel_downloads,
                 set_per_host_concurrency=per_host_concurrency,
                 set_connections_per_file=connections_per_file,
+                set_priority_policy=priority_policy,
             ),
         )
 
@@ -2383,7 +2392,7 @@ class ProcessLifecycleManager:
         allow_lora: bool | None = None,
         allow_controlnet: bool | None = None,
         allow_sdxl_controlnet: bool | None = None,
-        allow_post_processing: bool | None = None,
+        fetch_needs: AuxiliaryFetchNeeds | None = None,
         purge_loras: bool | None = None,
     ) -> None:
         """Forward changed download-gating flags to the download process, applied live (no restart).
@@ -2396,7 +2405,7 @@ class ProcessLifecycleManager:
         """
         if self._download_process_info is None:
             return
-        gating = (nsfw, allow_lora, allow_controlnet, allow_sdxl_controlnet, allow_post_processing, purge_loras)
+        gating = (nsfw, allow_lora, allow_controlnet, allow_sdxl_controlnet, fetch_needs, purge_loras)
         if all(arg is None for arg in gating):
             return
         self._download_process_info.safe_send_message(
@@ -2407,7 +2416,7 @@ class ProcessLifecycleManager:
                 set_allow_lora=allow_lora,
                 set_allow_controlnet=allow_controlnet,
                 set_allow_sdxl_controlnet=allow_sdxl_controlnet,
-                set_allow_post_processing=allow_post_processing,
+                set_fetch_needs=fetch_needs,
                 set_purge_loras=purge_loras,
             ),
         )

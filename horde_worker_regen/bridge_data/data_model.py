@@ -15,6 +15,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 from ruamel.yaml import YAML
 
+from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds, configured_alchemy_forms
 from horde_worker_regen.bridge_data.custom_models import (
     CustomModelDefinition,
     CustomModelPreparation,
@@ -22,6 +23,7 @@ from horde_worker_regen.bridge_data.custom_models import (
 )
 from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT, WORKER_KNOWN_EXTRA_ALCHEMY_FORMS
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 
 
 @dataclass(frozen=True)
@@ -644,6 +646,32 @@ class reGenBridgeData(CombinedHordeBridgeData):
             return True
         return bool(self.allow_post_processing) or bool(self.alchemist)
 
+    @property
+    def post_processing_lane_available(self) -> bool:
+        """Whether a post-processing lane exists for this configuration.
+
+        Pipeline disaggregation forces the lane on regardless of ``dedicated_post_processing``: a
+        disaggregated job's requested post-processing has nowhere else to run.
+        """
+        return self.post_processing_lane_enabled or self.enable_pipeline_disaggregation
+
+    @property
+    def auxiliary_fetch_needs(self) -> AuxiliaryFetchNeeds:
+        """Which auxiliary model groups this configuration needs the download process to fetch.
+
+        Upscalers and face fixers are needed when embedded post-processing is allowed or an alchemist
+        offers the post-processing forms, and only if a lane exists to run them. Background removal has the
+        same triggers but runs on the image-utilities lane, so it follows that lane's switch instead.
+        Caption needs BLIP whenever an alchemist has opted into the caption form.
+        """
+        forms = configured_alchemy_forms(self.forms) if self.alchemist else frozenset()
+        post_processing_served = bool(self.allow_post_processing) or KNOWN_ALCHEMY_FORMS.post_process in forms
+        return AuxiliaryFetchNeeds(
+            post_processing=post_processing_served and self.post_processing_lane_available,
+            strip_background=post_processing_served and self.enable_image_utilities,
+            caption=self.alchemy_caption_enabled and KNOWN_ALCHEMY_FORMS.caption in forms,
+        )
+
     _yaml_loader: YAML | None = None
 
     cycle_process_on_model_change: bool = Field(
@@ -711,6 +739,15 @@ class reGenBridgeData(CombinedHordeBridgeData):
     start on the next attempt. Only ``1`` keeps the resumable single-stream behaviour, where an interrupted
     download continues from where it left off. Set this to ``1`` on a slow or unreliable connection where
     re-fetching a large checkpoint from scratch is worse than a lower steady-state rate."""
+    download_priority_policy: DownloadPriorityPolicy = Field(default=DownloadPriorityPolicy.SERVE_FIRST)
+    """How queued model downloads are ordered.
+
+    ``serve_first`` (the default) fetches what the worker needs to start serving before anything else: the
+    safety models, then the first configured image model on its own, and only then the remaining image
+    models, feature models (ControlNet, post-processing, background removal, caption) and the default LoRAs,
+    in that order of preference. ``parallel`` is first come, first served under the concurrency limits
+    alone. Honoured at startup, on config reload, and switchable live from the Downloads tab; transfers
+    already in flight finish either way."""
     downloads_paused: bool = Field(default=False)
     """If true, background model downloads are held (the current chunk loop blocks) until resumed.
 

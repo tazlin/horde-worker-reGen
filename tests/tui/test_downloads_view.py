@@ -1,10 +1,13 @@
-"""Tests for the Downloads view's live 'N of M models ready' aggregation."""
+"""Tests for the Downloads view's live 'N of M models ready' aggregation and its queue-order control."""
 
 from __future__ import annotations
 
 import random
 
+import pytest
 from rich.console import Console
+from textual.app import App, ComposeResult
+from textual.widgets import Button
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
@@ -18,6 +21,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.models.feature_readiness import (
     FeatureReadiness,
     FeatureReadinessState,
@@ -343,3 +347,86 @@ def test_readiness_panel_renders_informational_rows() -> None:
     text = _render(DownloadsView()._render_readiness(summary))
     assert "Safety models" in text
     assert "present" in text
+
+
+class _DownloadsHost(App[None]):
+    """Hosts the real DownloadsView and records the queue-order messages it posts."""
+
+    def __init__(self) -> None:
+        """Mount one view and start with no recorded requests."""
+        super().__init__()
+        self.view = DownloadsView()
+        self.order_requests: list[DownloadsView.PriorityPolicyToggleRequested] = []
+
+    def compose(self) -> ComposeResult:
+        """Show the Downloads view on its own, with no surrounding chrome."""
+        yield self.view
+
+    def on_downloads_view_priority_policy_toggle_requested(
+        self,
+        message: DownloadsView.PriorityPolicyToggleRequested,
+    ) -> None:
+        """Record what the view asked for, standing in for the app's supervisor forward."""
+        self.order_requests.append(message)
+
+
+def _order_snapshot(policy: DownloadPriorityPolicy, *, startup_focus: bool = False) -> WorkerStateSnapshot:
+    return _snapshot(
+        downloads=DownloadStatusSnapshot(
+            phase=DownloadPhase.DOWNLOADING,
+            priority_policy=policy,
+            startup_focus=startup_focus,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_label"),
+    [
+        (DownloadPriorityPolicy.SERVE_FIRST, "Order: serve first"),
+        (DownloadPriorityPolicy.PARALLEL, "Order: parallel"),
+    ],
+)
+async def test_queue_order_button_names_the_order_the_worker_reports(
+    policy: DownloadPriorityPolicy,
+    expected_label: str,
+) -> None:
+    """The control states the order actually in force, so a live switch is visible without a config read."""
+    app = _DownloadsHost()
+    async with app.run_test(size=(180, 40)) as pilot:
+        await pilot.pause()
+        app.view.update_view(_order_snapshot(policy))
+        await pilot.pause()
+
+        assert str(app.query_one("#downloads-order", Button).label) == expected_label
+
+
+async def test_pressing_the_queue_order_button_reports_the_order_in_force() -> None:
+    """A press carries the current order, so the app can ask for the other one."""
+    app = _DownloadsHost()
+    async with app.run_test(size=(180, 40)) as pilot:
+        await pilot.pause()
+        app.view.update_view(_order_snapshot(DownloadPriorityPolicy.PARALLEL))
+        await pilot.pause()
+
+        await pilot.click("#downloads-order")
+        await pilot.pause()
+
+        assert len(app.order_requests) == 1
+        assert app.order_requests[0].current_policy is DownloadPriorityPolicy.PARALLEL
+
+
+def test_startup_focus_is_explained_while_the_queue_is_narrowed() -> None:
+    """While the queue is narrowed, the banner says what is being fetched and that the rest waits."""
+    downloads = DownloadStatusSnapshot(phase=DownloadPhase.DOWNLOADING, startup_focus=True)
+    text = _render(DownloadsView()._render_banner(downloads, None))
+    assert "safety models" in text
+    assert "first image model" in text
+    assert "waiting" in text
+
+
+def test_no_startup_focus_line_once_the_worker_can_serve() -> None:
+    """With the focus lifted the banner drops the explanation rather than leaving a stale claim up."""
+    downloads = DownloadStatusSnapshot(phase=DownloadPhase.DOWNLOADING, startup_focus=False)
+    text = _render(DownloadsView()._render_banner(downloads, None))
+    assert "safety models" not in text

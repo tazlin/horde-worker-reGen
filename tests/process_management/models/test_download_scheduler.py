@@ -12,6 +12,7 @@ import pytest
 from horde_worker_regen.model_download_core import UNKNOWN_DOWNLOAD_HOST, download_host_for_url
 from horde_worker_regen.process_management.models.download_scheduler import (
     DownloadKind,
+    DownloadPriorityPolicy,
     DownloadTask,
     HostAwareDownloadScheduler,
 )
@@ -19,6 +20,35 @@ from horde_worker_regen.process_management.models.download_scheduler import (
 
 def _task(model: str, host: str) -> DownloadTask:
     return DownloadTask(kind=DownloadKind.IMAGE_MODEL, model_name=model, host=host, feature="image model")
+
+
+def _safety_task(host: str = "github.com") -> DownloadTask:
+    return DownloadTask(kind=DownloadKind.SAFETY, model_name="safety models", host=host, feature="safety")
+
+
+def _feature_task(model: str, host: str) -> DownloadTask:
+    return DownloadTask(
+        kind=DownloadKind.AUX_MODEL,
+        model_name=model,
+        host=host,
+        feature="ControlNet",
+        manager_key="controlnet",
+    )
+
+
+def _default_loras_task(host: str = "civitai.com") -> DownloadTask:
+    return DownloadTask(kind=DownloadKind.DEFAULT_LORAS, model_name="default LoRas", host=host, feature="LoRa")
+
+
+def _drain_in_order(scheduler: HostAwareDownloadScheduler) -> list[str]:
+    """Acquire and immediately release every admissible task, returning the names in admission order."""
+    names: list[str] = []
+    while True:
+        task = scheduler.acquire(timeout=0.0)
+        if task is None:
+            return names
+        names.append(task.model_name)
+        scheduler.release(task)
 
 
 def _exclusive_task(model: str, host: str) -> DownloadTask:
@@ -52,6 +82,142 @@ class TestDownloadHostForUrl:
         assert download_host_for_url(None) == UNKNOWN_DOWNLOAD_HOST
         assert download_host_for_url("") == UNKNOWN_DOWNLOAD_HOST
         assert download_host_for_url("not a url") == UNKNOWN_DOWNLOAD_HOST
+
+
+class TestServeFirstOrdering:
+    """Under ``serve_first`` the queue is drained in the order that gets a worker serving soonest."""
+
+    def test_safety_models_start_before_an_earlier_queued_checkpoint(self) -> None:
+        """The safety models gate every job, so they are fetched ahead of checkpoints queued before them."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=1)
+        scheduler.enqueue_many([_task("checkpoint", "civitai.com"), _safety_task()])
+
+        assert _drain_in_order(scheduler) == ["safety models", "checkpoint"]
+
+    def test_tiers_run_in_order_and_arrival_breaks_ties(self) -> None:
+        """Image models come before feature models, which come before the default LoRAs; ties are oldest first."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=1)
+        scheduler.enqueue_many(
+            [
+                _default_loras_task(),
+                _feature_task("controlnet_canny", "huggingface.co"),
+                _task("second checkpoint", "civitai.com"),
+                _task("first checkpoint", "civitai.com"),
+                _feature_task("controlnet_depth", "huggingface.co"),
+            ],
+        )
+        scheduler.enqueue(_task("third checkpoint", "civitai.com"))
+
+        assert _drain_in_order(scheduler) == [
+            "second checkpoint",
+            "first checkpoint",
+            "third checkpoint",
+            "controlnet_canny",
+            "controlnet_depth",
+            "default LoRas",
+        ]
+
+    def test_a_popped_job_s_own_files_come_right_after_safety(self) -> None:
+        """A job waiting on its LoRA is served before the next checkpoint, since a card sits idle on it."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=1)
+        scheduler.enqueue_many([_task("checkpoint", "civitai.com"), _lora_task("job lora", "civitai.com")])
+
+        assert _drain_in_order(scheduler) == ["job lora", "checkpoint"]
+
+    def test_exclusive_verify_still_runs_last(self) -> None:
+        """The exclusive annotator verify keeps draining into the idle tail, whatever tier it sits in."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=1)
+        scheduler.enqueue_many([_exclusive_task("verify", "h"), _default_loras_task()])
+
+        assert _drain_in_order(scheduler) == ["default LoRas", "verify"]
+
+    def test_parallel_policy_is_first_come_first_served(self) -> None:
+        """An operator who chooses ``parallel`` gets the queue in arrival order, tiers ignored."""
+        scheduler = HostAwareDownloadScheduler(
+            max_parallel_downloads=1, priority_policy=DownloadPriorityPolicy.PARALLEL
+        )
+        scheduler.enqueue_many([_default_loras_task(), _task("checkpoint", "civitai.com"), _safety_task()])
+
+        assert _drain_in_order(scheduler) == ["default LoRas", "checkpoint", "safety models"]
+
+    def test_switching_policy_reorders_what_is_still_pending(self) -> None:
+        """Changing the policy mid-queue changes which pending task starts next; nothing is dropped."""
+        scheduler = HostAwareDownloadScheduler(
+            max_parallel_downloads=1, priority_policy=DownloadPriorityPolicy.PARALLEL
+        )
+        scheduler.enqueue_many(
+            [_default_loras_task(), _feature_task("controlnet_canny", "h"), _task("checkpoint", "c")]
+        )
+
+        assert scheduler.set_policy(DownloadPriorityPolicy.SERVE_FIRST) is True
+        assert scheduler.set_policy(DownloadPriorityPolicy.SERVE_FIRST) is False
+        assert _drain_in_order(scheduler) == ["checkpoint", "controlnet_canny", "default LoRas"]
+
+
+class TestStartupFocus:
+    """Until the worker can serve, only what it needs to serve is downloading."""
+
+    def test_focus_admits_safety_and_one_checkpoint_and_holds_the_rest(self) -> None:
+        """With focus on, a second checkpoint and every feature model wait; a job's own file does not."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=4)
+        scheduler.set_startup_focus(True)
+        scheduler.enqueue_many(
+            [
+                _feature_task("controlnet_canny", "huggingface.co"),
+                _task("first checkpoint", "civitai.com"),
+                _task("second checkpoint", "huggingface.co"),
+                _safety_task("github.com"),
+                _lora_task("job lora", "civitai.com"),
+            ],
+        )
+
+        admitted = {scheduler.acquire(timeout=0.0).model_name for _ in range(3)}  # type: ignore[union-attr]
+        assert admitted == {"safety models", "first checkpoint", "job lora"}
+        assert scheduler.acquire(timeout=0.0) is None
+
+    def test_focus_lets_the_next_checkpoint_start_once_the_first_lands(self) -> None:
+        """One checkpoint at a time: the second starts when the first is released, features still wait."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=4)
+        scheduler.set_startup_focus(True)
+        scheduler.enqueue_many(
+            [_task("first", "civitai.com"), _task("second", "huggingface.co"), _feature_task("canny", "h")],
+        )
+        first = scheduler.acquire(timeout=0.0)
+        assert first is not None and first.model_name == "first"
+        assert scheduler.acquire(timeout=0.0) is None
+
+        scheduler.release(first)
+        second = scheduler.acquire(timeout=0.0)
+        assert second is not None and second.model_name == "second"
+        assert scheduler.acquire(timeout=0.0) is None
+
+    def test_clearing_focus_releases_the_held_queue_in_tier_order(self) -> None:
+        """Once the worker can serve, everything that was held starts in tier order."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=1)
+        scheduler.set_startup_focus(True)
+        scheduler.enqueue_many([_default_loras_task(), _feature_task("canny", "h"), _task("checkpoint", "c")])
+        assert _drain_in_order(scheduler) == ["checkpoint"]  # the features stay held
+
+        assert scheduler.set_startup_focus(False) is True
+        assert _drain_in_order(scheduler) == ["canny", "default LoRas"]
+
+    def test_focus_is_ignored_under_the_parallel_policy(self) -> None:
+        """``parallel`` never narrows the queue, even when the worker has nothing to serve yet."""
+        scheduler = HostAwareDownloadScheduler(
+            max_parallel_downloads=4, priority_policy=DownloadPriorityPolicy.PARALLEL
+        )
+        assert scheduler.set_startup_focus(True) is False
+        scheduler.enqueue_many([_feature_task("canny", "h1"), _task("first", "h2"), _task("second", "h3")])
+
+        assert len(_drain_in_order(scheduler)) == 3
+
+    def test_exclusive_verify_waits_out_the_focus(self) -> None:
+        """A held feature queue keeps the exclusive verify from running, since work is still pending."""
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=4)
+        scheduler.set_startup_focus(True)
+        scheduler.enqueue_many([_exclusive_task("verify", "h"), _feature_task("canny", "h")])
+
+        assert scheduler.acquire(timeout=0.0) is None
 
 
 class TestHostAwareScheduler:

@@ -114,6 +114,7 @@ module paths directly.
 | `benchmark/gate_driver.py`    | Disagg A/B measurement gate: runs a mix through the harness in ABBA order, scores kudos/hr, and derives per-stage reload/latency mechanism metrics (`python -m horde_worker_regen.benchmark.gate_driver`) |
 | `amd_go_fast/`                | AMD/ROCm-specific optimizations                                 |
 | `capabilities/`               | Placeholder for future optional "capability" processes (heavy features split out of the base worker; see the README) |
+| `alchemy_forms.py`            | Torch-free alchemy `forms` helpers: the default form set, form-name normalisation, and the `AuxiliaryFetchNeeds` a configuration derives for the download process |
 | `app_state.py`                | Durable dashboard/worker state path helpers                     |
 | `compute_mode.py`, `server_capabilities.py` | Torch-free backend intent and advertised capability helpers |
 | `consts.py`                   | Shared constants and filenames                                  |

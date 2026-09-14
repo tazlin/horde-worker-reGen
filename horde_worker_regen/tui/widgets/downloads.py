@@ -29,6 +29,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     FeatureReadinessSummary,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.models.feature_readiness import FeatureReadinessState
 from horde_worker_regen.tui.formatters import human_bytes, human_duration, mini_bar, shorten
 
@@ -57,6 +58,18 @@ _PHASE_DETAIL: dict[DownloadPhase, str] = {
 }
 
 _BAR_WIDTH = 32
+
+_PRIORITY_POLICY_LABEL: dict[DownloadPriorityPolicy, str] = {
+    DownloadPriorityPolicy.SERVE_FIRST: "Order: serve first",
+    DownloadPriorityPolicy.PARALLEL: "Order: parallel",
+}
+"""Button label per queue order, so the control always states the order actually in force."""
+
+_STARTUP_FOCUS_DETAIL = (
+    "Fetching the safety models and the first image model before anything else, so the worker can start "
+    "serving as soon as possible. The rest of the queue is waiting."
+)
+"""Shown while the queue is narrowed, so a waiting queue does not read as a stalled one."""
 
 _ANNOTATOR_DOWNLOAD_FEATURE = "ControlNet annotators"
 """The feature label the download process tags its annotator-preload task with (mirrors
@@ -141,6 +154,14 @@ class DownloadsView(VerticalScroll):
             super().__init__()
             self.currently_paused = currently_paused
 
+    class PriorityPolicyToggleRequested(Message):
+        """Posted when the user toggles the download queue order."""
+
+        def __init__(self, *, current_policy: DownloadPriorityPolicy) -> None:
+            """Carry the order in force now, so the app asks for the other one."""
+            super().__init__()
+            self.current_policy = current_policy
+
     class RateLimitRequested(Message):
         """Posted when the user applies a download bandwidth cap (KB/s; 0 clears the cap)."""
 
@@ -159,14 +180,16 @@ class DownloadsView(VerticalScroll):
         """Posted when the user wants to choose which models to download (opens the picker modal)."""
 
     def __init__(self) -> None:
-        """Track the last-seen paused state so the control row labels itself correctly."""
+        """Track the last-seen paused state and queue order so the control row labels itself correctly."""
         super().__init__()
         self._paused = False
+        self._priority_policy = DownloadPriorityPolicy.SERVE_FIRST
 
     def compose(self) -> ComposeResult:
         """Lay out the controls row, phase banner, disk-plan panel, current download, queue, failures."""
         with Horizontal(id="downloads-controls", classes="responsive-toolbar"):
             yield Button("Pause downloads", id="downloads-pause")
+            yield Button(_PRIORITY_POLICY_LABEL[DownloadPriorityPolicy.SERVE_FIRST], id="downloads-order")
             yield Input(placeholder="rate limit KB/s (0 = off)", id="downloads-rate", type="integer")
             yield Button("Apply limit", id="downloads-rate-apply")
             yield Button("Download only", id="downloads-only-hold")
@@ -200,6 +223,10 @@ class DownloadsView(VerticalScroll):
 
         self._paused = downloads.paused if downloads is not None else False
         self.query_one("#downloads-pause", Button).label = "Resume downloads" if self._paused else "Pause downloads"
+        self._priority_policy = (
+            downloads.priority_policy if downloads is not None else DownloadPriorityPolicy.SERVE_FIRST
+        )
+        self.query_one("#downloads-order", Button).label = _PRIORITY_POLICY_LABEL[self._priority_policy]
         self.query_one("#downloads-banner", Static).update(self._render_banner(downloads, plan))
         if thin:
             self.query_one("#downloads-plan", Static).update(self._render_plan_compact(plan))
@@ -218,6 +245,8 @@ class DownloadsView(VerticalScroll):
         """Translate the control buttons into messages the app forwards to the supervisor."""
         if event.button.id == "downloads-pause":
             self.post_message(self.PauseToggleRequested(currently_paused=self._paused))
+        elif event.button.id == "downloads-order":
+            self.post_message(self.PriorityPolicyToggleRequested(current_policy=self._priority_policy))
         elif event.button.id == "downloads-rate-apply":
             self._post_rate_limit()
         elif event.button.id == "downloads-only-hold":
@@ -276,6 +305,8 @@ class DownloadsView(VerticalScroll):
         control = self._control_line(downloads)
         if control is not None:
             lines.append(control)
+        if downloads.startup_focus:
+            lines.append(Text(_STARTUP_FOCUS_DETAIL, style="yellow"))
 
         # Add a heads up that controlnets annotators can take up to 60 minutes to download and verify,
         # so the user doesn't think the worker is hung.

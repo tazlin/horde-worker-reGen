@@ -80,9 +80,13 @@ class DesiredState:
         downloading. ``to_cancel`` is the in-flight subset no longer desired, so a removal prunes the queue
         without touching files.
         """
-        desired = frozenset(configured) | frozenset(self._picker_additions)
+        configured_in_order = tuple(dict.fromkeys(configured))
+        desired = frozenset(configured_in_order) | frozenset(self._picker_additions)
         present_set = frozenset(present)
         in_flight_set = frozenset(in_flight)
-        to_fetch = tuple(sorted(desired - present_set))
+        # Configured order is the operator's preference order, so the first listed missing model is the
+        # first fetched; picker additions follow it.
+        picker_only = sorted(self._picker_additions - frozenset(configured_in_order))
+        to_fetch = tuple(name for name in (*configured_in_order, *picker_only) if name not in present_set)
         to_cancel = tuple(sorted(in_flight_set - desired))
         return ReconcilePlan(desired=desired, to_fetch=to_fetch, to_cancel=to_cancel)

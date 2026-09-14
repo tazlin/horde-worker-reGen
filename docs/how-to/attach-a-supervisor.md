@@ -95,6 +95,7 @@ through the orphan-proof graceful path rather than a raw command.
 {"command": "SET_SERVER_MAINTENANCE", "server_maintenance_enabled": true}
 {"command": "SET_CONCURRENCY", "target_threads": 2, "target_processes": 3}
 {"command": "SET_DOWNLOAD_RATE_LIMIT", "download_rate_limit_kbps": 5000}
+{"command": "SET_DOWNLOAD_PRIORITY_POLICY", "download_priority_policy": "parallel"}
 {"command": "RESTART_PROCESS", "process_id": 1}
 {"command": "DOWNLOAD_MODELS", "download_model_names": ["AlbedoBase XL (SDXL)"], "download_include_aux": false}
 {"command": "PAUSE"}
@@ -102,7 +103,8 @@ through the orphan-proof graceful path rather than a raw command.
 ```
 
 The full verb set: `PAUSE`, `RESUME`, `DRAIN`, `RESTART_PROCESS`, `RELOAD_CONFIG`, `SET_CONCURRENCY`,
-`PAUSE_DOWNLOADS`, `RESUME_DOWNLOADS`, `SET_DOWNLOAD_RATE_LIMIT`, `DOWNLOADS_ONLY_HOLD`, `GO_LIVE`,
+`PAUSE_DOWNLOADS`, `RESUME_DOWNLOADS`, `SET_DOWNLOAD_RATE_LIMIT`, `SET_DOWNLOAD_PRIORITY_POLICY`,
+`DOWNLOADS_ONLY_HOLD`, `GO_LIVE`,
 `DOWNLOAD_MODELS`, `SET_SERVER_MAINTENANCE`, `SET_STATS_EXPORT`, and `SHUTDOWN` / `GRACEFUL_SHUTDOWN`.
 
 `RESTART_PROCESS` addresses an inference slot by its `process_id`, or the download process id to revive a

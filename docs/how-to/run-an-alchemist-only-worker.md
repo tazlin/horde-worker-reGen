@@ -52,6 +52,11 @@ There are two ways to end up alchemist-only:
   NSFW, vectorize, palette, describe, aesthetic) run on the safety process.
 - **No image models are loaded.** Any configured `models_to_load`/`dynamic_models` are coerced off, so
   the worker never advertises or pops an image job.
+- **The forms decide which auxiliary models are downloaded.** A worker offering `post-process` fetches
+  the upscalers and face-fixers, and (with `enable_image_utilities` on) the background-removal weight;
+  one offering only text forms such as `interrogation` fetches neither. The caption model is fetched
+  only when `caption` is offered and `alchemy_caption_enabled: true` is set. Editing `forms` while the
+  worker runs applies without a restart.
 - **The dashboard reshapes around alchemy.** The overview shows an "ALCHEMIST-ONLY WORKER" identity, an
   alchemy-centric headline (forms submitted, in flight, pending), an alchemy job pipeline, and a longer
   recent-jobs view so sparse alchemy work stays visible over the session.

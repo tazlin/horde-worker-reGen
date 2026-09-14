@@ -32,6 +32,7 @@ from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ANNOTATION_CONT
 from hordelib.metrics import JobPhaseMetrics, SamplingStats
 from loguru import logger
 
+from horde_worker_regen.alchemy_forms import DEFAULT_AUXILIARY_FETCH_NEEDS, AuxiliaryFetchNeeds
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
@@ -79,6 +80,7 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
 from horde_worker_regen.process_management.lifecycle.utilities_adapter import UtilitiesProcessAdapter
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     ClearanceLeaseProxy,
@@ -1682,7 +1684,7 @@ def start_fake_download_process(
     allow_lora: bool = False,
     allow_controlnet: bool = False,
     allow_sdxl_controlnet: bool = False,
-    allow_post_processing: bool = True,
+    fetch_needs: AuxiliaryFetchNeeds = DEFAULT_AUXILIARY_FETCH_NEEDS,
     purge_loras: bool = False,
     amd_gpu: bool = False,
     directml: int | None = None,
@@ -1691,6 +1693,7 @@ def start_fake_download_process(
     max_parallel_downloads: int = 4,
     per_host_concurrency: int = 1,
     connections_per_file: int = 4,
+    priority_policy: DownloadPriorityPolicy = DownloadPriorityPolicy.SERVE_FIRST,
     scripted_present: list[str] | None = None,
     download_delay_seconds: float = 0.0,
     fail_models: list[str] | None = None,

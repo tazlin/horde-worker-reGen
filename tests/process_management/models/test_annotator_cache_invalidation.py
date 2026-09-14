@@ -19,6 +19,7 @@ import queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
 from horde_worker_regen.model_download_core import CompVisLike
 from horde_worker_regen.process_management.workers.download_process import (
     DOWNLOAD_PROCESS_ID,
@@ -74,7 +75,7 @@ def _download_process() -> HordeDownloadProcess:
         download_bandwidth_semaphore=Mock(),
         process_launch_identifier=0,
         allow_lora=False,
-        allow_post_processing=False,
+        fetch_needs=AuxiliaryFetchNeeds(),
         allow_sdxl_controlnet=False,
         allow_controlnet=True,
     )

@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerFatalConfigError, WorkerStateSnapshot
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.tui.attach import SupervisorLike
 from horde_worker_regen.tui.worker_launcher import SupervisorStallStats, SupervisorStatus, WorkerProcessMode
 
@@ -68,6 +69,8 @@ class FakeSupervisor:
         self.downloads_only_hold_calls = 0
         self.go_live_calls = 0
         self.rate_limits_kbps: list[int] = []
+        self.priority_policies: list[DownloadPriorityPolicy] = []
+        """Every download queue order the app asked for, in the order it asked."""
         self.download_requests: list[RecordedDownloadRequest] = []
         self.server_maintenance: list[bool] = []
         self.stats_export: list[bool] = []
@@ -192,6 +195,12 @@ class FakeSupervisor:
         """Record a bandwidth-cap request (in KB/s); True only when the worker is running."""
         self.requests.append("rate_limit")
         self.rate_limits_kbps.append(rate_limit_kbps)
+        return self._alive
+
+    def request_set_download_priority_policy(self, policy: DownloadPriorityPolicy) -> bool:
+        """Record a download queue-order request; True only when the worker is running."""
+        self.requests.append("priority_policy")
+        self.priority_policies.append(policy)
         return self._alive
 
     def request_downloads_only_hold(self) -> bool:

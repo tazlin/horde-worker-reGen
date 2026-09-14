@@ -236,6 +236,7 @@ _CONTROL_MESSAGE_FIELDS = (
     "target_threads",
     "target_processes",
     "download_rate_limit_kbps",
+    "download_priority_policy",
     "server_maintenance_enabled",
     "download_model_names",
     "download_include_aux",

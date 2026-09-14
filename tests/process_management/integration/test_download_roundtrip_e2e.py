@@ -144,11 +144,10 @@ def _make_download_process(
         download_bandwidth_semaphore=ctx.Semaphore(1),
         process_launch_identifier=1,
     )
-    # Keep the work focused on image models: the required safety models and the optional aux pass are
-    # unrelated networked downloads we are not exercising here.
+    # Keep the work focused on image models: the required safety models are an unrelated networked
+    # download not exercised here, and no aux pass is requested.
     process._safety_present = True
     process._safety_ensured = True
-    process._aux_enqueued = True
     process._refresh_present()
     return process, parent_conn
 

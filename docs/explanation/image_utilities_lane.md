@@ -236,8 +236,12 @@ going live, no restart required.
 The capability service runs with downloads disabled (`HIU_ALLOW_DOWNLOADS=false`), so it never fetches its
 own weights. The worker's download process pre-places the rembg `u2net.onnx` weight into the lane's isolated
 rembg cache (`AIWORKER_CACHE_HOME/horde/image-utilities/rembg`), verified against rembg's published checksum,
-so `strip_background` finds its model where the service looks for it. ControlNet annotator checkpoints are
-downloaded through the existing controlnet-annotator aux pass.
+so `strip_background` finds its model where the service looks for it. The weight is an ordinary queued
+download, not a side thread: it appears in the Downloads tab with its size and progress, and is retried and
+reported like any other model. It is queued only for a worker that can serve background removal: one that
+offers post-processing (`allow_post_processing`) or is an alchemist with the post-process form configured,
+and has the utilities lane enabled (`enable_image_utilities`). ControlNet annotator checkpoints are queued by
+the same [feature reconcile](model_downloads.md#feature-reconcile-queueing-what-is-missing).
 
 ## VRAM admission
 

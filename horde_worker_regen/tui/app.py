@@ -44,6 +44,7 @@ from horde_worker_regen.app_state import (
     should_prompt_onboarding,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import DownloadPhase, WorkerStateSnapshot
+from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.tui import socket_protocol as sp
@@ -1112,6 +1113,24 @@ class HordeWorkerTUI(App[None]):
     def on_downloads_view_pause_toggle_requested(self, message: DownloadsView.PauseToggleRequested) -> None:
         """Forward a Downloads-panel pause/resume click to the worker."""
         self._set_downloads_paused(currently_paused=message.currently_paused)
+
+    def on_downloads_view_priority_policy_toggle_requested(
+        self,
+        message: DownloadsView.PriorityPolicyToggleRequested,
+    ) -> None:
+        """Forward a Downloads-panel queue-order click to the worker, switching to the other policy."""
+        wanted = (
+            DownloadPriorityPolicy.PARALLEL
+            if message.current_policy is DownloadPriorityPolicy.SERVE_FIRST
+            else DownloadPriorityPolicy.SERVE_FIRST
+        )
+        sent = self._supervisor.request_set_download_priority_policy(wanted)
+        if not sent:
+            self.notify("Worker not running; download order not sent.", severity="warning")
+        elif wanted is DownloadPriorityPolicy.SERVE_FIRST:
+            self.notify("Downloads ordered to get the worker serving first.")
+        else:
+            self.notify("Downloads ordered first come, first served.")
 
     def on_control_view_toggle_pause_requested(self, _message: ControlView.TogglePauseRequested) -> None:
         """Forward the Control tab's local pause/resume request."""
