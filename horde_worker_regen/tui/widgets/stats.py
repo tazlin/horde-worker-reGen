@@ -365,7 +365,7 @@ class StatsView(Vertical):
 
     @staticmethod
     def _form_kind_label(form: str | None) -> str:
-        """Classify a form as graph (runs on an inference process) or CLIP (runs on the safety process)."""
+        """Classify a form as graph (runs on the post-processing lane) or CLIP (runs on the safety process)."""
         if form is None:
             return "-"
         return "graph" if capability_for_alchemy_form(form) is WorkerCapability.ALCHEMY_GRAPH else "clip"

@@ -69,7 +69,7 @@ def _result_message(
 class TestRequiredCapability:
     """Forms route to the capability that can serve them."""
 
-    def test_graph_forms_route_to_inference_processes(self) -> None:
+    def test_graph_forms_route_to_the_post_processing_lane(self) -> None:
         """Graph-backed forms (upscalers/facefixers) require ALCHEMY_GRAPH (the post-processing lane)."""
         for form in ("RealESRGAN_x4plus", "4x_AnimeSharp", "NMKD_Siax", "GFPGAN", "CodeFormers"):
             assert required_capability(form) == WorkerCapability.ALCHEMY_GRAPH, form

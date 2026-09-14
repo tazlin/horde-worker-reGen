@@ -3,8 +3,7 @@
 This process keeps the post-processing models (ESRGAN upscalers, GFPGAN/CodeFormer face-fixers)
 resident and runs the post-processing phase of image jobs off the inference processes, so a job's
 upscale/face-fix does not contend for VRAM with a fresh generation on the same slot and the models
-are not reloaded per job. It also serves the graph-backed alchemy forms (upscale/facefix/
-strip_background) that would otherwise run on an inference process.
+are not reloaded per job. It also serves the graph-backed alchemy forms (upscale/facefix).
 
 It owns a hordelib backend (for the post-processing graphs) but never loads an image-generation
 checkpoint: its only entry points are the per-operation ``post_process`` calls.
@@ -311,7 +310,7 @@ class HordePostProcessProcess(HordeProcess):
         return buffer.getvalue()
 
     def _run_graph_alchemy(self, form: AlchemyFormSpec) -> None:
-        """Run a graph-backed alchemy form (upscale/facefix/strip_background) and report the result.
+        """Run a graph-backed alchemy form (upscale/facefix) and report the result.
 
         The result image is WebP-encoded (quality 95, matching the legacy alchemist) so the main process
         can upload it to R2 without re-encoding.

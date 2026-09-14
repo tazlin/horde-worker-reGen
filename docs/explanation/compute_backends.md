@@ -215,8 +215,8 @@ fleet and clear the model list at startup.
   untouched. (This sits alongside the `rembg`/`onnxruntime` coercions above.)
 - **One inference process**: an alchemist-only worker forces each card's inference-process count to one
   ([`resolve_card_concurrency`][horde_worker_regen.process_management.process_manager.resolve_card_concurrency]
-  with `serves_image_generation=False`) rather than spawning the image-generation fleet. The graph
-  alchemy forms serialize through that single process; CLIP/text forms run on the safety process. The
+  with `serves_image_generation=False`) rather than spawning the image-generation fleet. Graph alchemy
+  forms run on the dedicated post-processing lane; CLIP/text forms run on the safety process. The
   inference process also no longer treats an empty image-model database as fatal, and the download
   coordinator starts inference without waiting for an image model that will never arrive.
 - **Fresh-install config**: a CPU install seeds `bridgeData.yaml` with `alchemist: true` and

@@ -46,10 +46,10 @@ There are two ways to end up alchemist-only:
 
 ## What changes in alchemist-only mode
 
-- **One inference process.** Instead of the image-generation fleet, a single inference process is
-  spawned per card; graph alchemy forms (upscale, face-fix, background removal) serialize through it.
-  Text/CLIP forms (caption, interrogation, NSFW, vectorize, palette, describe, aesthetic) run on the
-  safety process.
+- **One inference process per card.** Instead of the image-generation fleet, a single inference process
+  is spawned per card. Graph alchemy forms (upscale, face-fix) run on the dedicated post-processing
+  lane; background removal runs on the image-utilities lane. Text/CLIP forms (caption, interrogation,
+  NSFW, vectorize, palette, describe, aesthetic) run on the safety process.
 - **No image models are loaded.** Any configured `models_to_load`/`dynamic_models` are coerced off, so
   the worker never advertises or pops an image job.
 - **The dashboard reshapes around alchemy.** The overview shows an "ALCHEMIST-ONLY WORKER" identity, an

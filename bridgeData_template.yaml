@@ -69,9 +69,9 @@ safety_on_gpu: false
 #   8GB-10GB VRAM: false
 
 # Run post-processing (upscalers/face-fixers/background removal) on a dedicated process that keeps
-# those models resident, instead of inside the inference processes. This gives post-processing a
-# fixed, budgetable VRAM footprint and avoids reloading the models per job.
-#   auto: run the lane whenever post-processing is allowed (recommended)
+# those models resident. This gives post-processing a fixed, budgetable VRAM footprint and avoids
+# reloading the models per job.
+#   auto: run the lane whenever post-processing is allowed or this worker is an alchemist (recommended)
 #   on:   always run the lane
 #   off:  disable the lane; allow_post_processing must also be false because this worker has no place
 #         to run post-processing jobs
@@ -480,7 +480,7 @@ branded_model: true
 # Leave it true (the default) for the usual dreamer or dreamer+alchemist worker. The role matrix:
 #   dreamer: true,  alchemist: false  -> image generation only (the default)
 #   dreamer: true,  alchemist: true   -> both image generation and alchemy
-#   dreamer: false, alchemist: true   -> alchemy only (one inference process for graph forms)
+#   dreamer: false, alchemist: true   -> alchemy only (graph forms run on the post-processing lane)
 #   dreamer: false, alchemist: false  -> nothing to serve (the Config tab blocks this combination)
 # A CPU-only install cannot serve image generation regardless of this flag, so it always runs
 # alchemist-only there.
@@ -489,10 +489,10 @@ dreamer: true
 # Set to true to also serve alchemy (interrogation) jobs alongside image generation.
 # Image jobs always take priority. By default (alchemy_allow_concurrent) alchemy may run
 # concurrently with image generation when a process lane is spare and there is VRAM
-# headroom; otherwise it waits. Graph forms (upscalers, facefixers, strip_background) run
-# on the inference processes (shared with image generation); CLIP forms (interrogation,
-# nsfw, caption) run on the safety process. Set alchemist: true together with dreamer: false
-# for an alchemist-only worker.
+# headroom; otherwise it waits. Graph forms (upscalers, facefixers) run on the dedicated
+# post-processing lane; strip_background runs on the image-utilities lane; CLIP forms
+# (interrogation, nsfw, caption) run on the safety process. Set alchemist: true together
+# with dreamer: false for an alchemist-only worker.
 alchemist: false
 
 # Worker name for serving alchemy jobs.

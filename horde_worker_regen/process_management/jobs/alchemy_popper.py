@@ -13,9 +13,9 @@ judged per card: every alchemy-capable process is pinned to one, so a form is ad
 hosting an available capable process has the room, and the card whose headroom admitted it is the card the
 form is dispatched to.
 
-Graph forms (upscalers, facefixers, strip_background) are dispatched to the post-processing lane;
-text-output forms (caption, interrogation, nsfw, vectorize) to the safety process. Dispatch is keyed
-on :class:`WorkerCapability`, not process type.
+Graph forms (upscalers, facefixers) are dispatched to the post-processing lane; strip_background to
+the image-utilities lane; text-output forms (caption, interrogation, nsfw, vectorize) to the safety
+process. Dispatch is keyed on :class:`WorkerCapability`, not process type.
 """
 
 from __future__ import annotations

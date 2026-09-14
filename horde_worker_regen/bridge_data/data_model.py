@@ -619,9 +619,9 @@ class reGenBridgeData(CombinedHordeBridgeData):
     )
     """Whether to run a dedicated post-processing process.
 
-    The dedicated process keeps the post-processing models (upscalers, face-fixers, background removal)
-    resident and runs every post-processing phase off the inference processes, converting the transient
-    per-job post-processing VRAM spike into one fixed, budgetable footprint.
+    The dedicated process keeps the post-processing models (upscalers, face-fixers) resident and runs
+    every post-processing phase there, converting the transient per-job post-processing VRAM spike into
+    one fixed, budgetable footprint.
 
     - "auto": run the lane whenever any of its work is served (post-processing allowed, or an
       alchemist worker whose graph forms run on the lane).
@@ -633,8 +633,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     def post_processing_lane_enabled(self) -> bool:
         """Whether the dedicated post-processing lane should be running.
 
-        The lane is the only place post-processing and graph alchemy forms (upscale/facefix/
-        strip_background) run; "off" therefore also implies the worker does not offer post-processing.
+        The lane is the only place post-processing and graph alchemy forms (upscale/facefix) run;
+        "off" therefore also implies the worker does not offer post-processing.
         "auto" ties the lane to whether any of its work is served: embedded job post-processing
         (``allow_post_processing``) or graph alchemy forms (``alchemist``).
         """
@@ -963,11 +963,12 @@ class reGenBridgeData(CombinedHordeBridgeData):
     alchemist: bool = Field(default=False)
     """If true, this worker also pops and processes alchemy jobs (/v2/interrogate/pop).
 
-    Graph forms (upscalers, facefixers, strip_background) run on the inference processes,
-    which they share with image generation; CLIP forms (interrogation, nsfw) run on the
-    safety process. Image jobs always win contention for those processes; alchemy only
-    uses a lane image work does not currently need (see `alchemy_allow_concurrent`). The
-    forms offered are controlled by the `forms` field (see `CombinedHordeBridgeData`).
+    Graph forms (upscalers, facefixers) run on the dedicated post-processing lane, shared with
+    embedded image-job post-processing; strip_background runs on the image-utilities lane; CLIP
+    forms (interrogation, nsfw) run on the safety process. Image jobs always win contention for
+    the post-processing lane; alchemy only uses it when image work does not currently need it
+    (see `alchemy_allow_concurrent`). The forms offered are controlled by the `forms` field (see
+    `CombinedHordeBridgeData`).
     """
 
     alchemy_caption_enabled: bool = Field(default=False)

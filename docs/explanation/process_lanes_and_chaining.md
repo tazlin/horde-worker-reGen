@@ -10,7 +10,7 @@ the chain model that describes a job's route through it, and why post-processing
 | Lane | Process type | Resident models | Work served |
 | --- | --- | --- | --- |
 | Inference | `INFERENCE` (pool, per card) | The image-generation checkpoint(s) | Image generation (`IMAGE_GEN`) |
-| Post-processing | `POST_PROCESS` (single) | Upscalers, face-fixers, background removal | Job post-processing phases and graph alchemy forms (`ALCHEMY_GRAPH`) |
+| Post-processing | `POST_PROCESS` (single) | Upscalers, face-fixers | Job post-processing phases and graph alchemy forms (`ALCHEMY_GRAPH`) |
 | Safety | `SAFETY` (single) | The CLIP safety stack | Safety evaluation (`SAFETY_EVAL`) and CLIP alchemy forms (`ALCHEMY_CLIP`) |
 | Image utilities | `UTILITIES` (single) | ControlNet annotators, background-removal stack | ControlNet annotation and background removal (`IMAGE_UTILITIES`) |
 
@@ -37,7 +37,8 @@ moving a live lane is a scheduling decision, not a lifecycle one.
 
 The lane is controlled by `dedicated_post_processing`:
 
-- `auto` (default): the lane runs whenever post-processing is allowed (`allow_post_processing`).
+- `auto` (default): the lane runs whenever post-processing is allowed (`allow_post_processing`) or the
+  worker is an alchemist.
 - `on`: the lane always runs.
 - `off`: no lane, and the worker does not offer post-processing at all. The lane is the only place
   post-processing runs; there is no inline fallback inside the inference processes.

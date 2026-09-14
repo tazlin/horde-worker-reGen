@@ -285,8 +285,9 @@ class ModelDownloadCoordinator:
 
         # An alchemist-only worker (no image models configured, e.g. a CPU install) will never see an
         # image model land, so it must not wait for one: start inference as soon as the on-disk scan has
-        # completed, so the alchemy graph forms have their process. Without this the worker would wait
-        # forever (none of the model-present branches below can fire with an empty configured set).
+        # completed, which also brings up the post-processing lane the alchemy graph forms run on. Without
+        # this the worker would wait forever (none of the model-present branches below can fire with an
+        # empty configured set).
         if not self.bridge_data.image_models_to_load and self.bridge_data.alchemist and availability.scan_complete:
             logger.info("Alchemist-only worker (no image models configured); starting inference processes")
             self._process_lifecycle.start_inference_processes()

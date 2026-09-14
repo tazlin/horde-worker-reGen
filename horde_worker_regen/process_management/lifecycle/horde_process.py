@@ -112,7 +112,7 @@ class WorkerCapability(enum.Flag):
     SAFETY_EVAL = enum.auto()
     """Post-generation safety evaluation."""
     ALCHEMY_GRAPH = enum.auto()
-    """Graph-backed alchemy forms: upscalers, facefixers, strip_background."""
+    """Graph-backed alchemy forms: upscalers, facefixers."""
     ALCHEMY_CLIP = enum.auto()
     """CLIP-stack alchemy forms: caption, interrogation, nsfw."""
     IMAGE_UTILITIES = enum.auto()

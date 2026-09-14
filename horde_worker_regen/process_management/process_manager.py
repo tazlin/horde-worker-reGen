@@ -540,11 +540,9 @@ def resolve_card_concurrency(
     effective values reproduces today's globals exactly for a single-GPU host.
 
     When this worker does not serve image generation (``serves_image_generation`` is false: an
-    alchemist-only worker, whether by CPU install or a deliberate ``dreamer: false`` opt-out) the process
-    count is forced to one. The image-generation fleet exists to run many concurrent samplers; without
-    image work the only inference-process consumer is graph alchemy (upscale, face-fix), which serializes
-    fine through a single process while CLIP/text forms run on the safety process. The ceiling and
-    semaphore sizes are left intact so the single process is still sized correctly for what it runs.
+    alchemist-only worker, whether by CPU install or a deliberate ``dreamer: false`` opt-out) the
+    inference-process count is forced to one. The ceiling and semaphore sizes are left intact so the
+    single process is still sized correctly.
     """
     ceiling = max(max_threads, max_threads_ceiling)
     max_concurrent = ceiling
