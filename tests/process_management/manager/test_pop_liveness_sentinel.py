@@ -405,6 +405,37 @@ _FROZEN_QUEUE_PHRASE = "full and not draining"
 """The phrase identifying the full-but-frozen escalation, distinct from the ordinary silence disclosure."""
 
 
+async def test_a_worker_not_serving_images_is_not_reported_as_silent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dreamer role being off accounts for the image intake's silence, like a worker-wide pause does.
+
+    Alchemist-only and scribe-only workers hold the image popper at its own gate forever by choice; the
+    sentinel must not read that as a stalled intake path.
+    """
+    manager = _pooled_manager()
+    completed_at = await _complete_a_pop_attempt(manager)
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("horde_worker_regen.process_management.jobs.job_popper.asyncio.sleep", _no_sleep)
+    manager.bridge_data.dreamer = False
+    await manager._job_popper.api_job_pop(urgent=True)
+
+    assert manager._state.last_pop_gate == PopGate.IMAGE_GENERATION_NOT_SERVED
+    assert manager._state.workload_intake_paused is False
+
+    warnings, warn_sink = _capture("WARNING")
+    errors, error_sink = _capture("ERROR")
+    try:
+        manager._check_pop_liveness(completed_at + POP_LIVENESS_ERROR_SECONDS + 5.0)
+    finally:
+        logger.remove(warn_sink)
+        logger.remove(error_sink)
+
+    assert warnings == []
+    assert errors == []
+
+
 async def _full_queue_manager(head_model: str = "head_model") -> tuple[HordeWorkerProcessManager, float]:
     """Build a manager whose local queue is genuinely full and whose pops are held at that gate.
 

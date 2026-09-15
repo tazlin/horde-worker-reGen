@@ -5390,6 +5390,10 @@ class HordeWorkerProcessManager:
             self._pop_liveness_frozen_baseline = None
             self._pop_liveness_frozen_errored_at = 0.0
             return
+        if self._state.last_pop_gate == str(PopGate.IMAGE_GENERATION_NOT_SERVED):
+            # The operator deselected image generation; the image intake path is silent by choice and the
+            # other flows (alchemy, text) account for their own liveness.
+            return
         # Judged ahead of the governor check below: a governor explains why pops are not being attempted, but
         # nothing explains a queue of accepted work that neither dispatches nor completes.
         self._check_full_queue_liveness(now)
