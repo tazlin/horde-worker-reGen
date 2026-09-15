@@ -60,6 +60,12 @@ class HordeProcessType(enum.Enum):
     SAFETY = auto()
     DOWNLOAD = auto()
     """A background model-downloading process; serves no jobs and lives outside the process map."""
+    TEXT_BACKEND = auto()
+    """An external text-inference program (koboldcpp) the worker launches and supervises over HTTP.
+
+    Not a worker child in the IPC sense: it has no pipe and no message protocol, so it lives outside the
+    process map behind the ``TextBackendSupervisor`` in ``lifecycle/text_backend_supervisor.py``. The
+    member exists so the owned-PID registry and lifecycle logs name it consistently."""
     POST_PROCESS = auto()
     """A dedicated post-processing process that keeps the upscaler/face-fixer models resident and runs the
     post-processing phase of image jobs (and the graph-backed alchemy forms) off the inference processes."""
