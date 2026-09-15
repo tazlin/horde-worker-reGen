@@ -139,7 +139,7 @@ class TestCoTenantReserveShrinksTheContextBudget:
             pm.enabled_workloads = original
 
     def test_alchemist_and_scribe_each_add_a_reserve(self) -> None:
-        """An alchemist reserves at least its floor and a configured scribe adds its own floor on top."""
+        """An alchemist reserves at least its floor and a worker serving text adds its own floor on top."""
         from unittest.mock import Mock
 
         import horde_worker_regen.process_management.process_manager as pm
@@ -155,13 +155,49 @@ class TestCoTenantReserveShrinksTheContextBudget:
         bridge_data.alchemy_ram_headroom_mb = 2048  # below the alchemist floor, so the floor governs
 
         original = pm.enabled_workloads
-        pm.enabled_workloads = lambda bridge_data: frozenset({WorkloadKind.IMAGE_GENERATION, WorkloadKind.ALCHEMY})
+        pm.enabled_workloads = lambda bridge_data: frozenset(
+            {WorkloadKind.IMAGE_GENERATION, WorkloadKind.ALCHEMY, WorkloadKind.TEXT_GENERATION},
+        )
         try:
             reserve = co_tenant_ram_reserve_bytes(bridge_data)
         finally:
             pm.enabled_workloads = original
 
         assert reserve == _ALCHEMIST_CO_TENANT_RAM_BYTES + _SCRIBE_CO_TENANT_RAM_BYTES
+
+    def test_a_scribe_name_alone_reserves_nothing(self) -> None:
+        """The scribe name has a non-empty default, so only the served text workload may add the reserve."""
+        from unittest.mock import Mock
+
+        import horde_worker_regen.process_management.process_manager as pm
+        from horde_worker_regen.process_management.process_manager import co_tenant_ram_reserve_bytes
+        from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+
+        bridge_data = Mock()
+        bridge_data.scribe_name = "An Awesome Scribe"
+        bridge_data.alchemy_ram_headroom_mb = 2048
+
+        original = pm.enabled_workloads
+        pm.enabled_workloads = lambda bridge_data: frozenset({WorkloadKind.IMAGE_GENERATION})
+        try:
+            assert co_tenant_ram_reserve_bytes(bridge_data) == 0
+        finally:
+            pm.enabled_workloads = original
+
+    def test_the_real_role_derivation_gates_the_scribe_reserve(self) -> None:
+        """Through the real enabled_workloads, the default scribe name with scribe off reserves nothing."""
+        from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+        from horde_worker_regen.process_management.process_manager import (
+            _SCRIBE_CO_TENANT_RAM_BYTES,
+            co_tenant_ram_reserve_bytes,
+        )
+
+        image_only = reGenBridgeData(api_key="0000000000", alchemist=False)
+        assert image_only.scribe_name  # the SDK default is non-empty
+        assert co_tenant_ram_reserve_bytes(image_only) == 0
+
+        with_text = reGenBridgeData(api_key="0000000000", alchemist=False, scribe=True)
+        assert co_tenant_ram_reserve_bytes(with_text) == _SCRIBE_CO_TENANT_RAM_BYTES
 
     def test_raised_overhead_trims_a_context(self) -> None:
         """On a host where the RAM pool binds, reserving co-tenant RAM trims the worker-wide context budget.

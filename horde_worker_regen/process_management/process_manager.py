@@ -623,14 +623,16 @@ def co_tenant_ram_reserve_bytes(bridge_data: reGenBridgeData) -> int:
     Raised into ``target_ram_overhead_bytes`` so the per-card process-count cap sizes resident contexts against
     the RAM the co-tenants actually take, not the whole pool. Returns 0 for an image-only worker (byte-identical
     to prior sizing). An alchemist reserve is the larger of its configured per-form RAM headroom and a floor; a
-    configured scribe adds a fixed floor (its text model's size is not known here, so a coarse guard is used).
-    Never raises on a bad config value.
+    worker serving text generation adds a fixed floor (its text model's size is not known here, so a coarse
+    guard is used). Both gates read the served-workload set, never a name field: the scribe name has a
+    non-empty default, so keying on it reserved the floor in every worker. Never raises on a bad config value.
     """
     reserve = 0
-    if WorkloadKind.ALCHEMY in enabled_workloads(bridge_data):
+    served = enabled_workloads(bridge_data)
+    if WorkloadKind.ALCHEMY in served:
         alchemy_headroom_mb = config_number(getattr(bridge_data, "alchemy_ram_headroom_mb", None)) or 0.0
         reserve += max(_ALCHEMIST_CO_TENANT_RAM_BYTES, int(alchemy_headroom_mb * 1024 * 1024))
-    if getattr(bridge_data, "scribe_name", None):
+    if WorkloadKind.TEXT_GENERATION in served:
         reserve += _SCRIBE_CO_TENANT_RAM_BYTES
     return reserve
 
