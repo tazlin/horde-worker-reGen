@@ -45,11 +45,32 @@ worker cannot see how much, so it reserves a fixed coarse allowance for a co-hos
 decides how many inference processes to run. If you run a large text model next to image generation,
 expect to size your image configuration down.
 
-## Attaching the backend
+## Running the backend
 
-Point `kai_url` at where the backend listens (`http://localhost:5000` by default) and start it before,
-or at the same time as, the worker. The worker polls that address until it reports a loaded model, then
-asks it what it can do, and only then begins popping text jobs.
+By default the worker runs the backend for you (`text_backend_managed: true`). It obtains the program
+(for koboldcpp, a pinned upstream release it downloads and verifies on first use, unless
+`text_backend_executable` names one of your own), starts it on `text_backend_port` with the model file in
+`text_model_path`, waits for it to report a loaded model, and from then on relaunches it if it exits and
+stops it when the worker stops. The backend's own output goes to `logs/text_backend.log`. Which program is
+launched, and with what command line, follows `text_backend_kind`; a kind the worker cannot launch yet is
+refused by name at start-up with the supported list.
+
+The backend runs on the card `text_gpu_device_index` names, or on the lowest driven card when unset. On a
+multi-GPU host, naming a card dedicates it: image generation stops driving that card, so the two workloads
+never compete for its VRAM. On a single-card host the card stays shared whatever is configured, and the
+worker's VRAM accounting sees the backend as memory another process holds. The worker measures the
+backend's footprint once, as the card's free-VRAM drop between launch and ready, and logs it.
+
+Two process facts shape how the worker stops a backend, and they hold for any backend that behaves this
+way. A packaged program may run its real server as a child of the process the worker started (koboldcpp
+does), so the worker stops the whole process tree, children first, and records every process id so a
+worker that died hard can reap them on its next start. And a server that survived a previous run still
+holds its port, so the worker refuses to launch onto a held port and waits, rather than guessing another.
+
+To run the backend yourself instead, set `text_backend_managed: false`, point `kai_url` at where it
+listens (`http://localhost:5000` by default) and start it before, or at the same time as, the worker. The
+worker polls that address until it reports a loaded model, then asks it what it can do, and only then
+begins popping text jobs.
 
 Waiting is the normal case, not an error. A packaged backend unpacks itself and then loads weights from
 disk, which together take a minute or more on a first start. The worker polls quietly through that and
@@ -115,11 +136,9 @@ open on its behalf.
 
 ## What is not supported yet
 
-- **The worker does not own the backend process.** You start the backend and keep it running; the worker
-  attaches to its URL. It does not launch it, restart it after a crash, or stop it on shutdown.
-- **You cannot tell the worker which card to run text generation on.** That is a backend launch option
-  today, so the worker's own VRAM accounting knows nothing about it beyond the coarse co-tenant
-  allowance.
+- **A shared card is not priced.** When the backend shares a card with image generation, the worker's VRAM
+  admission sees the backend's memory only as the card's foreign floor; it does not yet treat the backend
+  as a tenant it can plan around, pause, or wake.
 - **The backend cannot be swapped or reconfigured while the worker runs.** Changing which model the
   backend serves means restarting the backend; the worker will notice when the generation it is waiting
   on fails and re-run its readiness gate, but nothing coordinates the two. Which *kind* of backend is

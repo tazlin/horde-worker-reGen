@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
-from horde_model_reference.text_backend_names import validate_not_backend_prefixed
+from horde_model_reference.text_backend_names import TEXT_BACKENDS, validate_not_backend_prefixed
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ALCHEMY_FORMS
 from horde_sdk.worker.dispatch.ai_horde.bridge_data import CombinedHordeBridgeData
 from loguru import logger
@@ -1139,6 +1139,55 @@ class reGenBridgeData(CombinedHordeBridgeData):
     that floor (a large model on a small card) or when jobs should be given up on sooner.
     """
 
+    text_backend_kind: TEXT_BACKENDS = Field(default=TEXT_BACKENDS.koboldcpp)
+    """Which text backend program serves this worker's text jobs.
+
+    Named in the horde's own vocabulary, so the same value chooses how the backend is launched, which
+    driver talks to it, and how the advertised model name is prefixed. koboldcpp is the default and the
+    first supported backend; a backend the worker cannot launch yet is refused by name at start-up, with
+    the supported list in the message.
+    """
+
+    text_backend_managed: bool = Field(default=True)
+    """If true, the worker launches and supervises the text backend itself.
+
+    The worker obtains the backend's executable (downloading a pinned release for backends distributed
+    that way, unless `text_backend_executable` points at one), starts it on `text_backend_port` with
+    `text_model_path`, waits for it to report a loaded model, relaunches it if it exits, and stops it on
+    shutdown. Set false to attach to a backend you run yourself at `kai_url` instead.
+    """
+
+    text_model_path: Path | None = Field(default=None)
+    """The model artefact the managed backend loads: a GGUF file for koboldcpp.
+
+    Required when `scribe` and `text_backend_managed` are both true. The advertised model name is not
+    derived from this path; set `text_model_name`, or leave it unset to advertise what the backend
+    reports (koboldcpp reports the file's stem).
+    """
+
+    text_backend_executable: Path | None = Field(default=None)
+    """A backend program to launch instead of the one the worker would provision itself.
+
+    Leave unset to let the worker obtain the pinned release for `text_backend_kind`. Set it to run a
+    build of your own, a newer upstream release, or a backend the worker cannot yet provision.
+    """
+
+    text_backend_port: int = Field(default=5001, ge=1, le=65535)
+    """Loopback port the managed backend listens on. The worker refuses to launch onto a port something
+    else still holds, because a backend that survived a previous run is the usual holder."""
+
+    text_gpu_layers: int = Field(default=99, ge=0)
+    """How much of the model the managed backend places on the card, in the backend's own unit (layers
+    for llama.cpp-based backends). A large value means the whole model; 0 keeps it on the CPU."""
+
+    text_gpu_device_index: int | None = Field(default=None, ge=0)
+    """The stable device index of the card the managed backend uses.
+
+    Unset means the lowest driven card, shared with image generation. Naming a card on a multi-GPU host
+    dedicates it to text: it is removed from the image device map, so image work never competes with the
+    backend for its VRAM. On a single-card host the card stays shared whatever is set here.
+    """
+
     enable_vram_budget: bool = Field(default=True)
     """Gate model preloads and concurrent dispatch on a measured VRAM budget.
 
@@ -1622,6 +1671,25 @@ class reGenBridgeData(CombinedHordeBridgeData):
                 "`dreamer`, `alchemist` and `scribe` are all false, so this worker has nothing to serve. "
                 "Enable `dreamer` for image generation, `alchemist` for alchemy forms, or `scribe` for "
                 "text generation in bridgeData.yaml.",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_managed_text_backend(self) -> Self:
+        """Require a model for a text backend the worker launches itself.
+
+        A managed backend without a model cannot start, and the failure would otherwise surface as a
+        relaunch loop minutes after start-up rather than as a configuration error. An attached backend
+        (`text_backend_managed: false`) loads whatever its operator gave it, so nothing is required there.
+
+        Raises:
+            ValueError: `scribe` and `text_backend_managed` are on and `text_model_path` is unset.
+        """
+        if self.scribe and self.text_backend_managed and self.text_model_path is None:
+            raise ValueError(
+                "`scribe` is on and `text_backend_managed` is true, but `text_model_path` is unset. Point it at "
+                "the model file the backend should load, or set `text_backend_managed: false` and run the "
+                "backend yourself at `kai_url`.",
             )
         return self
 

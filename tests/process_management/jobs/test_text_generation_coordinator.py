@@ -154,6 +154,7 @@ def _make_coordinator(
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         api_sessions=make_test_api_sessions(horde_client_session=resolved_session),
         backend=resolved_backend,
+        text_backend_kind=bridge_data.text_backend_kind,
     )
     return coordinator, resolved_backend, resolved_session
 
@@ -302,6 +303,7 @@ def test_a_coordinator_needs_something_to_generate_through() -> None:
             shutdown_manager=Mock(),
             runtime_config=make_test_runtime_config(bridge_data=make_mock_bridge_data(scribe=True)),
             api_sessions=make_test_api_sessions(horde_client_session=_FakeHordeClientSession()),
+            text_backend_kind=TEXT_BACKENDS.koboldcpp,
         )
 
 

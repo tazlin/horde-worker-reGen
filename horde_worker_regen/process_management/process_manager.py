@@ -27,6 +27,7 @@ from aiohttp import ClientSession
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
+from horde_model_reference.text_backend_names import TEXT_BACKENDS
 from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api.ai_horde_clients import (
     AIHordeAPIAsyncClientSession,
@@ -151,6 +152,10 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.process_temperature import classify_process_temperature
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
+from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import (
+    TEXT_BACKEND_LOG_FILE_NAME,
+    TextBackendSupervisor,
+)
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import (
     RecoveryDisposition,
     WorkerRecoveryCoordinator,
@@ -261,7 +266,15 @@ from horde_worker_regen.process_management.workers.safety_orchestrator import Sa
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
-from horde_worker_regen.run_root import abort_sentinel_path
+from horde_worker_regen.run_root import abort_sentinel_path, logs_dir
+from horde_worker_regen.text_backends import (
+    LOOPBACK_HOST,
+    TextBackend,
+    TextBackendLaunchSettings,
+    UnsupportedTextBackendError,
+    build_launch_spec,
+)
+from horde_worker_regen.text_backends.provision import TextBackendProvisionError, provision_executable
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers, mean_across_cards
@@ -457,6 +470,25 @@ def _select_driven_devices(
         )
         return device_map
     return TorchDeviceMap(root=selected)
+
+
+def _exclude_text_backend_device(device_map: TorchDeviceMap, text_device_index: int | None) -> TorchDeviceMap:
+    """Remove the card dedicated to a managed text backend from the image device map.
+
+    A multi-GPU host that names a text card gets one card per workload: the text backend owns its card's
+    VRAM outright and image admission never sees that card, so neither side prices around the other. A
+    single-card host keeps the card shared whatever is configured, because removing the only card would
+    leave image generation with nothing to drive; there the arbiter's foreign-floor reading absorbs the
+    backend's footprint. A card that is not driven (absent or excluded by ``gpu_device_indices``) changes
+    nothing here.
+    """
+    if text_device_index is None or text_device_index not in device_map.root or len(device_map.root) <= 1:
+        return device_map
+    remaining = {index: info for index, info in device_map.root.items() if index != text_device_index}
+    logger.info(
+        f"Device {text_device_index} is dedicated to the text backend; image generation drives {sorted(remaining)}.",
+    )
+    return TorchDeviceMap(root=remaining)
 
 
 def _resolve_inference_concurrency(
@@ -1328,6 +1360,8 @@ class HordeWorkerProcessManager:
             system_resources.device_map,
             self.bridge_data.gpu_device_indices,
         )
+        if self._text_backend_is_managed():
+            self._device_map = _exclude_text_backend_device(self._device_map, self.bridge_data.text_gpu_device_index)
         logger.debug(f"Driving device indices: {sorted(self._device_map.root)}")
 
         # System RAM the worker keeps free. Computed before the runtime plan so the per-card process-count
@@ -2037,6 +2071,8 @@ class HordeWorkerProcessManager:
         # flow polls an address rather than consulting local state, and there is nothing to poll for a
         # worker whose operator never attached a backend.
         self._text_coordinator: TextGenerationCoordinator | None = None
+        self._text_backend_driver: TextBackend | None = None
+        self._text_backend_supervisor: TextBackendSupervisor | None = None
         if WorkloadKind.TEXT_GENERATION in enabled_workloads(bridge_data):
             text_coordinator = TextGenerationCoordinator(
                 state=self._state,
@@ -2044,14 +2080,11 @@ class HordeWorkerProcessManager:
                 runtime_config=self._runtime_config,
                 api_sessions=self._api_sessions,
                 # Built when the flow starts, not here: the driver borrows the shared aiohttp session,
-                # which the main loop only populates once it is running. The flow hands its own backend
-                # kind back, so which backend is built and which one the flow advertises for are one
-                # decision rather than two defaults that can drift.
-                backend_factory=lambda text_backend_kind: build_text_backend(
-                    bridge_data=self.bridge_data,
-                    api_sessions=self._api_sessions,
-                    text_backend_kind=text_backend_kind,
-                ),
+                # which the main loop only populates once it is running. The same driver object is handed
+                # to the backend supervisor when the worker launches the backend itself, so the flow and
+                # the supervisor agree on one address and one readiness view.
+                backend_factory=self._text_backend_for,
+                text_backend_kind=bridge_data.text_backend_kind,
             )
             self._text_coordinator = text_coordinator
             self._flows[WorkloadKind.TEXT_GENERATION] = text_coordinator
@@ -8222,6 +8255,8 @@ class HordeWorkerProcessManager:
                 coroutines.append(self._model_demand_poller_loop())
             if not self.bridge_data._loaded_from_env_vars:
                 coroutines.append(self._bridge_data_reloader.bridge_data_loop())
+            if self._text_backend_is_managed():
+                coroutines.append(self._run_text_backend_supervisor())
 
             tasks = [asyncio.create_task(coro) for coro in coroutines]
             for task in tasks:
@@ -8245,11 +8280,108 @@ class HordeWorkerProcessManager:
                     if isinstance(result, BaseException) and not isinstance(result, CancelledError):
                         logger.error(f"main loop task raised during shutdown: {result}")
             finally:
+                # The text backend is an external program: nothing else reaps it, so it is stopped here,
+                # while the HTTP session its driver borrows is still open, whether the loops ended cleanly
+                # or were cancelled.
+                await self._stop_text_backend_supervisor()
                 # Every loop that can finalize a job (the submitter, and the control loop's post-inference
                 # drain) has returned, so no further job_completed record can be written and the terminal
                 # totals now account for the whole stream. In a finally so a cancelled loop still leaves
                 # the stream terminated.
                 self._record_session_end_once(self._session_end_reason or "graceful_shutdown")
+
+    def _text_backend_is_managed(self) -> bool:
+        """Return whether this worker launches its text backend itself.
+
+        True only for a worker serving text with `text_backend_managed` on and outside a dry run: a dry run
+        has no inference program to launch and the flow talks to the in-process stand-in instead.
+        """
+        bridge_data = self.bridge_data
+        return (
+            WorkloadKind.TEXT_GENERATION in enabled_workloads(bridge_data)
+            and bridge_data.text_backend_managed is True
+            and bridge_data.dry_run_skip_api is not True
+        )
+
+    def _text_backend_base_url(self) -> str | None:
+        """Return the managed backend's loopback URL, or None to use the operator's `kai_url`."""
+        if not self._text_backend_is_managed():
+            return None
+        return f"http://{LOOPBACK_HOST}:{self.bridge_data.text_backend_port}"
+
+    def _text_backend_for(self, text_backend_kind: TEXT_BACKENDS) -> TextBackend:
+        """Return the one driver the text flow and the backend supervisor share, building it on first use.
+
+        Both callers run inside the main loop, after the shared HTTP session exists. One object rather
+        than two so a relaunch the supervisor performs is observed by the flow through the same `ready()`
+        it polls, and so the address is decided once.
+        """
+        if self._text_backend_driver is None:
+            self._text_backend_driver = build_text_backend(
+                bridge_data=self.bridge_data,
+                api_sessions=self._api_sessions,
+                text_backend_kind=text_backend_kind,
+                base_url=self._text_backend_base_url(),
+            )
+        return self._text_backend_driver
+
+    def _text_backend_device_index(self) -> int | None:
+        """Return the card the managed backend uses: the configured one, else the lowest driven card."""
+        configured = self.bridge_data.text_gpu_device_index
+        if configured is not None:
+            return configured
+        if not self._device_map.root:
+            return None
+        return min(self._device_map.root)
+
+    async def _run_text_backend_supervisor(self) -> None:
+        """Provision, launch and keep alive the managed text backend for the worker's lifetime.
+
+        Provisioning may download a pinned release on first use, so it runs in a thread. A backend the
+        worker cannot obtain or cannot launch is logged once with the remedy and the text flow is left
+        waiting on its readiness gate, which is the same state as an attached backend that is not running.
+        """
+        bridge_data = self.bridge_data
+        kind = bridge_data.text_backend_kind
+        model_path = bridge_data.text_model_path
+        if model_path is None:
+            logger.error("The text backend is managed but `text_model_path` is unset; it will not be launched.")
+            return
+        executable = bridge_data.text_backend_executable
+        if executable is None:
+            try:
+                executable = await asyncio.to_thread(provision_executable, kind)
+            except TextBackendProvisionError as error:
+                logger.error(f"Could not obtain the {kind!s} text backend: {error}")
+                return
+        settings = TextBackendLaunchSettings(
+            executable=executable,
+            model_path=model_path,
+            port=bridge_data.text_backend_port,
+            device_index=self._text_backend_device_index(),
+            gpu_layers=bridge_data.text_gpu_layers,
+            context_length=bridge_data.max_context_length,
+            log_path=logs_dir(create=True) / TEXT_BACKEND_LOG_FILE_NAME,
+        )
+        try:
+            launch_spec = build_launch_spec(kind, settings)
+        except UnsupportedTextBackendError as error:
+            logger.error(f"Cannot launch the text backend: {error}")
+            return
+        supervisor = TextBackendSupervisor(
+            launch_spec=launch_spec,
+            backend=self._text_backend_for(kind),
+            owned_registry=self._owned_registry,
+            read_device_free_total_mb=self._read_device_free_total_mb,
+        )
+        self._text_backend_supervisor = supervisor
+        await supervisor.run()
+
+    async def _stop_text_backend_supervisor(self) -> None:
+        """Stop the managed text backend's process tree, if one was started."""
+        if self._text_backend_supervisor is None:
+            return
+        await self._text_backend_supervisor.stop()
 
     def _cancel_main_loop_siblings(self, tasks: list[asyncio.Task[None]]) -> None:
         """Cancel background loops after the control loop has completed final child teardown.

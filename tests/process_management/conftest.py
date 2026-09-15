@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
+from horde_model_reference.text_backend_names import TEXT_BACKENDS
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
 from pydantic import JsonValue
 
@@ -342,6 +343,13 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.text_model_name = None
     bd.text_threads = 1
     bd.text_generation_timeout_seconds = None
+    bd.text_backend_kind = TEXT_BACKENDS.koboldcpp
+    bd.text_backend_managed = False
+    bd.text_model_path = None
+    bd.text_backend_executable = None
+    bd.text_backend_port = 5001
+    bd.text_gpu_layers = 99
+    bd.text_gpu_device_index = None
     bd.aesthetic_scoring_enabled = True
     bd.forms = []
     bd.image_models_to_skip = None

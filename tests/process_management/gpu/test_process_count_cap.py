@@ -196,7 +196,7 @@ class TestCoTenantReserveShrinksTheContextBudget:
         assert image_only.scribe_name  # the SDK default is non-empty
         assert co_tenant_ram_reserve_bytes(image_only) == 0
 
-        with_text = reGenBridgeData(api_key="0000000000", alchemist=False, scribe=True)
+        with_text = reGenBridgeData(api_key="0000000000", alchemist=False, scribe=True, text_backend_managed=False)
         assert co_tenant_ram_reserve_bytes(with_text) == _SCRIBE_CO_TENANT_RAM_BYTES
 
     def test_raised_overhead_trims_a_context(self) -> None:

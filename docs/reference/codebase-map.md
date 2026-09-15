@@ -26,6 +26,8 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Post-processing lane dispatch          | `process_management/workers/post_process_orchestrator.py` (`PostProcessOrchestrator`) |
 | Disaggregated pipeline stages          | `process_management/workers/disaggregation_orchestrator.py`, `component_lane_process.py`, `inference_process.py`, `vae_lane_process.py` |
 | Alchemy pop / dispatch / submit        | `process_management/jobs/alchemy_popper.py` (`AlchemyCoordinator`) |
+| Text pop / generate / submit           | `process_management/jobs/text_generation_coordinator.py` (`TextGenerationCoordinator`, `advertised_model_name`, `build_text_backend`); generation happens in an external program, so there is no child process |
+| Launching and keeping alive the external text backend | `process_management/lifecycle/text_backend_supervisor.py` (`TextBackendSupervisor`); the command line comes from `text_backends/launch.py` (`build_launch_spec`, keyed by `TEXT_BACKENDS`) and the executable from `text_backends/provision.py` |
 | Parsing child-to-parent messages       | `process_management/ipc/message_dispatcher.py` (`MessageDispatcher`) |
 | IPC message and enum definitions       | `process_management/ipc/messages.py`                               |
 | Starting / replacing child processes, and pinning each auxiliary lane to its card | `process_management/lifecycle/process_lifecycle.py` (`ProcessLifecycleManager`) |

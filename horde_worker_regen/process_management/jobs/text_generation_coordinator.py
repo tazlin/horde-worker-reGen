@@ -282,7 +282,8 @@ def build_text_backend(
     *,
     bridge_data: reGenBridgeData,
     api_sessions: ApiSessions,
-    text_backend_kind: TEXT_BACKENDS = TEXT_BACKENDS.koboldcpp,
+    text_backend_kind: TEXT_BACKENDS,
+    base_url: str | None = None,
 ) -> TextBackend:
     """Create the backend the text flow generates through for this worker's configuration.
 
@@ -300,6 +301,8 @@ def build_text_backend(
         api_sessions: The shared session holder the driver borrows its HTTP session from.
         text_backend_kind: Which backend is attached, which the stand-in mimics. A backend that does not
             speak the KoboldAI API would also select a different driver here.
+        base_url: Where the backend listens. None means the operator's `kai_url`; a worker that launches
+            the backend itself passes the loopback URL of the process it started.
 
     Returns:
         A backend satisfying the protocol; which implementation is an implementation detail above here.
@@ -310,7 +313,10 @@ def build_text_backend(
             response_text=DRY_RUN_GENERATION_TEXT,
             latency_seconds=bridge_data.dry_run_inference_delay,
         )
-    return KoboldApiTextBackend(bridge_data.kai_url, api_sessions.require_aiohttp_session())
+    return KoboldApiTextBackend(
+        base_url if base_url is not None else bridge_data.kai_url,
+        api_sessions.require_aiohttp_session(),
+    )
 
 
 @dataclass
@@ -352,7 +358,7 @@ class TextGenerationCoordinator:
         api_sessions: ApiSessions,
         backend: TextBackend | None = None,
         backend_factory: Callable[[TEXT_BACKENDS], TextBackend] | None = None,
-        text_backend_kind: TEXT_BACKENDS = TEXT_BACKENDS.koboldcpp,
+        text_backend_kind: TEXT_BACKENDS,
     ) -> None:
         """Initialize with the shared main-process collaborators and the backend to generate through.
 
