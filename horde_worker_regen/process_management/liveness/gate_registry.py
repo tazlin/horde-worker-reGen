@@ -565,6 +565,18 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at="the repeated configuration error line, and the last_pop_gate stamp",
     ),
     GateEntry(
+        key="image_generation_not_served",
+        surface=GateSurface.POP_GATE,
+        kind=GateKind.HOLD,
+        subsystem="process_management.jobs.job_popper",
+        engaged_by="the dreamer role is off, so the worker serves alchemy or text only and composes no image offer",
+        released_by="the operator turning the dreamer role on, which a config reload picks up",
+        bound_seconds=None,
+        bound_source="",
+        backstop=("none by design; the operator chose not to serve image work, and the other flows are unaffected"),
+        observable_at="the last_pop_gate stamp",
+    ),
+    GateEntry(
         key="megapixelstep_wait",
         surface=GateSurface.POP_GATE,
         kind=GateKind.HOLD,

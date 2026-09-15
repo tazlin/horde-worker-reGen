@@ -134,6 +134,13 @@ bounded time for those jobs to report themselves faulted, and closes. The wait i
 backend is another program: it may have no abort route, or may ignore one, and the worker cannot be held
 open on its behalf.
 
+## Testing against the live horde without serving strangers
+
+Put the scribe worker into maintenance on the horde (the worker's page, or `PUT /v2/workers/{id}` with
+`maintenance: true`). The horde then refuses every pop from it, but still routes requests made under the
+owner's own API key to it, so a request that names the worker in `workers` is served by it and nobody
+else's traffic reaches it. The worker logs the hold once when it begins and once when pops resume.
+
 ## What is not supported yet
 
 - **A shared card is not priced.** When the backend shares a card with image generation, the worker's VRAM

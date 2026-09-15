@@ -49,6 +49,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     TextGenerateJobPopResponse,
     TextGenerationJobSubmitRequest,
 )
+from horde_sdk.ai_horde_api.consts import RC
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import derive_text_generation_timeout_seconds, reGenBridgeData
@@ -396,6 +397,7 @@ class TextGenerationCoordinator:
 
         self._in_flight: dict[str, TextJobInFlight] = {}
         self._job_tasks: set[asyncio.Task[None]] = set()
+        self._maintenance_hold_logged = False
 
         self._advertisement: TextFlowAdvertisement | None = None
         """What the backend's last description lets the worker offer. None until the gate has passed."""
@@ -560,11 +562,25 @@ class TextGenerationCoordinator:
         self._last_pop_time = time.time() + (self._error_pop_frequency - self._pop_frequency)
 
     def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
-        """Log a text pop error, with actionable guidance for the common, recoverable causes."""
+        """Log a text pop error, with actionable guidance for the common, recoverable causes.
+
+        A worker in maintenance is refused every pop with the operator's own maintenance message as the
+        text and ``WorkerMaintenance`` as the return code. That is a deliberate operator state, not a
+        fault, so it is announced once when it begins (and the resumption once, in the pop path) and
+        repeats stay at TRACE; the horde still routes the owner's own requests to such a worker.
+        """
+        if response.rc == RC.WorkerMaintenance:
+            if not self._maintenance_hold_logged:
+                logger.info(
+                    f"Text pops are held: this worker is in maintenance on the horde ({response.message!r}). "
+                    "Only its owner's requests reach it until maintenance is lifted.",
+                )
+                self._maintenance_hold_logged = True
+            else:
+                logger.trace(f"Text pop refused while in maintenance: {response.message!r}")
+            return
         message_lower = response.message.lower()
-        if "maintenance mode" in message_lower:
-            logger.warning(f"Failed to pop text job (Maintenance Mode): {response}")
-        elif "wrong credentials" in message_lower:
+        if "wrong credentials" in message_lower:
             logger.warning(f"Failed to pop text job (Wrong Credentials): {response}")
             logger.error("Did you set a unique `scribe_name` in bridgeData.yaml?")
             logger.error(
@@ -604,6 +620,9 @@ class TextGenerationCoordinator:
             self._enter_pop_error_backoff()
             return
 
+        if self._maintenance_hold_logged:
+            logger.info("Text pops resumed: the horde is accepting this worker's pops again.")
+            self._maintenance_hold_logged = False
         self._start_popped_jobs(pop_response)
 
     def _start_popped_jobs(self, pop_response: TextGenerateJobPopResponse) -> None:

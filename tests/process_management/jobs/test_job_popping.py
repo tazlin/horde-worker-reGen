@@ -26,7 +26,7 @@ from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
-from horde_worker_regen.process_management.config.worker_state import RecoveryParkReason, WorkerState
+from horde_worker_regen.process_management.config.worker_state import PopGate, RecoveryParkReason, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -316,6 +316,28 @@ class TestApiJobPopGuardClauses:
         process_map = _make_process_map_with_available_processes()
         popper = _make_popper(process_map=process_map, image_models_to_load=[])
         await popper.api_job_pop()
+        sleep.assert_awaited_once_with(3)
+
+    async def test_dreamer_off_holds_quietly_without_a_configuration_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A worker that deselected image generation stamps its own gate and logs no models error."""
+        sleep = AsyncMock()
+        monkeypatch.setattr("horde_worker_regen.process_management.jobs.job_popper.asyncio.sleep", sleep)
+        state = WorkerState()
+        process_map = _make_process_map_with_available_processes()
+        bridge_data = make_mock_bridge_data(dreamer=False, image_models_to_load=[])
+        popper = _make_popper(state=state, process_map=process_map, bridge_data=bridge_data)
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="TRACE")
+        try:
+            await popper.api_job_pop()
+        finally:
+            logger.remove(sink_id)
+
+        assert state.last_pop_gate == str(PopGate.IMAGE_GENERATION_NOT_SERVED)
+        assert not any("No models are configured" in message for message in messages)
         sleep.assert_awaited_once_with(3)
 
     async def test_too_frequent_pop_returns_early(self) -> None:

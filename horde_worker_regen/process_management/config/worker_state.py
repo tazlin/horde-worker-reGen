@@ -47,6 +47,8 @@ class PopGate(enum.StrEnum):
     """No inference process is available to take work."""
     NO_MODELS_CONFIGURED = "no_models_configured"
     """The configuration names no image models to load, so no offer can be composed."""
+    IMAGE_GENERATION_NOT_SERVED = "image_generation_not_served"
+    """The dreamer role is off, so this worker serves no image jobs and the image popper stays quiet."""
     MEGAPIXELSTEP_WAIT = "megapixelstep_wait"
     """The megapixelstep governor is letting large in-flight work drain before more is accepted."""
     POP_FREQUENCY_GATE = "pop_frequency_gate"

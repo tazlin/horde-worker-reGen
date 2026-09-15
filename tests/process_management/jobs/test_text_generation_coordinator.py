@@ -29,6 +29,8 @@ from horde_sdk.ai_horde_api.apimodels import (
     TextGenerateJobPopResponse,
     TextGenerationJobSubmitRequest,
 )
+from horde_sdk.ai_horde_api.consts import RC
+from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.jobs import text_generation_coordinator
@@ -634,3 +636,29 @@ async def _drain_job_tasks(coordinator: TextGenerationCoordinator) -> None:
     tasks = set(coordinator._job_tasks)
     if tasks:
         await asyncio.wait(tasks, timeout=10.0)
+
+
+async def test_a_maintenance_refusal_is_announced_once_and_resumption_once() -> None:
+    """A worker in maintenance is refused every pop; that is an operator state, so it is one line each way."""
+    coordinator, _backend, session = _make_coordinator()
+    assert await coordinator.await_backend_ready() is True
+    refusal = RequestErrorResponse(rc=RC.WorkerMaintenance, message="owner-only traffic")
+    logged: list[tuple[str, str]] = []
+    sink_id = logger.add(lambda m: logged.append((m.record["level"].name, m.record["message"])), level="TRACE")
+    try:
+        coordinator._handle_pop_error_response(refusal)
+        coordinator._handle_pop_error_response(refusal)
+        coordinator._handle_pop_error_response(refusal)
+
+        held_lines = [level for level, message in logged if "Text pops are held" in message]
+        assert held_lines == ["INFO"]
+        assert not any("API Error" in message for _level, message in logged)
+        assert sum(1 for level, _message in logged if level == "TRACE") == 2
+
+        coordinator._last_pop_time = 0.0
+        await coordinator.api_text_pop()
+
+        assert len(session.pop_requests) == 1
+        assert [level for level, message in logged if "Text pops resumed" in message] == ["INFO"]
+    finally:
+        logger.remove(sink_id)

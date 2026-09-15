@@ -1916,6 +1916,14 @@ class JobPopper:
 
         cur_time = time.time()
         bridge_data = self._runtime_config.bridge_data
+        if bridge_data.dreamer is False:
+            # The operator deselected image generation (an alchemist-only or scribe-only worker). The role
+            # coercion has already emptied the image model list, so without this gate every cycle would
+            # report a configuration error for a configuration that is exactly what was asked for.
+            self._state.last_pop_no_jobs_available = False
+            self._note_pop_gate(PopGate.IMAGE_GENERATION_NOT_SERVED)
+            await asyncio.sleep(3)
+            return
 
         idle_fill_wanted = self._state.wants_idle_fill_candidate
         if idle_fill_wanted:
