@@ -412,6 +412,16 @@
           <div class="fact"><span class="label">Completed / faulted</span><b><span id="alchemy-done">0</span> / <span id="alchemy-faulted">0</span></b></div>
         </div>
       </section>
+      <section class="secondary" id="text-section" hidden>
+        <h2>Text generation</h2>
+        <div class="facts">
+          <div class="fact"><span class="label">Backend</span><b id="text-backend">Not ready</b></div>
+          <div class="fact"><span class="label">Model</span><b id="text-model">-</b></div>
+          <div class="fact"><span class="label">In flight</span><b id="text-in-flight">0</b></div>
+          <div class="fact"><span class="label">Completed / faulted</span><b><span id="text-done">0</span> / <span id="text-faulted">0</span></b></div>
+          <div class="fact"><span class="label">Token rate</span><b id="text-rate">not reported</b></div>
+        </div>
+      </section>
       <section class="secondary">
         <h2>Active models</h2>
         <div class="models" id="models"><span class="detail">No active models.</span></div>
@@ -532,8 +542,9 @@
           stage.textContent = humanState(job.stage);
           const main = document.createElement("div");
           main.className = "row-main";
+          const isText = job.workload === "text_generation";
           const name = document.createElement("b");
-          name.textContent = job.model || "Image request";
+          name.textContent = job.model || (isText ? "Text request" : "Image request");
           name.title = name.textContent;
           const detail = document.createElement("small");
           detail.textContent = `job ${shortId(job.job_id)}${job.process_id === null ? "" : ` · process ${job.process_id}`}`;
@@ -541,10 +552,16 @@
           addProgress(main, job.progress_percent);
           const meta = document.createElement("span");
           meta.className = "row-meta";
+          // A row whose unit has no total has arrival without a fraction, so it shows the count it does
+          // have in the unit it counted, rather than a percentage nothing supports.
+          const counted = job.progress_current === null || job.progress_current === undefined
+            ? null
+            : `${formatNumber(job.progress_current)} ${job.progress_unit}`;
           const progress = job.progress_percent === null
-            ? (job.stage === "queued" ? "waiting" : "working")
+            ? (counted || (job.stage === "queued" ? "waiting" : "working"))
             : `${Math.round(job.progress_percent)}%`;
-          const speed = job.iterations_per_second ? ` · ${job.iterations_per_second.toFixed(1)} it/s` : "";
+          const rateUnit = isText ? "tok/s" : "it/s";
+          const speed = job.iterations_per_second ? ` · ${job.iterations_per_second.toFixed(1)} ${rateUnit}` : "";
           meta.textContent = `${progress}${speed}`;
           row.append(stage, main, meta);
           jobs.appendChild(row);
@@ -584,7 +601,13 @@
             : (process.vram_total_mb ? `${(process.vram_used_mb / 1024).toFixed(1)}/${(process.vram_total_mb / 1024).toFixed(0)} GB` : `${formatNumber(process.vram_used_mb)} MB`);
           const age = process.is_external ? process.health_age_seconds : process.heartbeat_age_seconds;
           const heartbeat = age === null || age === undefined ? "" : ` · ${Math.round(age)}s`;
-          meta.textContent = `${card}${vram}${heartbeat}`;
+          const requests = process.is_external && (process.active_requests || process.queued_requests)
+            ? ` · ${formatNumber(process.active_requests)} active, ${formatNumber(process.queued_requests)} queued`
+            : "";
+          const rate = process.is_external && process.tokens_per_second
+            ? ` · ${process.tokens_per_second.toFixed(1)} tok/s`
+            : "";
+          meta.textContent = `${card}${vram}${requests}${rate}${heartbeat}`;
           row.append(kind, main, meta);
           processes.appendChild(row);
         });
@@ -659,6 +682,18 @@
         setText("alchemy-submitting", formatNumber(state.alchemy_submitting));
         setText("alchemy-done", formatNumber(state.alchemy_submitted));
         setText("alchemy-faulted", formatNumber(state.alchemy_faulted));
+        const textTotal = state.text_in_flight + state.text_submitted + state.text_faulted;
+        byId("text-section").hidden = textTotal === 0 && !state.text_backend_ready && !state.text_model;
+        setText("text-backend", state.text_backend_ready ? "Ready" : "Not ready");
+        setText("text-model", state.text_model || "-");
+        setText("text-in-flight", formatNumber(state.text_in_flight));
+        setText("text-done", formatNumber(state.text_submitted));
+        setText("text-faulted", formatNumber(state.text_faulted));
+        // A backend without a statistics route counts no tokens for its whole life, so the absence is a
+        // property of the build rather than of this moment and is named instead of shown as a dash.
+        setText("text-rate", state.text_tokens_per_second === null || state.text_tokens_per_second === undefined
+          ? "not reported"
+          : `${state.text_tokens_per_second.toFixed(1)} tok/s`);
 
         const models = byId("models");
         models.replaceChildren();

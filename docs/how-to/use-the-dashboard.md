@@ -139,9 +139,16 @@ finished in each slice of the last fifteen minutes, so a worker that stops earni
 baseline within a couple of minutes. Below it are the requests in flight with their progress, and the
 last few finished.
 
+A scribe worker's text requests sit in the same two places. The offers line names text generation and
+the model the backend loaded; the requests in flight carry a text generation's own progress, as a
+percentage where the backend counts tokens and as the count of stream records where it does not; and a
+finished text request names the model, the tokens it produced when they were counted, how long it took
+and what it earned.
+
 One card appears only when something is off: a health finding, maintenance holding new requests back,
-the worker waiting after repeated trouble reaching the horde, or processes it restarted on its own this
-session. A healthy worker shows no such card, so seeing one is itself the signal.
+the worker waiting after repeated trouble reaching the horde, processes it restarted on its own this
+session, a text backend that has not reported a loaded model, or a text request that has stopped
+producing words. A healthy worker shows no such card, so seeing one is itself the signal.
 
 ### Appearance
 
@@ -200,6 +207,14 @@ an allocator reading like the inference slots', so the two are not comparable. T
 long ago the backend last answered a readiness probe, which the worker asks only while it is starting, so
 that figure grows while it serves and is not a sign of trouble.
 
+A scribe worker also gets a **Text** panel beside the alchemy one. It states whether the backend has
+reported a loaded model (and how long it has not, when it has not), the model it loaded, the context and
+generation limits the worker advertises, the session's in-flight, completed and faulted counts with the
+kudos text earned, and the most recent token rate. A backend that counts no tokens says so in place of
+the rate rather than showing a dash, because the absence holds for that backend's whole life rather than
+for this moment. On a worker whose only role is scribe, the worker panel names it **Scribe** with the
+scribe identity, as an alchemist-only worker is named for its alchemist.
+
 A **Governance** panel consolidates the pop governors and the scheduler's RAM and preload diagnostics;
 its title says how many governors are actively holding work back. Multi-GPU workers also get a
 per-card strip (one row per GPU: VRAM bar, contexts, active jobs).
@@ -228,6 +243,19 @@ Alchemy forms appear in the ledger and the Queue as their own rows, with the for
 goes (prefixed `⚗`) and the source image's resolution as the size. In pipeline-disaggregation mode the
 ledger also carries a per-job stage line (prefixed `Disagg:`) showing where each in-flight job sits in
 its pipeline and which process holds its current stage.
+
+Text generations are ledger rows too: queued until the backend takes one, then `inference` while it
+produces output, with no process or GPU, since they run in a separate program the worker reaches over
+HTTP. What the Progress cell counts depends on what the backend can report, and the cell names its unit:
+
+| Cell | Meaning |
+|------|---------|
+| `40/160 tokens` | The backend counts its own tokens, measured against the length the request asked for. |
+| `???????? 12 chunks` | The backend counts none, so the row shows the stream records that have arrived. Twelve records is not twelve tokens, and there is no total to divide by, so the bar is indeterminate rather than showing a percentage. |
+| `16.0 tok/s` in the `it/s` column | Generated tokens per second, shown only where the backend counts them. |
+
+Only a backend built with the per-request statistics route counts tokens; a stock one reports the text
+arriving and nothing a token count can honestly be derived from.
 
 #### Trends
 
@@ -258,7 +286,7 @@ RAM are always in the status bar.
 The layout follows the width in every density. Below about 100 columns everything stacks in one column,
 and tables shed their least-important columns rather than truncating (an 80-column terminal is
 first-class). At about 100 columns Health sits beside GPUs and the job pipeline. At about 165 columns
-the worker, alchemy, and residency panels spread three-up.
+the worker, alchemy, text, and residency panels spread three-up.
 
 ### Stats
 
@@ -270,6 +298,12 @@ The tables roll finalized image jobs up by model and by baseline, carrying jobs,
 (`width x height / 1,000,000 x steps x batch`), sampling time, end-to-end time, and how many jobs ran a
 batch above one. An alchemist worker also gets a per-form table: kind (graph or CLIP), forms completed,
 faults, average and total pop-to-submit time, and peak VRAM.
+
+A worker that served more than one workload also gets a **By workload totals** table: completed,
+faulted and kudos for each of image generation, alchemy and text generation, plus the mean tokens per
+text job where the backend counted them. The headline counters above are one pair for the whole worker
+and cannot say which flow earned what; a worker serving one workload sees no such table, because its
+headline figures already are the split.
 
 **JSONL export** toggles session-scoped stats export under `.horde_worker_regen/stats/`. It is off by
 default, rotates at 5 MiB per file, and warns once retained files exceed 50 MiB. Compress or downsample
@@ -497,7 +531,10 @@ responsive HTML rather than the terminal canvas, which makes it the practical qu
 phone. It shows worker identity and uptime, lifecycle and maintenance state, pipeline depth, session
 job and kudos totals, GPU duty, active models, recent horde messages, active-job stage and progress,
 per-process liveness, model, VRAM and heartbeat state, and alchemy totals when enabled. Its **At a
-glance** sentence leads with whatever best explains what the worker is doing now.
+glance** sentence leads with whatever best explains what the worker is doing now. A scribe worker adds
+a **Text generation** section (backend readiness, model, in flight, completed and faulted, token rate),
+its generations appear in **Active work** with the unit they count, and the text backend's own row
+carries how many requests it is producing and how many are waiting for it.
 
 Its controls are deliberately few: start, graceful stop, local pause/resume, and horde maintenance.
 **Pause** stops this worker from accepting new work locally; **Horde maintenance** changes the worker's

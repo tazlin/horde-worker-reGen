@@ -18,9 +18,10 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PopGovernorsSnapshot,
     StatsRollupRow,
     WorkerStateSnapshot,
+    WorkloadTotalsSnapshot,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
-from horde_worker_regen.process_management.scheduling.workload_flow import capability_for_alchemy_form
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind, capability_for_alchemy_form
 from horde_worker_regen.tui.formatters import (
     format_percent,
     human_bytes,
@@ -71,6 +72,7 @@ class StatsView(Vertical):
             yield Static(id="stats-governors")
             yield Static(id="stats-model-pool")
             yield Static(id="stats-export")
+            yield Static(id="stats-by-workload")
             yield Static(id="stats-by-model")
             yield Static(id="stats-by-baseline")
             yield Static(id="stats-by-form")
@@ -126,6 +128,12 @@ class StatsView(Vertical):
             pool_static.display = False
             seated_models = frozenset()
         self.query_one("#stats-export", Static).update(self._render_export(snapshot))
+        # One workload's totals are already the headline figures, so the split earns its space only on a
+        # worker that served more than one of them.
+        workload_static = self.query_one("#stats-by-workload", Static)
+        workload_static.display = len(snapshot.workload_totals) > 1
+        if workload_static.display:
+            workload_static.update(self._render_workload_totals(snapshot.workload_totals))
         self.query_one("#stats-by-model", Static).update(
             self._render_rollups("By model totals", snapshot.stats_model_rollups, seated_models=seated_models)
         )
@@ -329,6 +337,41 @@ class StatsView(Vertical):
             border_style="grey37",
             padding=(0, 1),
         )
+
+    _WORKLOAD_LABELS: dict[WorkloadKind, str] = {
+        WorkloadKind.IMAGE_GENERATION: "Image generation",
+        WorkloadKind.ALCHEMY: "Alchemy",
+        WorkloadKind.TEXT_GENERATION: "Text generation",
+    }
+    """How each workload is named in the split. A workload with no entry here is shown by its own value,
+    so a worker newer than this dashboard still names its rows."""
+
+    @classmethod
+    def _render_workload_totals(cls, totals: dict[WorkloadKind, WorkloadTotalsSnapshot]) -> Panel:
+        """Render this session's completed, faulted and earned figures split by workload.
+
+        The headline counters are one pair for the whole worker, which says nothing about which flow
+        earned what on a worker serving more than one. Only text carries a mean token count, and only
+        against a backend that counts its own tokens, so the column is otherwise a dash rather than a
+        zero a reader would take for a measurement.
+        """
+        table = Table(expand=True, border_style="grey37", header_style="bold")
+        table.add_column("Workload", no_wrap=True)
+        table.add_column("Completed", justify="right")
+        table.add_column("Faulted", justify="right")
+        table.add_column("Kudos", justify="right")
+        table.add_column("Mean tokens", justify="right")
+        for workload, row in sorted(totals.items(), key=lambda item: item[0].value):
+            faulted = Text(f"{row.faulted:,}", style="red" if row.faulted else "grey50")
+            mean_tokens = "-" if row.mean_generated_tokens is None else f"{row.mean_generated_tokens:,.0f}"
+            table.add_row(
+                cls._WORKLOAD_LABELS.get(workload, workload.value),
+                f"{row.completed:,}",
+                faulted,
+                f"{row.kudos:,.1f}",
+                mean_tokens,
+            )
+        return Panel(table, title="By workload totals", title_align="left", border_style="grey37", padding=(0, 1))
 
     @staticmethod
     def _render_form_rollups(rows: list[StatsRollupRow]) -> Panel:

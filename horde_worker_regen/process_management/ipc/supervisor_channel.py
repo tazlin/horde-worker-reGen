@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 25
+SUPERVISOR_PROTOCOL_VERSION = 26
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -96,6 +96,15 @@ v25 makes a supervised external process a row in the process surfaces without en
 :class:`SupervisedProcessSnapshotSource` is the one method such a process implements to produce its row.
 A map-derived row leaves every added field at its default, so a v25 snapshot of an image-only worker is
 what v24 produced.
+v26 puts a text generation in flight on the surfaces that already show work. ``WorkLedgerEntry`` gains
+``workload``, ``progress_unit`` (:class:`WorkLedgerProgressUnit`) and ``progress_age_seconds`` so a text
+row states what its progress counts and how long since it last moved; :class:`TextBackendActivity` carries
+the requests and token rate only the text flow can see onto the backend's row; ``RecentJobRecord`` gains
+``generated_tokens``; and the snapshot gains ``workload_totals``
+(:class:`WorkloadTotalsSnapshot` per workload), ``text_backend_not_ready_since`` and
+``snapshot_interval_seconds``, with ``text_stall_seconds`` and ``text_backend_ready_patience_seconds``
+on the config summary so the dashboard's text checks derive their thresholds from the worker rather than
+restating them.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -205,18 +214,46 @@ class WorkLedgerStage(enum.StrEnum):
     FAULTED = "faulted"
 
 
+class WorkLedgerProgressUnit(enum.StrEnum):
+    """What a work-ledger row's ``progress_current``/``progress_total`` count.
+
+    An image job's progress has always been sampler steps and is rendered without a unit word, because
+    that is what a reader of the column assumes. A text generation counts something else, and which of
+    the two it counts depends on what its backend can report, so the row says so rather than leaving a
+    reader to infer it from the model name.
+    """
+
+    STEPS = "steps"
+    TOKENS = "tokens"
+    """Tokens the backend itself counted; only a backend with a statistics route reports them."""
+    CHUNKS = "chunks"
+    """Stream records that have arrived, which is not a token count and has no total to divide by."""
+
+
 class WorkLedgerEntry(BaseModel):
     """One active or recently-finished job row for the Overview work ledger."""
 
     job_id: str
     stage: WorkLedgerStage
+    workload: WorkloadKind = WorkloadKind.IMAGE_GENERATION
+    """Which workload this row's work belongs to, so one ledger can carry all three."""
     model: str | None = None
     baseline: str | None = None
     process_id: int | None = None
     device_index: int | None = None
     progress_current: int | None = None
     progress_total: int | None = None
+    progress_unit: WorkLedgerProgressUnit = WorkLedgerProgressUnit.STEPS
+    """What the two progress figures count. A total is absent whenever the unit cannot supply one."""
+    progress_age_seconds: float | None = None
+    """Seconds since this row's progress last advanced, or None when nothing measures it.
+
+    Filled where the flow observes the work arriving continuously (a streamed text generation), so a row
+    that has stopped moving can be told from one that is moving slowly. An image job's staleness is read
+    from its process's heartbeat instead, so its rows leave this unset."""
     iterations_per_second: float | None = None
+    """The rate the work is arriving at: sampler iterations for an image job, generated tokens for a text
+    one, and None wherever the flow has no measured figure."""
     width: int | None = None
     height: int | None = None
     steps: int | None = None
@@ -313,6 +350,17 @@ class WorkerConfigSummary(BaseModel):
 
     Each role registers as its own separately-named worker on the horde, so this is never the dreamer's
     name. None when the role is off."""
+    text_stall_seconds: float = 30.0
+    """How long the worker lets a begun generation stay silent before it abandons the job.
+
+    Carried so the dashboard's stall check fires on the worker's own patience rather than a figure of its
+    own; the default is the bridge-data default, which is what a worker that predates the field meant."""
+    text_backend_ready_patience_seconds: float = 120.0
+    """How long the readiness gate waits before it says out loud that the backend has not answered.
+
+    The same figure the gate's own log line uses, so the check and the log agree about when a cold start
+    has stopped being a cold start. Not operator-configurable today; it rides the config summary because
+    that is where the dashboard's text thresholds come from."""
 
 
 class ResidentComponentEntry(BaseModel):
@@ -345,6 +393,26 @@ print an id numerically need no special case. Each supervised process takes a fi
 
 TEXT_BACKEND_PROCESS_ID = SUPERVISED_PROCESS_ID_BASE
 """The reserved row id of the supervised text backend (offset 0); one backend is supervised at a time."""
+
+
+class TextBackendActivity(BaseModel):
+    """Represents what the text flow is currently asking of its backend, for the backend's row.
+
+    The supervisor watches the process and never sees a generation, so these three figures reach the row
+    from the coordinator that owns the jobs. Handed to
+    [`to_process_snapshot`][horde_worker_regen.process_management.lifecycle.text_backend_supervisor.TextBackendSupervisor.to_process_snapshot]
+    rather than held by the supervisor, so no copy of them can go stale between snapshots.
+    """
+
+    active_requests: int = 0
+    """Generations the backend has begun producing output for."""
+    queued_requests: int = 0
+    """Jobs the worker has popped and not yet had taken, including one a busy backend turned away."""
+    tokens_per_second: float | None = None
+    """The most recent rate any in-flight generation reported, or None when none of them can report one.
+
+    A stock backend counts no tokens, so this stays None for its whole life rather than being derived
+    from stream records, which carry an arbitrary number of tokens each."""
 
 
 class TextBackendDetail(BaseModel):
@@ -551,6 +619,11 @@ class SupervisedProcessSnapshotSource(Protocol):
 
     Runtime-checkable so an assembly can assert a stand-in still produces a row; the check confirms the
     method is present, not that what it returns is honest.
+
+    An implementation may take further optional arguments for facts it cannot see for itself, which the
+    snapshot builder then supplies (the text backend's supervisor takes a :class:`TextBackendActivity`:
+    it watches the process and never sees a generation). Anything asked for that way is optional, so a
+    caller holding only this protocol still gets a complete row.
     """
 
     def to_process_snapshot(self) -> ProcessSnapshot:
@@ -585,6 +658,9 @@ class RecentJobRecord(BaseModel):
     features: JobFeatureSummary | None = None
     kudos_reward: float | None = None
     """What the horde paid for this job, or None when no reward is known (faulted, or never delivered)."""
+    generated_tokens: int | None = None
+    """Tokens a text generation produced, or None for every other workload and for a backend that counts
+    none of its own."""
 
     @classmethod
     def from_metrics_record(
@@ -630,7 +706,30 @@ class RecentJobRecord(BaseModel):
             sampler=sampler,
             features=features,
             kudos_reward=record.kudos_reward,
+            generated_tokens=record.generated_tokens,
         )
+
+
+class WorkloadTotalsSnapshot(BaseModel):
+    """Represents one workload's session totals, for a per-workload read of a run.
+
+    The wire twin of ``run_metrics.WorkloadTotals``, duplicated here rather than imported so this module
+    stays a leaf the metrics layer can depend on without a cycle (as :class:`ResidentComponentEntry`
+    twins the child's held-component report). Derived from the finished-job records, so a worker serving
+    three workloads has three sets of headline numbers instead of one pair that describes none of them.
+    """
+
+    completed: int = 0
+    """Records for work that did not fault."""
+    faulted: int = 0
+    """Records for work that faulted. With :attr:`completed` this partitions the workload's records."""
+    kudos: float = 0.0
+    """Kudos the horde paid for this workload's completed work; 0.0 when no record carried a reward."""
+    mean_generated_tokens: float | None = None
+    """Mean tokens per record for the records that reported a token count, or None when none did.
+
+    Only a text workload can carry this, and only against a backend that counts its own tokens; a stock
+    one reports nothing a mean could be taken of."""
 
 
 class StatsSample(BaseModel):
@@ -1455,6 +1554,23 @@ class WorkerStateSnapshot(BaseModel):
     backend's. None before the backend has answered."""
     text_max_length: int | None = None
     """The largest generation length offered, on the same basis as :attr:`text_context_length`."""
+    text_backend_not_ready_since: float | None = None
+    """When the readiness gate last opened, or None while the backend is ready or never had a flow.
+
+    A gate that has been open for a long time is the difference between a backend still loading weights
+    and one the operator never started, and a boolean cannot tell them apart."""
+
+    workload_totals: dict[WorkloadKind, WorkloadTotalsSnapshot] = Field(default_factory=dict)
+    """This session's completed/faulted/kudos totals per workload, derived from the finished-job records.
+
+    Workloads that finished nothing are absent rather than present with zeroes, so a dreamer-only worker
+    carries one entry."""
+
+    snapshot_interval_seconds: float = 1.0
+    """The floor cadence at which the worker publishes snapshots when nothing else changed.
+
+    Carried so a dashboard check about how long something has been true can allow for the worker's own
+    reporting delay without restating the cadence."""
 
     enabled_workloads: list[str] = Field(default_factory=list)
     """The workloads this worker serves, as ``WorkloadKind`` values (e.g. ``image_generation``,

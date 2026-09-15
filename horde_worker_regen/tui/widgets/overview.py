@@ -29,6 +29,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WholeCardResidencyStatus,
     WorkerStateSnapshot,
     WorkLedgerEntry,
+    WorkLedgerProgressUnit,
     WorkLedgerStage,
 )
 from horde_worker_regen.process_management.lifecycle.process_temperature import (
@@ -180,6 +181,9 @@ class OverviewView(Vertical):
         width: auto;
     }
     OverviewView #overview-alchemy {
+        width: auto;
+    }
+    OverviewView #overview-text {
         width: auto;
     }
     OverviewView #overview-update-nag {
@@ -340,6 +344,7 @@ class OverviewView(Vertical):
             with Container(id="overview-ops-row", classes="overview-row"):
                 yield Static(id="overview-worker")
                 yield Static(id="overview-alchemy")
+                yield Static(id="overview-text")
                 yield Static(id="overview-residency")
             with Container(id="overview-history-row", classes="overview-row"):
                 yield Static(id="overview-recent")
@@ -451,6 +456,10 @@ class OverviewView(Vertical):
                 "#overview-alchemy",
                 not thin and snapshot is not None and self._show_alchemy_panel(snapshot),
             ),
+            "#overview-text": visible(
+                "#overview-text",
+                not thin and snapshot is not None and self._show_text_panel(snapshot),
+            ),
             # Residency detail is details-only AND only when the feature applies, so it never clutters the
             # detailed view on hardware/configs that never engage whole-card residency.
             "#overview-residency": visible(
@@ -465,9 +474,12 @@ class OverviewView(Vertical):
         }
         for node_id, is_shown in show.items():
             self.query_one(node_id, Static).display = is_shown
-        # The ops-row container carries the worker/alchemy/residency panels; show it while any of them do.
+        # The ops row carries the worker/alchemy/text/residency panels; show it while any of them do.
         self.query_one("#overview-ops-row").display = (
-            show["#overview-worker"] or show["#overview-alchemy"] or show["#overview-residency"]
+            show["#overview-worker"]
+            or show["#overview-alchemy"]
+            or show["#overview-text"]
+            or show["#overview-residency"]
         )
 
         nag = self.query_one("#overview-update-nag", Static)
@@ -540,6 +552,10 @@ class OverviewView(Vertical):
         if show["#overview-alchemy"]:
             self.query_one("#overview-alchemy", Static).update(
                 self._render_alchemy_panel(snapshot, compact=phone),
+            )
+        if show["#overview-text"]:
+            self.query_one("#overview-text", Static).update(
+                self._render_text_panel(snapshot, compact=phone),
             )
         if show["#overview-recent"]:
             self.query_one("#overview-recent", Static).update(
@@ -1461,8 +1477,12 @@ class OverviewView(Vertical):
             else:
                 table.add_row(left_label, left_value, right_label, right_value)
 
+        # Each role registers as its own named worker on the horde, so a worker that serves one of them
+        # is named for that role rather than for the dreamer identity it never advertises.
         if self._is_alchemist_only(snapshot):
             add_pair("Alchemist", config.alchemist_name or "-", "Version", f"v{config.worker_version}")
+        elif self._is_scribe_only(snapshot):
+            add_pair("Scribe", config.scribe_name or "-", "Version", f"v{config.worker_version}")
         else:
             add_pair("Dreamer", config.dreamer_name, "Version", f"v{config.worker_version}")
         add_pair("Horde user", config.horde_username or "-", "Uptime", uptime)
@@ -1508,8 +1528,9 @@ class OverviewView(Vertical):
         """The workload the dashboard foregrounds.
 
         Image generation when served (the usual dreamer/mixed worker, whose existing layout is
-        unchanged); otherwise the sole remaining workload (an alchemist-only worker foregrounds alchemy);
-        None when nothing is served or the worker predates the served-workload signal.
+        unchanged); otherwise the sole remaining workload (an alchemist-only worker foregrounds alchemy,
+        a scribe-only one text generation); None when nothing is served or the worker predates the
+        served-workload signal.
         """
         workloads = cls._enabled_workloads(snapshot)
         if not workloads:
@@ -1523,6 +1544,11 @@ class OverviewView(Vertical):
         """Whether this worker serves alchemy and nothing else (the alchemist-only reshape trigger)."""
         return cls._enabled_workloads(snapshot) == frozenset({WorkloadKind.ALCHEMY})
 
+    @classmethod
+    def _is_scribe_only(cls, snapshot: WorkerStateSnapshot) -> bool:
+        """Whether this worker serves text generation and nothing else."""
+        return cls._enabled_workloads(snapshot) == frozenset({WorkloadKind.TEXT_GENERATION})
+
     @staticmethod
     def _show_alchemy_panel(snapshot: WorkerStateSnapshot) -> bool:
         """Return whether the Overview should show the alchemy panel outside thin mode."""
@@ -1530,6 +1556,16 @@ class OverviewView(Vertical):
             snapshot.alchemy_forms_pending + snapshot.alchemy_forms_in_flight + snapshot.alchemy_forms_awaiting_submit
             > 0
         )
+
+    @staticmethod
+    def _show_text_panel(snapshot: WorkerStateSnapshot) -> bool:
+        """Return whether the Overview should show the text panel outside thin mode.
+
+        Gated as the alchemy panel is: the role being on is enough, because a scribe whose backend has
+        never answered is exactly the worker whose operator needs to see why, and work in hand shows it
+        for a worker whose role was turned off under a running session.
+        """
+        return snapshot.config.scribe or snapshot.text_jobs_in_flight > 0
 
     @staticmethod
     def _allow_summary(snapshot: WorkerStateSnapshot) -> str:
@@ -1617,6 +1653,99 @@ class OverviewView(Vertical):
         return Panel(table, title="Alchemy", title_align="left", border_style=border, padding=(0, 1))
 
     @staticmethod
+    def _text_backend_row(snapshot: WorkerStateSnapshot) -> Text:
+        """Render the text backend's readiness and the model it loaded, or why there is no model yet.
+
+        Readiness is the whole of what decides whether a scribe takes work, so it leads, and a backend
+        that has not answered says how long it has not been answering: minutes is a model loading and
+        much longer is a backend nobody started.
+        """
+        if snapshot.text_backend_ready:
+            model = snapshot.text_model_name or "an unnamed model"
+            return Text.assemble(("ready", "green"), (f" · {shorten(model, 36)}", "grey70"))
+        not_ready_since = snapshot.text_backend_not_ready_since
+        waited = (
+            f" for {human_duration(max(0.0, snapshot.timestamp - not_ready_since))}"
+            if not_ready_since is not None and snapshot.timestamp
+            else ""
+        )
+        return Text.assemble(("not ready", "yellow"), (f"{waited} · no jobs are popped until it answers", "grey62"))
+
+    @classmethod
+    def _render_text_panel(cls, snapshot: WorkerStateSnapshot, *, compact: bool = False) -> Panel:
+        """Render the text backend's state, the caps it accepts, and this session's text work.
+
+        The counterpart of the alchemy panel for a scribe worker. The caps are the backend's own answers
+        narrowed by the operator's configuration, so they are shown as one row rather than as settings:
+        what the worker advertises is the pair, and either half alone misleads.
+        """
+        config = snapshot.config
+        table = Table.grid(padding=(0, 1 if compact else 2))
+        table.add_column(justify="right", style="bold cyan", no_wrap=True)
+        table.add_column()
+        if not compact:
+            table.add_column(justify="right", style="bold cyan", no_wrap=True)
+            table.add_column()
+
+        if not config.scribe:
+            table.add_row("Status", Text("disabled", style="grey50"), *(() if compact else ("", "")))
+            return Panel(table, title="Text", title_align="left", border_style="grey37", padding=(0, 1))
+
+        limits = Text(
+            f"{snapshot.text_context_length or '-'} context · {snapshot.text_max_length or '-'} generated",
+            style="grey70",
+        )
+        text_totals = snapshot.workload_totals.get(WorkloadKind.TEXT_GENERATION)
+        kudos = f"{text_totals.kudos:,.1f}" if text_totals is not None else "0.0"
+        faulted_colour = "red" if snapshot.text_total_faulted else "grey62"
+        in_flight_colour = "green" if snapshot.text_jobs_in_flight > 0 else "grey62"
+        runtime_text = Text.assemble(
+            (str(snapshot.text_jobs_in_flight), in_flight_colour),
+            (" in flight  ", "grey50"),
+            (str(snapshot.text_total_submitted), "grey70"),
+            (" done  ", "grey50"),
+            (str(snapshot.text_total_faulted), faulted_colour),
+            (" faulted  ", "grey50"),
+            (kudos, "magenta"),
+            (" kudos", "grey50"),
+        )
+        rate = cls._text_token_rate(snapshot)
+
+        if compact:
+            table.add_row("Backend", cls._text_backend_row(snapshot))
+            table.add_row("Limits", limits)
+            table.add_row("In flight", Text(str(snapshot.text_jobs_in_flight), style=in_flight_colour))
+            table.add_row("Done", str(snapshot.text_total_submitted))
+            table.add_row("Faulted", Text(str(snapshot.text_total_faulted), style=faulted_colour))
+            table.add_row("Kudos", kudos)
+            table.add_row("Rate", rate)
+        else:
+            table.add_row("Backend", cls._text_backend_row(snapshot), "Limits", limits)
+            table.add_row("Session", runtime_text, "Rate", rate)
+
+        border = (
+            "green" if snapshot.text_jobs_in_flight > 0 else ("grey37" if snapshot.text_backend_ready else "yellow")
+        )
+        return Panel(table, title="Text", title_align="left", border_style=border, padding=(0, 1))
+
+    @staticmethod
+    def _text_token_rate(snapshot: WorkerStateSnapshot) -> Text:
+        """Render the backend's most recent token rate, or say it is unmeasured.
+
+        A backend without a statistics route counts no tokens for its whole life, so the absence is a
+        property of the build rather than of this moment, and the row says so instead of showing a dash a
+        reader would take for "not right now".
+        """
+        for process in snapshot.processes:
+            detail = process.text_backend
+            if detail is None:
+                continue
+            if detail.tokens_per_second is not None:
+                return Text(f"{detail.tokens_per_second:,.1f} tokens/s", style="grey70")
+            break
+        return Text("not reported by this backend", style="grey50")
+
+    @staticmethod
     def _render_intent(snapshot: WorkerStateSnapshot, *, detailed: bool) -> Panel:
         """Render the Now / Next / Why orchestration strip."""
         intent = snapshot.orchestration_intent
@@ -1672,11 +1801,23 @@ class OverviewView(Vertical):
 
     @staticmethod
     def _work_progress_cell(entry: WorkLedgerEntry) -> Text:
-        """Render active job progress, or timing for completed work."""
+        """Render active job progress, or timing for completed work.
+
+        A row whose unit has no total (a generation whose backend counts stream records rather than
+        tokens) gets an indeterminate bar beside the count it does have, because a figure with nothing to
+        divide by is progress without a fraction, and inventing the fraction would be a claim about how
+        far through the generation is that nothing supports.
+        """
+        unit = "" if entry.progress_unit is WorkLedgerProgressUnit.STEPS else f" {entry.progress_unit.value}"
         if entry.progress_total:
             current = entry.progress_current or 0
             fraction = current / entry.progress_total
-            return Text.assemble((mini_bar(fraction, 8), "green"), (f" {current}/{entry.progress_total}", "grey62"))
+            return Text.assemble(
+                (mini_bar(fraction, 8), "green"),
+                (f" {current}/{entry.progress_total}{unit}", "grey62"),
+            )
+        if entry.progress_current is not None:
+            return Text.assemble(("?" * 8, "grey50"), (f" {entry.progress_current}{unit}", "grey62"))
         if entry.e2e_seconds is not None:
             return Text(human_duration(entry.e2e_seconds), style="grey62")
         return Text("-", style="grey50")
@@ -1730,6 +1871,19 @@ class OverviewView(Vertical):
         if entry.sampler is not None:
             cell.append(f" · {cls._sampler_label(entry.sampler)}", style="grey50")
         return cell
+
+    @staticmethod
+    def _work_rate_cell(entry: WorkLedgerEntry) -> str:
+        """Render the rate this row's work is arriving at, named for what the row counts.
+
+        The column is headed for the image case because that is nearly every row; a row counting
+        something else says so in the cell rather than being read as iterations.
+        """
+        if entry.progress_unit is WorkLedgerProgressUnit.STEPS:
+            return format_its(entry.iterations_per_second)
+        if entry.iterations_per_second is None or entry.iterations_per_second < 0:
+            return "-"
+        return f"{entry.iterations_per_second:.1f} tok/s"
 
     @staticmethod
     def _work_age_cell(entry: WorkLedgerEntry) -> str:
@@ -2674,8 +2828,11 @@ _WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
         width=8,
         no_wrap=True,
     ),
-    ColumnSpec("Progress", DensityTier.ESSENTIAL, OverviewView._work_progress_cell, width=12, no_wrap=True),
-    ColumnSpec("it/s", DensityTier.WIDE, lambda e: format_its(e.iterations_per_second), justify="right", width=6),
+    # Progress and the rate declare a minimum rather than a fixed width: a row that names its unit (a text
+    # generation counting tokens or stream records) needs the room, and ``ColumnSpec.content_width()``
+    # falls back to the minimum, so the fit budget and the shedding behaviour are unchanged.
+    ColumnSpec("Progress", DensityTier.ESSENTIAL, OverviewView._work_progress_cell, min_width=12, no_wrap=True),
+    ColumnSpec("it/s", DensityTier.WIDE, OverviewView._work_rate_cell, justify="right", min_width=6),
     ColumnSpec("Size", DensityTier.WIDE, OverviewView._work_size_cell, min_width=22, max_width=38, no_wrap=True),
     ColumnSpec("Features", DensityTier.DETAILS, OverviewView._work_features_cell, min_width=10, no_wrap=True),
 ]

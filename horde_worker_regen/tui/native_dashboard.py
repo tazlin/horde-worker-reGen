@@ -22,8 +22,10 @@ from pydantic import BaseModel, Field
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
     WorkerStateSnapshot,
+    WorkLedgerProgressUnit,
     WorkLedgerStage,
 )
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
@@ -48,12 +50,16 @@ class NativeJobState(BaseModel):
 
     job_id: str
     stage: str
+    workload: str = WorkloadKind.IMAGE_GENERATION.value
+    """The ``WorkloadKind`` value this row's work belongs to."""
     model: str | None = None
     process_id: int | None = None
     device_index: int | None = None
     progress_percent: float | None = None
     progress_current: int | None = None
     progress_total: int | None = None
+    progress_unit: str = WorkLedgerProgressUnit.STEPS.value
+    """What the progress figures count, so a row with no percentage still says what it has counted."""
     iterations_per_second: float | None = None
     age_seconds: float | None = None
 
@@ -80,6 +86,12 @@ class NativeProcessState(BaseModel):
     """An external process's measured VRAM footprint, which is not an allocator reading; None otherwise."""
     health_age_seconds: float | None = None
     """How long ago an external process last answered a health probe; None when it never has."""
+    active_requests: int = 0
+    """Requests an external process is currently producing output for; 0 for every other row."""
+    queued_requests: int = 0
+    """Requests the worker is holding for an external process to take; 0 for every other row."""
+    tokens_per_second: float | None = None
+    """An external text backend's most recent generation rate; None when it reports none."""
 
 
 class NativeDashboardState(BaseModel):
@@ -119,6 +131,13 @@ class NativeDashboardState(BaseModel):
     alchemy_pending: int = 0
     alchemy_active: int = 0
     alchemy_submitting: int = 0
+
+    text_submitted: int = 0
+    text_faulted: int = 0
+    text_in_flight: int = 0
+    text_backend_ready: bool = False
+    text_model: str | None = None
+    text_tokens_per_second: float | None = None
 
     effective_maintenance: bool = False
     local_paused: bool = False
@@ -177,9 +196,16 @@ class NativeSupervisor(Protocol):
 
 
 def _worker_name(snapshot: WorkerStateSnapshot) -> str:
-    """Choose the identity matching the workload this worker actually serves."""
-    if set(snapshot.enabled_workloads) == {"alchemy"} and snapshot.config.alchemist_name:
+    """Choose the identity matching the workload this worker actually serves.
+
+    Each role registers under its own name on the horde, so a worker serving one of them is named for
+    that role rather than for a dreamer identity it never advertises.
+    """
+    served = set(snapshot.enabled_workloads)
+    if served == {WorkloadKind.ALCHEMY.value} and snapshot.config.alchemist_name:
         return snapshot.config.alchemist_name
+    if served == {WorkloadKind.TEXT_GENERATION.value} and snapshot.config.scribe_name:
+        return snapshot.config.scribe_name
     return snapshot.config.dreamer_name
 
 
@@ -218,12 +244,14 @@ def _active_job_states(snapshot: WorkerStateSnapshot) -> list[NativeJobState]:
             NativeJobState(
                 job_id=entry.job_id,
                 stage=entry.stage.value,
+                workload=entry.workload.value,
                 model=entry.model,
                 process_id=entry.process_id,
                 device_index=entry.device_index,
                 progress_percent=_progress_percent(current, total, reported_percent),
                 progress_current=current,
                 progress_total=total,
+                progress_unit=entry.progress_unit.value,
                 iterations_per_second=entry.iterations_per_second,
                 age_seconds=entry.age_seconds,
             ),
@@ -258,6 +286,9 @@ def _process_states(snapshot: WorkerStateSnapshot) -> list[NativeProcessState]:
                 is_external=process.is_external,
                 footprint_mb=backend.footprint_mb if backend is not None else None,
                 health_age_seconds=health_age,
+                active_requests=backend.active_requests if backend is not None else 0,
+                queued_requests=backend.queued_requests if backend is not None else 0,
+                tokens_per_second=backend.tokens_per_second if backend is not None else None,
                 alive=process.is_alive,
                 busy=process.is_busy,
                 model=process.loaded_horde_model_name,
@@ -315,6 +346,19 @@ def build_native_dashboard_state(supervisor: NativeSupervisor) -> NativeDashboar
         alchemy_pending=snapshot.alchemy_forms_pending,
         alchemy_active=snapshot.alchemy_forms_in_flight,
         alchemy_submitting=snapshot.alchemy_forms_awaiting_submit,
+        text_submitted=snapshot.text_total_submitted,
+        text_faulted=snapshot.text_total_faulted,
+        text_in_flight=snapshot.text_jobs_in_flight,
+        text_backend_ready=snapshot.text_backend_ready,
+        text_model=snapshot.text_model_name,
+        text_tokens_per_second=next(
+            (
+                process.tokens_per_second
+                for process in process_states
+                if process.is_external and process.tokens_per_second is not None
+            ),
+            None,
+        ),
         effective_maintenance=snapshot.maintenance_mode,
         local_paused=snapshot.supervisor_paused,
         horde_maintenance=snapshot.worker_details_maintenance,

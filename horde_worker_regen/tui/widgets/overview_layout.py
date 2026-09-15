@@ -58,6 +58,7 @@ OVERVIEW_ELEMENTS: tuple[OverviewElement, ...] = (
     OverviewElement("recent", "#overview-recent", "Recent jobs", "Jobs"),
     OverviewElement("worker", "#overview-worker", "Worker config", "Worker"),
     OverviewElement("alchemy", "#overview-alchemy", "Alchemy", "Worker"),
+    OverviewElement("text", "#overview-text", "Text generation", "Worker"),
     OverviewElement("residency", "#overview-residency", "Whole-card residency", "Worker"),
 )
 

@@ -217,6 +217,27 @@ Readers that reason about inference lanes skip the row rather than counting it: 
 make the worker read as serving images, does not end the image lanes' warm-up, and names no card whose
 duty could be called low.
 
+What the row cannot say for itself, the flow hands it at snapshot time as a `TextBackendActivity`: how
+many generations the backend is producing output for, how many the worker is holding for it to take, and
+the most recent token rate any of them reported. The supervisor watches the process and never sees a
+generation, so a copy of these kept on the supervisor could only go stale; passing them per snapshot
+means the row is busy exactly while the flow has work against it.
+
+The flow is also where the backend's restarts become a fact about generation. A relaunch with nothing in
+hand fails no generation and re-runs no readiness gate, so a cold-kernel flag cleared by the previous
+process's first token would hold over a process that has produced nothing, and the first job after such a
+relaunch would be held to the stall bound instead of the whole deadline. For a backend the worker owns,
+the coordinator reads the supervisor's launch count through a `launch_count_provider` and treats any
+change in it as the kernels being cold again. A backend the operator runs has no launch the worker can
+count, and keeps the readiness gate as the only thing that can say it started over.
+
+Two health findings follow from the flow's own patiences rather than from figures the dashboard picks. A
+backend that has reported no loaded model for longer than the readiness gate's patience is a warning and
+past twice that a fault, which separates a model still loading from a backend nobody started. A
+generation that has produced nothing for longer than `text_stall_seconds` plus the snapshot interval is a
+warning; the interval is there so the dashboard never warns about a job the worker is in the act of
+faulting.
+
 ## What is not supported yet
 
 - **A shared card is not priced.** When the backend shares a card with image generation, the worker's VRAM
@@ -226,11 +247,14 @@ duty could be called low.
   backend serves means restarting the backend; the worker will notice when the generation it is waiting
   on fails and re-run its readiness gate, but nothing coordinates the two. Which *kind* of backend is
   attached is likewise fixed for the run.
-- **The dashboard has no text panel yet.** The snapshot carries the flow's counters and backend identity,
-  the backend has its row in the process surfaces, and finished text jobs appear in the recent-jobs views,
-  but no screen is laid out around text the way the image and alchemy panels are, and the config editor has
-  no scribe fields. The row's request counts and token rate are the flow's to report and are unset until it
-  does.
+- **The config editor has no scribe fields.** Text generation reaches the dashboard's surfaces: a text
+  panel in the Advanced Overview, in-flight generations in the work ledger and on the Simple home, text
+  postures in the health checklist, a per-workload split on Stats, and the backend's own section on the
+  native page. What is still missing is the editor page, so `scribe` and everything under it are edited
+  in `bridgeData.yaml` by hand.
+- **No activity feed carries text events.** Finished text jobs reach the Simple ticker through the
+  recent-jobs list, so the feed is built from what finished rather than from events the worker emitted at
+  the transitions themselves.
 - **Turning `scribe` on takes a restart.** Unlike most configuration, the role is read when the worker
   builds its flows, so a hot reload of `bridgeData.yaml` will not start a text flow that was off at
   launch (it will, however, stop one that was on).

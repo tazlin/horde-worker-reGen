@@ -12,8 +12,10 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerConfigSummary,
     WorkerStateSnapshot,
     WorkLedgerEntry,
+    WorkLedgerProgressUnit,
     WorkLedgerStage,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.native_dashboard import (
     NATIVE_ACTION_PATH,
     NATIVE_DASHBOARD_PATH,
@@ -307,3 +309,102 @@ def test_native_process_rows_carry_the_supervised_text_backend() -> None:
     assert backend_row.model == "Llama-3.2-3B"
     assert backend_row.footprint_mb == 2700
     assert backend_row.health_age_seconds == 42.0
+
+
+def _scribe_snapshot() -> WorkerStateSnapshot:
+    """A scribe worker serving one generation through a supervised backend."""
+    return WorkerStateSnapshot(
+        timestamp=200.0,
+        config=WorkerConfigSummary(
+            dreamer_name="Native Worker",
+            scribe_name="Native Scribe",
+            worker_version="12.0.0",
+            scribe=True,
+        ),
+        enabled_workloads=[WorkloadKind.TEXT_GENERATION.value],
+        text_backend_ready=True,
+        text_model_name="koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M",
+        text_total_submitted=9,
+        text_total_faulted=1,
+        text_jobs_in_flight=1,
+        processes=[
+            ProcessSnapshot(
+                process_id=TEXT_BACKEND_PROCESS_ID,
+                process_type="TEXT_BACKEND",
+                device_index=None,
+                last_process_state="SERVING",
+                is_alive=True,
+                is_busy=True,
+                is_external=True,
+                os_pid=48213,
+                display_state="ready",
+                loaded_horde_model_name="koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M",
+                text_backend=TextBackendDetail(
+                    kind="koboldcpp",
+                    port=5001,
+                    footprint_mb=2700,
+                    active_requests=1,
+                    queued_requests=2,
+                    tokens_per_second=16.0,
+                ),
+            ),
+        ],
+        work_ledger=[
+            WorkLedgerEntry(
+                job_id="text-job-id",
+                stage=WorkLedgerStage.INFERENCE,
+                workload=WorkloadKind.TEXT_GENERATION,
+                model="koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M",
+                progress_current=12,
+                progress_unit=WorkLedgerProgressUnit.CHUNKS,
+                iterations_per_second=16.0,
+                age_seconds=3.0,
+            ),
+        ],
+    )
+
+
+def test_the_projection_carries_a_text_generation_as_active_work() -> None:
+    """A text generation is work in hand, so it reaches the page through the ledger every job uses.
+
+    It runs in a separate program, so it has no process and no percentage: the row says what it counted
+    and in which unit instead of being given a fraction nothing supports.
+    """
+    state = build_native_dashboard_state(_NativeSupervisorDouble(_scribe_snapshot()))
+
+    assert len(state.active_jobs) == 1
+    job = state.active_jobs[0]
+    assert job.workload == WorkloadKind.TEXT_GENERATION.value
+    assert job.progress_unit == WorkLedgerProgressUnit.CHUNKS.value
+    assert job.progress_current == 12
+    assert job.progress_percent is None
+    assert job.process_id is None
+
+
+def test_the_projection_carries_the_backend_row_activity_and_the_scribe_identity() -> None:
+    """The backend's row states what the flow is asking of it, which the supervisor cannot see itself."""
+    state = build_native_dashboard_state(_NativeSupervisorDouble(_scribe_snapshot()))
+
+    assert state.worker_name == "Native Scribe"
+    assert state.text_backend_ready is True
+    assert state.text_in_flight == 1
+    assert state.text_submitted == 9
+    assert state.text_faulted == 1
+    assert state.text_tokens_per_second == 16.0
+    backend_row = next(row for row in state.process_states if row.is_external)
+    assert backend_row.active_requests == 1
+    assert backend_row.queued_requests == 2
+    assert backend_row.tokens_per_second == 16.0
+    assert backend_row.busy is True
+
+
+def test_the_native_page_renders_the_text_section_and_the_row_units() -> None:
+    """The page's own markup has to carry the fields the projection now sends, or they render nowhere."""
+    page = load_native_dashboard_html()
+
+    assert 'id="text-section"' in page
+    assert 'id="text-backend"' in page
+    assert 'id="text-rate"' in page
+    assert "state.text_in_flight" in page
+    assert "job.progress_unit" in page
+    assert "text_generation" in page

@@ -123,11 +123,14 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
     SystemMemorySnapshot,
+    TextBackendActivity,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
     WorkLedgerEntry,
+    WorkLedgerProgressUnit,
     WorkLedgerStage,
+    WorkloadTotalsSnapshot,
 )
 from horde_worker_regen.process_management.jobs.alchemy_popper import (
     AlchemyCoordinator,
@@ -138,7 +141,9 @@ from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.jobs.text_generation_coordinator import (
+    READY_SLOW_START_NOTICE_SECONDS,
     TextGenerationCoordinator,
+    TextJobInFlightRow,
     build_text_backend,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -272,6 +277,7 @@ from horde_worker_regen.text_backends import (
     LOOPBACK_HOST,
     TextBackend,
     TextBackendLaunchSettings,
+    TextGenerationProgress,
     UnsupportedTextBackendError,
     build_launch_spec,
 )
@@ -2087,6 +2093,12 @@ class HordeWorkerProcessManager:
                 backend_factory=self._text_backend_for,
                 text_backend_kind=bridge_data.text_backend_kind,
                 run_metrics=self._run_metrics,
+                # Read through a callable rather than handed the supervisor: the supervisor is built
+                # once the loop is running, long after this, and the flow needs only the count. A
+                # backend the operator runs has no launch the worker can count, so it gets nothing.
+                launch_count_provider=(
+                    self._managed_text_backend_launch_count if bridge_data.text_backend_managed else None
+                ),
             )
             self._text_coordinator = text_coordinator
             self._flows[WorkloadKind.TEXT_GENERATION] = text_coordinator
@@ -6771,6 +6783,7 @@ class HordeWorkerProcessManager:
         return WorkLedgerEntry(
             job_id=job.job_id,
             stage=WorkLedgerStage.FAULTED if job.faulted else WorkLedgerStage.COMPLETED,
+            workload=job.workload,
             model=job.model_name,
             baseline=job.baseline,
             width=job.width,
@@ -6799,6 +6812,7 @@ class HordeWorkerProcessManager:
         return WorkLedgerEntry(
             job_id=status.form_id,
             stage=self._ALCHEMY_STAGE_TO_LEDGER.get(status.stage, WorkLedgerStage.INFERENCE),
+            workload=WorkloadKind.ALCHEMY,
             model=f"⚗ {status.form} ({status.additional_info})" if status.additional_info else f"⚗ {status.form}",
             baseline=None,
             process_id=status.process_id,
@@ -6806,14 +6820,69 @@ class HordeWorkerProcessManager:
             height=status.height,
         )
 
+    def _text_job_to_ledger_entry(self, row: TextJobInFlightRow, *, now: float) -> WorkLedgerEntry:
+        """Project one in-flight text generation into the Overview work ledger.
+
+        A text generation runs in a separate program the worker reaches over HTTP, so the row carries no
+        process id and no card: there is no lane serving it and naming one would point an operator at a
+        process that is doing something else. What it counts depends on what its backend reports. A
+        backend with a statistics route counts tokens, which the horde's requested generation length is a
+        total for; a stock one offers only the stream's record count, which is not a token count and has
+        no total, so the row says ``chunks`` and leaves the total unset for the renderer to show as
+        indeterminate rather than dividing by a figure that means something else.
+        """
+        progress = row.progress
+        generating = row.is_generating
+        stage = WorkLedgerStage.INFERENCE if generating else WorkLedgerStage.QUEUED
+        counts_tokens = progress is not None and progress.completion_tokens is not None
+        unit = WorkLedgerProgressUnit.TOKENS if counts_tokens else WorkLedgerProgressUnit.CHUNKS
+        progress_current: int | None = None
+        if progress is not None:
+            progress_current = progress.completion_tokens if counts_tokens else progress.chunks_received
+        stage_since = row.time_generation_started if generating else row.time_popped
+        return WorkLedgerEntry(
+            job_id=row.job_id,
+            stage=stage,
+            workload=WorkloadKind.TEXT_GENERATION,
+            model=row.model_name,
+            progress_current=progress_current,
+            progress_total=row.max_length if counts_tokens else None,
+            progress_unit=unit,
+            progress_age_seconds=self._text_progress_age_seconds(progress),
+            iterations_per_second=progress.tokens_per_second if progress is not None else None,
+            age_seconds=max(0.0, now - stage_since) if stage_since else None,
+            intent="generating" if generating else "waiting for the text backend",
+        )
+
+    @staticmethod
+    def _text_progress_age_seconds(progress: TextGenerationProgress | None) -> float | None:
+        """Return how long ago a generation's last chunk arrived, or None before any has.
+
+        ``last_chunk_at`` is a monotonic reading (a wall clock that stepped would make the age lie), so
+        it is turned into an age here rather than shipped as a timestamp a dashboard would have to
+        compare against a clock it does not share.
+        """
+        if progress is None or progress.last_chunk_at is None:
+            return None
+        return max(0.0, time.monotonic() - progress.last_chunk_at)
+
+    def _text_in_flight_rows(self) -> list[TextJobInFlightRow]:
+        """Return the text flow's in-flight jobs, or nothing on a worker with no text flow."""
+        text_coordinator = self._text_coordinator
+        return [] if text_coordinator is None else text_coordinator.in_flight_view()
+
     def _build_work_ledger(self, recent_jobs: list[RecentJobRecord]) -> list[WorkLedgerEntry]:
         """Build active rows first, then recent completed/faulted rows for the Overview work ledger.
 
         Active image jobs come first and in pop order, so the ledger reads in the order the worker will
         serve the jobs rather than in tracker insertion order. Then come an alchemist worker's active forms
-        (each shown with the form as its model and the source-image resolution as its size), then recent
-        finished work, all capped. A job the tracker holds but has no pop order for sorts after the ordered
-        ones rather than displacing them.
+        (each shown with the form as its model and the source-image resolution as its size), then a scribe
+        worker's in-flight generations, then recent finished work, all capped. A job the tracker holds but
+        has no pop order for sorts after the ordered ones rather than displacing them.
+
+        The three workloads share one ledger rather than each getting a list of its own: they are all work
+        the worker has in hand, every surface that shows work would otherwise need a second data path, and
+        the row itself names which workload it came from.
         """
         now = time.time()
         queue_order_by_job_id = self._queue_order_by_job_id()
@@ -6831,6 +6900,7 @@ class HordeWorkerProcessManager:
         rows.extend(
             self._alchemy_status_to_ledger_entry(status) for status in self._alchemy_coordinator.active_form_statuses()
         )
+        rows.extend(self._text_job_to_ledger_entry(text_row, now=now) for text_row in self._text_in_flight_rows())
         active_ids = {row.job_id for row in rows}
         for job in reversed(recent_jobs):
             if len(rows) >= WORK_LEDGER_ENTRIES_IN_SNAPSHOT:
@@ -7756,6 +7826,39 @@ class HordeWorkerProcessManager:
         text_backend_supervisor = self._text_backend_supervisor
         return [] if text_backend_supervisor is None else [text_backend_supervisor]
 
+    def _supervised_process_row(self, source: SupervisedProcessSnapshotSource) -> ProcessSnapshot:
+        """Return one supervised program's row, adding what only the worker's own flows can see.
+
+        The protocol asks a supervised program for what it knows about itself, and the text backend's
+        supervisor knows the process but never sees a generation. The requests in flight against it and
+        the rate they are arriving at belong to the text flow, so they are handed to the row here rather
+        than mirrored onto the supervisor, where a copy could go stale between snapshots.
+        """
+        text_backend_supervisor = self._text_backend_supervisor
+        if text_backend_supervisor is not None and source is text_backend_supervisor:
+            return text_backend_supervisor.to_process_snapshot(activity=self._text_backend_activity())
+        return source.to_process_snapshot()
+
+    def _text_backend_activity(self) -> TextBackendActivity:
+        """Summarize what the text flow currently has in flight, for the backend's process row.
+
+        Generating jobs are the backend's active requests and popped-but-not-yet-taken ones are its
+        queue, which is the worker's own view of the queue rather than the backend's: a stock backend
+        exposes no per-request depth. The rate is the most recent one any live generation reported, and
+        stays None where none of them can report one, because a rate the worker guessed at would be read
+        as a measurement.
+        """
+        rows = self._text_in_flight_rows()
+        latest_rate: float | None = None
+        for row in rows:
+            if row.progress is not None and row.progress.tokens_per_second is not None:
+                latest_rate = row.progress.tokens_per_second
+        return TextBackendActivity(
+            active_requests=sum(1 for row in rows if row.is_generating),
+            queued_requests=sum(1 for row in rows if not row.is_generating),
+            tokens_per_second=latest_rate,
+        )
+
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
         import horde_worker_regen
@@ -7763,7 +7866,7 @@ class HordeWorkerProcessManager:
         bridge_data = self.bridge_data
         processes = [
             *(ProcessSnapshot.from_process_info(info) for info in self._process_map.values()),
-            *(source.to_process_snapshot() for source in self._supervised_snapshot_sources()),
+            *(self._supervised_process_row(source) for source in self._supervised_snapshot_sources()),
         ]
         active_models = sorted(
             {info.loaded_horde_model_name for info in self._process_map.values() if info.loaded_horde_model_name},
@@ -7908,6 +8011,8 @@ class HordeWorkerProcessManager:
             alchemy_forms=list(bridge_data.forms) if bridge_data.forms else list(DEFAULT_ALCHEMY_FORMS),
             scribe=bridge_data.scribe,
             scribe_name=bridge_data.scribe_name if bridge_data.scribe else None,
+            text_stall_seconds=bridge_data.text_stall_seconds,
+            text_backend_ready_patience_seconds=READY_SLOW_START_NOTICE_SECONDS,
         )
 
         # The text flow is registered only for a scribe worker, so everything about the text backend is
@@ -7998,6 +8103,19 @@ class HordeWorkerProcessManager:
             text_model_name=text_advertisement.model_name if text_advertisement is not None else None,
             text_context_length=text_advertisement.max_context_length if text_advertisement is not None else None,
             text_max_length=text_advertisement.max_length if text_advertisement is not None else None,
+            text_backend_not_ready_since=(
+                text_coordinator.backend_not_ready_since if text_coordinator is not None else None
+            ),
+            workload_totals={
+                workload: WorkloadTotalsSnapshot(
+                    completed=totals.completed,
+                    faulted=totals.faulted,
+                    kudos=totals.kudos,
+                    mean_generated_tokens=totals.mean_generated_tokens,
+                )
+                for workload, totals in run_metrics.workload_totals.items()
+            },
+            snapshot_interval_seconds=self._supervisor_publish_floor_interval,
             enabled_workloads=sorted(self._served_workloads(bridge_data)),
             pending_jobs=self._build_pending_jobs_list(),
             orchestration_intent=orchestration_intent,
@@ -8417,6 +8535,14 @@ class HordeWorkerProcessManager:
         if self._text_backend_supervisor is None:
             return
         await self._text_backend_supervisor.stop()
+
+    def _managed_text_backend_launch_count(self) -> int:
+        """Return how many times the worker has started the managed text backend this session.
+
+        Zero before the supervisor exists, which is the number of launches that have happened by then.
+        """
+        supervisor = self._text_backend_supervisor
+        return 0 if supervisor is None else supervisor.launch_count
 
     def _cancel_main_loop_siblings(self, tasks: list[asyncio.Task[None]]) -> None:
         """Cancel background loops after the control loop has completed final child teardown.

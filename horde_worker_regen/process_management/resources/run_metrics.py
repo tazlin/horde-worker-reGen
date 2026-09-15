@@ -320,6 +320,13 @@ class WorkloadTotals(BaseModel):
     """Records for work that faulted. With :attr:`completed` this partitions the workload's records."""
     kudos: float = 0.0
     """Kudos the horde paid for this workload's completed work; 0.0 when no record carried a reward."""
+    mean_generated_tokens: float | None = None
+    """Mean tokens per record over the records that reported a count, or None when none did.
+
+    Only text records carry a token count, and only against a backend that counts its own tokens, so
+    this stays None for every other workload and for a session served by a stock backend. Averaged over
+    the reporting records rather than all of them, because a record that reported nothing is unknown
+    rather than zero."""
 
 
 class StatsSampleEvent(BaseModel):
@@ -1372,6 +1379,8 @@ class WorkerRunMetrics:
         dreamer-only worker reports one entry.
         """
         totals: dict[WorkloadKind, WorkloadTotals] = {}
+        token_sums: dict[WorkloadKind, int] = {}
+        token_records: dict[WorkloadKind, int] = {}
         for record in self._jobs:
             entry = totals.setdefault(record.workload, WorkloadTotals())
             if record.faulted:
@@ -1380,6 +1389,11 @@ class WorkerRunMetrics:
                 entry.completed += 1
             if record.kudos_reward is not None:
                 entry.kudos += record.kudos_reward
+            if record.generated_tokens is not None:
+                token_sums[record.workload] = token_sums.get(record.workload, 0) + record.generated_tokens
+                token_records[record.workload] = token_records.get(record.workload, 0) + 1
+        for workload, reporting_records in token_records.items():
+            totals[workload].mean_generated_tokens = token_sums[workload] / reporting_records
         return totals
 
     def stats_export_state(self) -> StatsExportState:

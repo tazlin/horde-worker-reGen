@@ -435,6 +435,35 @@ class TextJobInFlight:
     """
 
 
+@dataclass(frozen=True)
+class TextJobInFlightRow:
+    """Represents one in-flight text job as everything outside the flow may see it.
+
+    A frozen copy rather than the live :class:`TextJobInFlight`, because the snapshot builder reads this
+    from the control loop while the job's own task is still writing to it: handing out the mutable job
+    would let a row change between the two fields a caller compares. Carries only what a dashboard row
+    needs; the payload, the busy counter and the stop flag stay inside the flow.
+    """
+
+    job_id: str
+    """The horde's id for this generation."""
+    model_name: str | None
+    """The model this job was popped against, as the worker advertised it."""
+    time_popped: float
+    """When the job was popped."""
+    time_generation_started: float | None
+    """When the backend was first asked for this generation, or None while it has not been asked."""
+    progress: TextGenerationProgress | None
+    """The backend's most recent report about this generation, or None before its first chunk."""
+    max_length: int | None
+    """The generation length the horde asked for, or None when the payload did not say."""
+
+    @property
+    def is_generating(self) -> bool:
+        """Whether the backend has been asked for this generation (rather than the job still waiting)."""
+        return self.time_generation_started is not None
+
+
 class TextGenerationCoordinator:
     """Owns the text-generation job lifecycle in the main process: gate, pop, generate, submit."""
 
@@ -449,6 +478,7 @@ class TextGenerationCoordinator:
         backend_factory: Callable[[TEXT_BACKENDS], TextBackend] | None = None,
         text_backend_kind: TEXT_BACKENDS,
         run_metrics: WorkerRunMetrics | None = None,
+        launch_count_provider: Callable[[], int] | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators and the backend to generate through.
 
@@ -471,6 +501,11 @@ class TextGenerationCoordinator:
             run_metrics: Where each finished job's record lands, so text jobs reach the same aggregates
                 image jobs and alchemy forms do. None in tests and in any assembly with no aggregator,
                 which records nothing rather than failing.
+            launch_count_provider: How many times the worker has started the backend process, for a
+                backend the worker owns. Any change in the count is a backend that has restarted its
+                generation kernels, which the flow must treat as cold again whether or not it noticed
+                the restart. None for a backend the operator runs, whose restarts the worker cannot
+                count and whose cold flag is reset by the readiness gate alone.
 
         Raises:
             ValueError: Neither `backend` nor `backend_factory` was given, leaving nothing to generate
@@ -487,6 +522,7 @@ class TextGenerationCoordinator:
         self._backend_factory = backend_factory
         self._text_backend_kind = text_backend_kind
         self._run_metrics = run_metrics
+        self._launch_count_provider = launch_count_provider
 
         self._in_flight: dict[str, TextJobInFlight] = {}
         self._job_tasks: set[asyncio.Task[None]] = set()
@@ -505,6 +541,21 @@ class TextGenerationCoordinator:
         before its first token appears, so the stall bound cannot apply to that first token. Set again
         by every readiness gate, which is what a relaunch drives the flow back through, and cleared by
         the first token the backend produces, whether that is the warm-up's or a job's.
+        """
+
+        self._last_launch_count: int | None = None
+        """The backend's launch count as the flow last saw it, or None before it has asked.
+
+        A relaunch the flow did not notice (nothing was in hand when the backend died, so no generation
+        failed and the gate never re-ran) leaves the cold flag stale. The count is the one fact that
+        changes across such a relaunch, so a change in it is what says the kernels are cold again.
+        """
+
+        self._backend_not_ready_since: float | None = time.time()
+        """When the readiness gate last opened, or None once the backend has answered.
+
+        Stamped at construction because the flow starts with its gate open: a worker whose backend never
+        answers has to be able to say how long that has been true.
         """
 
         self.num_jobs_submitted = 0
@@ -545,6 +596,34 @@ class TextGenerationCoordinator:
         showing a scribe with no work has the reason here rather than in the log.
         """
         return self._advertisement is not None
+
+    @property
+    def backend_not_ready_since(self) -> float | None:
+        """When the readiness gate last opened, or None while the backend is ready.
+
+        The duration behind :attr:`backend_ready`: a gate open for two minutes is a backend still loading
+        weights, and one open for an hour is a backend nobody started, which the flag alone cannot say.
+        """
+        return self._backend_not_ready_since
+
+    def in_flight_view(self) -> list[TextJobInFlightRow]:
+        """Return a frozen row per job the flow currently holds, in the order they were popped.
+
+        The whole of what the text flow shows anything outside it about the work in hand. Frozen copies
+        rather than the live jobs, so a reader cannot see one row change under it mid-read, and complete
+        rather than filtered, so a caller that wants only the generating ones decides that itself.
+        """
+        return [
+            TextJobInFlightRow(
+                job_id=job.job_id,
+                model_name=job.model_name,
+                time_popped=job.time_popped,
+                time_generation_started=job.time_generation_started,
+                progress=job.progress,
+                max_length=_payload_int(job.payload, TextPayloadKeys.MAX_LENGTH),
+            )
+            for job in sorted(self._in_flight.values(), key=lambda held: held.time_popped)
+        ]
 
     @property
     def backend_capabilities(self) -> TextBackendCapabilities | None:
@@ -591,9 +670,10 @@ class TextGenerationCoordinator:
             `True` when the backend answered and described itself, `False` when shutdown interrupted the
             wait.
         """
-        self._advertisement = None
+        self._close_readiness_gate()
         self._backend_capabilities = None
         self._backend_is_cold = True
+        self._note_backend_launch_count()
         backend = self.require_backend()
         gate_opened_at = time.monotonic()
         backoff_seconds = READY_BACKOFF_INITIAL_SECONDS
@@ -614,6 +694,7 @@ class TextGenerationCoordinator:
                         f"max_context_length={self._advertisement.max_context_length}, "
                         f"soft_prompts={len(self._advertisement.soft_prompts)})",
                     )
+                    self._backend_not_ready_since = None
                     await self._note_backend_capabilities(backend)
                     await self._warm_up_backend()
                     return True
@@ -635,6 +716,38 @@ class TextGenerationCoordinator:
             backoff_seconds = min(backoff_seconds * 2, READY_BACKOFF_MAX_SECONDS)
 
         return False
+
+    def _close_readiness_gate(self) -> None:
+        """Drop what the backend told the flow, and start the clock on how long it has been unready.
+
+        The clock is started only when it is not already running: the gate re-runs after a generation
+        found the backend gone, and the backend has been unready since that failure rather than since
+        the flow got round to polling it again.
+        """
+        self._advertisement = None
+        if self._backend_not_ready_since is None:
+            self._backend_not_ready_since = time.time()
+
+    def _note_backend_launch_count(self) -> None:
+        """Mark the backend cold again when the worker has restarted it since the flow last looked.
+
+        A relaunch with nothing in hand fails no generation and re-runs no gate, so the flow can hold a
+        cold flag that was cleared by the previous process's first token. The launch count is the one
+        fact that changes across such a relaunch. Does nothing for a backend the operator runs, whose
+        restarts the worker cannot count.
+        """
+        if self._launch_count_provider is None:
+            return
+        launch_count = self._launch_count_provider()
+        if launch_count == self._last_launch_count:
+            return
+        if self._last_launch_count is not None:
+            logger.debug(
+                f"Text backend is on launch {launch_count} (was {self._last_launch_count}); treating its "
+                "generation kernels as cold again.",
+            )
+        self._last_launch_count = launch_count
+        self._backend_is_cold = True
 
     async def _describe_backend(self, backend: TextBackend) -> TextBackendDescription | None:
         """Return what the backend says it can do, or None when it could not be asked.
@@ -899,6 +1012,9 @@ class TextGenerationCoordinator:
         """
         backend = self.require_backend()
         deadline_seconds = self.generation_deadline_seconds()
+        # Asked once per job rather than once per wake: a relaunch between two jobs is what the cold flag
+        # misses, and a relaunch inside one generation ends that generation anyway.
+        self._note_backend_launch_count()
 
         while True:
             # Re-stamped per attempt, so a job the backend turned away as busy measures its wait to the
@@ -927,7 +1043,7 @@ class TextGenerationCoordinator:
             except TextBackendUnavailable as unavailable:
                 logger.error(f"Text backend failed job {job.job_id[:8]}: {unavailable}")
                 await self._stop_generation(job)
-                self._advertisement = None
+                self._close_readiness_gate()
                 return None
             except _GenerationStalled as stalled:
                 logger.error(f"Text job {job.job_id[:8]} stalled: {stalled}. Abandoning the generation.")

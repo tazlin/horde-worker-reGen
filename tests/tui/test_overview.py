@@ -32,7 +32,9 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerConfigSummary,
     WorkerStateSnapshot,
     WorkLedgerEntry,
+    WorkLedgerProgressUnit,
     WorkLedgerStage,
+    WorkloadTotalsSnapshot,
 )
 from horde_worker_regen.process_management.models.feature_readiness import (
     FeatureReadiness,
@@ -1306,7 +1308,7 @@ def test_overview_layout_registry_covers_mode_managed_nodes() -> None:
         assert element_for_node(element.node_id) is element
 
 
-def _text_backend_process(*, detail: bool = True) -> ProcessSnapshot:
+def _text_backend_process(*, detail: bool = True, rate: float | None = 31.5) -> ProcessSnapshot:
     """The supervised text backend's row, optionally without the typed detail a supervisor attaches."""
     return ProcessSnapshot(
         process_id=TEXT_BACKEND_PROCESS_ID,
@@ -1328,7 +1330,7 @@ def _text_backend_process(*, detail: bool = True) -> ProcessSnapshot:
             launch_count=1,
             footprint_mb=2700,
             last_health_ok_at=time.time() - 42.0,
-            tokens_per_second=31.5,
+            tokens_per_second=rate,
         )
         if detail
         else None,
@@ -1365,3 +1367,140 @@ def test_process_table_renders_an_external_row_without_detail() -> None:
 
     assert "Text Backend" in text
     assert "ready" in text
+
+
+def _scribe_config(**overrides: object) -> WorkerConfigSummary:
+    """A scribe worker's config summary, with the dreamer identity it never advertises still present."""
+    return WorkerConfigSummary(
+        dreamer_name="Tester",
+        scribe_name="Tester-Scribe",
+        worker_version="12.0.0",
+        scribe=True,
+        **overrides,
+    )
+
+
+def _scribe_snapshot(**overrides: object) -> WorkerStateSnapshot:
+    """A serving scribe worker: backend ready, caps advertised, one session's totals."""
+    defaults: dict[str, object] = {
+        "config": _scribe_config(),
+        "enabled_workloads": [WorkloadKind.TEXT_GENERATION.value],
+        "text_backend_ready": True,
+        "text_model_name": "koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M",
+        "text_context_length": 4352,
+        "text_max_length": 512,
+        "text_total_submitted": 9,
+        "text_total_faulted": 1,
+        "workload_totals": {WorkloadKind.TEXT_GENERATION: WorkloadTotalsSnapshot(completed=9, faulted=1, kudos=37.5)},
+        "processes": [_text_backend_process()],
+    }
+    defaults.update(overrides)
+    return WorkerStateSnapshot(**defaults)
+
+
+def test_the_text_panel_is_shown_for_a_scribe_and_withheld_from_a_dreamer() -> None:
+    """The panel is gated on the role, like alchemy's: a scribe with no backend most needs to see why."""
+    dreamer = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"))
+
+    assert OverviewView._show_text_panel(_scribe_snapshot()) is True
+    assert OverviewView._show_text_panel(dreamer) is False
+
+
+def test_the_text_panel_states_the_backend_the_caps_and_the_session() -> None:
+    """A scribe's headline facts: what loaded, what it accepts, and what the session has earned."""
+    text = _render(OverviewView._render_text_panel(_scribe_snapshot()), width=200)
+
+    assert "ready" in text
+    assert "Llama-3.2-3B" in text
+    assert "4352 context · 512 generated" in text
+    assert "9 done" in text
+    assert "1 faulted" in text
+    assert "37.5 kudos" in text
+    assert "31.5 tokens/s" in text
+
+
+def test_the_text_panel_says_how_long_a_backend_has_not_answered() -> None:
+    """Minutes is a model loading and an hour is a backend nobody started; a flag cannot tell them apart."""
+    snapshot = _scribe_snapshot(
+        text_backend_ready=False,
+        text_model_name=None,
+        text_backend_not_ready_since=1000.0,
+        timestamp=1180.0,
+    )
+
+    text = _render(OverviewView._render_text_panel(snapshot), width=200)
+
+    assert "not ready" in text
+    assert "3m" in text
+    assert "no jobs are popped until it answers" in text
+
+
+def test_the_text_panel_names_an_unmeasured_token_rate_rather_than_dashing_it() -> None:
+    """A stock backend counts no tokens for its whole life, which is not "none right now"."""
+    snapshot = _scribe_snapshot(processes=[_text_backend_process(rate=None)])
+
+    text = _render(OverviewView._render_text_panel(snapshot), width=200)
+
+    assert "not reported by this backend" in text
+
+
+def test_a_scribe_only_worker_is_named_for_the_role_it_registers_under() -> None:
+    """Each role registers its own named worker, so the dreamer name is not this worker's identity."""
+    text = _render(OverviewView()._render_worker_table(_scribe_snapshot()), width=200)
+
+    assert "Scribe" in text
+    assert "Tester-Scribe" in text
+    assert "Dreamer" not in text
+
+
+def test_a_scribe_only_worker_foregrounds_text_generation() -> None:
+    """The dashboard foregrounds the one workload a single-role worker serves."""
+    assert OverviewView._primary_workload(_scribe_snapshot()) is WorkloadKind.TEXT_GENERATION
+
+
+def test_the_work_ledger_renders_a_text_row_with_its_unit_and_rate() -> None:
+    """A text row counts tokens against the length the horde asked for, and arrives at tokens a second."""
+    snapshot = _scribe_snapshot(
+        work_ledger=[
+            WorkLedgerEntry(
+                job_id="8a1f0c2b-4b2c-4d6e-8a1f-0c2b07d49abc",
+                stage=WorkLedgerStage.INFERENCE,
+                workload=WorkloadKind.TEXT_GENERATION,
+                model="koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M",
+                progress_current=40,
+                progress_total=160,
+                progress_unit=WorkLedgerProgressUnit.TOKENS,
+                iterations_per_second=16.0,
+                intent="generating",
+            ),
+        ],
+    )
+
+    text = _render(OverviewView()._render_work_ledger(snapshot, detailed=True, available_width=200), width=200)
+
+    assert "40/160 tokens" in text
+    assert "16.0 tok/s" in text
+    assert "generating" in text
+
+
+def test_a_text_row_counting_stream_records_gets_an_indeterminate_bar() -> None:
+    """Arrival without a total is progress with no fraction; a percentage would claim what cannot be said."""
+    snapshot = _scribe_snapshot(
+        work_ledger=[
+            WorkLedgerEntry(
+                job_id="8a1f0c2b-4b2c-4d6e-8a1f-0c2b07d49abc",
+                stage=WorkLedgerStage.INFERENCE,
+                workload=WorkloadKind.TEXT_GENERATION,
+                model="koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M",
+                progress_current=12,
+                progress_unit=WorkLedgerProgressUnit.CHUNKS,
+                intent="generating",
+            ),
+        ],
+    )
+
+    text = _render(OverviewView()._render_work_ledger(snapshot, detailed=True, available_width=200), width=200)
+
+    assert "????????" in text
+    assert "12 chunks" in text
+    assert "%" not in text

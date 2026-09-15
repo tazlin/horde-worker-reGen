@@ -27,7 +27,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Post-processing lane dispatch          | `process_management/workers/post_process_orchestrator.py` (`PostProcessOrchestrator`) |
 | Disaggregated pipeline stages          | `process_management/workers/disaggregation_orchestrator.py`, `component_lane_process.py`, `inference_process.py`, `vae_lane_process.py` |
 | Alchemy pop / dispatch / submit        | `process_management/jobs/alchemy_popper.py` (`AlchemyCoordinator`) |
-| Text pop / generate / submit           | `process_management/jobs/text_generation_coordinator.py` (`TextGenerationCoordinator`, `advertised_model_name`, `build_text_backend`); generation happens in an external program, so there is no child process |
+| Text pop / generate / submit           | `process_management/jobs/text_generation_coordinator.py` (`TextGenerationCoordinator`, its `in_flight_view` of frozen `TextJobInFlightRow`s, `advertised_model_name`, `build_text_backend`); generation happens in an external program, so there is no child process |
 | Launching and keeping alive the external text backend | `process_management/lifecycle/text_backend_supervisor.py` (`TextBackendSupervisor`, which is also the backend's dashboard row via `to_process_snapshot`); the command line comes from `text_backends/launch.py` (`build_launch_spec`, keyed by `TEXT_BACKENDS`) and the executable from `text_backends/provision.py` |
 | Parsing child-to-parent messages       | `process_management/ipc/message_dispatcher.py` (`MessageDispatcher`) |
 | IPC message and enum definitions       | `process_management/ipc/messages.py`                               |
@@ -117,7 +117,7 @@ module paths directly.
 | `benchmark/gate_driver.py`    | Disagg A/B measurement gate: runs a mix through the harness in ABBA order, scores kudos/hr, and derives per-stage reload/latency mechanism metrics (`python -m horde_worker_regen.benchmark.gate_driver`) |
 | `amd_go_fast/`                | AMD/ROCm-specific optimizations                                 |
 | `capabilities/`               | Placeholder for future optional "capability" processes (heavy features split out of the base worker; see the README) |
-| `text_backends/`              | The worker's whole conversation with a text-inference program it does not own (koboldcpp, sonar): the five-verb `TextBackend` protocol and its three exception types (`protocol.py`), the KoboldAI HTTP driver both backends accept (`kobold_api.py`), and the in-process `FakeTextBackend` dry runs and tests drive instead of a binary |
+| `text_backends/`              | The worker's whole conversation with a text-inference program it does not own (koboldcpp, sonar): the six-verb `TextBackend` protocol and its three exception types (`protocol.py`), the KoboldAI HTTP driver both backends accept (`kobold_api.py`), and the in-process `FakeTextBackend` dry runs and tests drive instead of a binary |
 | `alchemy_forms.py`            | Torch-free alchemy `forms` helpers: the default form set, form-name normalisation, and the `AuxiliaryFetchNeeds` a configuration derives for the download process |
 | `app_state.py`                | Durable dashboard/worker state path helpers                     |
 | `compute_mode.py`, `server_capabilities.py` | Torch-free backend intent and advertised capability helpers |

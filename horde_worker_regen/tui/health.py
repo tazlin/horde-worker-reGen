@@ -15,6 +15,7 @@ import shutil
 from pathlib import Path
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerFatalConfigError, WorkerStateSnapshot
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.tui.formatters import human_bytes, human_duration
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
@@ -455,6 +456,7 @@ def _build_checks(
         )
     checks.extend(_per_card_checks(snapshot))
     checks.extend(_model_fit_checks(snapshot))
+    checks.extend(_text_checks(snapshot))
     checks.append(_disk_check(snapshot))
     if snapshot.lora_pops_blocked_by_disk:
         checks.append(
@@ -577,6 +579,79 @@ def _model_fit_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
                 ),
             )
     return rows
+
+
+TEXT_BACKEND_CHECK_NAME = "Text backend"
+"""Names the readiness row. A surface that rewords a finding matches on the name, so the two text rows
+are named apart: "the backend never started" and "a generation stopped mid-flight" are different
+situations with different remedies."""
+
+TEXT_GENERATION_CHECK_NAME = "Text generation"
+"""Names the stall row (see :data:`TEXT_BACKEND_CHECK_NAME`)."""
+
+
+def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
+    """Text-generation rows: a backend that will not become ready, and a generation that stopped.
+
+    Silent on a worker whose operator did not select the scribe role, which is nearly every worker: a
+    row about a backend nobody configured is noise on every other dashboard.
+
+    Both thresholds come off the config summary rather than being stated here, so the dashboard's verdict
+    and the worker's own patience cannot drift apart. Readiness escalates rather than alarming at once
+    because a cold start legitimately runs to minutes: past the gate's own patience it is worth saying,
+    and past twice that the backend is not starting at all.
+    """
+    if not snapshot.config.scribe:
+        return []
+    rows: list[HealthCheck] = []
+    not_ready_for = _text_backend_not_ready_seconds(snapshot)
+    patience = snapshot.config.text_backend_ready_patience_seconds
+    if not_ready_for is not None and not_ready_for > patience:
+        failed = not_ready_for > patience * 2
+        rows.append(
+            HealthCheck(
+                TEXT_BACKEND_CHECK_NAME,
+                HealthStatus.ERROR if failed else HealthStatus.WARN,
+                f"No loaded model reported for {human_duration(not_ready_for)}; no text jobs are being "
+                "popped. Check that the backend is running and that `kai_url` is its address.",
+            ),
+        )
+    stalled = _text_stall_seconds(snapshot)
+    if stalled is not None:
+        rows.append(
+            HealthCheck(
+                TEXT_GENERATION_CHECK_NAME,
+                HealthStatus.WARN,
+                f"A text generation has produced nothing for {human_duration(stalled)}; the worker gives "
+                "up on it and faults the job at that point.",
+            ),
+        )
+    return rows
+
+
+def _text_backend_not_ready_seconds(snapshot: WorkerStateSnapshot) -> float | None:
+    """Return how long the text backend's readiness gate has been open, or None when it is not."""
+    if snapshot.text_backend_ready or snapshot.text_backend_not_ready_since is None or not snapshot.timestamp:
+        return None
+    return max(0.0, snapshot.timestamp - snapshot.text_backend_not_ready_since)
+
+
+def _text_stall_seconds(snapshot: WorkerStateSnapshot) -> float | None:
+    """Return the longest silence on an in-flight text generation past its bound, or None when none is.
+
+    The worker's own bound plus one snapshot interval, so the check never fires on a generation the
+    worker is in the act of abandoning: by the time the dashboard could warn, the next snapshot has
+    already dropped the row.
+    """
+    bound = snapshot.config.text_stall_seconds + snapshot.snapshot_interval_seconds
+    stalled = [
+        entry.progress_age_seconds
+        for entry in snapshot.work_ledger
+        if entry.workload is WorkloadKind.TEXT_GENERATION
+        and entry.progress_age_seconds is not None
+        and entry.progress_age_seconds > bound
+    ]
+    return max(stalled) if stalled else None
 
 
 def gpu_duty_low_cards(snapshot: WorkerStateSnapshot) -> list[int]:

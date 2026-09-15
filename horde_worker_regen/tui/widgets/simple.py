@@ -30,7 +30,12 @@ from textual.message import Message
 from textual.widgets import Button, Collapsible, Static
 
 from horde_worker_regen.app_state import OverviewTrendWindow
-from horde_worker_regen.process_management.ipc.supervisor_channel import RECENT_JOBS_IN_SNAPSHOT, DownloadPhase
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    RECENT_JOBS_IN_SNAPSHOT,
+    DownloadPhase,
+    WorkLedgerEntry,
+    WorkLedgerStage,
+)
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.formatters import (
     human_bytes,
@@ -40,7 +45,13 @@ from horde_worker_regen.tui.formatters import (
     shorten,
     sparkline,
 )
-from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase
+from horde_worker_regen.tui.health import (
+    TEXT_BACKEND_CHECK_NAME,
+    TEXT_GENERATION_CHECK_NAME,
+    HealthReport,
+    HealthStatus,
+    WorkerPhase,
+)
 from horde_worker_regen.tui.trends import fixed_counter_deltas, fixed_ratio_deltas
 
 if TYPE_CHECKING:
@@ -181,9 +192,76 @@ def job_progress_fraction(process: ProcessSnapshot) -> float | None:
     return None
 
 
+def _text_entries(snapshot: WorkerStateSnapshot) -> list[WorkLedgerEntry]:
+    """Return the in-flight text generations on this snapshot, in the order the worker popped them."""
+    active_stages = (WorkLedgerStage.QUEUED, WorkLedgerStage.INFERENCE, WorkLedgerStage.SUBMIT)
+    return [
+        entry
+        for entry in snapshot.work_ledger
+        if entry.workload is WorkloadKind.TEXT_GENERATION and entry.stage in active_stages
+    ]
+
+
+def _text_progress_total(snapshot: WorkerStateSnapshot) -> int:
+    """Return the summed progress of every in-flight text generation, whatever each one counts.
+
+    A counter for the liveness indicator, not a figure anyone reads: tokens and stream records are
+    summed together because the only question asked of it is whether it moved since the last frame.
+    """
+    return sum(entry.progress_current or 0 for entry in _text_entries(snapshot))
+
+
+_TEXT_POSTURE_WORDS: dict[str, str] = {
+    TEXT_BACKEND_CHECK_NAME: (
+        "The text program on this computer has not reported a loaded model, so no text requests are being taken."
+    ),
+    TEXT_GENERATION_CHECK_NAME: "A text request has stopped producing words and is being given up on.",
+}
+"""Simple's wording for each text finding, keyed by the health check's name.
+
+A finding this view has no wording for is left to the general first-finding line, so a check added later
+degrades to its own detail rather than disappearing."""
+
+
+def _text_posture_words(report: HealthReport) -> list[str]:
+    """Return Simple's wording for whichever text findings the health report raised."""
+    return [
+        _TEXT_POSTURE_WORDS[check.name]
+        for check in report.checks
+        if check.status >= HealthStatus.WARN and check.name in _TEXT_POSTURE_WORDS
+    ]
+
+
+def _text_request_progress(entry: WorkLedgerEntry) -> tuple[Text, Text]:
+    """Return the bar and the figure beside it for one in-flight text generation.
+
+    A generation whose backend counts tokens has a requested length to measure against and gets a real
+    bar. One whose backend counts only stream records has arrival but no fraction, so it gets an
+    indeterminate bar and the count in the unit it was counted in, rather than a percentage that would
+    read as "this far through" on evidence that cannot say. The unit keeps the word the operator
+    surfaces use, so a contributor who is promoted meets the same term rather than a second one.
+    """
+    waiting = entry.stage is WorkLedgerStage.QUEUED
+    if waiting:
+        return Text("waiting", "cyan"), Text("")
+    current = entry.progress_current
+    if entry.progress_total and current is not None:
+        fraction = max(0.0, min(1.0, current / entry.progress_total))
+        return Text(mini_bar(fraction, 16), "green"), Text(f"{fraction * 100:.0f}%", "bold")
+    if current is None:
+        return Text("working", "green"), Text("")
+    unit = entry.progress_unit.value.removesuffix("s") if current == 1 else entry.progress_unit.value
+    return Text("?" * 16, "grey50"), Text(f"{current:,} {unit}", "grey70")
+
+
+def _has_work_in_hand(snapshot: WorkerStateSnapshot) -> bool:
+    """Whether the worker is holding work of any kind, which decides what may prove it is alive."""
+    return snapshot.jobs_in_progress > 0 or snapshot.text_jobs_in_flight > 0
+
+
 def _identity_words(config: WorkerConfigSummary, *, uptime: float) -> str:
     """Name this worker, the build it is running, and who it is contributing for."""
-    names = [name for name in (config.dreamer_name, config.alchemist_name) if name]
+    names = [name for name in (config.dreamer_name, config.alchemist_name, config.scribe_name) if name]
     line = f"{' and '.join(names) or 'Unnamed worker'}, version {config.worker_version}"
     if config.horde_username:
         line += f", contributing as {config.horde_username}"
@@ -191,11 +269,13 @@ def _identity_words(config: WorkerConfigSummary, *, uptime: float) -> str:
     return f"{line}, contributing for {human_duration(uptime)}" if uptime > 0 else line
 
 
-def _offer_words(config: WorkerConfigSummary) -> str:
+def _offer_words(config: WorkerConfigSummary, *, text_model_name: str | None = None) -> str:
     """Name what this worker takes on, in the words a requester would recognise.
 
     LoRA follows the effective setting rather than the configured one, so a worker whose pops are not
-    currently advertising LoRA does not claim it.
+    currently advertising LoRA does not claim it. Text generation names the model the backend loaded
+    where it has answered, because "text generation" alone does not tell a contributor which of their
+    models the requests are being served by.
     """
     allows_lora = config.allow_lora if config.effective_allow_lora is None else config.effective_allow_lora
     offers: list[str] = []
@@ -209,6 +289,10 @@ def _offer_words(config: WorkerConfigSummary) -> str:
         offers.append("post-processing")
     if config.alchemist:
         offers.append("alchemy")
+    if config.scribe:
+        offers.append(
+            f"text generation with {shorten(text_model_name, 32)}" if text_model_name else "text generation",
+        )
     return ", ".join(offers) if offers else "plain image requests"
 
 
@@ -241,6 +325,11 @@ class LivenessIndicator:
     ``last_heartbeat_timestamp`` advances on any heartbeat, which separates a busy non-sampling stage
     from an absent process.
 
+    A text generation has no child of its own: it runs in a separate program, and what it produces
+    arrives as a stream the flow counts. That count is the same kind of signal as a sampling counter and
+    is read the same way, so a scribe worker with a generation in hand animates on the text arriving and
+    not on the supervisor still stamping snapshots over a backend that stopped.
+
     Whether a stall amounts to a fault is settled by
     [`derive`][horde_worker_regen.tui.health.derive], against tuned, download-aware thresholds the whole
     dashboard shares. This class supplies the animation and takes the verdict from the health report.
@@ -251,6 +340,7 @@ class LivenessIndicator:
         self._phase = 0
         self._last_steps: int | None = None
         self._last_child_heartbeat: float | None = None
+        self._last_text_progress: int | None = None
         self._last_timestamp: float | None = None
 
     def update(self, snapshot: WorkerStateSnapshot | None, *, is_alive: bool) -> None:
@@ -258,20 +348,24 @@ class LivenessIndicator:
         if snapshot is None or not is_alive:
             self._last_steps = None
             self._last_child_heartbeat = None
+            self._last_text_progress = None
             self._last_timestamp = None
             return
         children = [process for process in snapshot.processes if not process.is_external]
         steps = sum(process.heartbeats_inference_steps for process in children)
         child_heartbeat = max((process.last_heartbeat_timestamp for process in children), default=0.0)
-        working = snapshot.jobs_in_progress > 0
+        text_progress = _text_progress_total(snapshot)
+        working = _has_work_in_hand(snapshot)
         sampled = self._last_steps is not None and steps != self._last_steps
         child_reported = self._last_child_heartbeat is not None and child_heartbeat != self._last_child_heartbeat
+        text_arrived = self._last_text_progress is not None and text_progress != self._last_text_progress
         supervisor_reported = self._last_timestamp is not None and snapshot.timestamp != self._last_timestamp
-        advanced = (sampled or child_reported) if working else supervisor_reported
+        advanced = (sampled or child_reported or text_arrived) if working else supervisor_reported
         if advanced:
             self._phase += 1
         self._last_steps = steps
         self._last_child_heartbeat = child_heartbeat
+        self._last_text_progress = text_progress
         self._last_timestamp = snapshot.timestamp
 
     def marker(
@@ -290,7 +384,7 @@ class LivenessIndicator:
             return Text("○", "grey50")
         if concerning:
             return Text("!", "bold yellow")
-        if snapshot.jobs_in_progress > 0:
+        if _has_work_in_hand(snapshot):
             frames = _WORKING_FRAMES_ASCII if is_low_fidelity() else _WORKING_FRAMES
             return Text(frames[self._phase % len(frames)], "bold green")
         return Text(_IDLE_FRAMES[self._phase % len(_IDLE_FRAMES)], "cyan")
@@ -776,7 +870,10 @@ class SimpleHomeView(VerticalScroll):
             elif job.workload == WorkloadKind.ALCHEMY:
                 self._ticker.append(f"Finished an alchemy request{named}{elapsed}{earned}")
             elif job.workload == WorkloadKind.TEXT_GENERATION:
-                self._ticker.append(f"Finished a text request{named}{elapsed}{earned}")
+                # A text request has no resolution or step count to say how much work it was; the token
+                # count is the only figure that does, and a backend that counts none leaves it out.
+                tokens = f", {job.generated_tokens:,} tokens" if job.generated_tokens is not None else ""
+                self._ticker.append(f"Finished a text request{named}{tokens}{elapsed}{earned}")
             else:
                 self._ticker.append(f"Finished an image request{named}{elapsed}{earned}")
 
@@ -805,7 +902,8 @@ class SimpleHomeView(VerticalScroll):
         if snapshot is not None:
             uptime = time.time() - snapshot.session_start_time if snapshot.session_start_time else 0.0
             body.append(f"\n{_identity_words(snapshot.config, uptime=uptime)}", "grey62")
-            body.append(f"\nOffers: {_offer_words(snapshot.config)}. {_scale_words(snapshot.config)}.", "grey62")
+            offers = _offer_words(snapshot.config, text_model_name=snapshot.text_model_name)
+            body.append(f"\nOffers: {offers}. {_scale_words(snapshot.config)}.", "grey62")
         self.query_one("#simple-status", Static).update(body)
 
     def _render_headlines(self, snapshot: WorkerStateSnapshot | None) -> None:
@@ -834,13 +932,19 @@ class SimpleHomeView(VerticalScroll):
         )
 
     def _render_current(self, snapshot: WorkerStateSnapshot | None, *, is_alive: bool) -> None:
-        """Render a real progress bar per request in flight."""
+        """Render a real progress bar per request in flight, image and text alike.
+
+        A text generation has no process of its own, so its rows come from the work ledger rather than
+        from the process list; both kinds sit in one card because a contributor watching it is asking
+        what their machine is doing, not which subsystem is doing it.
+        """
         card = self.query_one("#simple-current", Static)
         if snapshot is None or not is_alive:
             card.update(titled("Right now", Text("Nothing running yet.", "grey70")))
             return
         busy = [process for process in snapshot.processes if process.is_busy and process.current_job_id]
-        if not busy:
+        text_entries = _text_entries(snapshot)
+        if not busy and not text_entries:
             card.update(titled("Right now", Text(self._idle_detail(snapshot), "grey70")))
             return
         table = Table.grid(padding=(0, 1))
@@ -858,6 +962,9 @@ class SimpleHomeView(VerticalScroll):
                 Text(name, "grey70"),
                 Text(f"{fraction * 100:.0f}%", "bold"),
             )
+        for entry in text_entries:
+            bar, detail = _text_request_progress(entry)
+            table.add_row(bar, Text(shorten(entry.model, 32) or "a text request", "grey70"), detail)
         card.update(titled("Right now", table))
 
     @staticmethod
@@ -884,8 +991,15 @@ class SimpleHomeView(VerticalScroll):
         is running and yet earning nothing: maintenance and pop backoff both stop new work arriving, and
         an absorbed process restart says the totals were interrupted. A nominal worker adds no line here,
         so the card's presence is itself the signal.
+
+        The two text postures are reworded from the health report's own findings rather than decided
+        again here, so Simple and the rest of the dashboard cannot disagree about whether a scribe is in
+        trouble. They are added beside the first finding rather than competing for its single slot: a
+        scribe worker whose backend never started has nothing else to say, and a dreamer-and-scribe one
+        would otherwise lose the text finding to any image one.
         """
         lines = [check.detail for check in report.checks if check.status >= HealthStatus.WARN][:1]
+        lines.extend(_text_posture_words(report))
         if snapshot is not None:
             if snapshot.maintenance_mode:
                 lines.append("Paused for maintenance, so no new requests are being taken.")

@@ -378,6 +378,41 @@ class TestTextJobRecords:
 
         assert list(metrics.snapshot().workload_totals) == [WorkloadKind.IMAGE_GENERATION]
 
+    def test_the_mean_token_count_averages_only_the_jobs_that_reported_one(self) -> None:
+        """A job whose backend counted nothing is unknown, not zero, so it cannot pull the mean down."""
+        metrics = WorkerRunMetrics()
+        for index, generated_tokens in enumerate((100, 200, None)):
+            metrics.record_text_job(
+                job_id=f"text-{index}",
+                model_name="koboldcpp/Llama-3.2-3B-Instruct",
+                time_popped=100.0,
+                time_submitted=110.0,
+                queue_wait_seconds=1.0,
+                generation_seconds=8.0,
+                faulted=False,
+                generated_tokens=generated_tokens,
+            )
+
+        assert metrics.snapshot().workload_totals[WorkloadKind.TEXT_GENERATION].mean_generated_tokens == 150.0
+
+    def test_a_session_whose_backend_counts_nothing_states_no_mean(self) -> None:
+        """A stock backend counts no tokens at all, and a zero there would read as a measurement."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics)
+        metrics.record_text_job(
+            job_id="text-1",
+            model_name="koboldcpp/Llama-3.2-3B-Instruct",
+            time_popped=100.0,
+            time_submitted=110.0,
+            queue_wait_seconds=1.0,
+            generation_seconds=8.0,
+            faulted=False,
+        )
+
+        totals = metrics.snapshot().workload_totals
+        assert totals[WorkloadKind.TEXT_GENERATION].mean_generated_tokens is None
+        assert totals[WorkloadKind.IMAGE_GENERATION].mean_generated_tokens is None
+
 
 class TestWorkerConditionFields:
     """The per-job conditions a cost analysis controls for: load, auxiliary wait, contention, residency."""

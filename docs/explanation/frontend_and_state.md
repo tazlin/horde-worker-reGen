@@ -58,7 +58,29 @@ defines the structured protocol over it:
   value carried as a plain string, so this module stays free of the scheduling package's import chain),
   which is what lets a recent-jobs row tell an image job, an alchemy form and a text generation apart.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 25) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 26) so a frontend can detect a mismatch with a worker built from different code.
+
+### One work ledger for three workloads
+
+`WorkLedgerEntry` carries a `workload`, and the ledger holds every unit of work the worker has in hand:
+image jobs first in pop order, then an alchemist's active forms, then a scribe's in-flight generations.
+The alternative, a list per workload, would give every surface that shows work a second data path for
+each new one, and each of them already renders one list.
+
+What a row's progress figures count is not the same across the three, so the row says so through
+`progress_unit`. An image job counts sampler steps, which is what the column has always meant and what a
+reader assumes, so `steps` renders without a unit word. A text generation counts tokens where its
+backend has a per-request statistics route, measured against the generation length the request asked
+for, and otherwise the stream records that have arrived, which is not a token count and has no total:
+that row renders an indeterminate bar rather than a fraction nothing supports. `iterations_per_second`
+is the same field carrying whichever rate the row's own unit implies, and stays unset where the flow has
+no measured figure rather than being derived from the text.
+
+A text row has no `process_id` and no `device_index`. Its generation runs in a separate program reached
+over HTTP, so there is no lane holding it, and naming one would point an operator at a process doing
+something else. `progress_age_seconds` is filled only where the flow watches work arrive continuously,
+which is what lets a dashboard tell a generation that stopped from one that is slow; an image job's
+staleness is read from its process's heartbeat instead.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate
@@ -559,6 +581,17 @@ resets `heartbeats_inference_steps` to zero on every heartbeat that is not a sam
 step, so alone it reads a model load or a post-processing pass as a wedge, and those
 routinely run for tens of seconds. The heartbeat timestamp advances on any heartbeat,
 which separates a busy non-sampling stage from an absent process.
+
+A text generation has no child at all: it runs in a separate program, and what it produces
+arrives as a stream the flow counts onto its work-ledger row. That count is the same kind
+of signal as a sampling counter and is admitted on the same terms, so while a scribe has a
+generation in hand the frame advances on the text arriving and never on the snapshot
+timestamp. The case the rule exists for is exactly this one: the worker's own loop stays
+healthy over a backend that stopped mid-generation, so its timestamps would otherwise
+animate over a wedge in a program the worker does not control. The two text health
+findings, a backend that will not become ready and a generation that has stopped, are
+reworded in Simple from the report rather than decided again there, so the two surfaces
+cannot disagree about whether a scribe is in trouble.
 
 Whether a stall amounts to a *fault* is settled by
 [`derive`][horde_worker_regen.tui.health.derive], against tuned, download-aware

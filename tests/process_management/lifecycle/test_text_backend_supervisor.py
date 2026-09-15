@@ -19,7 +19,10 @@ import psutil
 import pytest
 from horde_model_reference.text_backend_names import TEXT_BACKENDS
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import TEXT_BACKEND_PROCESS_ID
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    TEXT_BACKEND_PROCESS_ID,
+    TextBackendActivity,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import (
@@ -442,6 +445,52 @@ async def test_the_stopped_row_names_the_backend_without_claiming_a_process(tmp_
     assert row.text_backend.kind == str(TEXT_BACKENDS.koboldcpp)
     assert row.text_backend.launch_count == 0
     assert row.text_backend.model_name is None
+
+
+async def test_the_row_reports_the_requests_the_flow_has_in_flight(tmp_path: Path) -> None:
+    """The supervisor watches the process and never sees a generation, so the flow hands it the work.
+
+    Without that the row would read idle through every generation it served, which is the opposite of
+    what an operator watching the process table is looking for.
+    """
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(free_port(), tmp_path),
+        backend=StubBackend(ready_results=[True]),
+        backend_kind=TEXT_BACKENDS.koboldcpp,
+        launch_process=Launcher([FakeLaunched(pid=62)]),
+        timings=FAST,
+    )
+
+    row = supervisor.to_process_snapshot(
+        activity=TextBackendActivity(active_requests=2, queued_requests=1, tokens_per_second=31.5),
+    )
+
+    assert row.is_busy is True
+    assert row.text_backend is not None
+    assert row.text_backend.active_requests == 2
+    assert row.text_backend.queued_requests == 1
+    assert row.text_backend.tokens_per_second == 31.5
+
+
+async def test_a_row_with_nothing_in_flight_is_idle(tmp_path: Path) -> None:
+    """A backend the flow is asking nothing of is idle; a busy row would read as a lane holding work."""
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(free_port(), tmp_path),
+        backend=StubBackend(ready_results=[True]),
+        backend_kind=TEXT_BACKENDS.koboldcpp,
+        launch_process=Launcher([FakeLaunched(pid=63)]),
+        timings=FAST,
+    )
+
+    with_nothing = supervisor.to_process_snapshot(activity=TextBackendActivity())
+    without_activity = supervisor.to_process_snapshot()
+
+    for row in (with_nothing, without_activity):
+        assert row.is_busy is False
+        assert row.text_backend is not None
+        assert row.text_backend.active_requests == 0
+        assert row.text_backend.queued_requests == 0
+        assert row.text_backend.tokens_per_second is None
 
 
 async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_sizes(tmp_path: Path) -> None:

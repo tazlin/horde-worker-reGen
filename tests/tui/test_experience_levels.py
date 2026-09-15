@@ -30,10 +30,21 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     StatsSample,
     WorkerConfigSummary,
     WorkerStateSnapshot,
+    WorkLedgerEntry,
+    WorkLedgerProgressUnit,
+    WorkLedgerStage,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.config_form import CONFIG_FIELDS
+from horde_worker_regen.tui.health import (
+    TEXT_BACKEND_CHECK_NAME,
+    TEXT_GENERATION_CHECK_NAME,
+    HealthCheck,
+    HealthReport,
+    HealthStatus,
+    WorkerPhase,
+)
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, _subtab_id
 from horde_worker_regen.tui.widgets.experience import ExperienceIntroductionModal
 from horde_worker_regen.tui.widgets.simple import (
@@ -42,6 +53,9 @@ from horde_worker_regen.tui.widgets.simple import (
     SimpleHomeView,
     SimpleModelStatusView,
     TabPrimer,
+    _offer_words,
+    _text_posture_words,
+    _text_request_progress,
     job_progress_fraction,
 )
 from horde_worker_regen.tui.widgets.stats import StatsView
@@ -114,7 +128,8 @@ class _Snapshot:
     """A stand-in carrying only the fields the liveness indicator reads.
 
     ``heartbeat`` is the child's last heartbeat of any kind and ``steps`` its sampling counter. The
-    worker advances the two independently, and :class:`LivenessIndicator` reads both.
+    worker advances the two independently, and :class:`LivenessIndicator` reads both. A text generation
+    has no child at all, so its progress rides the work ledger and is counted from there.
     """
 
     def __init__(
@@ -124,11 +139,27 @@ class _Snapshot:
         timestamp: float,
         jobs_in_progress: int,
         heartbeat: float = 0.0,
+        text_jobs_in_flight: int = 0,
+        text_progress: int | None = None,
     ) -> None:
         """Store one frame of worker state."""
         self.processes = [_Process(steps, heartbeat=heartbeat)]
         self.timestamp = timestamp
         self.jobs_in_progress = jobs_in_progress
+        self.text_jobs_in_flight = text_jobs_in_flight
+        self.work_ledger = (
+            []
+            if text_progress is None
+            else [
+                WorkLedgerEntry(
+                    job_id="text-1",
+                    stage=WorkLedgerStage.INFERENCE,
+                    workload=WorkloadKind.TEXT_GENERATION,
+                    progress_current=text_progress,
+                    progress_unit=WorkLedgerProgressUnit.CHUNKS,
+                ),
+            ]
+        )
 
 
 @pytest.mark.slow
@@ -872,3 +903,145 @@ async def test_simple_home_navigation_lands_and_stays(tmp_path: Path, button_id:
         for _ in range(4):
             await pilot.pause()
         assert app.query_one("#main-tabs", TabbedContent).active == destination
+
+
+def test_the_hero_names_text_generation_and_the_model_serving_it() -> None:
+    """Naming the workload alone does not say which of a contributor's models answers the requests."""
+    scribe = WorkerConfigSummary(dreamer_name="AuroraBox", worker_version="9.9.9", scribe=True)
+
+    named = _offer_words(scribe, text_model_name="koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M")
+    unnamed = _offer_words(scribe)
+    dreamer_only = _offer_words(WorkerConfigSummary(dreamer_name="AuroraBox", worker_version="9.9.9"))
+
+    assert "text generation with" in named
+    assert "Llama-3.2-3B" in named
+    assert unnamed.endswith("text generation"), "a backend that has not answered names no model"
+    assert "text generation" not in dreamer_only
+
+
+def test_liveness_advances_on_text_arriving_and_not_on_the_supervisor_timestamp() -> None:
+    """A scribe's generation runs in a program the supervisor keeps stamping snapshots over.
+
+    The supervisor's own loop stays healthy while a backend stops mid-generation, so the timestamp is
+    exactly the signal the failure can satisfy. Only the text arriving may advance the frame while a
+    generation is in hand.
+    """
+    indicator = LivenessIndicator()
+    arriving = []
+    for tick in range(6):
+        snapshot = _Snapshot(
+            steps=0,
+            timestamp=1000.0 + tick,
+            jobs_in_progress=0,
+            text_jobs_in_flight=1,
+            text_progress=3 * tick,
+        )
+        indicator.update(snapshot, is_alive=True)
+        arriving.append(str(indicator.marker(snapshot, is_alive=True)))
+
+    stalled_indicator = LivenessIndicator()
+    stalled = []
+    for tick in range(20):
+        snapshot = _Snapshot(
+            steps=0,
+            timestamp=2000.0 + tick,
+            jobs_in_progress=0,
+            text_jobs_in_flight=1,
+            text_progress=17,
+        )
+        stalled_indicator.update(snapshot, is_alive=True)
+        stalled.append(str(stalled_indicator.marker(snapshot, is_alive=True)))
+
+    assert len(set(arriving)) > 1, "text arriving is the worker's own proof that it is working"
+    assert len(set(stalled)) == 1, "a backend producing nothing must not be animated by the supervisor"
+
+
+def test_a_text_request_shows_the_count_it_has_rather_than_a_fraction_it_lacks() -> None:
+    """A backend counting tokens has a length to measure against; one counting records has arrival only."""
+    counted = WorkLedgerEntry(
+        job_id="a",
+        stage=WorkLedgerStage.INFERENCE,
+        workload=WorkloadKind.TEXT_GENERATION,
+        progress_current=40,
+        progress_total=160,
+        progress_unit=WorkLedgerProgressUnit.TOKENS,
+    )
+    uncounted = WorkLedgerEntry(
+        job_id="b",
+        stage=WorkLedgerStage.INFERENCE,
+        workload=WorkloadKind.TEXT_GENERATION,
+        progress_current=12,
+        progress_unit=WorkLedgerProgressUnit.CHUNKS,
+    )
+    waiting = WorkLedgerEntry(
+        job_id="c",
+        stage=WorkLedgerStage.QUEUED,
+        workload=WorkloadKind.TEXT_GENERATION,
+    )
+
+    assert _text_request_progress(counted)[1].plain == "25%"
+    assert _text_request_progress(uncounted)[1].plain == "12 chunks"
+    assert "?" in _text_request_progress(uncounted)[0].plain
+    assert _text_request_progress(waiting)[0].plain == "waiting"
+
+
+def test_the_ticker_names_the_model_and_the_token_count_of_a_text_request() -> None:
+    """A text request has no resolution or step count, so the tokens are the only size it can state."""
+    home = SimpleHomeView()
+    home._record_events(
+        WorkerStateSnapshot(
+            config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+            recent_jobs=[
+                RecentJobRecord(
+                    job_id="a",
+                    workload=WorkloadKind.TEXT_GENERATION,
+                    model_name="koboldcpp/Llama-3.2-3B",
+                    generated_tokens=160,
+                    e2e_seconds=2.0,
+                    kudos_reward=4.0,
+                ),
+                RecentJobRecord(
+                    job_id="b",
+                    workload=WorkloadKind.TEXT_GENERATION,
+                    model_name="koboldcpp/Llama-3.2-3B",
+                    e2e_seconds=2.0,
+                ),
+            ],
+        ),
+    )
+
+    lines = list(home._ticker)
+    assert lines[0] == "Finished a text request with koboldcpp/Llama-3.2-3B, 160 tokens in 2s (+4.0 kudos)"
+    assert lines[1] == "Finished a text request with koboldcpp/Llama-3.2-3B in 2s", "no count is left unsaid"
+
+
+def test_the_attention_card_rewords_the_two_text_findings() -> None:
+    """Simple takes the verdict from the health report; reaching a second one would split the dashboard."""
+    unready = HealthReport(
+        phase=WorkerPhase.READY,
+        severity=HealthStatus.WARN,
+        headline="",
+        detail="",
+        checks=[HealthCheck(TEXT_BACKEND_CHECK_NAME, HealthStatus.WARN, "operator wording")],
+        animated=False,
+    )
+    stalled = HealthReport(
+        phase=WorkerPhase.READY,
+        severity=HealthStatus.WARN,
+        headline="",
+        detail="",
+        checks=[HealthCheck(TEXT_GENERATION_CHECK_NAME, HealthStatus.WARN, "operator wording")],
+        animated=False,
+    )
+    nominal = HealthReport(
+        phase=WorkerPhase.READY,
+        severity=HealthStatus.OK,
+        headline="",
+        detail="",
+        checks=[HealthCheck(TEXT_BACKEND_CHECK_NAME, HealthStatus.OK, "fine")],
+        animated=False,
+    )
+
+    assert "has not reported a loaded model" in _text_posture_words(unready)[0]
+    assert "stopped producing words" in _text_posture_words(stalled)[0]
+    assert _text_posture_words(nominal) == []

@@ -61,6 +61,7 @@ from horde_worker_regen.analysis.log_signatures import pattern_for
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     TEXT_BACKEND_PROCESS_ID,
     ProcessSnapshot,
+    TextBackendActivity,
     TextBackendDetail,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -458,15 +459,21 @@ class TextBackendSupervisor:
         self._backoff_seconds = None
         self._backoff_started_monotonic = None
 
-    def to_process_snapshot(self) -> ProcessSnapshot:
+    def to_process_snapshot(self, activity: TextBackendActivity | None = None) -> ProcessSnapshot:
         """Return the backend's row for the dashboard's process surfaces.
 
         Satisfies
         [`SupervisedProcessSnapshotSource`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisedProcessSnapshotSource]:
         the row is marked external and carries a typed
         [`TextBackendDetail`][horde_worker_regen.process_management.ipc.supervisor_channel.TextBackendDetail]
-        instead of the allocator readings and job progress a pipe-bearing child reports. Every figure is one
-        the supervisor already holds, so the call neither blocks nor asks the backend anything.
+        instead of the allocator readings and job progress a pipe-bearing child reports. Every figure the
+        supervisor supplies is one it already holds, so the call neither blocks nor asks the backend
+        anything.
+
+        Args:
+            activity: What the text flow currently has in flight against this backend, which the
+                supervisor cannot see for itself. None when no flow is attached, which leaves the row's
+                request counts at zero and the row idle rather than claiming work nothing accounts for.
         """
         description = self._description
         return ProcessSnapshot(
@@ -475,7 +482,7 @@ class TextBackendSupervisor:
             device_index=self._launch_spec.device_index,
             last_process_state=self._state.name,
             is_alive=self._state in (TextBackendState.LAUNCHING, TextBackendState.SERVING),
-            is_busy=False,
+            is_busy=activity is not None and activity.active_requests > 0,
             is_external=True,
             os_pid=self._tree_pids[0] if self._tree_pids else None,
             display_state=self._display_state(),
@@ -491,6 +498,9 @@ class TextBackendSupervisor:
                 ready_since=self._ready_since,
                 last_health_ok_at=self._last_health_ok_at,
                 relaunch_backoff_seconds=self._relaunch_backoff_remaining(),
+                active_requests=activity.active_requests if activity is not None else 0,
+                queued_requests=activity.queued_requests if activity is not None else 0,
+                tokens_per_second=activity.tokens_per_second if activity is not None else None,
                 model_buffer_mb=self._buffer_sizes.model_mebibytes,
                 kv_buffer_mb=self._buffer_sizes.kv_mebibytes,
                 compute_buffer_mb=self._buffer_sizes.compute_mebibytes,

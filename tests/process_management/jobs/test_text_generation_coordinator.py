@@ -15,7 +15,8 @@ import asyncio
 import time
 import uuid
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import FrozenInstanceError
 from typing import override
 from unittest.mock import Mock
 
@@ -145,6 +146,7 @@ def _make_coordinator(
     session: _FakeHordeClientSession | None = None,
     state: WorkerState | None = None,
     run_metrics: WorkerRunMetrics | None = None,
+    launch_count_provider: Callable[[], int] | None = None,
     **bridge_overrides: object,
 ) -> tuple[TextGenerationCoordinator, FakeTextBackend, _FakeHordeClientSession]:
     """Create a coordinator over a fake backend and a fake horde session, with the scribe role on.
@@ -170,6 +172,7 @@ def _make_coordinator(
         backend=resolved_backend,
         text_backend_kind=bridge_data.text_backend_kind,
         run_metrics=run_metrics,
+        launch_count_provider=launch_count_provider,
     )
     return coordinator, resolved_backend, resolved_session
 
@@ -983,3 +986,104 @@ async def test_a_backend_that_counts_nothing_records_no_token_counts() -> None:
     record = run_metrics.snapshot().jobs[0]
     assert record.prompt_tokens is None
     assert record.generated_tokens is None
+
+
+async def test_a_relaunch_the_flow_did_not_notice_marks_the_backend_cold_again() -> None:
+    """A backend restarted between two jobs has cold kernels, and no gate ran to say so.
+
+    The readiness gate resets the cold flag, but a relaunch with nothing in hand fails no generation and
+    re-runs no gate, so a flag cleared by the previous process's first token would hold over a process
+    that has produced nothing. The worker's own launch count is the fact that changed.
+    """
+    launches = [1]
+    coordinator, _backend, _session = _make_coordinator(launch_count_provider=lambda: launches[0])
+    await coordinator.await_backend_ready()
+    coordinator._backend_is_cold = False
+
+    launches[0] = 2
+    coordinator._note_backend_launch_count()
+
+    assert coordinator._backend_is_cold is True
+
+
+async def test_a_steady_launch_count_leaves_a_warm_backend_warm() -> None:
+    """Asking the count is idempotent: a backend that has not restarted keeps its warm kernels."""
+    coordinator, _backend, _session = _make_coordinator(launch_count_provider=lambda: 3)
+    await coordinator.await_backend_ready()
+    coordinator._backend_is_cold = False
+
+    coordinator._note_backend_launch_count()
+    coordinator._note_backend_launch_count()
+
+    assert coordinator._backend_is_cold is False
+
+
+async def test_a_backend_the_operator_runs_keeps_the_readiness_gate_reset() -> None:
+    """With no launch to count, the gate is the only thing that can say the backend started again."""
+    coordinator, _backend, _session = _make_coordinator()
+    await coordinator.await_backend_ready()
+    coordinator._backend_is_cold = False
+
+    coordinator._note_backend_launch_count()
+    assert coordinator._backend_is_cold is False
+
+    await coordinator.await_backend_ready()
+    assert coordinator._backend_is_cold is True
+
+
+async def test_the_in_flight_view_names_every_held_job_and_cannot_be_written_to() -> None:
+    """The snapshot builder reads this while the jobs' own tasks write to them, so it is a frozen copy.
+
+    Complete rather than filtered: a caller that wants only the generating jobs decides that itself, and
+    one that wants the queue would otherwise have no way to see it.
+    """
+    coordinator, _backend, _session = _make_coordinator()
+    queued = TextJobInFlight(job_id="queued-job", payload={"max_length": 160}, time_popped=10.0)
+    generating = TextJobInFlight(
+        job_id="generating-job",
+        payload={"max_length": 80},
+        time_popped=20.0,
+        model_name="koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M",
+        time_generation_started=21.0,
+        progress=TextGenerationProgress(
+            chunks_received=7,
+            characters_received=31,
+            completion_tokens=24,
+            elapsed_seconds=1.5,
+            tokens_per_second=16.0,
+        ),
+    )
+    coordinator._in_flight = {job.job_id: job for job in (generating, queued)}
+
+    rows = coordinator.in_flight_view()
+
+    assert [row.job_id for row in rows] == ["queued-job", "generating-job"], "rows arrive in pop order"
+    assert rows[0].is_generating is False
+    assert rows[0].max_length == 160
+    assert rows[0].progress is None
+    assert rows[1].is_generating is True
+    assert rows[1].model_name == "koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M"
+    assert rows[1].progress is not None
+    assert rows[1].progress.completion_tokens == 24
+    with pytest.raises(FrozenInstanceError):
+        rows[1].job_id = "rewritten"  # pyrefly: ignore[read-only]
+
+
+async def test_a_payload_with_no_generation_length_states_none_rather_than_a_default() -> None:
+    """The payload is the horde's; a length it did not state is unknown, not the worker's own cap."""
+    coordinator, _backend, _session = _make_coordinator()
+    coordinator._in_flight = {"job": TextJobInFlight(job_id="job", payload={}, time_popped=1.0)}
+
+    assert coordinator.in_flight_view()[0].max_length is None
+
+
+async def test_the_readiness_clock_starts_when_the_gate_opens_and_stops_when_it_passes() -> None:
+    """A dashboard asking why a scribe is idle needs how long, which a boolean cannot say."""
+    coordinator, _backend, _session = _make_coordinator()
+
+    assert coordinator.backend_not_ready_since is not None
+
+    await coordinator.await_backend_ready()
+
+    assert coordinator.backend_ready is True
+    assert coordinator.backend_not_ready_since is None

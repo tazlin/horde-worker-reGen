@@ -12,8 +12,15 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerConfigSummary,
     WorkerFatalConfigError,
     WorkerStateSnapshot,
+    WorkLedgerEntry,
+    WorkLedgerProgressUnit,
+    WorkLedgerStage,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.health import (
+    TEXT_BACKEND_CHECK_NAME,
+    TEXT_GENERATION_CHECK_NAME,
+    HealthCheck,
     HealthStatus,
     WorkerPhase,
     build_offline_checks,
@@ -611,3 +618,111 @@ def test_a_text_backend_is_not_a_card_with_low_duty() -> None:
     )
 
     assert gpu_duty_low_cards(snapshot) == []
+
+
+_SCRIBE_CONFIG = WorkerConfigSummary(
+    dreamer_name="Test",
+    scribe_name="Test-Scribe",
+    worker_version="12.0.0",
+    scribe=True,
+    text_stall_seconds=30.0,
+    text_backend_ready_patience_seconds=120.0,
+)
+"""A scribe worker's config summary carrying the two patiences the text checks derive from."""
+
+
+def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
+    """Return the text rows of a derived report, which is where both text findings land."""
+    report = derive(snapshot, SupervisorStatus.RUNNING, 1.0)
+    return [check for check in report.checks if check.name in (TEXT_BACKEND_CHECK_NAME, TEXT_GENERATION_CHECK_NAME)]
+
+
+def _unready_scribe(*, seconds: float) -> WorkerStateSnapshot:
+    """A scribe worker whose readiness gate has been open for ``seconds``."""
+    return _snapshot(
+        config=_SCRIBE_CONFIG,
+        timestamp=10_000.0,
+        text_backend_ready=False,
+        text_backend_not_ready_since=10_000.0 - seconds,
+    )
+
+
+def _generating_scribe(*, silent_for: float) -> WorkerStateSnapshot:
+    """A scribe worker with one generation in hand that last produced text ``silent_for`` ago."""
+    return _snapshot(
+        config=_SCRIBE_CONFIG,
+        timestamp=10_000.0,
+        text_backend_ready=True,
+        text_jobs_in_flight=1,
+        snapshot_interval_seconds=1.0,
+        work_ledger=[
+            WorkLedgerEntry(
+                job_id="running",
+                stage=WorkLedgerStage.INFERENCE,
+                workload=WorkloadKind.TEXT_GENERATION,
+                progress_current=12,
+                progress_unit=WorkLedgerProgressUnit.CHUNKS,
+                progress_age_seconds=silent_for,
+            ),
+        ],
+    )
+
+
+def test_a_backend_within_its_readiness_patience_raises_nothing() -> None:
+    """A cold start legitimately runs to minutes, so the wait itself is not a finding."""
+    assert _text_checks(_unready_scribe(seconds=90.0)) == []
+
+
+def test_a_backend_past_its_readiness_patience_warns_and_says_why_no_jobs_are_popped() -> None:
+    """Past the gate's own patience the wait stops being a cold start and is worth an operator's eye."""
+    checks = _text_checks(_unready_scribe(seconds=150.0))
+
+    assert [check.name for check in checks] == [TEXT_BACKEND_CHECK_NAME]
+    assert checks[0].status is HealthStatus.WARN
+    assert "no text jobs are being popped" in checks[0].detail
+
+
+def test_a_backend_past_twice_its_readiness_patience_is_a_fault() -> None:
+    """At that point the backend is not starting at all, which is a different situation from slow."""
+    checks = _text_checks(_unready_scribe(seconds=260.0))
+
+    assert checks[0].status is HealthStatus.ERROR
+
+
+def test_a_generation_within_its_stall_bound_raises_nothing() -> None:
+    """The bound is the worker's own patience; below it the generation is merely slow."""
+    assert _text_checks(_generating_scribe(silent_for=20.0)) == []
+
+
+def test_a_generation_that_has_produced_nothing_past_its_bound_warns() -> None:
+    """Silence is the one signal a deadline cannot give, and the worker faults the job on it."""
+    checks = _text_checks(_generating_scribe(silent_for=45.0))
+
+    assert [check.name for check in checks] == [TEXT_GENERATION_CHECK_NAME]
+    assert checks[0].status is HealthStatus.WARN
+    assert "produced nothing" in checks[0].detail
+
+
+def test_a_generation_at_the_stall_bound_is_given_the_snapshot_interval() -> None:
+    """The worker abandons the job at its own bound, so the dashboard must not warn about it first."""
+    assert _text_checks(_generating_scribe(silent_for=30.5)) == []
+
+
+def test_a_worker_without_the_scribe_role_never_sees_a_text_check() -> None:
+    """A row about a backend nobody configured is noise on nearly every dashboard."""
+    dreamer = _snapshot(
+        timestamp=10_000.0,
+        text_backend_ready=False,
+        text_backend_not_ready_since=1.0,
+        text_jobs_in_flight=1,
+        work_ledger=[
+            WorkLedgerEntry(
+                job_id="running",
+                stage=WorkLedgerStage.INFERENCE,
+                workload=WorkloadKind.TEXT_GENERATION,
+                progress_age_seconds=900.0,
+            ),
+        ],
+    )
+
+    assert _text_checks(dreamer) == []
