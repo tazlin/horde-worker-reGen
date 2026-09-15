@@ -114,6 +114,7 @@ module paths directly.
 | `benchmark/gate_driver.py`    | Disagg A/B measurement gate: runs a mix through the harness in ABBA order, scores kudos/hr, and derives per-stage reload/latency mechanism metrics (`python -m horde_worker_regen.benchmark.gate_driver`) |
 | `amd_go_fast/`                | AMD/ROCm-specific optimizations                                 |
 | `capabilities/`               | Placeholder for future optional "capability" processes (heavy features split out of the base worker; see the README) |
+| `text_backends/`              | The worker's whole conversation with a text-inference program it does not own (koboldcpp, sonar): the five-verb `TextBackend` protocol and its three exception types (`protocol.py`), the KoboldAI HTTP driver both backends accept (`kobold_api.py`), and the in-process `FakeTextBackend` dry runs and tests drive instead of a binary |
 | `alchemy_forms.py`            | Torch-free alchemy `forms` helpers: the default form set, form-name normalisation, and the `AuxiliaryFetchNeeds` a configuration derives for the download process |
 | `app_state.py`                | Durable dashboard/worker state path helpers                     |
 | `compute_mode.py`, `server_capabilities.py` | Torch-free backend intent and advertised capability helpers |
