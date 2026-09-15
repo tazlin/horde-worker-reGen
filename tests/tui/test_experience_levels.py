@@ -31,6 +31,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.config_form import CONFIG_FIELDS
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, _subtab_id
@@ -748,7 +749,12 @@ def test_the_ticker_says_which_model_earned_what() -> None:
             config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
             recent_jobs=[
                 RecentJobRecord(job_id="a", model_name="Deliberate", e2e_seconds=24.0, kudos_reward=8.25),
-                RecentJobRecord(job_id="b", is_alchemy=True, model_name="strip_background", e2e_seconds=2.0),
+                RecentJobRecord(
+                    job_id="b",
+                    workload=WorkloadKind.ALCHEMY.value,
+                    model_name="strip_background",
+                    e2e_seconds=2.0,
+                ),
                 RecentJobRecord(job_id="c", model_name="Deliberate", faulted=True, e2e_seconds=5.0, kudos_reward=None),
             ],
         ),

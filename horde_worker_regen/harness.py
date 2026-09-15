@@ -72,6 +72,7 @@ from horde_worker_regen.process_management.scheduling.model_demand_poller import
     DemandSnapshot,
     ModelDemandRecord,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
@@ -2551,7 +2552,11 @@ class WarmHarnessSession:
         deadline = time.time() + budget_seconds
         while True:
             metrics = manager.get_run_metrics_snapshot()
-            records = [job for job in metrics.jobs if not job.is_alchemy] if metrics is not None else []
+            records = (
+                [job for job in metrics.jobs if job.workload is WorkloadKind.IMAGE_GENERATION]
+                if metrics is not None
+                else []
+            )
             tracker_delta = manager._job_tracker.total_num_completed_jobs - base_completed
             if len(records) >= min(expected_records, tracker_delta) or time.time() >= deadline:
                 return metrics
@@ -2577,7 +2582,7 @@ class WarmHarnessSession:
         """
         if metrics is None:
             return tracker_completed, tracker_faulted
-        records = [job for job in metrics.jobs if not job.is_alchemy]
+        records = [job for job in metrics.jobs if job.workload is WorkloadKind.IMAGE_GENERATION]
         if not records:
             return tracker_completed, tracker_faulted
         completed = sum(1 for record in records if not record.faulted)

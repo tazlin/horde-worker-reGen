@@ -499,7 +499,10 @@ def test_trends_show_forms_per_hour_only_for_alchemist() -> None:
 
 def test_recent_jobs_retains_more_rows_when_alchemist_only() -> None:
     """Sparse alchemy work stays visible: an alchemist-only worker shows the full retained set, not 8."""
-    jobs = [RecentJobRecord(job_id=f"job-{i}", is_alchemy=True, model_name=f"form{i}") for i in range(12)]
+    jobs = [
+        RecentJobRecord(job_id=f"job-{i}", workload=WorkloadKind.ALCHEMY.value, model_name=f"form{i}")
+        for i in range(12)
+    ]
     alchemist_only = WorkerStateSnapshot(
         config=_alchemist_only_config(),
         enabled_workloads=[WorkloadKind.ALCHEMY.value],

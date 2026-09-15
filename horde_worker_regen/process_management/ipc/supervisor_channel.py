@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 23
+SUPERVISOR_PROTOCOL_VERSION = 24
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -86,6 +86,9 @@ images it produces. The worker resolves the sampler's published work profile and
 (it owns the ``horde_sdk`` import); a dashboard only formats what it is handed. v23 also dropped
 ``WorkLedgerEntry.raw_reason``: it carried the worker-wide pop-block reason on every row, which says
 nothing about the job the row is for, and the same text is already on ``orchestration_intent.raw_gate``.
+v24 makes text generation visible: ``RecentJobRecord.workload`` replaces its ``is_alchemy`` boolean (a
+worker serving three workloads cannot be partitioned by one), the snapshot gains the ``text_*`` counters
+and backend identity, and ``WorkerConfigSummary`` gains ``scribe``/``scribe_name``.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -296,6 +299,14 @@ class WorkerConfigSummary(BaseModel):
     alchemy_caption_enabled: bool = False
     alchemy_forms: list[str] = Field(default_factory=list)
 
+    scribe: bool = False
+    """Whether the operator selected the text-generation role."""
+    scribe_name: str | None = None
+    """The worker's scribe identity, shown in place of the dreamer name on a scribe-only worker.
+
+    Each role registers as its own separately-named worker on the horde, so this is never the dreamer's
+    name. None when the role is off."""
+
 
 class ResidentComponentEntry(BaseModel):
     """Represents one model component a process holds resident in its RAM component cache, for the dashboard.
@@ -436,7 +447,13 @@ class RecentJobRecord(BaseModel):
     """
 
     job_id: str
-    is_alchemy: bool = False
+    workload: str = "image_generation"
+    """Which workload produced this job, as a ``WorkloadKind`` value.
+
+    A plain string for the same reason :attr:`WorkerStateSnapshot.enabled_workloads` is one: importing
+    ``WorkloadKind`` here pulls the scheduling package's ``horde_sdk`` chain into every consumer, and
+    ``ipc.messages`` imports this module, so the import is also a cycle. Consumers compare against the
+    typed enum, which is a ``StrEnum`` and so compares equal to these values."""
     faulted: bool = False
     queue_wait_seconds: float | None = None
     e2e_seconds: float | None = None
@@ -485,7 +502,7 @@ class RecentJobRecord(BaseModel):
             )
         return cls(
             job_id=record.job_id,
-            is_alchemy=record.is_alchemy,
+            workload=record.workload.value,
             faulted=record.faulted,
             queue_wait_seconds=record.queue_wait_seconds,
             e2e_seconds=record.e2e_seconds,
@@ -1302,6 +1319,28 @@ class WorkerStateSnapshot(BaseModel):
     """Cumulative forms successfully submitted this session."""
     alchemy_total_faulted: int = 0
     """Cumulative forms that faulted (permanently failed) this session."""
+
+    text_jobs_in_flight: int = 0
+    """Text jobs popped, generating, or awaiting submission.
+
+    Text generation has no queued or dispatched stage to report beside this: its generations run in a
+    separate program the worker reaches over HTTP, so a popped job goes straight to that program."""
+    text_total_submitted: int = 0
+    """Cumulative text jobs successfully submitted this session."""
+    text_total_faulted: int = 0
+    """Cumulative text jobs submitted as faulted this session."""
+    text_backend_ready: bool = False
+    """Whether the text backend has reported a loaded model and described itself.
+
+    False while the readiness gate is open, which a cold start legitimately holds for minutes, and again
+    after a backend failure sends the flow back to the gate. Nothing is popped while it is False."""
+    text_model_name: str | None = None
+    """The text model as the worker advertises it, prefix included; None before the backend has answered."""
+    text_context_length: int | None = None
+    """The largest prompt-plus-generation token count offered: the lower of the operator's cap and the
+    backend's. None before the backend has answered."""
+    text_max_length: int | None = None
+    """The largest generation length offered, on the same basis as :attr:`text_context_length`."""
 
     enabled_workloads: list[str] = Field(default_factory=list)
     """The workloads this worker serves, as ``WorkloadKind`` values (e.g. ``image_generation``,

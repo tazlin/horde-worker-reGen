@@ -33,6 +33,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     StatsRollupRow,
     StatsSample,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.telemetry_spans import (
     job_e2e_histogram,
     job_queue_wait_histogram,
@@ -194,10 +195,15 @@ class ResourceStateKind(enum.StrEnum):
 
 
 class JobMetricsRecord(BaseModel):
-    """The full metrics picture of one finished job (or alchemy form)."""
+    """The full metrics picture of one finished unit of work (an image job, an alchemy form, a text job)."""
 
     job_id: str
-    is_alchemy: bool = False
+    workload: WorkloadKind = WorkloadKind.IMAGE_GENERATION
+    """Which flow produced this record.
+
+    Every reader that used to ask "is this an alchemy form?" asks this instead, because the worker serves
+    three workloads and a boolean can only partition two. Image-shaped fields (steps, resolution,
+    megapixelsteps, sampler) stay at their defaults on a record from another workload."""
     faulted: bool = False
     fault_reason: str | None = None
     """Why the job faulted, as reported by the stage that faulted it, or None when it did not fault.
@@ -288,6 +294,32 @@ class JobMetricsRecord(BaseModel):
     None when no reward is known: the job faulted, the worker never contacted the horde for it (canned
     submits), or the response carried no figure. A zero here would be a reward the horde really valued at
     nothing, so the unknown case is kept distinct."""
+
+    prompt_tokens: int | None = None
+    """Tokens the text backend consumed for this job's prompt, or None when it reported no count.
+
+    Text generation's analogue of the image fields above: a text job's cost is tokens in and tokens out,
+    where an image job's is pixels and steps. None on every other workload, and on a text job whose
+    backend does not report per-request counts."""
+    generated_tokens: int | None = None
+    """Tokens the text backend produced for this job, or None when it reported no count."""
+    max_length: int | None = None
+    """The generation-length cap the horde asked this text job for, or None outside text generation."""
+
+
+class WorkloadTotals(BaseModel):
+    """Represents one workload's session totals, for a per-workload read of a run.
+
+    Derived from the finished-job records at snapshot time rather than counted as work lands, so it cannot
+    drift from the records it summarizes.
+    """
+
+    completed: int = 0
+    """Records for work that did not fault."""
+    faulted: int = 0
+    """Records for work that faulted. With :attr:`completed` this partitions the workload's records."""
+    kudos: float = 0.0
+    """Kudos the horde paid for this workload's completed work; 0.0 when no record carried a reward."""
 
 
 class StatsSampleEvent(BaseModel):
@@ -553,6 +585,11 @@ class RunMetricsSnapshot(BaseModel):
     """Everything the run metrics aggregator observed, frozen at snapshot time."""
 
     jobs: list[JobMetricsRecord]
+    workload_totals: dict[WorkloadKind, WorkloadTotals] = Field(default_factory=dict)
+    """Session completed/faulted/kudos totals per workload, derived from ``jobs``.
+
+    A worker serving three workloads has three sets of headline numbers, and a single pair of counters
+    cannot say which flow earned what. Only workloads with at least one record appear."""
     stage_metrics: list[JobMetricsRecord] = Field(default_factory=list)
     """Per-stage metrics records from the disaggregated lanes (text-encode, VAE encode/decode), each tagged
     with its :class:`~horde_worker_regen.process_management.ipc.messages.PipelineStageTag`.
@@ -809,7 +846,9 @@ class WorkerRunMetrics:
             self._stage_metrics.append(
                 JobMetricsRecord(
                     job_id=message.job_id,
-                    is_alchemy=message.is_alchemy,
+                    # The child reports its own workload as a boolean it has always sent; the record's
+                    # three-way discriminator is the parent's vocabulary, so the mapping happens here.
+                    workload=WorkloadKind.ALCHEMY if message.is_alchemy else WorkloadKind.IMAGE_GENERATION,
                     stage=message.stage,
                     phase_metrics=metrics,
                 ),
@@ -957,7 +996,7 @@ class WorkerRunMetrics:
             job_e2e_histogram.record(e2e_seconds)
         record = JobMetricsRecord(
             job_id=form_id,
-            is_alchemy=True,
+            workload=WorkloadKind.ALCHEMY,
             faulted=faulted,
             e2e_seconds=e2e_seconds,
             phase_metrics=phase_metrics,
@@ -969,6 +1008,64 @@ class WorkerRunMetrics:
         )
         self._jobs.append(record)
         self._fold_form_rollup(record)
+        self._write_job_event(record, baseline=None)
+
+    def record_text_job(
+        self,
+        *,
+        job_id: str,
+        model_name: str | None,
+        time_popped: float,
+        time_submitted: float,
+        queue_wait_seconds: float | None,
+        generation_seconds: float | None,
+        faulted: bool,
+        kudos_reward: float | None = None,
+        prompt_tokens: int | None = None,
+        generated_tokens: int | None = None,
+        max_length: int | None = None,
+    ) -> None:
+        """Record one finished text job, the scribe analogue of :meth:`on_job_finalized`.
+
+        Text jobs run in a separate program and never touch the image job tracker or any child process, so
+        the text flow calls this at its terminal outcome with the timings it alone holds. The record feeds
+        the recent-jobs view, the per-workload totals and the JSONL export, giving text generation the same
+        per-job observability the other two workloads have.
+
+        Args:
+            job_id: The horde's id for the generation.
+            model_name: The model as the worker advertised it, prefix included; None when unknown.
+            time_popped: Epoch time the job was popped.
+            time_submitted: Epoch time the submit was delivered.
+            queue_wait_seconds: Pop to generation start; None when the job never reached the backend.
+            generation_seconds: How long the backend took, or None when it never generated.
+            faulted: Whether the outcome delivered to the horde was a fault report.
+            kudos_reward: What the horde paid, or None for a fault (which it pays nothing for).
+            prompt_tokens: Prompt tokens the backend reported, or None when it reports no counts.
+            generated_tokens: Generated tokens the backend reported, or None when it reports no counts.
+            max_length: The generation-length cap the horde asked for, when the payload named one.
+        """
+        e2e_seconds = max(0.0, time_submitted - time_popped)
+        job_e2e_histogram.record(e2e_seconds)
+        if queue_wait_seconds is not None:
+            job_queue_wait_histogram.record(queue_wait_seconds)
+        record = JobMetricsRecord(
+            job_id=job_id,
+            workload=WorkloadKind.TEXT_GENERATION,
+            faulted=faulted,
+            time_popped=time_popped,
+            queue_wait_seconds=queue_wait_seconds,
+            e2e_seconds=e2e_seconds,
+            model_name=model_name,
+            # The backend's generation is the text flow's whole compute span, so it lands where an image
+            # job's sampling time does and a reader asking "how long did the work itself take" finds it.
+            sampling_seconds=generation_seconds,
+            kudos_reward=kudos_reward,
+            prompt_tokens=prompt_tokens,
+            generated_tokens=generated_tokens,
+            max_length=max_length,
+        )
+        self._jobs.append(record)
         self._write_job_event(record, baseline=None)
 
     def record_process_crash(
@@ -1267,6 +1364,24 @@ class WorkerRunMetrics:
         """Return finalized alchemy-form rollups by form (``model`` carries the form name)."""
         return sorted(self._form_rollups.values(), key=lambda row: row.jobs, reverse=True)
 
+    def workload_totals(self) -> dict[WorkloadKind, WorkloadTotals]:
+        """Return this session's completed/faulted/kudos totals per workload.
+
+        Derived from the finished-job records each time it is asked, so it agrees with ``jobs`` by
+        construction. Workloads that finished nothing are absent rather than present with zeroes, so a
+        dreamer-only worker reports one entry.
+        """
+        totals: dict[WorkloadKind, WorkloadTotals] = {}
+        for record in self._jobs:
+            entry = totals.setdefault(record.workload, WorkloadTotals())
+            if record.faulted:
+                entry.faulted += 1
+            else:
+                entry.completed += 1
+            if record.kudos_reward is not None:
+                entry.kudos += record.kudos_reward
+        return totals
+
     def stats_export_state(self) -> StatsExportState:
         """Return current JSONL export state for the supervisor snapshot."""
         if self._stats_exporter is None:
@@ -1282,7 +1397,7 @@ class WorkerRunMetrics:
         return self._baseline_resolver(model_name)
 
     def _fold_rollup(self, record: JobMetricsRecord, *, baseline: str | None) -> None:
-        if record.is_alchemy:
+        if record.workload is not WorkloadKind.IMAGE_GENERATION:
             return
         model_key = (record.model_name, baseline)
         model_row = self._model_rollups.setdefault(
@@ -1336,7 +1451,7 @@ class WorkerRunMetrics:
             return
         if record.faulted:
             self._exported_jobs_faulted += 1
-            if not record.is_alchemy:
+            if record.workload is WorkloadKind.IMAGE_GENERATION:
                 self._exported_image_jobs_faulted += 1
         else:
             self._exported_jobs_submitted += 1
@@ -1394,6 +1509,7 @@ class WorkerRunMetrics:
         """
         return RunMetricsSnapshot(
             jobs=list(self._jobs),
+            workload_totals=self.workload_totals(),
             stage_metrics=list(self._stage_metrics),
             downloads=list(self._downloads),
             vram_used_high_water_mb_per_process=dict(self._vram_high_water_per_process),

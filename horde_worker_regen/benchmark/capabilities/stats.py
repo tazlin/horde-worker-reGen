@@ -50,6 +50,18 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[index]
 
 
+def _is_image_job(job: JobMetricsRecord) -> bool:
+    """Whether a finished-work record came from the image-generation flow.
+
+    Every statistic here is a diffusion statistic (sampling rate, VRAM reloads), so records from the
+    other workloads are excluded. The import is function-local to keep this module's import weight at
+    what its torch-free contract promises.
+    """
+    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+
+    return job.workload is WorkloadKind.IMAGE_GENERATION
+
+
 def _its_retention(jobs: list[JobMetricsRecord]) -> float | None:
     """Median sampling rate of the second half of completed image jobs ÷ that of the first half.
 
@@ -58,7 +70,7 @@ def _its_retention(jobs: list[JobMetricsRecord]) -> float | None:
     """
     timed: list[tuple[float, float]] = []
     for job in jobs:
-        if job.is_alchemy or job.phase_metrics is None or job.phase_metrics.sampling is None:
+        if not _is_image_job(job) or job.phase_metrics is None or job.phase_metrics.sampling is None:
             continue
         its = job.phase_metrics.sampling.iterations_per_second
         finalized = job.stage_timestamps.get("FINALIZED")
@@ -87,7 +99,7 @@ def _post_warmup_vram_reloads(jobs: list[JobMetricsRecord]) -> int | None:
     """
     timed: list[tuple[float, int]] = []
     for job in jobs:
-        if job.is_alchemy or job.phase_metrics is None:
+        if not _is_image_job(job) or job.phase_metrics is None:
             continue
         finalized = job.stage_timestamps.get("FINALIZED")
         if finalized is None:

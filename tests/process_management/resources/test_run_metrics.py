@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     ResourceStateKind,
     WorkerRunMetrics,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.process_management.simulation._dummy_jobs import dummy_job_factory
 
 
@@ -136,7 +137,7 @@ class TestJobCorrelation:
         assert len(snapshot.jobs) == 1
         record = snapshot.jobs[0]
         assert record.job_id == str(job.id_)
-        assert not record.is_alchemy
+        assert record.workload is WorkloadKind.IMAGE_GENERATION
         assert record.phase_metrics is not None
         assert record.phase_metrics.sampling is not None
         assert record.phase_metrics.sampling.iterations_per_second == 5.0
@@ -262,7 +263,7 @@ class TestJobCorrelation:
         )
 
         record = metrics.snapshot().jobs[0]
-        assert record.is_alchemy
+        assert record.workload is WorkloadKind.ALCHEMY
         assert record.model_name == "RealESRGAN_x4plus"
         assert record.e2e_seconds == 3.5
         assert record.faulted is False
@@ -284,6 +285,98 @@ class TestJobCorrelation:
         rollups = {row.model: row for row in metrics.form_rollups()}
         assert rollups["caption"].jobs == 2
         assert rollups["caption"].e2e_seconds == 6.0
+
+
+class TestTextJobRecords:
+    """The text flow's finished jobs, which reach run metrics through the flow rather than a child."""
+
+    def test_a_text_job_records_its_own_shape(self) -> None:
+        """A text job's cost is tokens and a generation span, not steps and pixels."""
+        metrics = WorkerRunMetrics()
+        metrics.record_text_job(
+            job_id="text-1",
+            model_name="koboldcpp/Llama-3.2-3B-Instruct",
+            time_popped=100.0,
+            time_submitted=112.0,
+            queue_wait_seconds=1.5,
+            generation_seconds=9.0,
+            faulted=False,
+            kudos_reward=12.5,
+            max_length=256,
+        )
+
+        record = metrics.snapshot().jobs[0]
+        assert record.workload is WorkloadKind.TEXT_GENERATION
+        assert record.model_name == "koboldcpp/Llama-3.2-3B-Instruct"
+        assert (record.time_popped, record.e2e_seconds) == (100.0, 12.0)
+        assert record.queue_wait_seconds == 1.5
+        assert record.sampling_seconds == 9.0
+        assert record.kudos_reward == 12.5
+        assert record.max_length == 256
+        # The backend reports no per-request token counts today, so they stay unknown rather than zero.
+        assert (record.prompt_tokens, record.generated_tokens) == (None, None)
+        # Image-shaped fields are untouched on a text record.
+        assert (record.steps, record.width, record.height) == (None, None, None)
+        assert record.megapixelsteps == 0.0
+
+    def test_text_jobs_stay_out_of_the_image_and_form_tables(self) -> None:
+        """A text record has no model rollup to join and is not an alchemy form."""
+        metrics = WorkerRunMetrics()
+        metrics.record_text_job(
+            job_id="text-1",
+            model_name="koboldcpp/Llama-3.2-3B-Instruct",
+            time_popped=100.0,
+            time_submitted=101.0,
+            queue_wait_seconds=None,
+            generation_seconds=None,
+            faulted=True,
+        )
+
+        assert metrics.model_rollups() == []
+        assert metrics.baseline_rollups() == []
+        assert metrics.form_rollups() == []
+        assert metrics.snapshot().jobs[0].faulted is True
+
+    def test_workload_totals_split_the_session_three_ways(self) -> None:
+        """A worker serving three workloads has three sets of headline numbers, not one."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, kudos_reward=4.0)
+        metrics.record_alchemy_form(form_id="form-1", form="caption", e2e_seconds=1.0, faulted=False, kudos_reward=2.0)
+        metrics.record_text_job(
+            job_id="text-1",
+            model_name="koboldcpp/Llama-3.2-3B-Instruct",
+            time_popped=100.0,
+            time_submitted=110.0,
+            queue_wait_seconds=1.0,
+            generation_seconds=8.0,
+            faulted=False,
+            kudos_reward=12.5,
+        )
+        metrics.record_text_job(
+            job_id="text-2",
+            model_name="koboldcpp/Llama-3.2-3B-Instruct",
+            time_popped=120.0,
+            time_submitted=121.0,
+            queue_wait_seconds=None,
+            generation_seconds=None,
+            faulted=True,
+        )
+
+        totals = metrics.snapshot().workload_totals
+        assert totals[WorkloadKind.IMAGE_GENERATION].completed == 1
+        assert totals[WorkloadKind.IMAGE_GENERATION].kudos == 4.0
+        assert totals[WorkloadKind.ALCHEMY].completed == 1
+        assert totals[WorkloadKind.ALCHEMY].kudos == 2.0
+        text_totals = totals[WorkloadKind.TEXT_GENERATION]
+        assert (text_totals.completed, text_totals.faulted) == (1, 1)
+        assert text_totals.kudos == 12.5
+
+    def test_a_workload_that_finished_nothing_has_no_totals_entry(self) -> None:
+        """A dreamer-only worker reports one workload, not three rows of zeroes."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics)
+
+        assert list(metrics.snapshot().workload_totals) == [WorkloadKind.IMAGE_GENERATION]
 
 
 class TestWorkerConditionFields:
@@ -650,7 +743,7 @@ class TestStatsRollupsAndExport:
         metrics = WorkerRunMetrics()
         metrics.record_alchemy_form(form_id="form-1", form="caption", e2e_seconds=1.0, faulted=False)
 
-        assert metrics.snapshot().jobs[0].is_alchemy
+        assert metrics.snapshot().jobs[0].workload is WorkloadKind.ALCHEMY
         assert metrics.model_rollups() == []
         assert metrics.baseline_rollups() == []
         assert [row.model for row in metrics.form_rollups()] == ["caption"]

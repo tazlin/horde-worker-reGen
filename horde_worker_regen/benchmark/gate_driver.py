@@ -285,6 +285,9 @@ def _disk_to_ram_by_stage(snapshot: RunMetricsSnapshot) -> tuple[dict[str, int],
 
 def _stage_latency_percentiles(snapshot: RunMetricsSnapshot) -> tuple[dict[str, float], dict[str, float]]:
     """Derive p50/p95 stage latency from the durations the records already carry (omitting untimed stages)."""
+    # Imported inside the function, as every run-metrics type here is, so module import stays torch-free.
+    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+
     samples: dict[str, list[float]] = {}
 
     def _add(key: str, value: float | None) -> None:
@@ -295,7 +298,7 @@ def _stage_latency_percentiles(snapshot: RunMetricsSnapshot) -> tuple[dict[str, 
         key = record.stage.value if record.stage is not None else _WHOLE_JOB_STAGE_KEY
         _add(key, _stage_record_compute_seconds(record))
     for record in snapshot.jobs:
-        if record.is_alchemy:
+        if record.workload is not WorkloadKind.IMAGE_GENERATION:
             continue
         _add(_WHOLE_JOB_STAGE_KEY, record.e2e_seconds)
 

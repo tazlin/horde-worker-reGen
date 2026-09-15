@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import TEXT_BACKEND_LOG_FILE_NAME
 from horde_worker_regen.tui.log_tailer import (
     LogFollower,
     _classify_bridge_log,
+    discover_bridge_logs,
     discover_bridge_logs_grouped,
 )
 
@@ -120,3 +122,35 @@ def test_truncation_reprimes_tail_not_whole_file(tmp_path: Path) -> None:
 
     assert _bytes_of(lines) <= _TAIL, "the rotation branch must not read the whole new file"
     assert lines and "rot" in lines[-1]
+
+
+def test_the_text_backend_log_is_discovered_after_the_bridge_logs(tmp_path: Path) -> None:
+    """The backend is another program, so its captured output follows the worker's own logs."""
+    for name in ("bridge.log", "bridge_1.log", TEXT_BACKEND_LOG_FILE_NAME):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    assert [path.name for path in discover_bridge_logs(tmp_path)] == [
+        "bridge.log",
+        "bridge_1.log",
+        TEXT_BACKEND_LOG_FILE_NAME,
+    ]
+
+
+def test_a_worker_that_never_ran_a_backend_discovers_no_text_log(tmp_path: Path) -> None:
+    """Most workers never run a text backend, and an absent file is not a missing one."""
+    (tmp_path / "bridge.log").write_text("x", encoding="utf-8")
+
+    assert [path.name for path in discover_bridge_logs(tmp_path)] == ["bridge.log"]
+
+
+def test_the_text_backend_log_groups_under_its_own_process_key(tmp_path: Path) -> None:
+    """The logs view groups by writing process, and the backend is a process of its own."""
+    for name in ("bridge.log", "bridge_1.log", TEXT_BACKEND_LOG_FILE_NAME):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    grouped = discover_bridge_logs_grouped(tmp_path)
+
+    assert list(grouped.keys()) == ["main", "1", "text_backend"]
+    entry = grouped["text_backend"][0]
+    assert entry.process_label == "text backend"
+    assert entry.is_current

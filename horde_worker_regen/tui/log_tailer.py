@@ -1,8 +1,12 @@
-"""Follow the worker's on-disk logs (logs/bridge.log and logs/bridge_n.log) for the TUI.
+"""Follow the worker's on-disk logs (logs/bridge.log, logs/bridge_n.log, logs/text_backend.log) for the TUI.
 
 A poll-based follower (driven by a Textual interval) rather than a background thread: it tracks a
 byte offset, holds back trailing partial lines, and reseeks on rotation (loguru rotates daily) or
 truncation. The worker already writes these files, so the TUI adds no new disk writes.
+
+The text backend's log is the captured output of a program the worker launches but does not own, so it
+is not a bridge log and does not rotate on loguru's schedule; it is followed all the same, because an
+operator diagnosing a scribe reads the backend's own words about why it will not load a model.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ import dataclasses
 import re
 from pathlib import Path
 
+from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import TEXT_BACKEND_LOG_FILE_NAME
 from horde_worker_regen.run_root import logs_dir
 
 _TAIL_BYTES = 256 * 1024
@@ -29,8 +34,18 @@ def default_log_dir() -> Path:
     return logs_dir()
 
 
+def _text_backend_logs(log_dir: Path) -> list[Path]:
+    """Return the text backend's log file when the worker has run one, empty otherwise."""
+    text_backend = log_dir / TEXT_BACKEND_LOG_FILE_NAME
+    return [text_backend] if text_backend.exists() else []
+
+
 def discover_bridge_logs(log_dir: Path | None = None) -> list[Path]:
-    """Return the main bridge log followed by any subprocess bridge logs, in stable order."""
+    """Return the main bridge log, then any subprocess bridge logs, then the text backend's, in stable order.
+
+    The text backend's log comes last because it is another program's output rather than one of this
+    worker's own loguru sinks, and it is absent on any worker that never ran a backend.
+    """
     if log_dir is None:
         log_dir = default_log_dir()
     if not log_dir.exists():
@@ -40,6 +55,7 @@ def discover_bridge_logs(log_dir: Path | None = None) -> list[Path]:
     if main.exists():
         result.append(main)
     result.extend(sorted(log_dir.glob("bridge_*.log"), key=lambda path: path.name))
+    result.extend(_text_backend_logs(log_dir))
     return result
 
 
@@ -101,19 +117,22 @@ def _process_sort_key(process_key: str) -> tuple[int, int, str]:
 
 
 def discover_bridge_logs_grouped(log_dir: Path | None = None) -> dict[str, list[BridgeLog]]:
-    """Group all ``bridge*.log`` files by writing process.
+    """Group all ``bridge*.log`` files, and the text backend's log, by writing process.
 
     Returns an ordered mapping (main, console, numbered subprocesses, then others) of process key to
     that process's files: the live file first, then rotated historical files newest-first. This lets
     the logs view present one entry per process and tuck the dated rotations behind a history selector
     instead of listing every rotated file as a confusing top-level peer.
+
+    The text backend's captured output groups under its own key at the end, so an operator diagnosing a
+    scribe reads the backend's own words in the same place as the worker's.
     """
     if log_dir is None:
         log_dir = default_log_dir()
     if not log_dir.exists():
         return {}
     grouped: dict[str, list[BridgeLog]] = {}
-    for path in log_dir.glob("bridge*.log"):
+    for path in [*log_dir.glob("bridge*.log"), *_text_backend_logs(log_dir)]:
         entry = _classify_bridge_log(path)
         grouped.setdefault(entry.process_key, []).append(entry)
 

@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.config.worker_state import WorkerState
     from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
     from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
+    from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 
 
 TEXT_POP_REQUEST_TIMEOUT_SECONDS: Final = 30.0
@@ -256,6 +257,19 @@ def build_text_flow_advertisement(
     )
 
 
+def _payload_int(payload: dict[str, object], key: str) -> int | None:
+    """Return one integer field of a popped payload, or None when it is absent or not an integer.
+
+    The payload is the horde's, forwarded to the backend untouched and never validated by the worker, so
+    a field read out of it for the worker's own records tolerates a shape the worker did not expect
+    rather than faulting a job that is otherwise fine.
+    """
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def dry_run_backend_description(backend: TEXT_BACKENDS) -> TextBackendDescription:
     """Create the description the dry-run stand-in answers with, spelled as that backend would spell it.
 
@@ -335,6 +349,20 @@ class TextJobInFlight:
     """The payload the horde sent, as it was sent, forwarded to the backend untouched."""
     time_popped: float
     """When the job was popped, for the pop-to-submit timing in the submit log line."""
+    model_name: str | None = None
+    """The model this job was popped against, as the worker advertised it.
+
+    Held on the job rather than read back at submit time: a backend that goes away clears the
+    advertisement, and the job's own record would then name no model at all.
+    """
+    time_generation_started: float | None = None
+    """When the backend was first asked to generate this job, or None while it never was.
+
+    The boundary between the job's queue wait and its generation, which is the split an image job's
+    record carries and the only one a text job has: the backend is a separate program, so there is no
+    dispatch, load or safety stage between the two."""
+    time_generation_finished: float | None = None
+    """When the backend answered (or was given up on), or None while it has not."""
     busy_attempts: int = 0
     """How many times the backend has answered busy for this job."""
     stopped: bool = False
@@ -360,11 +388,12 @@ class TextGenerationCoordinator:
         backend: TextBackend | None = None,
         backend_factory: Callable[[TEXT_BACKENDS], TextBackend] | None = None,
         text_backend_kind: TEXT_BACKENDS,
+        run_metrics: WorkerRunMetrics | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators and the backend to generate through.
 
         Args:
-            state: The shared worker state, read for shutdown.
+            state: The shared worker state, read for shutdown and updated with the session's kudos.
             shutdown_manager: The shutdown manager, observed for when to stop and notified on cancellation.
             runtime_config: Holds the current bridge configuration snapshot, re-read every cycle so a
                 hot-reloaded `scribe` or `text_threads` takes effect without a restart.
@@ -379,6 +408,9 @@ class TextGenerationCoordinator:
             text_backend_kind: Which backend the flow generates through, which is the whole of what
                 decides how the advertised model name is spelled. Defaults to the first backend the
                 worker supported; a further one is a different value here and nothing else.
+            run_metrics: Where each finished job's record lands, so text jobs reach the same aggregates
+                image jobs and alchemy forms do. None in tests and in any assembly with no aggregator,
+                which records nothing rather than failing.
 
         Raises:
             ValueError: Neither `backend` nor `backend_factory` was given, leaving nothing to generate
@@ -394,6 +426,7 @@ class TextGenerationCoordinator:
         self._backend = backend
         self._backend_factory = backend_factory
         self._text_backend_kind = text_backend_kind
+        self._run_metrics = run_metrics
 
         self._in_flight: dict[str, TextJobInFlight] = {}
         self._job_tasks: set[asyncio.Task[None]] = set()
@@ -406,8 +439,6 @@ class TextGenerationCoordinator:
         """Cumulative text jobs successfully submitted to the API this session."""
         self.num_jobs_faulted = 0
         """Cumulative text jobs submitted as faulted this session."""
-        self.kudos_earned_this_session = 0.0
-        """Cumulative kudos the horde has rewarded for this flow's submits this session."""
 
         self._last_pop_time = 0.0
         self._pop_frequency = 2.0
@@ -433,6 +464,15 @@ class TextGenerationCoordinator:
     def advertisement(self) -> TextFlowAdvertisement | None:
         """What the worker currently offers for this backend, or None while the readiness gate is open."""
         return self._advertisement
+
+    @property
+    def backend_ready(self) -> bool:
+        """Whether the backend has reported a loaded model and described itself.
+
+        The one readiness fact outside this flow: nothing is popped while it is False, so a dashboard
+        showing a scribe with no work has the reason here rather than in the log.
+        """
+        return self._advertisement is not None
 
     @property
     def text_backend_kind(self) -> TEXT_BACKENDS:
@@ -623,9 +663,14 @@ class TextGenerationCoordinator:
         if self._maintenance_hold_logged:
             logger.info("Text pops resumed: the horde is accepting this worker's pops again.")
             self._maintenance_hold_logged = False
-        self._start_popped_jobs(pop_response)
+        self._start_popped_jobs(pop_response, advertisement=advertisement)
 
-    def _start_popped_jobs(self, pop_response: TextGenerateJobPopResponse) -> None:
+    def _start_popped_jobs(
+        self,
+        pop_response: TextGenerateJobPopResponse,
+        *,
+        advertisement: TextFlowAdvertisement,
+    ) -> None:
         """Take every generation the pop returned into the ledger and start a task for each."""
         job_ids = self._popped_job_ids(pop_response)
         if not job_ids:
@@ -638,7 +683,12 @@ class TextGenerationCoordinator:
 
         payload = dict(pop_response.payload.model_dump(by_alias=True, exclude_unset=True))
         for job_id in job_ids:
-            job = TextJobInFlight(job_id=job_id, payload=payload, time_popped=time.time())
+            job = TextJobInFlight(
+                job_id=job_id,
+                payload=payload,
+                time_popped=time.time(),
+                model_name=advertisement.model_name,
+            )
             self._in_flight[job_id] = job
             self._state.text_jobs_in_flight = len(self._in_flight)
             logger.info(
@@ -697,10 +747,24 @@ class TextGenerationCoordinator:
         unreachable backend makes every job fail the same way, so both end the job here (and the second
         sends the flow back to the readiness gate).
         """
+        try:
+            return await self._offer_until_answered(job)
+        finally:
+            job.time_generation_finished = time.time()
+
+    async def _offer_until_answered(self, job: TextJobInFlight) -> str | None:
+        """Return the backend's text for one job, re-offering it while the backend answers busy.
+
+        Split from :meth:`_generate_text` so every way out of the offer loop stamps the generation's end
+        once, rather than each of its exits repeating the stamp.
+        """
         backend = self.require_backend()
         deadline_seconds = self.generation_deadline_seconds()
 
         while True:
+            # Re-stamped per attempt, so a job the backend turned away as busy measures its wait to the
+            # offer that was actually taken rather than to the first one that was not.
+            job.time_generation_started = time.time()
             try:
                 result = await asyncio.wait_for(
                     backend.generate(
@@ -824,17 +888,59 @@ class TextGenerationCoordinator:
 
     def _note_submitted(self, job: TextJobInFlight, *, response: JobSubmitResponse, is_faulted: bool) -> None:
         """Record and log one delivered submit. A fault report is delivered work the horde pays nothing for."""
+        submit_time = time.time()
         if is_faulted:
             self.num_jobs_faulted += 1
             logger.info(f"Reported text job {job.job_id[:8]} as faulted to the horde")
+            self._record_job_metrics(job, submit_time=submit_time, faulted=True, kudos_reward=None)
             return
 
         self.num_jobs_submitted += 1
-        self.kudos_earned_this_session += response.reward
-        time_taken = round(time.time() - job.time_popped, 2)
+        # The session kudos pool is the account's, not one flow's: text earnings belong in the same
+        # total and on the same kudos/hr clock as image generation's and alchemy's.
+        self._state.note_first_kudos_event(submit_time)
+        self._state.kudos_generated_this_session += response.reward
+        self._state.kudos_events.append((submit_time, response.reward))
+        time_taken = round(submit_time - job.time_popped, 2)
         logger.success(
             f"Submitted text job {job.job_id[:8]} for {response.reward:,.2f} kudos. "
             f"Job popped {time_taken} seconds ago.",
+        )
+        self._record_job_metrics(job, submit_time=submit_time, faulted=False, kudos_reward=response.reward)
+
+    def _record_job_metrics(
+        self,
+        job: TextJobInFlight,
+        *,
+        submit_time: float,
+        faulted: bool,
+        kudos_reward: float | None,
+    ) -> None:
+        """Record one delivered text job into run metrics. A no-op when no aggregator is wired.
+
+        A job faulted before the backend was ever asked has no generation span, so its timings are left
+        unknown rather than reported as zero.
+        """
+        if self._run_metrics is None:
+            return
+        generation_started = job.time_generation_started
+        generation_finished = job.time_generation_finished
+        queue_wait_seconds = max(0.0, generation_started - job.time_popped) if generation_started is not None else None
+        generation_seconds = (
+            max(0.0, generation_finished - generation_started)
+            if generation_started is not None and generation_finished is not None
+            else None
+        )
+        self._run_metrics.record_text_job(
+            job_id=job.job_id,
+            model_name=job.model_name,
+            time_popped=job.time_popped,
+            time_submitted=submit_time,
+            queue_wait_seconds=queue_wait_seconds,
+            generation_seconds=generation_seconds,
+            faulted=faulted,
+            kudos_reward=kudos_reward,
+            max_length=_payload_int(job.payload, "max_length"),
         )
 
     # endregion

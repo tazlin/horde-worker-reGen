@@ -51,8 +51,14 @@ defines the structured protocol over it:
   scalars, which are reductions across the driven cards. The snapshot also carries
   worker-owned stats data: the latest one-second `StatsSample`, bounded stats-history backfill for
   reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
-  export toggle and disk-size warning. The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 22) so a frontend can detect a mismatch with a worker built from different code.
+  export toggle and disk-size warning. A scribe worker's snapshot also carries its text flow: jobs in
+  flight, the session's submitted and faulted totals, whether the backend's readiness gate has passed,
+  and the model, context length and generation length being advertised, with `scribe` and `scribe_name`
+  on the config summary. Each `RecentJobRecord` names the workload that produced it (a `WorkloadKind`
+  value carried as a plain string, so this module stays free of the scheduling package's import chain),
+  which is what lets a recent-jobs row tell an image job, an alchemy form and a text generation apart.
+  The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
+  (currently 24) so a frontend can detect a mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate

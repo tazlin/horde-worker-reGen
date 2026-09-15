@@ -32,6 +32,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerLivenessFrame,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
 
 def _make_snapshot() -> WorkerStateSnapshot:
@@ -57,7 +58,7 @@ def test_protocol_version_pinned() -> None:
     The TUI refuses mismatched connections, so an incompatible snapshot/command change must bump
     ``SUPERVISOR_PROTOCOL_VERSION`` and update this literal in the same change.
     """
-    assert SUPERVISOR_PROTOCOL_VERSION == 23
+    assert SUPERVISOR_PROTOCOL_VERSION == 24
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:
@@ -113,7 +114,7 @@ def test_recent_job_record_from_metrics_record() -> None:
 
     record = JobMetricsRecord(
         job_id="abc",
-        is_alchemy=True,
+        workload=WorkloadKind.ALCHEMY,
         faulted=False,
         queue_wait_seconds=1.5,
         e2e_seconds=12.0,
@@ -125,7 +126,7 @@ def test_recent_job_record_from_metrics_record() -> None:
     )
     lean = RecentJobRecord.from_metrics_record(record)
     assert lean.job_id == "abc"
-    assert lean.is_alchemy is True
+    assert lean.workload == WorkloadKind.ALCHEMY
     assert lean.e2e_seconds == 12.0
     assert lean.model_name == "Deliberate"
     assert lean.features is not None
@@ -174,6 +175,65 @@ def test_queue_and_recent_baseline_survive_json_roundtrip() -> None:
     restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
     assert restored.pending_jobs[0].baseline == "stable_diffusion_1"
     assert restored.recent_jobs[0].baseline == "stable_diffusion_xl"
+
+
+def test_every_workload_survives_the_recent_job_wire_roundtrip() -> None:
+    """The workload discriminator travels as its string value, so each kind comes back comparable."""
+    snapshot = _make_snapshot()
+    snapshot.recent_jobs = [
+        RecentJobRecord(job_id=kind.value, workload=kind.value, model_name="m") for kind in WorkloadKind
+    ]
+
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+
+    assert [job.workload for job in restored.recent_jobs] == [kind.value for kind in WorkloadKind]
+    assert all(job.workload == WorkloadKind(job.job_id) for job in restored.recent_jobs)
+
+
+def test_a_recent_job_defaults_to_image_generation() -> None:
+    """Every record the worker wrote before the discriminator existed was an image job or an alchemy form."""
+    assert RecentJobRecord(job_id="r").workload == WorkloadKind.IMAGE_GENERATION
+
+
+def test_text_counters_and_scribe_identity_survive_the_wire() -> None:
+    """A scribe worker's snapshot carries its backend identity and its own job counters."""
+    snapshot = _make_snapshot()
+    snapshot.config = WorkerConfigSummary(
+        dreamer_name="Tester",
+        worker_version="12.0.0",
+        scribe=True,
+        scribe_name="Tester Scribe",
+    )
+    snapshot.text_jobs_in_flight = 2
+    snapshot.text_total_submitted = 11
+    snapshot.text_total_faulted = 1
+    snapshot.text_backend_ready = True
+    snapshot.text_model_name = "koboldcpp/Llama-3.2-3B-Instruct"
+    snapshot.text_context_length = 4096
+    snapshot.text_max_length = 512
+
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+
+    assert restored.config.scribe is True
+    assert restored.config.scribe_name == "Tester Scribe"
+    assert restored.text_jobs_in_flight == 2
+    assert (restored.text_total_submitted, restored.text_total_faulted) == (11, 1)
+    assert restored.text_backend_ready is True
+    assert restored.text_model_name == "koboldcpp/Llama-3.2-3B-Instruct"
+    assert (restored.text_context_length, restored.text_max_length) == (4096, 512)
+
+
+def test_a_worker_with_no_text_flow_reports_text_defaults() -> None:
+    """A dreamer-only worker never had a backend, so its text fields are unknown rather than zero."""
+    snapshot = _make_snapshot()
+
+    assert snapshot.config.scribe is False
+    assert snapshot.config.scribe_name is None
+    assert (snapshot.text_jobs_in_flight, snapshot.text_total_submitted, snapshot.text_total_faulted) == (0, 0, 0)
+    assert snapshot.text_backend_ready is False
+    assert snapshot.text_model_name is None
+    assert snapshot.text_context_length is None
+    assert snapshot.text_max_length is None
 
 
 def _fake_process_info() -> SimpleNamespace:

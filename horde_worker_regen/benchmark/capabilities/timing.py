@@ -132,14 +132,18 @@ def probe_timing(
     ``started_at_epoch`` is the harness run-start epoch (0.0 if the driver did not record it, in which
     case the startup/teardown segments are reported as unknown); ``elapsed_seconds`` is the measured
     wall; ``jobs`` is the run's per-job metrics; ``warmup_seconds`` is the pre-warm pass that preceded
-    the measured one, when there was one. Only non-alchemy image jobs with stage timestamps bound the
+    the measured one, when there was one. Only image-generation jobs with stage timestamps bound the
     window, since they are what the inference processes spend their wall-clock on.
     """
-    timed_jobs = [job for job in jobs if not job.is_alchemy and _INFERENCE_START_STAGE in (job.stage_timestamps or {})]
+    # Function-local so this module's import stays as light as its torch-free contract promises.
+    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+
+    image_jobs = [job for job in jobs if job.workload is WorkloadKind.IMAGE_GENERATION]
+    timed_jobs = [job for job in image_jobs if _INFERENCE_START_STAGE in (job.stage_timestamps or {})]
     timed_jobs.sort(key=lambda job: job.stage_timestamps[_INFERENCE_START_STAGE])
 
-    gpu_active = sum(_gpu_active_seconds_for_job(job) for job in jobs if not job.is_alchemy)
-    has_phase_metrics = any(job.phase_metrics is not None for job in jobs if not job.is_alchemy)
+    gpu_active = sum(_gpu_active_seconds_for_job(job) for job in image_jobs)
+    has_phase_metrics = any(job.phase_metrics is not None for job in image_jobs)
 
     if not timed_jobs:
         return ProbeTiming(

@@ -2085,6 +2085,7 @@ class HordeWorkerProcessManager:
                 # the supervisor agree on one address and one readiness view.
                 backend_factory=self._text_backend_for,
                 text_backend_kind=bridge_data.text_backend_kind,
+                run_metrics=self._run_metrics,
             )
             self._text_coordinator = text_coordinator
             self._flows[WorkloadKind.TEXT_GENERATION] = text_coordinator
@@ -7891,7 +7892,15 @@ class HordeWorkerProcessManager:
             alchemy_vram_headroom_mb=bridge_data.alchemy_vram_headroom_mb,
             alchemy_caption_enabled=bridge_data.alchemy_caption_enabled,
             alchemy_forms=list(bridge_data.forms) if bridge_data.forms else list(DEFAULT_ALCHEMY_FORMS),
+            scribe=bridge_data.scribe,
+            scribe_name=bridge_data.scribe_name if bridge_data.scribe else None,
         )
+
+        # The text flow is registered only for a scribe worker, so everything about the text backend is
+        # unknown (rather than zero) on a worker that never had one. Its advertisement is what the
+        # readiness gate established the backend can serve, so it is also the readiness signal.
+        text_coordinator = self._text_coordinator
+        text_advertisement = text_coordinator.advertisement if text_coordinator is not None else None
 
         return WorkerStateSnapshot(
             session_start_time=self.session_start_time,
@@ -7968,6 +7977,13 @@ class HordeWorkerProcessManager:
             alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,
             alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
+            text_jobs_in_flight=text_coordinator.num_in_flight if text_coordinator is not None else 0,
+            text_total_submitted=text_coordinator.num_jobs_submitted if text_coordinator is not None else 0,
+            text_total_faulted=text_coordinator.num_jobs_faulted if text_coordinator is not None else 0,
+            text_backend_ready=text_coordinator.backend_ready if text_coordinator is not None else False,
+            text_model_name=text_advertisement.model_name if text_advertisement is not None else None,
+            text_context_length=text_advertisement.max_context_length if text_advertisement is not None else None,
+            text_max_length=text_advertisement.max_length if text_advertisement is not None else None,
             enabled_workloads=sorted(self._served_workloads(bridge_data)),
             pending_jobs=self._build_pending_jobs_list(),
             orchestration_intent=orchestration_intent,

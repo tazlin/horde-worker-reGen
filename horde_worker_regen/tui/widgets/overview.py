@@ -2527,11 +2527,15 @@ class OverviewView(Vertical):
 
     @staticmethod
     def _recent_model_cell(job: RecentJobRecord) -> Text:
-        """The Model/type cell: the alchemy form (when known) for alchemy jobs, else the model name."""
-        if job.is_alchemy:
+        """The Model/type cell: the alchemy form or the text model when known, else the model name."""
+        if job.workload == WorkloadKind.ALCHEMY:
             if job.model_name:
                 return Text(f"⚗ {shorten(job.model_name, 22)}", style="grey62")
             return Text("alchemy", style="grey62")
+        if job.workload == WorkloadKind.TEXT_GENERATION:
+            if job.model_name:
+                return Text(f"✎ {shorten(job.model_name, 22)}", style="grey62")
+            return Text("text", style="grey62")
         return Text(shorten(job.model_name, 24) if job.model_name else "?", style="")
 
 

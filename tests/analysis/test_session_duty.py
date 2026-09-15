@@ -40,7 +40,7 @@ def _job(**overrides: object) -> dict[str, object]:
     job: dict[str, object] = {
         "job_id": "job-1",
         "faulted": False,
-        "is_alchemy": False,
+        "workload": "image_generation",
         "queue_wait_seconds": 2.0,
         "safety_seconds": 0.5,
         "stage_timestamps": {"PENDING_SUBMIT": 120.0, "FINALIZED": 121.0},
@@ -58,8 +58,30 @@ def _job(**overrides: object) -> dict[str, object]:
     return {"event": "job_completed", "job": job, "baseline": "stable_diffusion_xl"}
 
 
+def _legacy_job(*, is_alchemy: bool, **overrides: object) -> dict[str, object]:
+    """Create a ``job_completed`` event spelled the way sessions before the workload field spelled it."""
+    event = _job(is_alchemy=is_alchemy, **overrides)
+    job = event["job"]
+    assert isinstance(job, dict)
+    del job["workload"]
+    return event
+
+
 class TestStatsIngestion:
     """Reading retained stats JSONL sessions."""
+
+    def test_legacy_records_naming_only_is_alchemy_are_still_partitioned(self, tmp_path: Path) -> None:
+        """A stats directory holds every session an operator ran, including ones predating ``workload``."""
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        _write_jsonl(
+            stats_dir / "stats-v1.0.0-20260620-010203-000.jsonl",
+            [_sample(100.0), _legacy_job(is_alchemy=False), _legacy_job(is_alchemy=True, job_id="form-1")],
+        )
+
+        report = analyze_stats_sessions(stats_dir)[0]
+
+        assert report.completed_jobs == 1, "the alchemy form was counted as an image job"
 
     def test_reads_uncompressed_and_gzipped_rotations(self, tmp_path: Path) -> None:
         """Rotated JSONL and JSONL.GZ files are grouped into one session."""

@@ -141,6 +141,23 @@ Put the scribe worker into maintenance on the horde (the worker's page, or `PUT 
 owner's own API key to it, so a request that names the worker in `workers` is served by it and nobody
 else's traffic reaches it. The worker logs the hold once when it begins and once when pops resume.
 
+## What a finished text job is counted in
+
+A submitted text job earns kudos the same way an image job does, and the worker treats those earnings as
+the account's rather than one flow's: the paid submit updates the session kudos total, the kudos/hr
+clock, and the rolling kudos events, exactly as an alchemy form does.
+
+Each finished job (paid or faulted) also lands as one per-job run-metrics record carrying the advertised
+model name, the pop and submit times, the wait from pop to generation start, the generation's own
+duration, the reward, and the generation-length cap the horde asked for. The record names its workload,
+so a session's totals split three ways instead of collapsing text into the image numbers. The token
+counts a text job would otherwise carry are absent: no backend the worker speaks to reports per-request
+prompt and completion counts, so the fields stay unknown rather than guessed at.
+
+The supervisor snapshot carries the flow's live state for the dashboard: jobs in flight, the session's
+submitted and faulted totals, whether the readiness gate has passed, and the model, context length and
+generation length the worker is advertising.
+
 ## What is not supported yet
 
 - **A shared card is not priced.** When the backend shares a card with image generation, the worker's VRAM
@@ -150,9 +167,9 @@ else's traffic reaches it. The worker logs the hold once when it begins and once
   backend serves means restarting the backend; the worker will notice when the generation it is waiting
   on fails and re-run its readiness gate, but nothing coordinates the two. Which *kind* of backend is
   attached is likewise fixed for the run.
-- **Text jobs do not appear in the dashboard.** The flow keeps its own counts of submitted and faulted
-  jobs and logs each submit with its kudos, but it does not feed the per-job run metrics the image and
-  alchemy panels read.
+- **The dashboard has no text panel yet.** The snapshot carries the flow's counters and backend identity,
+  and finished text jobs appear in the recent-jobs views, but no screen is laid out around text the way
+  the image and alchemy panels are, and the config editor has no scribe fields.
 - **Turning `scribe` on takes a restart.** Unlike most configuration, the role is read when the worker
   builds its flows, so a hot reload of `bridgeData.yaml` will not start a text flow that was off at
   launch (it will, however, stop one that was on).

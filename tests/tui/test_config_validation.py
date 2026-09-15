@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.tui.config_validation import ConfigValidationSeverity, validate_config_interlocks
+from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.tui.config_validation import (
+    SCRIBE_NAME_RESERVED_DEFAULT,
+    ConfigValidationSeverity,
+    validate_config_interlocks,
+)
 
 
 def _messages(config: dict[str, object], severity: ConfigValidationSeverity) -> list[str]:
@@ -122,3 +127,69 @@ def test_enabled_pins_only_pool_without_pins_warns() -> None:
     )
 
     assert any("nothing to seat" in message for message in warnings)
+
+
+def _role_errors(config: dict[str, object]) -> list[tuple[str, str]]:
+    """Return (field key, message) for every error a role/identity configuration produces."""
+    return [
+        (issue.field_key, issue.message)
+        for issue in validate_config_interlocks(config)
+        if issue.severity is ConfigValidationSeverity.ERROR
+    ]
+
+
+def test_scribe_name_default_matches_the_bridge_data_default() -> None:
+    """The editor carries the placeholder as a literal; this pins it to the name the horde rejects."""
+    assert reGenBridgeData.model_fields["scribe_name"].default == SCRIBE_NAME_RESERVED_DEFAULT
+
+
+def test_a_scribe_only_worker_is_a_valid_worker() -> None:
+    """Text generation is a role in its own right, so a worker serving only it saves."""
+    errors = _role_errors({"dreamer": False, "alchemist": False, "scribe": True, "scribe_name": "My Scribe"})
+
+    assert errors == []
+
+
+def test_every_role_off_serves_nothing() -> None:
+    """A worker with no role selected has nothing to pop, whichever role the operator forgot."""
+    errors = _role_errors({"dreamer": False, "alchemist": False, "scribe": False})
+
+    assert [key for key, _ in errors] == ["dreamer"]
+    assert "Scribe" in errors[0][1]
+
+
+def test_a_scribe_needs_a_name_of_its_own() -> None:
+    """Worker names are unique horde-wide and each role registers separately, so a scribe needs its own."""
+    missing = _role_errors({"dreamer": False, "scribe": True, "scribe_name": "  "})
+    assert [key for key, _ in missing] == ["scribe_name"]
+    assert "required" in missing[0][1]
+
+    placeholder = _role_errors({"dreamer": False, "scribe": True, "scribe_name": SCRIBE_NAME_RESERVED_DEFAULT})
+    assert [key for key, _ in placeholder] == ["scribe_name"]
+    assert "placeholder" in placeholder[0][1]
+
+    collides_with_dreamer = _role_errors(
+        {"dreamer": True, "dreamer_name": "One Worker", "scribe": True, "scribe_name": "one worker"},
+    )
+    assert [key for key, _ in collides_with_dreamer] == ["scribe_name"]
+    assert "dreamer name" in collides_with_dreamer[0][1]
+
+    collides_with_alchemist = _role_errors(
+        {
+            "dreamer": True,
+            "dreamer_name": "One Worker",
+            "alchemist": True,
+            "alchemist_name": "Another Worker",
+            "scribe": True,
+            "scribe_name": "Another Worker",
+        },
+    )
+    assert [key for key, _ in collides_with_alchemist] == ["scribe_name"]
+    assert "alchemist name" in collides_with_alchemist[0][1]
+
+
+def test_a_scribe_name_is_not_checked_while_the_role_is_off() -> None:
+    """An operator who left a placeholder in a role they do not serve is not blocked by it."""
+    errors = _role_errors({"dreamer": True, "scribe": False, "scribe_name": SCRIBE_NAME_RESERVED_DEFAULT})
+
+    assert errors == []

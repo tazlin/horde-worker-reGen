@@ -6,6 +6,7 @@ from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent, SamplingStats
 
 from horde_worker_regen.benchmark.capabilities.timing import probe_timing
 from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
 
 def _image_job(
@@ -15,7 +16,7 @@ def _image_job(
     disk_load: float = 0.0,
     vram_load: float = 0.0,
     sampling: float = 0.0,
-    is_alchemy: bool = False,
+    workload: WorkloadKind = WorkloadKind.IMAGE_GENERATION,
 ) -> JobMetricsRecord:
     """A finished image job at the given absolute stage timestamps with optional phase durations."""
     model_loads: list[ModelLoadEvent] = []
@@ -29,7 +30,7 @@ def _image_job(
         )
     return JobMetricsRecord(
         job_id="j",
-        is_alchemy=is_alchemy,
+        workload=workload,
         stage_timestamps={"INFERENCE_IN_PROGRESS": inference_start, "FINALIZED": finalized},
         phase_metrics=JobPhaseMetrics(
             model_loads=model_loads,
@@ -104,10 +105,11 @@ def test_no_timed_jobs_yields_total_only() -> None:
     assert timing.jobs_completed == 0
 
 
-def test_alchemy_jobs_do_not_bound_the_image_window() -> None:
-    """Alchemy forms run on other lanes, so they are excluded from the image inference window."""
+def test_other_workloads_do_not_bound_the_image_window() -> None:
+    """Alchemy runs on other lanes and text runs in another program, so neither bounds the window."""
     jobs = [
-        _image_job(inference_start=9000.0, finalized=9000.0, is_alchemy=True, sampling=99.0),
+        _image_job(inference_start=9000.0, finalized=9000.0, workload=WorkloadKind.ALCHEMY, sampling=99.0),
+        _image_job(inference_start=8000.0, finalized=8000.0, workload=WorkloadKind.TEXT_GENERATION, sampling=88.0),
         _image_job(inference_start=1040.0, finalized=1070.0, sampling=4.0),
     ]
     timing = probe_timing(started_at_epoch=1000.0, elapsed_seconds=90.0, jobs=jobs)

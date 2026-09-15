@@ -40,6 +40,7 @@ from horde_worker_regen.process_management.jobs.text_generation_coordinator impo
     TextJobInFlight,
     advertised_model_name,
 )
+from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.text_backends import (
     FakeTextBackend,
@@ -138,9 +139,16 @@ def _make_coordinator(
     *,
     backend: FakeTextBackend | None = None,
     session: _FakeHordeClientSession | None = None,
+    state: WorkerState | None = None,
+    run_metrics: WorkerRunMetrics | None = None,
     **bridge_overrides: object,
 ) -> tuple[TextGenerationCoordinator, FakeTextBackend, _FakeHordeClientSession]:
-    """Create a coordinator over a fake backend and a fake horde session, with the scribe role on."""
+    """Create a coordinator over a fake backend and a fake horde session, with the scribe role on.
+
+    ``state`` and ``run_metrics`` are passed by the tests that assert on what the flow writes into the
+    shared session totals and the per-job records; the rest get a throwaway state and no aggregator,
+    which is also the assembly a worker with no run metrics wired runs under.
+    """
     resolved_backend = backend if backend is not None else FakeTextBackend(description=_DESCRIPTION)
     resolved_session = session if session is not None else _FakeHordeClientSession()
     # An explicit empty list because the pop request validates the field as a list and the shared mock
@@ -151,12 +159,13 @@ def _make_coordinator(
     shutdown_manager.is_time_for_shutdown.return_value = False
 
     coordinator = TextGenerationCoordinator(
-        state=WorkerState(),
+        state=state if state is not None else WorkerState(),
         shutdown_manager=shutdown_manager,
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         api_sessions=make_test_api_sessions(horde_client_session=resolved_session),
         backend=resolved_backend,
         text_backend_kind=bridge_data.text_backend_kind,
+        run_metrics=run_metrics,
     )
     return coordinator, resolved_backend, resolved_session
 
@@ -415,7 +424,6 @@ async def test_a_generated_job_is_submitted_as_ok_with_the_backend_text() -> Non
     assert submit_request.generation == "a generated answer"
     assert coordinator.num_jobs_submitted == 1
     assert coordinator.num_jobs_faulted == 0
-    assert coordinator.kudos_earned_this_session == pytest.approx(_SUBMIT_REWARD)
     assert coordinator.num_in_flight == 0
 
 
@@ -581,6 +589,119 @@ async def test_a_result_for_an_abandoned_generation_is_faulted_not_submitted() -
     assert submit_request.generation == FAULTED_GENERATION_TEXT
     assert "half an ans" not in submit_request.generation
     assert coordinator.num_jobs_faulted == 1
+
+
+async def test_a_paid_submit_reaches_the_session_kudos_pool() -> None:
+    """The kudos pool is the account's: text earnings share the session total and the kudos/hr clock."""
+    state = WorkerState()
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="an answer")
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, _session = _make_coordinator(backend=backend, session=session, state=state)
+    await coordinator.await_backend_ready()
+
+    await coordinator.api_text_pop()
+    await _drain_job_tasks(coordinator)
+
+    assert state.kudos_generated_this_session == pytest.approx(_SUBMIT_REWARD)
+    assert len(state.kudos_events) == 1
+    assert state.kudos_events[0][1] == pytest.approx(_SUBMIT_REWARD)
+    assert state.first_kudos_event_time is not None
+
+
+async def test_a_paid_submit_records_one_text_job() -> None:
+    """A finished text job is one record carrying the advertised model and the job's own timings."""
+    run_metrics = WorkerRunMetrics()
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="an answer")
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, _session = _make_coordinator(
+        backend=backend,
+        session=session,
+        run_metrics=run_metrics,
+    )
+    await coordinator.await_backend_ready()
+
+    await coordinator.api_text_pop()
+    await _drain_job_tasks(coordinator)
+
+    records = run_metrics.snapshot().jobs
+    assert len(records) == 1
+    record = records[0]
+    assert record.workload is WorkloadKind.TEXT_GENERATION
+    assert record.model_name == _DESCRIPTION.model_name
+    assert record.faulted is False
+    assert record.kudos_reward == pytest.approx(_SUBMIT_REWARD)
+    assert record.queue_wait_seconds is not None
+    assert record.sampling_seconds is not None
+    assert record.e2e_seconds is not None
+
+
+async def test_a_faulted_submit_records_a_faulted_job_and_pays_nothing() -> None:
+    """A fault report is delivered work the horde pays nothing for, so it earns no kudos."""
+    state = WorkerState()
+    run_metrics = WorkerRunMetrics()
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        generate_failures=(TextBackendRejectedPayload("no"),),
+    )
+    coordinator, _backend, _session = _make_coordinator(
+        backend=backend,
+        state=state,
+        run_metrics=run_metrics,
+    )
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=0.0, model_name=_DESCRIPTION.model_name)
+    coordinator._in_flight[job.job_id] = job
+
+    await coordinator.run_job(job)
+
+    record = run_metrics.snapshot().jobs[0]
+    assert record.workload is WorkloadKind.TEXT_GENERATION
+    assert record.faulted is True
+    assert record.kudos_reward is None
+    assert state.kudos_generated_this_session == 0.0
+    assert state.kudos_events == deque()
+
+
+async def test_the_recorded_max_length_comes_from_the_popped_payload() -> None:
+    """The cap the horde asked for is a text job's own shape, and the payload is where it is stated."""
+    run_metrics = WorkerRunMetrics()
+    coordinator, _backend, _session = _make_coordinator(run_metrics=run_metrics)
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(
+        job_id=_job_id(),
+        payload={"prompt": "a prompt", "max_length": 128},
+        time_popped=0.0,
+        model_name=_DESCRIPTION.model_name,
+    )
+    coordinator._in_flight[job.job_id] = job
+
+    await coordinator.run_job(job)
+
+    assert run_metrics.snapshot().jobs[0].max_length == 128
+
+
+async def test_a_flow_with_no_run_metrics_records_nothing_and_raises_nothing() -> None:
+    """An assembly with no aggregator still submits every job; recording is the part that is skipped."""
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, _session = _make_coordinator(session=session)
+    await coordinator.await_backend_ready()
+
+    await coordinator.api_text_pop()
+    await _drain_job_tasks(coordinator)
+
+    assert len(session.submit_requests) == 1
+    assert coordinator.num_jobs_submitted == 1
+
+
+async def test_the_backend_readiness_flag_follows_the_gate() -> None:
+    """Nothing is popped while the gate is open, so the dashboard reads the reason from this flag."""
+    coordinator, _backend, _session = _make_coordinator()
+
+    assert coordinator.backend_ready is False
+
+    await coordinator.await_backend_ready()
+
+    assert coordinator.backend_ready is True
 
 
 async def test_shutdown_abandons_every_in_flight_generation_and_closes_the_backend() -> None:

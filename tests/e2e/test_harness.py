@@ -20,6 +20,7 @@ import pytest
 
 from horde_worker_regen.harness import HarnessConfig, run_harness, run_harness_async
 from horde_worker_regen.process_management.lifecycle import shutdown_manager as shutdown_manager_module
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_alchemy_scenario,
     make_simple_scenario,
@@ -104,7 +105,7 @@ async def test_mixed_image_and_alchemy_scenario() -> None:
 
     # Alchemy form metrics flow through the same run-metrics chain as image jobs.
     assert result.metrics is not None
-    alchemy_records = [record for record in result.metrics.jobs if record.is_alchemy]
+    alchemy_records = [record for record in result.metrics.jobs if record.workload is WorkloadKind.ALCHEMY]
     assert len(alchemy_records) == 2
 
 

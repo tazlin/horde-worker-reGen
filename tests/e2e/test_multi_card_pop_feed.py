@@ -20,6 +20,7 @@ import pytest
 from horde_worker_regen.harness import HarnessConfig, HarnessResult, run_harness_async
 from horde_worker_regen.process_management.process_manager import SystemResources
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import SoakImageTemplate
 
 # The measured concurrency is a wall-clock figure, so these rows share one xdist worker under
@@ -64,7 +65,7 @@ def _busy_intervals(result: HarnessResult) -> list[tuple[float, float]]:
     assert result.metrics is not None
     intervals: list[tuple[float, float]] = []
     for record in result.metrics.jobs:
-        if record.is_alchemy or record.stage is not None:
+        if record.workload is not WorkloadKind.IMAGE_GENERATION or record.stage is not None:
             continue
         start = record.stage_timestamps.get("INFERENCE_IN_PROGRESS")
         end = record.stage_timestamps.get("PENDING_SAFETY_CHECK") or record.stage_timestamps.get("PENDING_SUBMIT")
@@ -85,7 +86,9 @@ def _fed_at_finish_ratio(result: HarnessResult, window: tuple[float, float]) -> 
     jobs = [
         record.stage_timestamps
         for record in result.metrics.jobs
-        if not record.is_alchemy and record.stage is None and "PENDING_INFERENCE" in record.stage_timestamps
+        if record.workload is WorkloadKind.IMAGE_GENERATION
+        and record.stage is None
+        and "PENDING_INFERENCE" in record.stage_timestamps
     ]
     finishes = [
         stamps.get("PENDING_SAFETY_CHECK") or stamps.get("PENDING_SUBMIT")

@@ -20,6 +20,7 @@ from horde_worker_regen.harness import HarnessConfig, HarnessResult, run_harness
 from horde_worker_regen.process_management.ipc.messages import PipelineStageTag
 from horde_worker_regen.process_management.process_manager import SystemResources
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     SoakImageTemplate,
@@ -446,7 +447,7 @@ def _assert_clean_canary_result(
     assert result.metrics.process_crash_events == []
     _assert_governed_a_loaded_card(result)
 
-    image_records = [record for record in result.metrics.jobs if not record.is_alchemy]
+    image_records = [record for record in result.metrics.jobs if record.workload is WorkloadKind.IMAGE_GENERATION]
     assert len(image_records) == expected_jobs
     assert Counter(record.model_name for record in image_records) == Counter(job.model for job in scenario)
     assert all(not record.faulted for record in image_records)
@@ -546,7 +547,11 @@ async def test_heterogeneous_card_offer_and_routing_survive_spawned_worker_lifec
     assert result.metrics is not None, result.failure_summary()
     assert result.metrics.process_crash_events == [], result.failure_summary()
 
-    records = [record for record in result.metrics.jobs if not record.is_alchemy and not record.faulted]
+    records = [
+        record
+        for record in result.metrics.jobs
+        if record.workload is WorkloadKind.IMAGE_GENERATION and not record.faulted
+    ]
     completed_models = Counter(record.model_name for record in records)
     assert completed_models[_PLAIN_CARD_MODEL] >= 1, result.failure_summary()
     assert completed_models[_CONTROL_CARD_MODEL] >= 1, result.failure_summary()

@@ -12,6 +12,7 @@ from horde_worker_regen.process_management.resources.duty_cycle import (
     summarize_duty_cycle,
 )
 from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
 
 def _phase_rich_job(job_id: str = "a") -> JobMetricsRecord:
@@ -68,10 +69,11 @@ class TestPhaseBreakdownAndGaps:
         gaps = format_phase_gaps(phase_breakdown([_phase_rich_job()]))
         assert gaps == "model load (disk) 4.2s/job, queue wait 2.5s/job"
 
-    def test_alchemy_jobs_are_excluded(self) -> None:
-        """Alchemy forms never pass through the image phases, so they contribute nothing to attribution."""
-        alchemy = JobMetricsRecord(job_id="x", is_alchemy=True)
-        assert phase_breakdown([alchemy]) == {}
+    def test_other_workloads_are_excluded(self) -> None:
+        """Only image jobs pass through the image phases, so no other workload reaches attribution."""
+        alchemy = JobMetricsRecord(job_id="x", workload=WorkloadKind.ALCHEMY)
+        text = JobMetricsRecord(job_id="y", workload=WorkloadKind.TEXT_GENERATION)
+        assert phase_breakdown([alchemy, text]) == {}
 
     def test_encode_and_graph_overhead_peeled_out_of_residual(self) -> None:
         """When the engine reports clip/vae-encode and pipeline framing, they become named buckets.

@@ -283,7 +283,7 @@ def analyze_stats_files(
         busy_threshold=busy_threshold,
     )
     duration_hours = _duration_hours(samples)
-    completed_jobs = sum(1 for job in jobs if not bool(job.get("faulted")) and not bool(job.get("is_alchemy")))
+    completed_jobs = sum(1 for job in jobs if not bool(job.get("faulted")) and _is_image_job(job))
     churn_delta = _counter_delta(samples, "churn_counts")
     slot_duty_delta = _counter_delta(samples, "slot_duty_totals")
     slot_duty_capacity = _last_int_or_none(samples, "slot_duty_capacity")
@@ -695,7 +695,7 @@ def _inference_queue_wait_summary(jobs: list[dict[str, Any]]) -> InferenceQueueW
     sampling_seconds = 0.0
     by_model: dict[str, list[dict[str, float]]] = {}
     for job in jobs:
-        if bool(job.get("faulted")) or bool(job.get("is_alchemy")):
+        if bool(job.get("faulted")) or not _is_image_job(job):
             continue
         queue_wait = _float_or_none(job.get("queue_wait_seconds"))
         if queue_wait is None:
@@ -997,6 +997,20 @@ def _float_or_none(value: object) -> float | None:
     if isinstance(value, int | float):
         return float(value)
     return None
+
+
+def _is_image_job(job: dict[str, Any]) -> bool:
+    """Whether an exported ``job_completed`` event describes an image-generation job.
+
+    Records written before the workload discriminator existed name only ``is_alchemy``, and a stats
+    directory holds every session an operator has ever run, so the older spelling is still read.
+    """
+    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+
+    workload = job.get("workload")
+    if workload is None:
+        return not bool(job.get("is_alchemy"))
+    return workload == WorkloadKind.IMAGE_GENERATION
 
 
 def _int_value(value: object) -> int:

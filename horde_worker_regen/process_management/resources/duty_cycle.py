@@ -95,6 +95,19 @@ def median(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
+def _is_image_job(job: JobMetricsRecord) -> bool:
+    """Whether a finished-work record came from the image-generation flow.
+
+    Duty cycle is GPU core uptime, and only image generation puts this worker's GPU to work: alchemy
+    forms carry no diffusion phases and text generation runs in another program entirely. The import is
+    function-local because ``WorkloadKind`` sits in the scheduling package, whose own imports would cost
+    this module the stdlib-and-pydantic-only weight it is kept at.
+    """
+    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+
+    return job.workload is WorkloadKind.IMAGE_GENERATION
+
+
 def phase_breakdown(jobs: list[JobMetricsRecord]) -> dict[str, float]:
     """Median per-job seconds in each pipeline phase, to show where a typical job's time goes.
 
@@ -105,7 +118,7 @@ def phase_breakdown(jobs: list[JobMetricsRecord]) -> dict[str, float]:
     samples: dict[str, list[float]] = {phase: [] for phase in PHASE_ORDER}
 
     for job in jobs:
-        if job.is_alchemy:
+        if not _is_image_job(job):
             continue
         stamps = job.stage_timestamps or {}
         if job.queue_wait_seconds is not None:
@@ -272,7 +285,7 @@ def summarize_duty_cycle(
     headline), and ``churn_counts`` is the per-window count of each reload/respawn event.
     """
     breakdown = phase_breakdown(jobs)
-    completed = sum(1 for job in jobs if not job.is_alchemy and not job.faulted)
+    completed = sum(1 for job in jobs if _is_image_job(job) and not job.faulted)
 
     no_jobs_fraction: float | None = None
     if window_seconds > 0:

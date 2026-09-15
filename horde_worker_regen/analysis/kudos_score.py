@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
 if TYPE_CHECKING:
     pass
@@ -284,7 +285,8 @@ def score_session(
     ``window_seconds`` to override (e.g. with the full soak duration).
 
     Args:
-        records: Finished-job records from a run metrics snapshot (alchemy records are ignored).
+        records: Finished-job records from a run metrics snapshot (records from the other workloads are
+            ignored: the scorer prices a diffusion payload).
         scorer: The loaded kudos checkpoint.
         window_seconds: Optional explicit window for the kudos/hr denominator.
 
@@ -298,7 +300,7 @@ def score_session(
     window_end: float | None = None
 
     for record in records:
-        if record.is_alchemy:
+        if record.workload is not WorkloadKind.IMAGE_GENERATION:
             continue
         payload = payload_from_job_record(record)
         per_image = scorer.score_payload(payload)

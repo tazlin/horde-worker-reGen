@@ -31,6 +31,7 @@ from textual.widgets import Button, Collapsible, Static
 
 from horde_worker_regen.app_state import OverviewTrendWindow
 from horde_worker_regen.process_management.ipc.supervisor_channel import RECENT_JOBS_IN_SNAPSHOT, DownloadPhase
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.formatters import (
     human_bytes,
     human_duration,
@@ -770,8 +771,10 @@ class SimpleHomeView(VerticalScroll):
             named = f" with {shorten(job.model_name, 24)}" if job.model_name else ""
             if job.faulted:
                 self._ticker.append(f"Could not finish a request{elapsed}")
-            elif job.is_alchemy:
+            elif job.workload == WorkloadKind.ALCHEMY:
                 self._ticker.append(f"Finished an alchemy request{named}{elapsed}{earned}")
+            elif job.workload == WorkloadKind.TEXT_GENERATION:
+                self._ticker.append(f"Finished a text request{named}{elapsed}{earned}")
             else:
                 self._ticker.append(f"Finished an image request{named}{elapsed}{earned}")
 
@@ -964,7 +967,14 @@ class SimpleActivityView(VerticalScroll):
         table.add_column("Kudos", justify="right", no_wrap=True)
         for job in list(snapshot.recent_jobs)[-12:][::-1]:
             result = Text("Not completed", "yellow") if job.faulted else Text("Completed", "green")
-            work = "Alchemy request" if job.is_alchemy else (job.model_name or "Image request")
+            if job.workload == WorkloadKind.ALCHEMY:
+                work = "Alchemy request"
+            elif job.model_name:
+                work = job.model_name
+            elif job.workload == WorkloadKind.TEXT_GENERATION:
+                work = "Text request"
+            else:
+                work = "Image request"
             elapsed = f"{job.e2e_seconds:.1f}s" if job.e2e_seconds is not None else "-"
             earned = f"{job.kudos_reward:,.1f}" if job.kudos_reward is not None else "-"
             table.add_row(result, work, elapsed, earned)
