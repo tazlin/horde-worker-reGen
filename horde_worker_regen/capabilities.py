@@ -30,9 +30,10 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
+
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
 # The one worker-local fact about feature extras: how a horde-engine feature extra is re-exported under
 # the worker's own ``[project.optional-dependencies]`` name. horde-engine's ``rembg`` extra is surfaced
@@ -162,12 +163,8 @@ def enabled_workloads(bridge_data: reGenBridgeData) -> frozenset[WorkloadKind]:
     future worker type adds a single membership rule here and is then first-class everywhere downstream
     rather than threading another boolean through every site.
 
-    ``WorkloadKind`` is imported lazily so this module's import stays torch-free (the benchmark planner
-    imports it); the import chain behind ``WorkloadKind`` is only pulled in when a caller actually needs
-    the served-workload set, which only happens in contexts that already tolerate it.
     """
     from horde_worker_regen.compute_mode import is_cpu_only_install
-    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
     workloads: set[WorkloadKind] = set()
     if bridge_data.dreamer and not is_cpu_only_install():
@@ -196,7 +193,6 @@ def _coerce_workload_config(bridge_data: reGenBridgeData, *, log: bool) -> list[
     worker that serves no workload at all is surfaced as a warning rather than silently doing nothing.
     """
     from horde_worker_regen.compute_mode import is_cpu_only_install
-    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
     if WorkloadKind.IMAGE_GENERATION in enabled_workloads(bridge_data):
         return []

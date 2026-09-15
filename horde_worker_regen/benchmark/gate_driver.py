@@ -50,6 +50,7 @@ from horde_worker_regen.benchmark.disagg_mixes import (
     DisaggGateMix,
     build_disagg_gate_scenario,
 )
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord, RunMetricsSnapshot
@@ -285,9 +286,6 @@ def _disk_to_ram_by_stage(snapshot: RunMetricsSnapshot) -> tuple[dict[str, int],
 
 def _stage_latency_percentiles(snapshot: RunMetricsSnapshot) -> tuple[dict[str, float], dict[str, float]]:
     """Derive p50/p95 stage latency from the durations the records already carry (omitting untimed stages)."""
-    # Imported inside the function, as every run-metrics type here is, so module import stays torch-free.
-    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
-
     samples: dict[str, list[float]] = {}
 
     def _add(key: str, value: float | None) -> None:

@@ -19,6 +19,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any, cast
 
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.stats_operations import default_stats_dir
 
 _STATS_SESSION_RE = re.compile(r"^stats-v(?P<version>.+)-(?P<stamp>\d{8}-\d{6})-(?P<index>\d+)\.jsonl(?:\.gz)?$")
@@ -1005,8 +1006,6 @@ def _is_image_job(job: dict[str, Any]) -> bool:
     Records written before the workload discriminator existed name only ``is_alchemy``, and a stats
     directory holds every session an operator has ever run, so the older spelling is still read.
     """
-    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
-
     workload = job.get("workload")
     if workload is None:
         return not bool(job.get("is_alchemy"))

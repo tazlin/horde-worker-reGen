@@ -18,6 +18,7 @@ from horde_worker_regen.process_management.resources.duty_cycle import (
     phase_breakdown,
     span_derived_busy_ratio,
 )
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 
 if TYPE_CHECKING:
     from horde_worker_regen.harness import HarnessResult
@@ -54,11 +55,8 @@ def _is_image_job(job: JobMetricsRecord) -> bool:
     """Whether a finished-work record came from the image-generation flow.
 
     Every statistic here is a diffusion statistic (sampling rate, VRAM reloads), so records from the
-    other workloads are excluded. The import is function-local to keep this module's import weight at
-    what its torch-free contract promises.
+    other workloads are excluded.
     """
-    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
-
     return job.workload is WorkloadKind.IMAGE_GENERATION
 
 

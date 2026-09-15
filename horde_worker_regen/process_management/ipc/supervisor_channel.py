@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.models.feature_readiness import FeatureReadiness
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 
 if TYPE_CHECKING:
     from multiprocessing.connection import Connection
@@ -447,13 +448,8 @@ class RecentJobRecord(BaseModel):
     """
 
     job_id: str
-    workload: str = "image_generation"
-    """Which workload produced this job, as a ``WorkloadKind`` value.
-
-    A plain string for the same reason :attr:`WorkerStateSnapshot.enabled_workloads` is one: importing
-    ``WorkloadKind`` here pulls the scheduling package's ``horde_sdk`` chain into every consumer, and
-    ``ipc.messages`` imports this module, so the import is also a cycle. Consumers compare against the
-    typed enum, which is a ``StrEnum`` and so compares equal to these values."""
+    workload: WorkloadKind = WorkloadKind.IMAGE_GENERATION
+    """Which workload produced this job."""
     faulted: bool = False
     queue_wait_seconds: float | None = None
     e2e_seconds: float | None = None
@@ -502,7 +498,7 @@ class RecentJobRecord(BaseModel):
             )
         return cls(
             job_id=record.job_id,
-            workload=record.workload.value,
+            workload=record.workload,
             faulted=record.faulted,
             queue_wait_seconds=record.queue_wait_seconds,
             e2e_seconds=record.e2e_seconds,

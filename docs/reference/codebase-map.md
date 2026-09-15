@@ -17,6 +17,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Process startup                        | `process_management/main_entry_point.py`, `worker_entry_points.py` |
 | Job popping / pop gates                | `process_management/jobs/job_popper.py` (`JobPopper`)              |
 | Job stages, faults, invariants, queue queries (head of queue, next models, aux preparation) | `process_management/jobs/job_tracker.py` (`JobTracker`) |
+| The `WorkloadKind` vocabulary (leaf module, stdlib + `strenum` only) | `process_management/scheduling/workload_kind.py` (`WorkloadKind`); re-exported from `workload_flow.py` for existing importers |
 | Scheduling inference & model preloads  | `process_management/scheduling/inference_scheduler.py` (`InferenceScheduler`) |
 | Pop-rate & megapixelstep throttling    | `process_management/scheduling/pop_throttler.py` (`PopThrottler`)  |
 | Pop/scheduling hold visibility         | `process_management/scheduling/pop_governor_registry.py`           |

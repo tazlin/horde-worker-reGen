@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
+
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
 
@@ -99,12 +101,8 @@ def _is_image_job(job: JobMetricsRecord) -> bool:
     """Whether a finished-work record came from the image-generation flow.
 
     Duty cycle is GPU core uptime, and only image generation puts this worker's GPU to work: alchemy
-    forms carry no diffusion phases and text generation runs in another program entirely. The import is
-    function-local because ``WorkloadKind`` sits in the scheduling package, whose own imports would cost
-    this module the stdlib-and-pydantic-only weight it is kept at.
+    forms carry no diffusion phases and text generation runs in another program entirely.
     """
-    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
-
     return job.workload is WorkloadKind.IMAGE_GENERATION
 
 

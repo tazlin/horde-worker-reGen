@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
+
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
 
@@ -135,9 +137,6 @@ def probe_timing(
     the measured one, when there was one. Only image-generation jobs with stage timestamps bound the
     window, since they are what the inference processes spend their wall-clock on.
     """
-    # Function-local so this module's import stays as light as its torch-free contract promises.
-    from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
-
     image_jobs = [job for job in jobs if job.workload is WorkloadKind.IMAGE_GENERATION]
     timed_jobs = [job for job in image_jobs if _INFERENCE_START_STAGE in (job.stage_timestamps or {})]
     timed_jobs.sort(key=lambda job: job.stage_timestamps[_INFERENCE_START_STAGE])

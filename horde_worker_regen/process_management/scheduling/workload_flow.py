@@ -24,24 +24,11 @@ from horde_sdk.generation_parameters.alchemy.consts import (
     is_strip_background_form,
     is_upscaler_form,
 )
-from strenum import StrEnum
 
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
 
-
-class WorkloadKind(StrEnum):
-    """A distinct kind of work reGen pops, runs, and submits as its own flow.
-
-    Audio and video generation are the intended next entries; they are reserved here (commented) rather
-    than declared so an unhandled member cannot be routed before its flow exists.
-    """
-
-    IMAGE_GENERATION = "image_generation"
-    ALCHEMY = "alchemy"
-    TEXT_GENERATION = "text_generation"
-    # AUDIO_GENERATION = "audio_generation"  # reserved: the next flow to add
-    # VIDEO_GENERATION = "video_generation"  # reserved
-
+# Re-exported from its leaf home so every existing importer of WorkloadKind from this module stays valid.
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 
 POST_PROCESS_RESERVE_FLOW = "image_post_processing"
 """Committed-reserve ledger flow name for image jobs active on the dedicated post-processing lane."""
