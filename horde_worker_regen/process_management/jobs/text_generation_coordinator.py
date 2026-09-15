@@ -640,6 +640,7 @@ class TextGenerationCoordinator:
         for job_id in job_ids:
             job = TextJobInFlight(job_id=job_id, payload=payload, time_popped=time.time())
             self._in_flight[job_id] = job
+            self._state.text_jobs_in_flight = len(self._in_flight)
             logger.info(
                 f"Popped text job {job_id[:8]} for {pop_response.model} "
                 f"(softprompt: {pop_response.softprompt}, ttl: {pop_response.ttl})",
@@ -686,6 +687,7 @@ class TextGenerationCoordinator:
             except Exception as fault_report_error:
                 logger.error(f"Could not report text job {job.job_id[:8]} as faulted: {fault_report_error}")
                 self._in_flight.pop(job.job_id, None)
+                self._state.text_jobs_in_flight = len(self._in_flight)
 
     async def _generate_text(self, job: TextJobInFlight) -> str | None:
         """Return the generated text for one job, or None when the job must be faulted.
@@ -777,6 +779,7 @@ class TextGenerationCoordinator:
             await self._submit_with_retries(job, generation=generation, state=state)
         finally:
             self._in_flight.pop(job.job_id, None)
+            self._state.text_jobs_in_flight = len(self._in_flight)
 
     async def _submit_with_retries(self, job: TextJobInFlight, *, generation: str, state: GENERATION_STATE) -> None:
         """Attempt the submit a bounded number of times, logging the outcome of the last attempt."""

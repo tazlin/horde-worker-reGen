@@ -263,6 +263,8 @@ class ShutdownManager:
             return False
         if self._state.alchemy_forms_in_flight > 0:
             return False
+        if self._state.text_jobs_in_flight > 0:
+            return False
 
         # Every non-inference lane must have accepted its END_PROCESS transition before the control loop
         # returns. The final lifecycle reap is the safety net, not the first time a forgotten service lane

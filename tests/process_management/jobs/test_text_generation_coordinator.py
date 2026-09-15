@@ -662,3 +662,18 @@ async def test_a_maintenance_refusal_is_announced_once_and_resumption_once() -> 
         assert [level for level, message in logged if "Text pops resumed" in message] == ["INFO"]
     finally:
         logger.remove(sink_id)
+
+
+async def test_the_worker_state_counts_text_jobs_in_flight_for_shutdown() -> None:
+    """Shutdown consults the shared state, so the count must rise on pop and fall once the submit lands."""
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, session = _make_coordinator(session=session)
+    assert await coordinator.await_backend_ready() is True
+    assert coordinator._state.text_jobs_in_flight == 0
+
+    await coordinator.api_text_pop()
+    assert coordinator._state.text_jobs_in_flight == 1
+
+    await _drain_job_tasks(coordinator)
+    assert coordinator._state.text_jobs_in_flight == 0
+    assert len(session.submit_requests) == 1

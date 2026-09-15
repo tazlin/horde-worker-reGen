@@ -136,6 +136,12 @@ class TestIsTimeForShutdown:
         shutdown_manager = _make_shutdown_manager(state=state)
         assert shutdown_manager.is_time_for_shutdown() is False
 
+    def test_text_jobs_in_flight_returns_false(self) -> None:
+        """A text generation running in the external backend prevents shutdown until it is submitted."""
+        state = WorkerState(shutting_down=True, text_jobs_in_flight=1)
+        shutdown_manager = _make_shutdown_manager(state=state)
+        assert shutdown_manager.is_time_for_shutdown() is False
+
     def test_all_processes_ending_returns_true(self) -> None:
         """If all processes are ending, is_time_for_shutdown should return True."""
         state = WorkerState(shutting_down=True)

@@ -403,6 +403,13 @@ class WorkerState:
     no-jobs idle tracking) can treat active alchemy work as the worker being busy.
     """
 
+    text_jobs_in_flight: int = 0
+    """Text jobs currently popped, generating, or awaiting submit.
+
+    Maintained by the text-generation coordinator so shutdown waits for a generation running in the
+    external backend to be submitted (or faulted) before the control loop decides the worker is done.
+    """
+
     avg_safety_seconds: float = 0.0
     """Exponential moving average of the measured wall-clock per safety check (0 until first sample).
 
