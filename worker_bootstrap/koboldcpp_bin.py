@@ -37,7 +37,7 @@ from pathlib import Path
 
 from worker_bootstrap import detect, paths
 
-KOBOLDCPP_VERSION = "v1.120"
+KOBOLDCPP_VERSION = "v1.121"
 """The pinned upstream release tag. Bumping it also replaces every digest in the asset table below."""
 
 _RELEASE_BASE_URL = "https://github.com/LostRuins/koboldcpp/releases/download"
@@ -103,25 +103,25 @@ _SUPPORTED_ASSETS: tuple[KoboldcppAsset, ...] = (
         host_platform=KoboldcppPlatform.WINDOWS_X64,
         variant=KoboldcppVariant.CUDA,
         asset_name="koboldcpp.exe",
-        sha256="6544239ab2747ee84e1ca265a702772fe63719774b829ec9e829f4029ac013db",
+        sha256="90b0d74ec01e5ef72efb6d45e6f10bee649458920ec951f48d58794c366b1639",
     ),
     KoboldcppAsset(
         host_platform=KoboldcppPlatform.WINDOWS_X64,
         variant=KoboldcppVariant.NOCUDA,
         asset_name="koboldcpp-nocuda.exe",
-        sha256="f926cf18a9c13d7be5f0bf490f7343e8ca78e2faf17aeb5c2ed6696b8b89c1ee",
+        sha256="ce94894823b19b32efe5db8b6cc8bbc459db23fa98fda16da978fbec960473b7",
     ),
     KoboldcppAsset(
         host_platform=KoboldcppPlatform.LINUX_X64,
         variant=KoboldcppVariant.CUDA,
         asset_name="koboldcpp-linux-x64",
-        sha256="12cd15ed41f800943b0c4dca9cb129bf6c3300bae45b53bd70886237b9aa076b",
+        sha256="463a5eb1392f0c40e6b5a9031ff77eeb9ae4fe8db4018c9108eb1f6fab659024",
     ),
     KoboldcppAsset(
         host_platform=KoboldcppPlatform.LINUX_X64,
         variant=KoboldcppVariant.NOCUDA,
         asset_name="koboldcpp-linux-x64-nocuda",
-        sha256="48e3ef799008b9d2b7accc59bb6da019064894621a410269c21bb744218419bb",
+        sha256="5939cb137d382a7095b82c330bb62579740066604861f0b57e59e49a20597666",
     ),
 )
 
