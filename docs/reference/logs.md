@@ -15,6 +15,7 @@ log line it reads, and the dashboard are kept from drifting apart.
 | `trace.log` | Errors, criticals, and `TRACE`-level lines (including the suppressed repeats described below). |
 | `trace_n.log` | The same, per process. |
 | `bridge_tui.log` / `bridge_host.log` | The supervisor (parent) process's own log: TUI dashboard or `--host` wrapper. Captures worker launch, crash-loop, and TUI-process crash diagnostics that never reach `bridge.log`. |
+| `text_backend.log` | A managed text backend's own stdout and stderr, appended across launches. Written by the backend, not the worker. |
 
 ## Repeating telemetry is time-boxed
 
@@ -71,6 +72,16 @@ The numbered logs map to the worker's child processes:
 
 For why the worker runs separate inference and safety processes, see
 [Architecture](../explanation/architecture.md).
+
+## What the worker reads out of `text_backend.log`
+
+A managed text backend writes this file itself; the worker only appends its launches to it and reads three
+lines back out. Once a launch becomes ready, the worker scans what that launch wrote for llama.cpp's
+`model buffer size`, `KV buffer size` and `compute buffer size` lines, sums each kind over the devices that
+printed it, and shows the totals on the backend's dashboard row. They are display detail only: no admission
+or pricing decision reads them, and a backend that prints none (a quiet debug level, or a program that is
+not llama.cpp-based) simply leaves them blank. The patterns are registered as log signatures with samples
+pinned to a real backend log, the same contract the worker's own parsed lines are held to.
 
 ## Tailing a log live
 

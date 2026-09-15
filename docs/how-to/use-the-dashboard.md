@@ -190,6 +190,16 @@ Two tables split the same worker along different axes. The **Work ledger** is jo
 job, listed in the order the worker will serve them. The process table is process-owned: slot state,
 resident model, GPU, memory, heartbeat, and completed count.
 
+A scribe worker's text backend is the last row of the process table, typed **Text Backend**. It is an
+external program rather than one of the worker's own processes, so its cells read a little differently:
+the id column shows its OS pid, the state column shows what the worker's supervisor is doing with it
+(`launching`, `ready`, `relaunching in 8 s`) plus its token rate while it generates, the GPU column is a
+dash when it runs on no card, and the baseline column gives the context size it was loaded with. Its VRAM
+figure is marked **measured**: it is how much the card's free memory dropped while the backend loaded, not
+an allocator reading like the inference slots', so the two are not comparable. The heartbeat column is how
+long ago the backend last answered a readiness probe, which the worker asks only while it is starting, so
+that figure grows while it serves and is not a sign of trouble.
+
 A **Governance** panel consolidates the pop governors and the scheduler's RAM and preload diagnostics;
 its title says how many governors are actively holding work back. Multi-GPU workers also get a
 per-card strip (one row per GPU: VRAM bar, contexts, active jobs).
@@ -278,7 +288,10 @@ in its title and everything else left as a genuine *Other (OS + apps)* remainder
 
 Each process panel shows its state and temperature phrase (*sampling*, *primed*, *loading*), current
 model and job, a sampling progress bar, iterations per second, VRAM and RAM (current and peak), and
-heartbeat freshness. A GPU-bearing process holding model components in RAM also lists them under
+heartbeat freshness. The text backend's panel carries its own facts instead: the model it loaded, the
+backend kind and port, its OS pid, its context and generation caps, its token rate, the VRAM measured at
+launch, how long it has been ready, how many times it has been launched, and the model, KV and compute
+buffer sizes its loader printed. A GPU-bearing process holding model components in RAM also lists them under
 **Resident** (name, kind, approximate MB) with a **Retained** line for the remainder its component
 cache does not account for. In pipeline-disaggregation mode the pinned sampler shows the same per-step
 bar, and the VAE lane shows one during a tiled decode.

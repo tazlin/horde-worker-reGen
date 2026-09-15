@@ -27,7 +27,12 @@ class LogSignature:
     name: str
     pattern: re.Pattern[str]
     emitter: str
-    """``module:function`` of the emitting site in ``horde_worker_regen``."""
+    """``module:function`` of the emitting site in ``horde_worker_regen``.
+
+    A line the worker does not emit itself names the program that does in place of the module
+    (``hordelib.comfy.model_management:free_memory``, ``koboldcpp.llama.cpp:load_tensors``). The contract
+    is the same one either way: the pattern is pinned to a sample from that program's real output, and the
+    entry says where to look when a release reworded the line."""
     sample: str
     """A literal message (the part after loguru's ``location - `` prefix) copied from a real worker log."""
     dry_run_reason: str = ""
@@ -76,6 +81,9 @@ _WHOLE_CARD_NOT_EXERCISED = (
 _MALFORMED_POP_NOT_EXERCISED = "the dry-run harness never synthesizes a malformed pop response with a blank model name"
 _HORDELIB_READOUT_NOT_EXERCISED = (
     "the dry-run harness's fake inference children never call hordelib's free-VRAM readout"
+)
+_TEXT_BACKEND_NOT_LAUNCHED = (
+    "printed once by the text backend into its own `logs/text_backend.log`, which a dry run never launches"
 )
 
 _SIGNATURE_LIST: list[LogSignature] = [
@@ -990,6 +998,31 @@ _SIGNATURE_LIST: list[LogSignature] = [
             "reachable only through a sustained scheduling starvation a short deterministic dry run does not sustain"
         ),
         field_of="head_starvation_model",
+    ),
+    # --- Text backend load-time buffer sizes (printed by llama.cpp inside koboldcpp) ---
+    _signature(
+        "text_backend_model_buffer",
+        r"^\S+:\s+(?P<device>\S+) model buffer size =\s+(?P<mebibytes>[\d.]+) MiB",
+        emitter="koboldcpp.llama.cpp:load_tensors",
+        sample="load_tensors:        CUDA0 model buffer size =  1918.35 MiB",
+        dry_run_reason=_TEXT_BACKEND_NOT_LAUNCHED,
+        flags=re.MULTILINE,
+    ),
+    _signature(
+        "text_backend_kv_buffer",
+        r"^\S+:\s+(?P<device>\S+) KV buffer size =\s+(?P<mebibytes>[\d.]+) MiB",
+        emitter="koboldcpp.llama.cpp:llama_kv_cache",
+        sample="llama_kv_cache:      CUDA0 KV buffer size =   476.00 MiB",
+        dry_run_reason=_TEXT_BACKEND_NOT_LAUNCHED,
+        flags=re.MULTILINE,
+    ),
+    _signature(
+        "text_backend_compute_buffer",
+        r"^\S+:\s+(?P<device>\S+) compute buffer size =\s+(?P<mebibytes>[\d.]+) MiB",
+        emitter="koboldcpp.llama.cpp:sched_reserve",
+        sample="sched_reserve:      CUDA0 compute buffer size =   278.79 MiB",
+        dry_run_reason=_TEXT_BACKEND_NOT_LAUNCHED,
+        flags=re.MULTILINE,
     ),
 ]
 

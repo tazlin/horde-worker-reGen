@@ -159,7 +159,7 @@ def _download_impact(snapshot: WorkerStateSnapshot) -> str:
     first run, when nothing can be served until the downloads land, it turns a long wait into an apparent
     fault, so the claim is made only when a loaded model backs it.
     """
-    serving = any(process.loaded_horde_model_name for process in snapshot.processes)
+    serving = any(process.loaded_horde_model_name for process in snapshot.processes if not process.is_external)
     if serving:
         return "Models download in the background; the worker keeps contributing meanwhile."
     return "The worker starts contributing once the first of these finishes. Leaving it running is enough."
@@ -260,8 +260,9 @@ class LivenessIndicator:
             self._last_child_heartbeat = None
             self._last_timestamp = None
             return
-        steps = sum(process.heartbeats_inference_steps for process in snapshot.processes)
-        child_heartbeat = max((process.last_heartbeat_timestamp for process in snapshot.processes), default=0.0)
+        children = [process for process in snapshot.processes if not process.is_external]
+        steps = sum(process.heartbeats_inference_steps for process in children)
+        child_heartbeat = max((process.last_heartbeat_timestamp for process in children), default=0.0)
         working = snapshot.jobs_in_progress > 0
         sampled = self._last_steps is not None and steps != self._last_steps
         child_reported = self._last_child_heartbeat is not None and child_heartbeat != self._last_child_heartbeat
@@ -379,9 +380,10 @@ def _process_restarts(snapshot: WorkerStateSnapshot, _report: HealthReport) -> s
 def _waiting_on_a_model(snapshot: WorkerStateSnapshot, _report: HealthReport) -> str | None:
     """Explain a queue that nothing is working on while a program is still getting a model ready."""
     pending = snapshot.jobs_pending_inference
-    if pending <= 0 or any(process.is_busy for process in snapshot.processes):
+    inference_processes = [process for process in snapshot.processes if not process.is_external]
+    if pending <= 0 or any(process.is_busy for process in inference_processes):
         return None
-    if not any(process.last_process_state in _MODEL_LOADING_STATES for process in snapshot.processes):
+    if not any(process.last_process_state in _MODEL_LOADING_STATES for process in inference_processes):
         return None
     return (
         f"Requests are queued ({pending:,} waiting to start) and no program is holding one yet, because a "
@@ -1069,7 +1071,11 @@ class SimpleModelStatusView(VerticalScroll):
     def _render_state(snapshot: WorkerStateSnapshot) -> RenderableType:
         """Summarise which configured models are loaded, on disk, fetching, or failed."""
         loaded = sorted(
-            {process.loaded_horde_model_name for process in snapshot.processes if process.loaded_horde_model_name},
+            {
+                process.loaded_horde_model_name
+                for process in snapshot.processes
+                if process.loaded_horde_model_name and not process.is_external
+            },
         )
         configured = list(snapshot.active_models)
         activity = snapshot.downloads

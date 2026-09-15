@@ -5,11 +5,13 @@ from __future__ import annotations
 from rich.console import Console
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    TEXT_BACKEND_PROCESS_ID,
     PreloadAdmissionSnapshot,
     ProcessSnapshot,
     RamGovernanceSnapshot,
     ResidentComponentEntry,
     SchedulingGovernanceSnapshot,
+    TextBackendDetail,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -200,3 +202,72 @@ def test_governance_strip_surfaces_scheduler_decisions() -> None:
     assert "p2" in text
     assert "preload concurrency gate" in text
     assert "draining p2" in text
+
+
+def _text_backend_process(*, detail: bool = True) -> ProcessSnapshot:
+    """The supervised text backend's row, optionally without the typed detail a supervisor attaches."""
+    return ProcessSnapshot(
+        process_id=TEXT_BACKEND_PROCESS_ID,
+        process_type="TEXT_BACKEND",
+        device_index=None,
+        last_process_state="SERVING",
+        is_alive=True,
+        is_busy=False,
+        is_external=True,
+        os_pid=48213,
+        display_state="ready",
+        loaded_horde_model_name="Llama-3.2-3B",
+        text_backend=TextBackendDetail(
+            kind="koboldcpp",
+            model_name="Llama-3.2-3B",
+            port=5001,
+            context_length=4352,
+            max_length=512,
+            launch_count=2,
+            footprint_mb=2700,
+            tokens_per_second=31.5,
+            model_buffer_mb=2227,
+            kv_buffer_mb=476,
+            compute_buffer_mb=295,
+        )
+        if detail
+        else None,
+    )
+
+
+def test_external_panel_shows_the_backend_detail_as_labelled_lines() -> None:
+    """The text backend's panel states its model, caps, footprint and loader buffers."""
+    text = _render(LiveView()._render_process_panel(_text_backend_process()))
+
+    assert "Text Backend" in text
+    assert "Llama-3.2-3B" in text
+    assert "koboldcpp on port 5001" in text
+    assert "48213" in text
+    assert "4,352 tokens" in text
+    assert "31.5 tokens/s" in text
+    assert "measured at launch" in text
+    assert "model" in text
+    assert "Sampling" not in text
+
+
+def test_external_panel_without_detail_renders_its_state_alone() -> None:
+    """A supervised row whose detail has not arrived still renders, showing only its state."""
+    text = _render(LiveView()._render_process_panel(_text_backend_process(detail=False)))
+
+    assert "ready" in text
+    assert "Buffers" not in text
+
+
+def test_live_view_renders_inference_slots_and_the_backend_together() -> None:
+    """A snapshot of two slots and one supervised backend produces a panel for each."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_process("INFERENCE_STARTING"), _process("WAITING_FOR_JOB"), _text_backend_process()],
+    )
+
+    panels = [LiveView()._render_process_panel(process) for process in snapshot.processes]
+    text = "".join(_render(panel) for panel in panels)
+
+    assert len(panels) == 3
+    assert "Text Backend" in text
+    assert text.count("Deliberate") == 2

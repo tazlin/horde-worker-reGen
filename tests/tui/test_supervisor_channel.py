@@ -13,6 +13,7 @@ import pytest
 from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
+    TEXT_BACKEND_PROCESS_ID,
     DisaggStageRow,
     ModelPoolBenchRow,
     ModelPoolSeatReadiness,
@@ -28,6 +29,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SupervisorChannel,
     SupervisorCommand,
     SupervisorControlMessage,
+    TextBackendDetail,
     WorkerConfigSummary,
     WorkerLivenessFrame,
     WorkerStateSnapshot,
@@ -58,7 +60,7 @@ def test_protocol_version_pinned() -> None:
     The TUI refuses mismatched connections, so an incompatible snapshot/command change must bump
     ``SUPERVISOR_PROTOCOL_VERSION`` and update this literal in the same change.
     """
-    assert SUPERVISOR_PROTOCOL_VERSION == 24
+    assert SUPERVISOR_PROTOCOL_VERSION == 25
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:
@@ -651,3 +653,69 @@ def test_model_pool_snapshot_survives_json_roundtrip() -> None:
     assert restored.model_pool.free_resident_hits == 0
     assert restored.model_pool.seats[0].readiness is ModelPoolSeatReadiness.RESIDENT
     assert restored.model_pool.seats[0].resident_process_ids == [2]
+
+
+def _external_process() -> ProcessSnapshot:
+    """The supervised text backend's row, as its supervisor projects it."""
+    return ProcessSnapshot(
+        process_id=TEXT_BACKEND_PROCESS_ID,
+        process_type="TEXT_BACKEND",
+        device_index=None,
+        last_process_state="SERVING",
+        is_alive=True,
+        is_busy=False,
+        is_external=True,
+        os_pid=48213,
+        display_state="ready",
+        loaded_horde_model_name="koboldcpp/Llama-3.2-3B",
+        text_backend=TextBackendDetail(
+            kind="koboldcpp",
+            model_name="koboldcpp/Llama-3.2-3B",
+            port=5001,
+            context_length=4352,
+            max_length=512,
+            launch_count=2,
+            footprint_mb=2700,
+            ready_since=1000.0,
+            last_health_ok_at=1000.0,
+            tokens_per_second=31.5,
+            model_buffer_mb=2227,
+            kv_buffer_mb=476,
+            compute_buffer_mb=295,
+        ),
+    )
+
+
+def test_an_external_process_row_survives_the_json_roundtrip() -> None:
+    """A supervised external process reaches the supervisor with its typed detail intact."""
+    snapshot = _make_snapshot()
+    snapshot.processes.append(_external_process())
+
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+
+    external = restored.processes[1]
+    assert external.is_external is True
+    assert external.os_pid == 48213
+    assert external.display_state == "ready"
+    assert external.device_index is None
+    assert external.text_backend is not None
+    assert external.text_backend.kind == "koboldcpp"
+    assert external.text_backend.context_length == 4352
+    assert external.text_backend.footprint_mb == 2700
+    assert external.text_backend.tokens_per_second == 31.5
+    assert (
+        external.text_backend.model_buffer_mb,
+        external.text_backend.kv_buffer_mb,
+        external.text_backend.compute_buffer_mb,
+    ) == (2227, 476, 295)
+
+
+def test_a_map_derived_row_is_never_external() -> None:
+    """An inference slot's row leaves the supervised-process fields at their defaults."""
+    restored = WorkerStateSnapshot.model_validate_json(_make_snapshot().model_dump_json())
+
+    inference = restored.processes[0]
+    assert inference.is_external is False
+    assert inference.text_backend is None
+    assert inference.display_state is None
+    assert inference.os_pid is None

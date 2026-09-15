@@ -58,7 +58,7 @@ defines the structured protocol over it:
   value carried as a plain string, so this module stays free of the scheduling package's import chain),
   which is what lets a recent-jobs row tell an image job, an alchemy form and a text generation apart.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 24) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 25) so a frontend can detect a mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate
@@ -69,6 +69,30 @@ defines the structured protocol over it:
   a later successful job pop proves the horde is sending work again. The worker-side
   maintenance latch follows the same rule: a real popped job clears the latch immediately
   and suppresses any stale worker-details `maintenance=True` cache until the poll catches up.
+
+### Supervised external processes in the process list
+
+Most `ProcessSnapshot` rows are projections of a `ProcessMap` entry, built by `from_process_info`. A row
+with `is_external` set comes from somewhere else: a program the worker launched and supervises but holds
+no pipe to, which produces its own row through the one-method
+[`SupervisedProcessSnapshotSource`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisedProcessSnapshotSource]
+protocol. The snapshot builder concatenates the map-derived rows with the supervised ones, so the process
+table, the Live tab and the native page each render one list and need no second data path. Today the only
+such process is the managed text backend.
+
+These processes stay out of the map deliberately. A map entry is a pipe-bearing child with torch allocator
+readings and an image-and-alchemy state vocabulary, and the map is walked untyped in many places (crash
+reaping, hung checks, the committed-VRAM ledger, per-card counts); an entry with none of those facts would
+be misread by each of them, and the alternative, splitting the map into children and supervised processes,
+was assessed at 25 to 40 files for one row. What an external process can honestly say instead rides on the
+row as typed detail: `os_pid`, a free-form `display_state` its supervisor writes, and a
+[`TextBackendDetail`][horde_worker_regen.process_management.ipc.supervisor_channel.TextBackendDetail] with
+the model, port, caps, launch count, measured VRAM footprint and load-time buffer sizes. `device_index` is
+`None` when the process runs on no card. Its `last_process_state` is its supervisor's own state name, kept
+disjoint from `HordeProcessState` so a reader that tests a state against an image-state set cannot match
+it, and every dashboard reader that reasons about inference lanes skips `is_external` rows outright. Their
+ids come from a reserved range (`SUPERVISED_PROCESS_ID_BASE`) that the map's slot ids and the download
+process's reserved id cannot reach.
 
 This mirrors the worker's own internal IPC (see
 [IPC and Messaging](ipc_and_messaging.md)) and is the structured upgrade of the

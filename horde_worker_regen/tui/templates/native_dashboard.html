@@ -576,9 +576,15 @@
           addProgress(main, process.progress_percent);
           const meta = document.createElement("span");
           meta.className = "row-meta";
-          const vram = process.vram_total_mb ? `${(process.vram_used_mb / 1024).toFixed(1)}/${(process.vram_total_mb / 1024).toFixed(0)} GB` : `${formatNumber(process.vram_used_mb)} MB`;
-          const heartbeat = process.heartbeat_age_seconds === null ? "" : ` · ${Math.round(process.heartbeat_age_seconds)}s`;
-          meta.textContent = `GPU ${process.device_index} · ${vram}${heartbeat}`;
+          // An external program reports a measured footprint rather than an allocator reading, and its
+          // freshness is the age of its last health answer, so its meta line is built from those instead.
+          const card = process.device_index === null ? "" : `GPU ${process.device_index} · `;
+          const vram = process.is_external
+            ? (process.footprint_mb === null ? "VRAM unmeasured" : `${formatNumber(process.footprint_mb)} MB measured`)
+            : (process.vram_total_mb ? `${(process.vram_used_mb / 1024).toFixed(1)}/${(process.vram_total_mb / 1024).toFixed(0)} GB` : `${formatNumber(process.vram_used_mb)} MB`);
+          const age = process.is_external ? process.health_age_seconds : process.heartbeat_age_seconds;
+          const heartbeat = age === null || age === undefined ? "" : ` · ${Math.round(age)}s`;
+          meta.textContent = `${card}${vram}${heartbeat}`;
           row.append(kind, main, meta);
           processes.appendChild(row);
         });

@@ -2308,7 +2308,7 @@ class OverviewView(Vertical):
         pending_models = frozenset(entry.model for entry in snapshot.pending_jobs if entry.model)
         # Group each card's slots together (then by slot id), so the GPU column reads as contiguous blocks on
         # a multi-GPU host; single-GPU is unaffected (every slot is device 0, leaving slot-id order intact).
-        for process in sorted(snapshot.processes, key=lambda p: (p.device_index, p.process_id)):
+        for process in sorted(snapshot.processes, key=_process_row_order):
             row = _ProcessRow(process=process, now=now, residency=residency, pending_models=pending_models)
             table.add_row(*[spec.render(row) for spec in layout.columns])
 
@@ -2331,6 +2331,8 @@ class OverviewView(Vertical):
         raw state would otherwise be ``WAITING_FOR_JOB`` for the first three.
         """
         process = row.process
+        if process.is_external:
+            return OverviewView._external_state_cell(process)
         temperature = classify_process_temperature(
             state=process.last_process_state,
             loaded_model=process.loaded_horde_model_name,
@@ -2353,13 +2355,37 @@ class OverviewView(Vertical):
         return cell
 
     @staticmethod
+    def _external_state_cell(process: ProcessSnapshot) -> Text:
+        """The State cell for a supervised external process: its own label, plus its rate when generating.
+
+        An external process reports no temperature and no sampling steps, so the label its supervisor
+        wrote is the whole of what the column can say. The generation rate rides along here because the
+        process table carries no throughput column of its own.
+        """
+        label = process.display_state or process.last_process_state.replace("_", " ").lower()
+        detail = process.text_backend
+        if detail is not None and detail.tokens_per_second is not None:
+            label = f"{label} · {detail.tokens_per_second:.0f} tok/s"
+        return Text(label, style=_EXTERNAL_STATE_STYLES.get(process.last_process_state, "yellow"))
+
+    @staticmethod
     def _temperature_style(temperature: ProcessTemperature) -> str:
         """Map a process temperature to a display colour (hot=active green, cold=dim grey)."""
         return temperature_colour(temperature)
 
     @staticmethod
     def _vram_cell(process: ProcessSnapshot) -> str:
-        """The GPU VRAM cell: used / total when total is known, else just the used figure."""
+        """The GPU VRAM cell: used / total when total is known, else just the used figure.
+
+        An external process has no torch allocator to read, so its cell is the footprint the worker
+        measured across its launch, marked as such: the two figures are not comparable and a bare number
+        in this column would read as one more allocator reading.
+        """
+        if process.is_external:
+            detail = process.text_backend
+            if detail is None or detail.footprint_mb is None:
+                return "-"
+            return f"{human_mb(detail.footprint_mb)} measured"
         if process.total_vram_mb:
             return f"{human_mb(process.vram_usage_mb)} / {human_mb(process.total_vram_mb)}"
         return human_mb(process.vram_usage_mb)
@@ -2402,6 +2428,22 @@ class OverviewView(Vertical):
             return Text("-", style="grey62")
         colour = "green" if age < 5 else ("yellow" if age < 15 else "red")
         return Text(f"{age:.1f}s", style=colour)
+
+    @staticmethod
+    def _external_heartbeat_cell(row: _ProcessRow) -> Text:
+        """Render how long ago an external process last answered a health probe.
+
+        Uncoloured by the staleness thresholds above: a text backend is asked whether it is ready while it
+        starts and not again while it serves, so a growing age here is the expected reading rather than a
+        process falling silent.
+        """
+        process = row.process
+        if not process.is_alive:
+            return Text("not alive", style="bold red")
+        detail = process.text_backend
+        if detail is None or detail.last_health_ok_at is None:
+            return Text("-", style="grey62")
+        return Text(human_duration(row.now - detail.last_health_ok_at), style="grey62")
 
     @staticmethod
     def _state_style(state: str) -> str:
@@ -2560,6 +2602,60 @@ def _heartbeat_age(row: _ProcessRow) -> float | None:
     return row.now - timestamp if timestamp else None
 
 
+_EXTERNAL_STATE_STYLES = {
+    "SERVING": "green",
+    "LAUNCHING": "yellow",
+    "BACKING_OFF": "red",
+    "STOPPED": "grey62",
+}
+"""Colour per supervised-backend state, keyed by the supervisor's own state names."""
+
+
+def _process_id_cell(row: _ProcessRow) -> str:
+    """The ID cell: a slot's process id, or an external process's OS pid, which is what identifies it."""
+    if row.process.is_external and row.process.os_pid is not None:
+        return str(row.process.os_pid)
+    return str(row.process.process_id)
+
+
+def _process_gpu_cell(row: _ProcessRow) -> str:
+    """The GPU cell: the card the slot is pinned to, or a dash for a process running on no card."""
+    device_index = row.process.device_index
+    return "-" if device_index is None else str(device_index)
+
+
+def _process_baseline_cell(row: _ProcessRow) -> str:
+    """The Baseline cell: an image model's family, or a text backend's context size in its place.
+
+    Both answer the same question about the resident model in the column beside it - what kind of model it
+    is and how big the worker asked it to be - and the process table has no column of its own for context.
+    """
+    if row.process.is_external:
+        detail = row.process.text_backend
+        if detail is None or detail.context_length is None:
+            return "-"
+        tokens = detail.context_length
+        # Context sizes are quoted in binary thousands ("32k context"), and the column is eight cells wide.
+        return f"{tokens // 1024}k ctx" if tokens >= 10240 else f"{tokens} ctx"
+    return short_baseline(row.process.loaded_horde_model_baseline)
+
+
+def _process_heartbeat_cell(row: _ProcessRow) -> Text:
+    """The Heartbeat cell: a child's heartbeat freshness, or an external process's last health answer."""
+    if row.process.is_external:
+        return OverviewView._external_heartbeat_cell(row)
+    return OverviewView._heartbeat_cell(_heartbeat_age(row), row.process.is_alive)
+
+
+def _process_row_order(process: ProcessSnapshot) -> tuple[int, int, int]:
+    """Order the process table: a card's slots together, then the supervised external processes.
+
+    External rows go last and carry no card of their own to group by, so they are not interleaved with a
+    card's block; within each group the slot id keeps the order stable.
+    """
+    return (1 if process.is_external else 0, process.device_index or 0, process.process_id)
+
+
 _WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
     ColumnSpec("Order", DensityTier.NORMAL, lambda e: _queue_order_cell(e.queue_order), width=6, no_wrap=True),
     ColumnSpec("Age", DensityTier.WIDE, OverviewView._work_age_cell, justify="right", width=8),
@@ -2589,10 +2685,13 @@ Rows arrive in pop order, so ``Order`` leads: the column and the row order say t
 reader scanning down the table is following the order the worker will serve the jobs in."""
 
 _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
-    ColumnSpec("ID", DensityTier.CRITICAL, lambda r: str(r.process.process_id), justify="right", width=3),
-    ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: _process_type_label(r.process.process_type), width=9),
-    ColumnSpec("State", DensityTier.CRITICAL, OverviewView._process_state_cell, width=18, no_wrap=True),
-    ColumnSpec("GPU", DensityTier.NORMAL, lambda r: str(r.process.device_index), justify="right", width=4),
+    # The identity and state columns declare a minimum rather than a fixed width: a supervised external row
+    # puts an OS pid where a slot puts a one- or two-digit id and a longer label in the state cell, and a
+    # minimum lets Rich grow the column for it while the fit calculation still budgets the slot-sized width.
+    ColumnSpec("ID", DensityTier.CRITICAL, _process_id_cell, justify="right", min_width=3),
+    ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: _process_type_label(r.process.process_type), min_width=9),
+    ColumnSpec("State", DensityTier.CRITICAL, OverviewView._process_state_cell, min_width=18, no_wrap=True),
+    ColumnSpec("GPU", DensityTier.NORMAL, _process_gpu_cell, justify="right", width=4),
     ColumnSpec(
         "Resident model",
         DensityTier.NORMAL,
@@ -2601,13 +2700,7 @@ _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
         max_width=24,
         no_wrap=True,
     ),
-    ColumnSpec(
-        "Baseline",
-        DensityTier.NORMAL,
-        lambda r: short_baseline(r.process.loaded_horde_model_baseline),
-        width=8,
-        no_wrap=True,
-    ),
+    ColumnSpec("Baseline", DensityTier.NORMAL, _process_baseline_cell, width=8, no_wrap=True),
     ColumnSpec("Done", DensityTier.NORMAL, lambda r: f"{r.process.num_jobs_completed:,}", justify="right", width=5),
     ColumnSpec(
         "GPU VRAM",
@@ -2625,13 +2718,7 @@ _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
         width=9,
         no_wrap=True,
     ),
-    ColumnSpec(
-        "Heartbeat",
-        DensityTier.DETAILS,
-        lambda r: OverviewView._heartbeat_cell(_heartbeat_age(r), r.process.is_alive),
-        justify="right",
-        width=9,
-    ),
+    ColumnSpec("Heartbeat", DensityTier.DETAILS, _process_heartbeat_cell, justify="right", width=9),
     ColumnSpec(
         "HB type",
         DensityTier.DETAILS,

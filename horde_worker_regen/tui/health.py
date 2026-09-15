@@ -42,6 +42,12 @@ _DISK_FLOOR_BYTES = 20 * 1024**3
 _INFERENCE_STATES = frozenset(
     {"INFERENCE_PRIMED", "INFERENCE_STARTING", "POST_PROCESSING", "ALCHEMY_STARTING", "JOB_RECEIVED"},
 )
+"""States an inference lane is in while it holds work.
+
+Every check keyed on this set, and on the ready/loading sets below, reads only the snapshot's non-external
+rows: a supervised external program (the text backend) carries its own state vocabulary and its own card,
+so counting it here would report a lane serving, warming up or starved on evidence from a process that is
+none of those things."""
 _GPU_DUTY_LOW_PERCENT = 5
 """Duty below this, with a job in flight on the card, is the near-idle condition worth an operator's eye."""
 
@@ -267,7 +273,9 @@ def derive(
             checks,
             False,
         )
-    serving = any(process.last_process_state in _INFERENCE_STATES for process in snapshot.processes)
+    serving = any(
+        process.last_process_state in _INFERENCE_STATES for process in snapshot.processes if not process.is_external
+    )
     if serving:
         kudos = "" if snapshot.kudos_per_hour is None else f" · {snapshot.kudos_per_hour:,.0f} kudos/hr"
         return HealthReport(
@@ -327,7 +335,7 @@ def _stale_threshold(snapshot: WorkerStateSnapshot) -> float:
     Reads the *last* snapshot we have (possibly the stale one itself): if it shows any process mid
     download or load, a longer silence is expected and tolerated before declaring the worker stuck.
     """
-    if any(process.last_process_state in _LOADING_STATES for process in snapshot.processes):
+    if any(process.last_process_state in _LOADING_STATES for process in snapshot.processes if not process.is_external):
         return STALE_SNAPSHOT_DOWNLOAD_SECONDS
     return STALE_SNAPSHOT_SECONDS
 
@@ -405,16 +413,19 @@ def _maintenance_detail(
 
 def _is_warming_up(snapshot: WorkerStateSnapshot) -> bool:
     """True before any process has become ready/serving (startup, first model load)."""
-    if not snapshot.processes:
+    inference_processes = [process for process in snapshot.processes if not process.is_external]
+    if not inference_processes:
         return True
-    if any(process.last_process_state in (_READY_STATES | _INFERENCE_STATES) for process in snapshot.processes):
+    if any(process.last_process_state in (_READY_STATES | _INFERENCE_STATES) for process in inference_processes):
         return False
-    return any(process.last_process_state in _LOADING_STATES for process in snapshot.processes)
+    return any(process.last_process_state in _LOADING_STATES for process in inference_processes)
 
 
 def _warmup_detail(snapshot: WorkerStateSnapshot) -> tuple[str, str]:
     """Describe what the worker is doing while warming up (downloading/loading which model)."""
     for process in snapshot.processes:
+        if process.is_external:
+            continue
         model = process.loaded_horde_model_name or "models"
         if process.last_process_state == "DOWNLOADING_MODEL":
             return f"downloading {model}", "Fetching model weights. First-time downloads can be large."
@@ -581,7 +592,11 @@ def gpu_duty_low_cards(snapshot: WorkerStateSnapshot) -> list[int]:
     """
     duty_per_card = snapshot.gpu_utilization_mean_percent_per_card
     busy_cards = {
-        process.device_index for process in snapshot.processes if process.last_process_state in _INFERENCE_STATES
+        process.device_index
+        for process in snapshot.processes
+        if not process.is_external
+        and process.device_index is not None
+        and process.last_process_state in _INFERENCE_STATES
     }
     low: list[int] = []
     for device_index in sorted(busy_cards):

@@ -19,7 +19,11 @@ from typing import Protocol
 from aiohttp import web
 from pydantic import BaseModel, Field
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot, WorkLedgerStage
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    ProcessSnapshot,
+    WorkerStateSnapshot,
+    WorkLedgerStage,
+)
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
@@ -59,7 +63,7 @@ class NativeProcessState(BaseModel):
 
     process_id: int
     process_type: str
-    device_index: int
+    device_index: int | None = None
     state: str
     alive: bool
     busy: bool
@@ -70,6 +74,12 @@ class NativeProcessState(BaseModel):
     vram_used_mb: int = 0
     vram_total_mb: int = 0
     heartbeat_age_seconds: float | None = None
+    is_external: bool = False
+    """Whether this is a supervised external program rather than a child of the worker."""
+    footprint_mb: int | None = None
+    """An external process's measured VRAM footprint, which is not an allocator reading; None otherwise."""
+    health_age_seconds: float | None = None
+    """How long ago an external process last answered a health probe; None when it never has."""
 
 
 class NativeDashboardState(BaseModel):
@@ -221,19 +231,33 @@ def _active_job_states(snapshot: WorkerStateSnapshot) -> list[NativeJobState]:
     return jobs
 
 
+def _process_order(process: ProcessSnapshot) -> tuple[int, int, int]:
+    """Order the process rows: each card's slots together, then the supervised external programs."""
+    return (1 if process.is_external else 0, process.device_index or 0, process.process_id)
+
+
 def _process_states(snapshot: WorkerStateSnapshot) -> list[NativeProcessState]:
     """Project the process table into compact semantic rows suitable for both native view densities."""
     states: list[NativeProcessState] = []
-    for process in sorted(snapshot.processes, key=lambda item: (item.device_index, item.process_id)):
+    for process in sorted(snapshot.processes, key=_process_order):
         heartbeat_age = None
         if process.last_heartbeat_timestamp:
             heartbeat_age = max(0.0, snapshot.timestamp - process.last_heartbeat_timestamp)
+        backend = process.text_backend
+        health_age = None
+        if backend is not None and backend.last_health_ok_at is not None:
+            health_age = max(0.0, snapshot.timestamp - backend.last_health_ok_at)
         states.append(
             NativeProcessState(
-                process_id=process.process_id,
+                process_id=process.os_pid
+                if process.is_external and process.os_pid is not None
+                else process.process_id,
                 process_type=process.process_type,
                 device_index=process.device_index,
-                state=process.last_process_state,
+                state=process.display_state or process.last_process_state,
+                is_external=process.is_external,
+                footprint_mb=backend.footprint_mb if backend is not None else None,
+                health_age_seconds=health_age,
                 alive=process.is_alive,
                 busy=process.is_busy,
                 model=process.loaded_horde_model_name,

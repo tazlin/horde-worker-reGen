@@ -6,7 +6,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    TEXT_BACKEND_PROCESS_ID,
     ProcessSnapshot,
+    TextBackendDetail,
     WorkerConfigSummary,
     WorkerStateSnapshot,
     WorkLedgerEntry,
@@ -257,3 +259,51 @@ async def test_native_http_handlers_serve_state_and_validate_actions() -> None:
         assert unknown.status == 400
     finally:
         await client.close()
+
+
+def test_native_process_rows_carry_the_supervised_text_backend() -> None:
+    """The native page's process list includes the backend, with its pid, state and measured footprint."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        timestamp=2000.0,
+        processes=[
+            ProcessSnapshot(
+                process_id=0,
+                process_type="INFERENCE",
+                last_process_state="INFERENCE_STARTING",
+                is_alive=True,
+                is_busy=True,
+            ),
+            ProcessSnapshot(
+                process_id=TEXT_BACKEND_PROCESS_ID,
+                process_type="TEXT_BACKEND",
+                device_index=None,
+                last_process_state="SERVING",
+                is_alive=True,
+                is_busy=False,
+                is_external=True,
+                os_pid=48213,
+                display_state="ready",
+                loaded_horde_model_name="Llama-3.2-3B",
+                text_backend=TextBackendDetail(
+                    kind="koboldcpp",
+                    model_name="Llama-3.2-3B",
+                    port=5001,
+                    footprint_mb=2700,
+                    last_health_ok_at=1958.0,
+                ),
+            ),
+        ],
+    )
+
+    rows = build_native_dashboard_state(_NativeSupervisorDouble(snapshot)).process_states
+
+    assert [row.is_external for row in rows] == [False, True]
+    backend_row = rows[1]
+    assert backend_row.process_id == 48213
+    assert backend_row.process_type == "TEXT_BACKEND"
+    assert backend_row.device_index is None
+    assert backend_row.state == "ready"
+    assert backend_row.model == "Llama-3.2-3B"
+    assert backend_row.footprint_mb == 2700
+    assert backend_row.health_age_seconds == 42.0

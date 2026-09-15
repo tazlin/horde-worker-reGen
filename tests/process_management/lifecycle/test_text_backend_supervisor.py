@@ -19,6 +19,7 @@ import psutil
 import pytest
 from horde_model_reference.text_backend_names import TEXT_BACKENDS
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import TEXT_BACKEND_PROCESS_ID
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import (
@@ -27,13 +28,16 @@ from horde_worker_regen.process_management.lifecycle.text_backend_supervisor imp
     TextBackendSupervisor,
     TextBackendSupervisorTimings,
     default_launch_process,
+    parse_backend_buffer_sizes,
     port_is_free,
 )
 from horde_worker_regen.text_backends import (
     KoboldApiTextBackend,
     TextBackendDescription,
+    TextBackendError,
     TextBackendLaunchSettings,
     TextBackendLaunchSpec,
+    TextBackendUnavailable,
     TextGenerationResult,
     build_launch_spec,
 )
@@ -95,11 +99,25 @@ class FakeLaunched:
 class StubBackend:
     """A `TextBackend` whose `ready()` answers follow a script, then a default; nothing else is exercised."""
 
-    def __init__(self, ready_results: list[bool], *, default_ready: bool = True) -> None:
+    def __init__(
+        self,
+        ready_results: list[bool],
+        *,
+        default_ready: bool = True,
+        description: TextBackendDescription | None = None,
+        describe_error: TextBackendError | None = None,
+    ) -> None:
         """Script the first answers of `ready()`; later calls answer ``default_ready``."""
         self._ready_results = list(ready_results)
         self.default_ready = default_ready
         self.ready_calls = 0
+        self.describe_calls = 0
+        self._description = description or TextBackendDescription(
+            model_name="stub",
+            max_context_length=1,
+            max_length=1,
+        )
+        self._describe_error = describe_error
 
     async def ready(self, *, deadline_seconds: float) -> bool:
         """Return the next scripted answer, or the default once the script is spent."""
@@ -109,8 +127,11 @@ class StubBackend:
         return self.default_ready
 
     async def describe(self) -> TextBackendDescription:
-        """Return a placeholder description."""
-        return TextBackendDescription(model_name="stub", max_context_length=1, max_length=1)
+        """Return the scripted description, or raise the scripted failure."""
+        self.describe_calls += 1
+        if self._describe_error is not None:
+            raise self._describe_error
+        return self._description
 
     async def generate(
         self,
@@ -348,6 +369,259 @@ async def test_stop_during_backoff_ends_the_run_without_another_launch(tmp_path:
     assert supervisor.state is TextBackendState.STOPPED
     assert supervisor.launch_count == 1
     assert len(launcher.specs) == 1
+
+
+BACKEND_LOAD_LOG = """load_tensors: offloaded 29/29 layers to GPU
+load_tensors:        CUDA0 model buffer size =  1918.35 MiB
+load_tensors:    CUDA_Host model buffer size =   308.23 MiB
+llama_context:  CUDA_Host  output buffer size =     1.47 MiB
+llama_kv_cache:      CUDA0 KV buffer size =   476.00 MiB
+sched_reserve:      CUDA0 compute buffer size =   278.79 MiB
+sched_reserve:  CUDA_Host compute buffer size =    16.30 MiB
+Load Text Model OK: True
+"""
+"""The load-time lines koboldcpp prints, copied from a real backend log (one line per device, plus the
+``output buffer size`` line that no buffer pattern may claim)."""
+
+
+class LoggingLauncher:
+    """Hands out scripted handles and appends each launch's own backend output to the spec's log."""
+
+    def __init__(self, handles: list[FakeLaunched], outputs: list[str]) -> None:
+        """Queue the handles and the text each successive launch writes before it becomes ready."""
+        self._handles = list(handles)
+        self._outputs = list(outputs)
+        self.specs: list[TextBackendLaunchSpec] = []
+
+    def __call__(self, spec: TextBackendLaunchSpec) -> LaunchedProcess:
+        """Append this launch's output as the real backend would, then return the next handle."""
+        self.specs.append(spec)
+        spec.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with spec.log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(self._outputs.pop(0))
+        return self._handles.pop(0)
+
+
+def test_buffer_sizes_are_summed_per_kind_across_device_lines() -> None:
+    """Each buffer kind sums its device lines, and the output-buffer line belongs to none of them."""
+    sizes = parse_backend_buffer_sizes(BACKEND_LOAD_LOG)
+
+    assert sizes.model_mebibytes == 2227
+    assert sizes.kv_mebibytes == 476
+    assert sizes.compute_mebibytes == 295
+
+
+def test_buffer_sizes_are_none_when_the_backend_printed_none() -> None:
+    """A backend that prints no buffer lines leaves every size unset rather than reporting zero."""
+    sizes = parse_backend_buffer_sizes("Load Text Model OK: True\n")
+
+    assert sizes.model_mebibytes is None
+    assert sizes.kv_mebibytes is None
+    assert sizes.compute_mebibytes is None
+
+
+async def test_the_stopped_row_names_the_backend_without_claiming_a_process(tmp_path: Path) -> None:
+    """Before anything is launched the row exists, is external, is not alive, and carries no pid."""
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(free_port(), tmp_path),
+        backend=StubBackend(ready_results=[True]),
+        backend_kind=TEXT_BACKENDS.koboldcpp,
+        launch_process=Launcher([FakeLaunched(pid=61)]),
+        timings=FAST,
+    )
+
+    row = supervisor.to_process_snapshot()
+
+    assert row.is_external is True
+    assert row.process_id == TEXT_BACKEND_PROCESS_ID
+    assert row.process_type == HordeProcessType.TEXT_BACKEND.name
+    assert row.is_alive is False
+    assert row.os_pid is None
+    assert row.display_state == "stopped"
+    assert row.text_backend is not None
+    assert row.text_backend.kind == str(TEXT_BACKENDS.koboldcpp)
+    assert row.text_backend.launch_count == 0
+    assert row.text_backend.model_name is None
+
+
+async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_sizes(tmp_path: Path) -> None:
+    """A serving backend's row states what it loaded, what it cost, and what its loader reported."""
+    handle = FakeLaunched(pid=71)
+    backend = StubBackend(
+        ready_results=[True],
+        description=TextBackendDescription(
+            model_name="koboldcpp/Llama-3.2-3B",
+            max_context_length=4352,
+            max_length=512,
+        ),
+    )
+    readings = iter([(10000.0, 16000.0), (7300.0, 16000.0)])
+    port = free_port()
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(port, tmp_path),
+        backend=backend,
+        backend_kind=TEXT_BACKENDS.koboldcpp,
+        launch_process=LoggingLauncher([handle], [BACKEND_LOAD_LOG]),
+        read_device_free_total_mb=lambda device_index: next(readings),
+        timings=FAST,
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.is_serving)
+    row = supervisor.to_process_snapshot()
+
+    assert row.display_state == "ready"
+    assert row.is_alive is True
+    assert row.os_pid == 71
+    assert row.device_index == 0
+    assert row.loaded_horde_model_name == "koboldcpp/Llama-3.2-3B"
+    detail = row.text_backend
+    assert detail is not None
+    assert detail.model_name == "koboldcpp/Llama-3.2-3B"
+    assert detail.context_length == 4352
+    assert detail.max_length == 512
+    assert detail.port == port
+    assert detail.launch_count == 1
+    assert detail.footprint_mb == 2700
+    assert detail.ready_since is not None
+    assert detail.last_health_ok_at == detail.ready_since
+    assert detail.relaunch_backoff_seconds is None
+    assert (detail.model_buffer_mb, detail.kv_buffer_mb, detail.compute_buffer_mb) == (2227, 476, 295)
+    assert backend.describe_calls == 1
+
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_the_launching_row_reports_launching_before_readiness(tmp_path: Path) -> None:
+    """A backend still loading its model reads as launching, with no description and no buffer sizes."""
+    starting = StubBackend(ready_results=[], default_ready=False)
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(free_port(), tmp_path),
+        backend=starting,
+        launch_process=LoggingLauncher([FakeLaunched(pid=81)], [BACKEND_LOAD_LOG]),
+        timings=FAST,
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.state is TextBackendState.LAUNCHING and supervisor.launch_count == 1)
+    row = supervisor.to_process_snapshot()
+
+    assert row.display_state == "launching"
+    assert row.is_alive is True
+    assert row.text_backend is not None
+    assert row.text_backend.model_name is None
+    assert row.text_backend.model_buffer_mb is None
+    assert starting.describe_calls == 0
+
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_the_backing_off_row_counts_down_to_the_relaunch(tmp_path: Path) -> None:
+    """A backend waiting to be relaunched says how long is left, and holds no detail from the dead launch."""
+    exited = FakeLaunched(pid=91)
+    exited.exit(1)
+    slow_backoff = FAST.model_copy(update={"relaunch_backoff": (30.0,)})
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(free_port(), tmp_path),
+        backend=StubBackend(ready_results=[True]),
+        launch_process=LoggingLauncher([exited, FakeLaunched(pid=92)], [BACKEND_LOAD_LOG, BACKEND_LOAD_LOG]),
+        timings=slow_backoff,
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.state is TextBackendState.BACKING_OFF)
+    row = supervisor.to_process_snapshot()
+
+    assert row.is_alive is False
+    assert row.display_state is not None
+    assert row.display_state.startswith("relaunching in ")
+    assert row.text_backend is not None
+    assert row.text_backend.relaunch_backoff_seconds is not None
+    assert 0.0 < row.text_backend.relaunch_backoff_seconds <= 30.0
+    assert row.text_backend.model_name is None
+    assert row.text_backend.ready_since is None
+
+    await supervisor.stop()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_each_launch_describes_once_and_reads_only_its_own_output(tmp_path: Path) -> None:
+    """A relaunch re-asks the backend and parses the second launch's lines, not the log's whole history."""
+    first = FakeLaunched(pid=101)
+    second = FakeLaunched(pid=102)
+    relaunched_log = BACKEND_LOAD_LOG.replace("1918.35", "918.35").replace("476.00", "376.00")
+    backend = StubBackend(ready_results=[True, True])
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(free_port(), tmp_path),
+        backend=backend,
+        launch_process=LoggingLauncher([first, second], [BACKEND_LOAD_LOG, relaunched_log]),
+        timings=FAST,
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.is_serving)
+    assert backend.describe_calls == 1
+    first.exit(3)
+    await wait_until(lambda: supervisor.launch_count == 2 and supervisor.is_serving)
+    row = supervisor.to_process_snapshot()
+
+    assert backend.describe_calls == 2
+    assert row.os_pid == 102
+    detail = row.text_backend
+    assert detail is not None
+    assert detail.launch_count == 2
+    assert (detail.model_buffer_mb, detail.kv_buffer_mb) == (1227, 376)
+
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_a_backend_that_will_not_describe_itself_still_serves(tmp_path: Path) -> None:
+    """A refused description leaves the row's model fields unset without holding up the readiness gate."""
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(free_port(), tmp_path),
+        backend=StubBackend(ready_results=[True], describe_error=TextBackendUnavailable("no answer")),
+        launch_process=Launcher([FakeLaunched(pid=111)]),
+        timings=FAST,
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.is_serving)
+    row = supervisor.to_process_snapshot()
+
+    assert row.display_state == "ready"
+    assert row.loaded_horde_model_name is None
+    assert row.text_backend is not None
+    assert row.text_backend.model_name is None
+    assert row.text_backend.context_length is None
+
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_a_backend_on_no_card_reports_no_device_index(tmp_path: Path) -> None:
+    """A CPU-only backend's row leaves the card unset instead of being charged to card 0."""
+    supervisor = TextBackendSupervisor(
+        launch_spec=spec_on(free_port(), tmp_path, device_index=None),
+        backend=StubBackend(ready_results=[True]),
+        launch_process=Launcher([FakeLaunched(pid=121)]),
+        timings=FAST,
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.is_serving)
+    row = supervisor.to_process_snapshot()
+
+    assert row.device_index is None
+    assert row.text_backend is not None
+    assert row.text_backend.footprint_mb is None
+
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
 
 
 @pytest.mark.slow

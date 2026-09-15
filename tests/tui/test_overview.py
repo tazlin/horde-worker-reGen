@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import time
+
 from rich.console import Console
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    TEXT_BACKEND_PROCESS_ID,
     CardSnapshot,
     CurrentDownloadStatus,
     DownloadPhase,
@@ -24,6 +27,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     StatsHistoryBackfill,
     StatsSample,
     SystemMemorySnapshot,
+    TextBackendDetail,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
@@ -1300,3 +1304,64 @@ def test_overview_layout_registry_covers_mode_managed_nodes() -> None:
     for element in OVERVIEW_ELEMENTS:
         assert element.node_id.startswith("#overview-")
         assert element_for_node(element.node_id) is element
+
+
+def _text_backend_process(*, detail: bool = True) -> ProcessSnapshot:
+    """The supervised text backend's row, optionally without the typed detail a supervisor attaches."""
+    return ProcessSnapshot(
+        process_id=TEXT_BACKEND_PROCESS_ID,
+        process_type="TEXT_BACKEND",
+        device_index=None,
+        last_process_state="SERVING",
+        is_alive=True,
+        is_busy=False,
+        is_external=True,
+        os_pid=48213,
+        display_state="ready",
+        loaded_horde_model_name="Llama-3.2-3B",
+        text_backend=TextBackendDetail(
+            kind="koboldcpp",
+            model_name="Llama-3.2-3B",
+            port=5001,
+            context_length=4352,
+            max_length=512,
+            launch_count=1,
+            footprint_mb=2700,
+            last_health_ok_at=time.time() - 42.0,
+            tokens_per_second=31.5,
+        )
+        if detail
+        else None,
+    )
+
+
+def test_process_table_renders_the_text_backend_beside_the_inference_slots() -> None:
+    """Two inference slots and one supervised backend render three rows, the backend's cells its own."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process(), _busy_process(), _text_backend_process()],
+    )
+
+    text = _render(OverviewView()._render_process_table(snapshot, detailed=True, available_width=200), width=200)
+
+    assert text.count("AlbedoBase XL") == 2
+    assert "Text Backend" in text
+    assert "48213" in text
+    assert "ready · 32 tok/s" in text
+    assert "Llama-3.2-3B" in text
+    assert "measured" in text
+    assert "4352 ctx" in text
+    assert "42s" in text
+
+
+def test_process_table_renders_an_external_row_without_detail() -> None:
+    """A supervised row whose detail has not arrived renders dashes rather than raising."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process(), _text_backend_process(detail=False)],
+    )
+
+    text = _render(OverviewView()._render_process_table(snapshot, detailed=True, available_width=200), width=200)
+
+    assert "Text Backend" in text
+    assert "ready" in text

@@ -118,6 +118,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SamplerSummary,
     SchedulingGovernanceSnapshot,
     StatsSample,
+    SupervisedProcessSnapshotSource,
     SupervisorChannel,
     SupervisorCommand,
     SupervisorControlMessage,
@@ -7745,12 +7746,25 @@ class HordeWorkerProcessManager:
             for entry in self._disaggregation_orchestrator.stage_snapshot()
         ]
 
+    def _supervised_snapshot_sources(self) -> list[SupervisedProcessSnapshotSource]:
+        """Return the external processes the worker supervises that project themselves as a process row.
+
+        These are programs the worker launches but holds no pipe to, so they are deliberately absent from
+        ``ProcessMap``; the dashboard sees them only through this list. Today that is the managed text
+        backend, and only once the text flow has registered one.
+        """
+        text_backend_supervisor = self._text_backend_supervisor
+        return [] if text_backend_supervisor is None else [text_backend_supervisor]
+
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
         import horde_worker_regen
 
         bridge_data = self.bridge_data
-        processes = [ProcessSnapshot.from_process_info(info) for info in self._process_map.values()]
+        processes = [
+            *(ProcessSnapshot.from_process_info(info) for info in self._process_map.values()),
+            *(source.to_process_snapshot() for source in self._supervised_snapshot_sources()),
+        ]
         active_models = sorted(
             {info.loaded_horde_model_name for info in self._process_map.values() if info.loaded_horde_model_name},
         )
@@ -8391,6 +8405,7 @@ class HordeWorkerProcessManager:
         supervisor = TextBackendSupervisor(
             launch_spec=launch_spec,
             backend=self._text_backend_for(kind),
+            backend_kind=kind,
             owned_registry=self._owned_registry,
             read_device_free_total_mb=self._read_device_free_total_mb,
         )

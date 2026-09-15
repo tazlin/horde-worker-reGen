@@ -15,6 +15,14 @@ and treats every backend the same way.
   process id in the owned-PID registry so a crashed worker's next run can reap it.
 - :func:`default_launch_process`: starts the spec's command with output appended to its log file.
 - :func:`port_is_free`: the pre-launch check that nothing still holds the backend's port.
+- :func:`parse_backend_buffer_sizes` and :class:`TextBackendBufferSizes`: the load-time buffer figures a
+  llama.cpp-based backend prints once, read out of the log it writes.
+
+The supervisor is also the backend's row on the dashboard. `to_process_snapshot()` satisfies
+[`SupervisedProcessSnapshotSource`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisedProcessSnapshotSource],
+so the snapshot builder can put the backend in the process table, the Live tab and the native page beside
+the worker's own children without it entering `ProcessMap`, whose entries are pipe-bearing children with
+torch allocator readings and an image state vocabulary a text row has none of.
 
 Two process facts are handled generically because a backend may exhibit either. A launched program may run
 the real server as a child of the launched process (koboldcpp does: it is a PyInstaller one-file binary
@@ -40,16 +48,24 @@ import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from enum import auto
+from pathlib import Path
 from typing import Protocol
 
 import psutil
+from horde_model_reference.text_backend_names import TEXT_BACKENDS
 from loguru import logger
 from pydantic import BaseModel, ConfigDict
 from strenum import StrEnum
 
+from horde_worker_regen.analysis.log_signatures import pattern_for
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    TEXT_BACKEND_PROCESS_ID,
+    ProcessSnapshot,
+    TextBackendDetail,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
-from horde_worker_regen.text_backends import TextBackend
+from horde_worker_regen.text_backends import TextBackend, TextBackendDescription, TextBackendError
 from horde_worker_regen.text_backends.launch_spec import LOOPBACK_HOST, TextBackendLaunchSpec
 
 TEXT_BACKEND_LOG_FILE_NAME = "text_backend.log"
@@ -134,12 +150,63 @@ class TextBackendSupervisorTimings(BaseModel):
 
 
 class TextBackendState(StrEnum):
-    """Where the supervised backend is in its life."""
+    """Where the supervised backend is in its life.
+
+    Deliberately its own vocabulary rather than a borrowed ``HordeProcessState``: the supervised backend is
+    not in ``ProcessMap``, and a name disjoint from the image-and-alchemy states is what keeps every reader
+    that tests a state against one of those sets from matching a text row.
+    """
 
     STOPPED = auto()
     LAUNCHING = auto()
     SERVING = auto()
     BACKING_OFF = auto()
+
+
+class TextBackendBufferSizes(BaseModel):
+    """Represents the load-time buffer sizes a llama.cpp-based backend printed, summed over its devices.
+
+    Best-effort display detail: the backend exposes no runtime memory query, so these are read once per
+    launch out of the log it writes, and a backend that prints nothing (a quiet debug level, or a program
+    that is not llama.cpp-based) leaves every field None. Nothing here is used for admission or pricing;
+    the launch-time free-VRAM delta stays the footprint the worker reasons with.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    model_mebibytes: int | None = None
+    """Weights the loader placed in buffers."""
+    kv_mebibytes: int | None = None
+    """The KV cache the loader allocated for the configured context."""
+    compute_mebibytes: int | None = None
+    """The compute buffers the loader reserved for its worst-case graph."""
+
+
+def parse_backend_buffer_sizes(backend_output: str) -> TextBackendBufferSizes:
+    """Parse the model, KV and compute buffer sizes out of one launch's backend output.
+
+    A llama.cpp-based backend prints one line per device per buffer kind, so each kind is summed across the
+    lines that named it. A kind no line mentioned stays None rather than becoming a zero, which would read
+    as "the backend allocated nothing".
+
+    Args:
+        backend_output: The text the backend wrote since its process was launched.
+
+    Returns:
+        The summed sizes, in the mebibytes the backend prints.
+    """
+    return TextBackendBufferSizes(
+        model_mebibytes=_sum_buffer_lines(backend_output, "text_backend_model_buffer"),
+        kv_mebibytes=_sum_buffer_lines(backend_output, "text_backend_kv_buffer"),
+        compute_mebibytes=_sum_buffer_lines(backend_output, "text_backend_compute_buffer"),
+    )
+
+
+def _sum_buffer_lines(backend_output: str, signature_name: str) -> int | None:
+    """Return the rounded sum of one registered buffer pattern's matches, or None when it matched nothing."""
+    matches = pattern_for(signature_name).finditer(backend_output)
+    mebibytes = [float(match.group("mebibytes")) for match in matches]
+    return round(sum(mebibytes)) if mebibytes else None
 
 
 DeviceFreeTotalReader = Callable[[int], tuple[float, float] | None]
@@ -168,6 +235,7 @@ class TextBackendSupervisor:
         *,
         launch_spec: TextBackendLaunchSpec,
         backend: TextBackend,
+        backend_kind: TEXT_BACKENDS = TEXT_BACKENDS.koboldcpp,
         owned_registry: OwnedProcessRegistry | None = None,
         launch_process: LaunchProcess = default_launch_process,
         read_device_free_total_mb: DeviceFreeTotalReader | None = None,
@@ -179,7 +247,10 @@ class TextBackendSupervisor:
 
         Args:
             launch_spec: What to launch and where it listens, already rendered for the chosen backend.
-            backend: The driver already pointed at the spec's URL; used only for `ready()` here.
+            backend: The driver already pointed at the spec's URL; used for `ready()` and, once ready,
+                one `describe()` whose answer names the backend's row on the dashboard.
+            backend_kind: Which program the spec launches. The spec is deliberately kind-agnostic (it is
+                one command line), so the kind is carried alongside it, for display only.
             owned_registry: Where launched PIDs are recorded for orphan reaping; None records nothing.
             launch_process: How a process is started; injected so tests never spawn anything.
             read_device_free_total_mb: Card memory reader for the footprint delta; None disables it.
@@ -190,6 +261,7 @@ class TextBackendSupervisor:
         """
         self._launch_spec = launch_spec
         self._backend = backend
+        self._backend_kind = backend_kind
         self._owned_registry = owned_registry
         self._launch_process = launch_process
         self._read_device_free_total_mb = read_device_free_total_mb
@@ -204,6 +276,17 @@ class TextBackendSupervisor:
         self._footprint_mb: float | None = None
         self._launch_count = 0
         self._consecutive_failures = 0
+
+        # Everything below describes the current launch for the dashboard's row and is cleared when the
+        # process goes away, so a stale model name or buffer figure can never outlive the process it came
+        # from. None of it is read by the ladder.
+        self._description: TextBackendDescription | None = None
+        self._buffer_sizes = TextBackendBufferSizes()
+        self._log_bytes_at_launch = 0
+        self._ready_since: float | None = None
+        self._last_health_ok_at: float | None = None
+        self._backoff_seconds: float | None = None
+        self._backoff_started_monotonic: float | None = None
 
     @property
     def backend(self) -> TextBackend:
@@ -267,6 +350,7 @@ class TextBackendSupervisor:
         A launch that fails leaves no process behind: the tree is stopped before returning False.
         """
         self._state = TextBackendState.LAUNCHING
+        self._clear_launch_detail()
         if not port_is_free(self._launch_spec.port):
             logger.warning(
                 f"Text backend port {self._launch_spec.port} is already in use; a previous backend may still "
@@ -275,6 +359,8 @@ class TextBackendSupervisor:
             return False
 
         free_before_mb = self._read_free_mb()
+        # The log is appended across launches, so the size now is where this launch's own output begins.
+        self._log_bytes_at_launch = _log_size_bytes(self._launch_spec.log_path)
         try:
             self._process = self._launch_process(self._launch_spec)
         except OSError as error:
@@ -300,11 +386,14 @@ class TextBackendSupervisor:
             if await self._backend.ready(deadline_seconds=self._timings.ready_probe_deadline):
                 self._record_tree(launch_identifier)
                 self._footprint_mb = self._footprint_from(free_before_mb)
+                self._ready_since = time.time()
+                self._last_health_ok_at = self._ready_since
                 self._state = TextBackendState.SERVING
                 footprint = "unmeasured" if self._footprint_mb is None else f"{self._footprint_mb:.0f} MB"
                 logger.info(
                     f"Text backend ready after {time.monotonic() - started:.1f}s; VRAM footprint {footprint}",
                 )
+                await self._collect_launch_detail()
                 return True
             if time.monotonic() - started > self._timings.ready_patience:
                 logger.error(
@@ -325,6 +414,7 @@ class TextBackendSupervisor:
                 logger.warning(f"Text backend exited with code {exit_code} while serving; it will be relaunched")
                 self._forget_tree()
                 self._process = None
+                self._clear_launch_detail()
                 self._state = TextBackendState.STOPPED
                 return
             await self._sleep(self._timings.liveness_poll_interval)
@@ -336,8 +426,95 @@ class TextBackendSupervisor:
         backoff = self._timings.relaunch_backoff
         index = min(self._consecutive_failures, len(backoff) - 1)
         self._state = TextBackendState.BACKING_OFF
+        self._backoff_seconds = backoff[index]
+        self._backoff_started_monotonic = time.monotonic()
         logger.info(f"Text backend relaunch in {backoff[index]:.0f}s")
         await self._sleep(backoff[index])
+
+    async def _collect_launch_detail(self) -> None:
+        """Read the display-only facts about the launch that has just become ready.
+
+        Both halves are best effort and neither gates serving: the description is one HTTP question the
+        driver already answers, and the buffer sizes come from the output the backend has written since it
+        was launched. A backend that refuses either leaves those fields unset and keeps generating.
+        """
+        try:
+            self._description = await self._backend.describe()
+        except TextBackendError as error:
+            logger.warning(f"Text backend became ready but would not describe itself: {error}")
+            self._description = None
+        backend_output = await asyncio.to_thread(
+            _read_log_from,
+            self._launch_spec.log_path,
+            self._log_bytes_at_launch,
+        )
+        self._buffer_sizes = parse_backend_buffer_sizes(backend_output)
+
+    def _clear_launch_detail(self) -> None:
+        """Drop the facts that belong to a launch that is over, so no row outlives its process."""
+        self._description = None
+        self._buffer_sizes = TextBackendBufferSizes()
+        self._ready_since = None
+        self._backoff_seconds = None
+        self._backoff_started_monotonic = None
+
+    def to_process_snapshot(self) -> ProcessSnapshot:
+        """Return the backend's row for the dashboard's process surfaces.
+
+        Satisfies
+        [`SupervisedProcessSnapshotSource`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisedProcessSnapshotSource]:
+        the row is marked external and carries a typed
+        [`TextBackendDetail`][horde_worker_regen.process_management.ipc.supervisor_channel.TextBackendDetail]
+        instead of the allocator readings and job progress a pipe-bearing child reports. Every figure is one
+        the supervisor already holds, so the call neither blocks nor asks the backend anything.
+        """
+        description = self._description
+        return ProcessSnapshot(
+            process_id=TEXT_BACKEND_PROCESS_ID,
+            process_type=HordeProcessType.TEXT_BACKEND.name,
+            device_index=self._launch_spec.device_index,
+            last_process_state=self._state.name,
+            is_alive=self._state in (TextBackendState.LAUNCHING, TextBackendState.SERVING),
+            is_busy=False,
+            is_external=True,
+            os_pid=self._tree_pids[0] if self._tree_pids else None,
+            display_state=self._display_state(),
+            loaded_horde_model_name=description.model_name if description is not None else None,
+            text_backend=TextBackendDetail(
+                kind=str(self._backend_kind),
+                model_name=description.model_name if description is not None else None,
+                port=self._launch_spec.port,
+                context_length=description.max_context_length if description is not None else None,
+                max_length=description.max_length if description is not None else None,
+                launch_count=self._launch_count,
+                footprint_mb=None if self._footprint_mb is None else round(self._footprint_mb),
+                ready_since=self._ready_since,
+                last_health_ok_at=self._last_health_ok_at,
+                relaunch_backoff_seconds=self._relaunch_backoff_remaining(),
+                model_buffer_mb=self._buffer_sizes.model_mebibytes,
+                kv_buffer_mb=self._buffer_sizes.kv_mebibytes,
+                compute_buffer_mb=self._buffer_sizes.compute_mebibytes,
+            ),
+        )
+
+    def _display_state(self) -> str:
+        """Return the operator-facing label for the backend's current state."""
+        if self._state is TextBackendState.SERVING:
+            return "ready"
+        if self._state is TextBackendState.LAUNCHING:
+            return "launching"
+        if self._state is TextBackendState.BACKING_OFF:
+            remaining = self._relaunch_backoff_remaining()
+            return "relaunching" if remaining is None else f"relaunching in {remaining:.0f} s"
+        return "stopped"
+
+    def _relaunch_backoff_remaining(self) -> float | None:
+        """Return the seconds left of the relaunch pause, or None when the backend is not backing off."""
+        if self._state is not TextBackendState.BACKING_OFF:
+            return None
+        if self._backoff_seconds is None or self._backoff_started_monotonic is None:
+            return None
+        return max(0.0, self._backoff_seconds - (time.monotonic() - self._backoff_started_monotonic))
 
     def _read_free_mb(self) -> float | None:
         if self._read_device_free_total_mb is None or self._launch_spec.device_index is None:
@@ -400,7 +577,32 @@ class TextBackendSupervisor:
             _kill_quietly(survivor)
         self._forget_tree()
         self._process = None
+        self._clear_launch_detail()
         self._state = TextBackendState.STOPPED
+
+
+def _log_size_bytes(log_path: Path) -> int:
+    """Return the backend log's current size, or 0 when it does not exist yet or cannot be read."""
+    try:
+        return log_path.stat().st_size
+    except OSError as error:
+        logger.debug(f"Text backend log {log_path} could not be sized: {error}")
+        return 0
+
+
+def _read_log_from(log_path: Path, offset_bytes: int) -> str:
+    """Return the backend log's text from ``offset_bytes`` to its end, or an empty string when unreadable.
+
+    Undecodable bytes are replaced rather than raising: the file holds a third-party program's raw output,
+    including whatever a progress spinner wrote, and every line this is read for is plain ASCII.
+    """
+    try:
+        with log_path.open("rb") as log_file:
+            log_file.seek(offset_bytes)
+            return log_file.read().decode("utf-8", errors="replace")
+    except OSError as error:
+        logger.debug(f"Text backend log {log_path} could not be read: {error}")
+        return ""
 
 
 def _process_tree_pids(root_pid: int) -> tuple[int, ...]:
@@ -448,9 +650,11 @@ __all__ = [
     "DeviceFreeTotalReader",
     "LaunchProcess",
     "LaunchedProcess",
+    "TextBackendBufferSizes",
     "TextBackendState",
     "TextBackendSupervisor",
     "TextBackendSupervisorTimings",
     "default_launch_process",
+    "parse_backend_buffer_sizes",
     "port_is_free",
 ]

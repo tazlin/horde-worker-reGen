@@ -65,6 +65,14 @@ _EXPECTED_QUIET_STATES = frozenset(
 _STALE_AFTER_SECONDS = 4.0
 """Beyond this snapshot age the live view is no longer trustworthy; it dims and flags the panels."""
 
+_EXTERNAL_STATE_COLOURS = {
+    "SERVING": "green",
+    "LAUNCHING": "yellow",
+    "BACKING_OFF": "red",
+    "STOPPED": "grey62",
+}
+"""Panel colour per supervised-backend state, keyed by the supervisor's own state names."""
+
 
 def _process_type_label(process_type: str) -> str:
     """Humanize process type enum names for live-panel titles."""
@@ -251,6 +259,8 @@ class LiveView(VerticalScroll):
         pending_models: frozenset[str] = frozenset(),
     ) -> RenderableType:
         """Render one process as a bordered panel with progress and resource detail."""
+        if process.is_external:
+            return self._render_external_process_panel(process, stale=stale)
         temperature = classify_process_temperature(
             state=process.last_process_state,
             loaded_model=process.loaded_horde_model_name,
@@ -351,6 +361,69 @@ class LiveView(VerticalScroll):
             (f"· {_process_type_label(process.process_type)} ", "grey62"),
         )
         return Panel(body, title=title, border_style=state_colour, title_align="left", padding=(0, 1))
+
+    def _render_external_process_panel(self, process: ProcessSnapshot, *, stale: bool = False) -> RenderableType:
+        """Render a supervised external process as labelled lines of its own typed detail.
+
+        Nothing an inference panel shows applies here: there are no sampling steps, no allocator readings
+        and no component cache. What a text backend can say about itself is a flat list of facts, so it is
+        rendered as one, and a fact the backend did not answer is left out rather than shown as a dash.
+        """
+        body = Table.grid(padding=(0, 2))
+        body.add_column(justify="right", style="bold cyan", no_wrap=True)
+        body.add_column(ratio=1)
+
+        state_colour = "grey50" if stale else _EXTERNAL_STATE_COLOURS.get(process.last_process_state, "yellow")
+        body.add_row("State", Text(process.display_state or process.last_process_state.lower(), style=state_colour))
+        detail = process.text_backend
+        if detail is None:
+            return Panel(body, title=self._external_panel_title(process), border_style=state_colour, padding=(0, 1))
+
+        body.add_row("Model", shorten(detail.model_name, 40))
+        body.add_row("Backend", f"{detail.kind} on port {detail.port}")
+        if process.os_pid is not None:
+            body.add_row("OS pid", str(process.os_pid))
+        if detail.context_length is not None:
+            generation_cap = "" if detail.max_length is None else f"   (up to {detail.max_length:,} generated)"
+            body.add_row("Context", f"{detail.context_length:,} tokens{generation_cap}")
+        if detail.active_requests or detail.queued_requests:
+            body.add_row("Requests", f"{detail.active_requests} in flight, {detail.queued_requests} queued")
+        if detail.tokens_per_second is not None:
+            body.add_row("Throughput", f"{detail.tokens_per_second:.1f} tokens/s")
+        # Labelled a measurement, not an allocator reading: it is the card's free-VRAM drop across the
+        # launch, which is the only VRAM figure a backend with no memory query can be held to.
+        body.add_row("GPU VRAM", f"{human_mb(detail.footprint_mb)} measured at launch")
+        buffers = [
+            f"{label} {human_mb(size)}"
+            for label, size in (
+                ("model", detail.model_buffer_mb),
+                ("KV", detail.kv_buffer_mb),
+                ("compute", detail.compute_buffer_mb),
+            )
+            if size is not None
+        ]
+        if buffers:
+            body.add_row("Buffers", Text(" · ".join(buffers), style="grey62"))
+        if detail.ready_since is not None:
+            body.add_row("Ready for", human_duration(time.time() - detail.ready_since))
+        if detail.relaunch_backoff_seconds is not None:
+            body.add_row("Relaunch in", human_duration(detail.relaunch_backoff_seconds))
+        body.add_row("Launches", f"{detail.launch_count:,}")
+        return Panel(
+            body,
+            title=self._external_panel_title(process),
+            border_style=state_colour,
+            title_align="left",
+            padding=(0, 1),
+        )
+
+    @staticmethod
+    def _external_panel_title(process: ProcessSnapshot) -> Text:
+        """Title an external process's panel by what it is rather than by a slot id it does not have."""
+        return Text.assemble(
+            (f" {_process_type_label(process.process_type)} ", "bold"),
+            ("· external program ", "grey62"),
+        )
 
     @staticmethod
     def _add_residency_rows(body: Table, process: ProcessSnapshot) -> None:

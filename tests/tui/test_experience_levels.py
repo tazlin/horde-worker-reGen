@@ -97,6 +97,7 @@ class _Process:
         current: int | None = None,
         total: int | None = None,
         heartbeat: float = 0.0,
+        is_external: bool = False,
     ) -> None:
         """Store the reported progress counters."""
         self.heartbeats_inference_steps = steps
@@ -104,6 +105,9 @@ class _Process:
         self.last_current_step = current
         self.last_total_steps = total
         self.last_heartbeat_timestamp = heartbeat
+        # The Simple helpers read only the worker's own children here; a supervised external program is
+        # skipped, so the stand-in carries the discriminator that says which it is.
+        self.is_external = is_external
 
 
 class _Snapshot:

@@ -118,3 +118,30 @@ def test_pattern_for_rejects_an_unknown_name() -> None:
     """Asking for a pattern that is not registered fails loudly rather than returning None."""
     with pytest.raises(KeyError):
         pattern_for("not_a_registered_signature")
+
+
+_BACKEND_LOAD_LINES = """load_tensors:        CUDA0 model buffer size =  1918.35 MiB
+load_tensors:    CUDA_Host model buffer size =   308.23 MiB
+llama_context:  CUDA_Host  output buffer size =     1.47 MiB
+llama_kv_cache:      CUDA0 KV buffer size =   476.00 MiB
+sched_reserve:      CUDA0 compute buffer size =   278.79 MiB
+sched_reserve:  CUDA_Host compute buffer size =    16.30 MiB
+"""
+"""A text backend's load-time buffer lines, copied verbatim from a real koboldcpp log."""
+
+
+def test_buffer_patterns_claim_their_own_device_lines_and_no_others() -> None:
+    """Each buffer pattern matches every device line of its own kind, and none of another kind's.
+
+    The three lines differ only in the word before ``buffer size``, and llama.cpp prints a fourth kind
+    (``output``) the worker does not read, so a pattern that matched loosely would sum figures from a
+    buffer it was not asked about.
+    """
+    matched = {
+        name: [match.group("device") for match in pattern_for(name).finditer(_BACKEND_LOAD_LINES)]
+        for name in ("text_backend_model_buffer", "text_backend_kv_buffer", "text_backend_compute_buffer")
+    }
+
+    assert matched["text_backend_model_buffer"] == ["CUDA0", "CUDA_Host"]
+    assert matched["text_backend_kv_buffer"] == ["CUDA0"]
+    assert matched["text_backend_compute_buffer"] == ["CUDA0", "CUDA_Host"]

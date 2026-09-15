@@ -107,6 +107,33 @@ spelling keeps the whole name. The worker derives that from which backend it is 
 prefixed twice and match nothing the horde has work for, so the config refuses one and tells you to drop
 it. An author segment is not a prefix and is kept.
 
+## Watching a generation arrive
+
+A text generation takes seconds to minutes, and a blocking request says nothing at all until it is over,
+so the worker asks the backend to stream its answer instead. The text then arrives in pieces, and the
+worker knows three things while a job is still running: how much has arrived, when the last of it did,
+and how long the job has been going. That is what the dashboard shows, and it is also how the worker
+tells a slow generation from a backend that has wedged.
+
+**Token counts and a token rate are a separate question.** One stream record carries an arbitrary number
+of tokens (fifty-five records carried a hundred and sixty tokens on a measured run), so nothing about
+how many tokens have been produced can be worked out from the text. A backend built with the worker's
+per-request statistics patch answers a route that says so, and a job on such a backend carries real
+token counts and a real rate. A stock build has no such route, the worker asks once and then stops
+asking, and the counts stay unknown rather than being guessed at from the characters. Either way the
+finished job's counts come from what the backend itself reported: the statistics route where there is
+one, the backend's own last-generation counters otherwise.
+
+A backend with no stream route at all still works. The worker falls back to the blocking request for
+that backend, says so once in the log, and generates exactly as it did before; it simply learns nothing
+about a job until the job is done.
+
+**The first generation after the backend starts is slow.** Its kernels are cold, and it produces a
+couple of tokens in its first several seconds where the same backend runs at over a hundred a second
+once warm. So a worker that launched the backend itself spends one short generation on warming it up
+before it pops anything, and throws the answer away. A backend you run yourself is left alone, because
+it may be serving other clients whose generation slot is not the worker's to spend.
+
 ## What happens when the backend misbehaves
 
 The worker never drops a job it has popped. A popped job that is quietly abandoned holds its requester
@@ -119,10 +146,19 @@ below ends in a submit, faulted where it has to be.
 | Refuses the payload                        | Faults the job immediately. It will be refused again, so re-offering it only burns the same failure repeatedly.   |
 | Cannot be reached, or fails the generation | Faults the job, then goes back to polling readiness. While the backend is down every job fails the same way.      |
 | Takes longer than the deadline             | Asks the backend to abandon the generation, then faults the job.                                                  |
+| Stops producing text part way through      | Asks the backend to abandon the generation and faults the job, without waiting the deadline out.                  |
+| Breaks the stream part way through         | Faults the job. Half a generation reads as a whole one to a requester, so partial text is never submitted.        |
 
 The per-generation deadline is `text_generation_timeout_seconds` when you set it, and otherwise is
 derived from `max_length` at a deliberately slow tokens-per-second floor (`max_length / 2 + 10`, the
 figure the older scribe bridge used). Set it explicitly if your backend is slower than that floor.
+
+That deadline bounds a whole generation, and it cannot tell a backend that is running slowly from one
+that has stopped: both are silent until it expires, and the difference is minutes of a requester's time.
+Because the answer streams, silence is its own signal, so a generation that has produced nothing for
+`text_stall_seconds` (thirty by default) is given up on there and then. The exception is the first token
+after the backend starts, which is given the whole deadline, because a cold backend legitimately takes
+seconds to produce anything.
 
 An abandoned generation deserves one note, because a backend's answer to being told to stop can be
 surprising: koboldcpp returns a success carrying the tokens it had produced so far. A truncated answer
@@ -150,13 +186,36 @@ clock, and the rolling kudos events, exactly as an alchemy form does.
 Each finished job (paid or faulted) also lands as one per-job run-metrics record carrying the advertised
 model name, the pop and submit times, the wait from pop to generation start, the generation's own
 duration, the reward, and the generation-length cap the horde asked for. The record names its workload,
-so a session's totals split three ways instead of collapsing text into the image numbers. The token
-counts a text job would otherwise carry are absent: no backend the worker speaks to reports per-request
-prompt and completion counts, so the fields stay unknown rather than guessed at.
+so a session's totals split three ways instead of collapsing text into the image numbers. Its prompt and
+generated token counts are there when the backend reported them and unknown when it did not, which is
+the difference between a patched build and a stock one described above.
 
 The supervisor snapshot carries the flow's live state for the dashboard: jobs in flight, the session's
 submitted and faulted totals, whether the readiness gate has passed, and the model, context length and
 generation length the worker is advertising.
+
+## The backend on the dashboard
+
+The backend is a program the worker launched, not a child it speaks IPC with, so it is not in the process
+map and never will be: the map's entries hold torch VRAM the worker accounts for and move through an
+image-and-alchemy state vocabulary, and a text entry would be misread by every reaper, ledger and health
+check that walks the map. It still appears wherever the map's processes do, as one more row, through
+`TextBackendSupervisor.to_process_snapshot()` and the
+[`SupervisedProcessSnapshotSource`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisedProcessSnapshotSource]
+protocol the snapshot builder concatenates onto the map-derived rows.
+
+The row says what a text backend can be held to. Its state is the supervisor's own (`launching`, `ready`,
+`relaunching in 8 s`), its resident model is the one the backend reported loading, its identity in the id
+column is the OS pid of the launched process, and its VRAM figure is the card's free-memory drop measured
+across the launch, labelled as measured because it is not an allocator reading and cannot be compared with
+one. The Live tab carries the rest as labelled lines: the port and backend kind, the context and
+generation caps, how long it has been ready, how many times it has been launched, and the buffer sizes
+llama.cpp printed while loading (see [Logs](../reference/logs.md)). Nothing on the row feeds admission or
+pricing; the arbiter still sees the backend only as the card's foreign floor.
+
+Readers that reason about inference lanes skip the row rather than counting it: a ready backend does not
+make the worker read as serving images, does not end the image lanes' warm-up, and names no card whose
+duty could be called low.
 
 ## What is not supported yet
 
@@ -168,8 +227,10 @@ generation length the worker is advertising.
   on fails and re-run its readiness gate, but nothing coordinates the two. Which *kind* of backend is
   attached is likewise fixed for the run.
 - **The dashboard has no text panel yet.** The snapshot carries the flow's counters and backend identity,
-  and finished text jobs appear in the recent-jobs views, but no screen is laid out around text the way
-  the image and alchemy panels are, and the config editor has no scribe fields.
+  the backend has its row in the process surfaces, and finished text jobs appear in the recent-jobs views,
+  but no screen is laid out around text the way the image and alchemy panels are, and the config editor has
+  no scribe fields. The row's request counts and token rate are the flow's to report and are unset until it
+  does.
 - **Turning `scribe` on takes a restart.** Unlike most configuration, the role is read when the worker
   builds its flows, so a hot reload of `bridgeData.yaml` will not start a text flow that was off at
   launch (it will, however, stop one that was on).
@@ -177,9 +238,10 @@ generation length the worker is advertising.
 ## Where it lives in the code
 
 - [`text_backends`][horde_worker_regen.text_backends]: the whole of the conversation with the external
-  program. Five verbs (`ready`, `describe`, `generate`, `stop`, `close`), two result models, three
-  exception types, and no HTTP visible above it. One driver serves every backend that speaks the
-  KoboldAI API.
+  program. Six verbs (`ready`, `describe`, `capabilities`, `generate`, `stop`, `close`), the result
+  models, three exception types, and no HTTP visible above it. One driver serves every backend that
+  speaks the KoboldAI API, streaming its generations and reporting them through a callback the flow
+  hands in.
 - [`TextGenerationCoordinator`][horde_worker_regen.process_management.jobs.text_generation_coordinator.TextGenerationCoordinator]:
   the flow itself, satisfying the same
   [`FlowCoordinator`][horde_worker_regen.process_management.scheduling.workload_flow.FlowCoordinator]

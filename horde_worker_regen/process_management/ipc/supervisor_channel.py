@@ -16,7 +16,7 @@ from __future__ import annotations
 import enum
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 24
+SUPERVISOR_PROTOCOL_VERSION = 25
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -90,6 +90,12 @@ nothing about the job the row is for, and the same text is already on ``orchestr
 v24 makes text generation visible: ``RecentJobRecord.workload`` replaces its ``is_alchemy`` boolean (a
 worker serving three workloads cannot be partitioned by one), the snapshot gains the ``text_*`` counters
 and backend identity, and ``WorkerConfigSummary`` gains ``scribe``/``scribe_name``.
+v25 makes a supervised external process a row in the process surfaces without entering ``ProcessMap``:
+``ProcessSnapshot`` gains ``is_external``, ``os_pid``, ``display_state`` and ``text_backend``
+(:class:`TextBackendDetail`), ``device_index`` accepts None for a process pinned to no card, and
+:class:`SupervisedProcessSnapshotSource` is the one method such a process implements to produce its row.
+A map-derived row leaves every added field at its default, so a v25 snapshot of an image-only worker is
+what v24 produced.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -327,20 +333,113 @@ class ResidentComponentEntry(BaseModel):
     """The entry's approximate resident RAM cost in megabytes, as the component cache's budget estimates it."""
 
 
+SUPERVISED_PROCESS_ID_BASE = 9100
+"""First process id reserved for a supervised external process, which never enters ``ProcessMap``.
+
+The map allocates slot ids from 0 upward, one per pipe-bearing child
+(``lifecycle/process_lifecycle.py::_allocate_inference_pid``), and the download process holds the reserved
+id 9000 (``workers/download_process.py::DOWNLOAD_PROCESS_ID``). A base of 9100 sits clear of both, leaves
+9000-9099 for further reserved single-process ids, and stays a small positive number so the dashboards that
+print an id numerically need no special case. Each supervised process takes a fixed offset from this base.
+"""
+
+TEXT_BACKEND_PROCESS_ID = SUPERVISED_PROCESS_ID_BASE
+"""The reserved row id of the supervised text backend (offset 0); one backend is supervised at a time."""
+
+
+class TextBackendDetail(BaseModel):
+    """Represents what a supervised text backend can say about itself, for the dashboard's row.
+
+    The text backend is an external program the worker launches but does not control, so most of this is
+    what it reported rather than what the worker configured: the model name and the caps come from the
+    backend's own description, and the footprint is the card's measured free-VRAM drop across its launch
+    (it exposes no runtime memory query). A field the current backend cannot answer stays None rather than
+    being filled from configuration, because the configured value and the loaded one disagree exactly when
+    an operator needs to see it. Nothing here feeds admission or pricing.
+    """
+
+    kind: str
+    """The ``TEXT_BACKENDS`` value naming the program (``koboldcpp``); a ``str`` so a future kind survives."""
+    model_name: str | None = None
+    """The model the backend reports having loaded; None before it has been asked or when it did not answer."""
+    port: int
+    """The loopback port the backend listens on."""
+    context_length: int | None = None
+    """The largest prompt-plus-generation token count the backend says it accepts."""
+    max_length: int | None = None
+    """The largest number of tokens the backend says it generates for one request."""
+    launch_count: int = 0
+    """How many times the supervisor has started the backend process this session."""
+    footprint_mb: int | None = None
+    """The card's free-VRAM drop between launch and readiness, or None when it could not be measured.
+
+    A measured whole-process footprint, not a torch allocator reading: it is not comparable with a slot's
+    ``vram_usage_mb`` and the dashboards mark it as measured where they show it."""
+    ready_since: float | None = None
+    """When the backend first answered its readiness probe for the current launch; None when not serving."""
+    last_health_ok_at: float | None = None
+    """When the backend last answered a readiness probe.
+
+    The supervisor probes only while a launch is starting, so while serving this stays the moment readiness
+    was reached: the worker asks a black box nothing it does not need, and the process's continued existence
+    is what the supervisor watches instead."""
+    relaunch_backoff_seconds: float | None = None
+    """Seconds left of the pause before the next launch attempt; None when not backing off."""
+    active_requests: int = 0
+    """Generations the worker currently has in flight against the backend."""
+    queued_requests: int = 0
+    """Generations the worker is holding for the backend to take."""
+    tokens_per_second: float | None = None
+    """The most recent generation rate observed, or None when nothing has been generated yet."""
+    model_buffer_mb: int | None = None
+    """Weights the backend's loader reported placing in buffers, summed over devices (MiB, as it prints)."""
+    kv_buffer_mb: int | None = None
+    """The KV cache the backend's loader reported allocating, summed over devices (MiB, as it prints)."""
+    compute_buffer_mb: int | None = None
+    """The compute buffers the backend's loader reported reserving, summed over devices (MiB, as it prints)."""
+
+
 class ProcessSnapshot(BaseModel):
-    """A serializable projection of one child process's live state (from ``HordeProcessInfo``)."""
+    """A serializable projection of one process's live state, for the dashboard's process surfaces.
+
+    Most rows are built from a ``HordeProcessInfo`` in ``ProcessMap`` by :meth:`from_process_info`. A row
+    with :attr:`is_external` set instead comes from a supervised external program the worker launched but
+    does not speak IPC with (:class:`SupervisedProcessSnapshotSource`); it carries :attr:`display_state` and
+    a typed detail block in place of the allocator readings and job progress a child reports, and every
+    field it cannot answer keeps its default.
+    """
 
     process_id: int
     process_type: str
     """The ``HordeProcessType`` name (e.g. ``INFERENCE`` / ``SAFETY``)."""
-    device_index: int = 0
+    device_index: int | None = 0
     """The stable index of the GPU this slot is pinned to (0 on a single-GPU host).
 
-    Lets the dashboard group a card's slots together and show a per-process GPU column on multi-GPU hosts."""
+    Lets the dashboard group a card's slots together and show a per-process GPU column on multi-GPU hosts.
+    None for an external process that runs on no card (a CPU-only text backend)."""
     last_process_state: str
-    """The ``HordeProcessState`` name (e.g. ``WAITING_FOR_JOB`` / ``INFERENCE_STARTING``)."""
+    """The process's own state-vocabulary name (e.g. ``WAITING_FOR_JOB`` / ``INFERENCE_STARTING``).
+
+    A ``HordeProcessState`` name on a map-derived row. An external row carries its supervisor's state name
+    instead, which is deliberately disjoint from the image vocabulary so no state-keyed reader matches it;
+    what an operator reads is :attr:`display_state`."""
     is_alive: bool
     is_busy: bool
+
+    is_external: bool = False
+    """Whether this row is a supervised external program rather than a pipe-bearing child of the worker.
+
+    False for every row derived from ``ProcessMap``. A reader reasoning about inference lanes (sampling,
+    serving, per-card work) skips the rows where this is True: they hold no torch allocator, run no horde
+    image job, and their state vocabulary is their own."""
+    os_pid: int | None = None
+    """The operating-system process id, where the row has one worth showing; None for a map-derived row."""
+    display_state: str | None = None
+    """A free-form operator-facing label for an external row (``ready``, ``relaunching in 8 s``).
+
+    None on a map-derived row, which is labelled from :attr:`last_process_state` instead."""
+    text_backend: TextBackendDetail | None = None
+    """The text backend's own detail, when this row is one; None for every other row."""
 
     loaded_horde_model_name: str | None = None
     loaded_horde_model_baseline: str | None = None
@@ -438,6 +537,25 @@ class ProcessSnapshot(BaseModel):
             if info.held_components
             else [],
         )
+
+
+@runtime_checkable
+class SupervisedProcessSnapshotSource(Protocol):
+    """Something the worker supervises that can project itself as one process-table row.
+
+    An external program the worker launches (the text backend today) is not in ``ProcessMap``: the map's
+    entries are pipe-bearing children with torch allocator readings and an image-and-alchemy state
+    vocabulary, and every untyped walk of the map would misread an entry that has neither. This protocol is
+    the whole of what such a program owes the dashboard, so the snapshot builder can concatenate the
+    map-derived rows with the supervised ones and every surface renders one list.
+
+    Runtime-checkable so an assembly can assert a stand-in still produces a row; the check confirms the
+    method is present, not that what it returns is honest.
+    """
+
+    def to_process_snapshot(self) -> ProcessSnapshot:
+        """Return this process's row, with ``is_external`` set and its own typed detail attached."""
+        ...
 
 
 class RecentJobRecord(BaseModel):

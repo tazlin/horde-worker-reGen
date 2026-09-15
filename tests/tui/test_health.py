@@ -18,6 +18,7 @@ from horde_worker_regen.tui.health import (
     WorkerPhase,
     build_offline_checks,
     derive,
+    gpu_duty_low_cards,
     summarize_reduced_skips,
     summarize_skips,
 )
@@ -567,3 +568,46 @@ def test_model_fit_rows_name_unserviceable_and_constrained_models() -> None:
     assert rows
     assert any(status is HealthStatus.ERROR and "Flux.1-Schnell" in detail for status, detail in statuses)
     assert any(status is HealthStatus.WARN and "max_power 40" in detail for status, detail in statuses)
+
+
+def _text_backend_process(state: str = "SERVING") -> ProcessSnapshot:
+    """The supervised text backend's row in the given supervisor state."""
+    return ProcessSnapshot(
+        process_id=9100,
+        process_type="TEXT_BACKEND",
+        device_index=None,
+        last_process_state=state,
+        is_alive=True,
+        is_busy=False,
+        is_external=True,
+        display_state="ready",
+        loaded_horde_model_name="Llama-3.2-3B",
+    )
+
+
+def test_a_ready_text_backend_is_not_an_inference_lane_serving() -> None:
+    """A serving external backend beside an idle slot leaves the worker reading as ready, not serving."""
+    snapshot = _snapshot(processes=[_process("WAITING_FOR_JOB"), _text_backend_process()])
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    assert report.phase is not WorkerPhase.SERVING
+
+
+def test_a_text_backend_alone_does_not_end_the_warm_up() -> None:
+    """A worker whose only row is its external backend is still warming up, as one with no rows is."""
+    snapshot = _snapshot(processes=[_text_backend_process()])
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    assert report.phase is WorkerPhase.WARMING_UP
+
+
+def test_a_text_backend_is_not_a_card_with_low_duty() -> None:
+    """The near-idle-card check reads inference lanes only; an external row names no card of its own."""
+    snapshot = _snapshot(
+        processes=[_text_backend_process()],
+        gpu_utilization_mean_percent_per_card={0: 0.0},
+    )
+
+    assert gpu_duty_low_cards(snapshot) == []
