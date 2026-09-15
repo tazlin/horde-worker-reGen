@@ -3119,6 +3119,25 @@ class ProcessLifecycleManager:
             return None
         return self._safety_pinned_card
 
+    @property
+    def safety_residency_fixed(self) -> bool:
+        """Whether safety's place on its card is fixed, so nothing may move it off for memory.
+
+        True only on a worker driving more than one card while the safety process is live on a card whose
+        effective config still permits it. A second card means the memory a demotion would return is never
+        the only place a model can run: the work that wanted it seats on a sibling instead, and the round
+        trip costs the whole safety rebuild plus the window in which the worker has no on-GPU classifier.
+        A single card keeps the demote/restore policy, which is its only way to make room at all.
+
+        The permission term is what keeps a config reload's withdrawal actionable
+        (:meth:`demote_safety_from_unpermitted_card`): a card that no longer permits safety does not hold a
+        fixed residency, so that path can still get the process off it.
+        """
+        if len(self._card_runtimes) <= 1:
+            return False
+        pinned_card = self.safety_gpu_card_index()
+        return pinned_card is not None and pinned_card in self.safety_permitted_card_indices
+
     def demote_safety_from_unpermitted_card(self) -> bool:
         """Move safety off-GPU when the card hosting it no longer permits an on-GPU safety process.
 
@@ -3142,11 +3161,16 @@ class ProcessLifecycleManager:
     def pause_safety_on_gpu(self, *, owner: PauseOwner) -> bool:
         """Move safety off-GPU for one reconciled resource-governance request.
 
-        A no-op when safety is not configured on-GPU, is already paused, or another intentional safety
-        placement rebuild has not reached readiness. Otherwise records the initiating request and triggers the
+        A no-op when safety is not configured on-GPU, is already paused, another intentional safety
+        placement rebuild has not reached readiness, or safety's residency is fixed
+        (:attr:`safety_residency_fixed`). Otherwise records the initiating request and triggers the
         existing replacement state machine, which ends the on-GPU process and brings a cpu_only one up over the
         next few control-loop ticks. Refusing to flip during an open readiness window prevents back-to-back
         placement requests from chaining intentional replacements.
+
+        The fixed-residency refusal is the backstop under the scheduler's own gates rather than a duplicate of
+        them: it is the single actuator that ends an on-GPU safety process, so denying it here means no caller
+        can demote a fixed residency by any path, present or added later.
 
         Args:
             owner: The request that caused the scheduler's sole placement reconciler to choose CPU safety.
@@ -3159,6 +3183,12 @@ class ProcessLifecycleManager:
             or self._safety_gpu_paused
             or self.safety_placement_transition_pending
         ):
+            return False
+        if self.safety_residency_fixed:
+            logger.debug(
+                f"{_pause_owner_phrase(owner)}: refused, the safety process's residency on card "
+                f"{self.safety_gpu_card_index()} is fixed while this worker drives more than one card.",
+            )
             return False
         self._safety_gpu_paused = True
         self._safety_gpu_pause_owner = owner

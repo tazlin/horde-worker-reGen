@@ -168,7 +168,61 @@ class SafetyPlacementLedger:
         """Policy-initiated moves of safety off the GPU this run (not the whole-card residency's own pauses)."""
         self.promotions = 0
         """Policy-initiated restores of safety onto the GPU this run."""
+        self._backlog_excluded_card: int | None = None
+        """The card new inference dispatches are held off while safety's backlog drains, or None."""
+        self.backlog_exclusions = 0
+        """Times the safety-backlog dispatch exclusion armed this run."""
         self._last_logged_inputs: tuple[object, ...] | None = None
+
+    @property
+    def backlog_excluded_card(self) -> int | None:
+        """The card new inference dispatches are excluded from while safety's backlog drains, else None.
+
+        Durable across cycles rather than re-derived from the current depth: the exclusion exists to let a
+        card that is behind on safety checks catch up, and a depth that dips for one cycle is not that card
+        catching up. Armed above :data:`SAFETY_BACKLOG_PRIORITY_DEPTH` and cleared only at a drained backlog
+        (:meth:`arm_backlog_exclusion`, :meth:`clear_backlog_exclusion`).
+        """
+        return self._backlog_excluded_card
+
+    def arm_backlog_exclusion(self, device_index: int | None, *, depth: int) -> bool:
+        """Hold new inference dispatches off ``device_index`` until safety's backlog drains.
+
+        Idempotent while it already names that card; re-arming onto a different card replaces it, which is
+        what a safety process that respawned elsewhere leaves behind.
+
+        Args:
+            device_index: The card safety occupies, whose new dispatches are held off.
+            depth: The safety backlog depth that armed it, for the disclosure.
+
+        Returns:
+            True when this call armed the exclusion (a state change), False when it already stood.
+        """
+        if device_index is None or self._backlog_excluded_card == device_index:
+            return False
+        self._backlog_excluded_card = device_index
+        self.backlog_exclusions += 1
+        logger.info(
+            f"Safety backlog of {depth} checks exceeds {SAFETY_BACKLOG_PRIORITY_DEPTH} on card {device_index}, "
+            "which hosts the safety process: holding new inference dispatches off that card until the backlog "
+            "drains. Jobs already running there are left to finish.",
+        )
+        return True
+
+    def clear_backlog_exclusion(self, *, depth: int) -> bool:
+        """Release the safety-backlog dispatch exclusion, returning whether one was standing.
+
+        Args:
+            depth: The safety backlog depth that released it, for the disclosure.
+        """
+        released_card = self._backlog_excluded_card
+        if released_card is None:
+            return False
+        self._backlog_excluded_card = None
+        logger.info(
+            f"Safety backlog on card {released_card} is at {depth}: new inference dispatches may land there again.",
+        )
+        return True
 
     def dwell_met(self, since: float | None, dwell_seconds: float) -> bool:
         """Whether evidence first seen at ``since`` has now held continuously for ``dwell_seconds``."""
@@ -182,10 +236,11 @@ class SafetyPlacementLedger:
         self.headroom_since = None
 
     def reset(self) -> None:
-        """Clear every clock and request while the policy is inert."""
+        """Clear every clock, request and dispatch exclusion while the policy is inert."""
         self.freeze_evidence()
         self.reclaim_pause_requested = False
         self.pp_backlog_since = None
+        self.clear_backlog_exclusion(depth=0)
 
     def advance_evidence(self, inputs: SafetyPlacementInputs, *, safety_paused: bool, pressure_counts: bool) -> None:
         """Advance the one clock that applies to safety's current placement, clearing the other.

@@ -408,6 +408,7 @@ def admission_room(
     post_process_reclaim_permitted: bool,
     safety_reclaim_permitted: bool,
     utilities_reclaim_permitted: bool,
+    safety_residency_fixed: bool = False,
 ) -> AdmissionRoom:
     """Decompose the admission identity for one candidate into tenancy by class and reclaim rungs.
 
@@ -419,7 +420,9 @@ def admission_room(
 
     Rungs, cheapest first: each idle inference sibling context (its full tenancy returns when the process
     exits), the post-processing lane, safety off-GPU, the utilities lane. A rung is listed even when policy
-    forbids it, so the line a person reads shows what an operator setting would unlock.
+    forbids it, so the line a person reads shows what an operator setting would unlock. A fixed safety
+    residency is the one exception: no setting unlocks it, so it is charged at no less than its whole-device
+    footprint and named as tenancy only, never as a rung a candidate could be admitted against.
 
     Args:
         candidate_mb: The candidate's outstanding device cost (MB), net of resident credit.
@@ -435,6 +438,8 @@ def admission_room(
         post_process_reclaim_permitted: Whether policy permits pausing the post-processing lane off-GPU now.
         safety_reclaim_permitted: Whether policy permits moving safety off-GPU now.
         utilities_reclaim_permitted: Whether policy permits pausing the utilities lane off-GPU now.
+        safety_residency_fixed: Whether safety's card is fixed, so its charge cannot fall below its
+            whole-device footprint and no candidate may be admitted against moving it off.
     """
     tenancy: dict[TenantLane, float] = {}
     rungs: list[RoomRung] = []
@@ -445,6 +450,12 @@ def admission_room(
             charge = max(0.0, safety_footprint_mb)
         else:
             charge = max(0.0, reserved or 0.0) + max(0.0, context_mb)
+        if lane is TenantLane.SAFETY and safety_residency_fixed:
+            # A fixed residency is not going anywhere, so the card owes safety its whole-device footprint for
+            # the rest of the session. A reservation reported below that figure is an at-rest reading taken
+            # between evaluations, not a smaller commitment, and admitting a candidate against the difference
+            # over-commits the card the moment the next check runs.
+            charge = max(charge, max(0.0, safety_footprint_mb))
         classed = TenantLane.INFERENCE_TARGET if process_id == target_process_id else lane
         tenancy[classed] = tenancy.get(classed, 0.0) + charge
         attributed += charge
@@ -456,6 +467,8 @@ def admission_room(
         (TenantLane.UTILITIES, RoomRungKind.UTILITIES_LANE, utilities_reclaim_permitted),
     )
     for lane, kind, permitted in lane_rungs:
+        if lane is TenantLane.SAFETY and safety_residency_fixed:
+            continue
         held = tenancy.get(lane, 0.0)
         if held > 0.0:
             rungs.append(RoomRung(kind, held, permitted))

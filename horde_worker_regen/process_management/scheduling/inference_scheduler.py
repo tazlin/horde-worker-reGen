@@ -1507,6 +1507,36 @@ class InferenceScheduler:
             return current_card
         return self._choose_safety_gpu_card()
 
+    def _safety_residency_fixed(self) -> bool:
+        """Whether safety's place on its card is fixed, so no owner may move it off to make room.
+
+        The one predicate behind that guarantee; the lifecycle manager defines it
+        (:attr:`ProcessLifecycleManager.safety_residency_fixed`) because it owns both the pinned card and the
+        card plan, and every consumer here reads it rather than re-deriving the condition: the placement
+        reconciler requests no owner and accrues no pressure evidence, the whole-card residency stops
+        displacing safety, the arbiter state withholds both safety rungs, and the admission room charges the
+        footprint as tenancy no candidate can be admitted against.
+
+        It holds only where the worker drives more than one card. With a sibling card the memory a demotion
+        would return is never the only place the work can run, so the trade is a whole safety rebuild and a
+        window without an on-GPU classifier in exchange for capacity the fleet already had; with one card the
+        demotion is the only way to make room at all, so single-GPU keeps the demote/restore policy unchanged.
+
+        Read as an identity against True because a partially-mocked lifecycle manager hands back a truthy
+        object for every attribute, and this one withholds the reclaim rungs the rest of the suite exercises.
+        """
+        return self._process_lifecycle.safety_residency_fixed is True
+
+    def _safety_residency_fixed_on(self, device_index: int | None) -> bool:
+        """Whether ``device_index`` is the card a fixed safety residency holds.
+
+        The worker-wide key (``None``) reads as safety's card, matching every other per-card predicate here:
+        a caller that names no device is asking about the one memory domain it knows of.
+        """
+        if not self._safety_residency_fixed():
+            return False
+        return device_index is None or device_index == self._process_lifecycle.safety_gpu_card_index()
+
     def _runtime_safety_placement_enabled(self) -> bool:
         """Whether the runtime safety-placement policy may act (safety configured on-GPU on a real device).
 
@@ -1682,6 +1712,19 @@ class InferenceScheduler:
         inputs = self._safety_placement_inputs(safety_card)
         ledger.log_inputs(inputs, safety_paused=safety_paused)
 
+        if self._safety_residency_fixed():
+            # Nothing here may move safety off its card, so the policy stops deciding placement and keeps only
+            # the two things that still mean something: the backlog exclusion that gives the card time to
+            # catch up on checks, and the promotion of weights a pre-fixed cycle left in host RAM. Evidence is
+            # dropped rather than accrued, so a spell of pressure cannot arm a demotion the moment the card
+            # count or the safety pin changes.
+            self._reconcile_safety_backlog_exclusion(safety_card, depth=safety_backlog_depth)
+            ledger.freeze_evidence()
+            ledger.reclaim_pause_requested = False
+            self._promote_safety_weights_if_room(safety_card, residency_veto=False)
+            return
+        ledger.clear_backlog_exclusion(depth=safety_backlog_depth)
+
         residency_veto = self._held_residency_requests_safety_off_gpu()
         residency_may_initiate = residency_veto and (safety_paused or safety_backlog_depth == 0)
 
@@ -1820,6 +1863,23 @@ class InferenceScheduler:
             self._safety_placement.weights_demoted = False
             logger.info("Card recovered; promoting the safety process's weights back onto the device.")
 
+    def _reconcile_safety_backlog_exclusion(self, device_index: int | None, *, depth: int) -> None:
+        """Hold new dispatches off safety's card while its check backlog is deep, releasing once it drains.
+
+        The relief valve a fixed residency needs. With safety unable to leave the card, a backlog of pending
+        checks has no placement remedy at all, so the pressure is taken off the only other way: the card stops
+        being offered new inference work until it has caught up. Jobs already running there finish, and every
+        sibling card keeps taking work throughout, so the worker slows on one card rather than stopping.
+
+        Armed above :data:`SAFETY_BACKLOG_PRIORITY_DEPTH` and released only at a drained backlog, because a
+        depth that dips for a cycle is the lane breathing rather than the lane recovering; releasing on the
+        dip re-fills the card and arms the exclusion again next cycle.
+        """
+        if depth > SAFETY_BACKLOG_PRIORITY_DEPTH:
+            self._safety_placement.arm_backlog_exclusion(device_index, depth=depth)
+        elif depth == 0:
+            self._safety_placement.clear_backlog_exclusion(depth=depth)
+
     # ---- end runtime safety placement ------------------------------------------------------------------
 
     # ---- whole-card exclusive residency -----------------------------------------------------------------
@@ -1897,8 +1957,12 @@ class InferenceScheduler:
         the card the one safety process is pinned to (:meth:`_safety_gpu_card`, headroom-chosen, not a fixed
         index). A residency on a non-safety card never disturbs safety. The worker-wide key (``None``,
         single-GPU) always qualifies.
+
+        A fixed safety residency (:meth:`_safety_residency_fixed`) outranks the operator's flag: the residency
+        takes the card it can get, and a whole-card model that cannot fit beside safety's fixed charge is
+        seated on a sibling card instead of evicting the classifier.
         """
-        if not self._whole_card_safety_off_gpu_enabled():
+        if not self._whole_card_safety_off_gpu_enabled() or self._safety_residency_fixed_on(device_index):
             return False
         if device_index is None or not self._card_runtimes:
             return True
@@ -4829,6 +4893,7 @@ class InferenceScheduler:
                 self._residency_should_pause_safety(device_index) and self._job_tracker.safety_backlog_depth == 0
             ),
             safety_weights_demotable=self._safety_weights_demotable(device_index),
+            safety_residency_fixed=self._safety_residency_fixed_on(device_index) and safety_contexts > 0,
             safety_footprint_mb=self._safety_footprint_mb() if safety_contexts > 0 else 0.0,
             lane_by_process_id=self._tenant_lane_by_process_id(device_index),
             utilities_context_count=utilities_contexts,
@@ -6778,10 +6843,13 @@ class InferenceScheduler:
         """Whether safety's resident weights can be demoted to host RAM in place right now.
 
         Gated on the same operator permission as moving safety off the card, on a live on-GPU safety process
-        that is not mid-rebuild, and on an empty safety backlog (queued checks would only re-stage them).
+        that is not mid-rebuild, and on an empty safety backlog (queued checks would only re-stage them). A
+        fixed residency (:meth:`_safety_residency_fixed`) withholds this rung as it withholds the process-level
+        one: the card owes safety its whole footprint for the session, so the weights are part of what it owes.
         """
         if (
             not self._safety_on_gpu_permitted
+            or self._safety_residency_fixed_on(device_index)
             or not self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu
             or self._safety_placement.weights_demoted
             or self._process_lifecycle.is_safety_gpu_paused
@@ -7023,9 +7091,14 @@ class InferenceScheduler:
         return tuple(lanes)
 
     def _reclaim_safety_candidate(self, device_index: int | None) -> LaneReclaimCandidate | None:
-        """Build the safety-off-GPU rung when the operator allows safety to leave the GPU."""
+        """Build the safety-off-GPU rung when the operator allows safety to leave the GPU.
+
+        None while safety's residency is fixed (:meth:`_safety_residency_fixed`): a rung the actuator will
+        refuse promises room the ladder then spends a verification window failing to find.
+        """
         if (
             not self._safety_on_gpu_permitted
+            or self._safety_residency_fixed_on(device_index)
             or not self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu
             or self._process_lifecycle.is_safety_gpu_paused
             or self._process_lifecycle.safety_placement_transition_pending is True
@@ -7244,9 +7317,14 @@ class InferenceScheduler:
         reconciler applies it immediately without advancing fit hysteresis, then consumes it only after the
         off-GPU child reaches readiness. Restoration is also reconciled there, so the ladder cannot overlap a
         residency or runtime-policy transition.
+
+        Reports no-op while safety's residency is fixed (:meth:`_safety_residency_fixed`), so a request filed
+        by a path that did not consult the candidate builder still frees nothing rather than parking a request
+        the reconciler will never apply.
         """
         if (
             self._safety_placement.reclaim_pause_requested
+            or self._safety_residency_fixed_on(device_index)
             or self._process_lifecycle.is_safety_gpu_paused
             or self._process_lifecycle.safety_placement_transition_pending is True
         ):
@@ -7931,13 +8009,38 @@ class InferenceScheduler:
         return process_info.device_index if self._multi_gpu_routing_active else None
 
     def _eligible_card_indices(self, job: ImageGenerateJobPopResponse) -> set[int]:
-        """Device indices of the cards whose effective config can serve ``job`` (see ``gpu_eligibility``).
+        """Device indices of the cards ``job`` may be dispatched onto right now.
 
-        Restricts dispatch (and the resident-process search) to cards that offer the job's model, fit its
-        weights, enable every feature it needs, and allow its resolution. An unknown fact never excludes a
-        card (the eligibility primitive abstains), so this only ever narrows routing on a genuine mismatch.
+        Cards whose effective config can serve it (see ``gpu_eligibility``: they offer the job's model, fit its
+        weights, enable every feature it needs, and allow its resolution), less any card the safety-backlog
+        exclusion is holding new dispatches off (:attr:`SafetyPlacementLedger.backlog_excluded_card`). An
+        unknown fact never excludes a card (the eligibility primitive abstains), so this only ever narrows
+        routing on a genuine mismatch or a standing exclusion.
+
+        Kept separate from :meth:`_card_eligibility`, which answers whether any card can *ever* serve the job
+        and faults it when none can: an exclusion is a card that is busy catching up, not a card that cannot
+        do the work, so a job whose only card is excluded waits rather than being faulted. Where the exclusion
+        leaves it nowhere to go this cycle, that is recorded as a dispatch decline so the idle card has a
+        stated cause.
         """
-        return self._card_eligibility(job).eligible_card_indices
+        eligible = self._card_eligibility(job).eligible_card_indices
+        excluded_card = self._safety_placement.backlog_excluded_card
+        if excluded_card is None or excluded_card not in eligible:
+            return eligible
+        eligible.discard(excluded_card)
+        if not eligible and job.id_ is not None:
+            self._dispatch_holds.note_decline(
+                DispatchDecline(
+                    job_id=str(job.id_),
+                    bucket=SlotDutyBucket.SAFETY_BACKLOG_EXCLUSION,
+                    device_index=excluded_card,
+                    detail=(
+                        "the only card that can serve it hosts the safety process and is holding new "
+                        "dispatches off while its safety check backlog drains"
+                    ),
+                ),
+            )
+        return eligible
 
     def _card_eligibility(self, job: ImageGenerateJobPopResponse) -> CardEligibilityVerdict:
         """Return exact per-card reasons behind the routing verdict for ``job``."""
@@ -7949,7 +8052,23 @@ class InferenceScheduler:
             self._card_runtimes,
             baseline=baseline_value,
             weight_mb=weight_mb,
+            fixed_reserved_vram_mb_by_card=self._fixed_reserved_vram_mb_by_card(),
         )
+
+    def _fixed_reserved_vram_mb_by_card(self) -> dict[int, float]:
+        """Device VRAM (MB) each card owes a tenant that no teardown returns, for the whole-card weight fit.
+
+        Only a fixed safety residency (:meth:`_safety_residency_fixed`) produces one today: that card carries
+        safety's whole-device footprint for the session, so a model that would otherwise claim the card is
+        judged against what is left of it and seats on a sibling when it does not fit. Empty on every other
+        topology, where the fit reads the card's whole total exactly as it always has.
+        """
+        if not self._safety_residency_fixed():
+            return {}
+        safety_card = self._process_lifecycle.safety_gpu_card_index()
+        if safety_card is None:
+            return {}
+        return {safety_card: self._safety_footprint_mb()}
 
     def _unserviceable_job_reason(self, job: ImageGenerateJobPopResponse) -> str | None:
         """Return a fault reason when no serving card can ever host this job's model minimum.

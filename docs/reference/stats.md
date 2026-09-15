@@ -135,6 +135,12 @@ judged against: `room_candidate_mb`, `room_available_mb`, `room_deficit_mb`, `ro
 `whole_card_wants`, `whole_card_retired_by_measurement`, `whole_card_measured_mb`,
 `whole_card_observations`. The hold WARNING in the log renders the same figures on one line.
 
+For a safety process with fixed multi-GPU residency, `tenancy_safety_mb` is never lower than the learned-or-seed
+safety footprint and `safety_off_gpu` is omitted from the room's rung fields entirely: it is capacity the card
+cannot offer, not a currently forbidden action an operator setting could unlock. A job held because the safety
+backlog temporarily excludes its only eligible card is classified under the `safety_backlog_exclusion`
+dispatch-stall bucket until the backlog drains.
+
 ## Stats tab: the Model pool section
 
 When the [fixed model pool](../explanation/model_pool.md) is enabled, the dashboard's **Stats** tab grows a

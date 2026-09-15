@@ -152,9 +152,15 @@ from dataclasses import dataclass, field
 
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
-from horde_worker_regen.process_management.ipc.messages import HordeInferenceControlMessage, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import (
+    HordeImageResult,
+    HordeInferenceControlMessage,
+    HordeProcessState,
+)
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -187,6 +193,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
 )
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import HEAD_PROTECTION_MAX_STARVE_SECONDS
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
+    SAFETY_BACKLOG_PRIORITY_DEPTH,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
 )
 from tests.process_management.conftest import make_job_pop_response
@@ -2790,6 +2797,108 @@ async def test_q_safety_stays_on_a_card_committed_only_to_the_work_it_serves() -
         f"{safety_card} is committed to ({heaviest_on_safety_card}), so this run would pass with the peak "
         f"priced worker-wide and says nothing about per-card attribution. {world.state_dump()}"
     )
+
+
+async def test_q_fixed_safety_residency_yields_its_card_to_a_deep_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-GPU safety stays resident, then its card stops new work until a deep backlog drains.
+
+    The sibling runs the heavier peak while safety remains pinned to card 1. Once more than two completed
+    images wait for safety, the durable exclusion leaves a job that only card 1 can serve pending without
+    interrupting the job already running there. Draining the backlog clears the latch and that same pending
+    job dispatches on card 1.
+    """
+    world = _two_card_safety_world()
+    world._lifecycle.safety_residency_fixed = True
+    assert world._card_runtimes is not None
+    world._card_runtimes[0].config.image_models_to_load = [_SD15_OTHER.name]
+    world._card_runtimes[1].config.image_models_to_load = [_SD15.name]
+
+    heavy_width, heavy_height = _TWO_CARD_HEAVY_SHAPE
+    light_width, light_height = _TWO_CARD_LIGHT_SHAPE
+    heavy = make_job_pop_response(
+        _SD15_OTHER.name,
+        width=heavy_width,
+        height=heavy_height,
+        n_iter=_TWO_CARD_HEAVY_BATCH,
+        ddim_steps=20,
+    )
+    running_on_safety_card = make_job_pop_response(
+        _SD15.name,
+        width=light_width,
+        height=light_height,
+        ddim_steps=_TWO_CARD_LIGHT_STEPS,
+    )
+    await world.pop(heavy)
+    await world.pop(running_on_safety_card)
+    for _ in range(20):
+        await world.step()
+        if (
+            heavy in world.job_tracker.jobs_in_progress
+            and running_on_safety_card in world.job_tracker.jobs_in_progress
+        ):
+            break
+
+    assert heavy in world.job_tracker.jobs_in_progress
+    assert running_on_safety_card in world.job_tracker.jobs_in_progress
+    sibling_peak = world.scheduler._largest_active_sampling_peak(0)
+    safety_card_peak = world.scheduler._largest_active_sampling_peak(_TWO_CARD_SAFETY_CARD)
+    assert sibling_peak is not None and safety_card_peak is not None and sibling_peak[0] > safety_card_peak[0]
+    assert world.safety_pause_events == []
+
+    original_drain_safety = world._drain_safety
+
+    async def hold_safety_backlog() -> None:
+        """Leave pending safety checks queued until the scenario explicitly drains them."""
+
+    monkeypatch.setattr(world, "_drain_safety", hold_safety_backlog)
+    for _ in range(SAFETY_BACKLOG_PRIORITY_DEPTH + 1):
+        completed = make_job_pop_response(_SD15.name)
+        await world.job_tracker.queue_for_safety(
+            HordeJobInfo(
+                sdk_api_job_info=completed,
+                job_image_results=[HordeImageResult(image_bytes=b"image")],
+                state=GENERATION_STATE.ok,
+                censored=False,
+                time_popped=world.now,
+            ),
+        )
+
+    in_progress_before_arm = set(world.job_tracker.jobs_in_progress)
+    world.scheduler._reconcile_runtime_safety_placement()
+    assert world.scheduler.safety_placement.backlog_excluded_card == _TWO_CARD_SAFETY_CARD
+    assert set(world.job_tracker.jobs_in_progress) == in_progress_before_arm
+    assert world.safety_pause_events == []
+
+    waiter = make_job_pop_response(
+        _SD15.name,
+        width=light_width,
+        height=light_height,
+        ddim_steps=20,
+    )
+    await world.pop(waiter)
+    for _ in range(12):
+        await world.step()
+    assert world.dispatch_tick(waiter) is None
+    assert any(
+        "safety_backlog_exclusion" in reason
+        for declines in world.dispatch_declines.values()
+        for reason in declines.values()
+    )
+    assert world.safety_pause_events == []
+
+    await original_drain_safety()
+    monkeypatch.setattr(world, "_drain_safety", original_drain_safety)
+    world.scheduler._reconcile_runtime_safety_placement()
+    assert world.scheduler.safety_placement.backlog_excluded_card is None
+    for _ in range(20):
+        await world.step()
+        if world.dispatch_tick(waiter) is not None:
+            break
+    assert world.dispatch_tick(waiter) is not None
+    waiter_lane = world.lane_serving(waiter)
+    assert waiter_lane is not None and world.card_of_lane(waiter_lane) == _TWO_CARD_SAFETY_CARD
 
 
 async def test_q_defect_reinjection_a_worker_wide_peak_evicts_safety_from_a_healthy_card(

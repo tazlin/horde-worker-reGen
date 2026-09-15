@@ -195,6 +195,30 @@ def test_safety_off_gpu_rung_is_available_when_operator_allows_safety_teardown()
     assert candidates.safety.kind is ReclaimRungKind.SAFETY_OFF_GPU
 
 
+def test_fixed_multi_gpu_safety_residency_has_no_safety_reclaim_rungs() -> None:
+    """A fixed safety residency offers neither weight demotion nor a process-cycle rung."""
+    safety = make_mock_process_info(
+        10,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    safety.process_reserved_mb = 3044  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({10: safety}),
+        bridge_data=make_mock_bridge_data(
+            safety_on_gpu=True,
+            whole_card_residency_safety_off_gpu=True,
+        ),
+    )
+    scheduler._process_lifecycle.safety_residency_fixed = True
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert candidates.safety_weights is None
+    assert candidates.safety is None
+
+
 def test_safety_off_gpu_rung_is_absent_when_safety_is_configured_cpu_side() -> None:
     """A CPU-side safety configuration must not create an on-GPU safety teardown candidate."""
     safety = make_mock_process_info(

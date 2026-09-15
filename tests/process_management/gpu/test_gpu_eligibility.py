@@ -34,6 +34,7 @@ def _profile(
     device_index: int,
     total_vram_mb: float | None,
     served: set[str] | None,
+    fixed_reserved_vram_mb: float = 0.0,
     **config: object,
 ) -> CardProfile:
     """A CardProfile with a config carrying the given feature/resolution overrides.
@@ -49,6 +50,7 @@ def _profile(
         total_vram_mb=total_vram_mb,
         config=bridge,
         served_models=frozenset(served) if served is not None else None,
+        fixed_reserved_vram_mb=fixed_reserved_vram_mb,
     )
 
 
@@ -144,3 +146,33 @@ class TestHeterogeneousWeightFit:
         requirements = describe_job_requirements(job, None, weight_mb=2048.0)  # ~2 GB
 
         assert eligible_cards([big_card, small_card], requirements) == {0, 1}
+
+    def test_fixed_safety_charge_excludes_only_whole_card_work_from_its_card(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A whole-card model seats on the sibling when safety's fixed footprint makes its card too small."""
+        import hordelib.vram_planning as vram_planning
+
+        monkeypatch.setattr(vram_planning, "compute_weight_budget_mb", lambda total_vram_mb: total_vram_mb * 0.8)
+        safety_card = _profile(
+            device_index=0,
+            total_vram_mb=16384,
+            served={"whole-card"},
+            fixed_reserved_vram_mb=3044.0,
+        )
+        sibling = _profile(device_index=1, total_vram_mb=16384, served={"whole-card"})
+        job = make_job_pop_response(model="whole-card", width=512, height=512)
+        ordinary = describe_job_requirements(job, _SDXL, weight_mb=11000.0)
+        whole_card = JobRequirements(
+            model=ordinary.model,
+            baseline=ordinary.baseline,
+            weight_mb=ordinary.weight_mb,
+            image_features=ordinary.image_features,
+            pixels=ordinary.pixels,
+            batch=ordinary.batch,
+            wants_whole_card=True,
+        )
+
+        assert eligible_cards([safety_card, sibling], ordinary) == {0, 1}
+        assert eligible_cards([safety_card, sibling], whole_card) == {1}

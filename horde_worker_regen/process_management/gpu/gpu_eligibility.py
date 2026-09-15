@@ -46,6 +46,8 @@ from horde_sdk.worker.feature_flags import (
 from loguru import logger
 from strenum import StrEnum
 
+from horde_worker_regen.process_management.models.model_sizing import is_extra_large_model
+
 if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
@@ -168,6 +170,10 @@ class CardProfile:
     total_vram_mb: float | None
     config: reGenBridgeData
     served_models: frozenset[str] | None = None
+    fixed_reserved_vram_mb: float = 0.0
+    """Device VRAM (MB) on this card that a whole-card resident can never have, because another tenant holds
+    it for the session and no teardown returns it (today: a fixed on-GPU safety residency). Zero on a card
+    with no such tenant, where the weight fit is judged against the whole total exactly as before."""
 
 
 @dataclass(frozen=True)
@@ -180,6 +186,9 @@ class JobRequirements:
     image_features: ImageGenerationFeatureFlags
     pixels: int
     batch: int
+    wants_whole_card: bool = False
+    """Whether this job's model claims the whole card (the EXTRA_LARGE size tier), so a card's permanently
+    reserved VRAM is capacity it can never borrow back for the weights."""
 
 
 @dataclass(frozen=True)
@@ -214,6 +223,7 @@ def describe_job_requirements(
     work by the ``nsfw`` flag on the offer, so the policy is enforced at pop time (see
     [`gpu_pop_shaping`][horde_worker_regen.process_management.gpu.gpu_pop_shaping]) rather than per card.
     """
+    baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
     return JobRequirements(
         model=job.model,
         baseline=baseline,
@@ -221,19 +231,32 @@ def describe_job_requirements(
         image_features=image_job_pop_response_to_feature_flags(job, resolved_baseline=baseline),
         pixels=int(job.payload.width) * int(job.payload.height),
         batch=int(job.payload.n_iter),
+        wants_whole_card=is_extra_large_model(job.model, baseline_value),
     )
 
 
-def _weights_fit_card(total_vram_mb: float | None, weight_mb: float | None) -> bool:
-    """Return whether weights fit the card budget, abstaining when either fact is unavailable."""
+def _weights_fit_card(
+    total_vram_mb: float | None,
+    weight_mb: float | None,
+    fixed_reserved_vram_mb: float = 0.0,
+) -> bool:
+    """Return whether weights fit the card budget, abstaining when either fact is unavailable.
+
+    ``fixed_reserved_vram_mb`` is device memory another tenant holds for the session, so the budget is
+    computed from what is left of the card rather than from its nameplate total: a card that permanently owes
+    three gigabytes to a resident classifier is, for a model that wants the whole card, a smaller card.
+    """
     if weight_mb is None or total_vram_mb is None or total_vram_mb <= 0:
         return True
+    usable_vram_mb = total_vram_mb - max(0.0, fixed_reserved_vram_mb)
+    if usable_vram_mb <= 0:
+        return False
     try:
         from hordelib.vram_planning import compute_weight_budget_mb
 
-        budget_mb = compute_weight_budget_mb(int(total_vram_mb))
+        budget_mb = compute_weight_budget_mb(int(usable_vram_mb))
     except Exception as error:  # noqa: BLE001 - an unavailable estimate must not crash routing
-        logger.debug(f"Weight-budget lookup failed for {total_vram_mb} MB: {type(error).__name__} {error}")
+        logger.debug(f"Weight-budget lookup failed for {usable_vram_mb} MB: {type(error).__name__} {error}")
         return True
     return weight_mb <= budget_mb
 
@@ -244,7 +267,11 @@ def reasons_card_cannot_serve(card: CardProfile, requirements: JobRequirements) 
     reasons: list[CardNotCapableReason] = []
     reasons.extend(worker_features.reasons_not_capable_of_features(requirements.image_features) or [])
 
-    if not _weights_fit_card(card.total_vram_mb, requirements.weight_mb):
+    # A job that shares the card is judged against the whole total: the reserved tenant's memory is admission's
+    # subject cycle by cycle, not a permanent subtraction from what the card can hold. A whole-card model gets
+    # the card to itself except for that tenant, so for it the reservation is capacity that is simply not there.
+    reserved_mb = card.fixed_reserved_vram_mb if requirements.wants_whole_card else 0.0
+    if not _weights_fit_card(card.total_vram_mb, requirements.weight_mb, reserved_mb):
         reasons.append(CARD_NOT_CAPABLE_REASON.model_weights)
     if (
         card.served_models is not None
@@ -285,6 +312,7 @@ def eligible_card_indices_for(
     *,
     baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
     weight_mb: float | None,
+    fixed_reserved_vram_mb_by_card: Mapping[int, float] | None = None,
 ) -> set[int]:
     """Return cards whose canonical features and local constraints cover an accepted job."""
     return card_eligibility_for(
@@ -292,6 +320,7 @@ def eligible_card_indices_for(
         card_runtimes,
         baseline=baseline,
         weight_mb=weight_mb,
+        fixed_reserved_vram_mb_by_card=fixed_reserved_vram_mb_by_card,
     ).eligible_card_indices
 
 
@@ -301,15 +330,23 @@ def card_eligibility_for(
     *,
     baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
     weight_mb: float | None,
+    fixed_reserved_vram_mb_by_card: Mapping[int, float] | None = None,
 ) -> CardEligibilityVerdict:
-    """Return exact per-card compatibility reasons for an accepted job."""
+    """Return exact per-card compatibility reasons for an accepted job.
+
+    ``fixed_reserved_vram_mb_by_card`` names device memory a card owes another tenant for the session (see
+    :attr:`CardProfile.fixed_reserved_vram_mb`). Omitted, every card is judged against its whole total, which
+    is the answer for a worker with no such tenant.
+    """
     requirements = describe_job_requirements(job, baseline, weight_mb)
+    reserved_by_card = fixed_reserved_vram_mb_by_card or {}
     profiles = [
         CardProfile(
             device_index=card.device_index,
             total_vram_mb=card.total_vram_mb,
             config=card.config,
             served_models=frozenset(card.config.image_models_to_load),
+            fixed_reserved_vram_mb=reserved_by_card.get(card.device_index, 0.0),
         )
         for card in card_runtimes.values()
     ]

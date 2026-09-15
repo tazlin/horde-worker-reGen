@@ -72,6 +72,11 @@ class SlotDutyBucket(StrEnum):
     """The head-priority barrier withheld the dispatch so the card the starved head's load is aimed at drains
     to the no-live-consumer admit. The withheld job keeps its queue position and runs once the barrier
     releases."""
+    SAFETY_BACKLOG_EXCLUSION = "safety_backlog_exclusion"
+    """The only card that could serve the job hosts the safety process and was holding new dispatches off
+    while its safety check backlog drained. The card's running jobs finish and the job dispatches once the
+    backlog clears; the exclusion is the relief valve for a card whose safety residency is fixed, so the
+    backlog has no placement remedy."""
     AUX_PREPARATION = "aux_preparation"
     """The selected job's auxiliary models (LoRAs, textual inversions) were still being placed on disk, so it
     held no lane and could not sample. Selection already skips such a job; this is the terminal backstop that

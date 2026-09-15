@@ -974,6 +974,26 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at=_DISPATCH_STALL_OBSERVABLE,
     ),
     GateEntry(
+        key="safety_backlog_exclusion",
+        surface=GateSurface.DISPATCH_STALL,
+        kind=GateKind.HOLD,
+        subsystem="process_management.scheduling.inference_scheduler",
+        engaged_by=(
+            "the only card that can serve the job hosts the safety process, whose residency there is fixed, "
+            "and its safety check backlog passed the priority depth, so the card takes no new dispatches "
+            "while it catches up"
+        ),
+        released_by="the card's safety backlog draining to zero, which the running jobs it keeps finishing feed",
+        bound_seconds=None,
+        bound_source="the safety lane's own drain rate for the checks already queued",
+        backstop=(
+            "the exclusion holds no work of its own and stops nothing already running, so the backlog that "
+            "armed it is drained by the jobs the card is still completing; every sibling card keeps taking "
+            "new work throughout"
+        ),
+        observable_at=_DISPATCH_STALL_OBSERVABLE,
+    ),
+    GateEntry(
         key="unexplained",
         surface=GateSurface.DISPATCH_STALL,
         kind=GateKind.HOLD,

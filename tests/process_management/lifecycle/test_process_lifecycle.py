@@ -55,6 +55,7 @@ def _make_plm(
     device_total_vram_mb_provider: object | None = None,
     device_governor_state_provider: object | None = None,
     gpu_start_context_mb_provider: object | None = None,
+    device_indices: tuple[int, ...] = (0,),
 ) -> ProcessLifecycleManager:
     """Helper to build a PLM with mostly-mocked dependencies."""
     bridge_data = Mock()
@@ -78,7 +79,11 @@ def _make_plm(
         horde_model_map=Mock(),
         job_tracker=job_tracker or JobTracker(),
         process_message_queue=Mock(),
-        card_runtimes=make_test_card_runtimes(target_process_count=2, config=bridge_data),
+        card_runtimes=make_test_card_runtimes(
+            device_indices=device_indices,
+            target_process_count=2,
+            config=bridge_data,
+        ),
         disk_lock=Mock(),
         download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
@@ -923,6 +928,20 @@ def test_pause_safety_on_gpu_is_noop_when_safety_not_on_gpu() -> None:
     plm = _make_plm()  # _make_plm defaults safety_on_gpu to False
     assert plm.pause_safety_on_gpu(owner=PauseOwner.WHOLE_CARD) is False
     assert plm.is_safety_gpu_paused is False
+
+
+def test_pause_safety_on_gpu_refuses_a_fixed_multi_gpu_residency() -> None:
+    """The lifecycle actuator backstop cannot move pinned safety off a card on a multi-GPU worker."""
+    plm = _make_plm(device_indices=(0, 1))
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+    plm._safety_pinned_card = 0
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+
+    assert plm.safety_residency_fixed is True
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is False
+    assert plm.is_safety_gpu_paused is False
+    assert plm.safety_gpu_pause_count == 0
+    assert plm.safety_processes_should_be_replaced is False
 
 
 def test_slow_healthy_safety_placement_respawn_cannot_advance_start_failure_breaker() -> None:

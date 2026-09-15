@@ -121,6 +121,21 @@ The `Withholding job pops: post-inference safety backlog` warning's closing advi
 running: it suggests enabling `safety_on_gpu` only while that is off, and names resource governance when the
 setting is on but the placement policy has moved safety to the CPU.
 
+On a multi-GPU worker, a safety process pinned to a permitted GPU has fixed residency: memory pressure,
+whole-card residency, and the reclaim ladder do not move it off that card or demote its weights. A deep backlog
+uses dispatch pressure instead. These edge-triggered info lines mark the durable exclusion arming above two
+pending checks and clearing only after the backlog reaches zero:
+
+```text
+Safety backlog of 3 checks exceeds 2 on card 1, which hosts the safety process: holding new inference
+dispatches off that card until the backlog drains. Jobs already running there are left to finish.
+Safety backlog on card 1 is at 0: new inference dispatches may land there again.
+```
+
+While the exclusion stands, a job that only that card can serve remains queued and its dispatch-hold record is
+classified as `safety_backlog_exclusion`. Other cards continue accepting work. Single-GPU workers retain the
+runtime demote/restore policy and use the pop self-throttle as their backlog relief valve.
+
 ## Supervisor stall forgiveness
 
 Two lines in `bridge_tui.log` / `bridge_host.log` describe the *supervisor's* own liveness rather than the

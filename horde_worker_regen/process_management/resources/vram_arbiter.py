@@ -539,6 +539,12 @@ class DeviceVramState:
     safety_footprint_mb: float = 0.0
     """Safety's whole-device footprint (MB), the figure every safety consumer prices from; used by the room
     breakdown when the safety process has not reported a reservation."""
+    safety_residency_fixed: bool = False
+    """Whether safety's place on this card is fixed for the session, so no policy can move it off.
+
+    Distinct from ``safety_reclaim_allowed`` being false for a cycle: that is a request policy withholds now
+    and may grant later, while this says the card owes safety its footprint for good. The room breakdown
+    charges a fixed residency at no less than that footprint and stops naming it as a rung."""
 
     def sampling_headroom_mb(self) -> float | None:
         """Reproduce the concurrent-sampling headroom (MB), or None when the total is unknown.
@@ -927,6 +933,7 @@ class VramArbiter:
             post_process_reclaim_permitted=state.post_process_reclaim_allowed,
             safety_reclaim_permitted=state.safety_reclaim_allowed,
             utilities_reclaim_permitted=state.utilities_reclaim_allowed,
+            safety_residency_fixed=state.safety_residency_fixed,
         )
 
     def _head_protection_defer(

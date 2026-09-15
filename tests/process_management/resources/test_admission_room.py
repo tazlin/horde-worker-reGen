@@ -33,14 +33,19 @@ def _edge_room(
     post_process_permitted: bool = True,
     utilities_permitted: bool = False,
     safety_permitted: bool = True,
+    safety_reserved_mb: float | None = None,
+    safety_residency_fixed: bool = False,
 ) -> AdmissionRoom:
     """A 24 GB card holding two inference contexts, a post-processing lane, a utilities lane and safety.
 
     The target slot (pid 2) and its idle sibling (pid 3) each report a small allocator reservation; the
     lanes report theirs; safety reports nothing and is priced at its footprint. The device-free reading is
-    set so the foreign share comes out to a round figure.
+    set so the foreign share comes out to a round figure. ``safety_reserved_mb`` gives safety a reported
+    reservation instead, for the rows about what a fixed residency is charged.
     """
     reserved = {2: 100.0, 3: 100.0, 1: 808.0, 4: 554.0}
+    if safety_reserved_mb is not None:
+        reserved[0] = safety_reserved_mb
     lanes = {
         2: TenantLane.INFERENCE_IDLE,
         3: TenantLane.INFERENCE_IDLE,
@@ -64,6 +69,7 @@ def _edge_room(
         post_process_reclaim_permitted=post_process_permitted,
         safety_reclaim_permitted=safety_permitted,
         utilities_reclaim_permitted=utilities_permitted,
+        safety_residency_fixed=safety_residency_fixed,
     )
 
 
@@ -150,6 +156,41 @@ def test_a_fitting_candidate_reports_no_deficit() -> None:
     assert room.deficit_mb < 0
     assert room.closable is False
     assert room.describe().startswith("fits by")
+
+
+def test_a_fixed_safety_residency_is_never_a_rung() -> None:
+    """A card that owes safety its place for the session offers no rung against it, permitted or not.
+
+    The unpermitted rung is still listed for every other lane, because an operator setting could unlock it.
+    Nothing unlocks a fixed residency, so naming it would promise room that can never be returned.
+    """
+    room = _edge_room(safety_residency_fixed=True, safety_permitted=True)
+
+    assert RoomRungKind.SAFETY_OFF_GPU not in {rung.kind for rung in room.rungs}
+    assert RoomRungKind.POST_PROCESS_LANE in {rung.kind for rung in room.rungs}
+    assert room.tenancy_mb[TenantLane.SAFETY] == 3044.0
+
+
+def test_a_fixed_safety_residency_is_charged_no_less_than_its_footprint() -> None:
+    """An at-rest reservation below the footprint does not lower what a fixed residency costs the card.
+
+    A safety process between evaluations reports the allocator it is holding right then, which is not the
+    commitment: the next check re-stages the weights. Admitting a candidate against that difference
+    over-commits the card the moment one arrives.
+    """
+    fixed = _edge_room(safety_reserved_mb=200.0, safety_residency_fixed=True)
+    movable = _edge_room(safety_reserved_mb=200.0, safety_residency_fixed=False)
+
+    assert fixed.tenancy_mb[TenantLane.SAFETY] == 3044.0
+    assert movable.tenancy_mb[TenantLane.SAFETY] == 200.0 + _CONTEXT_MB
+    assert fixed.reclaimable_mb == movable.reclaimable_mb - movable.tenancy_mb[TenantLane.SAFETY]
+
+
+def test_a_reservation_above_the_footprint_still_charges_the_reservation() -> None:
+    """The fixed charge is a floor, not a replacement: a safety process holding more is charged for it."""
+    room = _edge_room(safety_reserved_mb=5000.0, safety_residency_fixed=True)
+
+    assert room.tenancy_mb[TenantLane.SAFETY] == 5000.0 + _CONTEXT_MB
 
 
 def test_arbiter_attaches_the_room_to_a_non_fitting_verdict() -> None:

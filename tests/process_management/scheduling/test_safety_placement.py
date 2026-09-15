@@ -48,6 +48,7 @@ from horde_worker_regen.process_management.scheduling import inference_scheduler
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.retention import idle_resident_reclaimable_mb
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
+    SAFETY_BACKLOG_PRIORITY_DEPTH,
     SAFETY_GPU_LOAD_CHARGE_MB,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
     SAFETY_RESTORE_PP_BACKLOG_DEPTH,
@@ -158,6 +159,7 @@ def _placement_harness(
     lifecycle.is_safety_gpu_paused = False
     lifecycle.safety_pause_owner = None
     lifecycle.safety_placement_transition_pending = False
+    lifecycle.safety_residency_fixed = False
 
     def _mark_paused(*, owner: PauseOwner) -> bool:
         lifecycle.is_safety_gpu_paused = True
@@ -939,6 +941,60 @@ class TestSafetyBacklogPriority:
 
         harness.lifecycle.pause_safety_on_gpu.assert_not_called()
         assert harness.scheduler.safety_placement.pressure_since is None
+
+
+class TestFixedMultiGpuSafetyResidency:
+    """A pinned safety process on a multi-card worker stays resident and gets a backlog relief valve."""
+
+    @staticmethod
+    def _harness(monkeypatch: pytest.MonkeyPatch) -> _PlacementHarness:
+        """Build a two-card placement harness with safety pinned and fixed on card zero."""
+        harness = _placement_harness(
+            monkeypatch,
+            card_runtimes=make_test_card_runtimes(device_indices=(0, 1), mask_kind="cuda"),
+        )
+        harness.lifecycle.safety_gpu_card_index = Mock(return_value=0)
+        harness.lifecycle.safety_residency_fixed = True
+        return harness
+
+    async def test_fixed_residency_discards_pressure_and_every_pending_pause_request(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pressure and a pre-existing ladder request cannot name an owner or survive into a later topology."""
+        harness = self._harness(monkeypatch)
+        _pin_evidence(harness, pressured=True)
+        harness.scheduler.safety_placement.reclaim_pause_requested = True
+
+        harness.reconcile_over(harness.demotion_dwell_seconds * 2.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+        assert harness.scheduler.safety_placement.pressure_since is None
+        assert harness.scheduler.safety_placement.headroom_since is None
+        assert harness.scheduler.safety_placement.reclaim_pause_requested is False
+
+    async def test_backlog_exclusion_arms_above_threshold_and_clears_only_when_drained(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The durable latch survives a shallow backlog and releases only at exactly zero."""
+        harness = self._harness(monkeypatch)
+        await _queue_safety_backlog(harness.scheduler, SAFETY_BACKLOG_PRIORITY_DEPTH + 1)
+
+        harness.reconcile()
+        assert harness.scheduler.safety_placement.backlog_excluded_card == 0
+
+        queued = list(harness.scheduler._job_tracker.jobs_pending_safety_check)
+        for job_info in queued[:-1]:
+            await harness.scheduler._job_tracker.abandon_pending_safety(job_info)
+        harness.reconcile()
+        assert harness.scheduler._job_tracker.safety_backlog_depth == 1
+        assert harness.scheduler.safety_placement.backlog_excluded_card == 0
+
+        await harness.scheduler._job_tracker.abandon_pending_safety(queued[-1])
+        harness.reconcile()
+        assert harness.scheduler._job_tracker.safety_backlog_depth == 0
+        assert harness.scheduler.safety_placement.backlog_excluded_card is None
 
 
 class TestPerCardSafetyPermission:
