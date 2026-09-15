@@ -61,7 +61,7 @@ class HordeProcessType(enum.Enum):
     DOWNLOAD = auto()
     """A background model-downloading process; serves no jobs and lives outside the process map."""
     TEXT_BACKEND = auto()
-    """An external text-inference program (koboldcpp) the worker launches and supervises over HTTP.
+    """An external text-inference program the worker launches and supervises over HTTP.
 
     Not a worker child in the IPC sense: it has no pipe and no message protocol, so it lives outside the
     process map behind the ``TextBackendSupervisor`` in ``lifecycle/text_backend_supervisor.py``. The

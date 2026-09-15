@@ -90,6 +90,7 @@ class FakeTextBackend:
         response_text: str | Callable[[Mapping[str, object]], str] = "",
         latency_seconds: float = 0.0,
         generate_failures: Sequence[TextBackendError | None] = (),
+        ready_results: Sequence[bool] = (),
     ) -> None:
         """Create a fake backend that answers as configured.
 
@@ -103,11 +104,16 @@ class FakeTextBackend:
             generate_failures: One entry per successive generation: an exception to raise, or `None` to
                 succeed. Once the script runs out, every further generation succeeds. This is how a
                 caller scripts "busy twice then succeed", or a rejected payload, without a server.
+            ready_results: One entry per successive `ready` call. Once the script runs out, every
+                further call answers `True`. This is how a caller rehearses a backend that is still
+                loading its weights for the first few polls, which is the normal reading during a cold
+                start and the window a readiness gate exists for.
         """
         self._description = description
         self._response_text = response_text
         self._latency_seconds = latency_seconds
         self._generate_failures = tuple(generate_failures)
+        self._ready_results = tuple(ready_results)
         self._calls = _FakeCallLog()
         self._closed = False
 
@@ -137,20 +143,23 @@ class FakeTextBackend:
         return self._closed
 
     async def ready(self, *, deadline_seconds: float) -> bool:
-        """Return `True`, recording the call.
+        """Return the readiness scripted for this call, recording the call.
 
         A fake backend is configured with the model it claims to have loaded, so it is ready by
-        construction; a flow that needs to exercise a backend still starting up is given no fake until
-        the point where it should become ready.
+        construction unless `ready_results` says otherwise for the first few calls, which is how a
+        caller rehearses a backend still loading.
 
         Args:
             deadline_seconds: Recorded, so a caller can assert the deadline the flow chose.
 
         Returns:
-            `True`, always.
+            The next entry in the configured readiness script, or `True` once it runs out.
         """
+        ready_index = len(self._calls.ready)
         self._calls.ready.append(FakeReadyCall(deadline_seconds=deadline_seconds))
-        return True
+        if ready_index >= len(self._ready_results):
+            return True
+        return self._ready_results[ready_index]
 
     async def describe(self) -> TextBackendDescription:
         """Return the configured description, recording the call."""

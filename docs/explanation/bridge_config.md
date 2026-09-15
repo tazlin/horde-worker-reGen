@@ -12,7 +12,9 @@
         - [Custom models](#custom-models)
         - [Post-processing overlap](#post-processing-overlap)
         - [Dormant experimental flags](#dormant-experimental-flags)
+        - [Worker roles](#worker-roles)
         - [Alchemy](#alchemy)
+        - [Text generation (scribe)](#text-generation-scribe)
     - [Configuration flow at a glance](#configuration-flow-at-a-glance)
     - [See also](#see-also)
 
@@ -473,6 +475,22 @@ against measured host-RAM headroom (sized beside `ram_per_process_max_mb` and an
 co-tenants), never on the assumption that more cache is faster. Pair this preset
 with the `disagg_optimized N` model rule so the served set shares VAE lanes well.
 
+### Worker roles
+
+Three independent flags decide what a worker serves, and any combination of them is valid:
+
+| Field       | Default | Effect                                                                            |
+| ----------- | ------- | --------------------------------------------------------------------------------- |
+| `dreamer`   | `true`  | Serve image generation. The historical worker; deselect it to run other roles only. |
+| `alchemist` | `false` | Serve alchemy forms (see [Alchemy](#alchemy)).                                     |
+| `scribe`    | `false` | Serve text generation (see [Text generation](#text-generation-scribe)).            |
+
+With all three off the worker has nothing to serve and logs a warning. A CPU-only install cannot serve
+image generation regardless of `dreamer`, so only the other roles run there.
+[`capabilities.enabled_workloads`][horde_worker_regen.capabilities.enabled_workloads] is the single
+derivation of served workloads from these flags, and it drives process sizing and the dashboard's mode
+identity.
+
 ### Alchemy
 
 `alchemist: true` opts the worker into **alchemy** jobs (`/v2/interrogate/pop`) in
@@ -505,6 +523,32 @@ Image jobs always win contention for a process; in concurrent mode, alchemy only
 uses a process lane no waiting image job needs **and** only when the VRAM-headroom
 gate passes. See
 [Performance and Backpressure → Alchemy backpressure](performance_and_backpressure.md#alchemy-backpressure).
+
+### Text generation (scribe)
+
+`scribe: true` opts the worker into **text** jobs (`/v2/generate/text/pop`). The generation itself runs
+in a separate program the operator starts, the text backend (koboldcpp today; sonar and others planned),
+which the worker reaches over HTTP at `kai_url`, so this role starts no child process, loads no weights
+here, and takes no share of the VRAM budget. Nothing
+is popped until that backend reports a loaded model and describes itself, and each figure advertised is
+the lower of the operator's and the backend's. See [Text generation](text_generation.md) for the flow's
+behaviour and its current limitations.
+
+| Field                            | Default                   | Effect                                                                                                                                                                                                                       |
+| -------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scribe`                         | `false`                   | Enables text popping/processing at all. Read when the worker builds its flows, so turning it on takes a restart.                                                                                                              |
+| `scribe_name`                    | `"An Awesome Scribe"`     | The worker name this role registers under. Unique horde-wide, and cannot reuse `dreamer_name` or `alchemist_name`.                                                                                                             |
+| `kai_url`                        | `"http://localhost:5000"` | Where the text backend listens.                                                                                                                                                                                              |
+| `max_length`                     | `80`                      | Ceiling on tokens generated per job. Advertised as the lower of this and the backend's own cap, and, unless `text_generation_timeout_seconds` is set, the figure the per-generation deadline is derived from.                  |
+| `max_context_length`             | `1024`                    | Ceiling on prompt-plus-generation tokens. Advertised as the lower of this and the backend's own cap.                                                                                                                          |
+| `text_model_name`                | unset                     | The model to advertise, as the text model reference spells it (`author/Model`, plus any quant suffix). Unset follows whatever the backend reports. Give the plain name: the backend prefix is derived, and a prefixed name is rejected. |
+| `text_threads`                   | `1`                       | How many generations the backend runs at once; also the flow's in-flight ceiling and the thread count advertised on a pop. Unrelated to `max_threads`, which sizes GPU inference lanes. Bounded 1-16.                          |
+| `text_generation_timeout_seconds` | unset                    | Per-generation deadline. Unset derives it from `max_length` at a slow tokens-per-second floor (`max_length / 2 + 10`, the legacy scribe bridge's convention).                                                                  |
+| `branded_model`                  | `true`                    | Append the horde alias behind the API key to the advertised model, so no other worker can claim to serve it. Keeps it out of the shared pool.                                                                                  |
+
+On a host running a scribe beside image generation, the plan-time process-count sizing reserves a coarse
+fixed RAM allowance for the backend's weights, because the worker cannot see how large the text model is.
+See [Process count](#process-count).
 
 ### Log retention
 

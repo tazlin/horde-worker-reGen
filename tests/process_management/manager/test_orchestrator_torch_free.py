@@ -30,6 +30,10 @@ _TORCH_FREE_IMPORT_MODULES = [
     "horde_worker_regen.process_management.models.component_residency_map",
     "horde_worker_regen.process_management.resources.resource_budget",
     "horde_worker_regen.process_management.jobs.job_popper",
+    # The text flow and the package it talks to run in the main process and reach their backend over
+    # HTTP, so nothing about text generation may drag torch into the orchestrator.
+    "horde_worker_regen.process_management.jobs.text_generation_coordinator",
+    "horde_worker_regen.text_backends",
     "horde_worker_regen.process_management.gpu.gpu_eligibility",
     "horde_worker_regen.process_management.gpu.gpu_pop_shaping",
     "horde_worker_regen.process_management.jobs.pool_lanes",

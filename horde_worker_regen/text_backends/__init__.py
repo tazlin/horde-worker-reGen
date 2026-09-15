@@ -29,6 +29,17 @@ from horde_worker_regen.text_backends.kobold_api import (
     KoboldApiTextBackend,
     KoboldApiTimeouts,
 )
+from horde_worker_regen.text_backends.launch import (
+    LAUNCH_SPEC_BUILDERS,
+    UnsupportedTextBackendError,
+    build_launch_spec,
+    launchable_backends,
+)
+from horde_worker_regen.text_backends.launch_spec import (
+    LOOPBACK_HOST,
+    TextBackendLaunchSettings,
+    TextBackendLaunchSpec,
+)
 from horde_worker_regen.text_backends.protocol import (
     TextBackend,
     TextBackendBusy,
@@ -40,6 +51,8 @@ from horde_worker_regen.text_backends.protocol import (
 )
 
 __all__ = [
+    "LAUNCH_SPEC_BUILDERS",
+    "LOOPBACK_HOST",
     "FakeGenerateCall",
     "FakeReadyCall",
     "FakeStopCall",
@@ -53,6 +66,11 @@ __all__ = [
     "TextBackendDescription",
     "TextBackendError",
     "TextBackendRejectedPayload",
+    "TextBackendLaunchSettings",
+    "TextBackendLaunchSpec",
     "TextBackendUnavailable",
     "TextGenerationResult",
+    "UnsupportedTextBackendError",
+    "build_launch_spec",
+    "launchable_backends",
 ]

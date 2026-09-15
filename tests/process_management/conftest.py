@@ -332,6 +332,16 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.alchemy_vram_headroom_mb = 2000
     bd.alchemy_ram_headroom_mb = 2048
     bd.alchemy_caption_enabled = False
+    # The scribe role and its settings. Off by default, and read through ``scribe is True`` so that a
+    # Mock's truthy attribute cannot give every mocked test a text flow.
+    bd.scribe = False
+    bd.scribe_name = "test-scribe"
+    bd.kai_url = "http://localhost:5000"
+    bd.max_length = 80
+    bd.max_context_length = 1024
+    bd.text_model_name = None
+    bd.text_threads = 1
+    bd.text_generation_timeout_seconds = None
     bd.aesthetic_scoring_enabled = True
     bd.forms = []
     bd.image_models_to_skip = None

@@ -1,8 +1,8 @@
 """Names the distinct workloads reGen orchestrates and the capability routing each one needs.
 
 reGen runs several workload "flows" over one shared pool of child processes and one shared resource
-budget: image generation and alchemy today, with audio and video generation intended to follow. Each
-flow is its own pop -> dispatch -> submit loop; what they share is the process pool (routed by
+budget: image generation, alchemy and text generation today, with audio and video generation intended to
+follow. Each flow is its own pop -> dispatch -> submit loop; what they share is the process pool (routed by
 :class:`~horde_worker_regen.process_management.lifecycle.horde_process.WorkerCapability`), the shared
 :class:`~horde_worker_regen.process_management.resources.resource_budget.CommittedReserveLedger`, and this
 vocabulary.
@@ -38,6 +38,7 @@ class WorkloadKind(StrEnum):
 
     IMAGE_GENERATION = "image_generation"
     ALCHEMY = "alchemy"
+    TEXT_GENERATION = "text_generation"
     # AUDIO_GENERATION = "audio_generation"  # reserved: the next flow to add
     # VIDEO_GENERATION = "video_generation"  # reserved
 
@@ -70,13 +71,23 @@ and its reservation drops by omission; the job-finalize hook tightens that laten
 _WORKLOAD_CAPABILITIES: dict[WorkloadKind, WorkerCapability] = {
     WorkloadKind.IMAGE_GENERATION: WorkerCapability.IMAGE_GEN,
     WorkloadKind.ALCHEMY: WorkerCapability.ALCHEMY_GRAPH | WorkerCapability.ALCHEMY_CLIP,
+    WorkloadKind.TEXT_GENERATION: WorkerCapability(0),
 }
 """The capability flags that, between them, serve each workload. The single source of truth pairing a
-workload with the process capabilities that run it (mirrored per-process by ``DEFAULT_CAPABILITIES``)."""
+workload with the process capabilities that run it (mirrored per-process by ``DEFAULT_CAPABILITIES``).
+
+Text generation declares none: its generations run in a separate program the worker reaches over HTTP
+(see :mod:`horde_worker_regen.text_backends`), so no child process of this worker serves any part of it
+and there is nothing to route. An empty flag says that explicitly, where an absent entry would read as a
+workload whose routing nobody has decided yet."""
 
 
 def capabilities_for_workload(kind: WorkloadKind) -> WorkerCapability:
-    """Return the capability flags a process must declare to serve any part of the given workload."""
+    """Return the capability flags a process must declare to serve any part of the given workload.
+
+    An empty flag means the workload runs nowhere in this worker's process pool, which is true of text
+    generation; callers looking for a process to dispatch to should find none rather than any.
+    """
     return _WORKLOAD_CAPABILITIES[kind]
 
 
@@ -106,7 +117,9 @@ class FlowCoordinator(Protocol):
     ``ImageGenerationCoordinator`` satisfies it by wrapping the image pipeline's separate popper, submitter,
     and tracker, so both flows are launched and observed uniformly through the process manager's registry.
     A flow may keep dispatch elsewhere (image generation's is interwoven with the VRAM budget in the
-    control loop); the protocol covers the flow's identity, live work count, and lifecycle entry point.
+    control loop) or have no dispatch at all (text generation's generations run in a separate program
+    reached over HTTP); the protocol covers the flow's identity, live work count, and lifecycle entry
+    point.
     """
 
     @property

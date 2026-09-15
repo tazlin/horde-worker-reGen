@@ -8,26 +8,39 @@ a patience window never elapses.
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+import aiohttp
+import psutil
 import pytest
+from horde_model_reference.text_backend_names import TEXT_BACKENDS
 
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import (
-    KoboldcppArguments,
     LaunchedProcess,
-    TextBackendLaunchSpec,
     TextBackendState,
     TextBackendSupervisor,
     TextBackendSupervisorTimings,
-    koboldcpp_launch_spec,
+    default_launch_process,
     port_is_free,
 )
-from horde_worker_regen.text_backends import TextBackendDescription, TextGenerationResult
+from horde_worker_regen.text_backends import (
+    KoboldApiTextBackend,
+    TextBackendDescription,
+    TextBackendLaunchSettings,
+    TextBackendLaunchSpec,
+    TextGenerationResult,
+    build_launch_spec,
+)
+from worker_bootstrap.koboldcpp_bin import koboldcpp_executable
+
+REAL_MODEL_ENV_VAR = "HORDE_TEXT_SMOKE_GGUF"
+"""Path of a GGUF the real-binary row loads; the row skips when it is unset or the file is missing."""
 
 FAST = TextBackendSupervisorTimings(
     ready_poll_interval=0.03,
@@ -140,7 +153,7 @@ def free_port() -> int:
 
 
 def spec_on(port: int, tmp_path: Path, *, device_index: int | None = 0) -> TextBackendLaunchSpec:
-    """Return a launch spec for a fake executable listening on ``port``."""
+    """Return a launch spec for a fake executable listening on ``port``; no backend is implied."""
     return TextBackendLaunchSpec(
         executable=tmp_path / "backend.exe",
         arguments=("--port", str(port)),
@@ -157,55 +170,6 @@ async def wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> 
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("condition not reached in time")
         await asyncio.sleep(0.02)
-
-
-def test_koboldcpp_launch_spec_renders_the_expected_argv(tmp_path: Path) -> None:
-    """The koboldcpp argv carries the model, loopback port and host, CUDA ordinal, layers, context, and quiet flags."""
-    spec = koboldcpp_launch_spec(
-        executable=tmp_path / "koboldcpp.exe",
-        model_path=tmp_path / "model.gguf",
-        port=5001,
-        device_index=1,
-        gpu_layers=99,
-        context_length=4096,
-        log_path=tmp_path / "text_backend.log",
-    )
-
-    assert spec.command == [
-        str(tmp_path / "koboldcpp.exe"),
-        KoboldcppArguments.MODEL,
-        str(tmp_path / "model.gguf"),
-        KoboldcppArguments.PORT,
-        "5001",
-        KoboldcppArguments.HOST,
-        "127.0.0.1",
-        KoboldcppArguments.USE_CUDA,
-        "1",
-        KoboldcppArguments.GPU_LAYERS,
-        "99",
-        KoboldcppArguments.CONTEXT_SIZE,
-        "4096",
-        KoboldcppArguments.SKIP_LAUNCHER,
-        KoboldcppArguments.QUIET,
-    ]
-    assert spec.base_url == "http://127.0.0.1:5001"
-    assert spec.device_index == 1
-
-
-def test_koboldcpp_launch_spec_omits_the_cuda_flag_off_gpu(tmp_path: Path) -> None:
-    """Without a device index the CUDA flag is absent and the footprint device is None."""
-    spec = koboldcpp_launch_spec(
-        executable=tmp_path / "koboldcpp",
-        model_path=tmp_path / "model.gguf",
-        port=5001,
-        device_index=None,
-        gpu_layers=0,
-        context_length=2048,
-        log_path=tmp_path / "text_backend.log",
-    )
-
-    assert KoboldcppArguments.USE_CUDA not in spec.arguments
-    assert spec.device_index is None
 
 
 def test_port_is_free_reports_a_held_port() -> None:
@@ -384,3 +348,56 @@ async def test_stop_during_backoff_ends_the_run_without_another_launch(tmp_path:
     assert supervisor.state is TextBackendState.STOPPED
     assert supervisor.launch_count == 1
     assert len(launcher.specs) == 1
+
+
+@pytest.mark.slow
+async def test_real_koboldcpp_serves_and_leaves_no_process_behind(tmp_path: Path) -> None:
+    """The real koboldcpp binary reaches ready through the supervisor, and stop() ends its whole process tree.
+
+    koboldcpp's launched PID is a PyInstaller bootloader whose child is the real server; this row proves
+    the descendant is resolved, recorded, and gone after stop, and that the port is released. Any backend
+    that spawns its server as a child gets the same handling; koboldcpp is the one provisioned here.
+    """
+    executable = koboldcpp_executable()
+    model_env = os.environ.get(REAL_MODEL_ENV_VAR)
+    if executable is None or model_env is None or not Path(model_env).is_file():
+        pytest.skip(f"needs bin/koboldcpp and {REAL_MODEL_ENV_VAR} pointing at a GGUF")
+
+    port = free_port()
+    spec = build_launch_spec(
+        TEXT_BACKENDS.koboldcpp,
+        TextBackendLaunchSettings(
+            executable=executable,
+            model_path=Path(model_env),
+            port=port,
+            device_index=0,
+            gpu_layers=99,
+            context_length=2048,
+            log_path=tmp_path / "text_backend.log",
+        ),
+    )
+    registry = OwnedProcessRegistry(tmp_path / "owned.json")
+    async with aiohttp.ClientSession() as session:
+        backend = KoboldApiTextBackend(spec.base_url, session)
+        supervisor = TextBackendSupervisor(
+            launch_spec=spec,
+            backend=backend,
+            owned_registry=registry,
+            launch_process=default_launch_process,
+        )
+        task = asyncio.create_task(supervisor.run())
+        try:
+            await wait_until(lambda: supervisor.is_serving, timeout=300.0)
+            tree = supervisor.pids
+            assert len(tree) >= 2, f"expected the launched process and its server child, saw {tree}"
+            assert sorted(record.os_pid for record in registry._load()) == sorted(tree)
+            description = await backend.describe()
+            assert description.max_context_length == 2048
+        finally:
+            await supervisor.stop()
+            await asyncio.wait_for(task, timeout=60.0)
+            await backend.close()
+
+    assert registry._load() == []
+    assert [pid for pid in tree if psutil.pid_exists(pid)] == []
+    assert port_is_free(port) is True

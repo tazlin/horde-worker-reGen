@@ -153,12 +153,14 @@ def post_processing_install_hint() -> str:
 def enabled_workloads(bridge_data: reGenBridgeData) -> frozenset[WorkloadKind]:
     """Return the workloads this worker actually serves, derived from config and the install.
 
-    The single source of truth that turns the operator-facing role flags (``dreamer``, ``alchemist``)
-    into the internal :class:`WorkloadKind` vocabulary the rest of the worker reasons in (process
-    sizing, the flow registry, the dashboard). A CPU-only install cannot serve image generation
+    The single source of truth that turns the operator-facing role flags (``dreamer``, ``alchemist``,
+    ``scribe``) into the internal :class:`WorkloadKind` vocabulary the rest of the worker reasons in
+    (process sizing, the flow registry, the dashboard). A CPU-only install cannot serve image generation
     regardless of ``dreamer`` (CPU inference is impractically slow), so image generation is dropped
-    there. A future worker type adds a single membership rule here and is then first-class everywhere
-    downstream rather than threading another boolean through every site.
+    there. Text generation runs in an external program rather than a worker child, so it is never
+    dropped for the install's compute: a scribe-only worker on a CPU-only box is a working worker. A
+    future worker type adds a single membership rule here and is then first-class everywhere downstream
+    rather than threading another boolean through every site.
 
     ``WorkloadKind`` is imported lazily so this module's import stays torch-free (the benchmark planner
     imports it); the import chain behind ``WorkloadKind`` is only pulled in when a caller actually needs
@@ -172,6 +174,11 @@ def enabled_workloads(bridge_data: reGenBridgeData) -> frozenset[WorkloadKind]:
         workloads.add(WorkloadKind.IMAGE_GENERATION)
     if bridge_data.alchemist:
         workloads.add(WorkloadKind.ALCHEMY)
+    # Compared against True rather than read for truthiness because this flag is off by default and much
+    # of the test suite passes a Mock bridge data whose every unset attribute reads truthy; a bare check
+    # would give every one of those tests a text flow.
+    if bridge_data.scribe is True:
+        workloads.add(WorkloadKind.TEXT_GENERATION)
     return frozenset(workloads)
 
 
@@ -184,8 +191,9 @@ def _coerce_workload_config(bridge_data: reGenBridgeData, *, log: bool) -> list[
     (``dreamer: false``). In both cases the resolved image model list is cleared and dynamic model
     loading is turned off so the worker never advertises or pops an image job it will not run. Alchemy
     is left untouched: its graph forms (upscale, face-fix) and CLIP forms (interrogation, caption) run
-    acceptably without image generation, so an alchemist-enabled worker stays useful. A worker that
-    serves no workload at all is surfaced as a warning rather than silently doing nothing.
+    acceptably without image generation, so an alchemist-enabled worker stays useful. Text generation is
+    likewise untouched: it runs in an external program, so it does not need image generation either. A
+    worker that serves no workload at all is surfaced as a warning rather than silently doing nothing.
     """
     from horde_worker_regen.compute_mode import is_cpu_only_install
     from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
@@ -218,10 +226,11 @@ def _coerce_workload_config(bridge_data: reGenBridgeData, *, log: bool) -> list[
         if log:
             logger.warning(message)
 
-    if not bridge_data.alchemist and log:
+    if not enabled_workloads(bridge_data) and log:
         logger.warning(
-            f"Image generation is disabled ({reason}) and alchemist=False, so the worker has nothing to "
-            "serve. Set alchemist: true in bridgeData.yaml to run alchemy forms.",
+            f"Image generation is disabled ({reason}) and no other role is enabled, so the worker has "
+            "nothing to serve. Set alchemist: true in bridgeData.yaml to run alchemy forms, or "
+            "scribe: true to run text generation.",
         )
 
     return coercions

@@ -1,6 +1,7 @@
 title: Explanation
 nav:
     - architecture.md
+    - text_generation.md
     - job_lifecycle.md
     - job_state_machine.md
     - bridge_config.md

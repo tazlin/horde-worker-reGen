@@ -33,12 +33,21 @@ classification. Alchemy runs on a separate pop→dispatch→submit loop
 that reuses the same child processes the image pipeline already owns; it does not
 have its own process pool. See [Bridge Configuration](bridge_config.md#alchemy).
 
+A worker can also opt into **text generation** (`scribe: true`), which is the one
+workload with no child process at all: the generation happens in a separate
+program the operator runs (the text backend, koboldcpp today) that the worker
+reaches over HTTP, so the flow is a main-process loop that pops a text job,
+forwards its payload, and submits the text back. It is torch-free, touches no GPU, and takes no share of
+the VRAM budget, which is why it is valid on a CPU-only install and why a
+scribe-only worker is a working worker. See
+[Text generation](text_generation.md).
+
 ## Workloads (flows)
 
-Image generation and alchemy are two **workload flows** the worker orchestrates over one shared pool
-of child processes ([`WorkloadKind`][horde_worker_regen.process_management.scheduling.workload_flow.WorkloadKind];
+Image generation, alchemy and text generation are the **workload flows** the worker orchestrates
+([`WorkloadKind`][horde_worker_regen.process_management.scheduling.workload_flow.WorkloadKind];
 audio and video generation are the intended next flows). Each flow is its own pop→dispatch→submit
-loop. What they share is threefold:
+loop. The first two run over one shared pool of child processes, and what they share is threefold:
 
 - **The process pool**, routed by capability rather than by process type: each process declares a
   [`WorkerCapability`][horde_worker_regen.process_management.lifecycle.horde_process.WorkerCapability]
@@ -53,6 +62,11 @@ loop. What they share is threefold:
   above a *capacity* layer (the shared budget) that decides whether the device can physically hold the
   work at all.
 
+Text generation shares neither, which is the whole of what makes it simple: it declares no
+`WorkerCapability` (the routing table pairs it with an empty flag, stated rather than left absent) and
+registers nothing with the reserve ledger, because its generations run in a program the worker does not
+own. It still presents the same flow surface and is launched from the same registry.
+
 Each flow presents a uniform
 [`FlowCoordinator`][horde_worker_regen.process_management.scheduling.workload_flow.FlowCoordinator]
 surface (`kind`, `num_in_flight`, `run`). Alchemy satisfies it directly with `AlchemyCoordinator`;
@@ -66,8 +80,11 @@ per-workload work counts the same way for every flow, and a future audio/video f
 registry rather than getting a bespoke launch path. Which workloads a worker actually serves is the
 separate, declarative question answered by
 [`capabilities.enabled_workloads`][horde_worker_regen.capabilities.enabled_workloads] (derived from the
-`dreamer`/`alchemist` role flags and the install), which drives process sizing and the dashboard's mode
-identity; an alchemist-only worker is simply one whose served set is `{alchemy}`.
+`dreamer`/`alchemist`/`scribe` role flags and the install), which drives process sizing and the
+dashboard's mode identity; an alchemist-only worker is simply one whose served set is `{alchemy}`. The
+image and alchemy flows are always registered and self-gate on their role flag; the text flow is
+registered only when `scribe` is set, because it polls an address rather than consulting local state and
+a worker with no backend attached has nothing to poll.
 
 ## Why multiple processes?
 
@@ -120,8 +137,9 @@ Several long-lived asyncio tasks are started by `HordeWorkerProcessManager._main
 | `_periodic_update_check_loop()` | -     | Check for a newer worker release                                                          |
 | `ImageGenerationCoordinator.run()` | -  | Supervise the image `JobPopper` (1 s) and `JobSubmitter` (0.02 s) loops                   |
 | `AlchemyCoordinator.run()`    | 1 s     | Pop, dispatch, and submit alchemy forms (only when `alchemist: true`; otherwise idle); API pops are bounded to 30 s so shutdown remains responsive |
+| `TextGenerationCoordinator.run()` | 1 s | Gate on the text backend's readiness, then pop text jobs and run each on its own task (registered only when `scribe: true`); API pops are bounded to 30 s |
 
-The two coordinator tasks are launched uniformly from the flow registry (`self._flows`, keyed by
+The coordinator tasks are launched uniformly from the flow registry (`self._flows`, keyed by
 `WorkloadKind`). The image flow keeps the same per-loop shutdown supervision the popper and submitter
 had as top-level tasks: each is launched carrying `_handle_exception`, so if one ends the worker shuts
 down gracefully while the other keeps draining in-flight work. A further task

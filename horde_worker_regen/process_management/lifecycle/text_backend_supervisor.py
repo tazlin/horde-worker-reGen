@@ -1,30 +1,35 @@
 """Launch and keep alive the external text-inference program the text-generation flow talks to.
 
-The text workload's inference engine (koboldcpp today) is a program the worker does not control. It has no
-pipe, no IPC vocabulary and no `HordeProcessInfo`; the worker can start it, ask it a few HTTP questions
-through a [`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend] driver, and stop it. This
-module owns exactly that, and nothing more: the seam with a black box is kept to start, ready, stop, so
-there are as few places as possible where the two programs can disagree.
+A text backend is a separate program the worker does not control (koboldcpp today; sonar and other
+KoboldAI-API servers planned). It has no pipe, no IPC vocabulary and no `HordeProcessInfo`; the worker can
+start it, ask it a few HTTP questions through a
+[`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend] driver, and stop it. This module owns
+exactly that, and nothing more: the seam with a black box is kept to start, ready, stop, so there are as
+few places as possible where the two programs can disagree. Which program, and with which command line, is
+decided elsewhere ([`text_backends.launch`][horde_worker_regen.text_backends.launch]); the supervisor
+receives a rendered [`TextBackendLaunchSpec`][horde_worker_regen.text_backends.launch_spec.TextBackendLaunchSpec]
+and treats every backend the same way.
 
-- :class:`TextBackendLaunchSpec`: the executable, its arguments, the port and the log file.
-- :func:`koboldcpp_launch_spec`: derives the spec for koboldcpp from the worker's settings.
 - :class:`TextBackendSupervisor`: runs the launch, readiness gate, liveness watch and relaunch ladder on
   one asyncio task, measures the backend's VRAM footprint as the card's free-memory delta, and keeps every
   process id in the owned-PID registry so a crashed worker's next run can reap it.
+- :func:`default_launch_process`: starts the spec's command with output appended to its log file.
+- :func:`port_is_free`: the pre-launch check that nothing still holds the backend's port.
 
-Two facts about koboldcpp shape the process handling. It is a PyInstaller one-file binary, so the process
-the worker launches is a bootloader that unpacks itself and runs the real server as a child; terminating
-only the bootloader leaves the server alive, listening on the port and holding VRAM. The supervisor
-therefore resolves the whole process tree once the backend is ready, records every PID, and stops the
-tree descendants first. And a server that survived a previous run still holds the port, so a relaunch on
-that port fails until it is gone; the supervisor checks the port is free before launching and treats a
-held port as a launch failure that backs off rather than a reason to guess a different port.
+Two process facts are handled generically because a backend may exhibit either. A launched program may run
+the real server as a child of the launched process (koboldcpp does: it is a PyInstaller one-file binary
+whose bootloader unpacks itself and spawns the server), so terminating only the launched PID can leave the
+server alive, listening on the port and holding VRAM. The supervisor therefore resolves the whole process
+tree once the backend is ready, records every PID, and stops the tree descendants first. And a server that
+survived a previous run still holds its port, so a relaunch on that port fails until it is gone; the
+supervisor checks the port is free before launching and treats a held port as a launch failure that backs
+off rather than a reason to guess a different port.
 
 The relaunch ladder is deliberately one rung: the process exited, or it never answered `ready()` within
 the patience window, so kill the tree and launch again with backoff. Finer detection (an alive process
 that stopped answering mid-generation) is left to the flow, whose `generate()` raises
-`TextBackendUnavailable` and re-runs its own readiness gate; it is added here only once the backend proves
-a stable interface for it.
+`TextBackendUnavailable` and re-runs its own readiness gate; it is added here only once a backend proves a
+stable interface for it.
 """
 
 from __future__ import annotations
@@ -35,7 +40,6 @@ import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from enum import auto
-from pathlib import Path
 from typing import Protocol
 
 import psutil
@@ -46,9 +50,7 @@ from strenum import StrEnum
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.text_backends import TextBackend
-
-LOOPBACK_HOST = "127.0.0.1"
-"""The backend only ever listens on loopback; the worker is its sole client."""
+from horde_worker_regen.text_backends.launch_spec import LOOPBACK_HOST, TextBackendLaunchSpec
 
 TEXT_BACKEND_LOG_FILE_NAME = "text_backend.log"
 """File under the run's ``logs/`` that receives the backend's own stdout and stderr."""
@@ -81,102 +83,6 @@ class LaunchedProcess(Protocol):
             subprocess.TimeoutExpired: The process was still running when the timeout elapsed.
         """
         ...
-
-
-class TextBackendLaunchSpec(BaseModel):
-    """Represents everything needed to start one text backend process."""
-
-    model_config = ConfigDict(frozen=True)
-
-    executable: Path
-    """The backend binary."""
-    arguments: tuple[str, ...]
-    """Arguments after the executable, already rendered as strings."""
-    port: int
-    """The loopback port the backend will listen on; also what `base_url` is built from."""
-    log_path: Path
-    """Where the backend's own stdout and stderr go."""
-    device_index: int | None = None
-    """The stable device index the backend was told to use, for footprint measurement; None off-GPU."""
-
-    @property
-    def command(self) -> list[str]:
-        """Return the full argv."""
-        return [str(self.executable), *self.arguments]
-
-    @property
-    def base_url(self) -> str:
-        """Return the HTTP base URL the driver targets."""
-        return f"http://{LOOPBACK_HOST}:{self.port}"
-
-
-class KoboldcppArguments:
-    """koboldcpp's command-line flags, as spelled by upstream's argument parser."""
-
-    MODEL = "--model"
-    PORT = "--port"
-    HOST = "--host"
-    USE_CUDA = "--usecuda"
-    GPU_LAYERS = "--gpulayers"
-    CONTEXT_SIZE = "--contextsize"
-    SKIP_LAUNCHER = "--skiplauncher"
-    QUIET = "--quiet"
-
-
-def koboldcpp_launch_spec(
-    *,
-    executable: Path,
-    model_path: Path,
-    port: int,
-    device_index: int | None,
-    gpu_layers: int,
-    context_length: int,
-    log_path: Path,
-) -> TextBackendLaunchSpec:
-    """Create the launch spec for koboldcpp serving one GGUF on loopback.
-
-    The embedded horde worker inside koboldcpp stays off (no API key is passed): the worker pops. The
-    launcher GUI is skipped and output is quietened because the process runs unattended under the
-    supervisor. `device_index` becomes the CUDA ordinal; the parent sets ``CUDA_DEVICE_ORDER=PCI_BUS_ID``
-    before any child starts, so the worker's stable index and koboldcpp's ordinal agree. None means the
-    backend runs without CUDA (a no-CUDA build, or a CPU-only host).
-
-    Args:
-        executable: The koboldcpp binary.
-        model_path: The GGUF file to load.
-        port: Loopback port to listen on.
-        device_index: Stable device index for the CUDA backend, or None for no CUDA flag.
-        gpu_layers: How many layers to offload; koboldcpp caps a large number at the model's layer count.
-        context_length: The context size koboldcpp allocates its KV cache for.
-        log_path: Where the backend's output goes.
-    """
-    arguments: list[str] = [
-        KoboldcppArguments.MODEL,
-        str(model_path),
-        KoboldcppArguments.PORT,
-        str(port),
-        KoboldcppArguments.HOST,
-        LOOPBACK_HOST,
-    ]
-    if device_index is not None:
-        arguments.extend([KoboldcppArguments.USE_CUDA, str(device_index)])
-    arguments.extend(
-        [
-            KoboldcppArguments.GPU_LAYERS,
-            str(gpu_layers),
-            KoboldcppArguments.CONTEXT_SIZE,
-            str(context_length),
-            KoboldcppArguments.SKIP_LAUNCHER,
-            KoboldcppArguments.QUIET,
-        ],
-    )
-    return TextBackendLaunchSpec(
-        executable=executable,
-        arguments=tuple(arguments),
-        port=port,
-        log_path=log_path,
-        device_index=device_index,
-    )
 
 
 def default_launch_process(spec: TextBackendLaunchSpec) -> LaunchedProcess:
@@ -216,8 +122,9 @@ class TextBackendSupervisorTimings(BaseModel):
     ready_patience: float = 300.0
     """How long a launch may take to answer `ready()` before it is killed and relaunched.
 
-    A PyInstaller one-file binary unpacks itself on every start and then loads the model; a 3B model on a
-    warm disk took about a minute, and a large model on a cold disk takes several."""
+    Start-up is dominated by model loading, and some backends also unpack themselves first (a PyInstaller
+    one-file binary does). A 3B model on a warm disk took about a minute; a large model on a cold disk
+    takes several."""
     liveness_poll_interval: float = 1.0
     """Pause between exit-code polls while serving."""
     stop_grace: float = 15.0
@@ -271,12 +178,12 @@ class TextBackendSupervisor:
         """Wire the supervisor; nothing starts until `run()`.
 
         Args:
-            launch_spec: What to launch and where it listens.
+            launch_spec: What to launch and where it listens, already rendered for the chosen backend.
             backend: The driver already pointed at the spec's URL; used only for `ready()` here.
             owned_registry: Where launched PIDs are recorded for orphan reaping; None records nothing.
             launch_process: How a process is started; injected so tests never spawn anything.
             read_device_free_total_mb: Card memory reader for the footprint delta; None disables it.
-            timings: Waits and patience; defaults suit koboldcpp.
+            timings: Waits and patience.
             first_launch_identifier: The registry's launch identifier for the first launch; increments per
                 launch so a reaped PID can be attributed to its launch.
             sleep: Awaitable sleep, injected so tests can run the ladder without wall-clock waits.
@@ -329,7 +236,7 @@ class TextBackendSupervisor:
 
     @property
     def pids(self) -> tuple[int, ...]:
-        """Return the PIDs of the current process tree, bootloader first; empty when stopped."""
+        """Return the PIDs of the current process tree, launched process first; empty when stopped."""
         return self._tree_pids
 
     async def run(self) -> None:
@@ -447,8 +354,9 @@ class TextBackendSupervisor:
     def _record_tree(self, launch_identifier: int) -> None:
         """Resolve the process tree and record every PID not yet recorded.
 
-        Called at launch (the bootloader alone) and again at ready (by then the bootloader has spawned the
-        real server), so the registry holds the PID that actually owns the port and the VRAM.
+        Called at launch (the launched process alone) and again at ready (by then a bootloader-style
+        program has spawned the real server), so the registry holds the PID that actually owns the port
+        and the VRAM.
         """
         if self._process is None:
             return
@@ -536,17 +444,13 @@ def _kill_handle_quietly(process: LaunchedProcess) -> None:
 
 
 __all__ = [
-    "LOOPBACK_HOST",
     "TEXT_BACKEND_LOG_FILE_NAME",
     "DeviceFreeTotalReader",
-    "KoboldcppArguments",
     "LaunchProcess",
     "LaunchedProcess",
-    "TextBackendLaunchSpec",
     "TextBackendState",
     "TextBackendSupervisor",
     "TextBackendSupervisorTimings",
     "default_launch_process",
-    "koboldcpp_launch_spec",
     "port_is_free",
 ]

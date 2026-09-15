@@ -89,6 +89,9 @@ Want to know how it works under the hood, or contribute a change? The
 19. **[Admission pipeline](explanation/admission_pipeline.md)**: how preload,
     dispatch and clearance decide over a frozen per-cycle snapshot and return
     plans the executor runs; where each decision lives and how to change one.
+20. **[Text generation](explanation/text_generation.md)**: the scribe role, the
+    external text backend the worker attaches to by URL, what it advertises and
+    how it derives that, and what each backend failure does to a job.
 
 The **[codebase map](reference/codebase-map.md)** is a file-to-responsibility
 quick reference, and the auto-generated API reference for every module lives

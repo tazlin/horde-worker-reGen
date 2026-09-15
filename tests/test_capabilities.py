@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen import capabilities, compute_mode
 from horde_worker_regen.process_management.jobs.alchemy_popper import expand_offered_forms
@@ -31,6 +32,7 @@ def _bridge_data(**overrides: object) -> SimpleNamespace:
         dry_run_skip_inference=False,
         dreamer=True,
         alchemist=False,
+        scribe=False,
     )
     for key, value in overrides.items():
         setattr(bd, key, value)
@@ -252,11 +254,62 @@ def test_enabled_workloads_cpu_forces_alchemist_only(monkeypatch: pytest.MonkeyP
 
 
 def test_enabled_workloads_empty_when_nothing_selected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A worker with both roles off serves nothing (the warning case)."""
+    """A worker with every role off serves nothing (the warning case)."""
     _patch_cpu_install(monkeypatch, cpu=False)
-    bd = _bridge_data(dreamer=False, alchemist=False)
+    bd = _bridge_data(dreamer=False, alchemist=False, scribe=False)
 
     assert capabilities.enabled_workloads(bd) == frozenset()  # type: ignore[arg-type]
+
+
+def test_enabled_workloads_scribe_adds_text_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The scribe role adds text generation beside whatever else the worker serves."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=True, scribe=True)
+
+    assert capabilities.enabled_workloads(bd) == frozenset(  # type: ignore[arg-type]
+        {WorkloadKind.IMAGE_GENERATION, WorkloadKind.TEXT_GENERATION},
+    )
+
+
+def test_enabled_workloads_scribe_off_serves_no_text_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text generation is offered only when the operator asked for it."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=True, scribe=False)
+
+    assert WorkloadKind.TEXT_GENERATION not in capabilities.enabled_workloads(bd)  # type: ignore[arg-type]
+
+
+def test_enabled_workloads_scribe_only_is_a_valid_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scribe with no other role serves text generation and is not an empty worker."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=False, alchemist=False, scribe=True)
+
+    assert capabilities.enabled_workloads(bd) == frozenset({WorkloadKind.TEXT_GENERATION})  # type: ignore[arg-type]
+
+
+def test_enabled_workloads_scribe_survives_a_cpu_only_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text generation runs in an external program, so a CPU-only box is a perfectly good scribe."""
+    _patch_cpu_install(monkeypatch, cpu=True)
+    bd = _bridge_data(dreamer=True, alchemist=False, scribe=True)
+
+    assert capabilities.enabled_workloads(bd) == frozenset({WorkloadKind.TEXT_GENERATION})  # type: ignore[arg-type]
+
+
+def test_scribe_only_worker_is_not_warned_as_having_nothing_to_serve(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scribe-only worker has work, so the coercion pass must not report it as serving nothing."""
+    _patch_utilities(monkeypatch, True)
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=False, alchemist=False, scribe=True, image_models_to_load=[], dynamic_models=False)
+
+    logged: list[str] = []
+    sink_id = logger.add(lambda message: logged.append(message.record["message"]), level="WARNING")
+    try:
+        coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=True)  # type: ignore[arg-type]
+    finally:
+        logger.remove(sink_id)
+
+    assert coercions == []
+    assert not [line for line in logged if "nothing to" in line], logged
 
 
 def test_dreamer_false_disables_image_generation_on_gpu(monkeypatch: pytest.MonkeyPatch) -> None:

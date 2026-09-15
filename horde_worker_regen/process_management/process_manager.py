@@ -135,6 +135,10 @@ from horde_worker_regen.process_management.jobs.image_coordinator import ImageGe
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.jobs.text_generation_coordinator import (
+    TextGenerationCoordinator,
+    build_text_backend,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -2015,9 +2019,9 @@ class HordeWorkerProcessManager:
             job_tracker=self._job_tracker,
             subtask_done_callback=self._handle_exception,
         )
-        # One WorkloadKind-keyed registry of every workload flow this worker runs. Both flows are
-        # always present and self-gate (the image popper does not pop without models; the alchemy
-        # coordinator does not pop unless alchemist is set), so the registry mirrors today's
+        # One WorkloadKind-keyed registry of every workload flow this worker runs. The image and alchemy
+        # flows are always present and self-gate (the image popper does not pop without models; the
+        # alchemy coordinator does not pop unless alchemist is set), so the registry mirrors today's
         # always-running loops while giving the snapshot and TUI a uniform per-workload surface. Which
         # workloads the worker is *for* (process sizing, the dashboard's mode identity) is a separate,
         # declarative question answered by capabilities.enabled_workloads.
@@ -2025,6 +2029,30 @@ class HordeWorkerProcessManager:
             WorkloadKind.IMAGE_GENERATION: self._image_coordinator,
             WorkloadKind.ALCHEMY: self._alchemy_coordinator,
         }
+
+        # Text generation is registered only for a worker that selected the scribe role, unlike the two
+        # self-gating flows above: its generations run in a separate program reached over HTTP, so the
+        # flow polls an address rather than consulting local state, and there is nothing to poll for a
+        # worker whose operator never attached a backend.
+        self._text_coordinator: TextGenerationCoordinator | None = None
+        if WorkloadKind.TEXT_GENERATION in enabled_workloads(bridge_data):
+            text_coordinator = TextGenerationCoordinator(
+                state=self._state,
+                shutdown_manager=self._shutdown_manager,
+                runtime_config=self._runtime_config,
+                api_sessions=self._api_sessions,
+                # Built when the flow starts, not here: the driver borrows the shared aiohttp session,
+                # which the main loop only populates once it is running. The flow hands its own backend
+                # kind back, so which backend is built and which one the flow advertises for are one
+                # decision rather than two defaults that can drift.
+                backend_factory=lambda text_backend_kind: build_text_backend(
+                    bridge_data=self.bridge_data,
+                    api_sessions=self._api_sessions,
+                    text_backend_kind=text_backend_kind,
+                ),
+            )
+            self._text_coordinator = text_coordinator
+            self._flows[WorkloadKind.TEXT_GENERATION] = text_coordinator
 
         if stable_diffusion_reference is not None:
             self.stable_diffusion_reference = stable_diffusion_reference

@@ -2,8 +2,9 @@
 
 A stand-in that answered differently from what it was configured with, or that lost track of what it was
 asked, would let a flow test pass while the flow was wrong. These tests pin the configured answers, the
-failure script that lets a caller rehearse busy-then-succeed without a server, the deadline it honours,
-and the record it keeps of every call.
+readiness script that lets a caller rehearse a cold start, the failure script that lets a caller
+rehearse busy-then-succeed without a server, the deadline it honours, and the record it keeps of every
+call.
 """
 
 from __future__ import annotations
@@ -41,6 +42,17 @@ async def test_ready_is_true_and_records_the_deadline() -> None:
 
     assert await backend.ready(deadline_seconds=2.5) is True
     assert [call.deadline_seconds for call in backend.ready_calls] == [2.5]
+
+
+async def test_the_readiness_script_answers_false_until_it_runs_out() -> None:
+    """A cold backend answers not-ready for a while, which is the window a readiness gate exists for."""
+    backend = FakeTextBackend(description=_DESCRIPTION, ready_results=(False, False, True))
+
+    assert await backend.ready(deadline_seconds=1.0) is False
+    assert await backend.ready(deadline_seconds=1.0) is False
+    assert await backend.ready(deadline_seconds=1.0) is True
+    assert await backend.ready(deadline_seconds=1.0) is True, "past the end of the script the fake is ready"
+    assert len(backend.ready_calls) == 4, "a not-ready answer is still a call the flow made"
 
 
 async def test_describe_returns_the_configured_description() -> None:

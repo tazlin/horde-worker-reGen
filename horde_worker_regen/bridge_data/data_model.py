@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
+from horde_model_reference.text_backend_names import validate_not_backend_prefixed
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ALCHEMY_FORMS
 from horde_sdk.worker.dispatch.ai_horde.bridge_data import CombinedHordeBridgeData
 from loguru import logger
@@ -374,6 +375,42 @@ def cap_queue_size(*, max_threads: int, queue_size: int, log: bool = False) -> i
             logger.warning("queue_size has been set to 3 because max_threads is >= 2.")
         return 3
     return queue_size
+
+
+TEXT_GENERATION_TOKENS_PER_SECOND_FLOOR = 2.0
+"""Tokens per second a text backend is assumed to manage at worst, for deriving a generation deadline.
+
+Two tokens a second is far below what any machine an operator would run a scribe on produces; it is a
+floor for the slowest case (a large quantised model on a small card, sharing the box with image
+inference), because a deadline that is too generous only delays a fault while one that is too tight
+faults work the backend would have finished.
+"""
+
+TEXT_GENERATION_TIMEOUT_OVERHEAD_SECONDS = 10.0
+"""Fixed seconds added to a derived text-generation deadline for prompt processing and request overhead.
+
+Independent of the token count: the backend has to read and tokenise the prompt and answer the HTTP
+request whatever length it is asked to generate.
+"""
+
+
+def derive_text_generation_timeout_seconds(max_length: int) -> float:
+    """Return the per-generation deadline implied by a generation-length cap.
+
+    The generated token count is the only thing known about a text job's cost ahead of running it, so
+    the deadline is that cap divided by a deliberately slow tokens-per-second floor
+    (:data:`TEXT_GENERATION_TOKENS_PER_SECOND_FLOOR`) plus a fixed overhead
+    (:data:`TEXT_GENERATION_TIMEOUT_OVERHEAD_SECONDS`). At those values this is ``max_length / 2 + 10``,
+    the convention the legacy scribe bridge used, preserved so an operator moving over sees the same
+    patience they had before.
+
+    Args:
+        max_length: The largest number of tokens one generation may produce.
+
+    Returns:
+        The deadline in seconds.
+    """
+    return (max_length / TEXT_GENERATION_TOKENS_PER_SECOND_FLOOR) + TEXT_GENERATION_TIMEOUT_OVERHEAD_SECONDS
 
 
 def _warn_lease_without_residency(
@@ -987,16 +1024,17 @@ class reGenBridgeData(CombinedHordeBridgeData):
     dreamer: bool = Field(default=True)
     """If true, this worker pops and processes image-generation jobs (the dreamer role).
 
-    Defaults on, so a plain worker is a dreamer. Set it false to deliberately run an alchemist-only
-    worker on a GPU box (deselect image generation while keeping `alchemist: true`); the role matrix is:
+    Defaults on, so a plain worker is a dreamer. Set it false to deliberately deselect image generation
+    on a GPU box while keeping another role. The three roles are independent switches, each adding one
+    workload, and every combination of them is valid:
 
-    - ``dreamer: true,  alchemist: false`` -> image generation only (the historical default).
-    - ``dreamer: true,  alchemist: true``  -> both image generation and alchemy.
-    - ``dreamer: false, alchemist: true``  -> alchemy only (no image generation).
-    - ``dreamer: false, alchemist: false`` -> nothing to serve (a warning is logged).
+    - ``dreamer`` -> image generation (on by default; this is the historical worker).
+    - ``alchemist`` -> alchemy forms (upscale, face-fix, interrogation, caption).
+    - ``scribe`` -> text generation, through an external text backend.
 
-    A CPU-only install cannot serve image generation regardless of this flag, so it is treated as
-    alchemist-only there. The single source of truth deriving served workloads from these flags is
+    With all three false the worker has nothing to serve and a warning is logged. A CPU-only install
+    cannot serve image generation regardless of this flag, so only the other roles run there. The single
+    source of truth deriving served workloads from these flags is
     :func:`horde_worker_regen.capabilities.enabled_workloads`.
     """
 
@@ -1061,6 +1099,44 @@ class reGenBridgeData(CombinedHordeBridgeData):
     so alchemy is held back when available RAM (minus RAM already committed by in-flight work) falls below
     this floor, keeping it from pushing a memory-resident worker into paging. Read from the live system RAM
     figure; when unavailable, alchemy does not gate on RAM.
+    """
+
+    scribe: bool = Field(default=False)
+    """If true, this worker also pops and processes text-generation jobs (/v2/generate/text/pop).
+
+    Text generation runs in a separate program, the text backend (koboldcpp today; sonar and others
+    planned), which the operator starts themselves and the worker reaches over HTTP at `kai_url`. There
+    is no inference child process and no GPU work in the worker itself, so a scribe can be combined with
+    any other role or run on its own. What the worker advertises comes from `text_model_name`,
+    `text_threads`, `max_length` and `max_context_length`, each narrowed to what the backend says it
+    will accept.
+    """
+
+    text_model_name: str | None = Field(default=None)
+    """The text model to advertise, spelled as the text model reference spells it (`author/Model`).
+
+    A quantisation suffix the operator adds (`...-Instruct-Q4_K_M`) is kept. Leave it unset to advertise
+    whatever model the backend reports having loaded, which is the right answer whenever the backend is
+    the only thing that knows. Give the canonical name without a backend prefix: the horde expects the
+    name prefixed with the backend serving it, and which prefix that is (and whether the author segment
+    survives it) differs per backend, so the worker derives it and a prefix here would be applied twice.
+    """
+
+    text_threads: int = Field(default=1, ge=1, le=16)
+    """How many text generations the backend can run at once.
+
+    Also the flow's in-flight ceiling and the thread count advertised on a text pop, so the horde sizes
+    this worker's share of text work by it. Separate from `max_threads`, which sizes GPU inference lanes
+    in this worker's own child processes; the two have nothing in common and setting one says nothing
+    about the other.
+    """
+
+    text_generation_timeout_seconds: float | None = Field(default=None, gt=0)
+    """Seconds to wait for one text generation before abandoning it and faulting the job.
+
+    Leave it unset to derive the deadline from `max_length` at a slow-hardware floor (see
+    :func:`derive_text_generation_timeout_seconds`). Set it explicitly when the backend is slower than
+    that floor (a large model on a small card) or when jobs should be given up on sooner.
     """
 
     enable_vram_budget: bool = Field(default=True)
@@ -1537,15 +1613,15 @@ class reGenBridgeData(CombinedHordeBridgeData):
     def validate_workload_roles(self) -> Self:
         """Warn when no role is selected, so a worker that would serve nothing is not silent.
 
-        A CPU-only install still has alchemy to serve, so this only fires for the genuinely empty
-        ``dreamer: false, alchemist: false`` combination. The authoritative derivation of served
-        workloads (which also accounts for the CPU install) lives in
-        :func:`horde_worker_regen.capabilities.enabled_workloads`.
+        A CPU-only install still has alchemy and text generation to serve, so this only fires when every
+        role is deselected. The authoritative derivation of served workloads (which also accounts for the
+        CPU install) lives in :func:`horde_worker_regen.capabilities.enabled_workloads`.
         """
-        if not self.dreamer and not self.alchemist:
+        if not self.dreamer and not self.alchemist and not self.scribe:
             logger.warning(
-                "Both `dreamer` and `alchemist` are false, so this worker has nothing to serve. Enable "
-                "`dreamer` for image generation or `alchemist` for alchemy forms in bridgeData.yaml.",
+                "`dreamer`, `alchemist` and `scribe` are all false, so this worker has nothing to serve. "
+                "Enable `dreamer` for image generation, `alchemist` for alchemy forms, or `scribe` for "
+                "text generation in bridgeData.yaml.",
             )
         return self
 
@@ -1639,6 +1715,23 @@ class reGenBridgeData(CombinedHordeBridgeData):
             )
             return AIWORKER_DREAMER_WORKER_NAME
 
+        return value
+
+    @field_validator("text_model_name", mode="after")
+    def validate_text_model_name(cls, value: str | None) -> str | None:
+        """Validate that the advertised text model name carries no backend prefix.
+
+        The prefixed spelling the horde expects is derived from the canonical name, so a name that
+        already carries a backend prefix would be prefixed a second time and would match nothing the
+        horde has work for. An author segment (`meta-llama/Llama-3.2-3B-Instruct`) is not a prefix and
+        is kept.
+
+        Raises:
+            ValueError: The name begins with a text backend prefix.
+        """
+        if value is None:
+            return None
+        validate_not_backend_prefixed(value)
         return value
 
     @field_validator("forms")
