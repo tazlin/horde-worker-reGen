@@ -527,15 +527,20 @@ class WorkerRecoveryCoordinator:
     def _orphan_safety_grace_seconds(self) -> float:
         """Return how long a job may await a safety verdict before it is treated as orphaned.
 
-        The baseline is sized for an on-GPU check. While safety is off its card the same check runs on the CPU
-        and legitimately takes several times longer, so with a live pool the grace is scaled to what checks are
-        actually measuring on this host (the average the post-inference backpressure model already maintains)
-        plus one average check per job in the safety backlog (the lane is single-serial, so a job's verdict
-        latency includes every check queued ahead of it), bounded by :attr:`SAFETY_GRACE_MAX_SECONDS`. An
-        unready pool keeps the baseline: nothing is progressing for the grace to be generous towards.
+        The baseline is sized for an on-GPU check. Safety holding no card means the same check runs on the
+        CPU, where it takes seconds per image and the lane is single-serial, so a job's verdict latency is
+        its own check plus every check queued ahead of it. That is true whether safety is off its card
+        because the residency pause took it or because the operator configured it off the GPU, so the test
+        is which card safety occupies rather than whether it was paused off one.
+
+        With a live pool in that state the grace scales to what checks are actually measuring on this host
+        (the average the post-inference backpressure model already maintains) plus one average check per job
+        in the safety backlog, bounded by :attr:`SAFETY_GRACE_MAX_SECONDS`. An unready pool keeps the
+        baseline: nothing is progressing for the grace to be generous towards.
         """
         baseline_seconds = self.ORPHAN_SAFETY_GRACE_SECONDS
-        if not self._process_lifecycle.is_safety_gpu_paused or not self.is_safety_pool_ready():
+        safety_runs_on_gpu = self._process_lifecycle.safety_gpu_card_index() is not None
+        if safety_runs_on_gpu or not self.is_safety_pool_ready():
             return baseline_seconds
         average_check_seconds = self._state.avg_safety_seconds
         if average_check_seconds <= 0:

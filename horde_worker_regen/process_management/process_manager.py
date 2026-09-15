@@ -139,6 +139,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    SOFT_RESET_POOL_END_GRACE_SECONDS,
     ModelIncidentKind,
     PauseOwner,
     ProcessLifecycleManager,
@@ -4320,6 +4321,13 @@ class HordeWorkerProcessManager:
                     for process_info in self._process_map.values()
                     if process_info.process_type == HordeProcessType.INFERENCE
                 ]
+                # Nudge every slot toward exit first, then reap the batch against one shared deadline, the
+                # same shape the soft-reset pool rebuild uses. Replacing them one at a time pays a full
+                # per-slot grace each, so the reload of a wide pool takes minutes during which the worker
+                # serves nothing; under one budget the slots exit in parallel and the whole reload is bounded.
+                for process_info in inference_processes:
+                    self._process_lifecycle._broadcast_inference_end_request(process_info)
+                end_deadline = time.monotonic() + SOFT_RESET_POOL_END_GRACE_SECONDS
                 for process_info in inference_processes:
                     # This is a deliberate, operational reload of healthy slots, not a crash recovery:
                     # flag it so each replacement is not mislabelled "crashed or hung" in the recovery
@@ -4328,6 +4336,7 @@ class HordeWorkerProcessManager:
                     self._process_lifecycle._replace_inference_process(
                         process_info,
                         intentional_reason="maintenance-mode pool reload",
+                        end_join_deadline=end_deadline,
                     )
                 self._job_popper._replaced_due_to_maintenance = True
                 MaintenanceModeMessenger.print_maintenance_mode_messages()

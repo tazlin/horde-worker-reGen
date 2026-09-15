@@ -147,6 +147,21 @@ class SafetyOrchestrator:
             self._process_lifecycle.safety_processes_should_be_replaced = True
             await self._job_tracker.requeue_being_safety_checked()
         else:
+            # Mark the lane busy on the dispatch edge, the same way an inference slot is marked at
+            # START_INFERENCE. The lane evaluates one job at a time, so without this every finished job is
+            # sent at once and queues in the child's pipe: the verdict clock then expires jobs the child has
+            # not yet read, and each requeue sends a duplicate check that deepens the backlog. The child
+            # reports the same state when it picks the job up and WAITING_FOR_JOB when the verdict is sent.
+            live_safety_process = self._process_map.get(dispatched_to.process_id)
+            if (
+                live_safety_process is not None
+                and live_safety_process.process_launch_identifier == dispatched_to.process_launch_identifier
+            ):
+                self._process_map.on_process_state_change(
+                    process_id=dispatched_to.process_id,
+                    new_state=HordeProcessState.JOB_RECEIVED,
+                )
+
             # Record which launch is evaluating this job. A verdict that arrives after the launch has been
             # retired is still this job's verdict, and the dispatcher needs the ownership to tell that apart
             # from a stale message for a job some later launch is already re-checking.

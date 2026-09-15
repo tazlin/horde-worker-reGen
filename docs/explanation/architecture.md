@@ -152,7 +152,11 @@ and monitors child process health.
    replacement images). The dispatcher derives the job's final
    `GENERATION_STATE` from those evaluations. It also runs **CLIP/caption**
    alchemy forms (interrogation, NSFW classification, captioning) via
-   `START_ALCHEMY`.
+   `START_ALCHEMY`. Safety dispatch is single-flight: immediately after sending a
+   check the parent marks process `0` `JOB_RECEIVED`, and only the child's terminal
+   `WAITING_FOR_JOB` report releases it for the next queued image. The blocking
+   evaluation emits periodic pipeline-state heartbeats so a slow CPU check remains
+   distinguishable from a wedged child.
 
 A fourth, **download process** runs *outside* the inference/safety process map: it
 owns a hordelib model manager (without a ComfyUI init) and fetches model weights

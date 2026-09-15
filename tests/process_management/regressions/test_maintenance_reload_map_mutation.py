@@ -5,8 +5,8 @@ pool a clean start. The replacement retires the slot from the active process map
 separately), so iterating the live ``self._process_map.values()`` view while replacing raised
 ``RuntimeError: dictionary changed size during iteration``. That exception escaped the control-loop tick and
 took the whole worker down. The reload must iterate a snapshot so every inference slot is replaced regardless
-of the map mutation each replacement causes, and the once-per-reload maintenance flag must be set once rather
-than re-set inside the per-process loop.
+of the map mutation each replacement causes, signal the complete batch before reaping it against one shared
+deadline, and set the once-per-reload maintenance flag once rather than inside the per-process loop.
 """
 
 from __future__ import annotations
@@ -50,19 +50,27 @@ async def test_maintenance_reload_replaces_every_inference_slot_without_map_muta
     )
     pm._process_map.update({0: inf0, 1: inf1, 2: safety})
 
-    replaced: list[int] = []
+    events: list[tuple[str, int]] = []
+    join_deadlines: list[float] = []
+
+    def _fake_broadcast(process_info: HordeProcessInfo) -> None:
+        events.append(("end", process_info.process_id))
 
     def _fake_replace(
         process_info: HordeProcessInfo,
         *,
         intentional_reason: str | None = None,
+        end_join_deadline: float | None = None,
         **_kwargs: object,
     ) -> None:
-        replaced.append(process_info.process_id)
+        events.append(("replace", process_info.process_id))
+        assert end_join_deadline is not None
+        join_deadlines.append(end_join_deadline)
         # The real replacement retires the slot from the active map; a fresh launch spawns separately. That
         # net removal is exactly what breaks a live ``.values()`` iteration.
         pm._process_map.pop(process_info.process_id, None)
 
+    pm._process_lifecycle._broadcast_inference_end_request = _fake_broadcast  # type: ignore[method-assign]
     pm._process_lifecycle._replace_inference_process = _fake_replace  # type: ignore[method-assign]
 
     pm._state.last_pop_maintenance_mode = True
@@ -73,7 +81,8 @@ async def test_maintenance_reload_replaces_every_inference_slot_without_map_muta
 
     assert keep_running is True
     # Every inference slot replaced exactly once; the safety slot left alone.
-    assert sorted(replaced) == [0, 1]
+    assert events == [("end", 0), ("end", 1), ("replace", 0), ("replace", 1)]
+    assert len(set(join_deadlines)) == 1
     assert pm._job_popper._replaced_due_to_maintenance is True
 
 

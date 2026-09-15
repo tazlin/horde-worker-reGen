@@ -779,69 +779,86 @@ class HordeSafetyProcess(HordeProcess):
             self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
             return
 
-        self.send_memory_report_message(include_vram=False)
-        self._stage_clip()
-
-        time_start = time.time()
-
-        logger.info(
-            f"Horde safety process received job {message.job_id}. Number of images: {len(message.images_bytes)}",
+        # The lane serves one evaluation at a time, so its busy state is what tells the parent the job was
+        # actually received rather than still sitting in the pipe. The parent marks the same state at the
+        # send; this is the child's own confirmation of it, and the terminal WAITING_FOR_JOB releases it.
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.JOB_RECEIVED,
+            info=f"Received safety job {message.job_id}",
         )
+
+        self.send_memory_report_message(include_vram=False)
 
         safety_evaluations: list[HordeSafetyEvaluation] = []
 
-        for image_bytes in message.images_bytes:
-            try:
-                image_as_pil = PIL.Image.open(BytesIO(image_bytes))
-            except Exception as e:
-                logger.error(f"Failed to open image: {type(e).__name__} {e}")
-                safety_evaluations.append(
-                    HordeSafetyEvaluation(
-                        is_nsfw=True,
-                        is_csam=True,
-                        replacement_image_bytes=None,
-                        failed=True,
+        # An off-GPU check costs seconds per image and the whole evaluation is one blocking call sequence,
+        # during which the process loop publishes nothing. Without a beat the watchdog cannot tell a slow
+        # check from a wedged one, so it reads a legitimately long CPU check as a hang.
+        with self.periodic_heartbeat(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE):
+            self._stage_clip()
+
+            time_start = time.time()
+
+            logger.info(
+                f"Horde safety process received job {message.job_id}. Number of images: {len(message.images_bytes)}",
+            )
+
+            for image_bytes in message.images_bytes:
+                try:
+                    image_as_pil = PIL.Image.open(BytesIO(image_bytes))
+                except Exception as e:
+                    logger.error(f"Failed to open image: {type(e).__name__} {e}")
+                    safety_evaluations.append(
+                        HordeSafetyEvaluation(
+                            is_nsfw=True,
+                            is_csam=True,
+                            replacement_image_bytes=None,
+                            failed=True,
+                        ),
+                    )
+
+                    continue
+
+                nsfw_result: NSFWResult | None = self._nsfw_checker.check_for_nsfw(
+                    image=image_as_pil,
+                    prompt=message.prompt,
+                    model_info=(
+                        message.horde_model_info.model_dump() if message.horde_model_info is not None else None
                     ),
                 )
 
-                continue
+                if nsfw_result is None:
+                    raise RuntimeError("NSFW result is None")
 
-            nsfw_result: NSFWResult | None = self._nsfw_checker.check_for_nsfw(
-                image=image_as_pil,
-                prompt=message.prompt,
-                model_info=message.horde_model_info.model_dump() if message.horde_model_info is not None else None,
-            )
+                replacement_image_bytes: bytes | None = None
 
-            if nsfw_result is None:
-                raise RuntimeError("NSFW result is None")
+                if nsfw_result.is_csam:
+                    replacement_image_bytes = self.censor_csam_image_bytes
+                    logger.debug(f"CSAM detected in image {message.job_id}. Image is deleted.")
+                elif message.sfw_worker and nsfw_result.is_nsfw:
+                    replacement_image_bytes = self.censor_sfw_worker_image_bytes
+                    logger.info(f"SFW worker detected NSFW in image {message.job_id}.")
+                elif message.censor_nsfw and nsfw_result.is_nsfw:
+                    replacement_image_bytes = self.censor_sfw_request_image_bytes
+                    logger.info(f"Censor list detected NSFW in image {message.job_id}.")
 
-            replacement_image_bytes: bytes | None = None
+                # The aesthetic score rides on the same CLIP embedding the NSFW check just used, so it is
+                # cheap to attach here. It is scored on the original image (not any censored replacement)
+                # so the metadata describes what was actually generated.
+                aesthetic_score = self._score_aesthetic(image_as_pil) if message.include_aesthetic_score else None
 
-            if nsfw_result.is_csam:
-                replacement_image_bytes = self.censor_csam_image_bytes
-                logger.debug(f"CSAM detected in image {message.job_id}. Image is deleted.")
-            elif message.sfw_worker and nsfw_result.is_nsfw:
-                replacement_image_bytes = self.censor_sfw_worker_image_bytes
-                logger.info(f"SFW worker detected NSFW in image {message.job_id}.")
-            elif message.censor_nsfw and nsfw_result.is_nsfw:
-                replacement_image_bytes = self.censor_sfw_request_image_bytes
-                logger.info(f"Censor list detected NSFW in image {message.job_id}.")
+                safety_evaluations.append(
+                    HordeSafetyEvaluation(
+                        is_nsfw=nsfw_result.is_nsfw,
+                        is_csam=nsfw_result.is_csam,
+                        replacement_image_bytes=replacement_image_bytes,
+                        aesthetic_score=aesthetic_score,
+                    ),
+                )
 
-            # The aesthetic score rides on the same CLIP embedding the NSFW check just used, so it is
-            # cheap to attach here. It is scored on the original image (not any censored replacement)
-            # so the metadata describes what was actually generated.
-            aesthetic_score = self._score_aesthetic(image_as_pil) if message.include_aesthetic_score else None
-
-            safety_evaluations.append(
-                HordeSafetyEvaluation(
-                    is_nsfw=nsfw_result.is_nsfw,
-                    is_csam=nsfw_result.is_csam,
-                    replacement_image_bytes=replacement_image_bytes,
-                    aesthetic_score=aesthetic_score,
-                ),
-            )
-
-        time_elapsed = time.time() - time_start
+            # Measured inside the heartbeat window: leaving the context joins the reporter thread, and that
+            # join must not land in the duration the parent's backpressure and grace models read.
+            time_elapsed = time.time() - time_start
 
         info_message = f"Finished evaluating safety for job {message.job_id}"
         logger.info(info_message)

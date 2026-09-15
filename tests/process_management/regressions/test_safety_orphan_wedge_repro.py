@@ -316,6 +316,33 @@ class TestSafetyResultInvariant:
         assert job_info.state == GENERATION_STATE.faulted
         assert job_info in pm._job_tracker.jobs_pending_submit
 
+    async def test_late_verdict_clears_requeue_bookkeeping_on_the_following_reconcile(self) -> None:
+        """A verdict for a requeued job is accepted, and its watchdog attempt state is retired that tick."""
+        pm = make_testable_process_manager()
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        requeued = await pm._job_tracker.requeue_one_being_safety_checked(job_id)
+        assert requeued is True
+        pm._recovery_coordinator.safety_requeue_count[job_id] = 1
+        pm._recovery_coordinator.orphan_safety_since[job_id] = time.time()
+
+        await pm._message_dispatcher._handle_safety_result(
+            Mock(
+                job_id=job_id,
+                safety_evaluations=[_safety_eval()],
+                time_elapsed=14.0,
+            ),
+        )
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
+        assert job_info.safety_evaluated is True
+        assert job_id not in pm._recovery_coordinator.orphan_safety_since
+        assert job_id not in pm._recovery_coordinator.safety_requeue_count
+
 
 class TestLateVerdictForRequeuedJob:
     """A verdict that arrives after the orphan watchdog requeued its job still resolves that job.
@@ -632,6 +659,8 @@ class TestOffGpuSafetyGraceAndPlacementRebuilds:
         pm = make_testable_process_manager()
         _add_idle_safety_process(pm)
         coordinator = pm._recovery_coordinator
+        # Safety came up on a card: the grace reads the card it occupies, not whether a pause took it.
+        pm._process_lifecycle._safety_pinned_card = 0
         pm._state.avg_safety_seconds = 40.0
 
         job_info = _safety_job_info()
@@ -643,6 +672,34 @@ class TestOffGpuSafetyGraceAndPlacementRebuilds:
         await coordinator.reconcile_orphaned_safety_jobs()
 
         assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+
+    async def test_configured_cpu_safety_scales_the_grace_without_a_pause(self) -> None:
+        """Safety configured off the GPU gets the same scaled grace as safety paused off it.
+
+        The pause is only one of the ways safety ends up on the CPU; an operator can configure it there, and
+        that check is just as slow. Keying the grace on the pause flag held a permanently CPU-bound safety
+        lane to the on-GPU baseline, so every check that outran it was requeued into a duplicate.
+        """
+        pm = make_testable_process_manager()
+        _add_idle_safety_process(pm)
+        coordinator = pm._recovery_coordinator
+        # Never paused, and holding no card: the configured-CPU placement.
+        assert pm._process_lifecycle.is_safety_gpu_paused is False
+        assert pm._process_lifecycle.safety_gpu_card_index() is None
+        pm._state.avg_safety_seconds = 30.0
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        assert coordinator._orphan_safety_grace_seconds() == 30.0 * (
+            coordinator.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE + 1
+        )
+
+        coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 15.0)
+        await coordinator.reconcile_orphaned_safety_jobs()
+        assert pm._job_tracker.get_stage(job_id) == JobStage.SAFETY_CHECKING
 
     async def test_the_scaled_grace_is_capped(self) -> None:
         """A pathological average cannot let a hung safety process hold a job indefinitely."""

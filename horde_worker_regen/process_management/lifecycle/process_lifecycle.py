@@ -477,6 +477,7 @@ class ProcessLifecycleManager:
     _runtime_config: RuntimeConfig
     _max_inference_processes: int
     _max_safety_processes: int
+    _child_cpu_thread_cap: int | None
     _amd_gpu: bool
     _directml: int | None
     _abort_callback: Callable[[], None]
@@ -585,6 +586,7 @@ class ProcessLifecycleManager:
         self._abort_callback = abort_callback
         self._state = state
         self._entry_points = entry_points if entry_points is not None else ProcessEntryPoints()
+        self._child_cpu_thread_cap = self._compute_cpu_thread_cap()
         self._owned_registry = owned_registry
         # The ledger is always present (an in-memory ring by default) so diagnostics work under test;
         # the parent manager injects a file-backed one in a real run.
@@ -1243,6 +1245,7 @@ class ProcessLifecycleManager:
                     "amd_gpu": self._amd_gpu,
                     "directml": self._directml,
                     "dry_run_skip_safety": bridge_data.dry_run_skip_safety,
+                    "cpu_thread_cap": self._child_cpu_thread_cap,
                 },
             )
 
@@ -1423,6 +1426,7 @@ class ProcessLifecycleManager:
                 "amd_gpu": self._amd_gpu,
                 "directml": self._directml,
                 "dry_run_skip_post_processing": bridge_data.dry_run_skip_post_processing,
+                "cpu_thread_cap": self._child_cpu_thread_cap,
             },
         )
 
@@ -1872,6 +1876,7 @@ class ProcessLifecycleManager:
                 "directml": self._directml,
                 "horde_model_names": list(bridge_data.image_models_to_load),
                 "dry_run_skip_component_lane": bridge_data.dry_run_skip_inference,
+                "cpu_thread_cap": self._child_cpu_thread_cap,
             },
         )
         process.start()
@@ -2081,6 +2086,7 @@ class ProcessLifecycleManager:
                 "amd_gpu": self._amd_gpu,
                 "directml": self._directml,
                 "dry_run_skip_vae_lane": bridge_data.dry_run_skip_inference,
+                "cpu_thread_cap": self._child_cpu_thread_cap,
             },
         )
         process.start()
@@ -2532,6 +2538,39 @@ class ProcessLifecycleManager:
         self.end_download_process()
         self.start_download_process()
 
+    def _compute_cpu_thread_cap(self) -> int | None:
+        """Compute each GPU-bearing child's startup share of the host CPU threads.
+
+        Every child sizes its OpenMP/MKL pools to the whole machine by default, so a fleet of them
+        oversubscribes the host several times over. The host is not idle while the GPU works: SDE samplers
+        drive their torchsde Brownian-tree noise on it every step, and an off-GPU safety check is pure CPU
+        work queued behind them, so the oversubscription costs sampling throughput and starves safety. The
+        host is divided evenly among the children that compete for it (the planned inference slots, the
+        safety process, and one per enabled lane), with a floor of two threads so a small host still leaves
+        each child a usable pool.
+
+        A worker with a single inference slot has nothing to divide, so it keeps the untouched defaults.
+        The result is cached once during lifecycle construction: thread-pool environment variables are read
+        at child import time and cannot be changed coherently in children that are already running, so later
+        topology refreshes must not give replacement children a different share from their surviving peers.
+        """
+        if self._max_inference_processes <= 1:
+            return None
+        host_threads = os.cpu_count()
+        if host_threads is None:
+            return None
+        enabled_lanes = sum(
+            1
+            for lane_enabled in (
+                self.post_process_lane_enabled(),
+                self.vae_lane_enabled(),
+                self._component_lane_enabled(),
+            )
+            if lane_enabled
+        )
+        gpu_children = self._max_inference_processes + 1 + enabled_lanes
+        return max(2, host_threads // gpu_children)
+
     def _device_for_new_process(self) -> int:
         """Pick the card a newly-spawned inference process should run on.
 
@@ -2664,6 +2703,7 @@ class ProcessLifecycleManager:
                 # treat an empty image-model database as a fatal error in the child.
                 "expect_image_models": bool(card.config.image_models_to_load),
                 "legacy_comfy_vram_unload": bridge_data.legacy_comfy_vram_unload,
+                "cpu_thread_cap": self._child_cpu_thread_cap,
             },
         )
         process.start()

@@ -212,6 +212,16 @@ from both caps so it can probe higher concurrency than steady-state operation wo
 keep. When a cap reduces the configured count the worker logs the arithmetic so the
 smaller spawn is explained.
 
+When the resolved plan contains more than one inference process, the lifecycle
+manager also divides the host CPU count among the planned inference processes,
+the safety process, and each enabled GPU lane. Every such child receives the same
+floor-of-two OpenMP/MKL thread cap, computed once from the startup plan, before
+device pinning or any other torch/hordelib import. This avoids
+host oversubscription from torchsde's CPU-side Brownian-tree work and preserves CPU
+capacity for off-GPU safety checks. Explicit operator `OMP_NUM_THREADS` or
+`MKL_NUM_THREADS` values are retained; a single-inference-process worker is left
+unchanged.
+
 The **Config tab** shows a live estimate of this count under the Throughput
 fields, updating as you edit, so the consequence of a concurrency change is
 visible before you save.

@@ -80,6 +80,32 @@ def _apply_device_pin(
         )
 
 
+_OMP_NUM_THREADS_ENV = "OMP_NUM_THREADS"
+_MKL_NUM_THREADS_ENV = "MKL_NUM_THREADS"
+
+
+def _apply_cpu_thread_cap(cap: int | None) -> None:
+    """Cap this child's host-side math thread pools, when the parent has divided the host among children.
+
+    Each GPU-bearing child defaults its OpenMP/MKL pools to the whole machine, so several of them on one
+    host oversubscribe it many times over. The host CPU is not idle while the GPU works: SDE samplers drive
+    their torchsde Brownian-tree noise on it every step, and an off-GPU safety check is pure CPU work, so
+    the oversubscription both slows sampling and starves the safety lane behind it. The parent passes each
+    child its share of the host. Must run before the first torch import, which is where the pools are sized.
+
+    ``None`` (a single-inference-slot worker, which has nothing to divide) leaves both variables untouched,
+    and an operator's own value always wins: they are tuning this machine deliberately.
+
+    Args:
+        cap: Threads this child may use, or None to leave the pools at their defaults.
+    """
+    if cap is None:
+        return
+    for env_name in (_OMP_NUM_THREADS_ENV, _MKL_NUM_THREADS_ENV):
+        if env_name not in os.environ:
+            os.environ[env_name] = str(cap)
+
+
 def _spawn_timing_mark(process_id: int, kind: str, label: str) -> None:
     """Diagnostic: write a raw wall-clock marker to fd 2 for spawn/import-phase timing analysis.
 
@@ -307,6 +333,7 @@ def start_inference_process(
     gpu_sampling_lease: ClearanceLeaseProxy | None = None,
     expect_image_models: bool = True,
     legacy_comfy_vram_unload: bool = False,
+    cpu_thread_cap: int | None = None,
 ) -> None:
     """Start an inference process.
 
@@ -340,11 +367,14 @@ def start_inference_process(
         legacy_comfy_vram_unload (bool, optional): Launch this child with ``--disable-smart-memory``, the
             pre-retention regime in which ComfyUI unloads every model after each prompt and the scheduler's
             retention grants cannot hold the card. Defaults to False.
+        cpu_thread_cap (int | None, optional): This child's share of the host's CPU threads, sizing its \
+            OpenMP/MKL pools. None leaves them at their defaults. Defaults to None.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
     # Must precede the first torch/hordelib import below so the allocator reads it, and the device mask
     # must be applied before that too so torch only ever sees this process's assigned card.
     if not dry_run_skip_inference:
+        _apply_cpu_thread_cap(cpu_thread_cap)
         _apply_device_pin(process_id=process_id, device_index=device_index, accelerator_kind=accelerator_kind)
         _enable_expandable_segments(amd_gpu=amd_gpu, directml=directml)
     enable_child_faulthandler(f"inference_{process_id}")
@@ -484,6 +514,7 @@ def start_safety_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
+    cpu_thread_cap: int | None = None,
 ) -> None:
     """Start a safety process.
 
@@ -505,18 +536,23 @@ def start_safety_process(
             with the specified device
         dry_run_skip_safety (bool, optional): If true, skip real safety checks and return a dummy result.
             Defaults to False.
+        cpu_thread_cap (int | None, optional): This child's share of the host's CPU threads, sizing its \
+            OpenMP/MKL pools. None leaves them at their defaults. Defaults to None.
     """
     _spawn_timing_mark(process_id, "safety", "entry")
     # The on-GPU safety model (cpu_only False) must be masked to its assigned card before torch loads, the
     # same as an inference process. cpu_only safety needs no GPU, so it is never pinned; the default
     # single-GPU on-GPU case passes accelerator_kind None and so also writes no env var (byte-identical).
-    if not cpu_only and not dry_run_skip_safety:
-        _apply_device_pin(
-            process_id=process_id,
-            device_index=device_index,
-            accelerator_kind=accelerator_kind,
-            role="safety",
-        )
+    # Applied off-GPU too: a CPU safety check is the workload the cap exists to keep from being crowded out.
+    if not dry_run_skip_safety:
+        _apply_cpu_thread_cap(cpu_thread_cap)
+        if not cpu_only:
+            _apply_device_pin(
+                process_id=process_id,
+                device_index=device_index,
+                accelerator_kind=accelerator_kind,
+                role="safety",
+            )
     enable_child_faulthandler(f"safety_{process_id}")
     neutralize_inherited_argv()
     with contextlib.nullcontext():  # contextlib.redirect_stdout(), contextlib.redirect_stderr():
@@ -624,6 +660,7 @@ def start_post_process_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_post_processing: bool = False,
+    cpu_thread_cap: int | None = None,
 ) -> None:
     """Start the dedicated post-processing process.
 
@@ -644,9 +681,12 @@ def start_post_process_process(
         directml (int | None, optional): The DirectML device index, if any. Defaults to None.
         dry_run_skip_post_processing (bool, optional): Skip real post-processing (and hordelib init) and \
             echo images back. Defaults to False.
+        cpu_thread_cap (int | None, optional): This child's share of the host's CPU threads, sizing its \
+            OpenMP/MKL pools. None leaves them at their defaults. Defaults to None.
     """
     _spawn_timing_mark(process_id, "post_process", "entry")
     if not dry_run_skip_post_processing:
+        _apply_cpu_thread_cap(cpu_thread_cap)
         _apply_device_pin(
             process_id=process_id,
             device_index=device_index,
@@ -745,6 +785,7 @@ def start_vae_lane_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_vae_lane: bool = False,
+    cpu_thread_cap: int | None = None,
 ) -> None:
     """Start the dedicated VAE lane process.
 
@@ -765,9 +806,12 @@ def start_vae_lane_process(
         directml (int | None, optional): The DirectML device index, if any. Defaults to None.
         dry_run_skip_vae_lane (bool, optional): Skip the backend (and hordelib init) and return plausible \
             stand-in latent/image bytes. Defaults to False.
+        cpu_thread_cap (int | None, optional): This child's share of the host's CPU threads, sizing its \
+            OpenMP/MKL pools. None leaves them at their defaults. Defaults to None.
     """
     _spawn_timing_mark(process_id, "vae_lane", "entry")
     if not dry_run_skip_vae_lane:
+        _apply_cpu_thread_cap(cpu_thread_cap)
         _apply_device_pin(
             process_id=process_id,
             device_index=device_index,
@@ -857,6 +901,7 @@ def start_component_process(
     directml: int | None = None,
     horde_model_names: list[str] | None = None,
     dry_run_skip_component_lane: bool = False,
+    cpu_thread_cap: int | None = None,
 ) -> None:
     """Start the dedicated component lane process.
 
@@ -878,9 +923,12 @@ def start_component_process(
         horde_model_names (list[str] | None, optional): The worker's configured models; the lane holds the \
             components shared across them. Defaults to None.
         dry_run_skip_component_lane (bool, optional): Skip the backend and materialisation. Defaults to False.
+        cpu_thread_cap (int | None, optional): This child's share of the host's CPU threads, sizing its \
+            OpenMP/MKL pools. None leaves them at their defaults. Defaults to None.
     """
     _spawn_timing_mark(process_id, "component", "entry")
     if not dry_run_skip_component_lane:
+        _apply_cpu_thread_cap(cpu_thread_cap)
         _apply_device_pin(
             process_id=process_id,
             device_index=device_index,

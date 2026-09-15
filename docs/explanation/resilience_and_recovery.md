@@ -424,11 +424,13 @@ control-loop tick, with the same two-signal split as the in-progress case:
 
 The watchdog's grace **reads where safety is running**. Its baseline is sized for an
 on-GPU check; off-GPU the same check is CPU-bound and legitimately runs several times
-longer, so while safety is off its card with a live pool the grace scales to what
-checks are actually measuring on this host (the average the post-inference
-backpressure model already keeps), capped so a genuinely hung process is still caught.
-A fixed baseline there discards real progress on a check that was always going to
-finish, and the requeue then pays for the whole check again.
+longer. Whenever safety holds no GPU card—whether configured on CPU from startup or
+temporarily paused off a card—with a live pool, the grace scales to what checks are
+actually measuring on this host (the average the post-inference backpressure model
+already keeps) plus one average check for every job in the serial safety backlog,
+capped so a genuinely hung process is still caught. A fixed baseline there discards
+real progress on a check that was always going to finish, and the requeue then pays
+for the whole check again.
 
 A requeue that finds the safety pool unready normally forces a pool replacement. It
 does not do so while an **intentional placement rebuild** is in flight: that pool is
@@ -642,6 +644,9 @@ The escalation, in order:
    escalation policy still **counts** each soft reset (`limp_by_level`) so a
    persistent wedge still escalates to give-up. The parent process and the TUI stay
    attached. A transient wedge (a bad model load, a one-off deadlock) recovers here.
+   The same bounded-reap shape is used when horde maintenance triggers an operational
+   inference-pool reload: every slot is signalled first, then all are joined against
+   one shared deadline instead of paying a full shutdown grace serially per slot.
 3. **Give up cleanly** (`give_up_on_wedged_jobs`): once resets clearly are not
    helping (e.g. a deterministic crash-on-start), stop fighting: fault the jobs
    that cannot be served so the horde reissues them, rather than wedging forever.

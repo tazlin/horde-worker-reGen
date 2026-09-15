@@ -467,7 +467,7 @@ class TestFakeSafetyProcess:
             assert evaluation.replacement_image_bytes is None
 
         states = queue.state_changes()
-        assert HordeProcessState.EVALUATING_SAFETY in states
+        assert HordeProcessState.JOB_RECEIVED in states
         assert states[-1] == HordeProcessState.WAITING_FOR_JOB
 
 

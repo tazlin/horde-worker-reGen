@@ -1015,8 +1015,8 @@ class FakeSafetyProcess(HordeProcess):
             _hang_forever(f"fake safety {self.process_id}", f"hung on evaluation {self._evals_started}")
 
         self.send_process_state_change_message(
-            process_state=HordeProcessState.EVALUATING_SAFETY,
-            info="Evaluating safety",
+            process_state=HordeProcessState.JOB_RECEIVED,
+            info="Received safety job",
         )
 
         time_start = time.time()
@@ -1076,6 +1076,7 @@ def start_fake_inference_process(
     gpu_sampling_lease: ClearanceLeaseProxy | None = None,
     expect_image_models: bool = True,
     legacy_comfy_vram_unload: bool = False,
+    cpu_thread_cap: int | None = None,
     fail_every_n: int = 0,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
@@ -1151,6 +1152,7 @@ def start_fake_safety_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
+    cpu_thread_cap: int | None = None,
     fault_profile: FaultProfile | None = None,
 ) -> None:
     """Start a fake safety process.
@@ -1386,6 +1388,7 @@ def start_fake_post_process_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_post_processing: bool = False,
+    cpu_thread_cap: int | None = None,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
     sim_context_mb: float = 0.0,
@@ -1431,6 +1434,7 @@ def start_fake_vae_lane_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_vae_lane: bool = False,
+    cpu_thread_cap: int | None = None,
 ) -> None:
     """Start a fake VAE lane process.
 
@@ -1441,7 +1445,7 @@ def start_fake_vae_lane_process(
     """
     from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
 
-    _ = (accelerator_kind, amd_gpu, directml, dry_run_skip_vae_lane)
+    _ = (accelerator_kind, amd_gpu, directml, dry_run_skip_vae_lane, cpu_thread_cap)
     enable_child_faulthandler(f"fake_vae_lane_{process_id}")
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake vae lane")
@@ -1474,6 +1478,7 @@ def start_fake_component_process(
     directml: int | None = None,
     horde_model_names: list[str] | None = None,
     dry_run_skip_component_lane: bool = False,
+    cpu_thread_cap: int | None = None,
 ) -> None:
     """Start a fake component lane process.
 
@@ -1484,7 +1489,7 @@ def start_fake_component_process(
     """
     from horde_worker_regen.process_management.workers.component_lane_process import HordeComponentLaneProcess
 
-    _ = (accelerator_kind, amd_gpu, directml, horde_model_names)
+    _ = (accelerator_kind, amd_gpu, directml, horde_model_names, cpu_thread_cap)
     enable_child_faulthandler(f"fake_component_{process_id}")
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake component")
