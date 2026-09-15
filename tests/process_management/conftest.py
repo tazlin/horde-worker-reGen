@@ -343,6 +343,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.text_model_name = None
     bd.text_threads = 1
     bd.text_generation_timeout_seconds = None
+    bd.text_stall_seconds = 30.0
     bd.text_backend_kind = TEXT_BACKENDS.koboldcpp
     bd.text_backend_managed = False
     bd.text_model_path = None

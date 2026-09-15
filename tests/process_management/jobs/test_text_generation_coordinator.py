@@ -12,6 +12,7 @@ with no timing to race.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections import deque
 from collections.abc import Mapping
@@ -48,6 +49,8 @@ from horde_worker_regen.text_backends import (
     TextBackendDescription,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
+    TextGenerationProgress,
+    TextGenerationProgressCallback,
     TextGenerationResult,
 )
 from tests.process_management.conftest import (
@@ -71,7 +74,7 @@ _SUBMIT_REWARD = 12.5
 
 
 class _NeverAnsweringTextBackend(FakeTextBackend):
-    """A fake whose generations never return, for the flow's own bound on a call that does not come back.
+    """A fake whose generations never return and never report a chunk, so the flow's own bounds end them.
 
     The driver normally enforces the deadline and reports outliving it as an unavailable backend; this
     stands in for the case where nothing under the flow honours it.
@@ -84,6 +87,7 @@ class _NeverAnsweringTextBackend(FakeTextBackend):
         *,
         generation_key: str,
         deadline_seconds: float,
+        on_progress: TextGenerationProgressCallback | None = None,
     ) -> TextGenerationResult:
         """Never return."""
         await asyncio.Event().wait()
@@ -798,3 +802,184 @@ async def test_the_worker_state_counts_text_jobs_in_flight_for_shutdown() -> Non
     await _drain_job_tasks(coordinator)
     assert coordinator._state.text_jobs_in_flight == 0
     assert len(session.submit_requests) == 1
+
+
+async def test_a_streamed_job_carries_its_progress_on_the_in_flight_record() -> None:
+    """The snapshot reads a running job's progress from the ledger, so the flow has to put it there."""
+    backend = FakeTextBackend(description=_DESCRIPTION, stream_chunks=("the ", "backend's ", "answer"))
+    coordinator, _backend, session = _make_coordinator(backend=backend)
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(job_id=_job_id(), payload={"prompt": "a prompt"}, time_popped=0.0)
+    coordinator._in_flight[job.job_id] = job
+
+    await coordinator.run_job(job)
+
+    assert job.progress is not None, "a generation that arrived in pieces reported none of them"
+    assert job.progress.chunks_received == 3
+    assert job.progress.characters_received == len("the backend's answer")
+    assert session.submit_requests[0].generation == "the backend's answer"
+
+
+async def test_a_backend_that_stops_producing_tokens_faults_the_job_on_the_stall_bound() -> None:
+    """A wedged backend and a slow one look the same to a deadline; only silence tells them apart."""
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        stream_chunks=("this much and no more",),
+        stalls_after_chunks=True,
+    )
+    coordinator, _backend, session = _make_coordinator(
+        backend=backend,
+        text_stall_seconds=0.1,
+        text_generation_timeout_seconds=30.0,
+    )
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=0.0)
+    coordinator._in_flight[job.job_id] = job
+
+    started_at = time.monotonic()
+    await asyncio.wait_for(coordinator.run_job(job), timeout=10.0)
+    stalled_after_seconds = time.monotonic() - started_at
+
+    assert stalled_after_seconds < 5.0, "the job waited out its deadline instead of its stall bound"
+    assert [call.generation_key for call in backend.stop_calls] == [job.job_id]
+    assert session.submit_requests[0].state == GENERATION_STATE.faulted
+    assert coordinator.num_jobs_faulted == 1
+
+
+async def test_a_cold_backends_first_chunk_is_given_the_whole_deadline() -> None:
+    """A backend that has just started spends seconds warming its kernels, which is not a stall."""
+    backend = _NeverAnsweringTextBackend(description=_DESCRIPTION)
+    coordinator, _backend, session = _make_coordinator(
+        backend=backend,
+        text_stall_seconds=0.05,
+        text_generation_timeout_seconds=0.6,
+    )
+    await coordinator.await_backend_ready()
+    assert coordinator._backend_is_cold is True, "a backend that has produced nothing yet is cold"
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=0.0)
+    coordinator._in_flight[job.job_id] = job
+
+    started_at = time.monotonic()
+    await asyncio.wait_for(coordinator.run_job(job), timeout=10.0)
+    gave_up_after_seconds = time.monotonic() - started_at
+
+    assert gave_up_after_seconds > 0.4, "the first token of a cold backend was held to the stall bound"
+    assert session.submit_requests[0].state == GENERATION_STATE.faulted
+
+
+def test_the_first_chunk_of_a_warm_backend_is_held_to_the_stall_bound() -> None:
+    """Once the backend has produced a token, nothing about the next one deserves the whole deadline."""
+    coordinator, _backend, _session = _make_coordinator(text_stall_seconds=5.0)
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=0.0)
+
+    assert coordinator._chunk_patience_seconds(job, deadline_seconds=120.0) == 120.0
+
+    coordinator._backend_is_cold = False
+
+    assert coordinator._chunk_patience_seconds(job, deadline_seconds=120.0) == 5.0
+
+    coordinator._backend_is_cold = True
+    job.progress = TextGenerationProgress(chunks_received=1, characters_received=4, elapsed_seconds=0.1)
+
+    assert coordinator._chunk_patience_seconds(job, deadline_seconds=120.0) == 5.0
+
+
+async def test_a_managed_backend_is_warmed_up_once_after_readiness() -> None:
+    """The worker owns this backend, so the kernel warm-up is its cost to pay before any job arrives."""
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="warm")
+    coordinator, _backend, _session = _make_coordinator(backend=backend, text_backend_managed=True)
+
+    assert await coordinator.await_backend_ready() is True
+
+    assert len(backend.generate_calls) == 1
+    warm_up_call = backend.generate_calls[0]
+    assert warm_up_call.generation_key == text_generation_coordinator.WARM_UP_GENERATION_KEY
+    assert warm_up_call.payload == {
+        "prompt": text_generation_coordinator.WARM_UP_PROMPT,
+        "max_length": text_generation_coordinator.WARM_UP_MAX_LENGTH,
+    }
+    assert coordinator._backend_is_cold is False
+
+
+async def test_a_backend_the_operator_runs_is_not_warmed_up() -> None:
+    """An attached backend may be serving other clients, whose generation slot is not the worker's to spend."""
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="warm")
+    coordinator, _backend, _session = _make_coordinator(backend=backend, text_backend_managed=False)
+
+    assert await coordinator.await_backend_ready() is True
+
+    assert backend.generate_calls == ()
+
+
+async def test_a_failed_warm_up_does_not_hold_the_gate_closed() -> None:
+    """The gate passed on the backend's own answers; a discarded generation cannot take that back."""
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        generate_failures=(TextBackendUnavailable("not this time"),),
+    )
+    coordinator, _backend, _session = _make_coordinator(backend=backend, text_backend_managed=True)
+
+    assert await coordinator.await_backend_ready() is True
+
+    assert coordinator.advertisement is not None
+    assert coordinator._backend_is_cold is True
+
+
+async def test_the_gate_records_what_the_backend_can_report_about_a_generation() -> None:
+    """Whether a text job can show token counts at all is a property of the backend build, settled here."""
+    backend = FakeTextBackend(description=_DESCRIPTION, generation_stats=True)
+    coordinator, _backend, _session = _make_coordinator(backend=backend)
+
+    assert coordinator.backend_capabilities is None
+
+    await coordinator.await_backend_ready()
+
+    assert coordinator.backend_capabilities is not None
+    assert coordinator.backend_capabilities.generation_stats is True
+    assert backend.capabilities_call_count == 1
+
+
+async def test_the_token_counts_a_backend_reports_reach_the_run_metrics_record() -> None:
+    """A text job's size is what the backend counted, and it is the only thing that can count it."""
+    run_metrics = WorkerRunMetrics()
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        stream_chunks=("one ", "two"),
+        generation_stats=True,
+        stats_prompt_tokens=11,
+        stats_tokens_per_chunk=5,
+    )
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, _session = _make_coordinator(
+        backend=backend,
+        session=session,
+        run_metrics=run_metrics,
+    )
+    await coordinator.await_backend_ready()
+
+    await coordinator.api_text_pop()
+    await _drain_job_tasks(coordinator)
+
+    record = run_metrics.snapshot().jobs[0]
+    assert record.prompt_tokens == 11
+    assert record.generated_tokens == 10
+
+
+async def test_a_backend_that_counts_nothing_records_no_token_counts() -> None:
+    """A stock backend counts nothing, and a count guessed from the text would be worse than none."""
+    run_metrics = WorkerRunMetrics()
+    backend = FakeTextBackend(description=_DESCRIPTION, stream_chunks=("one ", "two"))
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, _session = _make_coordinator(
+        backend=backend,
+        session=session,
+        run_metrics=run_metrics,
+    )
+    await coordinator.await_backend_ready()
+
+    await coordinator.api_text_pop()
+    await _drain_job_tasks(coordinator)
+
+    record = run_metrics.snapshot().jobs[0]
+    assert record.prompt_tokens is None
+    assert record.generated_tokens is None

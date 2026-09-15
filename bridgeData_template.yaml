@@ -496,6 +496,12 @@ text_threads: 1
 # the figure the older scribe bridge used). Set it if your backend is slower than that.
 # text_generation_timeout_seconds: 60
 
+# Seconds without a single token arriving before the worker gives up on a generation and faults the job.
+# The backend streams its answer, so a gap this long means it stopped rather than that it is slow; a
+# generation that is merely long is bounded by text_generation_timeout_seconds instead. The first token
+# after the backend starts is exempt, because a cold backend takes seconds to produce anything.
+text_stall_seconds: 30
+
 # Which text backend program serves text jobs, in the horde's own naming. koboldcpp is the default and
 # the first supported backend; the same value decides how it is launched, which driver talks to it and
 # how the advertised model name is prefixed.

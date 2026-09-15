@@ -19,6 +19,13 @@ Two things the flow owns that the backend deliberately does not:
 Each popped job runs as its own task covering both its generation and its submit, so a slow submit
 delays neither the next pop nor another generation.
 
+Generations arrive as a stream of text, which gives the flow the one liveness signal a deadline cannot
+provide: a backend that has stopped producing is silent, while a backend that is merely slow is not. So
+the deadline stays the outer bound on a whole generation and a silence of `text_stall_seconds` ends one
+early, with the first token after a backend starts exempted because a cold backend spends seconds
+warming its kernels. The flow spends one short generation of its own on that warm-up where it owns the
+backend, so the first popped job does not.
+
 Which backend is attached is a constructor argument twice over: the object the flow generates through
 (the [`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend] protocol, never a concrete
 driver) and the `TEXT_BACKENDS` value naming which one it is, which is all that decides how the
@@ -30,6 +37,7 @@ Attaching to a backend the operator started is the whole of the lifecycle today.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from asyncio import CancelledError
 from dataclasses import dataclass
@@ -60,9 +68,14 @@ from horde_worker_regen.text_backends import (
     KoboldApiTextBackend,
     TextBackend,
     TextBackendBusy,
+    TextBackendCapabilities,
     TextBackendDescription,
+    TextBackendError,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
+    TextGenerationProgress,
+    TextGenerationProgressCallback,
+    TextGenerationResult,
 )
 
 if TYPE_CHECKING:
@@ -127,6 +140,23 @@ SUBMIT_MAX_ATTEMPTS: Final = 3
 SUBMIT_RETRY_WAIT_SECONDS: Final = 2.0
 """Wait between submit attempts for one job."""
 
+WARM_UP_PROMPT: Final = "Hello"
+"""The prompt the warm-up generation uses. Short and unremarkable: nothing reads its answer."""
+
+WARM_UP_MAX_LENGTH: Final = 8
+"""How many tokens the warm-up generation asks for.
+
+Enough that the backend runs its generation kernels at all, few enough that the wait is the warm-up
+itself rather than the generation.
+"""
+
+WARM_UP_GENERATION_KEY: Final = "regen-text-warm-up"
+"""The key the warm-up generation is issued with, deliberately not the shape of a horde job id.
+
+Job ids are UUIDs, so this can never name a real generation, and an abort or a statistics sample that
+went astray onto this key would name nothing the flow is holding.
+"""
+
 GENERATE_DEADLINE_GRACE_SECONDS: Final = 5.0
 """Slack between the deadline handed to the backend and the flow's own bound on the same call.
 
@@ -161,6 +191,26 @@ DRY_RUN_MAX_LENGTH: Final = 512
 
 DRY_RUN_GENERATION_TEXT: Final = "This generation came from a dry-run worker with no text backend attached."
 """What the dry-run stand-in generates, worded so it cannot be mistaken for a real generation."""
+
+
+class TextPayloadKeys:
+    """The horde payload fields the flow reads for its own records or sets on its own requests.
+
+    The payload is the horde's and is forwarded to the backend untouched; these are the two fields the
+    worker looks at, named here rather than spelled at each site.
+    """
+
+    PROMPT: Final = "prompt"
+    MAX_LENGTH: Final = "max_length"
+
+
+class _GenerationStalled(Exception):
+    """The backend stopped producing tokens for a generation it had begun.
+
+    Private to this module: it never leaves the offer loop that raises it, which turns it into the same
+    abandon-and-fault outcome a generation that outlived its deadline gets. A separate type from
+    `TimeoutError` because the two are different diagnoses, and the log line has to say which happened.
+    """
 
 
 @dataclass(frozen=True)
@@ -363,6 +413,16 @@ class TextJobInFlight:
     dispatch, load or safety stage between the two."""
     time_generation_finished: float | None = None
     """When the backend answered (or was given up on), or None while it has not."""
+    progress: TextGenerationProgress | None = None
+    """The most recent thing the backend said about this generation while it was running.
+
+    None before the first chunk arrives and for a job the backend never began. Replaced rather than
+    accumulated: each report already carries the running totals, so the latest one is the whole state.
+    """
+    prompt_tokens: int | None = None
+    """Prompt tokens the backend reported for this job, or None when nothing it offers reported them."""
+    generated_tokens: int | None = None
+    """Generated tokens the backend reported for this job, or None when nothing reported them."""
     busy_attempts: int = 0
     """How many times the backend has answered busy for this job."""
     stopped: bool = False
@@ -435,6 +495,18 @@ class TextGenerationCoordinator:
         self._advertisement: TextFlowAdvertisement | None = None
         """What the backend's last description lets the worker offer. None until the gate has passed."""
 
+        self._backend_capabilities: TextBackendCapabilities | None = None
+        """What the backend's optional routes turned out to be. None until the gate has passed."""
+
+        self._backend_is_cold = True
+        """Whether the backend has yet to produce a token since it started.
+
+        A backend that has just launched (or relaunched) spends seconds warming its generation kernels
+        before its first token appears, so the stall bound cannot apply to that first token. Set again
+        by every readiness gate, which is what a relaunch drives the flow back through, and cleared by
+        the first token the backend produces, whether that is the warm-up's or a job's.
+        """
+
         self.num_jobs_submitted = 0
         """Cumulative text jobs successfully submitted to the API this session."""
         self.num_jobs_faulted = 0
@@ -475,6 +547,15 @@ class TextGenerationCoordinator:
         return self._advertisement is not None
 
     @property
+    def backend_capabilities(self) -> TextBackendCapabilities | None:
+        """What the backend's optional routes turned out to be, or None while the gate is open.
+
+        The one thing that decides whether a text job can report token counts and a live rate at all, so
+        a reader asking why a job shows none finds the answer here rather than concluding the job is odd.
+        """
+        return self._backend_capabilities
+
+    @property
     def text_backend_kind(self) -> TEXT_BACKENDS:
         """Which text backend this flow generates through."""
         return self._text_backend_kind
@@ -511,6 +592,8 @@ class TextGenerationCoordinator:
             wait.
         """
         self._advertisement = None
+        self._backend_capabilities = None
+        self._backend_is_cold = True
         backend = self.require_backend()
         gate_opened_at = time.monotonic()
         backoff_seconds = READY_BACKOFF_INITIAL_SECONDS
@@ -531,6 +614,8 @@ class TextGenerationCoordinator:
                         f"max_context_length={self._advertisement.max_context_length}, "
                         f"soft_prompts={len(self._advertisement.soft_prompts)})",
                     )
+                    await self._note_backend_capabilities(backend)
+                    await self._warm_up_backend()
                     return True
 
             # Edge-triggered on the notice interval rather than emitted per probe: the gate polls every
@@ -562,6 +647,55 @@ class TextGenerationCoordinator:
         except TextBackendUnavailable as unavailable:
             logger.warning(f"Text backend reported ready but could not describe itself: {unavailable}")
             return None
+
+    async def _note_backend_capabilities(self, backend: TextBackend) -> None:
+        """Record which optional routes this backend has, and say once what that means for its jobs.
+
+        Asked at the gate rather than on the first generation so the answer is settled before any job
+        depends on it, and said out loud because "why does my text worker show no token rate" is
+        otherwise a question with no answer anywhere.
+        """
+        self._backend_capabilities = await backend.capabilities()
+        if self._backend_capabilities.generation_stats:
+            logger.info("Text backend reports per-request statistics; text jobs will carry token counts and a rate.")
+            return
+        logger.info(
+            "Text backend has no per-request statistics route, so text jobs report how much text has "
+            "arrived but no token counts and no token rate. A stock backend build is expected to answer this way.",
+        )
+
+    async def _warm_up_backend(self) -> None:
+        """Spend one short generation nobody is waiting for, so the first popped job does not pay for it.
+
+        The first generation after a backend starts produces its first tokens seconds later while the
+        inference kernels warm: two tokens in five seconds where the same backend runs at a hundred and
+        seventy-six a second once warm. A popped job that paid that would look stalled and would be
+        slower than the horde was promised. Skipped for a backend the operator runs themselves, which
+        may be serving other clients whose generation slot this is not the worker's to spend.
+
+        A warm-up that fails changes nothing: the gate has already passed on the backend's own answers,
+        and the next real job will find out soon enough whether generation works.
+        """
+        if self.bridge_data.text_backend_managed is not True:
+            logger.debug("Skipping the text backend warm-up: the operator runs this backend, and it may be serving.")
+            return
+
+        warm_up_started_at = time.monotonic()
+        try:
+            await self.require_backend().generate(
+                {TextPayloadKeys.PROMPT: WARM_UP_PROMPT, TextPayloadKeys.MAX_LENGTH: WARM_UP_MAX_LENGTH},
+                generation_key=WARM_UP_GENERATION_KEY,
+                deadline_seconds=self.generation_deadline_seconds(),
+            )
+        except TextBackendError as warm_up_failure:
+            logger.warning(f"The text backend warm-up generation did not complete: {warm_up_failure}")
+            return
+
+        self._backend_is_cold = False
+        logger.info(
+            f"Text backend warmed up in {time.monotonic() - warm_up_started_at:.1f}s "
+            f"({WARM_UP_MAX_LENGTH} tokens, discarded); the first popped job starts on warm kernels.",
+        )
 
     # endregion
 
@@ -721,11 +855,11 @@ class TextGenerationCoordinator:
         the server times it out, which the horde charges the worker for.
         """
         try:
-            result_text = await self._generate_text(job)
-            if result_text is None:
+            result = await self._generate_text(job)
+            if result is None:
                 await self.submit_job(job, generation="", state=GENERATION_STATE.faulted)
                 return
-            await self.submit_job(job, generation=result_text, state=GENERATION_STATE.ok)
+            await self.submit_job(job, generation=result.text, state=GENERATION_STATE.ok)
         except CancelledError:
             raise
         except Exception as unexpected_error:
@@ -739,8 +873,8 @@ class TextGenerationCoordinator:
                 self._in_flight.pop(job.job_id, None)
                 self._state.text_jobs_in_flight = len(self._in_flight)
 
-    async def _generate_text(self, job: TextJobInFlight) -> str | None:
-        """Return the generated text for one job, or None when the job must be faulted.
+    async def _generate_text(self, job: TextJobInFlight) -> TextGenerationResult | None:
+        """Return the backend's answer for one job, or None when the job must be faulted.
 
         Retries only the case where retrying can work: a busy backend is healthy and the payload is fine,
         so the same job is worth re-offering shortly. A refused payload will be refused again, and an
@@ -748,12 +882,17 @@ class TextGenerationCoordinator:
         sends the flow back to the readiness gate).
         """
         try:
-            return await self._offer_until_answered(job)
+            result = await self._offer_until_answered(job)
         finally:
             job.time_generation_finished = time.time()
 
-    async def _offer_until_answered(self, job: TextJobInFlight) -> str | None:
-        """Return the backend's text for one job, re-offering it while the backend answers busy.
+        if result is not None:
+            job.prompt_tokens = result.prompt_tokens
+            job.generated_tokens = result.generated_tokens
+        return result
+
+    async def _offer_until_answered(self, job: TextJobInFlight) -> TextGenerationResult | None:
+        """Return the backend's answer for one job, re-offering it while the backend answers busy.
 
         Split from :meth:`_generate_text` so every way out of the offer loop stamps the generation's end
         once, rather than each of its exits repeating the stamp.
@@ -766,13 +905,10 @@ class TextGenerationCoordinator:
             # offer that was actually taken rather than to the first one that was not.
             job.time_generation_started = time.time()
             try:
-                result = await asyncio.wait_for(
-                    backend.generate(
-                        job.payload,
-                        generation_key=job.job_id,
-                        deadline_seconds=deadline_seconds,
-                    ),
-                    timeout=deadline_seconds + GENERATE_DEADLINE_GRACE_SECONDS,
+                result = await self._generate_until_stalled_or_answered(
+                    job,
+                    backend=backend,
+                    deadline_seconds=deadline_seconds,
                 )
             except TextBackendBusy as busy:
                 job.busy_attempts += 1
@@ -793,6 +929,10 @@ class TextGenerationCoordinator:
                 await self._stop_generation(job)
                 self._advertisement = None
                 return None
+            except _GenerationStalled as stalled:
+                logger.error(f"Text job {job.job_id[:8]} stalled: {stalled}. Abandoning the generation.")
+                await self._stop_generation(job)
+                return None
             except TimeoutError:
                 logger.error(
                     f"Text job {job.job_id[:8]} outlived its {deadline_seconds:.0f}s deadline; "
@@ -807,7 +947,93 @@ class TextGenerationCoordinator:
                     f"{job.job_id[:8]}; a stopped generation is incomplete however much of it came back",
                 )
                 return None
-            return result.text
+            return result
+
+    async def _generate_until_stalled_or_answered(
+        self,
+        job: TextJobInFlight,
+        *,
+        backend: TextBackend,
+        deadline_seconds: float,
+    ) -> TextGenerationResult:
+        """Return one offer's answer, giving up early on a backend that stopped producing tokens.
+
+        The deadline bounds a generation that is running slowly; it cannot bound one that is not running
+        at all, because a backend that wedged at the first token looks exactly like a backend that will
+        answer at the last moment, and the difference is minutes of a requester's time. The text arrives
+        continuously, so silence is the signal: a generation that has produced nothing for
+        `text_stall_seconds` is over, whatever its deadline still allows.
+
+        Raises:
+            _GenerationStalled: The backend produced nothing for longer than its patience allows.
+            TextBackendError: Whatever the backend raised for this offer.
+            TimeoutError: The offer outlived the deadline without the backend enforcing it.
+        """
+        chunk_arrived = asyncio.Event()
+        generation = asyncio.create_task(
+            asyncio.wait_for(
+                backend.generate(
+                    job.payload,
+                    generation_key=job.job_id,
+                    deadline_seconds=deadline_seconds,
+                    on_progress=self._progress_recorder(job, chunk_arrived),
+                ),
+                timeout=deadline_seconds + GENERATE_DEADLINE_GRACE_SECONDS,
+            ),
+        )
+        offer_started_at = time.monotonic()
+
+        try:
+            while True:
+                patience_seconds = self._chunk_patience_seconds(job, deadline_seconds=deadline_seconds)
+                last_chunk_at = job.progress.last_chunk_at if job.progress is not None else None
+                silent_since = last_chunk_at if last_chunk_at is not None else offer_started_at
+                silence_allowed_for = silent_since + patience_seconds - time.monotonic()
+                if silence_allowed_for <= 0:
+                    raise _GenerationStalled(
+                        f"no text arrived for {patience_seconds:.1f}s after "
+                        f"{job.progress.chunks_received if job.progress is not None else 0} chunk(s)",
+                    )
+                if await _generation_finished_first(generation, chunk_arrived, timeout=silence_allowed_for):
+                    return generation.result()
+                # A chunk landed, so the silence the loop was measuring is over and the next one is
+                # measured from this arrival. Every wake re-reads the patience too, because the first
+                # chunk of a cold backend is the one token held to a different bound than the rest.
+                chunk_arrived.clear()
+        finally:
+            await _cancel_generation(generation)
+
+    def _progress_recorder(
+        self,
+        job: TextJobInFlight,
+        chunk_arrived: asyncio.Event,
+    ) -> TextGenerationProgressCallback:
+        """Return the callback that puts one job's live progress where the flow and the snapshot read it."""
+
+        def record_progress(progress: TextGenerationProgress) -> None:
+            """Hold the latest report on the job, and wake the stall bound when text actually arrived.
+
+            Statistics samples come through here too and carry no new text, so only a report that
+            advanced the chunk count counts as the backend having produced something.
+            """
+            chunks_before = job.progress.chunks_received if job.progress is not None else 0
+            job.progress = progress
+            if progress.chunks_received > chunks_before:
+                self._backend_is_cold = False
+                chunk_arrived.set()
+
+        return record_progress
+
+    def _chunk_patience_seconds(self, job: TextJobInFlight, *, deadline_seconds: float) -> float:
+        """Return how long this generation may stay silent before the flow gives up on it.
+
+        A backend that has not produced a token since it started is warming its kernels, which takes
+        seconds and is not a fault, so the first token of a cold backend is given the whole deadline.
+        Every token after that, and every token of a warm backend, is held to the stall bound.
+        """
+        if job.progress is None and self._backend_is_cold:
+            return deadline_seconds
+        return self.bridge_data.text_stall_seconds
 
     def generation_deadline_seconds(self) -> float:
         """Return how long one generation may take before the flow abandons it.
@@ -919,7 +1145,8 @@ class TextGenerationCoordinator:
         """Record one delivered text job into run metrics. A no-op when no aggregator is wired.
 
         A job faulted before the backend was ever asked has no generation span, so its timings are left
-        unknown rather than reported as zero.
+        unknown rather than reported as zero, and its token counts are unknown for the same reason: only
+        a backend that ran the job can say how many tokens it was, and only some backends say at all.
         """
         if self._run_metrics is None:
             return
@@ -940,7 +1167,9 @@ class TextGenerationCoordinator:
             generation_seconds=generation_seconds,
             faulted=faulted,
             kudos_reward=kudos_reward,
-            max_length=_payload_int(job.payload, "max_length"),
+            prompt_tokens=job.prompt_tokens,
+            generated_tokens=job.generated_tokens,
+            max_length=_payload_int(job.payload, TextPayloadKeys.MAX_LENGTH),
         )
 
     # endregion
@@ -998,3 +1227,53 @@ class TextGenerationCoordinator:
             logger.warning(f"{len(self._in_flight)} text job(s) did not finish before the flow closed")
 
         await backend.close()
+
+
+async def _generation_finished_first(
+    generation: asyncio.Task[TextGenerationResult],
+    chunk_arrived: asyncio.Event,
+    *,
+    timeout: float,
+) -> bool:
+    """Return whether the generation finished before a chunk arrived or the wait ran out.
+
+    Three things can end this wait and each means something different: the generation answered, the
+    backend produced text (so the silence being measured is over), or neither happened for long enough
+    that the backend has stopped. Waiting on the generation alone would measure silence only in whole
+    waits, so a stall bound shorter than the deadline would never be reached.
+    """
+    waiting_for_a_chunk = asyncio.ensure_future(chunk_arrived.wait())
+    try:
+        finished, _still_waiting = await asyncio.wait(
+            {generation, waiting_for_a_chunk},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        waiting_for_a_chunk.cancel()
+        # The waiter exists only to wake this loop, so its cancellation is the expected end of it.
+        with contextlib.suppress(CancelledError):
+            await waiting_for_a_chunk
+
+    return generation in finished
+
+
+async def _cancel_generation(generation: asyncio.Task[TextGenerationResult]) -> None:
+    """Abandon a generation the flow is no longer waiting on, and wait for it to notice.
+
+    Awaited rather than left to finish on its own so that no generation task outlives the offer that
+    started it: the offer has already decided the job's outcome, and a task still writing progress into
+    a job that has been faulted would be reporting on work nobody is waiting for.
+    """
+    if generation.done():
+        return
+
+    generation.cancel()
+    try:
+        await generation
+    except CancelledError:
+        # Expected: this is the cancellation just asked for arriving. The caller's own reason for
+        # abandoning the generation is the exception that propagates, not this one.
+        pass
+    except Exception as abandoned_failure:
+        logger.debug(f"An abandoned text generation ended with {abandoned_failure!r}")

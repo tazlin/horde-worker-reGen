@@ -1,20 +1,23 @@
 """The KoboldAI driver is the worker's whole conversation with a program it does not control.
 
 These tests drive the real driver against a local `aiohttp` application whose answers are shaped like
-koboldcpp's: the same routes, the same JSON keys, the same string booleans on abort, and the same 503
-for "one generation at a time and I am on it". Two things they pin above all: the horde payload reaches
-the backend exactly as it arrived, with only the generation key added, and every failure mode surfaces
-as one of the three protocol exceptions so the flow never has to look at HTTP.
+koboldcpp's: the same routes, the same JSON keys, the same server-sent-events framing, the same string
+booleans on abort, and the same 503 for "one generation at a time and I am on it". Three things they pin
+above all: the horde payload reaches the backend exactly as it arrived with only the generation key
+added, a generation is driven through the stream and reports itself as it arrives, and every failure
+mode surfaces as one of the three protocol exceptions so the flow never has to look at HTTP.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from typing import Final
 
 import aiohttp
 import pytest
@@ -22,6 +25,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from horde_worker_regen.text_backends import (
+    CAPABILITY_PROBE_GENERATION_KEY,
     KoboldApiJsonKeys,
     KoboldApiRoutes,
     KoboldApiTextBackend,
@@ -29,12 +33,17 @@ from horde_worker_regen.text_backends import (
     TextBackendBusy,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
+    TextGenerationProgress,
+    kobold_api,
 )
 
 _MODEL_NAME = "koboldcpp/a-model.gguf"
 _MAX_CONTEXT_LENGTH = 4096
 _MAX_LENGTH = 512
-_GENERATED_TEXT = "the backend's own words"
+_STREAM_CHUNKS: Final = ("the backend's ", "own ", "words")
+"""One generation as the stream delivers it: several tokens per record, which is what a real one sends."""
+_GENERATED_TEXT = "".join(_STREAM_CHUNKS)
+_STREAM_FINISH_REASON = "length"
 _GENERATION_KEY = "FEDCBA98"
 
 _BUSY_BODY = {"detail": {"msg": "Server is busy; please try again later.", "type": "service_unavailable"}}
@@ -45,13 +54,60 @@ _SLOW_ANSWER_SECONDS = 0.5
 
 _SHORT_DEADLINE_SECONDS = 0.05
 
+_RECORD_DELAY_SECONDS = 0.05
+"""Spacing between stream records, so a test can act while a generation is still arriving."""
+
+_FAST_STATS_POLL_SECONDS = 0.01
+"""The statistics poll interval under test: several samples inside one short streamed generation."""
+
+_STATS_SAMPLES: Final = (
+    {
+        KoboldApiJsonKeys.FOUND: True,
+        "batched": True,
+        "state": 2,
+        "slot": 1,
+        KoboldApiJsonKeys.PROMPT_TOKENS: 12,
+        KoboldApiJsonKeys.COMPLETION_TOKENS: 20,
+        KoboldApiJsonKeys.GENERATION_SECONDS: 1.0,
+        "finished": False,
+    },
+    {
+        KoboldApiJsonKeys.FOUND: True,
+        "batched": True,
+        "state": 2,
+        "slot": 1,
+        KoboldApiJsonKeys.PROMPT_TOKENS: 12,
+        KoboldApiJsonKeys.COMPLETION_TOKENS: 40,
+        KoboldApiJsonKeys.GENERATION_SECONDS: 2.0,
+        "finished": False,
+    },
+)
+"""A patched backend's answers about one generation in flight, the second repeating once the script ends."""
+
+
+def _default_stream_records() -> tuple[dict[str, object], ...]:
+    """Return koboldcpp's own stream shape: a null finish reason per record and a real one on the last."""
+    records: list[dict[str, object]] = [
+        {KoboldApiJsonKeys.TOKEN: chunk, KoboldApiJsonKeys.FINISH_REASON: None} for chunk in _STREAM_CHUNKS[:-1]
+    ]
+    records.append(
+        {KoboldApiJsonKeys.TOKEN: _STREAM_CHUNKS[-1], KoboldApiJsonKeys.FINISH_REASON: _STREAM_FINISH_REASON}
+    )
+    return tuple(records)
+
+
+def _sonar_stream_records() -> tuple[dict[str, object], ...]:
+    """Return sonar's stream shape, which carries a token and never a finish reason at all."""
+    return tuple({KoboldApiJsonKeys.TOKEN: chunk} for chunk in _STREAM_CHUNKS)
+
 
 @dataclass
 class _KoboldBackendBehaviour:
     """How the fake KoboldAI server should answer, and what it recorded while doing so.
 
-    Defaults describe a healthy koboldcpp with a model loaded, no soft prompts and a working abort
-    route; each test changes only the one thing it is about.
+    Defaults describe a healthy stock koboldcpp: a model loaded, no soft prompts, a working stream and
+    abort route, and no statistics route, which is what an unpatched build has.  Each test changes only
+    the one thing it is about.
     """
 
     model_name: str = _MODEL_NAME
@@ -62,13 +118,32 @@ class _KoboldBackendBehaviour:
     soft_prompts: tuple[str, ...] | None = ()
     """The list the soft-prompts route answers with; `None` makes that route answer 404."""
     generate_status: int = HTTPStatus.OK
+    """The status both generation routes answer with, since a backend refuses a request either way."""
     generate_body: object | None = None
-    """An explicit generate body, or `None` for koboldcpp's faithful `results` answer."""
+    """An explicit blocking generate body, or `None` for koboldcpp's faithful `results` answer."""
     generate_delay_seconds: float = 0.0
+    stream_route_present: bool = True
+    """Whether the stream route exists. `False` answers 404 there, as a backend without one does."""
+    stream_records: tuple[Mapping[str, object], ...] | None = None
+    """The records the stream sends, or `None` for koboldcpp's own shape over `_STREAM_CHUNKS`."""
+    stream_record_delay_seconds: float = 0.0
+    stream_breaks_after_records: int | None = None
+    """Cut the connection after this many records, standing in for a backend that died mid-generation."""
+    stats_route_present: bool = False
+    stats_samples: tuple[Mapping[str, object], ...] = _STATS_SAMPLES
+    perf_last_token_count: int = 0
+    perf_last_input_count: int = 0
     abort_route_present: bool = True
+    abort_requested: asyncio.Event = field(default_factory=asyncio.Event)
     recorded_generate_bodies: list[object] = field(default_factory=list)
+    """Every body either generation route received, so passthrough is asserted whichever one was used."""
     recorded_generate_authorizations: list[str | None] = field(default_factory=list)
     recorded_abort_bodies: list[object] = field(default_factory=list)
+    recorded_stats_bodies: list[object] = field(default_factory=list)
+    blocking_generate_count: int = 0
+    stream_generate_count: int = 0
+    perf_request_count: int = 0
+    stats_sample_index: int = 0
 
 
 def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
@@ -96,16 +171,25 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
             return web.json_response({"detail": "not found"}, status=HTTPStatus.NOT_FOUND)
         return web.json_response({KoboldApiJsonKeys.VALUES: list(behaviour.soft_prompts)})
 
-    async def handle_generate(request: web.Request) -> web.Response:
-        """Record the forwarded request and answer as the behaviour dictates."""
+    async def record_generation_request(request: web.Request) -> None:
+        """Record what either generation route was sent, which is what a passthrough assertion reads."""
         behaviour.recorded_generate_bodies.append(await request.json())
         behaviour.recorded_generate_authorizations.append(request.headers.get(aiohttp.hdrs.AUTHORIZATION))
+
+    def refusal_for(status: int) -> web.Response:
+        """Return the answer a backend gives for a request it will not run, with koboldcpp's busy body."""
+        if status == HTTPStatus.SERVICE_UNAVAILABLE:
+            return web.json_response(_BUSY_BODY, status=HTTPStatus.SERVICE_UNAVAILABLE)
+        return web.json_response({"detail": "nope"}, status=status)
+
+    async def handle_generate(request: web.Request) -> web.Response:
+        """Answer the blocking route, which says nothing at all until the generation is finished."""
+        behaviour.blocking_generate_count += 1
+        await record_generation_request(request)
         if behaviour.generate_delay_seconds > 0:
             await asyncio.sleep(behaviour.generate_delay_seconds)
-        if behaviour.generate_status == HTTPStatus.SERVICE_UNAVAILABLE:
-            return web.json_response(_BUSY_BODY, status=HTTPStatus.SERVICE_UNAVAILABLE)
         if behaviour.generate_status != HTTPStatus.OK:
-            return web.json_response({"detail": "nope"}, status=behaviour.generate_status)
+            return refusal_for(behaviour.generate_status)
         if behaviour.generate_body is not None:
             return web.json_response(behaviour.generate_body)
         return web.json_response(
@@ -113,17 +197,75 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
                 KoboldApiJsonKeys.RESULTS: [
                     {
                         KoboldApiJsonKeys.TEXT: _GENERATED_TEXT,
-                        "finish_reason": "length",
-                        "prompt_tokens": 12,
-                        "completion_tokens": 34,
+                        KoboldApiJsonKeys.FINISH_REASON: _STREAM_FINISH_REASON,
+                        KoboldApiJsonKeys.PROMPT_TOKENS: 12,
+                        KoboldApiJsonKeys.COMPLETION_TOKENS: 34,
                     },
                 ],
             },
         )
 
+    async def handle_generate_stream(request: web.Request) -> web.StreamResponse:
+        """Stream the generation back the way koboldcpp does, one `event: message` record per chunk."""
+        behaviour.stream_generate_count += 1
+        await record_generation_request(request)
+        if not behaviour.stream_route_present:
+            return web.json_response({"detail": "not found"}, status=HTTPStatus.NOT_FOUND)
+        if behaviour.generate_delay_seconds > 0:
+            await asyncio.sleep(behaviour.generate_delay_seconds)
+        if behaviour.generate_status != HTTPStatus.OK:
+            return refusal_for(behaviour.generate_status)
+
+        records = behaviour.stream_records if behaviour.stream_records is not None else _default_stream_records()
+        response = web.StreamResponse()
+        response.content_type = "text/event-stream"
+        await response.prepare(request)
+        for records_sent, record in enumerate(records, start=1):
+            if behaviour.stream_record_delay_seconds > 0:
+                await asyncio.sleep(behaviour.stream_record_delay_seconds)
+            if behaviour.abort_requested.is_set():
+                break
+            await response.write(f"event: message\ndata: {json.dumps(dict(record))}\n\n".encode())
+            if records_sent == behaviour.stream_breaks_after_records:
+                # A backend that died part way through: the connection goes without the body ever being
+                # completed, which is what the driver has to tell apart from a generation that ended.
+                transport = request.transport
+                assert transport is not None, "a prepared response always has a transport"
+                transport.abort()
+                return response
+        await response.write_eof()
+        return response
+
+    async def handle_generation_stats(request: web.Request) -> web.Response:
+        """Answer per-request statistics as a patched build does, or 404 as a stock build does."""
+        body = await request.json()
+        behaviour.recorded_stats_bodies.append(body)
+        if not behaviour.stats_route_present:
+            return web.json_response({"detail": "not found"}, status=HTTPStatus.NOT_FOUND)
+        if body.get(KoboldApiJsonKeys.GENERATION_KEY) == CAPABILITY_PROBE_GENERATION_KEY:
+            return web.json_response({KoboldApiJsonKeys.FOUND: False})
+        sample_index = min(behaviour.stats_sample_index, len(behaviour.stats_samples) - 1)
+        behaviour.stats_sample_index += 1
+        if sample_index < 0:
+            return web.json_response({KoboldApiJsonKeys.FOUND: False})
+        return web.json_response(dict(behaviour.stats_samples[sample_index]))
+
+    async def handle_perf(request: web.Request) -> web.Response:
+        """Answer the counters describing whichever generation finished most recently."""
+        behaviour.perf_request_count += 1
+        return web.json_response(
+            {
+                KoboldApiJsonKeys.LAST_TOKEN_COUNT: behaviour.perf_last_token_count,
+                KoboldApiJsonKeys.LAST_INPUT_COUNT: behaviour.perf_last_input_count,
+                "idle": 1,
+                "queue": 0,
+            },
+        )
+
     async def handle_abort(request: web.Request) -> web.Response:
-        """Record the abort and answer koboldcpp's two flags, which are strings rather than booleans."""
+        """Record the abort, end any stream in flight, and answer koboldcpp's two string flags."""
         behaviour.recorded_abort_bodies.append(await request.json())
+        behaviour.abort_requested.set()
         return web.json_response({KoboldApiJsonKeys.SUCCESS: "true", KoboldApiJsonKeys.DONE: "true"})
 
     app = web.Application()
@@ -132,6 +274,9 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
     app.router.add_get(KoboldApiRoutes.MAX_LENGTH, handle_max_length)
     app.router.add_get(KoboldApiRoutes.SOFT_PROMPTS_LIST, handle_soft_prompts)
     app.router.add_post(KoboldApiRoutes.GENERATE, handle_generate)
+    app.router.add_post(KoboldApiRoutes.GENERATE_STREAM, handle_generate_stream)
+    app.router.add_post(KoboldApiRoutes.GENERATION_STATS, handle_generation_stats)
+    app.router.add_get(KoboldApiRoutes.PERF, handle_perf)
     if behaviour.abort_route_present:
         app.router.add_post(KoboldApiRoutes.ABORT, handle_abort)
     return app
@@ -166,6 +311,32 @@ async def _backend_on_a_closed_port() -> AsyncIterator[KoboldApiTextBackend]:
         yield KoboldApiTextBackend(closed_url, session)
     finally:
         await session.close()
+
+
+class _ProgressRecorder:
+    """Collects every progress report a generation made, which is what the flow would be reading."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.reports: list[TextGenerationProgress] = []
+        self.first_chunk = asyncio.Event()
+
+    def __call__(self, progress: TextGenerationProgress) -> None:
+        """Record one report and wake anything waiting for the generation to have started arriving."""
+        self.reports.append(progress)
+        if progress.chunks_received > 0:
+            self.first_chunk.set()
+
+    @property
+    def chunk_reports(self) -> list[TextGenerationProgress]:
+        """The reports that carried a chunk, in order, ignoring any that only carried statistics."""
+        seen_chunks = 0
+        carried_a_chunk: list[TextGenerationProgress] = []
+        for report in self.reports:
+            if report.chunks_received > seen_chunks:
+                seen_chunks = report.chunks_received
+                carried_a_chunk.append(report)
+        return carried_a_chunk
 
 
 async def test_driver_satisfies_the_protocol() -> None:
@@ -261,6 +432,202 @@ async def test_describe_raises_unavailable_when_the_backend_is_not_listening() -
             await backend.describe()
 
 
+async def test_capabilities_finds_the_statistics_route_on_a_patched_backend() -> None:
+    """A build with the statistics route is what lets a text job report token counts at all."""
+    behaviour = _KoboldBackendBehaviour(stats_route_present=True)
+
+    async with _running_backend(behaviour) as backend:
+        capabilities = await backend.capabilities()
+
+    assert capabilities.generation_stats is True
+    assert behaviour.recorded_stats_bodies == [
+        {KoboldApiJsonKeys.GENERATION_KEY: CAPABILITY_PROBE_GENERATION_KEY},
+    ], "the probe asks about a key no generation will ever use"
+
+
+async def test_capabilities_is_probed_once_and_the_answer_reused() -> None:
+    """The route is part of the program, so a build without one will not grow one while it runs."""
+    behaviour = _KoboldBackendBehaviour(stats_route_present=False)
+
+    async with _running_backend(behaviour) as backend:
+        first = await backend.capabilities()
+        second = await backend.capabilities()
+
+    assert first.generation_stats is False
+    assert second.generation_stats is False
+    assert len(behaviour.recorded_stats_bodies) == 1
+
+
+async def test_a_streamed_generation_assembles_the_text_and_reports_every_chunk() -> None:
+    """The stream is how the worker learns anything at all before a generation has finished."""
+    behaviour = _KoboldBackendBehaviour()
+    progress = _ProgressRecorder()
+
+    async with _running_backend(behaviour) as backend:
+        result = await backend.generate(
+            {"prompt": "a prompt"},
+            generation_key=_GENERATION_KEY,
+            deadline_seconds=10.0,
+            on_progress=progress,
+        )
+
+    assert result.text == _GENERATED_TEXT
+    assert behaviour.stream_generate_count == 1
+    assert behaviour.blocking_generate_count == 0
+    assert [report.chunks_received for report in progress.chunk_reports] == [1, 2, 3]
+    assert [report.characters_received for report in progress.chunk_reports] == [
+        len(_STREAM_CHUNKS[0]),
+        len(_STREAM_CHUNKS[0]) + len(_STREAM_CHUNKS[1]),
+        len(_GENERATED_TEXT),
+    ]
+    assert progress.chunk_reports[-1].last_chunk_at is not None
+
+
+async def test_the_final_stream_record_carries_the_finish_reason() -> None:
+    """Why a generation stopped is the backend's own word for it, and only the last record has it."""
+    async with _running_backend(_KoboldBackendBehaviour()) as backend:
+        result = await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+
+    assert result.finish_reason == _STREAM_FINISH_REASON
+
+
+async def test_a_stream_without_any_finish_reason_still_produces_the_generation() -> None:
+    """A sonar record carries a token and nothing else, so an absent finish reason is not a failure."""
+    behaviour = _KoboldBackendBehaviour(stream_records=_sonar_stream_records())
+    progress = _ProgressRecorder()
+
+    async with _running_backend(behaviour) as backend:
+        result = await backend.generate(
+            {},
+            generation_key=_GENERATION_KEY,
+            deadline_seconds=10.0,
+            on_progress=progress,
+        )
+
+    assert result.text == _GENERATED_TEXT
+    assert result.finish_reason is None
+    assert len(progress.chunk_reports) == len(_STREAM_CHUNKS)
+
+
+async def test_statistics_samples_reach_the_callback_with_token_counts_and_a_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chunk is an arbitrary number of tokens, so counts and a rate can only come from the backend."""
+    monkeypatch.setattr(kobold_api, "STATS_POLL_INTERVAL_SECONDS", _FAST_STATS_POLL_SECONDS)
+    behaviour = _KoboldBackendBehaviour(
+        stats_route_present=True,
+        stream_record_delay_seconds=_RECORD_DELAY_SECONDS,
+    )
+    progress = _ProgressRecorder()
+
+    async with _running_backend(behaviour) as backend:
+        result = await backend.generate(
+            {},
+            generation_key=_GENERATION_KEY,
+            deadline_seconds=10.0,
+            on_progress=progress,
+        )
+
+    counted_reports = [report for report in progress.reports if report.completion_tokens is not None]
+    assert counted_reports, "a backend with the statistics route must report token counts while it runs"
+    assert counted_reports[-1].completion_tokens == 40
+    assert counted_reports[-1].prompt_tokens == 12
+    assert counted_reports[-1].tokens_per_second == pytest.approx(20.0)
+    assert result.prompt_tokens == 12
+    assert result.generated_tokens == 40
+    assert behaviour.perf_request_count == 0, "a backend that counted the tokens is not asked again"
+
+
+async def test_a_backend_without_statistics_is_asked_once_and_reports_no_counts() -> None:
+    """A stock build has no statistics route, and a rate guessed from characters would be a lie."""
+    behaviour = _KoboldBackendBehaviour(stats_route_present=False)
+    progress = _ProgressRecorder()
+
+    async with _running_backend(behaviour) as backend:
+        for _generation in range(2):
+            await backend.generate(
+                {},
+                generation_key=_GENERATION_KEY,
+                deadline_seconds=10.0,
+                on_progress=progress,
+            )
+
+    assert len(behaviour.recorded_stats_bodies) == 1, "the route was probed once and then left alone"
+    assert all(report.completion_tokens is None for report in progress.reports)
+    assert all(report.prompt_tokens is None for report in progress.reports)
+    assert all(report.tokens_per_second is None for report in progress.reports)
+
+
+async def test_a_streamed_generation_without_statistics_takes_its_counts_from_the_perf_route() -> None:
+    """The perf counters describe the generation that just finished, which is this one when it ran alone."""
+    behaviour = _KoboldBackendBehaviour(
+        stats_route_present=False,
+        perf_last_token_count=160,
+        perf_last_input_count=20,
+    )
+
+    async with _running_backend(behaviour) as backend:
+        result = await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+
+    assert result.generated_tokens == 160
+    assert result.prompt_tokens == 20
+    assert behaviour.perf_request_count == 1
+
+
+async def test_a_missing_stream_route_falls_back_to_the_blocking_call() -> None:
+    """A backend with no stream route still generates; the worker just learns nothing until it answers."""
+    behaviour = _KoboldBackendBehaviour(stream_route_present=False)
+
+    async with _running_backend(behaviour) as backend:
+        first = await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+        second = await backend.generate({}, generation_key="a-second-generation", deadline_seconds=10.0)
+
+    assert first.text == _GENERATED_TEXT
+    assert second.text == _GENERATED_TEXT
+    assert first.finish_reason == _STREAM_FINISH_REASON
+    assert first.prompt_tokens == 12
+    assert first.generated_tokens == 34
+    assert behaviour.blocking_generate_count == 2
+    assert behaviour.stream_generate_count == 1, "a route that is missing is not asked for again"
+
+
+async def test_a_stream_that_breaks_mid_way_fails_the_generation() -> None:
+    """Half a generation reads as a whole one to a requester, so a broken stream is a failure, not an answer."""
+    behaviour = _KoboldBackendBehaviour(
+        stream_breaks_after_records=1,
+        stream_record_delay_seconds=_RECORD_DELAY_SECONDS,
+    )
+
+    async with _running_backend(behaviour) as backend:
+        with pytest.raises(TextBackendUnavailable):
+            await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+
+    assert behaviour.blocking_generate_count == 0, "a generation that had begun must not be silently re-run"
+
+
+async def test_aborting_a_generation_mid_stream_returns_the_text_that_arrived() -> None:
+    """An abandoned generation on koboldcpp answers with what it had, which the flow then discards."""
+    behaviour = _KoboldBackendBehaviour(stream_record_delay_seconds=_RECORD_DELAY_SECONDS)
+    progress = _ProgressRecorder()
+
+    async with _running_backend(behaviour) as backend:
+        generation = asyncio.create_task(
+            backend.generate(
+                {},
+                generation_key=_GENERATION_KEY,
+                deadline_seconds=10.0,
+                on_progress=progress,
+            ),
+        )
+        await asyncio.wait_for(progress.first_chunk.wait(), timeout=5.0)
+        await backend.stop(generation_key=_GENERATION_KEY)
+        result = await asyncio.wait_for(generation, timeout=5.0)
+
+    assert behaviour.recorded_abort_bodies == [{KoboldApiJsonKeys.GENERATION_KEY: _GENERATION_KEY}]
+    assert result.text != _GENERATED_TEXT, "an abandoned generation cannot have produced all of its text"
+    assert _GENERATED_TEXT.startswith(result.text)
+
+
 async def test_generate_forwards_the_payload_untouched_and_adds_only_the_generation_key() -> None:
     """The horde owns the payload's shape, so every key, nested or unfamiliar, arrives as it was sent."""
     payload: dict[str, object] = {
@@ -288,12 +655,14 @@ async def test_generate_forwards_the_payload_untouched_and_adds_only_the_generat
 
 
 async def test_generate_maps_busy_to_the_busy_exception() -> None:
-    """503 is the KoboldAI way of saying the single generation slot is taken, so the job can be re-offered."""
+    """503 is the KoboldAI way of saying the generation slots are taken, so the job can be re-offered."""
     behaviour = _KoboldBackendBehaviour(generate_status=HTTPStatus.SERVICE_UNAVAILABLE)
 
     async with _running_backend(behaviour) as backend:
         with pytest.raises(TextBackendBusy):
             await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+
+    assert behaviour.blocking_generate_count == 0, "a busy backend is busy on either route"
 
 
 @pytest.mark.parametrize(
@@ -310,6 +679,8 @@ async def test_generate_maps_a_refused_payload_to_the_rejected_exception(rejecti
     async with _running_backend(behaviour) as backend:
         with pytest.raises(TextBackendRejectedPayload):
             await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+
+    assert behaviour.blocking_generate_count == 0, "a refused payload is refused on either route"
 
 
 @pytest.mark.parametrize(
@@ -328,6 +699,8 @@ async def test_generate_maps_every_other_failing_status_to_unavailable(failing_s
         with pytest.raises(TextBackendUnavailable):
             await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
 
+    assert behaviour.blocking_generate_count == 1, "a stream that would not start is tried blocking once"
+
 
 @pytest.mark.parametrize(
     "malformed_body",
@@ -339,13 +712,24 @@ async def test_generate_maps_every_other_failing_status_to_unavailable(failing_s
 )
 async def test_generate_treats_a_malformed_success_body_as_unavailable(malformed_body: object) -> None:
     """A 200 with no usable generation is a backend answering nonsense, and the message says what it sent."""
-    behaviour = _KoboldBackendBehaviour(generate_body=malformed_body)
+    behaviour = _KoboldBackendBehaviour(generate_body=malformed_body, stream_route_present=False)
 
     async with _running_backend(behaviour) as backend:
         with pytest.raises(TextBackendUnavailable) as raised:
             await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
 
     assert KoboldApiJsonKeys.RESULTS in str(raised.value)
+
+
+async def test_a_stream_that_ends_without_a_record_falls_back_to_the_blocking_call() -> None:
+    """A route that opens and produces nothing has not generated anything, so the request is run again."""
+    behaviour = _KoboldBackendBehaviour(stream_records=())
+
+    async with _running_backend(behaviour) as backend:
+        result = await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+
+    assert result.text == _GENERATED_TEXT
+    assert behaviour.blocking_generate_count == 1
 
 
 async def test_generate_past_the_deadline_is_unavailable() -> None:
@@ -355,6 +739,8 @@ async def test_generate_past_the_deadline_is_unavailable() -> None:
     async with _running_backend(behaviour) as backend:
         with pytest.raises(TextBackendUnavailable):
             await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=_SHORT_DEADLINE_SECONDS)
+
+    assert behaviour.blocking_generate_count == 0, "a deadline is not a reason to run the generation twice"
 
 
 async def test_generate_raises_unavailable_when_the_backend_is_not_listening() -> None:

@@ -9,6 +9,7 @@ call.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 
 import pytest
@@ -20,6 +21,7 @@ from horde_worker_regen.text_backends import (
     TextBackendDescription,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
+    TextGenerationProgress,
 )
 
 _DESCRIPTION = TextBackendDescription(
@@ -29,6 +31,18 @@ _DESCRIPTION = TextBackendDescription(
     soft_prompts=("a_soft_prompt",),
 )
 _GENERATION_KEY = "0123ABCD"
+
+
+class _ProgressRecorder:
+    """Collects every progress report a generation made, which is what the flow would be reading."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.reports: list[TextGenerationProgress] = []
+
+    def __call__(self, progress: TextGenerationProgress) -> None:
+        """Record one report."""
+        self.reports.append(progress)
 
 
 def test_fake_satisfies_the_protocol() -> None:
@@ -209,3 +223,114 @@ async def test_the_recorded_views_are_copies_the_caller_cannot_edit() -> None:
 
     with pytest.raises(AttributeError):
         backend.generate_calls[0].generation_key = "rewritten"  # pyrefly: ignore - the refusal is the assertion
+
+
+async def test_the_stand_in_streams_its_chunks_and_returns_their_concatenation() -> None:
+    """A dry run has to exercise the progress path, so the stand-in arrives in pieces the way a backend does."""
+    backend = FakeTextBackend(description=_DESCRIPTION, stream_chunks=("one ", "two ", "three"))
+    progress = _ProgressRecorder()
+
+    result = await backend.generate(
+        {},
+        generation_key=_GENERATION_KEY,
+        deadline_seconds=5.0,
+        on_progress=progress,
+    )
+
+    assert result.text == "one two three"
+    assert [report.chunks_received for report in progress.reports] == [1, 2, 3]
+    assert progress.reports[-1].characters_received == len("one two three")
+
+
+async def test_a_generation_with_no_chunk_script_arrives_as_one_chunk() -> None:
+    """The configured response text is still a generation, so it still reports itself arriving."""
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="all at once")
+    progress = _ProgressRecorder()
+
+    result = await backend.generate(
+        {},
+        generation_key=_GENERATION_KEY,
+        deadline_seconds=5.0,
+        on_progress=progress,
+    )
+
+    assert result.text == "all at once"
+    assert [report.chunks_received for report in progress.reports] == [1]
+
+
+async def test_the_configured_finish_reason_is_reported() -> None:
+    """Why a generation stopped is the backend's word, so a stand-in has to be able to say one."""
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="done", finish_reason="stop")
+
+    result = await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=5.0)
+
+    assert result.finish_reason == "stop"
+
+
+async def test_a_stand_in_without_statistics_reports_no_counts_and_no_rate() -> None:
+    """A stock backend counts nothing, and the stand-in for one must not invent counts from its chunks."""
+    backend = FakeTextBackend(description=_DESCRIPTION, stream_chunks=("a ", "b"))
+    progress = _ProgressRecorder()
+
+    result = await backend.generate(
+        {},
+        generation_key=_GENERATION_KEY,
+        deadline_seconds=5.0,
+        on_progress=progress,
+    )
+
+    assert (await backend.capabilities()).generation_stats is False
+    assert all(report.completion_tokens is None for report in progress.reports)
+    assert all(report.tokens_per_second is None for report in progress.reports)
+    assert result.generated_tokens is None
+    assert result.prompt_tokens is None
+
+
+async def test_a_stand_in_with_statistics_reports_counts_and_a_rate() -> None:
+    """The same switch the real capability probe answers decides whether a text job can show a rate."""
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        stream_chunks=("a ", "b"),
+        chunk_interval_seconds=0.01,
+        generation_stats=True,
+        stats_prompt_tokens=7,
+        stats_tokens_per_chunk=5,
+    )
+    progress = _ProgressRecorder()
+
+    result = await backend.generate(
+        {},
+        generation_key=_GENERATION_KEY,
+        deadline_seconds=5.0,
+        on_progress=progress,
+    )
+
+    assert (await backend.capabilities()).generation_stats is True
+    assert [report.completion_tokens for report in progress.reports] == [5, 10]
+    assert all(report.prompt_tokens == 7 for report in progress.reports)
+    assert progress.reports[-1].tokens_per_second is not None
+    assert result.prompt_tokens == 7
+    assert result.generated_tokens == 10
+
+
+async def test_a_stand_in_that_stalls_never_answers() -> None:
+    """A backend that wedged part way through is what a caller's stall bound exists to end."""
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        stream_chunks=("only this much",),
+        stalls_after_chunks=True,
+    )
+    progress = _ProgressRecorder()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            backend.generate(
+                {},
+                generation_key=_GENERATION_KEY,
+                deadline_seconds=60.0,
+                on_progress=progress,
+            ),
+            timeout=0.2,
+        )
+
+    assert [report.chunks_received for report in progress.reports] == [1]

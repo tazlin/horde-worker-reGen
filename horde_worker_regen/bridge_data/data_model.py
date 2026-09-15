@@ -1139,6 +1139,17 @@ class reGenBridgeData(CombinedHordeBridgeData):
     that floor (a large model on a small card) or when jobs should be given up on sooner.
     """
 
+    text_stall_seconds: float = Field(default=30.0, gt=0)
+    """Seconds without a single token arriving before a text generation is abandoned and the job faulted.
+
+    The backend streams its answer, so a healthy generation produces text continuously and a gap this
+    long is a backend that stopped rather than one that is slow. Separate from
+    `text_generation_timeout_seconds`, which bounds the whole generation and stays the outer limit: a
+    long generation on a slow card is legitimate, a silent one is not. The first token of the first
+    generation after the backend starts is exempt, because a cold backend spends seconds warming its
+    kernels before it produces anything.
+    """
+
     text_backend_kind: TEXT_BACKENDS = Field(default=TEXT_BACKENDS.koboldcpp)
     """Which text backend program serves this worker's text jobs.
 
