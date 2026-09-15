@@ -48,6 +48,15 @@ update`, replace a PATH-provided uv, or replace the executable hosting the curre
 Network-body truncation and filesystem publication failures are normalized into `UvCompatibilityError`,
 which the command dispatcher reports without a traceback.
 
+The koboldcpp binary the text-generation workload drives follows the same contract, with the digests
+pinned in `worker_bootstrap/koboldcpp_bin.py` because upstream publishes no checksum files. A download
+streams to a temporary sibling inside `bin/`, is hashed as it lands, is compared with the pinned SHA-256
+for the selected asset, and becomes `bin/koboldcpp-<tag>[.exe]`. It replaces `bin/koboldcpp[.exe]` only
+after the staged binary reports the pinned version, and `bin/koboldcpp-version` then records what the
+stable path holds. A digest failure or a failed version probe publishes nothing and leaves an
+already-published binary runnable. Windows x64 and Linux x64 are supported, each with a CUDA and a
+no-CUDA asset; any other platform is refused by name instead of being served a guessed asset.
+
 Current `runtime.cmd` and `runtime.sh` launchers apply the same staging rule to the uv executable needed to
 start `bootstrap.py`: download the exact archive and adjacent checksum, verify SHA-256, extract into a
 temporary directory, probe the version outside the project, then replace `bin/uv` only after every check
@@ -94,6 +103,7 @@ torch-hold controls.
 | Pre-import recovery | `bootstrap.py`, `_recover_interrupted_update` | `tests/bootstrap/test_updater.py` |
 | Bootstrap dispatch and pre-launch synchronization | `worker_bootstrap/cli.py`, `main`, `_cmd_update`, `_ensure_synced` | `tests/bootstrap/test_cli.py` |
 | Exact uv discovery, verification, and publication | `worker_bootstrap/uvbin.py`, `ensure_compatible_uv`, `_download_verified_uv` | `tests/bootstrap/test_uvbin.py` |
+| Pinned koboldcpp download, verification, and publication | `worker_bootstrap/koboldcpp_bin.py`, `ensure_koboldcpp`, `koboldcpp_executable` | `tests/bootstrap/test_koboldcpp_bin.py` |
 | Release discovery, integrity verification, transaction, and overlay | `worker_bootstrap/updater.py`, `check_for_update`, `perform_update`, `apply_bundle`, `restore_interrupted_update` | `tests/bootstrap/test_updater.py` |
 | Platform uv bootstrap and launcher generation | `runtime.cmd`, `runtime.sh`, `worker_bootstrap/updater.py`, `launchers_need_refresh` | `tests/test_uv_version_consistency.py`, `tests/test_self_updater.py` |
 | Isolated subprocess environment and locked sync | `worker_bootstrap/runner.py`, `build_child_env`, `uv_sync` | `tests/bootstrap/test_runner.py` |

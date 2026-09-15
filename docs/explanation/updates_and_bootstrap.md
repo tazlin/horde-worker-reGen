@@ -55,6 +55,19 @@ The repair never invokes `uv self update`. That command is unavailable when uv w
 mode. It also never replaces a PATH-provided uv or the executable currently hosting bootstrap, which can be
 locked on Windows.
 
+## Bootstrapping text backends
+
+### Koboldcpp
+
+The worker downloads the single-file binary upstream for koboldcpp. Detected hardware picks the version:
+an NVIDIA card gets the CUDA build, and anything else gets the smaller build carrying the Vulkan and CPU
+backends, which is what a machine with an AMD or Intel GPU, or with no GPU at all, wants. Windows x64 and
+Linux x64 are the supported hosts. Unsupported platforms stop with an error message.
+
+The download happens on demand rather than during installation, leaving it to operator choice.
+It is placed in `bin/` beside the private uv. The release tag and the checksum of every supported asset are
+pinned in the bootstrap and is hash-verified following download before being available for use.
+
 ## Source and dependencies converge before launch
 
 The updater invalidates the lock fingerprint before overlaying source. On the next update or launch, a
