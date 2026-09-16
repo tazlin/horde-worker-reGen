@@ -518,7 +518,8 @@ text_backend_managed: true
 # text_model_path: "T:/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 
 # A backend program to launch instead of the one the worker provisions: your own build, a newer upstream
-# release, or a backend the worker cannot yet download.
+# release, or a backend the worker cannot yet download. A .py path is a source checkout's entry script
+# (koboldcpp.py beside its compiled library) and runs under the worker's own Python.
 # text_backend_executable: "C:/tools/koboldcpp.exe"
 
 # Loopback port the managed backend listens on.

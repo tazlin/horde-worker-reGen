@@ -49,7 +49,8 @@ expect to size your image configuration down.
 
 By default the worker runs the backend for you (`text_backend_managed: true`). It obtains the program
 (for koboldcpp, a pinned upstream release it downloads and verifies on first use, unless
-`text_backend_executable` names one of your own), starts it on `text_backend_port` with the model file in
+`text_backend_executable` names one of your own: a binary, or a source checkout's `koboldcpp.py` beside its
+compiled library, which the worker runs under its own interpreter), starts it on `text_backend_port` with the model file in
 `text_model_path`, waits for it to report a loaded model, and from then on relaunches it if it exits and
 stops it when the worker stops. The backend's own output goes to `logs/text_backend.log`. Which program is
 launched, and with what command line, follows `text_backend_kind`; a kind the worker cannot launch yet is

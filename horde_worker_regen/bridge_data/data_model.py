@@ -1180,7 +1180,9 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """A backend program to launch instead of the one the worker would provision itself.
 
     Leave unset to let the worker obtain the pinned release for `text_backend_kind`. Set it to run a
-    build of your own, a newer upstream release, or a backend the worker cannot yet provision.
+    build of your own, a newer upstream release, or a backend the worker cannot yet provision. A `.py`
+    path is a source checkout's entry script (koboldcpp's `koboldcpp.py` beside its compiled library) and
+    is run by the worker's own interpreter.
     """
 
     text_backend_port: int = Field(default=5001, ge=1, le=65535)

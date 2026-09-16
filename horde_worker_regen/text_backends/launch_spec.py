@@ -10,12 +10,16 @@ all the process supervisor ever sees.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
 LOOPBACK_HOST = "127.0.0.1"
 """Every text backend listens on loopback only; the worker is its sole client."""
+
+SOURCE_SCRIPT_SUFFIX = ".py"
+"""An executable with this suffix is a source checkout's entry script and is run by the worker's interpreter."""
 
 
 class TextBackendLaunchSettings(BaseModel):
@@ -47,7 +51,7 @@ class TextBackendLaunchSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     executable: Path
-    """The backend program."""
+    """The backend program: a binary, or a Python script run from a source checkout."""
     arguments: tuple[str, ...]
     """Arguments after the executable, already rendered as strings."""
     port: int
@@ -58,8 +62,21 @@ class TextBackendLaunchSpec(BaseModel):
     """The stable device index the backend was told to use, for footprint measurement; None off-GPU."""
 
     @property
+    def runs_from_source(self) -> bool:
+        """Whether the executable is a Python script rather than a program the OS can start directly."""
+        return self.executable.suffix.lower() == SOURCE_SCRIPT_SUFFIX
+
+    @property
     def command(self) -> list[str]:
-        """Return the full argv."""
+        """Return the full argv.
+
+        A script is run by the worker's own interpreter: a backend checkout (a patched build, or a build
+        for a platform without a release binary) keeps its native libraries beside the script and imports
+        only packages the worker already carries, so no second environment is needed. A script launched this
+        way is the server itself, not a bootloader, which the supervisor's tree resolution already tolerates.
+        """
+        if self.runs_from_source:
+            return [sys.executable, str(self.executable), *self.arguments]
         return [str(self.executable), *self.arguments]
 
     @property
@@ -70,6 +87,7 @@ class TextBackendLaunchSpec(BaseModel):
 
 __all__ = [
     "LOOPBACK_HOST",
+    "SOURCE_SCRIPT_SUFFIX",
     "TextBackendLaunchSettings",
     "TextBackendLaunchSpec",
 ]

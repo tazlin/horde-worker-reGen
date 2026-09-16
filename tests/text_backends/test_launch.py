@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,25 @@ def test_koboldcpp_renders_the_expected_argv(tmp_path: Path) -> None:
     assert spec.base_url == f"http://{LOOPBACK_HOST}:5001"
     assert spec.device_index == 1
     assert spec.log_path == settings.log_path
+
+
+def test_a_script_executable_runs_under_the_worker_interpreter(tmp_path: Path) -> None:
+    """A `.py` executable (a source checkout) is launched by the worker's own Python, arguments unchanged."""
+    settings = settings_in(tmp_path).model_copy(update={"executable": tmp_path / "koboldcpp.py"})
+
+    spec = build_launch_spec(TEXT_BACKENDS.koboldcpp, settings)
+
+    assert spec.runs_from_source
+    assert spec.command[:2] == [sys.executable, str(settings.executable)]
+    assert tuple(spec.command[2:]) == spec.arguments
+
+
+def test_a_binary_executable_is_the_command_itself(tmp_path: Path) -> None:
+    """A binary executable starts directly; no interpreter is prepended."""
+    spec = build_launch_spec(TEXT_BACKENDS.koboldcpp, settings_in(tmp_path))
+
+    assert not spec.runs_from_source
+    assert spec.command[0] == str(spec.executable)
 
 
 def test_koboldcpp_omits_the_cuda_flag_off_gpu(tmp_path: Path) -> None:
