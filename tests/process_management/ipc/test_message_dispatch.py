@@ -27,6 +27,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessStateChangeMessage,
     ModelLoadState,
 )
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -911,6 +912,56 @@ class TestHandleModelStateChange:
         )
 
         assert hmm.root.get("test_model") is not None
+
+    def test_a_preload_completing_reaches_the_event_ring_once(self) -> None:
+        """A child reports its weights resident both when a preload lands and after every job it runs.
+
+        Only the first of those is a load completing, so the event is recorded against the map's prior
+        LOADING entry for that slot; without it the ring would report a model becoming ready once per job.
+        """
+        process_map = ProcessMap({0: make_mock_process_info(0)})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry("test_model", load_state=ModelLoadState.LOADING, process_id=0)
+        recorded: list[tuple[WorkerEventKind, str | None, float | None]] = []
+        dispatcher = _make_dispatcher(process_map=process_map, horde_model_map=horde_model_map)
+        dispatcher.set_event_sink(
+            lambda kind, **fields: recorded.append((kind, fields.get("model"), fields.get("duration_seconds"))),
+        )
+        loaded = Mock(
+            horde_model_name="test_model",
+            horde_model_state=ModelLoadState.LOADED_IN_VRAM,
+            process_id=0,
+            time_elapsed=4.5,
+            info="loaded",
+            vram_unload_refused=False,
+        )
+
+        dispatcher._handle_model_state_change(loaded)
+        dispatcher._handle_model_state_change(loaded)
+
+        assert recorded == [(WorkerEventKind.PRELOAD_READY, "test_model", 4.5)]
+
+    def test_a_model_loading_on_another_slot_is_not_this_slots_preload(self) -> None:
+        """The prior LOADING entry has to belong to the reporting process, or a swap would fire twice."""
+        process_map = ProcessMap({0: make_mock_process_info(0), 1: make_mock_process_info(1)})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry("test_model", load_state=ModelLoadState.LOADING, process_id=1)
+        recorded: list[WorkerEventKind] = []
+        dispatcher = _make_dispatcher(process_map=process_map, horde_model_map=horde_model_map)
+        dispatcher.set_event_sink(lambda kind, **_fields: recorded.append(kind))
+
+        dispatcher._handle_model_state_change(
+            Mock(
+                horde_model_name="test_model",
+                horde_model_state=ModelLoadState.LOADED_IN_VRAM,
+                process_id=0,
+                time_elapsed=None,
+                info="loaded",
+                vram_unload_refused=False,
+            ),
+        )
+
+        assert recorded == []
 
     def test_model_on_disk_does_not_update_process_map(self) -> None:
         """Model state change to ON_DISK should not update the process map's loaded model."""

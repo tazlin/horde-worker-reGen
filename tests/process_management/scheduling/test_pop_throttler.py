@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.scheduling.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
@@ -25,6 +26,7 @@ def _make_throttler(
     job_tracker: JobTracker | None = None,
     default_pop_frequency: float = 1.0,
     error_pop_frequency: float = 5.0,
+    on_event: WorkerEventSink | None = None,
 ) -> PopThrottler:
     if job_tracker is None:
         job_tracker = JobTracker()
@@ -32,6 +34,7 @@ def _make_throttler(
         job_tracker=job_tracker,
         default_pop_frequency=default_pop_frequency,
         error_pop_frequency=error_pop_frequency,
+        on_event=on_event,
     )
 
 
@@ -139,6 +142,37 @@ class TestOnPopError:
         throttler.on_pop_error()
         throttler.on_pop_error()
         assert throttler.current_pop_frequency == 5.0
+
+
+class TestBackoffEvents:
+    """The event ring learns about the backoff posture, and only when it changes."""
+
+    def test_the_ring_sees_one_entry_per_backoff_spell(self) -> None:
+        """Both calls run on every pop, so an event per call would be one per second on a healthy worker."""
+        recorded: list[tuple[WorkerEventKind, object]] = []
+        throttler = _make_throttler(
+            error_pop_frequency=5.0,
+            on_event=lambda kind, **fields: recorded.append((kind, fields.get("duration_seconds"))),
+        )
+
+        throttler.on_pop_error()
+        throttler.on_pop_error()
+        throttler.on_pop_success()
+        throttler.on_pop_success()
+
+        assert recorded == [
+            (WorkerEventKind.POP_BACKOFF_ENTERED, 5.0),
+            (WorkerEventKind.POP_BACKOFF_LEFT, None),
+        ]
+
+    def test_a_worker_that_never_errored_records_nothing(self) -> None:
+        """A successful pop on a worker that was not backing off is not a recovery from anything."""
+        recorded: list[WorkerEventKind] = []
+        throttler = _make_throttler(on_event=lambda kind, **_fields: recorded.append(kind))
+
+        throttler.on_pop_success()
+
+        assert recorded == []
 
 
 class TestOnNoJobsAvailable:

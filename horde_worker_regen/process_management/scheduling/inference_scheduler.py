@@ -35,6 +35,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     ModelLoadState,
 )
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, LineSkip, NextJobAndProcess
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import (
@@ -261,6 +262,7 @@ from horde_worker_regen.process_management.scheduling.workload_flow import (
     DISPATCH_ADMISSION_FLOW,
     POST_PROCESS_RESERVE_FLOW,
     PRELOAD_ADMISSION_FLOW,
+    WorkloadKind,
 )
 from horde_worker_regen.telemetry_spans import span_preload_model
 from horde_worker_regen.utils.config_coercion import config_number
@@ -541,6 +543,9 @@ class InferenceScheduler:
         # Optional sink for between-jobs reload/respawn events, set by the manager to
         # WorkerRunMetrics.record_churn. None in unit tests that drive the scheduler directly.
         self._churn_observer: Callable[[ChurnKind], None] | None = None
+        # Optional sink for the worker event ring, set by the manager to WorkerRunMetrics.record_event on
+        # the same terms as the churn observer: None in unit tests, which then record nothing.
+        self._event_sink: WorkerEventSink | None = None
 
         # The ledger-driven admission overlay. The baseline provider yields the reconciler's measured
         # shared-device baseline (MB) per card, wired by the manager (None until wired, and in standalone unit
@@ -762,6 +767,10 @@ class InferenceScheduler:
     def set_churn_observer(self, observer: Callable[[ChurnKind], None]) -> None:
         """Register the sink for between-jobs reload/respawn events (see :data:`ChurnKind`)."""
         self._churn_observer = observer
+
+    def set_event_sink(self, sink: WorkerEventSink) -> None:
+        """Register the sink for this scheduler's worker-ring events (a preload starting)."""
+        self._event_sink = sink
 
     def set_admission_baseline_provider(self, provider: Callable[[int | None], float | None]) -> None:
         """Register the source of the measured shared-device baseline (MB) per card for the admission overlay.
@@ -5838,6 +5847,18 @@ class InferenceScheduler:
             available_process.last_preload_requested_at = time.time()
             if is_model_swap:
                 self._record_churn("model_swap")
+            if self._event_sink is not None:
+                self._event_sink(
+                    WorkerEventKind.PRELOAD_STARTED,
+                    workload=WorkloadKind.IMAGE_GENERATION,
+                    model=job.model,
+                    job_id=str(job.id_) if job.id_ is not None else None,
+                    process_id=available_process.process_id,
+                    device_index=available_process.device_index,
+                    # The displaced model rather than a bare "swap": a reader asking why a load is
+                    # happening again wants to know whose weights paid for it.
+                    detail=f"replacing {prior_model}" if is_model_swap else None,
+                )
             self._process_lifecycle.action_ledger.record(
                 LedgerEventType.PRELOAD_REQUESTED,
                 process_id=available_process.process_id,

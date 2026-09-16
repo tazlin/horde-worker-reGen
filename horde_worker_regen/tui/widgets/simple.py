@@ -31,8 +31,9 @@ from textual.widgets import Button, Collapsible, Static
 
 from horde_worker_regen.app_state import OverviewTrendWindow
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
-    RECENT_JOBS_IN_SNAPSHOT,
     DownloadPhase,
+    WorkerEvent,
+    WorkerEventKind,
     WorkLedgerEntry,
     WorkLedgerStage,
 )
@@ -95,14 +96,6 @@ _DOWNLOAD_PHASE_DETAIL: dict[DownloadPhase, str] = {
 
 _IDLE_FRAMES = ("·", "•", "·", " ")
 """A slower breathing indicator for a worker that is responsive but has no work in hand."""
-
-_SEEN_JOB_MEMORY = RECENT_JOBS_IN_SNAPSHOT * 10
-"""Finished requests remembered so the feed does not repeat one.
-
-A job can only be re-offered while it remains inside the snapshot's own window, so any bound above that
-window suffices; the multiple leaves room for the window to widen. The bound exists because a session
-can run for days, and an unbounded record would hold one identifier per request served.
-"""
 
 _TREND_SAMPLE_MIN_SECONDS = 2.0
 """Minimum wall-clock gap between retained trend samples, so a window spans minutes not frames."""
@@ -252,6 +245,103 @@ def _text_request_progress(entry: WorkLedgerEntry) -> tuple[Text, Text]:
         return Text("working", "green"), Text("")
     unit = entry.progress_unit.value.removesuffix("s") if current == 1 else entry.progress_unit.value
     return Text("?" * 16, "grey50"), Text(f"{current:,} {unit}", "grey70")
+
+
+def event_sentence(event: WorkerEvent) -> str | None:
+    """Return the plain-language line for one worker event, or None for a kind the feed does not show.
+
+    Shared with the native page so one worker transition reads the same wherever it is shown. Two kinds
+    are deliberately unsaid: a pop, because one line per accepted request would crowd out every other
+    kind, and a first backend launch, because the readiness line that follows it seconds later says the
+    same thing with a duration. Both stay on the ring for the surfaces that list every transition.
+    """
+    match event.kind:
+        case WorkerEventKind.JOB_FINISHED | WorkerEventKind.JOB_FAULTED:
+            return _finished_request_words(event)
+        case WorkerEventKind.PRELOAD_STARTED:
+            return f"Started loading {shorten(event.model, 24)}" if event.model else "Started loading a model"
+        case WorkerEventKind.PRELOAD_READY:
+            return f"{shorten(event.model, 24)} is ready to serve" if event.model else "A model is ready to serve"
+        case WorkerEventKind.BACKEND_READY:
+            if event.duration_seconds is None:
+                return "Text backend ready"
+            return f"Text backend ready after {event.duration_seconds:.0f} s"
+        case WorkerEventKind.BACKEND_RELAUNCHED:
+            return f"Text backend restarted (launch {event.payload.count})"
+        case WorkerEventKind.PROCESS_RECOVERED:
+            if event.payload.device_index is None:
+                # A whole service lane was rebuilt rather than one card's slot, so there is no card to name.
+                return "Recovered a worker process"
+            return f"Recovered the inference process on GPU {event.payload.device_index}"
+        case WorkerEventKind.DOWNLOAD_FINISHED:
+            return f"Finished downloading {shorten(event.model, 24)}" if event.model else "Finished a download"
+        case WorkerEventKind.MAINTENANCE_ON:
+            # A horde-side hold is refused per flow and carries that flow; the operator's own pause is
+            # worker-wide and carries none, and must not be reported as the horde's doing.
+            if event.workload is None:
+                return "Paused on this computer, so no new requests are being taken"
+            return "The horde is holding requests back (maintenance)"
+        case WorkerEventKind.MAINTENANCE_OFF:
+            if event.workload is None:
+                return "Resumed on this computer; requests are flowing again"
+            return "Requests are flowing again"
+        case WorkerEventKind.POP_BACKOFF_ENTERED:
+            return "Backing off from the horde after errors"
+        case WorkerEventKind.POP_BACKOFF_LEFT:
+            return "Back to normal polling"
+        case WorkerEventKind.JOB_POPPED | WorkerEventKind.BACKEND_LAUNCHED:
+            return None
+
+
+def _finished_request_words(event: WorkerEvent) -> str:
+    """Return the feed's line for one finished or faulted request, in the words of its workload."""
+    elapsed = f" in {event.duration_seconds:.0f}s" if event.duration_seconds is not None else ""
+    # The reward is only known for a job the horde accepted and paid for, so a faulted line says
+    # nothing about kudos rather than showing a zero the contributor would read as a bad payout.
+    earned = f" (+{event.kudos:,.1f} kudos)" if event.kudos is not None else ""
+    named = f" with {shorten(event.model, 24)}" if event.model else ""
+    if event.kind is WorkerEventKind.JOB_FAULTED:
+        return f"Could not finish a request{elapsed}"
+    if event.workload is WorkloadKind.ALCHEMY:
+        return f"Finished an alchemy request{named}{elapsed}{earned}"
+    if event.workload is WorkloadKind.TEXT_GENERATION:
+        # A text request has no resolution or step count to say how much work it was; the token
+        # count is the only figure that does, and a backend that counts none leaves it out.
+        tokens = f", {event.payload.count:,} tokens" if event.payload.count is not None else ""
+        return f"Finished a text request{named}{tokens}{elapsed}{earned}"
+    return f"Finished an image request{named}{elapsed}{earned}"
+
+
+def _text_backend_row(snapshot: WorkerStateSnapshot) -> ProcessSnapshot | None:
+    """Return the supervised text backend's row, or None when the worker has no backend row yet."""
+    return next((process for process in snapshot.processes if process.text_backend is not None), None)
+
+
+def _posture_words(snapshot: WorkerStateSnapshot | None, *, connected: bool) -> str:
+    """State this dashboard's contact with the worker, when it last asked for work, and what is loaded.
+
+    Unconditional, unlike the attention card: a contributor watching a worker that earns nothing needs the
+    three facts that separate "nothing to do" from "not asking" and "nothing loaded to serve with", and a
+    line that appears only when something is wrong cannot be checked against a healthy worker.
+    """
+    parts = ["In contact with the worker" if connected else "Not in contact with the worker"]
+    if snapshot is None:
+        return parts[0]
+    since_pop = snapshot.seconds_since_last_pop
+    parts.append(
+        f"last asked the horde {human_duration(since_pop)} ago" if since_pop is not None else "never asked yet",
+    )
+    config = snapshot.config
+    if config.dreamer:
+        loaded = sum(
+            1 for process in snapshot.processes if not process.is_external and process.loaded_horde_model_name
+        )
+        parts.append(f"{loaded} of {config.num_models} models loaded")
+    if config.scribe:
+        row = _text_backend_row(snapshot)
+        state = row.display_state if row is not None and row.display_state else "not started"
+        parts.append(f"text backend {state}")
+    return " · ".join(parts)
 
 
 def _has_work_in_hand(snapshot: WorkerStateSnapshot) -> bool:
@@ -709,9 +799,11 @@ class SimpleHomeView(VerticalScroll):
         self._backfilled_session_start: float | None = None
         self._last_sample_at = 0.0
         self._ticker: deque[str] = deque(maxlen=_TICKER_LINES)
-        # Insertion-ordered so the oldest identifier can be evicted; a plain set would grow for the life
-        # of a session that runs for days.
-        self._seen_job_ids: dict[str, None] = {}
+        # The highest event sequence this feed has shown. One integer rather than a set of identifiers:
+        # the worker stamps its ring monotonically, so everything at or below this has been seen.
+        self._highest_event_sequence = 0
+        self._backend_ready_seconds: float | None = None
+        """How long the text backend's last completed launch took, or None before one completed."""
         self._setup_required = False
 
     def compose(self) -> ComposeResult:
@@ -773,12 +865,18 @@ class SimpleHomeView(VerticalScroll):
         snapshot: WorkerStateSnapshot | None,
         *,
         is_alive: bool,
+        connected: bool = True,
     ) -> None:
-        """Refresh every card from one frame of worker state."""
+        """Refresh every card from one frame of worker state.
+
+        ``connected`` is whether this dashboard still has its channel to the worker, which only a session
+        attached to a worker host can lose; a dashboard that owns the worker process is always in contact
+        with it, which is the default.
+        """
         self._liveness.update(snapshot, is_alive=is_alive)
         self._record_trend(snapshot)
         self._record_events(snapshot)
-        self._render_status(report, snapshot, is_alive=is_alive)
+        self._render_status(report, snapshot, is_alive=is_alive, connected=connected)
         self._render_headlines(snapshot)
         self._render_current(snapshot, is_alive=is_alive)
         self._render_attention(report, snapshot)
@@ -821,7 +919,10 @@ class SimpleHomeView(VerticalScroll):
         self._kudos_history.clear()
         self._completed_history.clear()
         self._ticker.clear()
-        self._seen_job_ids.clear()
+        # A different worker session numbers its ring from the start again, so the highest sequence this
+        # feed showed belongs to the session it just left.
+        self._highest_event_sequence = 0
+        self._backend_ready_seconds = None
         self._trend_epoch = session_start
         self._backfilled_session_start = session_start
 
@@ -858,31 +959,27 @@ class SimpleHomeView(VerticalScroll):
         return deltas
 
     def _record_events(self, snapshot: WorkerStateSnapshot | None) -> None:
-        """Append newly finished requests to the feed, newest last."""
+        """Append the worker transitions this feed has not shown yet, newest last.
+
+        Deduplicated by the event's own sequence rather than by job id: the ring carries kinds that belong
+        to no job, and the sequence is what a reconnecting dashboard can compare against what it has
+        already shown. A snapshot whose lowest sequence is above the highest shown proves the ring evicted
+        events unseen, and the feed then shows what did arrive rather than inventing the gap.
+        """
         if snapshot is None:
             return
-        for job in snapshot.recent_jobs:
-            if job.job_id in self._seen_job_ids:
+        for event in snapshot.recent_events:
+            if event.sequence <= self._highest_event_sequence:
                 continue
-            self._seen_job_ids[job.job_id] = None
-            while len(self._seen_job_ids) > _SEEN_JOB_MEMORY:
-                del self._seen_job_ids[next(iter(self._seen_job_ids))]
-            elapsed = f" in {job.e2e_seconds:.0f}s" if job.e2e_seconds is not None else ""
-            # The reward is only known for a job the horde accepted and paid for, so a faulted line says
-            # nothing about kudos rather than showing a zero the contributor would read as a bad payout.
-            earned = f" (+{job.kudos_reward:,.1f} kudos)" if job.kudos_reward is not None else ""
-            named = f" with {shorten(job.model_name, 24)}" if job.model_name else ""
-            if job.faulted:
-                self._ticker.append(f"Could not finish a request{elapsed}")
-            elif job.workload == WorkloadKind.ALCHEMY:
-                self._ticker.append(f"Finished an alchemy request{named}{elapsed}{earned}")
-            elif job.workload == WorkloadKind.TEXT_GENERATION:
-                # A text request has no resolution or step count to say how much work it was; the token
-                # count is the only figure that does, and a backend that counts none leaves it out.
-                tokens = f", {job.generated_tokens:,} tokens" if job.generated_tokens is not None else ""
-                self._ticker.append(f"Finished a text request{named}{tokens}{elapsed}{earned}")
-            else:
-                self._ticker.append(f"Finished an image request{named}{elapsed}{earned}")
+            self._highest_event_sequence = event.sequence
+            if event.kind is WorkerEventKind.BACKEND_READY and event.duration_seconds is not None:
+                # How long the backend took to come up last time is the only honest estimate of how long
+                # the next launch will take, and the row cannot supply it: its launch detail is cleared at
+                # the start of every attempt.
+                self._backend_ready_seconds = event.duration_seconds
+            sentence = event_sentence(event)
+            if sentence is not None:
+                self._ticker.append(sentence)
 
     def _render_status(
         self,
@@ -890,6 +987,7 @@ class SimpleHomeView(VerticalScroll):
         snapshot: WorkerStateSnapshot | None,
         *,
         is_alive: bool,
+        connected: bool,
     ) -> None:
         """Render the headline phase with the liveness marker beside it, over who this worker is.
 
@@ -906,6 +1004,7 @@ class SimpleHomeView(VerticalScroll):
         phase = _PHASE_WORDS.get(report.phase, report.headline)
         style = "bold red" if report.severity >= HealthStatus.ERROR else "bold green"
         body = Text.assemble(marker, ("  ", ""), (f"{phase}\n", style), (report.detail, "grey70"))
+        body.append(f"\n{_posture_words(snapshot, connected=connected)}", "grey70")
         if snapshot is not None:
             uptime = time.time() - snapshot.session_start_time if snapshot.session_start_time else 0.0
             body.append(f"\n{_identity_words(snapshot.config, uptime=uptime)}", "grey62")
@@ -974,22 +1073,59 @@ class SimpleHomeView(VerticalScroll):
             table.add_row(bar, Text(shorten(entry.model, 32) or "a text request", "grey70"), detail)
         card.update(titled("Right now", table))
 
+    def _idle_detail(self, snapshot: WorkerStateSnapshot) -> str:
+        """Explain what the worker is waiting for, one sentence per workload it serves.
+
+        A worker serving two workloads is idle for two reasons at once, and a single sentence has to pick
+        one of them, which leaves the other flow unexplained. Maintenance is the exception: it holds every
+        flow's pops, so it is said once instead of per workload.
+        """
+        if snapshot.maintenance_mode:
+            return "Maintenance is holding requests back."
+        config = snapshot.config
+        sentences: list[str] = []
+        if config.dreamer:
+            sentences.append(self._idle_image_words(snapshot))
+        if config.alchemist:
+            sentences.append("No alchemy requests are waiting.")
+        if config.scribe:
+            sentences.append(self._idle_text_words(snapshot))
+        if not sentences:
+            return "Waiting for a community request."
+        return " ".join(sentences)
+
     @staticmethod
-    def _idle_detail(snapshot: WorkerStateSnapshot) -> str:
-        """Explain what the worker is doing when nothing is being sampled.
+    def _idle_image_words(snapshot: WorkerStateSnapshot) -> str:
+        """Say what image generation is waiting for: its own downloads, its queue, or the horde.
 
         Reads the download phase rather than merely testing it against idle, so a paused or failed
-        download is never described as one in progress.
+        download is never described as one in progress, and names the file in flight where the subsystem
+        reports one: "downloading" for an hour says nothing about whether it is progressing.
         """
-        downloads = snapshot.downloads
-        if downloads is not None:
-            detail = _DOWNLOAD_PHASE_DETAIL.get(downloads.phase)
-            if detail is not None:
-                return detail
         pending = snapshot.jobs_pending_inference
         if pending:
             return f"Preparing {pending} request{'s' if pending != 1 else ''}."
-        return "Waiting for a community request."
+        downloads = snapshot.downloads
+        if downloads is not None:
+            if downloads.phase is DownloadPhase.DOWNLOADING and downloads.current is not None:
+                return f"Waiting for the download of {shorten(downloads.current.model_name, 32)}."
+            detail = _DOWNLOAD_PHASE_DETAIL.get(downloads.phase)
+            if detail is not None:
+                return detail
+        return "No image requests are waiting for your models."
+
+    def _idle_text_words(self, snapshot: WorkerStateSnapshot) -> str:
+        """Say what text generation is waiting for: its backend to come up, or the horde.
+
+        The estimate is how long the backend's last completed launch took, which the feed remembers from
+        the worker's own readiness event. Before one has completed there is no estimate, and the sentence
+        says so rather than naming a number nothing supports.
+        """
+        if snapshot.text_backend_ready:
+            return "No text requests are waiting for your model."
+        if self._backend_ready_seconds is None:
+            return "The text backend is starting."
+        return f"The text backend is starting, ready in about {self._backend_ready_seconds:.0f} s."
 
     def _render_attention(self, report: HealthReport, snapshot: WorkerStateSnapshot | None) -> None:
         """Show what is off-nominal, and nothing at all while everything is.

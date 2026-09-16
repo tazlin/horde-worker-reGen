@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     DownloadStatusSnapshot,
     SupervisorCommand,
     SupervisorControlMessage,
+    WorkerEventKind,
 )
 from horde_worker_regen.process_management.jobs.job_popper import _select_models_for_pop
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -333,6 +334,31 @@ class TestManagerDownloadHandling:
         # Inference starts exactly once, when the first model lands.
         manager._process_lifecycle.start_inference_processes.assert_called_once()
         assert manager._model_availability.present == {"a", "b"}
+
+    def test_the_first_report_seeds_the_download_baseline_without_events(self) -> None:
+        """A worker whose models are already on disk has finished no downloads this session.
+
+        The download process reports its whole available set rather than per-model completions, so the
+        first report is the baseline; announcing it would report every model a long-running operator owns
+        as freshly downloaded and evict everything else from the ring.
+        """
+        manager = self._manager_in_download_mode(image_models_to_load=["a", "b"])
+
+        manager._download_coordinator.on_download_availability(_availability_message(["a", "b"]))
+
+        assert manager._run_metrics.recent_events() == []
+
+    def test_a_model_appearing_after_the_baseline_is_one_event_each(self) -> None:
+        """Each newly present model is its own completion, and a report that adds nothing adds nothing."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a", "b", "c"])
+
+        manager._download_coordinator.on_download_availability(_availability_message(["a"]))
+        manager._download_coordinator.on_download_availability(_availability_message(["a", "b", "c"]))
+        manager._download_coordinator.on_download_availability(_availability_message(["a", "b", "c"]))
+
+        events = manager._run_metrics.recent_events()
+        assert [event.kind for event in events] == [WorkerEventKind.DOWNLOAD_FINISHED] * 2
+        assert [event.model for event in events] == ["b", "c"]
 
     def test_pre_scan_report_does_not_request_or_start(self) -> None:
         """An early scanning report (scan_complete False) defers both the request and inference."""

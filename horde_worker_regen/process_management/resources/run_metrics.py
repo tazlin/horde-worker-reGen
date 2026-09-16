@@ -12,6 +12,7 @@ from __future__ import annotations
 import enum
 import os
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,10 +29,14 @@ from horde_worker_regen.process_management.ipc.messages import (
     PipelineStageTag,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    RECENT_EVENTS_IN_SNAPSHOT,
     StatsExportState,
     StatsHistoryBackfill,
     StatsRollupRow,
     StatsSample,
+    WorkerEvent,
+    WorkerEventKind,
+    WorkerEventPayload,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.telemetry_spans import (
@@ -767,6 +772,8 @@ class WorkerRunMetrics:
     def __init__(self, *, baseline_resolver: Callable[[str], str | None] | None = None) -> None:
         """Initialize empty aggregation state."""
         self._jobs: list[JobMetricsRecord] = []
+        self._events: deque[WorkerEvent] = deque(maxlen=RECENT_EVENTS_IN_SNAPSHOT)
+        self._next_event_sequence = 1
         self._stage_metrics: list[JobMetricsRecord] = []
         self._downloads: list[DownloadEvent] = []
         self._phase_metrics_by_job: dict[str, JobPhaseMetrics] = {}
@@ -805,6 +812,10 @@ class WorkerRunMetrics:
         disagreeing with the records above it.
         """
         self._jobs.clear()
+        # The ring goes with the records it describes, but the sequence does not restart: a frontend
+        # holding the highest sequence it has shown would otherwise be handed lower ones it must treat
+        # as already seen, and would skip the whole level that follows.
+        self._events.clear()
         self._stage_metrics.clear()
         self._downloads.clear()
         self._phase_metrics_by_job.clear()
@@ -820,6 +831,77 @@ class WorkerRunMetrics:
         self._decision_states.clear()
         for times in self._churn_event_times.values():
             times.clear()
+
+    def record_event(
+        self,
+        kind: WorkerEventKind,
+        *,
+        workload: WorkloadKind | None = None,
+        model: str | None = None,
+        job_id: str | None = None,
+        duration_seconds: float | None = None,
+        kudos: float | None = None,
+        process_id: int | None = None,
+        device_index: int | None = None,
+        count: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Record one worker transition on the bounded event ring, stamping it with the next sequence.
+
+        The ring lives here because the finished-job kinds are recorded where the finished-job records
+        are, so the two can never disagree about a job; every other site reaches this through the
+        aggregator it holds or through a :class:`WorkerEventSink` the process manager binds to this method.
+
+        Args:
+            kind: Which transition happened.
+            workload: The workload it belongs to, or None for a worker-wide transition.
+            model: The model involved, where the site names one.
+            job_id: The job or form involved, where the site has one.
+            duration_seconds: How long the thing that ended took, where the site measured it.
+            kudos: What the horde paid, for a job it paid for.
+            process_id: The worker's own process id, for a site that has one.
+            device_index: The card, for a site pinned to one.
+            count: Whatever the event counts (a launch number, a generation's tokens).
+            detail: Why, in the words the site already had.
+        """
+        event = WorkerEvent(
+            sequence=self._next_event_sequence,
+            kind=kind,
+            workload=workload,
+            model=model,
+            job_id=job_id,
+            duration_seconds=duration_seconds,
+            kudos=kudos,
+            payload=WorkerEventPayload(
+                process_id=process_id,
+                device_index=device_index,
+                count=count,
+                detail=detail,
+            ),
+        )
+        self._next_event_sequence += 1
+        self._events.append(event)
+
+    def recent_events(self) -> list[WorkerEvent]:
+        """Return the events still on the ring, oldest first (a copy; the ring itself stays private)."""
+        return list(self._events)
+
+    def _record_finished_job_event(self, record: JobMetricsRecord) -> None:
+        """Record the ring's finished or faulted event for one job record.
+
+        Taken from the record rather than from the caller's arguments, so a surface reading the ring and
+        one reading the finished-job list cannot describe the same job differently.
+        """
+        self.record_event(
+            WorkerEventKind.JOB_FAULTED if record.faulted else WorkerEventKind.JOB_FINISHED,
+            workload=record.workload,
+            model=record.model_name,
+            job_id=record.job_id,
+            duration_seconds=record.e2e_seconds,
+            kudos=record.kudos_reward,
+            count=record.generated_tokens,
+            detail=record.fault_reason,
+        )
 
     def record_churn(self, kind: ChurnKind) -> None:
         """Record one between-jobs reload/respawn event (see :data:`ChurnKind`), pruning stale entries.
@@ -972,6 +1054,7 @@ class WorkerRunMetrics:
             kudos_reward=tracked.kudos_reward,
         )
         self._jobs.append(record)
+        self._record_finished_job_event(record)
         baseline = self._resolve_baseline(model_name)
         self._fold_rollup(record, baseline=baseline)
         self._write_job_event(record, baseline=baseline)
@@ -1014,6 +1097,7 @@ class WorkerRunMetrics:
             kudos_reward=kudos_reward,
         )
         self._jobs.append(record)
+        self._record_finished_job_event(record)
         self._fold_form_rollup(record)
         self._write_job_event(record, baseline=None)
 
@@ -1073,6 +1157,7 @@ class WorkerRunMetrics:
             max_length=max_length,
         )
         self._jobs.append(record)
+        self._record_finished_job_event(record)
         self._write_job_event(record, baseline=None)
 
     def record_process_crash(

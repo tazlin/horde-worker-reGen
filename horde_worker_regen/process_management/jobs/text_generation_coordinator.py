@@ -61,6 +61,7 @@ from horde_sdk.ai_horde_api.consts import RC
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import derive_text_generation_timeout_seconds, reGenBridgeData
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.text_backends import (
@@ -576,6 +577,11 @@ class TextGenerationCoordinator:
         pop" reads, and a pop time in the future would read as a worker that popped before it started."""
         self._pop_hold_until = 0.0
         """Instant before which no pop is attempted, set by a pop that could not be completed."""
+        self._pop_backoff_reported = False
+        """Whether the current error-backoff spell has been recorded on the event ring.
+
+        A spell can be extended by any number of failed pops and is left by the first pop that goes out
+        after it expires, so the ring gets one entry and one exit rather than one per attempt."""
         self._pop_frequency = 2.0
         self._error_pop_frequency = 15.0
         self._loop_interval = 1.0
@@ -891,8 +897,32 @@ class TextGenerationCoordinator:
         )
 
     def _enter_pop_error_backoff(self) -> None:
-        """Hold off the next pop by the error interval after a pop that could not be completed."""
+        """Hold off the next pop by the error interval after a pop that could not be completed.
+
+        The hold arithmetic is what it has always been; the one addition is that the ring learns about the
+        posture on the edge, so a run of failed pops reports backing off once rather than once per pop.
+        """
         self._pop_hold_until = time.time() + self._error_pop_frequency
+        if self._pop_backoff_reported:
+            return
+        self._pop_backoff_reported = True
+        if self._run_metrics is not None:
+            self._run_metrics.record_event(
+                WorkerEventKind.POP_BACKOFF_ENTERED,
+                workload=WorkloadKind.TEXT_GENERATION,
+                duration_seconds=self._error_pop_frequency,
+            )
+
+    def _note_pop_resumed(self) -> None:
+        """Record that a pop is going out again, on the first one after an error hold expired."""
+        if not self._pop_backoff_reported:
+            return
+        self._pop_backoff_reported = False
+        if self._run_metrics is not None:
+            self._run_metrics.record_event(
+                WorkerEventKind.POP_BACKOFF_LEFT,
+                workload=WorkloadKind.TEXT_GENERATION,
+            )
 
     def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
         """Log a text pop error, with actionable guidance for the common, recoverable causes.
@@ -909,6 +939,15 @@ class TextGenerationCoordinator:
                     "Only its owner's requests reach it until maintenance is lifted.",
                 )
                 self._maintenance_hold_logged = True
+                # The same horde-side flag the image popper latches, seen from this flow's own pops, so it
+                # is the same event kind rather than a second one. The latch is the edge; every pop after
+                # the first is refused with the same message.
+                if self._run_metrics is not None:
+                    self._run_metrics.record_event(
+                        WorkerEventKind.MAINTENANCE_ON,
+                        workload=WorkloadKind.TEXT_GENERATION,
+                        detail=response.message,
+                    )
             else:
                 logger.trace(f"Text pop refused while in maintenance: {response.message!r}")
             return
@@ -929,6 +968,7 @@ class TextGenerationCoordinator:
         if advertisement is None or not self._should_pop():
             return
 
+        self._note_pop_resumed()
         self._last_pop_time = time.time()
 
         try:
@@ -956,6 +996,12 @@ class TextGenerationCoordinator:
         if self._maintenance_hold_logged:
             logger.info("Text pops resumed: the horde is accepting this worker's pops again.")
             self._maintenance_hold_logged = False
+            if self._run_metrics is not None:
+                self._run_metrics.record_event(
+                    WorkerEventKind.MAINTENANCE_OFF,
+                    workload=WorkloadKind.TEXT_GENERATION,
+                    detail="the horde answered a pop again",
+                )
         self._start_popped_jobs(pop_response, advertisement=advertisement)
 
     def _start_popped_jobs(
@@ -988,6 +1034,13 @@ class TextGenerationCoordinator:
                 f"Popped text job {job_id[:8]} for {pop_response.model} "
                 f"(softprompt: {pop_response.softprompt}, ttl: {pop_response.ttl})",
             )
+            if self._run_metrics is not None:
+                self._run_metrics.record_event(
+                    WorkerEventKind.JOB_POPPED,
+                    workload=WorkloadKind.TEXT_GENERATION,
+                    model=job.model_name,
+                    job_id=job_id,
+                )
             self._launch_job_task(job)
 
     @staticmethod

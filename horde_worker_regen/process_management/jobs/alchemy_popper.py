@@ -71,6 +71,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeAlchemyResultMessage,
     HordeControlFlag,
 )
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_models import PendingAlchemySubmitJob
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
@@ -490,6 +491,11 @@ class AlchemyCoordinator:
         started."""
         self._pop_hold_until = 0.0
         """Instant before which no pop is attempted, set by a pop that could not be completed."""
+        self._pop_backoff_reported = False
+        """Whether the current error-backoff spell has been recorded on the event ring.
+
+        A spell can be extended by any number of failed pops and is left by the first pop that goes out
+        after it expires, so the ring gets one entry and one exit rather than one per attempt."""
         self._pop_frequency = 4.0
         self._error_pop_frequency = 15.0
         self._loop_interval = 1.0
@@ -933,6 +939,31 @@ class AlchemyCoordinator:
             spec.form,
         )
 
+    def _enter_pop_error_backoff(self) -> None:
+        """Hold off the next pop by the error interval after a pop that could not be completed.
+
+        The hold arithmetic is what it has always been; the one addition is that the ring learns about the
+        posture on the edge, so a run of failed pops reports backing off once rather than once per pop.
+        """
+        self._pop_hold_until = time.time() + self._error_pop_frequency
+        if self._pop_backoff_reported:
+            return
+        self._pop_backoff_reported = True
+        if self._run_metrics is not None:
+            self._run_metrics.record_event(
+                WorkerEventKind.POP_BACKOFF_ENTERED,
+                workload=WorkloadKind.ALCHEMY,
+                duration_seconds=self._error_pop_frequency,
+            )
+
+    def _note_pop_resumed(self) -> None:
+        """Record that a pop is going out again, on the first one after an error hold expired."""
+        if not self._pop_backoff_reported:
+            return
+        self._pop_backoff_reported = False
+        if self._run_metrics is not None:
+            self._run_metrics.record_event(WorkerEventKind.POP_BACKOFF_LEFT, workload=WorkloadKind.ALCHEMY)
+
     def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
         """Log an alchemy pop error, with actionable guidance for common, recoverable causes."""
         message_lower = response.message.lower()
@@ -958,6 +989,7 @@ class AlchemyCoordinator:
         if not self._should_pop():
             return
 
+        self._note_pop_resumed()
         self._last_pop_time = time.time()
         bridge_data = self.bridge_data
 
@@ -994,16 +1026,16 @@ class AlchemyCoordinator:
             logger.warning(
                 f"Alchemy pop request timed out after {ALCHEMY_POP_REQUEST_TIMEOUT_SECONDS:.0f} seconds",
             )
-            self._pop_hold_until = time.time() + self._error_pop_frequency
+            self._enter_pop_error_backoff()
             return
         except Exception as e:
             logger.warning(f"Failed to pop alchemy job (Unexpected Error): {e}")
-            self._pop_hold_until = time.time() + self._error_pop_frequency
+            self._enter_pop_error_backoff()
             return
 
         if isinstance(pop_response, RequestErrorResponse):
             self._handle_pop_error_response(pop_response)
-            self._pop_hold_until = time.time() + self._error_pop_frequency
+            self._enter_pop_error_backoff()
             return
 
         if not pop_response.forms:
@@ -1063,6 +1095,13 @@ class AlchemyCoordinator:
                 spec.form_id,
                 spec.form,
             )
+            if self._run_metrics is not None:
+                self._run_metrics.record_event(
+                    WorkerEventKind.JOB_POPPED,
+                    workload=WorkloadKind.ALCHEMY,
+                    model=spec.form,
+                    job_id=spec.form_id,
+                )
 
     # endregion
 

@@ -10,9 +10,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from loguru import logger
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs import alchemy_popper
 from horde_worker_regen.process_management.jobs.alchemy_popper import lane_bound_post_processor_candidates
 from horde_worker_regen.process_management.models.model_availability import PostProcessorPresence
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from tests.process_management.conftest import make_testable_process_manager
 
 
@@ -48,6 +50,40 @@ async def test_alchemy_pop_times_out_and_enters_error_backoff(monkeypatch: pytes
     # backoff written into it would report a pop that has not happened yet.
     assert coordinator._pop_hold_until >= started_at + coordinator._error_pop_frequency
     assert coordinator.last_pop_time <= time.time()
+
+
+async def test_an_alchemy_backoff_spell_reaches_the_event_ring_once_each_way(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run of failed alchemy pops is one posture on the ring, ended by the pop that goes out after it.
+
+    The form pop runs every few seconds, so an event per failure would evict everything that explains why
+    the worker stopped earning.
+    """
+    manager = make_testable_process_manager(alchemist=True)
+    coordinator = manager._alchemy_coordinator
+    run_metrics = manager._run_metrics
+
+    coordinator._enter_pop_error_backoff()
+    coordinator._enter_pop_error_backoff()
+    assert [event.kind for event in run_metrics.recent_events()] == [WorkerEventKind.POP_BACKOFF_ENTERED]
+    assert run_metrics.recent_events()[0].workload is WorkloadKind.ALCHEMY
+
+    monkeypatch.setattr(coordinator, "_should_pop", lambda: True)
+    monkeypatch.setattr(alchemy_popper, "expand_offered_forms", lambda *_args, **_kwargs: ["nsfw"])
+    coordinator.bridge_data.priority_usernames = []
+    session = Mock()
+    session.submit_request = AsyncMock(return_value=SimpleNamespace(forms=[], skipped=None))
+    api_sessions = Mock()
+    api_sessions.require_horde_client_session.return_value = session
+    coordinator._api_sessions = api_sessions
+
+    await coordinator.api_alchemy_pop()
+
+    assert [event.kind for event in run_metrics.recent_events()] == [
+        WorkerEventKind.POP_BACKOFF_ENTERED,
+        WorkerEventKind.POP_BACKOFF_LEFT,
+    ]
 
 
 async def test_withheld_post_processors_are_logged_only_when_the_set_changes(

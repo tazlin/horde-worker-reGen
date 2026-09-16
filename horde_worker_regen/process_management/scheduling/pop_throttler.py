@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -40,12 +42,21 @@ class PopThrottler:
         job_tracker: JobTracker,
         default_pop_frequency: float = 1.0,
         error_pop_frequency: float = 5.0,
+        on_event: WorkerEventSink | None = None,
     ) -> None:
-        """Initialize with a job tracker and configurable pop frequencies."""
+        """Initialize with a job tracker, configurable pop frequencies, and an optional event sink.
+
+        Args:
+            job_tracker: The tracker whose queue the megapixelstep wait reads.
+            default_pop_frequency: Seconds between pops while the horde is answering normally.
+            error_pop_frequency: Seconds between pops while backing off after an error.
+            on_event: Where the entry into and exit from error backoff is recorded; None records nothing.
+        """
         self._job_tracker = job_tracker
         self._default_pop_frequency = default_pop_frequency
         self._error_pop_frequency = error_pop_frequency
         self._current_pop_frequency = default_pop_frequency
+        self._on_event = on_event
 
         self._last_pop_no_jobs_available_time = 0.0
         self._time_spent_no_jobs_available = 0.0
@@ -71,11 +82,23 @@ class PopThrottler:
 
     def on_pop_success(self) -> None:
         """Reset frequency to default after a successful pop."""
+        was_backing_off = self.is_in_error_backoff
         self._current_pop_frequency = self._default_pop_frequency
+        # Both of these run on every pop, so the event is recorded on the change of posture rather than
+        # on the call: a healthy worker calls this once a second.
+        if was_backing_off and self._on_event is not None:
+            self._on_event(WorkerEventKind.POP_BACKOFF_LEFT, workload=WorkloadKind.IMAGE_GENERATION)
 
     def on_pop_error(self) -> None:
         """Slow down pop frequency after an error."""
+        was_backing_off = self.is_in_error_backoff
         self._current_pop_frequency = self._error_pop_frequency
+        if not was_backing_off and self._on_event is not None:
+            self._on_event(
+                WorkerEventKind.POP_BACKOFF_ENTERED,
+                workload=WorkloadKind.IMAGE_GENERATION,
+                duration_seconds=self._error_pop_frequency,
+            )
 
     def on_no_jobs_available(self, cur_time: float, *, queue_empty: bool) -> None:
         """Track idle time when no jobs are available."""

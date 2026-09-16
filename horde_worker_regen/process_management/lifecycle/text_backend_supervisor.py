@@ -66,9 +66,12 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
     TextBackendActivity,
     TextBackendDetail,
+    WorkerEventKind,
+    WorkerEventSink,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.text_backends import (
     TextBackend,
     TextBackendDescription,
@@ -268,6 +271,7 @@ class TextBackendSupervisor:
         timings: TextBackendSupervisorTimings | None = None,
         first_launch_identifier: int = 0,
         sleep: Sleep = asyncio.sleep,
+        on_event: WorkerEventSink | None = None,
     ) -> None:
         """Wire the supervisor; nothing starts until `run()`.
 
@@ -287,6 +291,9 @@ class TextBackendSupervisor:
             first_launch_identifier: The registry's launch identifier for the first launch; increments per
                 launch so a reaped PID can be attributed to its launch.
             sleep: Awaitable sleep, injected so tests can run the ladder without wall-clock waits.
+            on_event: Where a launch, a readiness and a relaunch are recorded on the worker event ring.
+                This module is torch-free lifecycle code with no run-metrics reference, so the process
+                manager binds the ring's own recorder here; None records nothing and changes no rung.
         """
         self._launch_spec_factory = launch_spec_factory
         self._launch_spec: TextBackendLaunchSpec | None = None
@@ -298,6 +305,12 @@ class TextBackendSupervisor:
         self._timings = timings or TextBackendSupervisorTimings()
         self._next_launch_identifier = first_launch_identifier
         self._sleep = sleep
+        self._on_event = on_event
+        self._relaunch_pending = False
+        """Whether the next launch follows a back-off, which is what makes it a relaunch.
+
+        Recorded on the launch rather than on the back-off: a back-off that a stop interrupts never
+        becomes a relaunch, and a reader of the ring wants the attempt, not the pause before it."""
 
         self._process: LaunchedProcess | None = None
         self._tree_pids: tuple[int, ...] = ()
@@ -443,6 +456,14 @@ class TextBackendSupervisor:
         logger.info(
             f"Text backend launched (pid {self._process.pid}, launch {self._launch_count}): {' '.join(spec.command)}",
         )
+        if self._on_event is not None:
+            self._on_event(
+                WorkerEventKind.BACKEND_RELAUNCHED if self._relaunch_pending else WorkerEventKind.BACKEND_LAUNCHED,
+                workload=WorkloadKind.TEXT_GENERATION,
+                count=self._launch_count,
+                detail=str(self._backend_kind),
+            )
+        self._relaunch_pending = False
 
         started = time.monotonic()
         while not self._stop_requested:
@@ -458,9 +479,18 @@ class TextBackendSupervisor:
                 self._last_health_ok_at = self._ready_since
                 self._state = TextBackendState.SERVING
                 footprint = "unmeasured" if self._footprint_mb is None else f"{self._footprint_mb:.0f} MB"
+                ready_after_seconds = time.monotonic() - started
                 logger.info(
-                    f"Text backend ready after {time.monotonic() - started:.1f}s; VRAM footprint {footprint}",
+                    f"Text backend ready after {ready_after_seconds:.1f}s; VRAM footprint {footprint}",
                 )
+                if self._on_event is not None:
+                    self._on_event(
+                        WorkerEventKind.BACKEND_READY,
+                        workload=WorkloadKind.TEXT_GENERATION,
+                        duration_seconds=ready_after_seconds,
+                        count=self._launch_count,
+                        detail=f"VRAM footprint {footprint}",
+                    )
                 await self._collect_launch_detail(spec)
                 return True
             if time.monotonic() - started > self._timings.ready_patience:
@@ -493,6 +523,7 @@ class TextBackendSupervisor:
             return
         backoff = self._timings.relaunch_backoff
         index = min(self._consecutive_failures, len(backoff) - 1)
+        self._relaunch_pending = True
         self._state = TextBackendState.BACKING_OFF
         self._backoff_seconds = backoff[index]
         self._backoff_started_monotonic = time.monotonic()

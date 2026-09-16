@@ -723,6 +723,18 @@ class HordeWorkerTUI(App[None]):
         """Whether an attached supervisor still holds its pre-status placeholder lifecycle."""
         return isinstance(supervisor, AttachedWorkerSupervisor) and not supervisor.lifecycle_resolved
 
+    @staticmethod
+    def _worker_in_contact(supervisor: SupervisorLike) -> bool:
+        """Whether this session still has its channel to the worker.
+
+        Only an attached session has a channel that can drop: a supervisor that owns the worker process
+        holds its pipe for as long as the process exists, and whether that process is alive is a separate
+        question the lifecycle status answers.
+        """
+        if isinstance(supervisor, AttachedWorkerSupervisor):
+            return supervisor.connected
+        return True
+
     def _warm_model_catalog(self) -> None:
         """Pre-load the image-model catalog in the background so views open instantly (best-effort).
 
@@ -989,7 +1001,12 @@ class HordeWorkerTUI(App[None]):
             # rather than starting from an empty chart.
             simple_home = self.query_one(SimpleHomeView)
             simple_home.set_setup_required(self._refresh_setup_required())
-            simple_home.update_view(report, snapshot, is_alive=self._supervisor.is_alive())
+            simple_home.update_view(
+                report,
+                snapshot,
+                is_alive=self._supervisor.is_alive(),
+                connected=self._worker_in_contact(self._supervisor),
+            )
             for primer in self.query(TabPrimer):
                 primer.update_view(snapshot, report)
             self.query_one(SimpleActivityView).update_view(snapshot)

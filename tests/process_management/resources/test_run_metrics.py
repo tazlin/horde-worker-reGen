@@ -15,7 +15,11 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeJobMetricsMessage,
     PipelineStageTag,
 )
-from horde_worker_regen.process_management.ipc.supervisor_channel import StatsSample
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    RECENT_EVENTS_IN_SNAPSHOT,
+    StatsSample,
+    WorkerEventKind,
+)
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, TrackedJob
 from horde_worker_regen.process_management.resources.run_metrics import (
@@ -285,6 +289,81 @@ class TestJobCorrelation:
         rollups = {row.model: row for row in metrics.form_rollups()}
         assert rollups["caption"].jobs == 2
         assert rollups["caption"].e2e_seconds == 6.0
+
+
+class TestEventRing:
+    """The bounded ring of worker transitions the dashboards read, and the job records it agrees with."""
+
+    def test_every_workloads_finished_job_reaches_the_ring_beside_its_record(self) -> None:
+        """One recorder writes both, so no surface can show a finished job the other has not.
+
+        The ring carries the same figures the record does (the model, the duration, what the horde paid,
+        and a text generation's token count), because a feed built from a second reading of the same job
+        is a feed that can disagree with the totals beside it.
+        """
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, kudos_reward=4.0)
+        metrics.record_alchemy_form(form_id="form-1", form="caption", e2e_seconds=1.0, faulted=False, kudos_reward=2.0)
+        metrics.record_text_job(
+            job_id="text-1",
+            model_name="koboldcpp/Llama-3.2-3B-Instruct",
+            time_popped=100.0,
+            time_submitted=110.0,
+            queue_wait_seconds=1.0,
+            generation_seconds=8.0,
+            faulted=False,
+            kudos_reward=12.5,
+            generated_tokens=160,
+        )
+
+        events = metrics.recent_events()
+        assert [event.kind for event in events] == [WorkerEventKind.JOB_FINISHED] * 3
+        assert [event.sequence for event in events] == [1, 2, 3]
+        assert [event.workload for event in events] == [
+            WorkloadKind.IMAGE_GENERATION,
+            WorkloadKind.ALCHEMY,
+            WorkloadKind.TEXT_GENERATION,
+        ]
+        assert events[0].kudos == 4.0
+        assert events[1].model == "caption"
+        assert (events[2].payload.count, events[2].kudos, events[2].duration_seconds) == (160, 12.5, 10.0)
+
+    def test_a_faulted_job_is_its_own_kind_and_carries_why(self) -> None:
+        """A fault is a different event, not a finished job with a flag a reader has to notice."""
+        metrics = WorkerRunMetrics()
+        _finalize_job(metrics, faulted=True, fault_reason="the slot was replaced mid-job")
+
+        event = metrics.recent_events()[0]
+        assert event.kind is WorkerEventKind.JOB_FAULTED
+        assert event.payload.detail == "the slot was replaced mid-job"
+        assert event.kudos is None
+
+    def test_the_ring_is_bounded_and_keeps_the_newest_transitions(self) -> None:
+        """A long session's ring must cost a fixed payload, and the newest events are the ones read."""
+        metrics = WorkerRunMetrics()
+        for _ in range(RECENT_EVENTS_IN_SNAPSHOT + 12):
+            metrics.record_event(WorkerEventKind.PRELOAD_READY, model="Deliberate")
+
+        events = metrics.recent_events()
+        assert len(events) == RECENT_EVENTS_IN_SNAPSHOT
+        assert events[0].sequence == 13
+        assert events[-1].sequence == RECENT_EVENTS_IN_SNAPSHOT + 12
+
+    def test_a_level_boundary_clears_the_ring_without_restarting_the_sequence(self) -> None:
+        """A frontend holding the highest sequence it has shown must not be handed lower ones again.
+
+        The records go at a benchmark level boundary and the ring goes with them, but a sequence that
+        restarted would read as already-shown and the next level's events would never appear.
+        """
+        metrics = WorkerRunMetrics()
+        metrics.record_event(WorkerEventKind.PRELOAD_STARTED, model="Deliberate")
+        metrics.reset()
+
+        assert metrics.recent_events() == []
+
+        metrics.record_event(WorkerEventKind.PRELOAD_READY, model="Deliberate")
+
+        assert [event.sequence for event in metrics.recent_events()] == [2]
 
 
 class TestTextJobRecords:

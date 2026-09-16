@@ -128,16 +128,34 @@ Settings you cannot see are still preserved. Saving from any level writes back e
 
 ### The Simple home screen
 
-Simple's Overview opens with a line naming what the worker is doing, then which worker this is: its
-name and version, the horde account it contributes for, how long this session has run, what it offers
-requesters, how many models it serves, and how many requests it takes at once. Under that sit the
-session totals, requests completed and kudos earned, with the hourly rate the worker measures while it
-works. The rate reads as unknown rather than zero until there is enough to measure.
+Simple's Overview opens with a line naming what the worker is doing, then a posture line, then which
+worker this is: its name and version, the horde account it contributes for, how long this session has
+run, what it offers requesters, how many models it serves, and how many requests it takes at once. Under
+that sit the session totals, requests completed and kudos earned, with the hourly rate the worker
+measures while it works. The rate reads as unknown rather than zero until there is enough to measure.
+
+The posture line is always there, on a healthy worker as much as a struggling one: whether the dashboard
+is still in contact with the worker, how long ago the worker last asked the horde for work ("never asked
+yet" before its first pop), how many of the models it serves are loaded, and, for a scribe, what state
+its text backend is in. Those are the three facts that separate a worker with nothing to do from one
+that has stopped asking and one with nothing loaded to serve with.
 
 The small chart under each total is a rate rather than the total drawn again: it shows how much
 finished in each slice of the last fifteen minutes, so a worker that stops earning flattens to the
 baseline within a couple of minutes. Below it are the requests in flight with their progress, and the
-last few finished.
+**Recent** card.
+
+With nothing in flight, the card that would show progress says what each workload the worker serves is
+waiting for, one sentence each: no image requests waiting for your models, a text backend starting (with
+roughly how long that took last time, once one start has been measured), the download it is waiting for
+named, or, once, that maintenance is holding requests back.
+
+**Recent** is the worker's own account of what it did, newest last: requests finished and what each
+earned, a model starting to load and becoming ready to serve, the text backend coming up or restarting,
+a process the worker recovered, a download finishing, the horde holding requests back and releasing them,
+and the worker backing off after trouble reaching the horde. Accepted requests are not listed there: one
+line per request would push everything else off the card. The browser page's own **Recent** section
+carries the same lines with how long ago each happened.
 
 A scribe worker's text requests sit in the same two places. The offers line names text generation and
 the model the backend loaded; the requests in flight carry a text generation's own progress, as a

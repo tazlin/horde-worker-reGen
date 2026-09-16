@@ -45,13 +45,69 @@ worker cannot see how much, so it reserves a fixed coarse allowance for a co-hos
 decides how many inference processes to run. If you run a large text model next to image generation,
 expect to size your image configuration down.
 
+## Choosing the model
+
+One key says which model a worker-run backend loads: `text_model`. It takes either a catalogued model's
+name, spelled the way the text model reference spells it, or the path to a model file of your own.
+
+```yaml
+# a catalogued model: the worker knows its file, its size and its digest
+text_model: "meta-llama/Meta-Llama-3.1-8B-Instruct-Q4_K_M"
+
+# or a file you supply: used where it sits, never fetched
+text_model: "T:/horde-text-models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+```
+
+Which of the two a value is, is decided by the filesystem: an existing file is that file, and anything
+else is looked up as a name. A managed backend needs the key; the config is refused without it. A backend
+you run yourself (`text_backend_managed: false`) has already been given its model, so the key is unused
+there.
+
+**The catalogue is part of the model reference, not a list beside it.** The horde's text model reference
+is a name registry: its records carry the publisher's page and a parameter count, and deliberately no
+per-file download entries, because a quantised conversion hosted anywhere is a valid thing for a worker to
+run. koboldcpp needs one such file. So the worker contributes the models it has measured to the reference
+as one more source (`horde_worker_regen/text_backends/model_catalogue.py`, registered under the source id
+`regen_text`), and a read of the text category sees them beside the canonical records. Each contributed
+record declares its file's name, size and SHA-256 in the fields the reference already has, and carries
+what running the model showed (its quantisation, the context it was measured at, the VRAM it held, the
+tokens per second, and the card it was measured on) in the record's `settings`. A canonical record of the
+same name wins, so when the reference carries these files itself the worker's copies are shadowed and
+nothing else changes.
+
+Three models are in the catalogue today, each measured on one 16 GB card: Llama-3.2-3B-Instruct Q4_K_M
+(2911 MB at 4096 context), Meta-Llama-3.1-8B-Instruct Q4_K_M (5954 MB at 8192), and
+Mistral-Nemo-Instruct-2407 Q4_K_M (8633 MB at 8192). The list grows by measurement: a model nobody has run
+has no footprint to price against, and an estimate priced as a measurement is how a card gets
+over-committed.
+
+**Where files land.** A file the worker fetches goes in `text_models_dir`, which defaults to
+`<AIWORKER_CACHE_HOME>/text_models`. The model reference publishes an on-disk folder for each category
+whose files it declares, and it declares none for text models, so this folder is the worker's own choice
+rather than part of the shared layout; registering one in the reference is an open question. A
+`text_model` naming a path is read where it sits and never copied here.
+
+**The fetch happens while the backend is being provisioned**, in the same step that obtains the program,
+so the dashboard's backend row reads `provisioning` for as long as it takes and a failure is reported
+there rather than as a silent relaunch loop. The reference package's own downloader does the transfer: it
+resumes an interrupted one with a `Range` request instead of starting over, hashes while it streams, and
+fails the fetch if the result does not match the declared digest. A file already on disk at the declared
+size is left alone, so only the first launch pays for it. The image model download process is not
+involved at any point.
+
+A catalogued model whose file has no recorded origin cannot be fetched, and the worker says which file it
+wanted and where it looked for it. That is the state of every model in the catalogue today: the three
+measurements were taken from files on the operator's disk, and no quantiser repository is on record for
+them. Put the file at the named path (or set `text_models_dir` to where you keep it) and the catalogue
+still supplies its name, digest and measured footprint.
+
 ## Running the backend
 
 By default the worker runs the backend for you (`text_backend_managed: true`). It obtains the program
 (for koboldcpp, a pinned upstream release it downloads and verifies on first use, unless
 `text_backend_executable` names one of your own: a binary, or a source checkout's `koboldcpp.py` beside its
-compiled library, which the worker runs under its own interpreter), starts it on `text_backend_port` with the model file in
-`text_model_path`, waits for it to report a loaded model, and from then on relaunches it if it exits and
+compiled library, which the worker runs under its own interpreter), obtains the model file `text_model`
+names, starts it on `text_backend_port`, waits for it to report a loaded model, and from then on relaunches it if it exits and
 stops it when the worker stops. The backend's own output goes to `logs/text_backend.log`. Which program is
 launched, and with what command line, follows `text_backend_kind`; a kind the worker cannot launch yet is
 refused by name at start-up with the supported list.
@@ -103,9 +159,10 @@ case the worker is written for.
 What a pop offers the horde is a promise about what the backend will accept, so nothing is popped before
 the backend has answered, and every figure offered is the lower of yours and the backend's:
 
-- **The model name.** By default, whatever model the backend says it loaded. Set `text_model_name` to
-  override it, spelled the way the text model reference spells it: `author/Model`, plus a quantisation
-  suffix if your file has one.
+- **The model name.** A catalogued `text_model` is offered under its record's name. A `text_model` that
+  names a file of your own is offered under the file's stem, and an attached backend under whatever model
+  it reports loading. Set `text_model_name` to override any of those, spelled the way the text model
+  reference spells it: `author/Model`, plus a quantisation suffix if your file has one.
 - **`max_length` and `max_context_length`.** Your ceiling or the backend's, whichever is lower.
   Advertising more than the backend accepts just draws jobs it then refuses.
 - **Soft prompts.** Exactly the list the backend exposes, which is usually empty. The worker passes a

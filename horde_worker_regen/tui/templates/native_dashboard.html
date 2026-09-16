@@ -422,6 +422,10 @@
           <div class="fact"><span class="label">Token rate</span><b id="text-rate">not reported</b></div>
         </div>
       </section>
+      <section class="wide" id="recent-section">
+        <h2>Recent · <span id="recent-event-count">0</span></h2>
+        <div class="row-list" id="recent-events"><p class="empty">Nothing has happened yet.</p></div>
+      </section>
       <section class="secondary">
         <h2>Active models</h2>
         <div class="models" id="models"><span class="detail">No active models.</span></div>
@@ -567,6 +571,41 @@
           jobs.appendChild(row);
         });
       };
+      const renderRecentEvents = state => {
+        const events = byId("recent-events");
+        events.replaceChildren();
+        configureEntryGrid(events, state.recent_events.length, "--jobs-share");
+        setText("recent-event-count", formatNumber(state.recent_events.length));
+        if (!state.recent_events.length) {
+          emptyRow(events, "Nothing has happened yet.");
+          return;
+        }
+        // The sentence comes from the worker's projection, so this page and the terminal feed cannot word
+        // the same transition differently; the row adds only the age and the model it names.
+        state.recent_events.forEach(event => {
+          const row = document.createElement("div");
+          row.className = "state-row";
+          const kind = document.createElement("span");
+          kind.className = "state-label";
+          kind.textContent = humanState(event.kind);
+          const main = document.createElement("div");
+          main.className = "row-main";
+          const sentence = document.createElement("b");
+          sentence.textContent = event.sentence;
+          sentence.title = event.sentence;
+          const detail = document.createElement("small");
+          detail.textContent = event.model || (event.workload ? humanState(event.workload) : "the worker");
+          detail.title = detail.textContent;
+          main.append(sentence, detail);
+          const meta = document.createElement("span");
+          meta.className = "row-meta";
+          meta.textContent = event.age_seconds === null || event.age_seconds === undefined
+            ? ""
+            : `${formatDuration(event.age_seconds)} ago`;
+          row.append(kind, main, meta);
+          events.appendChild(row);
+        });
+      };
       const renderProcesses = state => {
         const processes = byId("processes");
         processes.replaceChildren();
@@ -670,9 +709,11 @@
         maintenanceButton.disabled = !connected || !state.worker_running || Boolean(pendingAction);
 
         state.active_jobs = state.active_jobs || [];
+        state.recent_events = state.recent_events || [];
         state.process_states = state.process_states || [];
         renderInsight(state);
         renderJobs(state);
+        renderRecentEvents(state);
         renderProcesses(state);
 
         const alchemyTotal = state.alchemy_pending + state.alchemy_active + state.alchemy_submitting + state.alchemy_submitted + state.alchemy_faulted;

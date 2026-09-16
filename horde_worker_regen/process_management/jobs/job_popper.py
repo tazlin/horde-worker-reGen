@@ -35,6 +35,7 @@ from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
 )
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobStage, JobTracker
 from horde_worker_regen.process_management.jobs.large_model_pop_governor import (
@@ -92,6 +93,7 @@ from horde_worker_regen.process_management.scheduling.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
     PopThrottler,
 )
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     CannedJobSource,
     make_default_dry_run_source,
@@ -108,6 +110,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
     from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
     from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+    from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 
 # Post-inference backpressure tuning. The safety stage sits downstream of inference and (unlike the
 # pre-inference queue, bounded by queue_size) had no bound: when inference outran a slow/CPU safety
@@ -481,6 +484,7 @@ class JobPopper:
         pool_active_seats_provider: Callable[[], frozenset[str]] | None = None,
         pool_pop_outcome_sink: Callable[..., None] | None = None,
         quarantined_models_provider: Callable[[], frozenset[str]] | None = None,
+        run_metrics: WorkerRunMetrics | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -559,6 +563,10 @@ class JobPopper:
         repeatedly killing the slots they are dispatched to. They come off the offer so the horde stops
         assigning their jobs, which is what ends the drop stream a quarantine would otherwise keep feeding. It
         defaults to "nothing quarantined", so a popper wired without it (and the tests) advertises as before.
+
+        `run_metrics`, when provided, receives this popper's transitions for the worker's event ring: an
+        accepted pop, and the horde's maintenance latch closing and opening. It defaults to None, which
+        records nothing and changes no pop decision.
         """
         self._state = state
         self._process_map = process_map
@@ -641,6 +649,10 @@ class JobPopper:
         # them the manager wires a guard that faults auxiliary-bearing jobs immediately, since nothing could
         # ever prepare one. The no-op default is for tests that construct a popper directly.
         self._on_job_popped = on_job_popped if on_job_popped is not None else (lambda _job: None)
+        # Where this popper's transitions (an accepted pop, the horde's maintenance latch opening and
+        # closing) land on the worker's event ring. None in the tests that construct a popper directly,
+        # which records nothing and changes no pop decision.
+        self._run_metrics = run_metrics
         # LoRAs are placed on disk only by the dedicated background download process, so a worker running
         # without it can never prepare a LoRA job. Advertising LoRA support then would only pop jobs that can
         # never be fed. Defaults True so a popper constructed directly (and the tests) keeps advertising.
@@ -658,7 +670,10 @@ class JobPopper:
 
         self._model_availability = model_availability
 
-        self._pop_throttler = PopThrottler(job_tracker=job_tracker)
+        self._pop_throttler = PopThrottler(
+            job_tracker=job_tracker,
+            on_event=run_metrics.record_event if run_metrics is not None else None,
+        )
         self._source_image_downloader = SourceImageDownloader(
             api_sessions=api_sessions,
             job_tracker=job_tracker,
@@ -1759,6 +1774,12 @@ class JobPopper:
                 self._state.server_maintenance_latched_at = time.time()
                 self._state.server_maintenance_pop_rejections = 0
                 self._state.server_maintenance_forced_by_server = _is_server_forced_maintenance(message_lower)
+                if self._run_metrics is not None:
+                    self._run_metrics.record_event(
+                        WorkerEventKind.MAINTENANCE_ON,
+                        workload=WorkloadKind.IMAGE_GENERATION,
+                        detail=response.message,
+                    )
             # Counted on every rejection, not only on the edge: the log line above fires once per episode, so
             # this counter is the worker's only measure of how much work the maintenance is costing it.
             self._state.server_maintenance_pop_rejections += 1
@@ -2359,6 +2380,14 @@ class JobPopper:
         if self._state.last_pop_maintenance_mode:
             logger.info("Clearing horde maintenance latch: a new job was popped successfully.")
             self._state.server_maintenance_cleared_by_job_pop = True
+            # Inside the latch check, which is the only edge: the assignment below runs on every
+            # successful pop and would otherwise report maintenance lifting once per job.
+            if self._run_metrics is not None:
+                self._run_metrics.record_event(
+                    WorkerEventKind.MAINTENANCE_OFF,
+                    workload=WorkloadKind.IMAGE_GENERATION,
+                    detail="a job was popped successfully",
+                )
         self._state.last_pop_maintenance_mode = False
         self._state.server_maintenance_latched_at = 0.0
         self._state.server_maintenance_forced_by_server = False
@@ -2396,6 +2425,14 @@ class JobPopper:
             job_pop_response.id_,
             job_pop_response.model,
         )
+        if self._run_metrics is not None:
+            self._run_metrics.record_event(
+                WorkerEventKind.JOB_POPPED,
+                workload=WorkloadKind.IMAGE_GENERATION,
+                model=job_pop_response.model,
+                job_id=str(job_pop_response.id_) if job_pop_response.id_ is not None else None,
+                count=job_pop_response.payload.n_iter,
+            )
 
         # Checked before any preparation work: a job with no model identity can never be dispatched, so
         # downloading its source media (and prefetching its auxiliaries) would only spend the worker's time on

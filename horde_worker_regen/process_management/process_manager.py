@@ -127,6 +127,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     TextBackendActivity,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
+    WorkerEventKind,
     WorkerStateSnapshot,
     WorkLedgerEntry,
     WorkLedgerProgressUnit,
@@ -1555,6 +1556,10 @@ class HordeWorkerProcessManager:
             ),
         )
 
+        # Built before the collaborators that record on its event ring, and before the stats-export and
+        # session-start calls below that need the rest of the manager's configuration.
+        self._run_metrics = WorkerRunMetrics(baseline_resolver=self._safe_model_baseline)
+
         self._download_coordinator = ModelDownloadCoordinator(
             state=self._state,
             process_map=self._process_map,
@@ -1565,6 +1570,7 @@ class HordeWorkerProcessManager:
             stable_diffusion_reference_provider=lambda: self.stable_diffusion_reference,
             enable_background_downloads=self._enable_background_downloads,
             pool_pending_models_provider=lambda: self._model_pool.pending_download_models(),
+            on_event=self._run_metrics.record_event,
         )
 
         self._aux_prefetch_coordinator = AuxPrefetchCoordinator(
@@ -1600,8 +1606,6 @@ class HordeWorkerProcessManager:
         self._message_dispatcher.set_channel_corruption_handler(self._restart_after_message_channel_corruption)
         # The dispatcher decodes each memory report's component-residency snapshot into this shared map.
         self._message_dispatcher.set_component_residency_map(self._component_residency_map)
-
-        self._run_metrics = WorkerRunMetrics(baseline_resolver=self._safe_model_baseline)
 
         # Persistent opt-in: begin session-scoped stats export for the whole run without a dashboard toggle.
         # The runtime SET_STATS_EXPORT command still overrides this for the session either way. Strict-bool
@@ -1726,12 +1730,14 @@ class HordeWorkerProcessManager:
             on_job_metrics=self._on_job_metrics,
             on_download_metrics=self._run_metrics.on_download_metrics,
         )
+        self._message_dispatcher.set_event_sink(self._run_metrics.record_event)
         self._message_dispatcher.set_download_availability_handler(self._download_coordinator.on_download_availability)
         self._message_dispatcher.set_aux_prefetch_result_handler(self._aux_prefetch_coordinator.on_prefetch_result)
         self._message_dispatcher.set_model_load_failure_handler(self._on_model_load_failure)
         self._message_dispatcher.set_inference_step_observer(self._observe_inference_step)
         self._job_tracker.set_finalize_observer(self._on_job_finalized)
         self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)
+        self._process_lifecycle.set_event_sink(self._run_metrics.record_event)
         self._process_lifecycle.set_model_quarantine_handler(self._on_model_quarantined)
 
         # Terminal-generation-fault history for the fault-rate breaker, as (time, model) pairs pruned to the
@@ -1830,6 +1836,7 @@ class HordeWorkerProcessManager:
         # Attribute between-jobs reload/respawn churn (model swaps, VRAM evictions, process cycles) into
         # the run metrics so the periodic duty-cycle line can name it alongside the per-job phase gaps.
         self._inference_scheduler.set_churn_observer(self._run_metrics.record_churn)
+        self._inference_scheduler.set_event_sink(self._run_metrics.record_event)
         # The sampling-headroom arithmetic's baseline term is the reconciler's measured shared-device
         # baseline, captured in the drift cadence on the manager. Feed it to the scheduler so the
         # concurrent-sampling gate sizes real capacity per card.
@@ -2018,6 +2025,7 @@ class HordeWorkerProcessManager:
             pool_active_seats_provider=self._model_pool.active_seat_models,
             pool_pop_outcome_sink=self._model_pool.on_pop_outcome,
             quarantined_models_provider=self._process_lifecycle.quarantined_models,
+            run_metrics=self._run_metrics,
         )
 
         # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
@@ -6357,9 +6365,21 @@ class HordeWorkerProcessManager:
         """Dispatch one supervisor command onto the worker's existing control mechanisms."""
         match command.command:
             case SupervisorCommand.PAUSE | SupervisorCommand.DRAIN:
+                # Compared before the assignment: a frontend may send PAUSE over an already-paused worker,
+                # and the ring records the operator's pause beginning rather than each command.
+                if not self._state.supervisor_paused:
+                    self._run_metrics.record_event(
+                        WorkerEventKind.MAINTENANCE_ON,
+                        detail="the operator paused this worker",
+                    )
                 self._state.supervisor_paused = True
                 logger.info("Supervisor requested pause: no new jobs will be popped (in-flight jobs finish).")
             case SupervisorCommand.RESUME:
+                if self._state.supervisor_paused:
+                    self._run_metrics.record_event(
+                        WorkerEventKind.MAINTENANCE_OFF,
+                        detail="the operator resumed this worker",
+                    )
                 self._state.supervisor_paused = False
                 logger.info("Supervisor requested resume: job popping re-enabled.")
                 # An operator resume may also lift any horde-side maintenance the worker is in, but only
@@ -8145,6 +8165,7 @@ class HordeWorkerProcessManager:
             ram_high_water_mb_per_process=run_metrics.ram_used_high_water_mb_per_process,
             disk_free_bytes=dict(self._disk_monitor.current_free_bytes),
             recent_jobs=recent_jobs,
+            recent_events=self._run_metrics.recent_events(),
             latest_stats_sample=latest_stats_sample,
             stats_model_rollups=self._run_metrics.model_rollups(),
             stats_baseline_rollups=self._run_metrics.baseline_rollups(),
@@ -8579,6 +8600,7 @@ class HordeWorkerProcessManager:
             backend_kind=kind,
             owned_registry=self._owned_registry,
             read_device_free_total_mb=self._read_device_free_total_mb,
+            on_event=self._run_metrics.record_event,
         )
         self._text_backend_supervisor = supervisor
         await supervisor.run()

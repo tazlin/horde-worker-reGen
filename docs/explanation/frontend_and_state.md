@@ -69,7 +69,38 @@ defines the structured protocol over it:
   plus its fault reports, matching what the image job tracker's movement counter means; the same totals feed
   the stats sample and the durable `WorkerRunRecord`, which is what judges a session productive.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 27) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 28) so a frontend can detect a mismatch with a worker built from different code.
+
+### The event ring
+
+`recent_events` is a bounded ring of
+[`WorkerEvent`][horde_worker_regen.process_management.ipc.supervisor_channel.WorkerEvent] entries, oldest
+first, capped at `RECENT_EVENTS_IN_SNAPSHOT` (40). Each entry is one transition the worker made: a pop, a
+preload starting and becoming resident, a job finished or faulted, the text backend launched, ready or
+restarted, a process recovered, a download finished, maintenance and pop backoff beginning and ending. The
+whole ring rides every snapshot, so the bound is the payload's bound and no consumer slices it.
+
+Three rules make it readable:
+
+- **Every event is recorded where its transition happens**, by the site that already made the decision, so
+  the ring is a history rather than a difference between sampled snapshots. The finished-job kinds are
+  recorded in `WorkerRunMetrics` beside the per-job record, which is why the ring and `recent_jobs` cannot
+  disagree about a job.
+- **A state's edge is the event.** Maintenance, pop backoff and a model's residency are all reported
+  repeatedly by their own sites, so each one records only a change of value: a worker refused every pop for
+  an hour of maintenance contributes one entry and one exit, not one per pop.
+- **`sequence` is monotonic per worker session**, starting at 1. A frontend keeps the highest sequence it
+  has shown; an event at or below it has been shown, and a ring whose lowest sequence is above it proves
+  events were evicted before that frontend saw them, which is what lets a reconnecting dashboard show what
+  arrived instead of repeating or silently skipping work. A benchmark level boundary clears the ring with
+  the records it describes and deliberately does not restart the sequence.
+
+One payload class (`WorkerEventPayload`: `process_id`, `device_index`, `count`, `detail`) serves every kind
+rather than a subclass per kind, so a consumer reads the ring as a list of one model and a kind it does not
+recognise still renders what it can. The Simple home's feed and the browser page's Recent section both
+render `event_sentence`, so one transition reads the same wherever it is shown; pops and first backend
+launches are on the ring but have no sentence, because one line per accepted request would crowd out every
+kind that explains a session.
 
 ### One work ledger for three workloads
 

@@ -33,6 +33,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadStatusSnapshot,
+    WorkerEventKind,
 )
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -41,6 +42,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.process_manager import POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB
+from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 from horde_worker_regen.process_management.scheduling.model_pool import PopLane
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedJobSource, make_empty_pop_response
@@ -79,6 +81,7 @@ def _make_popper(
     pool_active_seats_provider: Callable[[], frozenset[str]] | None = None,
     pool_pop_outcome_sink: Callable[..., None] | None = None,
     card_runtimes: dict[int, CardRuntime] | None = None,
+    run_metrics: WorkerRunMetrics | None = None,
 ) -> JobPopper:
     """Build a JobPopper with mostly-mocked dependencies."""
     if state is None:
@@ -120,6 +123,7 @@ def _make_popper(
         pool_active_seats_provider=pool_active_seats_provider,
         pool_pop_outcome_sink=pool_pop_outcome_sink,
         card_runtimes=card_runtimes,
+        run_metrics=run_metrics,
     )
 
 
@@ -1548,6 +1552,18 @@ class TestHandlePopErrorResponse:
         # Should not raise; just quietly update
         popper._handle_pop_error_response(resp)
 
+    def test_a_maintenance_episode_reaches_the_event_ring_once(self) -> None:
+        """Every pop of a worker in maintenance is refused, so only the latch closing is an event."""
+        run_metrics = WorkerRunMetrics()
+        popper = _make_popper(state=WorkerState(), run_metrics=run_metrics)
+
+        for _ in range(3):
+            popper._handle_pop_error_response(self._make_error_response("Server is in maintenance mode"))
+
+        held = [event for event in run_metrics.recent_events() if event.kind is WorkerEventKind.MAINTENANCE_ON]
+        assert len(held) == 1
+        assert held[0].payload.detail == "Server is in maintenance mode"
+
     def test_every_rejection_is_counted_even_though_only_the_first_warns(self) -> None:
         """The warning is edge-triggered, so the count is what measures a long maintenance episode."""
         state = WorkerState()
@@ -1806,6 +1822,7 @@ class TestApiJobPopFullFlow:
         job_tracker: JobTracker | None = None,
         bridge_data: Mock | None = None,
         model_availability: ModelAvailability | None = None,
+        run_metrics: WorkerRunMetrics | None = None,
     ) -> JobPopper:
         """Create a popper in a state where all guard clauses pass."""
         if state is None:
@@ -1826,6 +1843,7 @@ class TestApiJobPopFullFlow:
             bridge_data=bridge_data,
             horde_client_session=horde_session,
             model_availability=model_availability,
+            run_metrics=run_metrics,
         )
 
     @_full_flow_patches
@@ -1863,6 +1881,40 @@ class TestApiJobPopFullFlow:
         assert popper._state.server_maintenance_latched_at == 0.0
         assert popper._state.server_maintenance_forced_by_server is False
         assert popper._state.server_maintenance_pop_rejections == 0
+
+    @_full_flow_patches
+    async def test_an_accepted_pop_and_a_lifted_maintenance_latch_reach_the_event_ring(
+        self,
+        _mock_req_cls: Mock,
+    ) -> None:
+        """The ring carries the pop that arrived and, once, the maintenance it proved was over.
+
+        The latch is cleared on every successful pop, so a second pop must not report the horde lifting
+        maintenance again: a feed of that would read as the worker flapping in and out of maintenance.
+        """
+        run_metrics = WorkerRunMetrics()
+        state = WorkerState(last_job_pop_time=0.0, last_pop_maintenance_mode=True)
+        popper = self._make_ready_popper(
+            api_response=make_job_pop_response(model="Deliberate"),
+            state=state,
+            run_metrics=run_metrics,
+        )
+
+        await popper.api_job_pop()
+
+        assert [event.kind for event in run_metrics.recent_events()] == [
+            WorkerEventKind.MAINTENANCE_OFF,
+            WorkerEventKind.JOB_POPPED,
+        ]
+        popped = run_metrics.recent_events()[1]
+        assert popped.model == "Deliberate"
+        assert popped.job_id is not None
+
+        popper._state.last_job_pop_time = 0.0
+        await popper.api_job_pop()
+
+        lifted = [event for event in run_metrics.recent_events() if event.kind is WorkerEventKind.MAINTENANCE_OFF]
+        assert len(lifted) == 1, "the latch is cleared on every pop; only its closing is an event"
 
     @_full_flow_patches
     async def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:

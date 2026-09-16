@@ -23,6 +23,7 @@ from horde_model_reference.text_backend_names import TEXT_BACKENDS
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     TEXT_BACKEND_PROCESS_ID,
     TextBackendActivity,
+    WorkerEventKind,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
@@ -292,6 +293,68 @@ async def test_an_exit_before_ready_is_relaunched_after_backoff(tmp_path: Path) 
 
     await supervisor.stop()
     await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_the_launch_and_the_readiness_reach_the_event_ring(tmp_path: Path) -> None:
+    """A first launch and the readiness that followed it are what the dashboard's feed shows of a backend.
+
+    Both carry the launch number, and the readiness carries how long the backend took, which is the only
+    honest basis for telling a contributor how long the next start will take.
+    """
+    handle = FakeLaunched(pid=31)
+    recorded: list[tuple[WorkerEventKind, dict[str, object]]] = []
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
+        backend=StubBackend(ready_results=[True]),
+        launch_process=Launcher([handle]),
+        timings=FAST,
+        on_event=lambda kind, **fields: recorded.append((kind, fields)),
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.is_serving)
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert [kind for kind, _fields in recorded] == [
+        WorkerEventKind.BACKEND_LAUNCHED,
+        WorkerEventKind.BACKEND_READY,
+    ]
+    assert [fields["count"] for _kind, fields in recorded] == [1, 1]
+    ready_fields = recorded[1][1]
+    assert isinstance(ready_fields["duration_seconds"], float)
+    assert ready_fields["duration_seconds"] >= 0.0
+
+
+async def test_the_launch_after_a_backoff_is_recorded_as_a_relaunch(tmp_path: Path) -> None:
+    """A relaunch is the attempt that follows a back-off, not the pause itself.
+
+    A back-off a stop interrupts never becomes a launch, and a reader of the feed wants the attempt; so the
+    first launch is a launch and the one after a failure is a restart, with its launch number.
+    """
+    first = FakeLaunched(pid=41)
+    first.exit(1)
+    second = FakeLaunched(pid=42)
+    recorded: list[tuple[WorkerEventKind, dict[str, object]]] = []
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
+        backend=StubBackend(ready_results=[True]),
+        launch_process=Launcher([first, second]),
+        timings=FAST,
+        on_event=lambda kind, **fields: recorded.append((kind, fields)),
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.is_serving)
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert [kind for kind, _fields in recorded] == [
+        WorkerEventKind.BACKEND_LAUNCHED,
+        WorkerEventKind.BACKEND_RELAUNCHED,
+        WorkerEventKind.BACKEND_READY,
+    ]
+    assert recorded[1][1]["count"] == 2
 
 
 async def test_missing_the_ready_patience_stops_the_process_and_relaunches(tmp_path: Path) -> None:

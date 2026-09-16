@@ -18,7 +18,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.models.feature_readiness import FeatureReadiness
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 27
+SUPERVISOR_PROTOCOL_VERSION = 28
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -119,10 +119,23 @@ exists from before the command line is rendered (the supervised backend's life b
 ``seconds_since_last_pop``) now include alchemy and text work, so a worker serving either alone reports its
 own headline figures rather than zero; the ``alchemy_*`` and ``text_*`` fields and ``workload_totals`` remain
 the per-workload split.
+v28 adds ``recent_events`` (:class:`WorkerEvent` entries, bounded by :data:`RECENT_EVENTS_IN_SNAPSHOT`): the
+worker's own transitions as they happened (pops, preloads, finished and faulted work, backend launches,
+process recoveries, finished downloads, maintenance and pop-backoff edges), each with a per-session
+``sequence`` so a reconnecting frontend can tell events it has shown from ones it has not. The ring is
+recorded where the finished-job records are, so it and ``recent_jobs`` cannot disagree about a job.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
 """How many of the most recent finished-job records to carry in a snapshot (bounds payload size)."""
+
+RECENT_EVENTS_IN_SNAPSHOT = 40
+"""How many of the most recent worker events to carry in a snapshot (bounds payload size).
+
+Above the finished-job bound because finishing a job is one of a dozen kinds recorded here: a worker
+that finished twenty-five jobs also preloaded models, launched a backend and recovered a process
+between them, and a ring the size of the job list would evict the surrounding transitions that explain
+the jobs. Small enough that the whole ring rides every snapshot without slicing."""
 
 PENDING_JOBS_IN_SNAPSHOT = 8
 """How many pending-inference jobs to carry in a snapshot (bounds payload size)."""
@@ -775,6 +788,103 @@ class RecentJobRecord(BaseModel):
             kudos_reward=record.kudos_reward,
             generated_tokens=record.generated_tokens,
         )
+
+
+class WorkerEventKind(enum.StrEnum):
+    """One kind of worker transition carried on the event ring.
+
+    Each member names a transition the worker already makes a decision at, not a state it can be asked
+    about: an event is recorded where the change happens, so the ring is a history rather than a sampled
+    difference between snapshots. The pop, preload and load members are named after the same transitions
+    the log-signature registry (``analysis/log_signatures.py``) registers at those sites.
+    """
+
+    JOB_POPPED = "job_popped"
+    PRELOAD_STARTED = "preload_started"
+    PRELOAD_READY = "preload_ready"
+    JOB_FINISHED = "job_finished"
+    JOB_FAULTED = "job_faulted"
+    BACKEND_LAUNCHED = "backend_launched"
+    BACKEND_READY = "backend_ready"
+    BACKEND_RELAUNCHED = "backend_relaunched"
+    PROCESS_RECOVERED = "process_recovered"
+    DOWNLOAD_FINISHED = "download_finished"
+    MAINTENANCE_ON = "maintenance_on"
+    MAINTENANCE_OFF = "maintenance_off"
+    POP_BACKOFF_ENTERED = "pop_backoff_entered"
+    POP_BACKOFF_LEFT = "pop_backoff_left"
+
+
+class WorkerEventPayload(BaseModel):
+    """Represents the few extra facts an event's own site holds, the same shape for every kind.
+
+    One payload class rather than a subclass per kind: the ring is a list of one model, so a frontend
+    reads it without narrowing, and a reader that does not know a kind still gets its fields. A field a
+    kind has nothing to say about stays None rather than becoming a zero.
+    """
+
+    process_id: int | None = None
+    """The worker's own process id for a preload or a recovered slot; None for a site that has none."""
+    device_index: int | None = None
+    """The card the event happened on; None when the site is not pinned to one."""
+    count: int | None = None
+    """Whatever the event counts: a backend's launch number, a generation's tokens."""
+    detail: str | None = None
+    """Why, in the words the site already had (a recovery reason, the model a preload displaces)."""
+
+
+class WorkerEvent(BaseModel):
+    """Represents one worker transition, as the site that made it saw it.
+
+    The ring these sit on is bounded, so a frontend that has been away longer than the bound has missed
+    events; :attr:`sequence` is what lets it say so rather than silently re-showing or skipping work.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    sequence: int
+    """Monotonic within one worker session, starting at 1.
+
+    A reconnecting frontend keeps the highest sequence it has shown: an event at or below it has been
+    shown, and a ring whose lowest sequence is above it proves events were evicted unseen."""
+    kind: WorkerEventKind
+    timestamp: float = Field(default_factory=time.time)
+    """The worker's wall clock when the transition happened, which is the clock its snapshots use."""
+    workload: WorkloadKind | None = None
+    """The workload the event belongs to; None for a worker-wide event (a process recovery, a download)."""
+    model: str | None = None
+    job_id: str | None = None
+    duration_seconds: float | None = None
+    """How long the thing that just ended took, where the site measured it."""
+    kudos: float | None = None
+    """What the horde paid, for a finished job the horde paid for; None everywhere else."""
+    payload: WorkerEventPayload = Field(default_factory=WorkerEventPayload)
+
+
+class WorkerEventSink(Protocol):
+    """The callable a collaborator with no run-metrics reference is handed to record its transitions.
+
+    Structurally satisfied by ``WorkerRunMetrics.record_event``, which owns the ring and assigns the
+    sequence, so a site emits without importing the metrics aggregator: the process manager injects the
+    bound method. Declared here beside :class:`WorkerEventKind` so an emitting site needs one import.
+    """
+
+    def __call__(
+        self,
+        kind: WorkerEventKind,
+        *,
+        workload: WorkloadKind | None = ...,
+        model: str | None = ...,
+        job_id: str | None = ...,
+        duration_seconds: float | None = ...,
+        kudos: float | None = ...,
+        process_id: int | None = ...,
+        device_index: int | None = ...,
+        count: int | None = ...,
+        detail: str | None = ...,
+    ) -> None:
+        """Record one worker transition (see ``WorkerRunMetrics.record_event``)."""
+        ...
 
 
 class WorkloadTotalsSnapshot(BaseModel):
@@ -1439,7 +1549,7 @@ class WorkerStateSnapshot(BaseModel):
 
     Carries the same headline information the console ``StatusReporter`` assembles, plus the
     per-process detail the live view renders. Payload size is bounded: ``recent_jobs`` is capped
-    at :data:`RECENT_JOBS_IN_SNAPSHOT`.
+    at :data:`RECENT_JOBS_IN_SNAPSHOT` and ``recent_events`` at :data:`RECENT_EVENTS_IN_SNAPSHOT`.
     """
 
     protocol_version: int = SUPERVISOR_PROTOCOL_VERSION
@@ -1575,6 +1685,8 @@ class WorkerStateSnapshot(BaseModel):
 
     recent_jobs: list[RecentJobRecord] = Field(default_factory=list)
     """The most recent finished-job records, newest last (capped)."""
+    recent_events: list[WorkerEvent] = Field(default_factory=list)
+    """The most recent worker transitions, newest last, bounded by :data:`RECENT_EVENTS_IN_SNAPSHOT`."""
 
     latest_stats_sample: StatsSample | None = None
     """The latest one-second worker-owned stats sample."""

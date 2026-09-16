@@ -27,6 +27,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor
+from horde_worker_regen.tui.widgets.simple import event_sentence
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
 NATIVE_DASHBOARD_PATH = "/native"
@@ -62,6 +63,23 @@ class NativeJobState(BaseModel):
     """What the progress figures count, so a row with no percentage still says what it has counted."""
     iterations_per_second: float | None = None
     age_seconds: float | None = None
+
+
+class NativeEventState(BaseModel):
+    """One worker transition from the event ring, in the same shape as an active-work row.
+
+    The sentence is the one the terminal dashboard's feed uses, resolved here rather than in the browser,
+    so a transition reads the same on both surfaces and the page holds no second set of wordings.
+    """
+
+    sequence: int
+    """The worker's own ordering of this event within its session."""
+    kind: str
+    sentence: str
+    workload: str | None = None
+    model: str | None = None
+    age_seconds: float | None = None
+    """How long ago it happened, or None when the snapshot's clock could not place it."""
 
 
 class NativeProcessState(BaseModel):
@@ -147,6 +165,7 @@ class NativeDashboardState(BaseModel):
     processes_total: int = 0
     processes_busy: int = 0
     active_jobs: list[NativeJobState] = Field(default_factory=list)
+    recent_events: list[NativeEventState] = Field(default_factory=list)
     process_states: list[NativeProcessState] = Field(default_factory=list)
     active_models: list[str] = Field(default_factory=list)
     api_messages: list[str] = Field(default_factory=list)
@@ -243,6 +262,30 @@ def _active_job_states(snapshot: WorkerStateSnapshot) -> list[NativeJobState]:
             ),
         )
     return jobs
+
+
+def _recent_event_states(snapshot: WorkerStateSnapshot) -> list[NativeEventState]:
+    """Project the worker's event ring, newest first, dropping the kinds that have no sentence.
+
+    Newest first because the page is read top-down and a reader arriving at it wants what just happened;
+    the terminal feed accumulates downward instead, and both read the same ring.
+    """
+    events: list[NativeEventState] = []
+    for event in reversed(snapshot.recent_events):
+        sentence = event_sentence(event)
+        if sentence is None:
+            continue
+        events.append(
+            NativeEventState(
+                sequence=event.sequence,
+                kind=event.kind.value,
+                sentence=sentence,
+                workload=event.workload.value if event.workload is not None else None,
+                model=event.model,
+                age_seconds=max(0.0, snapshot.timestamp - event.timestamp) if event.timestamp else None,
+            ),
+        )
+    return events
 
 
 def _process_order(process: ProcessSnapshot) -> tuple[int, int, int]:
@@ -353,6 +396,7 @@ def build_native_dashboard_state(supervisor: NativeSupervisor) -> NativeDashboar
         processes_total=len(process_states),
         processes_busy=sum(process.busy for process in process_states),
         active_jobs=_active_job_states(snapshot),
+        recent_events=_recent_event_states(snapshot),
         process_states=process_states,
         active_models=list(snapshot.active_models),
         api_messages=list(snapshot.api_messages[:3]),

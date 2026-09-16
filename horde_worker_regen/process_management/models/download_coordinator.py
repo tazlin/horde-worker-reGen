@@ -11,7 +11,11 @@ from loguru import logger
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeDownloadAvailabilityMessage
-from horde_worker_regen.process_management.ipc.supervisor_channel import DownloadPlanSummary
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    DownloadPlanSummary,
+    WorkerEventKind,
+    WorkerEventSink,
+)
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.desired_state import DesiredState
@@ -42,6 +46,7 @@ class ModelDownloadCoordinator:
         pool_pending_models_provider: Callable[[], Collection[str]] = frozenset,
         clock: Callable[[], float] = time.time,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        on_event: WorkerEventSink | None = None,
     ) -> None:
         """Initialize the download coordinator.
 
@@ -59,6 +64,9 @@ class ModelDownloadCoordinator:
                 does not prune a pool-initiated download. Defaults to an empty set (pool disabled or absent).
             clock: Wall-clock provider for startup-grace decisions.
             monotonic_clock: Monotonic clock provider for download-plan cache expiry.
+            on_event: Where a model newly on disk is recorded on the worker event ring; None records
+                nothing. The download process reports the whole available set rather than per-model
+                completions, and this coordinator is its one reader, so the difference is taken here.
         """
         self._state = state
         self._process_map = process_map
@@ -71,6 +79,13 @@ class ModelDownloadCoordinator:
         self._pool_pending_models_provider = pool_pending_models_provider
         self._clock = clock
         self._monotonic_clock = monotonic_clock
+        self._on_event = on_event
+        self._models_present_at_last_report: frozenset[str] | None = None
+        """The on-disk model set the previous availability report carried, or None before the first one.
+
+        The first report is the baseline and produces no events: everything already on disk arrived before
+        this session, and announcing a worker's whole model set as freshly downloaded would bury the one
+        download that actually finished."""
 
         self.inference_processes_started = False
         self.safety_processes_started = False
@@ -86,6 +101,7 @@ class ModelDownloadCoordinator:
 
     def on_download_availability(self, message: HordeDownloadAvailabilityMessage) -> None:
         """Record an on-disk availability snapshot from the download process."""
+        self._note_newly_present_models(frozenset(message.available_model_names))
         self._model_availability.update(
             present=set(message.available_model_names),
             currently_downloading=message.currently_downloading,
@@ -120,6 +136,21 @@ class ModelDownloadCoordinator:
 
         self.maybe_start_safety_processes()
         self.maybe_start_inference_processes()
+
+    def _note_newly_present_models(self, present: frozenset[str]) -> None:
+        """Record one event per model that has appeared on disk since the previous availability report.
+
+        The download process reports its whole available set each time and never says "this one finished",
+        so a completed download is the difference between two reports. A model that disappears is not an
+        event of its own here: that is a file removed or a scan that could not read it, which the download
+        subsystem's own status reports.
+        """
+        previous = self._models_present_at_last_report
+        self._models_present_at_last_report = present
+        if previous is None or self._on_event is None:
+            return
+        for model_name in sorted(present - previous):
+            self._on_event(WorkerEventKind.DOWNLOAD_FINISHED, model=model_name)
 
     def reconcile_downloads(
         self,

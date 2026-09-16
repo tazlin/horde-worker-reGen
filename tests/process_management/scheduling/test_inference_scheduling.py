@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     ModelInfo,
     ModelLoadState,
 )
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -292,6 +293,47 @@ class TestPreloadModels:
         result = inference_scheduler.preload_models()
         assert result is True
         assert process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+
+    async def test_a_preload_that_was_sent_reaches_the_event_ring(self) -> None:
+        """The ring's load entries are the worker's own account of where a job's weights went.
+
+        Recorded on the send rather than on the decision, so a preload the pipe refused is not reported as
+        a load the worker started.
+        """
+        process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("new_model"))
+        recorded: list[tuple[WorkerEventKind, dict[str, object]]] = []
+        inference_scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: process_info}),
+            job_tracker=job_tracker,
+        )
+        inference_scheduler.set_event_sink(lambda kind, **fields: recorded.append((kind, fields)))
+
+        assert inference_scheduler.preload_models() is True
+
+        assert len(recorded) == 1
+        kind, fields = recorded[0]
+        assert kind is WorkerEventKind.PRELOAD_STARTED
+        assert fields["model"] == "new_model"
+        assert fields["process_id"] == 0
+        assert fields["detail"] is None, "a fresh slot displaces nothing, so there is no swap to report"
+
+    async def test_a_preload_onto_occupied_weights_names_what_it_displaces(self) -> None:
+        """A load that throws away resident weights is the one a reader asks about, so it says whose."""
+        process_info = make_mock_process_info(0, model_name="old_model", state=HordeProcessState.WAITING_FOR_JOB)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("new_model"))
+        recorded: list[dict[str, object]] = []
+        inference_scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: process_info}),
+            job_tracker=job_tracker,
+        )
+        inference_scheduler.set_event_sink(lambda _kind, **fields: recorded.append(fields))
+
+        assert inference_scheduler.preload_models() is True
+
+        assert recorded[0]["detail"] == "replacing old_model"
 
     async def test_resident_head_is_attempted_before_later_preload(self) -> None:
         """A resident queue head gets the scheduling cycle before later models are preloaded."""

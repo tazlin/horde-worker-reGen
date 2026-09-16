@@ -11,7 +11,13 @@ from __future__ import annotations
 import time
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
-from horde_worker_regen.process_management.ipc.supervisor_channel import ModelPoolSeatReadiness
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    RECENT_EVENTS_IN_SNAPSHOT,
+    ModelPoolSeatReadiness,
+    SupervisorCommand,
+    SupervisorControlMessage,
+    WorkerEventKind,
+)
 from horde_worker_regen.process_management.jobs.pool_lanes import LaneDecision, PoolLaneState
 from horde_worker_regen.process_management.jobs.text_generation_coordinator import TextJobInFlight
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot
@@ -250,6 +256,63 @@ def test_headless_publish_still_builds_the_snapshot_at_the_floor() -> None:
     manager._last_supervisor_publish_time -= manager._supervisor_publish_floor_interval + 1.0
     manager._publish_supervisor_snapshot()
     assert builds == 2
+
+
+def test_the_event_ring_reaches_the_snapshot_oldest_first() -> None:
+    """The dashboards read the worker's transitions off the snapshot, in the order they happened.
+
+    Oldest first because the feed that renders it accumulates downward and a reconnecting frontend walks
+    the ring comparing sequences; a reversed ring would make the first event it sees the newest one.
+    """
+    manager = make_testable_process_manager()
+    manager._run_metrics.record_event(WorkerEventKind.JOB_POPPED, model="Deliberate", job_id="job-1")
+    manager._run_metrics.record_event(WorkerEventKind.PRELOAD_STARTED, model="Deliberate", process_id=2)
+
+    snapshot = manager._build_worker_state_snapshot()
+
+    assert [event.kind for event in snapshot.recent_events] == [
+        WorkerEventKind.JOB_POPPED,
+        WorkerEventKind.PRELOAD_STARTED,
+    ]
+    assert [event.sequence for event in snapshot.recent_events] == [1, 2]
+    assert snapshot.recent_events[1].payload.process_id == 2
+
+
+def test_the_event_ring_on_the_snapshot_is_bounded() -> None:
+    """Every snapshot carries the whole ring, so the ring's own bound is the payload's bound."""
+    manager = make_testable_process_manager()
+    for _ in range(RECENT_EVENTS_IN_SNAPSHOT * 2):
+        manager._run_metrics.record_event(WorkerEventKind.DOWNLOAD_FINISHED, model="Deliberate")
+
+    snapshot = manager._build_worker_state_snapshot()
+
+    assert len(snapshot.recent_events) == RECENT_EVENTS_IN_SNAPSHOT
+    assert snapshot.recent_events[-1].sequence == RECENT_EVENTS_IN_SNAPSHOT * 2
+
+
+def test_a_worker_that_did_nothing_yet_carries_an_empty_ring() -> None:
+    """The field is additive: a worker with no transitions yet reports the snapshot it always did."""
+    manager = make_testable_process_manager()
+
+    assert manager._build_worker_state_snapshot().recent_events == []
+
+
+def test_an_operator_pause_and_resume_are_recorded_once_each() -> None:
+    """A frontend may re-send a pause over an already-paused worker, and the ring records the posture.
+
+    The local pause is the operator's, not the horde's, so it carries no workload: that is what tells a
+    reader (and the feed's wording) which of the two held the worker's pops back.
+    """
+    manager = make_testable_process_manager()
+
+    for _ in range(3):
+        manager._apply_supervisor_command(SupervisorControlMessage(command=SupervisorCommand.PAUSE))
+    for _ in range(3):
+        manager._apply_supervisor_command(SupervisorControlMessage(command=SupervisorCommand.RESUME))
+
+    events = manager._run_metrics.recent_events()
+    assert [event.kind for event in events] == [WorkerEventKind.MAINTENANCE_ON, WorkerEventKind.MAINTENANCE_OFF]
+    assert [event.workload for event in events] == [None, None]
 
 
 def test_text_work_reaches_the_whole_worker_counters() -> None:

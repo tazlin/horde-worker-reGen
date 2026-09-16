@@ -48,6 +48,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeVaeEncodeResultMessage,
     ModelLoadState,
 )
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
 from horde_worker_regen.process_management.jobs.failure_classification import is_resource_failure
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import InferenceFailureResolution, JobTracker
@@ -70,7 +71,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     ResolutionBucket,
     plausible_activation_ceiling_mb,
 )
-from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
+from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW, WorkloadKind
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.telemetry_spans import (
     inference_duration_histogram,
@@ -223,6 +224,8 @@ class MessageDispatcher:
     _on_inference_step: Callable[[int], None] | None = None
     """Invoked as ``(process_id)`` on each INFERENCE_STEP heartbeat, so the parent's per-step floor can grade
     the slot's sampling pace. Registered by the parent; None leaves the detector idle (standalone tests)."""
+    _event_sink: WorkerEventSink | None = None
+    """Where a model becoming resident is recorded on the worker event ring; None records nothing."""
     _on_stage_result: Callable[[HordeProcessMessage], Awaitable[None]] | None = None
     """Invoked with a disaggregated-stage result (text-encode/sample/vae-encode/vae-decode), registered
     by the parent's disaggregation orchestrator; it dispatches by concrete message type."""
@@ -493,6 +496,10 @@ class MessageDispatcher:
         Lets the parent's per-step floor grade a slot's sampling pace beat by beat, off the child hot path.
         """
         self._on_inference_step = handler
+
+    def set_event_sink(self, sink: WorkerEventSink) -> None:
+        """Register the sink a completed preload is recorded on (the worker event ring)."""
+        self._event_sink = sink
 
     def set_footprint_store(self, store: LearnedFootprintStore) -> None:
         """Register the learned-footprint store to observe measured device footprints into (shadow-only).
@@ -1498,6 +1505,16 @@ class MessageDispatcher:
                 self._on_model_load_failure(message.process_id, message.horde_model_name)
             return
 
+        # Read before the map is updated: a child reports LOADED_IN_VRAM both when a preload finishes and
+        # after every job it runs on those weights, so "the model was loading on this slot" is the only
+        # thing that distinguishes a load completing from a slot restating what it still holds.
+        previous_entry = self._horde_model_map.root.get(message.horde_model_name)
+        was_loading_here = (
+            previous_entry is not None
+            and previous_entry.horde_model_load_state == ModelLoadState.LOADING
+            and previous_entry.process_id == message.process_id
+        )
+
         self._horde_model_map.update_entry(
             horde_model_name=message.horde_model_name,
             load_state=message.horde_model_state,
@@ -1521,6 +1538,14 @@ class MessageDispatcher:
                 message.horde_model_state == ModelLoadState.LOADED_IN_VRAM
                 or message.horde_model_state == ModelLoadState.LOADED_IN_RAM
             ):
+                if was_loading_here and self._event_sink is not None:
+                    self._event_sink(
+                        WorkerEventKind.PRELOAD_READY,
+                        workload=WorkloadKind.IMAGE_GENERATION,
+                        model=message.horde_model_name,
+                        duration_seconds=message.time_elapsed,
+                        process_id=message.process_id,
+                    )
                 if message.horde_model_state == ModelLoadState.LOADED_IN_VRAM:
                     if message.vram_unload_refused:
                         # Nothing materialized here: this is the same tenancy an unload failed to remove, so

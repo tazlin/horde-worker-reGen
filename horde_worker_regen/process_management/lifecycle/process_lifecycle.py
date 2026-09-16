@@ -42,6 +42,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeHeartbeatType,
     HordeProcessState,
 )
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import read_last_startup_crash
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
@@ -769,6 +770,8 @@ class ProcessLifecycleManager:
         self._hung_processes_detected_time = 0.0
         self._any_replaced = False
         self._on_process_recovery: Callable[[HordeProcessInfo, str], None] | None = None
+        # Where a recovered process lands on the worker event ring; None (standalone tests) records nothing.
+        self._event_sink: WorkerEventSink | None = None
         self._download_process_info = None
         self._slot_recovery_history = {}
         self._slot_consecutive_start_failures = {}
@@ -853,6 +856,38 @@ class ProcessLifecycleManager:
         Used by the run-metrics aggregator to record crash/hang events.
         """
         self._on_process_recovery = observer
+
+    def set_event_sink(self, sink: WorkerEventSink) -> None:
+        """Register the sink a recovered process is recorded on (the worker event ring)."""
+        self._event_sink = sink
+
+    def _count_process_recovery(
+        self,
+        *,
+        reason: str | None,
+        process_id: int | None = None,
+        device_index: int | None = None,
+    ) -> None:
+        """Count one recovered process and record it on the event ring.
+
+        The single place the recovery count rises, so a surface reading the ring and one reading the count
+        cannot disagree about how much a session has recovered. A service lane rebuilt as a whole has
+        neither a slot id nor a reason of its own, and passes None for both rather than a manufactured one.
+
+        Args:
+            reason: Why the process was replaced, or None where the site has no reason to give.
+            process_id: The worker's own id for the replaced slot, or None for a whole-lane rebuild.
+            device_index: The card the slot was pinned to, where the site knows it.
+        """
+        self._num_process_recoveries += 1
+        if self._event_sink is None:
+            return
+        self._event_sink(
+            WorkerEventKind.PROCESS_RECOVERED,
+            process_id=process_id,
+            device_index=device_index,
+            detail=reason,
+        )
 
     def _notify_process_recovery(self, process_info: HordeProcessInfo, reason: str) -> None:
         if self._on_process_recovery is None:
@@ -1537,7 +1572,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._post_process_replacement_intentional = False
             else:
-                self._num_process_recoveries += 1
+                self._count_process_recovery(reason=None)
 
     @property
     def post_process_processes_should_be_replaced(self) -> bool:
@@ -1775,7 +1810,7 @@ class ProcessLifecycleManager:
                 # commit-charge reset is not read as a crash loop.
                 self._utilities_replacement_intentional = False
             else:
-                self._num_process_recoveries += 1
+                self._count_process_recovery(reason=None)
 
     @property
     def utilities_processes_should_be_replaced(self) -> bool:
@@ -1938,7 +1973,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._component_lane_replacement_intentional = False
             else:
-                self._num_process_recoveries += 1
+                self._count_process_recovery(reason=None)
 
     def component_lane_enabled(self) -> bool:
         """Whether the dedicated component (text-encode) lane should run (public view of the config gate)."""
@@ -2152,7 +2187,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._vae_lane_replacement_intentional = False
             else:
-                self._num_process_recoveries += 1
+                self._count_process_recovery(reason=None)
 
     @property
     def vae_lane_processes_should_be_replaced(self) -> bool:
@@ -3482,7 +3517,7 @@ class ProcessLifecycleManager:
             else:
                 self._safety_replacement_intentional = False
                 self._safety_replacement_intentional_until_ready = False
-                self._num_process_recoveries += 1
+                self._count_process_recovery(reason=None)
                 self._record_safety_recovery()
 
     def _safety_replacement_is_suppressed(self) -> bool:
@@ -4217,7 +4252,11 @@ class ProcessLifecycleManager:
         self._notify_process_recovery(process_info, recovery_reason)
 
         self._end_inference_process(process_info, join_deadline=end_join_deadline)
-        self._num_process_recoveries += 1
+        self._count_process_recovery(
+            reason=recovery_reason,
+            process_id=process_info.process_id,
+            device_index=process_info.device_index,
+        )
 
         if will_quarantine:
             self._quarantine_inference_slot(process_info, quarantine_reason)

@@ -16,6 +16,7 @@ from horde_worker_regen.process_management.config.worker_state import (
 )
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -811,6 +812,49 @@ def test_crash_replacement_still_counts_as_a_recovery() -> None:
 
     assert plm._num_process_recoveries == 1
     assert len(plm._slot_recovery_history.get(1, [])) == 1
+
+
+def test_a_crash_replacement_reaches_the_event_ring_with_its_slot_and_reason() -> None:
+    """The count and the event come from one place, so a dashboard's feed and its total cannot disagree.
+
+    The inference site is the one that knows which slot on which card was replaced and why, and all three
+    ride the event; a whole service lane rebuilt elsewhere has none of them and says so with None.
+    """
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+    recorded: list[tuple[WorkerEventKind, dict[str, object]]] = []
+    plm.set_event_sink(lambda kind, **fields: recorded.append((kind, fields)))
+
+    crashed = make_mock_process_info(1, model_name=None, state=HordeProcessState.INFERENCE_STARTING)
+    plm._process_map[1] = crashed
+
+    plm._replace_inference_process(crashed)
+
+    assert plm._num_process_recoveries == 1
+    assert len(recorded) == 1
+    kind, fields = recorded[0]
+    assert kind is WorkerEventKind.PROCESS_RECOVERED
+    assert (fields["process_id"], fields["device_index"]) == (1, 0)
+    assert fields["detail"], "the site's own recovery reason rides the event"
+
+
+def test_an_intentional_replacement_reaches_neither_the_count_nor_the_ring() -> None:
+    """A deliberate pool reload is not a recovery, so it must not appear as one in either place."""
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+    plm._action_ledger = Mock()
+    recorded: list[WorkerEventKind] = []
+    plm.set_event_sink(lambda kind, **_fields: recorded.append(kind))
+
+    healthy = make_mock_process_info(1, model_name="stable_diffusion", state=HordeProcessState.WAITING_FOR_JOB)
+    plm._process_map[1] = healthy
+
+    plm._replace_inference_process(healthy, intentional_reason="maintenance-mode pool reload")
+
+    assert plm._num_process_recoveries == 0
+    assert recorded == []
 
 
 def test_get_processes_with_model_for_queued_job_empty() -> None:

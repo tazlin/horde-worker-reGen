@@ -10,6 +10,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
     TextBackendDetail,
     WorkerConfigSummary,
+    WorkerEvent,
+    WorkerEventKind,
     WorkerStateSnapshot,
     WorkLedgerEntry,
     WorkLedgerProgressUnit,
@@ -145,6 +147,23 @@ def _snapshot() -> WorkerStateSnapshot:
                 model="AlbedoBase XL",
             ),
         ],
+        recent_events=[
+            WorkerEvent(
+                sequence=4,
+                kind=WorkerEventKind.JOB_POPPED,
+                workload=WorkloadKind.IMAGE_GENERATION,
+                model="AlbedoBase XL",
+                job_id="active-job-id",
+                timestamp=180.0,
+            ),
+            WorkerEvent(
+                sequence=5,
+                kind=WorkerEventKind.PRELOAD_READY,
+                workload=WorkloadKind.IMAGE_GENERATION,
+                model="AlbedoBase XL",
+                timestamp=190.0,
+            ),
+        ],
     )
 
 
@@ -170,6 +189,34 @@ def test_state_projection_is_small_and_preserves_high_level_facts() -> None:
     assert "processes" not in payload
     assert "recent_jobs" not in payload
     assert "work_ledger" not in payload
+    # The ring is the exception among the snapshot's own collections: the page shows what just happened,
+    # so its events are projected (as sentences and ages) rather than withheld.
+    assert "recent_events" in payload
+
+
+def test_the_recent_section_projects_the_ring_newest_first_with_its_own_sentences() -> None:
+    """The page shows the worker's transitions in the wording the terminal feed uses.
+
+    Newest first because a reader arriving at the page wants what just happened, and the sentence comes
+    from the projection so the two surfaces cannot word one transition differently. A kind the feed does
+    not say (a pop) is not a row here either.
+    """
+    state = build_native_dashboard_state(_NativeSupervisorDouble(_snapshot()))
+
+    assert [event.kind for event in state.recent_events] == ["preload_ready"]
+    event = state.recent_events[0]
+    assert event.sequence == 5
+    assert event.sentence == "AlbedoBase XL is ready to serve"
+    assert event.model == "AlbedoBase XL"
+    assert event.age_seconds == 10.0
+
+
+def test_a_worker_with_no_transitions_yet_projects_no_recent_rows() -> None:
+    """The section is empty rather than absent, so the page's markup is the same either way."""
+    snapshot = _snapshot()
+    snapshot.recent_events = []
+
+    assert build_native_dashboard_state(_NativeSupervisorDouble(snapshot)).recent_events == []
 
 
 def test_state_projection_handles_an_attached_host_without_a_snapshot() -> None:
@@ -431,3 +478,15 @@ def test_the_native_page_renders_the_text_section_and_the_row_units() -> None:
     assert "state.text_in_flight" in page
     assert "job.progress_unit" in page
     assert "text_generation" in page
+
+
+def test_the_native_page_renders_the_recent_section() -> None:
+    """The Recent rows need their own container and renderer in the markup, or the ring shows nowhere."""
+    page = load_native_dashboard_html()
+
+    assert 'id="recent-section"' in page
+    assert 'id="recent-events"' in page
+    assert 'id="recent-event-count"' in page
+    assert "renderRecentEvents(state)" in page
+    assert "event.sentence" in page
+    assert "event.age_seconds" in page

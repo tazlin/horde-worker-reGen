@@ -35,6 +35,7 @@ from horde_sdk.ai_horde_api.consts import RC
 from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs import text_generation_coordinator
 from horde_worker_regen.process_management.jobs.text_generation_coordinator import (
     FAULTED_GENERATION_TEXT,
@@ -766,6 +767,75 @@ async def _drain_job_tasks(coordinator: TextGenerationCoordinator) -> None:
     tasks = set(coordinator._job_tasks)
     if tasks:
         await asyncio.wait(tasks, timeout=10.0)
+
+
+async def test_a_popped_generation_reaches_the_event_ring() -> None:
+    """The ring's pop entries are what the operator surfaces show as intake; one per generation taken."""
+    run_metrics = WorkerRunMetrics()
+    coordinator, _backend, _session = _make_coordinator(
+        session=_FakeHordeClientSession(pop_responses=[_pop_response(job_id=_job_id())]),
+        run_metrics=run_metrics,
+    )
+    assert await coordinator.await_backend_ready() is True
+
+    await coordinator.api_text_pop()
+    await _drain_job_tasks(coordinator)
+
+    advertisement = coordinator.advertisement
+    assert advertisement is not None
+    popped = [event for event in run_metrics.recent_events() if event.kind is WorkerEventKind.JOB_POPPED]
+    assert len(popped) == 1
+    assert popped[0].workload is WorkloadKind.TEXT_GENERATION
+    assert popped[0].model == advertisement.model_name, "the ring names the model the worker advertised"
+
+
+async def test_a_maintenance_hold_and_its_lifting_are_each_recorded_once() -> None:
+    """The horde refuses every pop while a worker is in maintenance, so only the edges are events.
+
+    The same kind the image popper records, because it is the same horde-side flag seen from this flow's
+    own pops; a second kind would make a dashboard decide which of two names meant maintenance.
+    """
+    run_metrics = WorkerRunMetrics()
+    coordinator, _backend, _session = _make_coordinator(run_metrics=run_metrics)
+    assert await coordinator.await_backend_ready() is True
+    refusal = RequestErrorResponse(rc=RC.WorkerMaintenance, message="owner-only traffic")
+
+    coordinator._handle_pop_error_response(refusal)
+    coordinator._handle_pop_error_response(refusal)
+    coordinator._last_pop_time = 0.0
+    coordinator._pop_hold_until = 0.0
+    await coordinator.api_text_pop()
+
+    maintenance = [
+        event.kind
+        for event in run_metrics.recent_events()
+        if event.kind in (WorkerEventKind.MAINTENANCE_ON, WorkerEventKind.MAINTENANCE_OFF)
+    ]
+    assert maintenance == [WorkerEventKind.MAINTENANCE_ON, WorkerEventKind.MAINTENANCE_OFF]
+
+
+async def test_an_error_backoff_spell_is_one_entry_and_one_exit() -> None:
+    """A run of failed pops is one posture, and the pop that goes out afterwards ends it.
+
+    An event per failed pop would fill the ring with the same fact and evict everything that explains it.
+    """
+    run_metrics = WorkerRunMetrics()
+    coordinator, _backend, _session = _make_coordinator(run_metrics=run_metrics)
+    assert await coordinator.await_backend_ready() is True
+
+    coordinator._enter_pop_error_backoff()
+    coordinator._enter_pop_error_backoff()
+    coordinator._enter_pop_error_backoff()
+    assert [event.kind for event in run_metrics.recent_events()] == [WorkerEventKind.POP_BACKOFF_ENTERED]
+
+    coordinator._last_pop_time = 0.0
+    coordinator._pop_hold_until = 0.0
+    await coordinator.api_text_pop()
+
+    assert [event.kind for event in run_metrics.recent_events()] == [
+        WorkerEventKind.POP_BACKOFF_ENTERED,
+        WorkerEventKind.POP_BACKOFF_LEFT,
+    ]
 
 
 async def test_a_maintenance_refusal_is_announced_once_and_resumption_once() -> None:

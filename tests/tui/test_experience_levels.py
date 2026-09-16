@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from textual.app import App, ComposeResult
 from textual.widgets import Collapsible, TabbedContent, TabPane
 
 from horde_worker_regen.app_state import (
@@ -25,10 +26,19 @@ from horde_worker_regen.app_state import (
     WorkerAppState,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    TEXT_BACKEND_PROCESS_ID,
+    CurrentDownloadStatus,
+    DownloadPhase,
+    DownloadStatusSnapshot,
+    ProcessSnapshot,
     RecentJobRecord,
     StatsHistoryBackfill,
     StatsSample,
+    TextBackendDetail,
     WorkerConfigSummary,
+    WorkerEvent,
+    WorkerEventKind,
+    WorkerEventPayload,
     WorkerStateSnapshot,
     WorkLedgerEntry,
     WorkLedgerProgressUnit,
@@ -55,6 +65,7 @@ from horde_worker_regen.tui.widgets.simple import (
     TabPrimer,
     _identity_words,
     _offer_words,
+    _posture_words,
     _text_posture_words,
     _text_request_progress,
     job_progress_fraction,
@@ -773,6 +784,36 @@ def test_home_restores_worker_owned_trends_after_a_frontend_reconnect() -> None:
     assert home._trend_epoch == 100.0
 
 
+def _finished_event(
+    sequence: int,
+    *,
+    workload: WorkloadKind = WorkloadKind.IMAGE_GENERATION,
+    model: str | None = None,
+    duration: float | None = None,
+    kudos: float | None = None,
+    tokens: int | None = None,
+    faulted: bool = False,
+) -> WorkerEvent:
+    """Create the ring entry a finished (or faulted) request produces, as run metrics records it."""
+    return WorkerEvent(
+        sequence=sequence,
+        kind=WorkerEventKind.JOB_FAULTED if faulted else WorkerEventKind.JOB_FINISHED,
+        workload=workload,
+        model=model,
+        duration_seconds=duration,
+        kudos=kudos,
+        payload=WorkerEventPayload(count=tokens),
+    )
+
+
+def _events_snapshot(*events: WorkerEvent) -> WorkerStateSnapshot:
+    """Create a snapshot carrying exactly ``events`` on its ring."""
+    return WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+        recent_events=list(events),
+    )
+
+
 def test_the_ticker_says_which_model_earned_what() -> None:
     """A finished-request line names the model and the kudos the horde paid for it.
 
@@ -781,18 +822,10 @@ def test_the_ticker_says_which_model_earned_what() -> None:
     """
     home = SimpleHomeView()
     home._record_events(
-        WorkerStateSnapshot(
-            config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
-            recent_jobs=[
-                RecentJobRecord(job_id="a", model_name="Deliberate", e2e_seconds=24.0, kudos_reward=8.25),
-                RecentJobRecord(
-                    job_id="b",
-                    workload=WorkloadKind.ALCHEMY.value,
-                    model_name="strip_background",
-                    e2e_seconds=2.0,
-                ),
-                RecentJobRecord(job_id="c", model_name="Deliberate", faulted=True, e2e_seconds=5.0, kudos_reward=None),
-            ],
+        _events_snapshot(
+            _finished_event(1, model="Deliberate", duration=24.0, kudos=8.25),
+            _finished_event(2, workload=WorkloadKind.ALCHEMY, model="strip_background", duration=2.0),
+            _finished_event(3, model="Deliberate", duration=5.0, faulted=True),
         ),
     )
 
@@ -801,6 +834,117 @@ def test_the_ticker_says_which_model_earned_what() -> None:
     # An unpaid reward is simply absent: alchemy here has no figure, and a faulted request never earns one.
     assert lines[1] == "Finished an alchemy request with strip_background in 2s"
     assert "kudos" not in lines[2]
+
+
+def test_the_feed_says_what_the_worker_did_besides_finishing_requests() -> None:
+    """Each transition the ring carries gets one plain sentence, from the event's own numbers.
+
+    A feed of finished requests alone leaves a contributor with nothing to read while the worker loads a
+    model, obtains a backend or recovers a process, which is exactly when they are watching it.
+    """
+    home = SimpleHomeView()
+    home._record_events(
+        _events_snapshot(
+            WorkerEvent(sequence=1, kind=WorkerEventKind.PRELOAD_STARTED, model="Deliberate"),
+            WorkerEvent(sequence=2, kind=WorkerEventKind.PRELOAD_READY, model="Deliberate"),
+            WorkerEvent(sequence=3, kind=WorkerEventKind.BACKEND_READY, duration_seconds=18.4),
+            WorkerEvent(
+                sequence=4,
+                kind=WorkerEventKind.BACKEND_RELAUNCHED,
+                payload=WorkerEventPayload(count=3),
+            ),
+            WorkerEvent(
+                sequence=5,
+                kind=WorkerEventKind.PROCESS_RECOVERED,
+                payload=WorkerEventPayload(process_id=2, device_index=1),
+            ),
+            WorkerEvent(sequence=6, kind=WorkerEventKind.DOWNLOAD_FINISHED, model="Deliberate"),
+        ),
+    )
+
+    assert list(home._ticker) == [
+        "Started loading Deliberate",
+        "Deliberate is ready to serve",
+        "Text backend ready after 18 s",
+        "Text backend restarted (launch 3)",
+        "Recovered the inference process on GPU 1",
+        "Finished downloading Deliberate",
+    ]
+
+
+def test_the_feed_says_who_held_the_requests_back_and_when_they_returned() -> None:
+    """A local pause and the horde's maintenance both stop work, and must not be read as each other.
+
+    The horde refuses a flow's pops and the event carries that flow; the operator's pause is worker-wide
+    and carries none, which is what separates "they stopped sending" from "you stopped asking".
+    """
+    home = SimpleHomeView()
+    home._record_events(
+        _events_snapshot(
+            WorkerEvent(
+                sequence=1,
+                kind=WorkerEventKind.MAINTENANCE_ON,
+                workload=WorkloadKind.IMAGE_GENERATION,
+            ),
+            WorkerEvent(
+                sequence=2,
+                kind=WorkerEventKind.MAINTENANCE_OFF,
+                workload=WorkloadKind.IMAGE_GENERATION,
+            ),
+            WorkerEvent(sequence=3, kind=WorkerEventKind.MAINTENANCE_ON),
+            WorkerEvent(sequence=4, kind=WorkerEventKind.MAINTENANCE_OFF),
+            WorkerEvent(sequence=5, kind=WorkerEventKind.POP_BACKOFF_ENTERED),
+            WorkerEvent(sequence=6, kind=WorkerEventKind.POP_BACKOFF_LEFT),
+        ),
+    )
+
+    assert list(home._ticker) == [
+        "The horde is holding requests back (maintenance)",
+        "Requests are flowing again",
+        "Paused on this computer, so no new requests are being taken",
+        "Resumed on this computer; requests are flowing again",
+        "Backing off from the horde after errors",
+        "Back to normal polling",
+    ]
+
+
+def test_the_feed_leaves_pops_and_first_launches_unsaid() -> None:
+    """One line per accepted request would crowd out every kind that explains the session.
+
+    Both kinds stay on the ring for the operator surfaces; this is about what the six-line feed spends its
+    lines on.
+    """
+    home = SimpleHomeView()
+    home._record_events(
+        _events_snapshot(
+            WorkerEvent(sequence=1, kind=WorkerEventKind.JOB_POPPED, model="Deliberate", job_id="job-1"),
+            WorkerEvent(sequence=2, kind=WorkerEventKind.BACKEND_LAUNCHED, payload=WorkerEventPayload(count=1)),
+            WorkerEvent(sequence=3, kind=WorkerEventKind.PRELOAD_READY, model="Deliberate"),
+        ),
+    )
+
+    assert list(home._ticker) == ["Deliberate is ready to serve"]
+
+
+def test_the_feed_shows_each_event_once_across_snapshots_and_survives_a_gap() -> None:
+    """The ring rides every snapshot, so a feed that did not dedupe would repeat it every second.
+
+    A frontend away longer than the ring's bound comes back to events it never saw and a lowest sequence
+    above what it has shown; it shows what arrived rather than inventing the ones that were evicted.
+    """
+    home = SimpleHomeView()
+    first = _finished_event(7, model="Deliberate", duration=3.0)
+    second = _finished_event(8, model="Deliberate", duration=4.0)
+
+    home._record_events(_events_snapshot(first, second))
+    home._record_events(_events_snapshot(first, second))
+
+    assert len(home._ticker) == 2
+    assert home._highest_event_sequence == 8
+
+    home._record_events(_events_snapshot(_finished_event(64, model="Deliberate", duration=5.0)))
+
+    assert len(home._ticker) == 3, "an event above the highest shown is new, whatever was missed before it"
 
 
 def test_the_home_trend_survives_having_no_history_yet() -> None:
@@ -1027,30 +1171,193 @@ def test_the_ticker_names_the_model_and_the_token_count_of_a_text_request() -> N
     """A text request has no resolution or step count, so the tokens are the only size it can state."""
     home = SimpleHomeView()
     home._record_events(
-        WorkerStateSnapshot(
-            config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
-            recent_jobs=[
-                RecentJobRecord(
-                    job_id="a",
-                    workload=WorkloadKind.TEXT_GENERATION,
-                    model_name="koboldcpp/Llama-3.2-3B",
-                    generated_tokens=160,
-                    e2e_seconds=2.0,
-                    kudos_reward=4.0,
-                ),
-                RecentJobRecord(
-                    job_id="b",
-                    workload=WorkloadKind.TEXT_GENERATION,
-                    model_name="koboldcpp/Llama-3.2-3B",
-                    e2e_seconds=2.0,
-                ),
-            ],
+        _events_snapshot(
+            _finished_event(
+                1,
+                workload=WorkloadKind.TEXT_GENERATION,
+                model="koboldcpp/Llama-3.2-3B",
+                tokens=160,
+                duration=2.0,
+                kudos=4.0,
+            ),
+            _finished_event(
+                2,
+                workload=WorkloadKind.TEXT_GENERATION,
+                model="koboldcpp/Llama-3.2-3B",
+                duration=2.0,
+            ),
         ),
     )
 
     lines = list(home._ticker)
     assert lines[0] == "Finished a text request with koboldcpp/Llama-3.2-3B, 160 tokens in 2s (+4.0 kudos)"
     assert lines[1] == "Finished a text request with koboldcpp/Llama-3.2-3B in 2s", "no count is left unsaid"
+
+
+def test_the_idle_sentence_explains_every_workload_the_worker_serves() -> None:
+    """A worker idle on two flows is idle for two reasons, and one sentence can only give one of them."""
+    home = SimpleHomeView()
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(
+            dreamer_name="TestWorker",
+            worker_version="0.0.0",
+            dreamer=True,
+            scribe=True,
+            scribe_name="TestScribe",
+        ),
+        text_backend_ready=True,
+    )
+
+    detail = home._idle_detail(snapshot)
+
+    assert "No image requests are waiting for your models." in detail
+    assert "No text requests are waiting for your model." in detail
+
+
+def test_a_download_the_worker_is_waiting_for_is_named() -> None:
+    """A phase word alone says nothing for an hour; the file in flight is what a contributor can act on."""
+    home = SimpleHomeView()
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0", dreamer=True),
+        downloads=DownloadStatusSnapshot(
+            phase=DownloadPhase.DOWNLOADING,
+            current=CurrentDownloadStatus(model_name="Deliberate", feature="image", target_dir="models"),
+        ),
+    )
+
+    assert home._idle_detail(snapshot) == "Waiting for the download of Deliberate."
+
+
+def test_a_starting_text_backend_is_only_given_a_number_once_one_has_been_measured() -> None:
+    """The estimate is the last launch's own duration, which the feed learns from the readiness event.
+
+    Before a launch has completed there is nothing to estimate from, and a guessed number would be read as
+    a promise the worker never made.
+    """
+    home = SimpleHomeView()
+    config = WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0", dreamer=False, scribe=True)
+    snapshot = WorkerStateSnapshot(config=config)
+
+    assert home._idle_detail(snapshot) == "The text backend is starting."
+
+    home._record_events(
+        WorkerStateSnapshot(
+            config=config,
+            recent_events=[WorkerEvent(sequence=1, kind=WorkerEventKind.BACKEND_READY, duration_seconds=18.4)],
+        ),
+    )
+
+    assert home._idle_detail(snapshot) == "The text backend is starting, ready in about 18 s."
+
+
+def test_maintenance_explains_the_whole_worker_rather_than_each_flow() -> None:
+    """Maintenance holds every flow's pops, so saying it once per workload would only repeat itself."""
+    home = SimpleHomeView()
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(
+            dreamer_name="TestWorker",
+            worker_version="0.0.0",
+            dreamer=True,
+            scribe=True,
+        ),
+        maintenance_mode=True,
+    )
+
+    assert home._idle_detail(snapshot) == "Maintenance is holding requests back."
+
+
+def test_the_posture_line_states_contact_the_last_pop_and_what_is_loaded() -> None:
+    """These three separate "nothing to do" from "not asking" and from "nothing loaded to serve with".
+
+    Unconditional, so a contributor can check a healthy worker against it rather than only meeting it when
+    something has gone wrong.
+    """
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(
+            dreamer_name="TestWorker",
+            worker_version="0.0.0",
+            dreamer=True,
+            scribe=True,
+            num_models=3,
+        ),
+        seconds_since_last_pop=12.0,
+        processes=[
+            ProcessSnapshot(
+                process_id=0,
+                process_type="inference",
+                last_process_state="waiting_for_job",
+                is_alive=True,
+                is_busy=False,
+                loaded_horde_model_name="Deliberate",
+            ),
+            ProcessSnapshot(
+                process_id=TEXT_BACKEND_PROCESS_ID,
+                process_type="text_backend",
+                last_process_state="serving",
+                is_alive=True,
+                is_busy=False,
+                is_external=True,
+                display_state="serving",
+                text_backend=TextBackendDetail(kind="koboldcpp"),
+            ),
+        ],
+    )
+
+    line = _posture_words(snapshot, connected=True)
+
+    assert (
+        line
+        == "In contact with the worker · last asked the horde 12s ago · 1 of 3 models loaded · text backend serving"
+    )
+
+
+def test_the_posture_line_says_when_the_worker_has_not_been_asked_or_reached() -> None:
+    """A dashboard that lost its channel, and a worker that has never popped, both have to say so."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0", dreamer=False),
+    )
+
+    assert _posture_words(snapshot, connected=False).startswith("Not in contact with the worker")
+    assert "never asked yet" in _posture_words(snapshot, connected=False)
+    assert _posture_words(None, connected=False) == "Not in contact with the worker"
+
+
+class _SimpleHomeHarness(App[None]):
+    """Mount a SimpleHomeView alone so one frame of its own rendering can be read."""
+
+    def compose(self) -> ComposeResult:
+        """Lay out the home view under test."""
+        yield SimpleHomeView()
+
+
+async def test_the_home_screen_shows_the_posture_line_the_feed_and_the_idle_sentence() -> None:
+    """The three additions have to reach the rendered screen, not only the helpers that build them."""
+    app = _SimpleHomeHarness()
+    report = HealthReport(
+        phase=WorkerPhase.IDLE,
+        severity=HealthStatus.OK,
+        headline="Idle",
+        detail="",
+        checks=[],
+        animated=False,
+    )
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0", dreamer=True, num_models=2),
+        seconds_since_last_pop=9.0,
+        recent_events=[_finished_event(1, model="Deliberate", duration=7.0, kudos=3.0)],
+    )
+
+    async with app.run_test(size=(120, 50)) as pilot:
+        view = app.query_one(SimpleHomeView)
+        view.update_view(report, snapshot, is_alive=True, connected=True)
+        await pilot.pause()
+        rendered = _screen_text(app)
+
+    assert "In contact with the worker" in rendered
+    assert "last asked the horde 9s ago" in rendered
+    assert "0 of 2 models loaded" in rendered
+    assert "No image requests are waiting for your models." in rendered
+    assert "Finished an image request with Deliberate in 7s (+3.0 kudos)" in rendered
 
 
 def test_the_attention_card_rewords_the_two_text_findings() -> None:
