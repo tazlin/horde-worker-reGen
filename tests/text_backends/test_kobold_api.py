@@ -538,6 +538,40 @@ async def test_statistics_samples_reach_the_callback_with_token_counts_and_a_rat
     assert behaviour.perf_request_count == 0, "a backend that counted the tokens is not asked again"
 
 
+def test_a_rate_is_measured_between_counted_samples_when_the_backend_reports_no_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backend that stores its timings only at finish answers zero seconds live; the count growth still rates it."""
+    clock = {"now": 100.0}
+    monkeypatch.setattr(kobold_api.time, "monotonic", lambda: clock["now"])
+    generation = kobold_api._StreamedGeneration(started_at=clock["now"])
+
+    def sample(completion_tokens: int) -> kobold_api._KoboldGenerationStats:
+        return kobold_api._KoboldGenerationStats.model_validate(
+            {
+                KoboldApiJsonKeys.FOUND: True,
+                KoboldApiJsonKeys.PROMPT_TOKENS: 0,
+                KoboldApiJsonKeys.COMPLETION_TOKENS: completion_tokens,
+                KoboldApiJsonKeys.GENERATION_SECONDS: 0.0,
+            },
+        )
+
+    generation.note_stats(sample(10))
+    assert generation.snapshot().tokens_per_second is None, "one sample is a count, not a rate"
+
+    clock["now"] = 100.5
+    generation.note_stats(sample(60))
+    assert generation.snapshot().tokens_per_second == pytest.approx(100.0)
+
+    clock["now"] = 101.0
+    generation.note_stats(sample(60))
+    assert generation.snapshot().tokens_per_second == pytest.approx(100.0), "no growth keeps the last rate"
+
+    clock["now"] = 102.0
+    generation.note_stats(sample(80))
+    assert generation.snapshot().tokens_per_second == pytest.approx(20.0)
+
+
 async def test_a_backend_without_statistics_is_asked_once_and_reports_no_counts() -> None:
     """A stock build has no statistics route, and a rate guessed from characters would be a lie."""
     behaviour = _KoboldBackendBehaviour(stats_route_present=False)

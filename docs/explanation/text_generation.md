@@ -120,7 +120,8 @@ tells a slow generation from a backend that has wedged.
 of tokens (fifty-five records carried a hundred and sixty tokens on a measured run), so nothing about
 how many tokens have been produced can be worked out from the text. A backend built with the worker's
 per-request statistics patch answers a route that says so, and a job on such a backend carries real
-token counts and a real rate. A stock build has no such route, the worker asks once and then stops
+token counts and a real rate: the backend's own generation timing where it reports one live, else the
+growth in its token count between two samples over the time between them. A stock build has no such route, the worker asks once and then stops
 asking, and the counts stay unknown rather than being guessed at from the characters. Either way the
 finished job's counts come from what the backend itself reported: the statistics route where there is
 one, the backend's own last-generation counters otherwise.

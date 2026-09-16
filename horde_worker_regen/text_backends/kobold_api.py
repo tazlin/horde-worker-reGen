@@ -325,6 +325,8 @@ class _StreamedGeneration:
         self._prompt_tokens: int | None = None
         self._completion_tokens: int | None = None
         self._tokens_per_second: float | None = None
+        self._last_counted_sample: tuple[float, int] | None = None
+        """When the last sample that carried a generated-token count arrived, and that count."""
 
     @property
     def text(self) -> str:
@@ -375,10 +377,20 @@ class _StreamedGeneration:
         if completion_tokens is None:
             return
         self._completion_tokens = completion_tokens
-        # The backend's own generation seconds, never the worker's elapsed time: elapsed covers queueing
-        # and prompt processing, so dividing by it would report a rate the backend never ran at.
+        sampled_at = time.monotonic()
+        # The backend's own generation seconds first, never the worker's elapsed time since the request:
+        # elapsed covers queueing and prompt processing, so dividing by it would report a rate the backend
+        # never ran at. A backend that counts tokens live but only stores its timings at finish reports
+        # zero seconds throughout; there the growth between two counted samples over the wall clock
+        # between them is generation time alone, so it is the rate the backend is running at.
         if stats.generation_seconds is not None and stats.generation_seconds > 0:
             self._tokens_per_second = completion_tokens / stats.generation_seconds
+        elif self._last_counted_sample is not None:
+            previous_at, previous_count = self._last_counted_sample
+            grown = completion_tokens - previous_count
+            if grown > 0 and sampled_at > previous_at:
+                self._tokens_per_second = grown / (sampled_at - previous_at)
+        self._last_counted_sample = (sampled_at, completion_tokens)
 
     def snapshot(self) -> TextGenerationProgress:
         """Return what is known about this generation right now."""
