@@ -24,7 +24,20 @@ def ensure_offline_reference_manager() -> ModelReferenceManager:
 
     manager = ModelReferenceManager(offline=True, prefetch_strategy=PrefetchStrategy.NONE)
     _retry_transient_category_miss(manager)
+    _register_worker_providers(manager)
     return manager
+
+
+def _register_worker_providers(manager: ModelReferenceManager) -> None:
+    """Add the record sources the worker contributes to *manager*, so every context reads the same models.
+
+    The worker's measured text models are records the canonical reference does not carry yet, and a name
+    one context can resolve while another cannot is a model the worker advertises and then cannot load.
+    Imported here rather than at module scope to keep this module's import cost to the reference package.
+    """
+    from horde_worker_regen.text_backends.model_catalogue import register_text_model_catalogue
+
+    register_text_model_catalogue(manager)
 
 
 def _retry_transient_category_miss(manager: ModelReferenceManager) -> None:
@@ -62,6 +75,8 @@ async def initialize_model_reference_manager() -> ModelReferenceManager:
     horde_model_reference_manager = ModelReferenceManager(
         prefetch_strategy=PrefetchStrategy.ASYNC,
     )
+
+    _register_worker_providers(horde_model_reference_manager)
 
     prefetch_handle = horde_model_reference_manager.deferred_prefetch_handle
 

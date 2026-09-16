@@ -340,13 +340,14 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.kai_url = "http://localhost:5000"
     bd.max_length = 80
     bd.max_context_length = 1024
+    bd.text_model = None
+    bd.text_models_dir = None
     bd.text_model_name = None
     bd.text_threads = 1
     bd.text_generation_timeout_seconds = None
     bd.text_stall_seconds = 30.0
     bd.text_backend_kind = TEXT_BACKENDS.koboldcpp
     bd.text_backend_managed = False
-    bd.text_model_path = None
     bd.text_backend_executable = None
     bd.text_backend_port = 5001
     bd.text_gpu_layers = 99

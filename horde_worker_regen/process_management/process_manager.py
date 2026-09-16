@@ -283,7 +283,12 @@ from horde_worker_regen.text_backends import (
     TextGenerationProgress,
     build_launch_spec,
 )
-from horde_worker_regen.text_backends.provision import provision_executable
+from horde_worker_regen.text_backends.model_catalogue import resolve_text_model, text_model_records
+from horde_worker_regen.text_backends.provision import (
+    TextBackendProvisionError,
+    ensure_text_model_file,
+    provision_executable,
+)
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers, mean_across_cards
@@ -2089,6 +2094,8 @@ class HordeWorkerProcessManager:
         self._text_coordinator: TextGenerationCoordinator | None = None
         self._text_backend_driver: TextBackend | None = None
         self._text_backend_supervisor: TextBackendSupervisor | None = None
+        self._text_model_canonical_name: str | None = None
+        """The advertised spelling of the managed backend's model, known once the model file is resolved."""
         if WorkloadKind.TEXT_GENERATION in enabled_workloads(bridge_data):
             text_coordinator = TextGenerationCoordinator(
                 state=self._state,
@@ -2112,6 +2119,9 @@ class HordeWorkerProcessManager:
                 # messages and the driver's requests cannot name different backends, and a hot-reloaded
                 # `kai_url` reaches both.
                 backend_address_provider=self._text_backend_address,
+                # The managed model's advertised spelling is known only once its file is resolved, which
+                # happens in the supervisor's provisioning step, so the flow reads it at readiness.
+                canonical_name_provider=self._managed_text_model_canonical_name,
             )
             self._text_coordinator = text_coordinator
             self._flows[WorkloadKind.TEXT_GENERATION] = text_coordinator
@@ -8589,13 +8599,12 @@ class HordeWorkerProcessManager:
         minutes a first-run download takes, instead of leaving the worker looking as though it has no
         backend; a backend that cannot be obtained at all is reported on that row by the supervisor.
         """
-        model_path = self.bridge_data.text_model_path
-        if model_path is None:
-            logger.error("The text backend is managed but `text_model_path` is unset; it will not be launched.")
+        if self.bridge_data.text_model is None:
+            logger.error("The text backend is managed but `text_model` is unset; it will not be launched.")
             return
         kind = self.bridge_data.text_backend_kind
         supervisor = TextBackendSupervisor(
-            launch_spec_factory=partial(self._render_text_backend_launch_spec, kind, model_path),
+            launch_spec_factory=partial(self._render_text_backend_launch_spec, kind),
             backend=self._text_backend_for(kind),
             backend_kind=kind,
             owned_registry=self._owned_registry,
@@ -8605,21 +8614,30 @@ class HordeWorkerProcessManager:
         self._text_backend_supervisor = supervisor
         await supervisor.run()
 
-    def _render_text_backend_launch_spec(self, kind: TEXT_BACKENDS, model_path: Path) -> TextBackendLaunchSpec:
-        """Obtain the managed backend's executable and render the command line that starts it.
+    def _render_text_backend_launch_spec(self, kind: TEXT_BACKENDS) -> TextBackendLaunchSpec:
+        """Obtain the managed backend's model file and executable, and render the command line that starts it.
 
-        Blocking: a first provision downloads a pinned release. The supervisor calls this in a thread, and
-        both failures it can raise are reported there, on the backend's own row.
+        Blocking: a first provision downloads a pinned release and, for a catalogued model, the model file.
+        The supervisor calls this in a thread, and every failure it can raise is reported there, on the
+        backend's own row. The model's advertised spelling is kept for the flow, which reads it once the
+        backend is ready.
 
         Args:
             kind: Which backend to obtain and render for.
-            model_path: The model artefact the backend is to load.
 
         Raises:
-            TextBackendProvisionError: The executable could not be obtained.
+            TextBackendProvisionError: The model file or the executable could not be obtained, or
+                `text_model` names neither a file nor a catalogued model.
             UnsupportedTextBackendError: The worker has no command line for ``kind``.
         """
         bridge_data = self.bridge_data
+        if bridge_data.text_model is None:
+            raise TextBackendProvisionError("`text_model` is unset")
+        manager = self.horde_model_reference_manager
+        records = text_model_records(manager) if manager is not None else {}
+        resolved = resolve_text_model(bridge_data.text_model, records, bridge_data.text_models_dir)
+        model_path = ensure_text_model_file(resolved)
+        self._text_model_canonical_name = resolved.canonical_name
         executable = bridge_data.text_backend_executable or provision_executable(kind)
         settings = TextBackendLaunchSettings(
             executable=executable,
@@ -8631,6 +8649,10 @@ class HordeWorkerProcessManager:
             log_path=logs_dir(create=True) / TEXT_BACKEND_LOG_FILE_NAME,
         )
         return build_launch_spec(kind, settings)
+
+    def _managed_text_model_canonical_name(self) -> str | None:
+        """Return the managed model's advertised spelling, or None before its file has been resolved."""
+        return self._text_model_canonical_name
 
     async def _stop_text_backend_supervisor(self) -> None:
         """Stop the managed text backend's process tree, if one was started."""

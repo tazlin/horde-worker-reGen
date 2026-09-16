@@ -479,11 +479,22 @@ max_context_length: 1024
 # Prevents the model from being used from the shared pool but ensures no other worker can pretend to serve it.
 branded_model: true
 
-# The text model to advertise, spelled as the text model reference spells it ("author/Model", with a
-# quantisation suffix if the file has one). Leave it unset to advertise whatever model the backend says
-# it has loaded, which is usually what you want. Give the plain name: the horde expects it prefixed with
-# the backend serving it, and the worker adds that prefix, so a name that already carries one would be
-# prefixed twice and match no work.
+# Which text model a worker-managed backend loads. Required when scribe and text_backend_managed are
+# both true. Either a catalogued model's name, spelled as the text model reference spells it, or the path
+# to a model file of your own (a GGUF for koboldcpp). A catalogued name is fetched into text_models_dir
+# once and checked against the digest the catalogue declares; a path is used where it sits.
+# text_model: "meta-llama/Meta-Llama-3.1-8B-Instruct-Q4_K_M"
+
+# Where model files the worker fetches are kept. Unset puts them in <AIWORKER_CACHE_HOME>/text_models.
+# A text_model that names a path is read where it sits and never copied here.
+# text_models_dir: "T:/horde-text-models"
+
+# Override the name this worker advertises for its text model, spelled as the text model reference spells
+# it ("author/Model", with a quantisation suffix if the file has one). A catalogued model already carries
+# that spelling, so this is for a file of your own whose name is not the one the horde knows, or for a
+# backend you run yourself that reports a name the horde does not recognise. Give the plain name: the
+# horde expects it prefixed with the backend serving it, and the worker adds that prefix, so a name that
+# already carries one would be prefixed twice and match no work.
 # text_model_name: "meta-llama/Llama-3.2-3B-Instruct"
 
 # How many text generations your backend can run at once. This is also how many text jobs the worker
@@ -508,14 +519,10 @@ text_stall_seconds: 30
 text_backend_kind: koboldcpp
 
 # Let the worker run the backend for you. It downloads a pinned release (unless text_backend_executable
-# points at a program of your own), starts it on text_backend_port with text_model_path, waits for it to
-# load, restarts it if it exits, and stops it when the worker stops. Set false to run the backend
-# yourself and have the worker attach to kai_url instead.
+# points at a program of your own), obtains the model named by text_model, starts the backend on
+# text_backend_port, waits for it to load, restarts it if it exits, and stops it when the worker stops.
+# Set false to run the backend yourself and have the worker attach to kai_url instead.
 text_backend_managed: true
-
-# The model file the managed backend loads (a GGUF for koboldcpp). Required when scribe and
-# text_backend_managed are both true.
-# text_model_path: "T:/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 
 # A backend program to launch instead of the one the worker provisions: your own build, a newer upstream
 # release, or a backend the worker cannot yet download. A .py path is a source checkout's entry script

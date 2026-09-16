@@ -45,7 +45,7 @@ def test_an_unset_or_undriven_text_card_changes_nothing() -> None:
 
 def test_a_managed_text_backend_requires_a_model_path() -> None:
     """A scribe that launches its own backend cannot start without a model, so the config is refused."""
-    with pytest.raises(ValueError, match="text_model_path"):
+    with pytest.raises(ValueError, match="text_model"):
         reGenBridgeData(api_key="0000000000", scribe=True)
 
 
@@ -53,13 +53,13 @@ def test_an_attached_text_backend_needs_no_model_path() -> None:
     """A scribe attaching to an operator-run backend leaves the model to that backend."""
     bridge_data = reGenBridgeData(api_key="0000000000", scribe=True, text_backend_managed=False)
 
-    assert bridge_data.text_model_path is None
+    assert bridge_data.text_model is None
     assert bridge_data.text_backend_kind is TEXT_BACKENDS.koboldcpp
 
 
 def test_a_managed_text_backend_with_a_model_path_is_accepted(tmp_path: Path) -> None:
     """The managed default is usable as soon as a model is named."""
-    bridge_data = reGenBridgeData(api_key="0000000000", scribe=True, text_model_path=tmp_path / "model.gguf")
+    bridge_data = reGenBridgeData(api_key="0000000000", scribe=True, text_model=str(tmp_path / "model.gguf"))
 
     assert bridge_data.text_backend_managed is True
     assert bridge_data.text_backend_port == 5001

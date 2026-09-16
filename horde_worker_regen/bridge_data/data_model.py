@@ -1107,19 +1107,42 @@ class reGenBridgeData(CombinedHordeBridgeData):
     Text generation runs in a separate program, the text backend (koboldcpp today; sonar and others
     planned), which the operator starts themselves and the worker reaches over HTTP at `kai_url`. There
     is no inference child process and no GPU work in the worker itself, so a scribe can be combined with
-    any other role or run on its own. What the worker advertises comes from `text_model_name`,
+    any other role or run on its own. What the worker advertises comes from `text_model`,
     `text_threads`, `max_length` and `max_context_length`, each narrowed to what the backend says it
     will accept.
     """
 
-    text_model_name: str | None = Field(default=None)
-    """The text model to advertise, spelled as the text model reference spells it (`author/Model`).
+    text_model: str | None = Field(default=None)
+    """Which text model the managed backend loads: a catalogued model's name, or a path to your own file.
 
-    A quantisation suffix the operator adds (`...-Instruct-Q4_K_M`) is kept. Leave it unset to advertise
-    whatever model the backend reports having loaded, which is the right answer whenever the backend is
-    the only thing that knows. Give the canonical name without a backend prefix: the horde expects the
-    name prefixed with the backend serving it, and which prefix that is (and whether the author segment
-    survives it) differs per backend, so the worker derives it and a prefix here would be applied twice.
+    Required when `scribe` and `text_backend_managed` are both true. A name is looked up in the text
+    model reference (`meta-llama/Meta-Llama-3.1-8B-Instruct-Q4_K_M`); when the record declares a file,
+    the worker fetches it into `text_models_dir` once and verifies it against the declared digest, and
+    the advertised name is the record's. A path is taken as the artefact itself, is never fetched, and is
+    advertised under its file stem unless `text_model_name` overrides that. An attached backend
+    (`text_backend_managed: false`) loads whatever its operator gave it, so this is unused there.
+    """
+
+    text_models_dir: Path | None = Field(default=None)
+    """Where text model files the worker fetches are kept. Unset puts them in
+    `<AIWORKER_CACHE_HOME>/text_models`.
+
+    A `text_model` naming a path is read where it sits and never copied here. The model reference
+    publishes no on-disk folder for text model files, so this location is the worker's own choice rather
+    than part of the shared model-cache layout.
+    """
+
+    text_model_name: str | None = Field(default=None)
+    """Override the advertised model name, spelled as the text model reference spells it (`author/Model`).
+
+    A catalogued model already carries the reference's spelling, so this is for a file of your own whose
+    stem is not the name the horde knows it by, and for an attached backend that reports a name the horde
+    does not recognise. Unset follows the resolved model: the record's name, the file's stem, or (for an
+    attached backend) whatever model it reports having loaded. A quantisation suffix
+    (`...-Instruct-Q4_K_M`) is part of the name and is kept. Give the canonical name without a backend
+    prefix: the horde expects the name prefixed with the backend serving it, and which prefix that is
+    (and whether the author segment survives it) differs per backend, so the worker derives it and a
+    prefix here would be applied twice.
     """
 
     text_threads: int = Field(default=1, ge=1, le=16)
@@ -1163,17 +1186,9 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """If true, the worker launches and supervises the text backend itself.
 
     The worker obtains the backend's executable (downloading a pinned release for backends distributed
-    that way, unless `text_backend_executable` points at one), starts it on `text_backend_port` with
-    `text_model_path`, waits for it to report a loaded model, relaunches it if it exits, and stops it on
-    shutdown. Set false to attach to a backend you run yourself at `kai_url` instead.
-    """
-
-    text_model_path: Path | None = Field(default=None)
-    """The model artefact the managed backend loads: a GGUF file for koboldcpp.
-
-    Required when `scribe` and `text_backend_managed` are both true. The advertised model name is not
-    derived from this path; set `text_model_name`, or leave it unset to advertise what the backend
-    reports (koboldcpp reports the file's stem).
+    that way, unless `text_backend_executable` points at one), obtains the model named by `text_model`,
+    starts it on `text_backend_port`, waits for it to report a loaded model, relaunches it if it exits,
+    and stops it on shutdown. Set false to attach to a backend you run yourself at `kai_url` instead.
     """
 
     text_backend_executable: Path | None = Field(default=None)
@@ -1696,13 +1711,13 @@ class reGenBridgeData(CombinedHordeBridgeData):
         (`text_backend_managed: false`) loads whatever its operator gave it, so nothing is required there.
 
         Raises:
-            ValueError: `scribe` and `text_backend_managed` are on and `text_model_path` is unset.
+            ValueError: `scribe` and `text_backend_managed` are on and `text_model` is unset.
         """
-        if self.scribe and self.text_backend_managed and self.text_model_path is None:
+        if self.scribe and self.text_backend_managed and self.text_model is None:
             raise ValueError(
-                "`scribe` is on and `text_backend_managed` is true, but `text_model_path` is unset. Point it at "
-                "the model file the backend should load, or set `text_backend_managed: false` and run the "
-                "backend yourself at `kai_url`.",
+                "`scribe` is on and `text_backend_managed` is true, but `text_model` is unset. Set it to a "
+                "catalogued model's name or to the path of a model file the backend should load, or set "
+                "`text_backend_managed: false` and run the backend yourself at `kai_url`.",
             )
         return self
 

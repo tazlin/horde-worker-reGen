@@ -280,6 +280,7 @@ def build_text_flow_advertisement(
     bridge_data: reGenBridgeData,
     description: TextBackendDescription,
     backend: TEXT_BACKENDS,
+    canonical_name: str | None = None,
 ) -> TextFlowAdvertisement:
     """Create the advertisement for a described backend under the operator's configuration.
 
@@ -292,13 +293,15 @@ def build_text_flow_advertisement(
         bridge_data: The live configuration, read for `text_model_name` and the two caps.
         description: What the backend answered when asked to describe itself.
         backend: Which backend the flow generates through, which decides the advertised spelling.
+        canonical_name: The spelling the worker resolved for a managed, catalogued model; `text_model_name`
+            overrides it, and None leaves the spelling to what the backend reports.
 
     Returns:
         The facts every pop until the next readiness gate will carry.
     """
     return TextFlowAdvertisement(
         model_name=advertised_model_name(
-            configured_name=bridge_data.text_model_name,
+            configured_name=bridge_data.text_model_name or canonical_name,
             described_name=description.model_name,
             backend=backend,
         ),
@@ -481,6 +484,7 @@ class TextGenerationCoordinator:
         run_metrics: WorkerRunMetrics | None = None,
         launch_count_provider: Callable[[], int] | None = None,
         backend_address_provider: Callable[[], str] | None = None,
+        canonical_name_provider: Callable[[], str | None] | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators and the backend to generate through.
 
@@ -512,6 +516,10 @@ class TextGenerationCoordinator:
                 messages that tell an operator which address answered nothing. None means the operator's
                 `kai_url`, the convention `build_text_backend` already uses for its own address argument, so
                 a worker that launched the backend itself does not print an address it is not using.
+            canonical_name_provider: The advertised spelling of the model the worker resolved for its
+                managed backend, read at readiness because the file is resolved in the supervisor's
+                provisioning step. None, or a provider answering None, leaves the spelling to
+                `text_model_name` and then to what the backend reports.
 
         Raises:
             ValueError: Neither `backend` nor `backend_factory` was given, leaving nothing to generate
@@ -530,6 +538,7 @@ class TextGenerationCoordinator:
         self._run_metrics = run_metrics
         self._launch_count_provider = launch_count_provider
         self._backend_address_provider = backend_address_provider
+        self._canonical_name_provider = canonical_name_provider
 
         self._in_flight: dict[str, TextJobInFlight] = {}
         self._job_tasks: set[asyncio.Task[None]] = set()
@@ -725,6 +734,9 @@ class TextGenerationCoordinator:
                         bridge_data=self.bridge_data,
                         description=description,
                         backend=self._text_backend_kind,
+                        canonical_name=(
+                            self._canonical_name_provider() if self._canonical_name_provider is not None else None
+                        ),
                     )
                     logger.info(
                         f"Text backend ready after {time.monotonic() - gate_opened_at:.1f}s; advertising "

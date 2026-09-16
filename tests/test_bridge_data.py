@@ -376,3 +376,47 @@ def test_bridge_data_to_dot_env_file() -> None:
 
     BridgeDataLoader.write_bridge_data_as_dot_env_file(bridge_data, "bridgeData.env")
     assert pathlib.Path("bridgeData.env").is_file()
+
+
+class TestTextModelConfiguration:
+    """One `text_model` key names either a catalogued model or a file, and a managed scribe needs it."""
+
+    def test_a_managed_scribe_without_a_model_is_refused(self) -> None:
+        """A managed backend with no model cannot start, and a relaunch loop hides the reason for minutes."""
+        with pytest.raises(ValueError, match="text_model"):
+            reGenBridgeData(api_key=ANON_API_KEY, scribe=True)
+
+    def test_an_attached_scribe_needs_no_model(self) -> None:
+        """A backend the operator runs has already been given its model, so nothing is required here."""
+        bridge_data = reGenBridgeData(api_key=ANON_API_KEY, scribe=True, text_backend_managed=False)
+
+        assert bridge_data.text_model is None
+
+    def test_a_catalogue_name_and_a_file_path_are_both_accepted(self) -> None:
+        """The key is one key: the filesystem decides which of the two a value is, at resolution time."""
+        named = reGenBridgeData(api_key=ANON_API_KEY, scribe=True, text_model="meta-llama/Model-Q4_K_M")
+        supplied = reGenBridgeData(api_key=ANON_API_KEY, scribe=True, text_model="T:/models/Model-Q4_K_M.gguf")
+
+        assert named.text_model == "meta-llama/Model-Q4_K_M"
+        assert supplied.text_model == "T:/models/Model-Q4_K_M.gguf"
+
+    def test_the_models_directory_defaults_to_unset(self) -> None:
+        """Unset means the worker's own default under the model cache, resolved when a file is fetched."""
+        bridge_data = reGenBridgeData(api_key=ANON_API_KEY, scribe=True, text_model="meta-llama/Model-Q4_K_M")
+
+        assert bridge_data.text_models_dir is None
+
+    def test_the_replaced_key_is_no_longer_a_field(self) -> None:
+        """A config still setting `text_model_path` reaches the unknown-parameter warning path, not the model."""
+        bridge_data = reGenBridgeData.model_validate(
+            {
+                "api_key": ANON_API_KEY,
+                "scribe": True,
+                "text_model": "meta-llama/Model-Q4_K_M",
+                "text_model_path": "T:/models/Model-Q4_K_M.gguf",
+            },
+        )
+
+        assert "text_model_path" not in reGenBridgeData.model_fields
+        assert bridge_data.model_extra is not None
+        assert "text_model_path" in bridge_data.model_extra
