@@ -67,6 +67,7 @@ _STALE_AFTER_SECONDS = 4.0
 
 _EXTERNAL_STATE_COLOURS = {
     "SERVING": "green",
+    "PROVISIONING": "yellow",
     "LAUNCHING": "yellow",
     "BACKING_OFF": "red",
     "STOPPED": "grey62",
@@ -380,7 +381,16 @@ class LiveView(VerticalScroll):
             return Panel(body, title=self._external_panel_title(process), border_style=state_colour, padding=(0, 1))
 
         body.add_row("Model", shorten(detail.model_name, 40))
-        body.add_row("Backend", f"{detail.kind} on port {detail.port}")
+        # The port comes with the rendered command line, so a backend the worker has not obtained yet has
+        # no port to name and the line says which of the two situations the row is in.
+        backend_line = (
+            f"{detail.kind}, program not yet obtained"
+            if detail.port is None
+            else f"{detail.kind} on port {detail.port}"
+        )
+        body.add_row("Backend", backend_line)
+        if detail.provision_error is not None:
+            body.add_row("Not obtained", detail.provision_error)
         if process.os_pid is not None:
             body.add_row("OS pid", str(process.os_pid))
         if detail.context_length is not None:

@@ -53,12 +53,23 @@ defines the structured protocol over it:
   reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
   export toggle and disk-size warning. A scribe worker's snapshot also carries its text flow: jobs in
   flight, the session's submitted and faulted totals, whether the backend's readiness gate has passed,
-  and the model, context length and generation length being advertised, with `scribe` and `scribe_name`
-  on the config summary. Each `RecentJobRecord` names the workload that produced it (a `WorkloadKind`
+  and the model, context length and generation length being advertised, with `scribe`, `scribe_name` and
+  `text_backend_managed` on the config summary. The summary carries all three role flags (`dreamer`,
+  `alchemist`, `scribe`) and owns the worker's display identity: `enabled_worker_names` returns the enabled
+  roles' horde names in the order dreamer, alchemist, scribe, and `worker_display_name` joins them. Every
+  surface that names the worker reads one of those two, so the status bar, the identity lines, the API
+  health row and the browser page cannot disagree about who the worker is, and a role that is switched off
+  is never named. Each `RecentJobRecord` names the workload that produced it (a `WorkloadKind`
   value carried as a plain string, so this module stays free of the scheduling package's import chain),
   which is what lets a recent-jobs row tell an image job, an alchemy form and a text generation apart.
+  The headline job counters (`num_jobs_popped`, `num_jobs_submitted`, `num_jobs_faulted`,
+  `jobs_in_progress`, `seconds_since_last_pop`) are the whole worker's across every workload, summed once
+  in the snapshot builder rather than per renderer, so a scribe-only or alchemist-only worker's header, hero
+  and Stats tab do not read zero while its own counters climb. Each flow contributes its delivered submits
+  plus its fault reports, matching what the image job tracker's movement counter means; the same totals feed
+  the stats sample and the durable `WorkerRunRecord`, which is what judges a session productive.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 26) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 27) so a frontend can detect a mismatch with a worker built from different code.
 
 ### One work ledger for three workloads
 

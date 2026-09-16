@@ -1373,6 +1373,7 @@ def _scribe_config(**overrides: object) -> WorkerConfigSummary:
     """A scribe worker's config summary, with the dreamer identity it never advertises still present."""
     return WorkerConfigSummary(
         dreamer_name="Tester",
+        dreamer=False,
         scribe_name="Tester-Scribe",
         worker_version="12.0.0",
         scribe=True,
@@ -1444,13 +1445,22 @@ def test_the_text_panel_names_an_unmeasured_token_rate_rather_than_dashing_it() 
     assert "not reported by this backend" in text
 
 
-def test_a_scribe_only_worker_is_named_for_the_role_it_registers_under() -> None:
-    """Each role registers its own named worker, so the dreamer name is not this worker's identity."""
-    text = _render(OverviewView()._render_worker_table(_scribe_snapshot()), width=200)
+def test_the_worker_panel_names_every_role_the_operator_enabled() -> None:
+    """Each role registers its own named worker, so naming one of two names half the worker.
 
-    assert "Scribe" in text
-    assert "Tester-Scribe" in text
-    assert "Dreamer" not in text
+    A scribe-only worker is named for the role it registers under rather than for the dreamer identity it
+    never advertises, and a worker with both roles on is named for both.
+    """
+    scribe_only = _render(OverviewView()._render_worker_table(_scribe_snapshot()), width=200)
+    dreamer_and_scribe = _render(
+        OverviewView()._render_worker_table(
+            _scribe_snapshot(config=_scribe_config().model_copy(update={"dreamer": True})),
+        ),
+        width=200,
+    )
+
+    assert "Tester-Scribe" in scribe_only
+    assert "Tester and Tester-Scribe" in dreamer_and_scribe
 
 
 def test_a_scribe_only_worker_foregrounds_text_generation() -> None:

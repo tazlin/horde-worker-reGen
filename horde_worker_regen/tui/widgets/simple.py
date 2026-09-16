@@ -260,9 +260,12 @@ def _has_work_in_hand(snapshot: WorkerStateSnapshot) -> bool:
 
 
 def _identity_words(config: WorkerConfigSummary, *, uptime: float) -> str:
-    """Name this worker, the build it is running, and who it is contributing for."""
-    names = [name for name in (config.dreamer_name, config.alchemist_name, config.scribe_name) if name]
-    line = f"{' and '.join(names) or 'Unnamed worker'}, version {config.worker_version}"
+    """Name this worker, the build it is running, and who it is contributing for.
+
+    Only the enabled roles are named: a name the worker never registers is not its identity, and the
+    defaults the unselected roles carry would otherwise be read as workers a contributor is running.
+    """
+    line = f"{config.worker_display_name or 'Unnamed worker'}, version {config.worker_version}"
     if config.horde_username:
         line += f", contributing as {config.horde_username}"
         return f"{line} for {human_duration(uptime)}" if uptime > 0 else line
@@ -272,6 +275,9 @@ def _identity_words(config: WorkerConfigSummary, *, uptime: float) -> str:
 def _offer_words(config: WorkerConfigSummary, *, text_model_name: str | None = None) -> str:
     """Name what this worker takes on, in the words a requester would recognise.
 
+    The image offers are gated on the dreamer role: the flags behind them default on, so a worker that
+    serves only text or only alchemy would otherwise claim image work it never pops.
+
     LoRA follows the effective setting rather than the configured one, so a worker whose pops are not
     currently advertising LoRA does not claim it. Text generation names the model the backend loaded
     where it has answered, because "text generation" alone does not tell a contributor which of their
@@ -279,14 +285,15 @@ def _offer_words(config: WorkerConfigSummary, *, text_model_name: str | None = N
     """
     allows_lora = config.allow_lora if config.effective_allow_lora is None else config.effective_allow_lora
     offers: list[str] = []
-    if allows_lora:
-        offers.append("LoRA styles")
-    if config.allow_controlnet or config.allow_sdxl_controlnet:
-        offers.append("ControlNet guidance")
-    if config.allow_img2img:
-        offers.append("image-to-image")
-    if config.allow_post_processing:
-        offers.append("post-processing")
+    if config.dreamer:
+        if allows_lora:
+            offers.append("LoRA styles")
+        if config.allow_controlnet or config.allow_sdxl_controlnet:
+            offers.append("ControlNet guidance")
+        if config.allow_img2img:
+            offers.append("image-to-image")
+        if config.allow_post_processing:
+            offers.append("post-processing")
     if config.alchemist:
         offers.append("alchemy")
     if config.scribe:

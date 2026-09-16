@@ -11,6 +11,7 @@ import asyncio
 import os
 import socket
 import subprocess
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import (
     LaunchedProcess,
+    LaunchSpecFactory,
     TextBackendState,
     TextBackendSupervisor,
     TextBackendSupervisorTimings,
@@ -42,8 +44,10 @@ from horde_worker_regen.text_backends import (
     TextBackendLaunchSpec,
     TextBackendUnavailable,
     TextGenerationResult,
+    UnsupportedTextBackendError,
     build_launch_spec,
 )
+from horde_worker_regen.text_backends.provision import TextBackendProvisionError
 from worker_bootstrap.koboldcpp_bin import koboldcpp_executable
 
 REAL_MODEL_ENV_VAR = "HORDE_TEXT_SMOKE_GGUF"
@@ -169,6 +173,16 @@ class Launcher:
         return self._handles.pop(0)
 
 
+def factory_for(spec: TextBackendLaunchSpec) -> LaunchSpecFactory:
+    """Return a factory handing the supervisor a spec that is already rendered.
+
+    The supervisor obtains its backend through a factory, and these rows are about what it does once it
+    has one, so the spec is built up front (a free port is probed while the test knows it is free) and the
+    factory only hands it over. The rows about obtaining supply their own factory.
+    """
+    return lambda: spec
+
+
 def free_port() -> int:
     """Return a loopback port nothing is listening on right now."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -214,7 +228,7 @@ async def test_ready_after_polls_makes_the_backend_serving_and_measures_the_foot
     readings = iter([(10000.0, 16000.0), (7300.0, 16000.0)])
 
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=backend,
         owned_registry=registry,
         launch_process=launcher,
@@ -244,7 +258,7 @@ async def test_footprint_is_unmeasured_without_a_reader(tmp_path: Path) -> None:
     """No free-VRAM reader means no footprint, not a zero."""
     handle = FakeLaunched(pid=1)
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=Launcher([handle]),
         timings=FAST,
@@ -265,7 +279,7 @@ async def test_an_exit_before_ready_is_relaunched_after_backoff(tmp_path: Path) 
     second = FakeLaunched(pid=12)
     launcher = Launcher([first, second])
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=launcher,
         timings=FAST,
@@ -287,7 +301,7 @@ async def test_missing_the_ready_patience_stops_the_process_and_relaunches(tmp_p
     launcher = Launcher([first, second])
     never_ready = StubBackend(ready_results=[], default_ready=False)
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=never_ready,
         launch_process=launcher,
         timings=FAST,
@@ -311,7 +325,7 @@ async def test_an_exit_while_serving_is_relaunched(tmp_path: Path) -> None:
     second = FakeLaunched(pid=32)
     registry = OwnedProcessRegistry(tmp_path / "owned.json")
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True, True]),
         owned_registry=registry,
         launch_process=Launcher([first, second]),
@@ -335,7 +349,7 @@ async def test_a_held_port_defers_the_launch_without_starting_anything(tmp_path:
         holder.bind(("127.0.0.1", 0))
         held_port = int(holder.getsockname()[1])
         supervisor = TextBackendSupervisor(
-            launch_spec=spec_on(held_port, tmp_path),
+            launch_spec_factory=factory_for(spec_on(held_port, tmp_path)),
             backend=StubBackend(ready_results=[True]),
             launch_process=launcher,
             timings=FAST,
@@ -357,7 +371,7 @@ async def test_stop_during_backoff_ends_the_run_without_another_launch(tmp_path:
     slow_backoff = FAST.model_copy(update={"relaunch_backoff": (30.0,)})
     launcher = Launcher([exited, FakeLaunched(pid=52)])
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=launcher,
         timings=slow_backoff,
@@ -426,7 +440,7 @@ def test_buffer_sizes_are_none_when_the_backend_printed_none() -> None:
 async def test_the_stopped_row_names_the_backend_without_claiming_a_process(tmp_path: Path) -> None:
     """Before anything is launched the row exists, is external, is not alive, and carries no pid."""
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         backend_kind=TEXT_BACKENDS.koboldcpp,
         launch_process=Launcher([FakeLaunched(pid=61)]),
@@ -454,7 +468,7 @@ async def test_the_row_reports_the_requests_the_flow_has_in_flight(tmp_path: Pat
     what an operator watching the process table is looking for.
     """
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         backend_kind=TEXT_BACKENDS.koboldcpp,
         launch_process=Launcher([FakeLaunched(pid=62)]),
@@ -475,7 +489,7 @@ async def test_the_row_reports_the_requests_the_flow_has_in_flight(tmp_path: Pat
 async def test_a_row_with_nothing_in_flight_is_idle(tmp_path: Path) -> None:
     """A backend the flow is asking nothing of is idle; a busy row would read as a lane holding work."""
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         backend_kind=TEXT_BACKENDS.koboldcpp,
         launch_process=Launcher([FakeLaunched(pid=63)]),
@@ -507,7 +521,7 @@ async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_si
     readings = iter([(10000.0, 16000.0), (7300.0, 16000.0)])
     port = free_port()
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(port, tmp_path),
+        launch_spec_factory=factory_for(spec_on(port, tmp_path)),
         backend=backend,
         backend_kind=TEXT_BACKENDS.koboldcpp,
         launch_process=LoggingLauncher([handle], [BACKEND_LOAD_LOG]),
@@ -546,7 +560,7 @@ async def test_the_launching_row_reports_launching_before_readiness(tmp_path: Pa
     """A backend still loading its model reads as launching, with no description and no buffer sizes."""
     starting = StubBackend(ready_results=[], default_ready=False)
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=starting,
         launch_process=LoggingLauncher([FakeLaunched(pid=81)], [BACKEND_LOAD_LOG]),
         timings=FAST,
@@ -561,6 +575,7 @@ async def test_the_launching_row_reports_launching_before_readiness(tmp_path: Pa
     assert row.text_backend is not None
     assert row.text_backend.model_name is None
     assert row.text_backend.model_buffer_mb is None
+    assert row.text_backend.launching_since is not None, "the readiness patience is measured from here"
     assert starting.describe_calls == 0
 
     await supervisor.stop()
@@ -573,7 +588,7 @@ async def test_the_backing_off_row_counts_down_to_the_relaunch(tmp_path: Path) -
     exited.exit(1)
     slow_backoff = FAST.model_copy(update={"relaunch_backoff": (30.0,)})
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=LoggingLauncher([exited, FakeLaunched(pid=92)], [BACKEND_LOAD_LOG, BACKEND_LOAD_LOG]),
         timings=slow_backoff,
@@ -591,6 +606,9 @@ async def test_the_backing_off_row_counts_down_to_the_relaunch(tmp_path: Path) -
     assert 0.0 < row.text_backend.relaunch_backoff_seconds <= 30.0
     assert row.text_backend.model_name is None
     assert row.text_backend.ready_since is None
+    # The attempt outlives the launch it belongs to: a reader asking how long the backend has failed to
+    # answer needs when the worker last tried, which a row cleared between attempts cannot say.
+    assert row.text_backend.launching_since is not None
 
     await supervisor.stop()
     task.cancel()
@@ -605,7 +623,7 @@ async def test_each_launch_describes_once_and_reads_only_its_own_output(tmp_path
     relaunched_log = BACKEND_LOAD_LOG.replace("1918.35", "918.35").replace("476.00", "376.00")
     backend = StubBackend(ready_results=[True, True])
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=backend,
         launch_process=LoggingLauncher([first, second], [BACKEND_LOAD_LOG, relaunched_log]),
         timings=FAST,
@@ -632,7 +650,7 @@ async def test_each_launch_describes_once_and_reads_only_its_own_output(tmp_path
 async def test_a_backend_that_will_not_describe_itself_still_serves(tmp_path: Path) -> None:
     """A refused description leaves the row's model fields unset without holding up the readiness gate."""
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True], describe_error=TextBackendUnavailable("no answer")),
         launch_process=Launcher([FakeLaunched(pid=111)]),
         timings=FAST,
@@ -655,7 +673,7 @@ async def test_a_backend_that_will_not_describe_itself_still_serves(tmp_path: Pa
 async def test_a_backend_on_no_card_reports_no_device_index(tmp_path: Path) -> None:
     """A CPU-only backend's row leaves the card unset instead of being charged to card 0."""
     supervisor = TextBackendSupervisor(
-        launch_spec=spec_on(free_port(), tmp_path, device_index=None),
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path, device_index=None)),
         backend=StubBackend(ready_results=[True]),
         launch_process=Launcher([FakeLaunched(pid=121)]),
         timings=FAST,
@@ -703,7 +721,7 @@ async def test_real_koboldcpp_serves_and_leaves_no_process_behind(tmp_path: Path
     async with aiohttp.ClientSession() as session:
         backend = KoboldApiTextBackend(spec.base_url, session)
         supervisor = TextBackendSupervisor(
-            launch_spec=spec,
+            launch_spec_factory=factory_for(spec),
             backend=backend,
             owned_registry=registry,
             launch_process=default_launch_process,
@@ -724,3 +742,115 @@ async def test_real_koboldcpp_serves_and_leaves_no_process_behind(tmp_path: Path
     assert registry._load() == []
     assert [pid for pid in tree if psutil.pid_exists(pid)] == []
     assert port_is_free(port) is True
+
+
+async def test_a_row_before_any_launch_has_no_launch_instant(tmp_path: Path) -> None:
+    """A supervisor that has not run has attempted nothing, and a clock started here would time a download.
+
+    The instant is what the dashboard's readiness patience is measured from, so its absence is how the
+    dashboard knows the worker is still obtaining the backend rather than failing to start it.
+    """
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
+        backend=StubBackend(ready_results=[True]),
+        launch_process=Launcher([FakeLaunched(pid=1)]),
+        timings=FAST,
+    )
+
+    row = supervisor.to_process_snapshot()
+
+    assert row.display_state == "stopped"
+    assert row.text_backend is not None
+    assert row.text_backend.launching_since is None
+
+
+async def test_the_row_reads_provisioning_while_the_program_is_being_obtained(tmp_path: Path) -> None:
+    """A first run downloads the program, and that minute is the backend's life rather than a gap in it.
+
+    The row exists from construction, so the dashboard can say what the worker is doing; before the spec
+    is rendered there is no port to name and no card the backend was told to use.
+    """
+    obtaining = asyncio.Event()
+    spec = spec_on(free_port(), tmp_path)
+
+    def obtain_slowly() -> TextBackendLaunchSpec:
+        obtaining.set()
+        while not release_spec.is_set():
+            time.sleep(0.01)
+        return spec
+
+    release_spec = asyncio.Event()
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=obtain_slowly,
+        backend=StubBackend(ready_results=[True]),
+        launch_process=Launcher([FakeLaunched(pid=61)]),
+        timings=FAST,
+    )
+    task = asyncio.create_task(supervisor.run())
+    try:
+        await asyncio.wait_for(obtaining.wait(), timeout=5.0)
+        row = supervisor.to_process_snapshot()
+
+        assert supervisor.state is TextBackendState.PROVISIONING
+        assert row.display_state == "provisioning"
+        assert row.last_process_state == "PROVISIONING"
+        assert row.is_alive is False, "no process exists yet, and the row must not claim one"
+        assert row.text_backend is not None
+        assert row.text_backend.port is None
+        assert row.text_backend.launching_since is None
+        assert row.device_index is None
+    finally:
+        release_spec.set()
+
+    await wait_until(lambda: supervisor.is_serving)
+    ready_row = supervisor.to_process_snapshot()
+    assert ready_row.text_backend is not None
+    assert ready_row.text_backend.port == spec.port
+
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_a_program_that_cannot_be_obtained_is_reported_on_the_row_and_stops(tmp_path: Path) -> None:
+    """Obtaining is not retried, so the reason has to reach the row: no clock would ever run out."""
+
+    def cannot_obtain() -> TextBackendLaunchSpec:
+        raise TextBackendProvisionError("the release download failed")
+
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=cannot_obtain,
+        backend=StubBackend(ready_results=[True]),
+        launch_process=Launcher([]),
+        timings=FAST,
+    )
+
+    await asyncio.wait_for(supervisor.run(), timeout=5.0)
+
+    row = supervisor.to_process_snapshot()
+    assert supervisor.state is TextBackendState.STOPPED
+    assert supervisor.launch_count == 0, "nothing is launched for a backend there is no program for"
+    assert row.display_state == "not obtained"
+    assert row.text_backend is not None
+    assert row.text_backend.provision_error is not None
+    assert "the release download failed" in row.text_backend.provision_error
+
+
+async def test_an_unrenderable_backend_is_reported_the_same_way(tmp_path: Path) -> None:
+    """The other failure the factory can raise is a backend the worker has no command line for."""
+
+    def cannot_render() -> TextBackendLaunchSpec:
+        raise UnsupportedTextBackendError("sonar")
+
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=cannot_render,
+        backend=StubBackend(ready_results=[True]),
+        launch_process=Launcher([]),
+        timings=FAST,
+    )
+
+    await asyncio.wait_for(supervisor.run(), timeout=5.0)
+
+    row = supervisor.to_process_snapshot()
+    assert row.text_backend is not None
+    assert row.text_backend.provision_error is not None
+    assert "sonar" in row.text_backend.provision_error

@@ -78,6 +78,20 @@ disk, which together take a minute or more on a first start. The worker polls qu
 only says something when the wait has gone on long enough to suggest the backend is not coming: nothing
 started, the wrong port, or a firewall.
 
+Obtaining the program comes before any of that, and is part of the backend's life rather than a gap before
+it: the worker's supervisor owns that step too, so the backend has a row on the dashboard reading
+`provisioning` for as long as a first-run download takes, and the row states the port only once the command
+line has been rendered. A program that cannot be obtained at all is not retried, because a download that
+failed is not something a relaunch ladder recovers; the reason is logged once and carried on the row, where
+the dashboard turns it into an error rather than waiting on a clock that would never run out.
+
+The patience a managed backend is judged by is therefore measured from the launch attempt rather than from
+the worker's start, and while the program is still being obtained the dashboard says so and raises nothing.
+The wait for an attached backend is timed from the worker's first look at it, because the worker did not
+start it and has no launch to measure from. Either way, a message about a backend that is not answering
+names the address the worker is actually using: its own loopback port for a managed backend, `kai_url` for
+one you run.
+
 One thing to know about credentials: a backend started with a password (koboldcpp's `--password`)
 refuses a request carrying the wrong one in a way the worker cannot tell apart from a backend that is
 down. If your worker sits in the readiness gate forever against a backend you can see running, check the
@@ -239,6 +253,26 @@ past twice that a fault, which separates a model still loading from a backend no
 generation that has produced nothing for longer than `text_stall_seconds` plus the snapshot interval is a
 warning; the interval is there so the dashboard never warns about a job the worker is in the act of
 faulting.
+
+The backend's posture also reaches the headline, not only the checklist. A scribe whose backend is being
+obtained or started is warming up, in the same place on the phase ladder as a worker loading its first
+image model, and an image role that is further along (serving a job, or loading its own models) keeps the
+headline instead. Past the readiness patience the headline is a warning and past twice that an error
+naming the remedy, which differs by who runs the backend: a managed one points at its row and
+`logs/text_backend.log`, an attached one at `kai_url` and whether the program is running. A program that
+could not be obtained at all is an error immediately, with the reason the download or the rendering gave.
+And whatever the phase decides, the headline can never read OK while any check in the list beside it has
+failed.
+
+The whole-worker counters count every workload's work. The header's "done", the hero's submitted and
+faulted figures, the Stats tab's job line, Simple's completed count, the native page's active-work figure
+and the durable run record are the worker's totals across image, alchemy and text, so a scribe-only or
+alchemist-only worker reports its own work rather than the image tracker's zero; "last pop" is the most
+recent pop any flow made. Each flow contributes its delivered submits plus its fault reports, which is what
+the image tracker's own movement counter means. The `alchemy_*` and `text_*` fields and the by-workload
+totals remain the per-workload split, and the Stats tab shows that split whenever a workload other than
+image generation has totals: a scribe-only worker's single row carries the mean generated tokens, which no
+headline figure states.
 
 ## What is not supported yet
 

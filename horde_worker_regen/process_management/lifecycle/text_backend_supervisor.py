@@ -6,13 +6,16 @@ start it, ask it a few HTTP questions through a
 [`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend] driver, and stop it. This module owns
 exactly that, and nothing more: the seam with a black box is kept to start, ready, stop, so there are as
 few places as possible where the two programs can disagree. Which program, and with which command line, is
-decided elsewhere ([`text_backends.launch`][horde_worker_regen.text_backends.launch]); the supervisor
-receives a rendered [`TextBackendLaunchSpec`][horde_worker_regen.text_backends.launch_spec.TextBackendLaunchSpec]
+decided elsewhere ([`text_backends.launch`][horde_worker_regen.text_backends.launch]); the supervisor is
+handed a factory that obtains the executable and renders a
+[`TextBackendLaunchSpec`][horde_worker_regen.text_backends.launch_spec.TextBackendLaunchSpec],
 and treats every backend the same way.
 
-- :class:`TextBackendSupervisor`: runs the launch, readiness gate, liveness watch and relaunch ladder on
-  one asyncio task, measures the backend's VRAM footprint as the card's free-memory delta, and keeps every
-  process id in the owned-PID registry so a crashed worker's next run can reap it.
+- :class:`TextBackendSupervisor`: runs the obtaining step, launch, readiness gate, liveness watch and
+  relaunch ladder on one asyncio task, measures the backend's VRAM footprint as the card's free-memory
+  delta, and keeps every process id in the owned-PID registry so a crashed worker's next run can reap it.
+  The whole of the backend's life is here, obtaining included, so it has one row on the dashboard from the
+  moment the worker decides to have a backend at all.
 - :func:`default_launch_process`: starts the spec's command with output appended to its log file.
 - :func:`port_is_free`: the pre-launch check that nothing still holds the backend's port.
 - :func:`parse_backend_buffer_sizes` and :class:`TextBackendBufferSizes`: the load-time buffer figures a
@@ -66,8 +69,14 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
-from horde_worker_regen.text_backends import TextBackend, TextBackendDescription, TextBackendError
+from horde_worker_regen.text_backends import (
+    TextBackend,
+    TextBackendDescription,
+    TextBackendError,
+    UnsupportedTextBackendError,
+)
 from horde_worker_regen.text_backends.launch_spec import LOOPBACK_HOST, TextBackendLaunchSpec
+from horde_worker_regen.text_backends.provision import TextBackendProvisionError
 
 TEXT_BACKEND_LOG_FILE_NAME = "text_backend.log"
 """File under the run's ``logs/`` that receives the backend's own stdout and stderr."""
@@ -159,6 +168,7 @@ class TextBackendState(StrEnum):
     """
 
     STOPPED = auto()
+    PROVISIONING = auto()
     LAUNCHING = auto()
     SERVING = auto()
     BACKING_OFF = auto()
@@ -216,15 +226,30 @@ DeviceFreeTotalReader = Callable[[int], tuple[float, float] | None]
 LaunchProcess = Callable[[TextBackendLaunchSpec], LaunchedProcess]
 """Starts the backend process described by a spec."""
 
+LaunchSpecFactory = Callable[[], TextBackendLaunchSpec]
+"""Obtains the backend's executable and renders its command line.
+
+Blocking, and on a first run for hundreds of megabytes: a backend distributed as a release download is
+fetched and verified here. The supervisor calls it once, in a thread, before its first launch.
+
+Raises:
+    TextBackendProvisionError: The executable could not be obtained.
+    UnsupportedTextBackendError: The worker cannot render a command line for this backend.
+"""
+
 Sleep = Callable[[float], Awaitable[None]]
 
 
 class TextBackendSupervisor:
-    """Keep one text backend process launched, ready and accounted for until asked to stop.
+    """Keep one text backend obtained, launched, ready and accounted for until asked to stop.
 
     The driver (`backend`) targets the spec's loopback URL, which does not change across relaunches, so
     the text-generation flow holds one driver object for the supervisor's whole life and never learns
     about relaunches except through `ready()` returning False for a while.
+
+    The backend's life begins at obtaining it, not at launching it, so the supervisor takes a factory
+    rather than a rendered spec: the row exists from construction and a first-run download is something
+    the dashboard can show, rather than a minute in which the worker appears to have no backend at all.
 
     Concurrency:
         `run()` is one asyncio task. `stop()` may be awaited from another task at any time; it flips the
@@ -234,7 +259,7 @@ class TextBackendSupervisor:
     def __init__(
         self,
         *,
-        launch_spec: TextBackendLaunchSpec,
+        launch_spec_factory: LaunchSpecFactory,
         backend: TextBackend,
         backend_kind: TEXT_BACKENDS = TEXT_BACKENDS.koboldcpp,
         owned_registry: OwnedProcessRegistry | None = None,
@@ -247,9 +272,12 @@ class TextBackendSupervisor:
         """Wire the supervisor; nothing starts until `run()`.
 
         Args:
-            launch_spec: What to launch and where it listens, already rendered for the chosen backend.
-            backend: The driver already pointed at the spec's URL; used for `ready()` and, once ready,
-                one `describe()` whose answer names the backend's row on the dashboard.
+            launch_spec_factory: Obtains the executable and renders what to launch and where it listens.
+                Called once, in a thread, at the start of `run()`; a failure is reported here and leaves
+                the backend stopped rather than reaching the caller.
+            backend: The driver already pointed at the backend's URL; used for `ready()` and, once ready,
+                one `describe()` whose answer names the backend's row on the dashboard. Its address is
+                decided by configuration rather than by the spec, so it can exist before the spec does.
             backend_kind: Which program the spec launches. The spec is deliberately kind-agnostic (it is
                 one command line), so the kind is carried alongside it, for display only.
             owned_registry: Where launched PIDs are recorded for orphan reaping; None records nothing.
@@ -260,7 +288,8 @@ class TextBackendSupervisor:
                 launch so a reaped PID can be attributed to its launch.
             sleep: Awaitable sleep, injected so tests can run the ladder without wall-clock waits.
         """
-        self._launch_spec = launch_spec
+        self._launch_spec_factory = launch_spec_factory
+        self._launch_spec: TextBackendLaunchSpec | None = None
         self._backend = backend
         self._backend_kind = backend_kind
         self._owned_registry = owned_registry
@@ -286,6 +315,16 @@ class TextBackendSupervisor:
         self._log_bytes_at_launch = 0
         self._ready_since: float | None = None
         self._last_health_ok_at: float | None = None
+        # Outlives one launch deliberately, unlike the fields above: it is when the worker last *tried*,
+        # which is what a reader measuring how long the backend has failed to answer needs, and a launch
+        # that never started a process (a held port) has to count as an attempt too.
+        self._launching_since: float | None = None
+        self._provision_error: str | None = None
+        """Why the backend could not be obtained, or None while that has not happened.
+
+        The reason rather than a state: a backend that cannot be obtained is stopped, and without the
+        reason on the row the dashboard would show a worker permanently "obtaining" a program that is
+        never coming."""
         self._backoff_seconds: float | None = None
         self._backoff_started_monotonic: float | None = None
 
@@ -324,9 +363,19 @@ class TextBackendSupervisor:
         return self._tree_pids
 
     async def run(self) -> None:
-        """Run the launch, gate, watch and relaunch loop until `stop()` is awaited."""
+        """Run the obtain, launch, gate, watch and relaunch loop until `stop()` is awaited.
+
+        Obtaining happens once: a backend the worker cannot obtain at all is not a backend a relaunch
+        ladder can recover, so the reason is reported and the supervisor stops rather than downloading in
+        a loop.
+        """
         while not self._stop_requested:
-            became_ready = await self._launch_and_gate()
+            spec = self._launch_spec
+            if spec is None:
+                spec = await self._obtain_launch_spec()
+            if spec is None or self._stop_requested:
+                break
+            became_ready = await self._launch_and_gate(spec)
             if self._stop_requested:
                 break
             if became_ready:
@@ -345,27 +394,46 @@ class TextBackendSupervisor:
         await self._stop_tree()
         self._state = TextBackendState.STOPPED
 
-    async def _launch_and_gate(self) -> bool:
+    async def _obtain_launch_spec(self) -> TextBackendLaunchSpec | None:
+        """Obtain the backend and render its command line, or report why that could not be done.
+
+        Run in a thread because a first provision downloads a release. The row reads `provisioning` for as
+        long as this takes, which on a first run is the difference between a dashboard that shows a
+        download and one that shows nothing.
+        """
+        self._state = TextBackendState.PROVISIONING
+        try:
+            self._launch_spec = await asyncio.to_thread(self._launch_spec_factory)
+        except TextBackendProvisionError as error:
+            self._provision_error = f"Could not obtain the {self._backend_kind!s} text backend: {error}"
+            logger.error(self._provision_error)
+        except UnsupportedTextBackendError as error:
+            self._provision_error = f"Cannot launch the {self._backend_kind!s} text backend: {error}"
+            logger.error(self._provision_error)
+        return self._launch_spec
+
+    async def _launch_and_gate(self, spec: TextBackendLaunchSpec) -> bool:
         """Launch the process and wait for `ready()`; return whether it became ready.
 
         A launch that fails leaves no process behind: the tree is stopped before returning False.
         """
         self._state = TextBackendState.LAUNCHING
         self._clear_launch_detail()
-        if not port_is_free(self._launch_spec.port):
+        self._launching_since = time.time()
+        if not port_is_free(spec.port):
             logger.warning(
-                f"Text backend port {self._launch_spec.port} is already in use; a previous backend may still "
+                f"Text backend port {spec.port} is already in use; a previous backend may still "
                 "be running. Launch deferred.",
             )
             return False
 
-        free_before_mb = self._read_free_mb()
+        free_before_mb = self._read_free_mb(spec)
         # The log is appended across launches, so the size now is where this launch's own output begins.
-        self._log_bytes_at_launch = _log_size_bytes(self._launch_spec.log_path)
+        self._log_bytes_at_launch = _log_size_bytes(spec.log_path)
         try:
-            self._process = self._launch_process(self._launch_spec)
+            self._process = self._launch_process(spec)
         except OSError as error:
-            logger.error(f"Text backend failed to start ({self._launch_spec.executable}): {error}")
+            logger.error(f"Text backend failed to start ({spec.executable}): {error}")
             self._process = None
             return False
         self._launch_count += 1
@@ -373,8 +441,7 @@ class TextBackendSupervisor:
         self._next_launch_identifier += 1
         self._record_tree(launch_identifier)
         logger.info(
-            f"Text backend launched (pid {self._process.pid}, launch {self._launch_count}): "
-            f"{' '.join(self._launch_spec.command)}",
+            f"Text backend launched (pid {self._process.pid}, launch {self._launch_count}): {' '.join(spec.command)}",
         )
 
         started = time.monotonic()
@@ -386,7 +453,7 @@ class TextBackendSupervisor:
                 return False
             if await self._backend.ready(deadline_seconds=self._timings.ready_probe_deadline):
                 self._record_tree(launch_identifier)
-                self._footprint_mb = self._footprint_from(free_before_mb)
+                self._footprint_mb = self._footprint_from(spec, free_before_mb)
                 self._ready_since = time.time()
                 self._last_health_ok_at = self._ready_since
                 self._state = TextBackendState.SERVING
@@ -394,7 +461,7 @@ class TextBackendSupervisor:
                 logger.info(
                     f"Text backend ready after {time.monotonic() - started:.1f}s; VRAM footprint {footprint}",
                 )
-                await self._collect_launch_detail()
+                await self._collect_launch_detail(spec)
                 return True
             if time.monotonic() - started > self._timings.ready_patience:
                 logger.error(
@@ -432,7 +499,7 @@ class TextBackendSupervisor:
         logger.info(f"Text backend relaunch in {backoff[index]:.0f}s")
         await self._sleep(backoff[index])
 
-    async def _collect_launch_detail(self) -> None:
+    async def _collect_launch_detail(self, spec: TextBackendLaunchSpec) -> None:
         """Read the display-only facts about the launch that has just become ready.
 
         Both halves are best effort and neither gates serving: the description is one HTTP question the
@@ -446,7 +513,7 @@ class TextBackendSupervisor:
             self._description = None
         backend_output = await asyncio.to_thread(
             _read_log_from,
-            self._launch_spec.log_path,
+            spec.log_path,
             self._log_bytes_at_launch,
         )
         self._buffer_sizes = parse_backend_buffer_sizes(backend_output)
@@ -476,10 +543,11 @@ class TextBackendSupervisor:
                 request counts at zero and the row idle rather than claiming work nothing accounts for.
         """
         description = self._description
+        spec = self._launch_spec
         return ProcessSnapshot(
             process_id=TEXT_BACKEND_PROCESS_ID,
             process_type=HordeProcessType.TEXT_BACKEND.name,
-            device_index=self._launch_spec.device_index,
+            device_index=None if spec is None else spec.device_index,
             last_process_state=self._state.name,
             is_alive=self._state in (TextBackendState.LAUNCHING, TextBackendState.SERVING),
             is_busy=activity is not None and activity.active_requests > 0,
@@ -490,11 +558,13 @@ class TextBackendSupervisor:
             text_backend=TextBackendDetail(
                 kind=str(self._backend_kind),
                 model_name=description.model_name if description is not None else None,
-                port=self._launch_spec.port,
+                port=None if spec is None else spec.port,
                 context_length=description.max_context_length if description is not None else None,
                 max_length=description.max_length if description is not None else None,
                 launch_count=self._launch_count,
                 footprint_mb=None if self._footprint_mb is None else round(self._footprint_mb),
+                launching_since=self._launching_since,
+                provision_error=self._provision_error,
                 ready_since=self._ready_since,
                 last_health_ok_at=self._last_health_ok_at,
                 relaunch_backoff_seconds=self._relaunch_backoff_remaining(),
@@ -513,6 +583,10 @@ class TextBackendSupervisor:
             return "ready"
         if self._state is TextBackendState.LAUNCHING:
             return "launching"
+        if self._state is TextBackendState.PROVISIONING:
+            return "provisioning"
+        if self._provision_error is not None:
+            return "not obtained"
         if self._state is TextBackendState.BACKING_OFF:
             remaining = self._relaunch_backoff_remaining()
             return "relaunching" if remaining is None else f"relaunching in {remaining:.0f} s"
@@ -526,14 +600,14 @@ class TextBackendSupervisor:
             return None
         return max(0.0, self._backoff_seconds - (time.monotonic() - self._backoff_started_monotonic))
 
-    def _read_free_mb(self) -> float | None:
-        if self._read_device_free_total_mb is None or self._launch_spec.device_index is None:
+    def _read_free_mb(self, spec: TextBackendLaunchSpec) -> float | None:
+        if self._read_device_free_total_mb is None or spec.device_index is None:
             return None
-        reading = self._read_device_free_total_mb(self._launch_spec.device_index)
+        reading = self._read_device_free_total_mb(spec.device_index)
         return None if reading is None else reading[0]
 
-    def _footprint_from(self, free_before_mb: float | None) -> float | None:
-        free_after_mb = self._read_free_mb()
+    def _footprint_from(self, spec: TextBackendLaunchSpec, free_before_mb: float | None) -> float | None:
+        free_after_mb = self._read_free_mb(spec)
         if free_before_mb is None or free_after_mb is None:
             return None
         return max(0.0, free_before_mb - free_after_mb)

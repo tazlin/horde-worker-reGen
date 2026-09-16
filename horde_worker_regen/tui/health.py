@@ -14,7 +14,11 @@ import os
 import shutil
 from pathlib import Path
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerFatalConfigError, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    TextBackendDetail,
+    WorkerFatalConfigError,
+    WorkerStateSnapshot,
+)
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.tui.formatters import human_bytes, human_duration
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
@@ -139,7 +143,46 @@ def derive(
     useful before the worker starts rather than empty. ``fatal_error`` is the worker's reported
     non-retryable config problem (e.g. a taken worker name); when set on a crashed worker it replaces
     the generic crash message with the specific reason and remedy. This function itself stays pure.
+
+    The phase decides the severity, and then :func:`_with_error_check_severity` has the last word: a
+    headline that reads OK over a failed check is the one verdict the panel must never give.
     """
+    return _with_error_check_severity(
+        _derive_phase(
+            snapshot,
+            supervisor_status,
+            snapshot_age,
+            offline_checks=offline_checks,
+            optimistic_server_maintenance=optimistic_server_maintenance,
+            fatal_error=fatal_error,
+        ),
+    )
+
+
+def _with_error_check_severity(report: HealthReport) -> HealthReport:
+    """Return the report with its severity raised to ERROR while any of its checks failed.
+
+    Applied to every check rather than the ones a phase happens to know about, so a check added later
+    cannot report a failure the headline contradicts. Only an OK severity is raised: a phase that already
+    judged the worker WARN or worse has chosen its own wording for what is wrong.
+    """
+    if report.severity is not HealthStatus.OK:
+        return report
+    if not any(check.status is HealthStatus.ERROR for check in report.checks):
+        return report
+    return dataclasses.replace(report, severity=HealthStatus.ERROR)
+
+
+def _derive_phase(
+    snapshot: WorkerStateSnapshot | None,
+    supervisor_status: SupervisorStatus,
+    snapshot_age: float | None,
+    *,
+    offline_checks: list[HealthCheck] | None = None,
+    optimistic_server_maintenance: bool = False,
+    fatal_error: WorkerFatalConfigError | None = None,
+) -> HealthReport:
+    """Return the phase, headline and checklist, before the failed-check severity floor is applied."""
     pre_flight = offline_checks or []
     if supervisor_status is SupervisorStatus.STOPPED:
         return HealthReport(
@@ -291,6 +334,13 @@ def derive(
     if _is_warming_up(snapshot):
         what, detail = _warmup_detail(snapshot)
         return HealthReport(WorkerPhase.WARMING_UP, HealthStatus.INFO, f"Warming up: {what}", detail, checks, True)
+
+    # The text backend sits where image warming-up sits: a worker whose image side is further along the
+    # ladder (serving a job, or still loading its own models) keeps that headline, and a scribe whose
+    # backend is not up is not "ready" for anything.
+    text_posture = _text_posture_report(snapshot, checks)
+    if text_posture is not None:
+        return text_posture
 
     idle_for = snapshot.seconds_since_last_pop
     if snapshot.time_spent_no_jobs_available > IDLE_SECONDS or (idle_for is not None and idle_for > IDLE_SECONDS):
@@ -525,7 +575,7 @@ def _api_check(
     if snapshot.in_error_backoff:
         return HealthCheck("API", HealthStatus.WARN, "Backing off after pop failures")
     if snapshot.worker_registered:
-        return HealthCheck("API", HealthStatus.OK, f"Reachable; registered as {snapshot.config.dreamer_name}")
+        return HealthCheck("API", HealthStatus.OK, f"Reachable; registered as {snapshot.config.worker_display_name}")
     return HealthCheck("API", HealthStatus.INFO, "Reachable; not yet acknowledged by the horde")
 
 
@@ -590,11 +640,126 @@ TEXT_GENERATION_CHECK_NAME = "Text generation"
 """Names the stall row (see :data:`TEXT_BACKEND_CHECK_NAME`)."""
 
 
+@dataclasses.dataclass(frozen=True)
+class TextBackendWait:
+    """Represents a text backend that is not ready yet, and how long that has been true."""
+
+    managed: bool
+    """Whether the worker launches the backend itself, which decides the remedy and the wording."""
+    seconds: float | None
+    """How long the worker has been waiting for the backend to answer, measured from its launch attempt.
+
+    None while a managed backend has not been launched at all, which is the worker obtaining the program:
+    a first run downloads it, and nothing about that is the backend failing to start."""
+    provision_error: str | None = None
+    """Why the program could not be obtained, or None while that has not happened.
+
+    A backend that cannot be obtained is never launched and so never late, which is exactly why this is
+    reported rather than waited on: no clock would ever run out."""
+
+
+def _text_backend_wait(snapshot: WorkerStateSnapshot) -> TextBackendWait | None:
+    """Return how long the scribe's backend has been unready, or None when there is nothing to report.
+
+    The clock a managed backend is judged by starts at its launch attempt rather than at the flow's first
+    look, because the worker legitimately spends minutes obtaining the program before there is anything to
+    launch. An attached backend has no launch the worker can time, so its clock is the readiness gate's own.
+    """
+    if not snapshot.config.scribe or snapshot.text_backend_ready or not snapshot.timestamp:
+        return None
+    if snapshot.config.text_backend_managed:
+        detail = _text_backend_detail(snapshot)
+        launching_since = detail.launching_since if detail is not None else None
+        provision_error = detail.provision_error if detail is not None else None
+        seconds = None if launching_since is None else max(0.0, snapshot.timestamp - launching_since)
+        return TextBackendWait(managed=True, seconds=seconds, provision_error=provision_error)
+    if snapshot.text_backend_not_ready_since is None:
+        return None
+    return TextBackendWait(
+        managed=False,
+        seconds=max(0.0, snapshot.timestamp - snapshot.text_backend_not_ready_since),
+    )
+
+
+def _text_backend_detail(snapshot: WorkerStateSnapshot) -> TextBackendDetail | None:
+    """Return the supervised text backend's row detail, or None when the snapshot carries no such row."""
+    for process in snapshot.processes:
+        if process.text_backend is not None:
+            return process.text_backend
+    return None
+
+
+def _text_posture_report(snapshot: WorkerStateSnapshot, checks: list[HealthCheck]) -> HealthReport | None:
+    """Return the headline a scribe's unready backend earns, or None when it has nothing to say.
+
+    A backend still being obtained or started is warming up, on the same footing as an image worker loading
+    its first model. Past the worker's own patience the cold start has stopped being a cold start and the
+    worker is serving nothing, which is a degraded worker rather than a slow one; past twice that, the
+    headline carries the remedy, because by then nothing is going to happen without the operator.
+    """
+    wait = _text_backend_wait(snapshot)
+    if wait is None:
+        return None
+    if wait.provision_error is not None:
+        return HealthReport(
+            WorkerPhase.DEGRADED,
+            HealthStatus.ERROR,
+            "Text backend could not be obtained",
+            f"{wait.provision_error} No text jobs can be served until the program is available; "
+            "`text_backend_executable` can point at one you already have.",
+            checks,
+            False,
+        )
+    if wait.seconds is None:
+        return HealthReport(
+            WorkerPhase.WARMING_UP,
+            HealthStatus.INFO,
+            "Warming up: obtaining the text backend",
+            "Fetching the text-inference program before it can be started. A first run downloads it.",
+            checks,
+            True,
+        )
+    patience = snapshot.config.text_backend_ready_patience_seconds
+    if wait.seconds <= patience:
+        started_by = "starting" if wait.managed else "waiting for"
+        return HealthReport(
+            WorkerPhase.WARMING_UP,
+            HealthStatus.INFO,
+            f"Warming up: {started_by} the text backend, {human_duration(wait.seconds)} so far",
+            "Loading the model into the backend. No text jobs are popped until it reports one.",
+            checks,
+            True,
+        )
+    failed = wait.seconds > patience * 2
+    detail = (
+        f"The backend has reported no loaded model. {_text_backend_remedy(wait)}"
+        if failed
+        else "The backend has not reported a loaded model yet; a large model on a cold disk can take minutes."
+    )
+    return HealthReport(
+        WorkerPhase.DEGRADED,
+        HealthStatus.ERROR if failed else HealthStatus.WARN,
+        f"Text backend not ready for {human_duration(wait.seconds)}",
+        detail,
+        checks,
+        True,
+    )
+
+
+def _text_backend_remedy(wait: TextBackendWait) -> str:
+    """Return what an operator should look at for a backend that is not answering."""
+    if wait.managed:
+        return "The worker launches it; see the Text Backend row and logs/text_backend.log."
+    return "Check that it is running and that `kai_url` is its address."
+
+
 def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
     """Text-generation rows: a backend that will not become ready, and a generation that stopped.
 
     Silent on a worker whose operator did not select the scribe role, which is nearly every worker: a
-    row about a backend nobody configured is noise on every other dashboard.
+    row about a backend nobody configured is noise on every other dashboard. Silent, too, while the worker
+    is still obtaining a managed backend, which is work in progress rather than a backend that is late; a
+    program that could not be obtained at all is reported at once instead, since no clock would run out.
 
     Both thresholds come off the config summary rather than being stated here, so the dashboard's verdict
     and the worker's own patience cannot drift apart. Readiness escalates rather than alarming at once
@@ -604,16 +769,18 @@ def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
     if not snapshot.config.scribe:
         return []
     rows: list[HealthCheck] = []
-    not_ready_for = _text_backend_not_ready_seconds(snapshot)
+    wait = _text_backend_wait(snapshot)
     patience = snapshot.config.text_backend_ready_patience_seconds
-    if not_ready_for is not None and not_ready_for > patience:
-        failed = not_ready_for > patience * 2
+    if wait is not None and wait.provision_error is not None:
+        rows.append(HealthCheck(TEXT_BACKEND_CHECK_NAME, HealthStatus.ERROR, wait.provision_error))
+    elif wait is not None and wait.seconds is not None and wait.seconds > patience:
+        failed = wait.seconds > patience * 2
         rows.append(
             HealthCheck(
                 TEXT_BACKEND_CHECK_NAME,
                 HealthStatus.ERROR if failed else HealthStatus.WARN,
-                f"No loaded model reported for {human_duration(not_ready_for)}; no text jobs are being "
-                "popped. Check that the backend is running and that `kai_url` is its address.",
+                f"No loaded model reported for {human_duration(wait.seconds)}; no text jobs are being "
+                f"popped. {_text_backend_remedy(wait)}",
             ),
         )
     stalled = _text_stall_seconds(snapshot)
@@ -627,13 +794,6 @@ def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
             ),
         )
     return rows
-
-
-def _text_backend_not_ready_seconds(snapshot: WorkerStateSnapshot) -> float | None:
-    """Return how long the text backend's readiness gate has been open, or None when it is not."""
-    if snapshot.text_backend_ready or snapshot.text_backend_not_ready_since is None or not snapshot.timestamp:
-        return None
-    return max(0.0, snapshot.timestamp - snapshot.text_backend_not_ready_since)
 
 
 def _text_stall_seconds(snapshot: WorkerStateSnapshot) -> float | None:

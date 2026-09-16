@@ -195,20 +195,6 @@ class NativeSupervisor(Protocol):
         """Request the explicit Horde-side maintenance state."""
 
 
-def _worker_name(snapshot: WorkerStateSnapshot) -> str:
-    """Choose the identity matching the workload this worker actually serves.
-
-    Each role registers under its own name on the horde, so a worker serving one of them is named for
-    that role rather than for a dreamer identity it never advertises.
-    """
-    served = set(snapshot.enabled_workloads)
-    if served == {WorkloadKind.ALCHEMY.value} and snapshot.config.alchemist_name:
-        return snapshot.config.alchemist_name
-    if served == {WorkloadKind.TEXT_GENERATION.value} and snapshot.config.scribe_name:
-        return snapshot.config.scribe_name
-    return snapshot.config.dreamer_name
-
-
 def _progress_percent(
     current: int | None,
     total: int | None,
@@ -324,7 +310,7 @@ def build_native_dashboard_state(supervisor: NativeSupervisor) -> NativeDashboar
         shutting_down=snapshot.shutting_down,
         snapshot_timestamp=snapshot.timestamp,
         session_start_time=snapshot.session_start_time or None,
-        worker_name=_worker_name(snapshot),
+        worker_name=snapshot.config.worker_display_name,
         worker_version=snapshot.config.worker_version,
         horde_username=snapshot.config.horde_username,
         jobs_popped=snapshot.num_jobs_popped,

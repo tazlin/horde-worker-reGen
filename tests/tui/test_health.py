@@ -8,6 +8,7 @@ import pytest
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
+    TextBackendDetail,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerFatalConfigError,
@@ -726,3 +727,134 @@ def test_a_worker_without_the_scribe_role_never_sees_a_text_check() -> None:
     )
 
     assert _text_checks(dreamer) == []
+
+
+_MANAGED_SCRIBE_CONFIG = _SCRIBE_CONFIG.model_copy(update={"text_backend_managed": True})
+"""A scribe worker that launches its own backend, which has a different clock and a different remedy."""
+
+
+def _managed_scribe(*, launching_for: float | None, gate_open_for: float) -> WorkerStateSnapshot:
+    """A worker launching its own backend, with a launch attempt begun ``launching_for`` ago.
+
+    ``launching_for`` of None is a worker still obtaining the program, which has no launch to time, and
+    ``gate_open_for`` is the flow's own clock, deliberately set much larger so a row proves which of the two
+    the check reads. The idle inference lane is what a scribe-only worker's own children look like once they
+    are up, so the image warming-up phase does not stand in front of the text one.
+    """
+    processes: list[ProcessSnapshot] = [_process("WAITING_FOR_JOB")]
+    if launching_for is not None:
+        processes.append(
+            ProcessSnapshot(
+                process_id=9100,
+                process_type="TEXT_BACKEND",
+                device_index=None,
+                last_process_state="LAUNCHING",
+                is_alive=True,
+                is_busy=False,
+                is_external=True,
+                display_state="launching",
+                text_backend=TextBackendDetail(
+                    kind="koboldcpp",
+                    port=5011,
+                    launching_since=10_000.0 - launching_for,
+                ),
+            ),
+        )
+    return _snapshot(
+        config=_MANAGED_SCRIBE_CONFIG,
+        timestamp=10_000.0,
+        processes=processes,
+        text_backend_ready=False,
+        text_backend_not_ready_since=10_000.0 - gate_open_for,
+    )
+
+
+def test_a_managed_backend_still_being_obtained_is_warming_up_and_raises_nothing() -> None:
+    """Downloading the program on a first run is work in progress, not a backend that will not start."""
+    snapshot = _managed_scribe(launching_for=None, gate_open_for=400.0)
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 1.0)
+
+    assert report.phase is WorkerPhase.WARMING_UP
+    assert "obtaining the text backend" in report.headline
+    assert _text_checks(snapshot) == []
+
+
+def test_a_managed_backends_patience_is_measured_from_its_launch_not_the_flows_first_look() -> None:
+    """The flow's clock starts with the worker, so a long provision would read as a late backend."""
+    snapshot = _managed_scribe(launching_for=30.0, gate_open_for=400.0)
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 1.0)
+
+    assert report.phase is WorkerPhase.WARMING_UP
+    assert "starting the text backend" in report.headline
+    assert _text_checks(snapshot) == []
+
+
+def test_a_managed_backend_past_its_patience_is_a_warn_headline_and_a_warn_row() -> None:
+    """A worker serving nothing while its own backend will not answer is not a ready worker."""
+    snapshot = _managed_scribe(launching_for=150.0, gate_open_for=400.0)
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 1.0)
+
+    assert report.phase is WorkerPhase.DEGRADED
+    assert report.severity is HealthStatus.WARN
+    assert "Text backend not ready" in report.headline
+    assert _text_checks(snapshot)[0].status is HealthStatus.WARN
+
+
+def test_a_managed_backend_past_twice_its_patience_names_the_worker_owned_remedy() -> None:
+    """The worker started it, so there is nothing for the operator to start: its output is the evidence."""
+    snapshot = _managed_scribe(launching_for=260.0, gate_open_for=400.0)
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 1.0)
+
+    assert report.severity is HealthStatus.ERROR
+    assert "logs/text_backend.log" in report.detail
+    row = _text_checks(snapshot)[0]
+    assert row.status is HealthStatus.ERROR
+    assert "logs/text_backend.log" in row.detail
+
+
+def test_an_attached_backend_past_its_patience_points_at_kai_url() -> None:
+    """A backend the operator runs is theirs to check, at the address they configured."""
+    row = _text_checks(_unready_scribe(seconds=260.0))[0]
+
+    assert "`kai_url` is its address" in row.detail
+
+
+def test_a_failed_check_is_never_reported_under_an_ok_headline() -> None:
+    """A headline at OK over a failed row tells an operator the opposite of what the row says."""
+    snapshot = _snapshot(processes=[_process("WAITING_FOR_JOB")], lora_pops_blocked_by_disk=True)
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    assert report.phase is WorkerPhase.READY
+    assert report.severity is HealthStatus.ERROR
+
+
+def test_a_program_that_could_not_be_obtained_is_an_error_not_a_warm_up() -> None:
+    """Nothing is retried after that failure, so a headline still reading "obtaining" would never resolve."""
+    snapshot = _managed_scribe(launching_for=None, gate_open_for=400.0)
+    row = ProcessSnapshot(
+        process_id=9100,
+        process_type="TEXT_BACKEND",
+        device_index=None,
+        last_process_state="STOPPED",
+        is_alive=False,
+        is_busy=False,
+        is_external=True,
+        display_state="not obtained",
+        text_backend=TextBackendDetail(kind="koboldcpp", provision_error="the release download failed"),
+    )
+    snapshot.processes = [_process("WAITING_FOR_JOB"), row]
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 1.0)
+
+    assert report.phase is WorkerPhase.DEGRADED
+    assert report.severity is HealthStatus.ERROR
+    assert report.headline == "Text backend could not be obtained"
+    assert "the release download failed" in report.detail
+    checks = _text_checks(snapshot)
+    assert [check.name for check in checks] == [TEXT_BACKEND_CHECK_NAME]
+    assert checks[0].status is HealthStatus.ERROR

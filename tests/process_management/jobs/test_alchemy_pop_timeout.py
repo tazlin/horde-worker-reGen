@@ -44,7 +44,10 @@ async def test_alchemy_pop_times_out_and_enters_error_backoff(monkeypatch: pytes
 
     session.submit_request.assert_awaited_once()
     assert request_cancelled.is_set(), "wait_for did not cancel the timed-out SDK request"
-    assert coordinator._last_pop_time >= started_at + (coordinator._error_pop_frequency - coordinator._pop_frequency)
+    # The hold is its own instant: the pop time itself is what the worker's "last pop" figure reads, so a
+    # backoff written into it would report a pop that has not happened yet.
+    assert coordinator._pop_hold_until >= started_at + coordinator._error_pop_frequency
+    assert coordinator.last_pop_time <= time.time()
 
 
 async def test_withheld_post_processors_are_logged_only_when_the_set_changes(

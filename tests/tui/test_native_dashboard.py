@@ -317,6 +317,7 @@ def _scribe_snapshot() -> WorkerStateSnapshot:
         timestamp=200.0,
         config=WorkerConfigSummary(
             dreamer_name="Native Worker",
+            dreamer=False,
             scribe_name="Native Scribe",
             worker_version="12.0.0",
             scribe=True,
@@ -396,6 +397,28 @@ def test_the_projection_carries_the_backend_row_activity_and_the_scribe_identity
     assert backend_row.queued_requests == 2
     assert backend_row.tokens_per_second == 16.0
     assert backend_row.busy is True
+
+
+def test_the_projection_names_every_enabled_role() -> None:
+    """A worker with two roles registers two workers on the horde, and the page names both of them."""
+    snapshot = _scribe_snapshot()
+    snapshot.config = snapshot.config.model_copy(update={"dreamer": True})
+
+    state = build_native_dashboard_state(_NativeSupervisorDouble(snapshot))
+
+    assert state.worker_name == "Native Worker and Native Scribe"
+
+
+def test_the_projection_names_an_alchemist_only_worker_by_its_alchemy_identity() -> None:
+    """The alchemist name is the only one such a worker advertises, whatever the dreamer name says."""
+    snapshot = _scribe_snapshot()
+    snapshot.config = snapshot.config.model_copy(
+        update={"dreamer": False, "scribe": False, "alchemist": True, "alchemist_name": "Native Alchemist"},
+    )
+
+    state = build_native_dashboard_state(_NativeSupervisorDouble(snapshot))
+
+    assert state.worker_name == "Native Alchemist"
 
 
 def test_the_native_page_renders_the_text_section_and_the_row_units() -> None:

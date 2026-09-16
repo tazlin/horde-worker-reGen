@@ -53,6 +53,7 @@ from horde_worker_regen.tui.widgets.simple import (
     SimpleHomeView,
     SimpleModelStatusView,
     TabPrimer,
+    _identity_words,
     _offer_words,
     _text_posture_words,
     _text_request_progress,
@@ -917,6 +918,43 @@ def test_the_hero_names_text_generation_and_the_model_serving_it() -> None:
     assert "Llama-3.2-3B" in named
     assert unnamed.endswith("text generation"), "a backend that has not answered names no model"
     assert "text generation" not in dreamer_only
+
+
+def test_the_identity_line_names_only_the_roles_the_operator_enabled() -> None:
+    """Every role's name defaults to something, so naming the unselected ones invents workers."""
+    scribe_only = WorkerConfigSummary(
+        dreamer_name="AuroraBox",
+        dreamer=False,
+        alchemist_name="An Awesome Alchemist",
+        scribe_name="AuroraBox-Scribe",
+        worker_version="9.9.9",
+        scribe=True,
+    )
+    dreamer_and_scribe = scribe_only.model_copy(update={"dreamer": True})
+    alchemist_only = scribe_only.model_copy(update={"scribe": False, "alchemist": True})
+
+    assert _identity_words(scribe_only, uptime=0.0).startswith("AuroraBox-Scribe, version")
+    assert _identity_words(dreamer_and_scribe, uptime=0.0).startswith("AuroraBox and AuroraBox-Scribe, version")
+    assert _identity_words(alchemist_only, uptime=0.0).startswith("An Awesome Alchemist, version")
+
+
+def test_the_offers_line_claims_image_work_only_for_a_dreamer() -> None:
+    """The image flags default on, so a scribe-only worker would otherwise advertise image-to-image."""
+    scribe_only = WorkerConfigSummary(
+        dreamer_name="AuroraBox",
+        dreamer=False,
+        scribe_name="AuroraBox-Scribe",
+        worker_version="9.9.9",
+        scribe=True,
+        allow_img2img=True,
+        allow_post_processing=True,
+        allow_lora=True,
+    )
+    alchemist_only = scribe_only.model_copy(update={"scribe": False, "alchemist": True})
+
+    assert _offer_words(scribe_only) == "text generation"
+    assert _offer_words(alchemist_only) == "alchemy"
+    assert "image-to-image" in _offer_words(scribe_only.model_copy(update={"dreamer": True}))
 
 
 def test_liveness_advances_on_text_arriving_and_not_on_the_supervisor_timestamp() -> None:

@@ -1372,11 +1372,24 @@ class HordeWorkerTUI(App[None]):
             parts.append(f"[grey62]kudos/hr[/] {kudos}")
             parts.append(f"[grey62]done[/] {snapshot.num_jobs_submitted}")
             parts.append(f"[yellow]faulted[/] {snapshot.num_jobs_faulted}" if snapshot.num_jobs_faulted else "")
-            parts.append(f"[grey62]worker[/] {snapshot.config.dreamer_name}")
+            parts.append(f"[grey62]worker[/] {self._worker_identity_markup(snapshot)}")
         parts.append(f"[grey62]mode[/] {self._supervisor.mode.value}")
 
         parts = [part for part in parts if part]
         self.query_one("#status-bar", Static).update(Text.from_markup(self._fit_status_parts(parts)))
+
+    @staticmethod
+    def _worker_identity_markup(snapshot: WorkerStateSnapshot) -> str:
+        """Name the worker for the status bar, the first enabled role's name plus a count of the others.
+
+        The bar sheds whole segments when the terminal is too narrow, so a multi-role worker's full identity
+        would cost the segments after it rather than being shortened; the count keeps the fact that there are
+        more names, and the Overview's identity line spells them out.
+        """
+        names = snapshot.config.enabled_worker_names
+        if len(names) <= 1:
+            return snapshot.config.worker_display_name
+        return f"{names[0]} +{len(names) - 1}"
 
     def _fit_status_parts(self, parts: list[str]) -> str:
         """Join ``parts`` (priority-ordered markup) with separators, dropping the tail that will not fit.

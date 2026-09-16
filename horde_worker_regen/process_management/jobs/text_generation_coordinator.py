@@ -479,6 +479,7 @@ class TextGenerationCoordinator:
         text_backend_kind: TEXT_BACKENDS,
         run_metrics: WorkerRunMetrics | None = None,
         launch_count_provider: Callable[[], int] | None = None,
+        backend_address_provider: Callable[[], str] | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators and the backend to generate through.
 
@@ -506,6 +507,10 @@ class TextGenerationCoordinator:
                 generation kernels, which the flow must treat as cold again whether or not it noticed
                 the restart. None for a backend the operator runs, whose restarts the worker cannot
                 count and whose cold flag is reset by the readiness gate alone.
+            backend_address_provider: Where the backend the driver was built for actually listens, for the
+                messages that tell an operator which address answered nothing. None means the operator's
+                `kai_url`, the convention `build_text_backend` already uses for its own address argument, so
+                a worker that launched the backend itself does not print an address it is not using.
 
         Raises:
             ValueError: Neither `backend` nor `backend_factory` was given, leaving nothing to generate
@@ -523,6 +528,7 @@ class TextGenerationCoordinator:
         self._text_backend_kind = text_backend_kind
         self._run_metrics = run_metrics
         self._launch_count_provider = launch_count_provider
+        self._backend_address_provider = backend_address_provider
 
         self._in_flight: dict[str, TextJobInFlight] = {}
         self._job_tasks: set[asyncio.Task[None]] = set()
@@ -564,6 +570,12 @@ class TextGenerationCoordinator:
         """Cumulative text jobs submitted as faulted this session."""
 
         self._last_pop_time = 0.0
+        """When the flow last asked the horde for text work; 0.0 before it has asked at all.
+
+        The instant itself, never moved forward to hold the next pop off: it is what the dashboard's "last
+        pop" reads, and a pop time in the future would read as a worker that popped before it started."""
+        self._pop_hold_until = 0.0
+        """Instant before which no pop is attempted, set by a pop that could not be completed."""
         self._pop_frequency = 2.0
         self._error_pop_frequency = 15.0
         self._loop_interval = 1.0
@@ -582,6 +594,26 @@ class TextGenerationCoordinator:
     def num_in_flight(self) -> int:
         """Text jobs popped, generating, or awaiting submission (the flow's total live work units)."""
         return len(self._in_flight)
+
+    @property
+    def last_pop_time(self) -> float:
+        """When this flow last asked the horde for text work, or 0.0 before it has asked at all.
+
+        The whole-worker "last pop" figure is the most recent pop across every flow, and on a scribe-only
+        worker this is the only flow that pops.
+        """
+        return self._last_pop_time
+
+    @property
+    def backend_address(self) -> str:
+        """Where the backend this flow generates through listens.
+
+        Every message that reports the backend unreachable names this rather than `kai_url`, which is the
+        wrong address for a backend the worker launched on a loopback port of its own choosing.
+        """
+        if self._backend_address_provider is None:
+            return self.bridge_data.kai_url
+        return self._backend_address_provider()
 
     @property
     def advertisement(self) -> TextFlowAdvertisement | None:
@@ -705,8 +737,8 @@ class TextGenerationCoordinator:
             if time.monotonic() - last_notice_at >= READY_SLOW_START_NOTICE_SECONDS:
                 last_notice_at = time.monotonic()
                 logger.warning(
-                    f"Text backend at {self.bridge_data.kai_url} has not reported a loaded model after "
-                    f"{waited_seconds:.0f}s. Is it running, and is `kai_url` its address? A password-protected "
+                    f"Text backend at {self.backend_address} has not reported a loaded model after "
+                    f"{waited_seconds:.0f}s. {self._backend_not_answering_remedy()} A password-protected "
                     "backend that refuses the worker's credentials reads as a backend that is down.",
                 )
             else:
@@ -716,6 +748,17 @@ class TextGenerationCoordinator:
             backoff_seconds = min(backoff_seconds * 2, READY_BACKOFF_MAX_SECONDS)
 
         return False
+
+    def _backend_not_answering_remedy(self) -> str:
+        """Return what an operator should look at when the backend reports no loaded model.
+
+        A backend the worker launches has nothing for the operator to start, and the reason it is not
+        answering is in the launch the worker performed; one the operator runs is theirs to check, at the
+        address they configured.
+        """
+        if self.bridge_data.text_backend_managed:
+            return "The worker launches it, so its own output is in logs/text_backend.log."
+        return "Is it running, and is `kai_url` its address?"
 
     def _close_readiness_gate(self) -> None:
         """Drop what the backend told the flow, and start the clock on how long it has been unready.
@@ -825,7 +868,10 @@ class TextGenerationCoordinator:
             return False
         if len(self._in_flight) >= bridge_data.text_threads:
             return False
-        return (time.time() - self._last_pop_time) >= self._pop_frequency
+        now = time.time()
+        if now < self._pop_hold_until:
+            return False
+        return (now - self._last_pop_time) >= self._pop_frequency
 
     def _build_pop_request(self, advertisement: TextFlowAdvertisement) -> TextGenerateJobPopRequest:
         """Create the pop request offering exactly what the gate established this worker can serve."""
@@ -846,7 +892,7 @@ class TextGenerationCoordinator:
 
     def _enter_pop_error_backoff(self) -> None:
         """Hold off the next pop by the error interval after a pop that could not be completed."""
-        self._last_pop_time = time.time() + (self._error_pop_frequency - self._pop_frequency)
+        self._pop_hold_until = time.time() + self._error_pop_frequency
 
     def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
         """Log a text pop error, with actionable guidance for the common, recoverable causes.

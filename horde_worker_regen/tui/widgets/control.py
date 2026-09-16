@@ -113,7 +113,7 @@ class ControlView(VerticalScroll):
         local_pause = "paused" if self._paused else "serving allowed"
         server_maintenance = "on" if self._server_maintenance else "off"
         auto_start = "on" if self._auto_start else "off"
-        worker = snapshot.config.dreamer_name if snapshot is not None else "-"
+        worker = snapshot.config.worker_display_name if snapshot is not None else "-"
         table.add_row("Worker", worker, "Supervisor", supervisor_status.value)
         table.add_row("Local pause", local_pause, "Horde maintenance", server_maintenance)
         table.add_row("Auto-start", auto_start, "Restart attempts", str(restart_attempts))

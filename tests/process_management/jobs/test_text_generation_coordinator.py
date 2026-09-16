@@ -147,6 +147,7 @@ def _make_coordinator(
     state: WorkerState | None = None,
     run_metrics: WorkerRunMetrics | None = None,
     launch_count_provider: Callable[[], int] | None = None,
+    backend_address_provider: Callable[[], str] | None = None,
     **bridge_overrides: object,
 ) -> tuple[TextGenerationCoordinator, FakeTextBackend, _FakeHordeClientSession]:
     """Create a coordinator over a fake backend and a fake horde session, with the scribe role on.
@@ -173,6 +174,7 @@ def _make_coordinator(
         text_backend_kind=bridge_data.text_backend_kind,
         run_metrics=run_metrics,
         launch_count_provider=launch_count_provider,
+        backend_address_provider=backend_address_provider,
     )
     return coordinator, resolved_backend, resolved_session
 
@@ -1087,3 +1089,68 @@ async def test_the_readiness_clock_starts_when_the_gate_opens_and_stops_when_it_
 
     assert coordinator.backend_ready is True
     assert coordinator.backend_not_ready_since is None
+
+
+async def test_the_slow_backend_notice_names_the_address_the_driver_uses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker that launched its own backend reaches it on its own port, not on the configured `kai_url`.
+
+    An operator who is told to check an address the worker is not using looks at a healthy program and
+    finds nothing, which is worse than being told nothing.
+    """
+    _quicken_readiness(monkeypatch)
+    monkeypatch.setattr(text_generation_coordinator, "READY_SLOW_START_NOTICE_SECONDS", 0.0)
+    coordinator, _backend, _session = _make_coordinator(
+        backend=FakeTextBackend(description=_DESCRIPTION, ready_results=(False,)),
+        backend_address_provider=lambda: "http://127.0.0.1:5011",
+        text_backend_managed=True,
+    )
+    logged: list[str] = []
+    sink_id = logger.add(lambda m: logged.append(m.record["message"]), level="TRACE")
+    try:
+        assert await coordinator.await_backend_ready() is True
+    finally:
+        logger.remove(sink_id)
+
+    notices = [message for message in logged if "has not reported a loaded model" in message]
+    assert notices
+    assert "http://127.0.0.1:5011" in notices[0]
+    assert "localhost:5000" not in notices[0]
+    assert "logs/text_backend.log" in notices[0], "the worker launched it, so its own output is the evidence"
+
+
+async def test_the_slow_backend_notice_asks_about_kai_url_for_a_backend_the_operator_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attached backend is the operator's program at the address they configured, so that is the question."""
+    _quicken_readiness(monkeypatch)
+    monkeypatch.setattr(text_generation_coordinator, "READY_SLOW_START_NOTICE_SECONDS", 0.0)
+    coordinator, _backend, _session = _make_coordinator(
+        backend=FakeTextBackend(description=_DESCRIPTION, ready_results=(False,)),
+        text_backend_managed=False,
+    )
+    logged: list[str] = []
+    sink_id = logger.add(lambda m: logged.append(m.record["message"]), level="TRACE")
+    try:
+        assert await coordinator.await_backend_ready() is True
+    finally:
+        logger.remove(sink_id)
+
+    notices = [message for message in logged if "has not reported a loaded model" in message]
+    assert notices
+    assert "http://localhost:5000" in notices[0], "with no provider the address is the operator's `kai_url`"
+    assert "is `kai_url` its address?" in notices[0]
+
+
+async def test_a_failed_pop_holds_the_next_one_without_moving_the_last_pop_instant() -> None:
+    """The whole-worker "last pop" figure reads this instant, so a hold must not be written into it."""
+    coordinator, _backend, _session = _make_coordinator()
+    assert await coordinator.await_backend_ready() is True
+    await coordinator.api_text_pop()
+    popped_at = coordinator.last_pop_time
+    assert popped_at > 0.0
+
+    coordinator._enter_pop_error_backoff()
+
+    assert coordinator.last_pop_time == popped_at
+    assert coordinator.last_pop_time <= time.time()
+    assert coordinator._should_pop() is False, "the hold is what keeps the next pop off"

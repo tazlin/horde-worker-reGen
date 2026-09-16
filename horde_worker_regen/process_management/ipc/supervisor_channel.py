@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 26
+SUPERVISOR_PROTOCOL_VERSION = 27
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -105,6 +105,20 @@ the requests and token rate only the text flow can see onto the backend's row; `
 ``snapshot_interval_seconds``, with ``text_stall_seconds`` and ``text_backend_ready_patience_seconds``
 on the config summary so the dashboard's text checks derive their thresholds from the worker rather than
 restating them.
+v27 makes the worker's identity and its text backend's posture readable from the summary alone. The config
+summary gains ``dreamer`` (the third role flag, so every surface can name the enabled roles rather than
+guessing from the workload list) and ``text_backend_managed`` (whether the worker launches the backend
+itself, which decides the remedy a stuck backend is given); :attr:`WorkerConfigSummary.enabled_worker_names`
+and :attr:`WorkerConfigSummary.worker_display_name` are the one place that identity is derived.
+``TextBackendDetail`` gains ``launching_since``, the instant the current launch attempt began, which is
+what the readiness patience window is measured from for a backend the worker launches, and
+``provision_error``, why its program could not be obtained; ``port`` becomes optional because the row now
+exists from before the command line is rendered (the supervised backend's life begins at obtaining it, and
+``TextBackendState.PROVISIONING`` is the state it reports meanwhile). The snapshot's whole-worker counters
+(``num_jobs_popped``, ``num_jobs_submitted``, ``num_jobs_faulted``, ``jobs_in_progress``,
+``seconds_since_last_pop``) now include alchemy and text work, so a worker serving either alone reports its
+own headline figures rather than zero; the ``alchemy_*`` and ``text_*`` fields and ``workload_totals`` remain
+the per-workload split.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -311,6 +325,11 @@ class WorkerConfigSummary(BaseModel):
     """
 
     dreamer_name: str
+    dreamer: bool = True
+    """Whether the operator selected the image-generation role.
+
+    Defaults on, which is what a worker predating the field meant: the role is on by default and the field
+    exists so a surface can tell a dreamer's name from a name the worker never advertises."""
     alchemist_name: str | None = None
     """The worker's alchemist identity, shown in place of the dreamer name on an alchemist-only worker."""
     worker_version: str
@@ -361,6 +380,38 @@ class WorkerConfigSummary(BaseModel):
     The same figure the gate's own log line uses, so the check and the log agree about when a cold start
     has stopped being a cold start. Not operator-configurable today; it rides the config summary because
     that is where the dashboard's text thresholds come from."""
+    text_backend_managed: bool = False
+    """Whether the worker launches the text backend itself rather than reaching one the operator runs.
+
+    The two have different remedies when the backend does not answer, and only the worker knows which
+    arrangement it is in: a managed backend's failure is in the worker's own log and its supervised row,
+    while an attached one is the operator's program at the address they configured."""
+
+    @property
+    def enabled_worker_names(self) -> tuple[str, ...]:
+        """Return the horde names of the roles this operator enabled, in the order dreamer, alchemist, scribe.
+
+        Each role registers as its own separately-named worker on the horde, so a worker with two roles on
+        has two identities and a surface that shows one of them is showing half the worker. The role flags
+        decide this rather than the served-workload list: a role whose backend is not ready yet is still
+        part of who the worker is. Empty only when every role is off, which the worker warns about at
+        start-up.
+        """
+        by_role = (
+            (self.dreamer, self.dreamer_name),
+            (self.alchemist, self.alchemist_name),
+            (self.scribe, self.scribe_name),
+        )
+        return tuple(name for enabled, name in by_role if enabled and name)
+
+    @property
+    def worker_display_name(self) -> str:
+        """Return the enabled roles' names as one phrase, for a surface with room for all of them.
+
+        Falls back to the dreamer name when no role is enabled, so a misconfigured worker still has
+        something to be called rather than an empty line.
+        """
+        return " and ".join(self.enabled_worker_names) or self.dreamer_name
 
 
 class ResidentComponentEntry(BaseModel):
@@ -430,8 +481,12 @@ class TextBackendDetail(BaseModel):
     """The ``TEXT_BACKENDS`` value naming the program (``koboldcpp``); a ``str`` so a future kind survives."""
     model_name: str | None = None
     """The model the backend reports having loaded; None before it has been asked or when it did not answer."""
-    port: int
-    """The loopback port the backend listens on."""
+    port: int | None = None
+    """The loopback port the backend listens on, or None before its command line has been rendered.
+
+    A managed backend's row exists from the moment the worker sets out to have one, which is before the
+    program has been obtained, and the port is part of that rendered command line rather than a fact the
+    row can state earlier."""
     context_length: int | None = None
     """The largest prompt-plus-generation token count the backend says it accepts."""
     max_length: int | None = None
@@ -443,6 +498,18 @@ class TextBackendDetail(BaseModel):
 
     A measured whole-process footprint, not a torch allocator reading: it is not comparable with a slot's
     ``vram_usage_mb`` and the dashboards mark it as measured where they show it."""
+    launching_since: float | None = None
+    """When the most recent launch attempt began, or None before the worker has attempted one.
+
+    The instant a readiness patience window is measured from for a backend the worker launches: obtaining
+    the program can take minutes of downloading before a launch is even attempted, and a clock started
+    before that reads a legitimate first-run provision as a backend that will not start. Stamped per
+    attempt, so a relaunch is given the same patience the first launch had."""
+    provision_error: str | None = None
+    """Why the backend's program could not be obtained, or None while that has not happened.
+
+    A backend that cannot be obtained is never launched, so without this the row and the headline would sit
+    at "obtaining" for the rest of the session over a program that is never coming."""
     ready_since: float | None = None
     """When the backend first answered its readiness probe for the current launch; None when not serving."""
     last_health_ok_at: float | None = None

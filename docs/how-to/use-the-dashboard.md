@@ -200,12 +200,22 @@ resident model, GPU, memory, heartbeat, and completed count.
 A scribe worker's text backend is the last row of the process table, typed **Text Backend**. It is an
 external program rather than one of the worker's own processes, so its cells read a little differently:
 the id column shows its OS pid, the state column shows what the worker's supervisor is doing with it
-(`launching`, `ready`, `relaunching in 8 s`) plus its token rate while it generates, the GPU column is a
-dash when it runs on no card, and the baseline column gives the context size it was loaded with. Its VRAM
+(`provisioning` while the program is still being obtained, then `launching`, `ready`,
+`relaunching in 8 s`, or `not obtained` when the program could not be fetched at all) plus its token
+rate while it generates, the GPU column is a dash when it runs on no card, and the baseline column gives
+the context size it was loaded with. The Live tab's Backend line reads "program not yet obtained" until
+the command line has been rendered, and carries the reason on the row when obtaining failed. The
+headline above says which of those the worker is in: warming up while the backend is being obtained or
+started, a warning once that has run past the readiness patience, and an error past twice it naming where
+to look (this row and `logs/text_backend.log` for a backend the worker launches, `kai_url` for one you
+run). Its VRAM
 figure is marked **measured**: it is how much the card's free memory dropped while the backend loaded, not
 an allocator reading like the inference slots', so the two are not comparable. The heartbeat column is how
 long ago the backend last answered a readiness probe, which the worker asks only while it is starting, so
 that figure grows while it serves and is not a sign of trouble.
+
+The worker panel's first line is the worker's identity: every enabled role's horde name, joined with
+"and". A role you switched off is never named there, whatever name its field still holds.
 
 A scribe worker also gets a **Text** panel beside the alchemy one. It states whether the backend has
 reported a loaded model (and how long it has not, when it has not), the model it loaded, the context and
@@ -214,6 +224,10 @@ kudos text earned, and the most recent token rate. A backend that counts no toke
 the rate rather than showing a dash, because the absence holds for that backend's whole life rather than
 for this moment. On a worker whose only role is scribe, the worker panel names it **Scribe** with the
 scribe identity, as an alchemist-only worker is named for its alchemist.
+
+Simple's "Offers" line claims image work only when the dreamer role is on: the flags behind image-to-image,
+LoRA, ControlNet and post-processing default on, so a scribe-only or alchemist-only worker would otherwise
+advertise work it never pops.
 
 A **Governance** panel consolidates the pop governors and the scheduler's RAM and preload diagnostics;
 its title says how many governors are actively holding work back. Multi-GPU workers also get a
@@ -299,11 +313,12 @@ The tables roll finalized image jobs up by model and by baseline, carrying jobs,
 batch above one. An alchemist worker also gets a per-form table: kind (graph or CLIP), forms completed,
 faults, average and total pop-to-submit time, and peak VRAM.
 
-A worker that served more than one workload also gets a **By workload totals** table: completed,
-faulted and kudos for each of image generation, alchemy and text generation, plus the mean tokens per
-text job where the backend counted them. The headline counters above are one pair for the whole worker
-and cannot say which flow earned what; a worker serving one workload sees no such table, because its
-headline figures already are the split.
+A worker that served any workload other than image generation also gets a **By workload totals** table:
+completed, faulted and kudos for each of image generation, alchemy and text generation, plus the mean
+tokens per text job where the backend counted them. The headline counters above are one pair for the whole
+worker and cannot say which flow earned what, nor state anything a text job is measured in, so a
+scribe-only worker's single row is where its token mean appears. An image-only worker sees no such table,
+because its headline figures already are the split.
 
 **JSONL export** toggles session-scoped stats export under `.horde_worker_regen/stats/`. It is off by
 default, rotates at 5 MiB per file, and warns once retained files exceed 50 MiB. Compress or downsample
@@ -411,9 +426,14 @@ The suggested config shows per-setting provenance (proven, untested, failed, or 
 A one-line status bar sits above the tabs and stays visible everywhere. It leads with the worker's
 lifecycle phase as a coloured badge and a health summary (the worst outstanding check, or an `N/N ok`
 tally), then the live vitals: the job pipeline (`q▸inf▸post▸saf▸sub` when post-processing is enabled),
-GPU duty, system RAM, kudos/hr, jobs done and faulted, and the worker name. On a narrow terminal the
-lowest-priority segments drop from the right rather than wrap, so the phase and health are never pushed
-off the line.
+GPU duty, system RAM, kudos/hr, jobs done and faulted, and the worker name. Jobs done and faulted are the
+whole worker's, across image, alchemy and text. On a narrow terminal the lowest-priority segments drop from
+the right rather than wrap, so the phase and health are never pushed off the line.
+
+Each enabled role registers as its own separately-named worker on the horde, so the worker name is the
+first enabled role's name with `+1` (or `+2`) after it when there is more than one; the Overview's and
+Simple's identity lines and the browser page spell all of them out, joined with "and". A role you switched
+off is never named, whatever name its field still holds.
 
 ## Keyboard shortcuts
 

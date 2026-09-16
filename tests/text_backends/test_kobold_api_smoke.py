@@ -24,12 +24,14 @@ from horde_model_reference.text_backend_names import TEXT_BACKENDS
 
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import (
+    LaunchSpecFactory,
     TextBackendSupervisor,
     default_launch_process,
 )
 from horde_worker_regen.text_backends import (
     KoboldApiTextBackend,
     TextBackendLaunchSettings,
+    TextBackendLaunchSpec,
     TextGenerationProgress,
     build_launch_spec,
 )
@@ -63,6 +65,11 @@ async def _wait_until_serving(supervisor: TextBackendSupervisor) -> None:
 
 
 @pytest.mark.slow
+def factory_for(spec: TextBackendLaunchSpec) -> LaunchSpecFactory:
+    """Return a factory handing the supervisor the spec this row rendered for the real binary."""
+    return lambda: spec
+
+
 async def test_real_koboldcpp_streams_a_generation_and_reports_it_arriving(tmp_path: Path) -> None:
     """A real streamed generation arrives in pieces and answers the same shape the blocking route does.
 
@@ -93,7 +100,7 @@ async def test_real_koboldcpp_streams_a_generation_and_reports_it_arriving(tmp_p
     async with aiohttp.ClientSession() as session:
         backend = KoboldApiTextBackend(launch_spec.base_url, session)
         supervisor = TextBackendSupervisor(
-            launch_spec=launch_spec,
+            launch_spec_factory=factory_for(launch_spec),
             backend=backend,
             owned_registry=OwnedProcessRegistry(tmp_path / "owned.json"),
             launch_process=default_launch_process,

@@ -407,6 +407,7 @@ class AlchemyCoordinator:
     """Per card, the low-water mark of free VRAM (MB) seen while that card had a form in flight."""
 
     _last_pop_time: float
+    _pop_hold_until: float
     _pop_frequency: float
     _error_pop_frequency: float
     _loop_interval: float
@@ -482,6 +483,13 @@ class AlchemyCoordinator:
         self._min_free_vram_mb = {}
 
         self._last_pop_time = 0.0
+        """When the flow last asked the horde for forms; 0.0 before it has asked at all.
+
+        The instant itself, never moved forward to hold the next pop off: the whole-worker "last pop"
+        figure reads it, and a pop time in the future would read as a worker that popped before it
+        started."""
+        self._pop_hold_until = 0.0
+        """Instant before which no pop is attempted, set by a pop that could not be completed."""
         self._pop_frequency = 4.0
         self._error_pop_frequency = 15.0
         self._loop_interval = 1.0
@@ -500,6 +508,15 @@ class AlchemyCoordinator:
     def num_in_flight(self) -> int:
         """Forms popped, dispatched, or awaiting submission (the flow's total live work units)."""
         return len(self._pending_forms) + len(self._in_flight) + len(self._pending_submits)
+
+    @property
+    def last_pop_time(self) -> float:
+        """When this flow last asked the horde for forms, or 0.0 before it has asked at all.
+
+        The whole-worker "last pop" figure is the most recent pop across every flow, and on an
+        alchemist-only worker this is the only flow that pops.
+        """
+        return self._last_pop_time
 
     @property
     def num_forms_pending(self) -> int:
@@ -635,7 +652,10 @@ class AlchemyCoordinator:
             return False
         if len(self._in_flight) >= max(bridge_data.alchemy_max_concurrency, 1):
             return False
-        if (time.time() - self._last_pop_time) < self._pop_frequency:
+        now = time.time()
+        if now < self._pop_hold_until:
+            return False
+        if (now - self._last_pop_time) < self._pop_frequency:
             return False
 
         offered = expand_offered_forms(
@@ -974,16 +994,16 @@ class AlchemyCoordinator:
             logger.warning(
                 f"Alchemy pop request timed out after {ALCHEMY_POP_REQUEST_TIMEOUT_SECONDS:.0f} seconds",
             )
-            self._last_pop_time = time.time() + (self._error_pop_frequency - self._pop_frequency)
+            self._pop_hold_until = time.time() + self._error_pop_frequency
             return
         except Exception as e:
             logger.warning(f"Failed to pop alchemy job (Unexpected Error): {e}")
-            self._last_pop_time = time.time() + (self._error_pop_frequency - self._pop_frequency)
+            self._pop_hold_until = time.time() + self._error_pop_frequency
             return
 
         if isinstance(pop_response, RequestErrorResponse):
             self._handle_pop_error_response(pop_response)
-            self._last_pop_time = time.time() + (self._error_pop_frequency - self._pop_frequency)
+            self._pop_hold_until = time.time() + self._error_pop_frequency
             return
 
         if not pop_response.forms:

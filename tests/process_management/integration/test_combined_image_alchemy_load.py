@@ -125,6 +125,8 @@ def _make_coordinator(
     coordinator._free_vram_baseline_mb = {}
     coordinator._min_free_vram_mb = {}
     coordinator._last_pop_time = 0.0
+    # The pop gate reads the hold as well as the instant, and this double skips __init__.
+    coordinator._pop_hold_until = 0.0
     coordinator._pop_frequency = 4.0
     coordinator.num_forms_faulted = 0
     return coordinator

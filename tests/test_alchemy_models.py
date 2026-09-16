@@ -875,6 +875,8 @@ def _make_policy_coordinator(
     coordinator._in_flight_owner = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
     coordinator._last_pop_time = 0.0
+    # The pop gate reads the hold as well as the instant, and this double skips __init__.
+    coordinator._pop_hold_until = 0.0
     coordinator._pop_frequency = 4.0
     return coordinator
 

@@ -85,3 +85,30 @@ def test_a_workload_whose_backend_counts_no_tokens_shows_no_mean() -> None:
 
     assert "Text generation" in text
     assert "-" in text
+
+
+def test_the_workload_split_shows_for_a_scribe_only_worker() -> None:
+    """Its single row carries the token mean, which the headline counters have no room for."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", dreamer=False, worker_version="12.0.0", scribe=True),
+        workload_totals={
+            WorkloadKind.TEXT_GENERATION: WorkloadTotalsSnapshot(
+                completed=9,
+                faulted=1,
+                kudos=37.5,
+                mean_generated_tokens=152.0,
+            ),
+        },
+    )
+
+    assert StatsView._shows_workload_split(snapshot) is True
+
+
+def test_the_workload_split_stays_hidden_on_an_image_only_worker() -> None:
+    """One workload's totals are the headline figures already, so the table would only restate them."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        workload_totals={WorkloadKind.IMAGE_GENERATION: WorkloadTotalsSnapshot(completed=40, faulted=2, kudos=310.0)},
+    )
+
+    assert StatsView._shows_workload_split(snapshot) is False

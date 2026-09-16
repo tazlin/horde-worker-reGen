@@ -13,6 +13,7 @@ import time
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import ModelPoolSeatReadiness
 from horde_worker_regen.process_management.jobs.pool_lanes import LaneDecision, PoolLaneState
+from horde_worker_regen.process_management.jobs.text_generation_coordinator import TextJobInFlight
 from horde_worker_regen.process_management.scheduling.model_demand_poller import DemandSnapshot
 from horde_worker_regen.process_management.scheduling.model_pool import (
     ModelPool,
@@ -249,3 +250,90 @@ def test_headless_publish_still_builds_the_snapshot_at_the_floor() -> None:
     manager._last_supervisor_publish_time -= manager._supervisor_publish_floor_interval + 1.0
     manager._publish_supervisor_snapshot()
     assert builds == 2
+
+
+def test_text_work_reaches_the_whole_worker_counters() -> None:
+    """The header, the hero, the Stats tab and the native page read these, and a scribe's work is the worker's.
+
+    ``total_num_completed_jobs`` counts terminal jobs with faults included, so the text term is submits plus
+    fault reports; otherwise a faulted text job would be counted as faulted and never as done.
+    """
+    manager = make_testable_process_manager(scribe=True)
+    coordinator = manager._text_coordinator
+    assert coordinator is not None
+    coordinator.num_jobs_submitted = 4
+    coordinator.num_jobs_faulted = 1
+    coordinator._in_flight["in-hand"] = TextJobInFlight(
+        job_id="in-hand",
+        payload={},
+        time_popped=time.time(),
+        model_name="koboldcpp/a-model",
+    )
+    coordinator._last_pop_time = time.time()
+
+    snapshot = manager._build_worker_state_snapshot()
+
+    assert snapshot.num_jobs_submitted == 5
+    assert snapshot.num_jobs_faulted == 1
+    assert snapshot.jobs_in_progress == 1
+    assert snapshot.num_jobs_popped == 1
+    assert snapshot.seconds_since_last_pop is not None
+    assert snapshot.seconds_since_last_pop < 60.0
+    assert snapshot.latest_stats_sample is not None
+    assert snapshot.latest_stats_sample.jobs_submitted == 5
+    # The per-workload split is what it was: the headline is a sum, not a replacement.
+    assert (snapshot.text_total_submitted, snapshot.text_total_faulted, snapshot.text_jobs_in_flight) == (4, 1, 1)
+
+
+def test_a_worker_with_no_text_flow_counts_exactly_what_it_did_before() -> None:
+    """Every text term is zero on a worker that never had a text flow, so its snapshot is unchanged."""
+    manager = make_testable_process_manager()
+
+    snapshot = manager._build_worker_state_snapshot()
+
+    assert manager._text_coordinator is None
+    counters = (
+        snapshot.num_jobs_submitted,
+        snapshot.num_jobs_faulted,
+        snapshot.num_jobs_popped,
+        snapshot.jobs_in_progress,
+    )
+    assert counters == (0, 0, 0, 0)
+    assert snapshot.seconds_since_last_pop is None
+
+
+def test_alchemy_work_reaches_the_whole_worker_counters() -> None:
+    """An alchemist-only worker's header read the image tracker's zero for the same reason a scribe's did.
+
+    Alchemy forms never enter the image job tracker (it is read for gating and never written), so the
+    coordinator's own counters are the only place its work exists.
+    """
+    manager = make_testable_process_manager(alchemist=True)
+    coordinator = manager._alchemy_coordinator
+    coordinator.num_forms_submitted = 7
+    coordinator.num_forms_faulted = 2
+    coordinator._last_pop_time = time.time()
+
+    snapshot = manager._build_worker_state_snapshot()
+
+    assert snapshot.num_jobs_submitted == 9
+    assert snapshot.num_jobs_faulted == 2
+    assert snapshot.seconds_since_last_pop is not None
+    assert snapshot.seconds_since_last_pop < 60.0
+    # The per-workload split is untouched, as it is for text.
+    assert (snapshot.alchemy_total_submitted, snapshot.alchemy_total_faulted) == (7, 2)
+
+
+def test_the_run_record_counts_every_flows_delivered_work() -> None:
+    """A session is judged productive by what it delivered, and a scribe delivers none of it as image jobs."""
+    manager = make_testable_process_manager(scribe=True, alchemist=True)
+    text = manager._text_coordinator
+    assert text is not None
+    text.num_jobs_submitted = 3
+    text.num_jobs_faulted = 1
+    manager._alchemy_coordinator.num_forms_submitted = 2
+
+    record = manager.build_run_record()
+
+    assert record.jobs_submitted == 6
+    assert record.jobs_faulted == 1

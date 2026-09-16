@@ -12,6 +12,7 @@ import threading
 import time
 from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping
+from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
 from multiprocessing.synchronize import BoundedSemaphore as BoundedSemaphore_MultiProcessing
@@ -277,11 +278,11 @@ from horde_worker_regen.text_backends import (
     LOOPBACK_HOST,
     TextBackend,
     TextBackendLaunchSettings,
+    TextBackendLaunchSpec,
     TextGenerationProgress,
-    UnsupportedTextBackendError,
     build_launch_spec,
 )
-from horde_worker_regen.text_backends.provision import TextBackendProvisionError, provision_executable
+from horde_worker_regen.text_backends.provision import provision_executable
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers, mean_across_cards
@@ -2099,6 +2100,10 @@ class HordeWorkerProcessManager:
                 launch_count_provider=(
                     self._managed_text_backend_launch_count if bridge_data.text_backend_managed else None
                 ),
+                # Read through the same callable the driver's own address comes from, so the flow's
+                # messages and the driver's requests cannot name different backends, and a hot-reloaded
+                # `kai_url` reaches both.
+                backend_address_provider=self._text_backend_address,
             )
             self._text_coordinator = text_coordinator
             self._flows[WorkloadKind.TEXT_GENERATION] = text_coordinator
@@ -7859,6 +7864,62 @@ class HordeWorkerProcessManager:
             tokens_per_second=latest_rate,
         )
 
+    # region whole-worker job counters
+
+    # A worker's headline job figures are the whole worker's. The image job tracker knows only image jobs,
+    # so a worker serving alchemy or text alone would report the tracker's zero while its own counters
+    # climbed. Each flow's counters keep the semantics the tracker's have, which is what makes them
+    # addable, and the per-workload split stays on the ``alchemy_*``/``text_*`` fields and
+    # ``workload_totals``. Defined once here because the snapshot, its stats sample and the durable run
+    # record all state the same totals.
+
+    def _terminal_jobs_every_flow(self) -> int:
+        """Return terminal jobs across every workload, faults included, as the image tracker counts them.
+
+        ``JobTracker.total_num_completed_jobs`` is a movement counter that includes faults, so each other
+        flow contributes its delivered submits plus its fault reports: those two are disjoint in both flows,
+        and together they are the work that reached an end.
+        """
+        alchemy = self._alchemy_coordinator
+        text = self._text_coordinator
+        terminal = self._job_tracker.total_num_completed_jobs
+        terminal += alchemy.num_forms_submitted + alchemy.num_forms_faulted
+        if text is not None:
+            terminal += text.num_jobs_submitted + text.num_jobs_faulted
+        return terminal
+
+    def _faulted_jobs_every_flow(self) -> int:
+        """Return the faults recorded across every workload this session."""
+        text = self._text_coordinator
+        faulted = self._job_tracker.num_jobs_faulted + self._alchemy_coordinator.num_forms_faulted
+        return faulted if text is None else faulted + text.num_jobs_faulted
+
+    def _jobs_in_hand_other_flows(self) -> int:
+        """Return the work units the non-image flows currently hold, popped through to awaiting submit.
+
+        Held and in-flight are one number for both of these flows, unlike an image job's several stages, so
+        the same term serves the snapshot's queued and in-progress figures.
+        """
+        text = self._text_coordinator
+        in_hand = self._alchemy_coordinator.num_in_flight
+        return in_hand if text is None else in_hand + text.num_in_flight
+
+    def _seconds_since_any_flows_last_pop(self, now: float) -> float | None:
+        """Return the age of the most recent pop any flow made, or None when none has popped yet.
+
+        Every flow asks the horde for its own work, so a worker that popped a second ago on one of them has
+        popped: reading the image popper alone says "never" for the whole life of a scribe-only worker.
+        """
+        text = self._text_coordinator
+        last_pop_time = max(
+            self._state.last_job_pop_time,
+            self._alchemy_coordinator.last_pop_time,
+            0.0 if text is None else text.last_pop_time,
+        )
+        return (now - last_pop_time) if last_pop_time else None
+
+    # endregion
+
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
         import horde_worker_regen
@@ -7901,8 +7962,18 @@ class HordeWorkerProcessManager:
         # Reduce from the per-card figures already computed rather than re-walking each card's buffer.
         gpu_utilization_mean_percent = mean_across_cards(gpu_duty_per_card.values())
         gpu_utilization_busy_fraction = mean_across_cards(gpu_busy_per_card.values())
-        last_pop_time = self._state.last_job_pop_time
-        seconds_since_last_pop = (now - last_pop_time) if last_pop_time else None
+        # The text flow is registered only for a scribe worker, so everything about the text backend is
+        # unknown (rather than zero) on a worker that never had one. Its advertisement is what the
+        # readiness gate established the backend can serve, so it is also the readiness signal.
+        text_coordinator = self._text_coordinator
+        text_advertisement = text_coordinator.advertisement if text_coordinator is not None else None
+        text_jobs_in_flight = text_coordinator.num_in_flight if text_coordinator is not None else 0
+        text_jobs_submitted = text_coordinator.num_jobs_submitted if text_coordinator is not None else 0
+        text_jobs_faulted = text_coordinator.num_jobs_faulted if text_coordinator is not None else 0
+        jobs_submitted_total = self._terminal_jobs_every_flow()
+        jobs_faulted_total = self._faulted_jobs_every_flow()
+        jobs_in_hand_other_flows = self._jobs_in_hand_other_flows()
+        seconds_since_last_pop = self._seconds_since_any_flows_last_pop(now)
         api_messages: list[str] = []
         for api_message in self._job_popper.api_messages_received.values():
             if api_message.message_text:
@@ -7931,8 +8002,8 @@ class HordeWorkerProcessManager:
         stats_sample = self._run_metrics.record_stats_sample(
             StatsSample(
                 timestamp=now,
-                jobs_submitted=self._job_tracker.total_num_completed_jobs,
-                jobs_faulted=self._job_tracker.num_jobs_faulted,
+                jobs_submitted=jobs_submitted_total,
+                jobs_faulted=jobs_faulted_total,
                 kudos_per_hour=kudos_per_hour,
                 kudos_this_session=kudos_session,
                 eligible_seconds_total=eligible_seconds,
@@ -7940,7 +8011,7 @@ class HordeWorkerProcessManager:
                 gpu_busy_fraction=gpu_utilization_busy_fraction,
                 pending_megapixelsteps=self._job_tracker.get_pending_megapixelsteps(),
                 jobs_pending_inference=len(self._job_tracker.jobs_pending_inference),
-                jobs_in_progress=len(self._job_tracker.jobs_in_progress),
+                jobs_in_progress=len(self._job_tracker.jobs_in_progress) + jobs_in_hand_other_flows,
                 jobs_pending_safety_check=len(self._job_tracker.jobs_pending_safety_check),
                 jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
                 jobs_pending_submit=len(self._job_tracker.jobs_pending_submit),
@@ -7977,6 +8048,7 @@ class HordeWorkerProcessManager:
 
         config = WorkerConfigSummary(
             dreamer_name=bridge_data.dreamer_worker_name,
+            dreamer=bridge_data.dreamer,
             alchemist_name=bridge_data.alchemist_name,
             worker_version=horde_worker_regen.__version__,
             horde_username=self.user_info.username if self.user_info is not None else None,
@@ -8013,13 +8085,8 @@ class HordeWorkerProcessManager:
             scribe_name=bridge_data.scribe_name if bridge_data.scribe else None,
             text_stall_seconds=bridge_data.text_stall_seconds,
             text_backend_ready_patience_seconds=READY_SLOW_START_NOTICE_SECONDS,
+            text_backend_managed=self._text_backend_is_managed(),
         )
-
-        # The text flow is registered only for a scribe worker, so everything about the text backend is
-        # unknown (rather than zero) on a worker that never had one. Its advertisement is what the
-        # readiness gate established the backend can serve, so it is also the readiness signal.
-        text_coordinator = self._text_coordinator
-        text_advertisement = text_coordinator.advertisement if text_coordinator is not None else None
 
         return WorkerStateSnapshot(
             session_start_time=self.session_start_time,
@@ -8050,14 +8117,14 @@ class HordeWorkerProcessManager:
             api_messages=api_messages,
             config=config,
             processes=processes,
-            num_jobs_popped=self.num_jobs_total,
-            num_jobs_submitted=self._job_tracker.total_num_completed_jobs,
-            num_jobs_faulted=self._job_tracker.num_jobs_faulted,
+            num_jobs_popped=self.num_jobs_total + jobs_in_hand_other_flows,
+            num_jobs_submitted=jobs_submitted_total,
+            num_jobs_faulted=jobs_faulted_total,
             num_job_slowdowns=self._job_submitter.num_job_slowdowns,
             num_process_recoveries=self._process_lifecycle._num_process_recoveries,
             pending_megapixelsteps=self._job_tracker.get_pending_megapixelsteps(),
             jobs_pending_inference=len(self._job_tracker.jobs_pending_inference),
-            jobs_in_progress=len(self._job_tracker.jobs_in_progress),
+            jobs_in_progress=len(self._job_tracker.jobs_in_progress) + jobs_in_hand_other_flows,
             jobs_pending_safety_check=len(self._job_tracker.jobs_pending_safety_check),
             jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
             jobs_pending_post_processing=len(self._job_tracker.jobs_pending_post_processing),
@@ -8096,9 +8163,9 @@ class HordeWorkerProcessManager:
             alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,
             alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
-            text_jobs_in_flight=text_coordinator.num_in_flight if text_coordinator is not None else 0,
-            text_total_submitted=text_coordinator.num_jobs_submitted if text_coordinator is not None else 0,
-            text_total_faulted=text_coordinator.num_jobs_faulted if text_coordinator is not None else 0,
+            text_jobs_in_flight=text_jobs_in_flight,
+            text_total_submitted=text_jobs_submitted,
+            text_total_faulted=text_jobs_faulted,
             text_backend_ready=text_coordinator.backend_ready if text_coordinator is not None else False,
             text_model_name=text_advertisement.model_name if text_advertisement is not None else None,
             text_context_length=text_advertisement.max_context_length if text_advertisement is not None else None,
@@ -8231,6 +8298,8 @@ class HordeWorkerProcessManager:
         Read after the main loop ends (the counters remain valid on the manager). ``clean_exit`` is
         False when the session tripped the consecutive-failure circuit breaker or needed terminal recovery,
         either of which flags a bad run and disqualifies the active config from being recorded as known-good.
+        The job counts are the whole worker's: a session is judged productive by whether work was delivered,
+        and a scribe-only or alchemist-only worker delivers none of it through the image job tracker.
         """
         import horde_worker_regen
 
@@ -8240,8 +8309,8 @@ class HordeWorkerProcessManager:
             ended_at=ended_at,
             duration_seconds=max(0.0, ended_at - self.session_start_time),
             worker_version=horde_worker_regen.__version__,
-            jobs_submitted=self._job_tracker.total_num_completed_jobs,
-            jobs_faulted=self._job_tracker.num_jobs_faulted,
+            jobs_submitted=self._terminal_jobs_every_flow(),
+            jobs_faulted=self._faulted_jobs_every_flow(),
             kudos_this_session=self._state.kudos_generated_this_session,
             clean_exit=(
                 not self._state.too_many_consecutive_failed_jobs
@@ -8455,10 +8524,15 @@ class HordeWorkerProcessManager:
             and bridge_data.dry_run_skip_api is not True
         )
 
-    def _text_backend_base_url(self) -> str | None:
-        """Return the managed backend's loopback URL, or None to use the operator's `kai_url`."""
+    def _text_backend_address(self) -> str:
+        """Return where the text backend this worker talks to listens.
+
+        The worker's own loopback port when it launches the backend itself, and the operator's `kai_url`
+        when they run it. One function so the driver's requests and every message about the backend name
+        the same address; the flow reads it through a callable because `kai_url` can be hot-reloaded.
+        """
         if not self._text_backend_is_managed():
-            return None
+            return self.bridge_data.kai_url
         return f"http://{LOOPBACK_HOST}:{self.bridge_data.text_backend_port}"
 
     def _text_backend_for(self, text_backend_kind: TEXT_BACKENDS) -> TextBackend:
@@ -8473,7 +8547,7 @@ class HordeWorkerProcessManager:
                 bridge_data=self.bridge_data,
                 api_sessions=self._api_sessions,
                 text_backend_kind=text_backend_kind,
-                base_url=self._text_backend_base_url(),
+                base_url=self._text_backend_address(),
             )
         return self._text_backend_driver
 
@@ -8487,25 +8561,44 @@ class HordeWorkerProcessManager:
         return min(self._device_map.root)
 
     async def _run_text_backend_supervisor(self) -> None:
-        """Provision, launch and keep alive the managed text backend for the worker's lifetime.
+        """Keep the managed text backend alive for the worker's lifetime, from obtaining it onwards.
 
-        Provisioning may download a pinned release on first use, so it runs in a thread. A backend the
-        worker cannot obtain or cannot launch is logged once with the remedy and the text flow is left
-        waiting on its readiness gate, which is the same state as an attached backend that is not running.
+        The supervisor owns the whole of the backend's life, so it is built before anything is obtained and
+        handed the step that obtains it. That is what puts the backend's row on the dashboard for the
+        minutes a first-run download takes, instead of leaving the worker looking as though it has no
+        backend; a backend that cannot be obtained at all is reported on that row by the supervisor.
         """
-        bridge_data = self.bridge_data
-        kind = bridge_data.text_backend_kind
-        model_path = bridge_data.text_model_path
+        model_path = self.bridge_data.text_model_path
         if model_path is None:
             logger.error("The text backend is managed but `text_model_path` is unset; it will not be launched.")
             return
-        executable = bridge_data.text_backend_executable
-        if executable is None:
-            try:
-                executable = await asyncio.to_thread(provision_executable, kind)
-            except TextBackendProvisionError as error:
-                logger.error(f"Could not obtain the {kind!s} text backend: {error}")
-                return
+        kind = self.bridge_data.text_backend_kind
+        supervisor = TextBackendSupervisor(
+            launch_spec_factory=partial(self._render_text_backend_launch_spec, kind, model_path),
+            backend=self._text_backend_for(kind),
+            backend_kind=kind,
+            owned_registry=self._owned_registry,
+            read_device_free_total_mb=self._read_device_free_total_mb,
+        )
+        self._text_backend_supervisor = supervisor
+        await supervisor.run()
+
+    def _render_text_backend_launch_spec(self, kind: TEXT_BACKENDS, model_path: Path) -> TextBackendLaunchSpec:
+        """Obtain the managed backend's executable and render the command line that starts it.
+
+        Blocking: a first provision downloads a pinned release. The supervisor calls this in a thread, and
+        both failures it can raise are reported there, on the backend's own row.
+
+        Args:
+            kind: Which backend to obtain and render for.
+            model_path: The model artefact the backend is to load.
+
+        Raises:
+            TextBackendProvisionError: The executable could not be obtained.
+            UnsupportedTextBackendError: The worker has no command line for ``kind``.
+        """
+        bridge_data = self.bridge_data
+        executable = bridge_data.text_backend_executable or provision_executable(kind)
         settings = TextBackendLaunchSettings(
             executable=executable,
             model_path=model_path,
@@ -8515,20 +8608,7 @@ class HordeWorkerProcessManager:
             context_length=bridge_data.max_context_length,
             log_path=logs_dir(create=True) / TEXT_BACKEND_LOG_FILE_NAME,
         )
-        try:
-            launch_spec = build_launch_spec(kind, settings)
-        except UnsupportedTextBackendError as error:
-            logger.error(f"Cannot launch the text backend: {error}")
-            return
-        supervisor = TextBackendSupervisor(
-            launch_spec=launch_spec,
-            backend=self._text_backend_for(kind),
-            backend_kind=kind,
-            owned_registry=self._owned_registry,
-            read_device_free_total_mb=self._read_device_free_total_mb,
-        )
-        self._text_backend_supervisor = supervisor
-        await supervisor.run()
+        return build_launch_spec(kind, settings)
 
     async def _stop_text_backend_supervisor(self) -> None:
         """Stop the managed text backend's process tree, if one was started."""

@@ -128,10 +128,8 @@ class StatsView(Vertical):
             pool_static.display = False
             seated_models = frozenset()
         self.query_one("#stats-export", Static).update(self._render_export(snapshot))
-        # One workload's totals are already the headline figures, so the split earns its space only on a
-        # worker that served more than one of them.
         workload_static = self.query_one("#stats-by-workload", Static)
-        workload_static.display = len(snapshot.workload_totals) > 1
+        workload_static.display = self._shows_workload_split(snapshot)
         if workload_static.display:
             workload_static.update(self._render_workload_totals(snapshot.workload_totals))
         self.query_one("#stats-by-model", Static).update(
@@ -152,6 +150,17 @@ class StatsView(Vertical):
         if event.button.id != "stats-export-button" or self._snapshot is None:
             return
         self.post_message(self.ExportToggled(not self._snapshot.stats_export.enabled))
+
+    @staticmethod
+    def _shows_workload_split(snapshot: WorkerStateSnapshot) -> bool:
+        """Whether the by-workload table earns its space on this worker.
+
+        The headline counters carry the whole worker's jobs and kudos, so an image-only worker learns
+        nothing from a table that restates them. A non-image workload is measured in figures the headline
+        has no room for (a text flow's mean generated tokens has nowhere else to appear), so one row is
+        worth showing as soon as such a workload has totals.
+        """
+        return any(workload is not WorkloadKind.IMAGE_GENERATION for workload in snapshot.workload_totals)
 
     @staticmethod
     def _render_headlines(snapshot: WorkerStateSnapshot) -> Panel:

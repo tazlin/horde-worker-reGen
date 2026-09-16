@@ -1477,14 +1477,9 @@ class OverviewView(Vertical):
             else:
                 table.add_row(left_label, left_value, right_label, right_value)
 
-        # Each role registers as its own named worker on the horde, so a worker that serves one of them
-        # is named for that role rather than for the dreamer identity it never advertises.
-        if self._is_alchemist_only(snapshot):
-            add_pair("Alchemist", config.alchemist_name or "-", "Version", f"v{config.worker_version}")
-        elif self._is_scribe_only(snapshot):
-            add_pair("Scribe", config.scribe_name or "-", "Version", f"v{config.worker_version}")
-        else:
-            add_pair("Dreamer", config.dreamer_name, "Version", f"v{config.worker_version}")
+        # Each enabled role registers as its own named worker on the horde, so the panel names every one of
+        # them, from the summary's own derivation rather than from a rule of its own.
+        add_pair("Worker", config.worker_display_name, "Version", f"v{config.worker_version}")
         add_pair("Horde user", config.horde_username or "-", "Uptime", uptime)
         custom_model_status = (
             f"{config.custom_models_ready}/{config.custom_models_configured} ready"
@@ -1543,11 +1538,6 @@ class OverviewView(Vertical):
     def _is_alchemist_only(cls, snapshot: WorkerStateSnapshot) -> bool:
         """Whether this worker serves alchemy and nothing else (the alchemist-only reshape trigger)."""
         return cls._enabled_workloads(snapshot) == frozenset({WorkloadKind.ALCHEMY})
-
-    @classmethod
-    def _is_scribe_only(cls, snapshot: WorkerStateSnapshot) -> bool:
-        """Whether this worker serves text generation and nothing else."""
-        return cls._enabled_workloads(snapshot) == frozenset({WorkloadKind.TEXT_GENERATION})
 
     @staticmethod
     def _show_alchemy_panel(snapshot: WorkerStateSnapshot) -> bool:
