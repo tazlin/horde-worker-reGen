@@ -23,6 +23,7 @@ as needed.
     - [run as a system service](how-to/run-as-a-system-service.md)
     - [run on AMD ROCm](how-to/run-on-amd-rocm.md)
     - [run an alchemist-only worker](how-to/run-an-alchemist-only-worker.md)
+    - [run a text worker](how-to/run-a-text-worker.md)
     - [run multiple GPUs](how-to/run-multiple-gpus.md)
     - [add custom models](how-to/add-custom-models.md)
     - [run in Docker](how-to/run-in-docker.md)
