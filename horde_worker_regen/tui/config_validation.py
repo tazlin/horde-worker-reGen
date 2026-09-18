@@ -26,14 +26,6 @@ class ConfigValidationIssue:
 
 _META_PREFIXES = ("top", "bottom", "all")
 
-SCRIBE_NAME_RESERVED_DEFAULT = "An Awesome Scribe"
-"""The reserved placeholder scribe name shipped in bridgeData_template.yaml.
-
-The horde rejects a worker that tries to register under it (names are unique horde-wide), so a save
-carrying it is blocked. Kept as a literal here for the same reason the config editor keeps the dreamer
-and alchemist placeholders as literals: importing ``reGenBridgeData`` would pull the SDK into the TUI
-process. A drift guard in ``tests/tui/test_config_validation.py`` pins it to the model's real default."""
-
 
 def _bool(config: dict[str, Any], key: str) -> bool:
     """Return a config boolean, treating absent/None as false."""
@@ -116,24 +108,6 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
 
     if not _bool(config, "dreamer") and not _bool(config, "alchemist") and not _bool(config, "scribe"):
         error("dreamer", "Enable Dreamer image generation, Alchemist or Scribe; all off serves nothing.")
-
-    if _bool(config, "scribe"):
-        scribe_name = _str(config, "scribe_name")
-        if not scribe_name:
-            error("scribe_name", "Scribe name is required when Scribe text generation is enabled.")
-        elif scribe_name == SCRIBE_NAME_RESERVED_DEFAULT:
-            error("scribe_name", "Scribe name is still the default placeholder; set a unique one.")
-        else:
-            # Each role registers as its own separately-named worker on the horde, so a name shared with
-            # another role is a registration the horde refuses at pop time.
-            for other_key, other_label in (("dreamer_name", "dreamer"), ("alchemist_name", "alchemist")):
-                other_name = _str(config, other_key)
-                if other_name and scribe_name.lower() == other_name.lower():
-                    error(
-                        "scribe_name",
-                        f"Scribe name must differ from the {other_label} name (each worker type registers "
-                        "separately on the horde).",
-                    )
 
     if _bool(config, "extra_slow_worker"):
         if _bool(config, "high_performance_mode"):

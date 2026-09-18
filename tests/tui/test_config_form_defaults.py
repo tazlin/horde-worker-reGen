@@ -21,6 +21,7 @@ from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     DREAMER_NAME_RESERVED_DEFAULT,
     MAX_THROUGHPUT_MODE_EFFECTIVE_VALUES,
+    SCRIBE_NAME_RESERVED_DEFAULT,
     FieldKind,
     field_yaml_path,
     validate_identity_names,
@@ -35,11 +36,19 @@ _INTENTIONALLY_BLANK = frozenset(
         "civitai_api_token",
         "dreamer_name",
         "alchemist_name",
+        "scribe_name",
         "cache_home",
         # These fields have model default=None (meaning "unset"); the editor shows a blank/zero
         # placeholder that the operator is expected to fill in before enabling the feature.
         "kudos_training_data_file",
         "download_rate_limit_kbps",
+        # The scribe's text fields whose model default is None: a blank input is the editor's spelling
+        # of "unset", and the save path leaves an untouched blank out of the file entirely.
+        "text_model",
+        "text_models_dir",
+        "text_model_name",
+        "text_backend_executable",
+        "text_backend_password",
     }
 )
 
@@ -124,6 +133,7 @@ def test_reserved_name_constants_match_model_defaults() -> None:
     """
     assert reGenBridgeData.model_fields["dreamer_worker_name"].default == DREAMER_NAME_RESERVED_DEFAULT
     assert reGenBridgeData.model_fields["alchemist_name"].default == ALCHEMIST_NAME_RESERVED_DEFAULT
+    assert reGenBridgeData.model_fields["scribe_name"].default == SCRIBE_NAME_RESERVED_DEFAULT
 
 
 def test_validate_identity_names_rules() -> None:
@@ -153,3 +163,47 @@ def test_validate_identity_names_rules() -> None:
         "alchemist_name",
     ]
     assert validate_identity_names("Dreamer", alchemist_enabled=True, alchemist_name="Alchemist") == []
+
+
+def _scribe_name_errors(
+    scribe_name: str,
+    *,
+    dreamer_name: str = "Dreamer",
+    alchemist_enabled: bool = False,
+    alchemist_name: str = "",
+    scribe_enabled: bool = True,
+) -> list[str]:
+    """Return the field keys the validator reports for one scribe-name configuration."""
+    return [
+        key
+        for key, _message in validate_identity_names(
+            dreamer_name,
+            alchemist_enabled=alchemist_enabled,
+            alchemist_name=alchemist_name,
+            scribe_enabled=scribe_enabled,
+            scribe_name=scribe_name,
+        )
+    ]
+
+
+def test_a_scribe_needs_a_name_of_its_own() -> None:
+    """Worker names are unique horde-wide and each role registers separately, so a scribe needs its own."""
+    assert _scribe_name_errors("My Scribe") == []
+    assert _scribe_name_errors("  ") == ["scribe_name"]
+    assert _scribe_name_errors(SCRIBE_NAME_RESERVED_DEFAULT) == ["scribe_name"]
+    assert _scribe_name_errors("dreamer", dreamer_name="Dreamer") == ["scribe_name"]
+    assert _scribe_name_errors(
+        "Alchemist",
+        alchemist_enabled=True,
+        alchemist_name="Alchemist",
+    ) == ["scribe_name"]
+
+
+def test_a_scribe_may_reuse_the_name_of_a_role_that_is_off() -> None:
+    """Only a name a role registers under is taken, so an unserved role's name is not a collision."""
+    assert _scribe_name_errors("Alchemist", alchemist_enabled=False, alchemist_name="Alchemist") == []
+
+
+def test_a_scribe_name_is_not_checked_while_the_role_is_off() -> None:
+    """An operator who left a placeholder in a role they do not serve is not blocked by it."""
+    assert _scribe_name_errors(SCRIBE_NAME_RESERVED_DEFAULT, scribe_enabled=False) == []

@@ -234,6 +234,50 @@ async def test_save_succeeds_with_unrendered_dry_run_field_present(tmp_path: Pat
 
 
 @pytest.mark.e2e
+async def test_a_scribe_only_config_saves_one_text_field(tmp_path: Path) -> None:
+    """Text generation is a role in its own right, so a worker serving only it edits and saves normally."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "n"\ndreamer: false\nscribe: true\nscribe_name: "My Scribe"\n'
+        'text_model: "meta-llama/Llama-3.2-3B-Instruct-Q4_K_M"\ntext_threads: 1\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-text_threads", Input).value = "3"
+        assert editor._save() is True
+        await pilot.pause()
+
+    reloaded = load_config(path)
+    assert reloaded["text_threads"] == 3
+    # Every other key the scribe page shows is untouched, including the ones it merely displayed.
+    assert reloaded["text_model"] == "meta-llama/Llama-3.2-3B-Instruct-Q4_K_M"
+    assert reloaded["scribe_name"] == "My Scribe"
+    written = path.read_text(encoding="utf-8")
+    assert "text_backend_port" not in written
+    assert "text_stall_seconds" not in written
+
+
+@pytest.mark.e2e
+async def test_the_text_model_picker_writes_its_choice_into_the_field(tmp_path: Path) -> None:
+    """The picker only fills the input, so the choice is an unsaved form edit like any typed one."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "n"\nscribe: true\nscribe_name: "My Scribe"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        assert editor.query_one("#cfg-text_model", Input).value == ""
+
+        editor._apply_text_model_choice("meta-llama/Llama-3.2-3B-Instruct-Q4_K_M")
+        await pilot.pause()
+        assert editor.query_one("#cfg-text_model", Input).value == "meta-llama/Llama-3.2-3B-Instruct-Q4_K_M"
+
+        assert editor._save() is True
+        await pilot.pause()
+
+    assert load_config(path)["text_model"] == "meta-llama/Llama-3.2-3B-Instruct-Q4_K_M"
+
+
+@pytest.mark.e2e
 async def test_live_gpu_detection_does_not_make_config_dirty(tmp_path: Path) -> None:
     """A worker-reported GPU card is live state, not an unsaved Per-GPU config edit."""
     app, _path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\n')

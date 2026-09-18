@@ -40,25 +40,6 @@ def _text_backend_logs(log_dir: Path) -> list[Path]:
     return [text_backend] if text_backend.exists() else []
 
 
-def discover_bridge_logs(log_dir: Path | None = None) -> list[Path]:
-    """Return the main bridge log, then any subprocess bridge logs, then the text backend's, in stable order.
-
-    The text backend's log comes last because it is another program's output rather than one of this
-    worker's own loguru sinks, and it is absent on any worker that never ran a backend.
-    """
-    if log_dir is None:
-        log_dir = default_log_dir()
-    if not log_dir.exists():
-        return []
-    result: list[Path] = []
-    main = log_dir / "bridge.log"
-    if main.exists():
-        result.append(main)
-    result.extend(sorted(log_dir.glob("bridge_*.log"), key=lambda path: path.name))
-    result.extend(_text_backend_logs(log_dir))
-    return result
-
-
 _DATE_TOKEN = re.compile(
     r"[._](?P<date>\d{4}-\d{2}-\d{2}(?:[ _T]\d{2}[-:]\d{2}[-:]\d{2})?(?:[_.]\d+)?)$",
 )

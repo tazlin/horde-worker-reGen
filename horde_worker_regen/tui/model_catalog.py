@@ -1,9 +1,12 @@
-"""Image-model catalog and meta-instruction helpers for the config editor's model controls.
+"""Model catalogs and meta-instruction helpers for the config editor's model controls.
 
-The model list is loaded lazily from ``horde_model_reference`` (only when the picker is opened, off the
-UI thread), so the TUI stays light. The meta-instruction logic mirrors ``horde_sdk``'s ``MetaInstruction``
-regexes locally (without importing the heavy SDK) so the editor can build, classify, and explain the
+Both catalogs (image generation for the models lists, text generation for the scribe's one model key)
+are loaded lazily from ``horde_model_reference`` (only when a picker is opened, off the UI thread), so
+the TUI stays light. The meta-instruction logic mirrors ``horde_sdk``'s ``MetaInstruction`` regexes
+locally (without importing the heavy SDK) so the editor can build, classify, and explain the
 ``top N`` / ``all sdxl models`` style commands documented in bridgeData_template.yaml.
+
+Reference reading lives here rather than in the picker modals, so a modal holds presentation only.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from pathlib import Path
 
     from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
     from horde_model_reference.model_reference_manager import ModelReferenceManager
@@ -48,11 +52,14 @@ class ModelInfo:
     """Whether this model comes from a PRIMARY's pending (beta) queue rather than the canonical reference."""
 
 
-def load_image_models() -> list[ModelInfo]:
-    """Load the image-generation model reference (blocking; call from a worker thread).
+def _loaded_model_reference_manager() -> ModelReferenceManager:
+    """Return the prefetched reference manager, building and awaiting it on first use (blocking).
 
-    Imports ``horde_model_reference`` lazily so the TUI does not pay for it at startup. Returns an
-    alphabetical list; raises on failure so the caller can surface a clear message.
+    Imports ``horde_model_reference`` lazily so the TUI does not pay for it at startup, and runs its own
+    event loop, so this belongs on a worker thread rather than on the UI thread.
+
+    Raises:
+        RuntimeError: The manager was created without a prefetch handle to await.
     """
     from horde_model_reference.model_reference_manager import ModelReferenceManager, PrefetchStrategy
 
@@ -74,7 +81,15 @@ def load_image_models() -> list[ModelInfo]:
 
         return horde_model_reference_manager
 
-    manager = asyncio.run(ensure_model_reference_manager_initialized())
+    return asyncio.run(ensure_model_reference_manager_initialized())
+
+
+def load_image_models() -> list[ModelInfo]:
+    """Load the image-generation model reference (blocking; call from a worker thread).
+
+    Returns an alphabetical list; raises on failure so the caller can surface a clear message.
+    """
+    manager = _loaded_model_reference_manager()
 
     records, beta_names = _image_records_with_beta(manager)
 
@@ -169,6 +184,84 @@ def _query_beta_records(
     except Exception as error:  # noqa: BLE001 - beta is best-effort enrichment, never fatal to the picker
         logger.warning(f"Could not load beta models for the picker: {type(error).__name__}: {error}")
         return None
+
+
+@dataclasses.dataclass(frozen=True)
+class TextModelInfo:
+    """A single text model from the merged text reference, with the attributes the picker shows.
+
+    A record nobody has run carries no measurement, so the measured attributes are None rather than
+    zero: "unknown" and "costs nothing" are different answers and the picker must not conflate them.
+    """
+
+    name: str
+    has_file: bool
+    """Whether the record declares a file, which is what makes the model choosable."""
+    quant: str = ""
+    """The quantisation of the declared file, as its name spells it (``Q4_K_M``)."""
+    size_bytes: int | None = None
+    """The declared size of the file, or None when the record declares none."""
+    footprint_mb: int | None = None
+    """The VRAM the loaded model held when it was measured, or None when nobody has measured it."""
+    context: int | None = None
+    """The context length the measurement was taken at, which sizes the KV cache in the footprint."""
+    tokens_per_second: float | None = None
+    source_card: str = ""
+    """The card the measurement was taken on, without which the other figures cannot be compared."""
+    parameters_count: int | None = None
+    homepage: str = ""
+    description: str = ""
+    on_disk: bool = False
+    """Whether the declared file already exists where the worker would look for it (existence only)."""
+    target_path: str = ""
+    """Where the file is, or would be fetched to."""
+
+
+def load_text_models(text_models_dir: Path | None = None) -> list[TextModelInfo]:
+    """Load the text-generation model reference, merged with this worker's measured models (blocking).
+
+    Call from a worker thread: it may build and prefetch the reference manager. Registering the worker's
+    catalogue is what puts a file on offer against a name at all, since the canonical text reference is a
+    name registry that declares no files.
+
+    Args:
+        text_models_dir: Where fetched text model files are kept, or None for the worker's default.
+
+    Returns:
+        Every known text model, alphabetical, those with a file on offer first.
+    """
+    from horde_worker_regen.text_backends.model_catalogue import (
+        default_text_models_dir,
+        measured_facts,
+        text_model_records,
+    )
+
+    records = text_model_records(_loaded_model_reference_manager())
+    directory = default_text_models_dir() if text_models_dir is None else text_models_dir
+
+    models: list[TextModelInfo] = []
+    for name, record in records.items():
+        declared_file = record.config.download[0] if record.config.download else None
+        measurement = measured_facts(record)
+        target = directory / declared_file.file_name if declared_file is not None else None
+        models.append(
+            TextModelInfo(
+                name=name,
+                has_file=declared_file is not None,
+                quant=measurement.quant if measurement is not None else "",
+                size_bytes=record.declared_total_size_bytes,
+                footprint_mb=measurement.footprint_mb if measurement is not None else None,
+                context=measurement.context if measurement is not None else None,
+                tokens_per_second=measurement.tokens_per_second if measurement is not None else None,
+                source_card=measurement.source_card if measurement is not None else "",
+                parameters_count=record.parameters_count,
+                homepage=str(record.url or ""),
+                description=str(record.description or ""),
+                on_disk=target is not None and target.is_file(),
+                target_path=str(target) if target is not None else "",
+            ),
+        )
+    return sorted(models, key=lambda model: (not model.has_file, model.name.lower()))
 
 
 @dataclasses.dataclass(frozen=True)

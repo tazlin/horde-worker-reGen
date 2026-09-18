@@ -108,6 +108,8 @@ module paths directly.
 | `bridge_data/custom_models.py` | Typed custom-checkpoint definitions, dependency-derived baseline choices, startup readiness validation, and atomic hordelib registry materialization |
 | `bridge_data/disagg_model_selection.py` | Pure ranking for the `disagg_optimized N` model rule: shared-VAE cluster (via `derive_canonical_registry` over merged record/sidecar hashes) then popularity |
 | `tui/`                        | Textual dashboard, config form, worker host/launcher, and `native_dashboard.py`'s minimal semantic web overview and supervisor adapter |
+| `tui/model_catalog.py`        | The reference reads both config pickers work from: `load_image_models` for the models lists, `load_text_models` for the scribe's one model key (merged canonical plus worker-measured text records, with each one's declared file, measurement and on-disk presence) |
+| `tui/widgets/text_model_picker.py` | `TextModelPickerModal`: browses the text catalogue and dismisses with one model name for the `text_model` field, listing the records with no file on offer below a divider as unchoosable |
 | `models/`                     | Worker-side model reference and metadata helpers                |
 | `reporting/`                  | Status reporting and run statistics                             |
 | `utils/`                      | Image, job, system, accelerator-probe, quota, and diagnostics helpers |

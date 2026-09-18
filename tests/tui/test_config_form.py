@@ -5,13 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from horde_model_reference.text_backend_names import TEXT_BACKENDS
 
+from horde_worker_regen.compute_mode import TextBackendAccelerator
 from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     CONFIG_SUBTABS,
     GPU_OVERRIDE_FIELDS,
     ConfigField,
     FieldKind,
+    FieldPicker,
     coerce_value,
     current_value,
     field_key_present,
@@ -26,6 +29,8 @@ _SAMPLE_YAML = """\
 api_key: "secret123"
 max_threads: 2
 allow_lora: true
+scribe: true
+scribe_name: "My Scribe"
 models_to_load:
   - "Deliberate"
   - "AlbedoBase XL (SDXL)"
@@ -132,6 +137,8 @@ def test_save_preserves_comments_and_untouched_keys(tmp_path: Path) -> None:
     written = path.read_text(encoding="utf-8")
     assert "# a comment that must survive a round-trip" in written
     assert 'api_key: "secret123"' in written
+    # A key belonging to another role's page is as untouched as any other key the edit did not name.
+    assert 'scribe_name: "My Scribe"' in written
 
     reloaded = load_config(path)
     assert current_value(_field("max_threads", FieldKind.INT), reloaded) == 4
@@ -251,6 +258,101 @@ def test_model_pool_section_is_configurable() -> None:
             assert field.yaml_parent == ""
         else:
             assert field.yaml_parent == "model_pool"
+
+
+def test_scribe_section_is_configurable() -> None:
+    """The editor exposes a Text sub-tab whose fields are the scribe's, tiered by what they risk."""
+    subtab_sections = {section for _label, sections in CONFIG_SUBTABS for section in sections}
+    assert "Scribe" in subtab_sections
+
+    by_key = {field.key: field for field in CONFIG_FIELDS if field.section == "Scribe"}
+    assert by_key["scribe"].kind is FieldKind.BOOL
+    assert by_key["text_model"].picker is FieldPicker.TEXT_MODEL
+    assert by_key["text_backend_managed"].kind is FieldKind.BOOL
+    # The password is a credential and must carry the same masking the other secrets do.
+    assert by_key["text_backend_password"].secret is True
+
+    tiers = {key: field.risk_level for key, field in by_key.items()}
+    assert tiers["scribe"] == "normal"
+    assert tiers["scribe_name"] == "normal"
+    assert tiers["text_model"] == "normal"
+    assert tiers["text_backend_port"] == "advanced"
+    assert tiers["text_threads"] == "advanced"
+    assert tiers["text_generation_timeout_seconds"] == "dangerous"
+    assert tiers["text_stall_seconds"] == "dangerous"
+
+
+def test_scribe_select_choices_come_from_their_enums() -> None:
+    """A backend or compute path added to its enum reaches the editor without a second edit."""
+    by_key = {field.key: field for field in CONFIG_FIELDS if field.section == "Scribe"}
+
+    assert by_key["text_backend_kind"].choices == tuple(backend.value for backend in TEXT_BACKENDS)
+    assert by_key["text_backend_accelerator"].choices == tuple(
+        accelerator.value for accelerator in TextBackendAccelerator
+    )
+    # Each SELECT's displayed default has to be one of its own choices, or the editor opens on a value
+    # its own coercion rejects.
+    assert by_key["text_backend_kind"].default() in by_key["text_backend_kind"].choices
+    assert by_key["text_backend_accelerator"].default() in by_key["text_backend_accelerator"].choices
+
+
+def test_scribe_numeric_fields_round_trip_through_coercion(tmp_path: Path) -> None:
+    """The scribe's numeric fields coerce within their model bounds and survive a save/reload."""
+    by_key = {field.key: field for field in CONFIG_FIELDS if field.section == "Scribe"}
+    data = load_config(tmp_path / "absent.yaml")
+
+    for key, entered, expected in (
+        ("max_length", "512", 512),
+        ("text_threads", "4", 4),
+        ("text_backend_port", "5002", 5002),
+        ("text_stall_seconds", "45.5", 45.5),
+    ):
+        set_field_value(by_key[key], data, coerce_value(by_key[key], entered))
+        assert current_value(by_key[key], data) == expected
+
+    # Blank is a meaningful value for the two optional numbers: "derived" and "the lowest driven card".
+    assert coerce_value(by_key["text_generation_timeout_seconds"], "") is None
+    assert coerce_value(by_key["text_gpu_device_index"], "") is None
+
+    path = tmp_path / "bridgeData.yaml"
+    save_config(data, path)
+    reloaded = load_config(path)
+    assert current_value(by_key["text_threads"], reloaded) == 4
+    assert current_value(by_key["text_stall_seconds"], reloaded) == 45.5
+
+
+def test_scribe_numeric_bounds_match_the_model() -> None:
+    """The editor enforces the same bounds the pydantic fields declare, not looser ones."""
+    by_key = {field.key: field for field in CONFIG_FIELDS if field.section == "Scribe"}
+
+    with pytest.raises(ValueError, match="at most 16"):
+        coerce_value(by_key["text_threads"], "17")
+    with pytest.raises(ValueError, match="at most 65535"):
+        coerce_value(by_key["text_backend_port"], "65536")
+    with pytest.raises(ValueError, match="at most 16384"):
+        coerce_value(by_key["max_context_length"], "16385")
+    with pytest.raises(ValueError, match="must be greater than 0"):
+        coerce_value(by_key["text_stall_seconds"], "0")
+    with pytest.raises(ValueError, match="at least 0"):
+        coerce_value(by_key["text_gpu_device_index"], "-1")
+
+
+def test_scribe_one_mode_fields_say_which_mode_they_apply_to() -> None:
+    """A field that only means something in one backend mode has to say so where it is edited."""
+    by_key = {field.key: field for field in CONFIG_FIELDS if field.section == "Scribe"}
+
+    for key in ("kai_url", "text_backend_password"):
+        assert "Worker runs the backend' is off" in by_key[key].help, key
+    for key in (
+        "text_model",
+        "text_models_dir",
+        "text_backend_executable",
+        "text_backend_port",
+        "text_gpu_layers",
+        "text_gpu_device_index",
+        "text_backend_accelerator",
+    ):
+        assert "when the worker runs the backend" in by_key[key].help, key
 
 
 def test_deprecated_field_help_names_the_pool() -> None:

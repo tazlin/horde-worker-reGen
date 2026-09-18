@@ -111,8 +111,10 @@ so anything you learn to find in Simple is in the same place in Developer.
 Simple holds back three things:
 
 - The Config tab's tuning pages, whose settings only mean something beside the measurements that would
-  justify changing them. Simple keeps Dashboard, Essentials, Models, Content, Features, Alchemy, and
-  LoRA & Downloads.
+  justify changing them. Simple keeps Dashboard, Essentials, Models, Content, Features, Alchemy, Text,
+  and LoRA & Downloads. Text is there for the same reason Alchemy is: a scribe is a worker role, and
+  its role switch, name and model are the same kind of decision the dreamer settings are. The backend
+  tuning on that page is held back per field, not by withholding the page.
 - The GPU table's tuning columns.
 - The three shortcuts that act on the Advanced Overview (`C`, `H`, `F6`), since Simple shows a
   different view.
@@ -382,6 +384,28 @@ The tab also holds a models editor and a searchable model picker: search across 
 tags, and triggers, filter by baseline, by SFW/NSFW/inpainting, and by on-disk status, sort by any
 column, mark models for the load or skip lists, and inspect a model's full record. Clear actions
 confirm before dropping staged work.
+
+#### The Text sub-tab
+
+The **Text** sub-tab configures the scribe role: whether to serve text jobs, the name it registers
+under, which model it loads, and how the text backend is obtained and run. Text generation happens in
+a separate program, so nothing here spawns an inference process; the worker downloads, starts and
+supervises that program for you unless you turn **Worker runs the backend** off and point the worker
+at one you run yourself.
+
+**Text model** has a *Choose...* button beside it that opens the text model catalogue: one row per
+model with its quantisation, file size, measured VRAM footprint, the context that footprint was
+measured at, and whether the file is already in your text models folder. Models the reference knows
+but publishes no file for are listed below a divider and cannot be chosen, because the worker would
+have nothing to load for them. Choosing fills the field; you can also type the path to a model file of
+your own into it directly, which the worker reads where it sits and never copies.
+
+A model nobody has measured shows no footprint. That is "unknown", not "free": the picker will not
+guess what a model costs on your card.
+
+The remaining fields are tiered. The backend's port, program, compute path, GPU layers, device index
+and thread count are advanced; the two text timeouts are on the Developer tier with the worker's other
+fuses. Fields that only apply in one backend mode say so in their help text.
 
 #### Deciding whether to turn the model pool on
 

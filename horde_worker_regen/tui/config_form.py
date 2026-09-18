@@ -5,8 +5,8 @@ The editor works on the raw YAML, not ``reGenBridgeData``, so the TUI parent sta
 happens worker-side when the worker reloads the file (errors surface in the Logs view). Field help,
 bounds, and grouping come from bridgeData_template.yaml and the SDK's field constraints.
 
-Fields that are obsolete or marked "Currently unused in reGen" (and the Scribe worker fields) are
-intentionally omitted: showing controls that do nothing would mislead, not help.
+Fields that are obsolete or marked "Currently unused in reGen" are intentionally omitted: showing
+controls that do nothing would mislead, not help.
 """
 
 from __future__ import annotations
@@ -17,10 +17,12 @@ from collections.abc import MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from horde_model_reference.text_backend_names import TEXT_BACKENDS
 from pydantic import TypeAdapter, ValidationError
 from ruamel.yaml import YAML
 
 from horde_worker_regen.bridge_data.custom_models import CustomModelDefinition
+from horde_worker_regen.compute_mode import TextBackendAccelerator
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 
 DEFAULT_CONFIG_PATH = Path("bridgeData.yaml")
@@ -48,12 +50,18 @@ DEDICATED_POST_PROCESSING_CHOICES = ("auto", "on", "off")
 # rather than retyped, so a new policy cannot go missing from the editor.
 DOWNLOAD_PRIORITY_POLICY_CHOICES = tuple(policy.value for policy in DownloadPriorityPolicy)
 
+# Derived from the enums that own these vocabularies (the horde's backend names, and the install's
+# compute-path token) so a backend or path added there reaches the editor without a second edit.
+TEXT_BACKEND_CHOICES = tuple(backend.value for backend in TEXT_BACKENDS)
+TEXT_BACKEND_ACCELERATOR_CHOICES = tuple(accelerator.value for accelerator in TextBackendAccelerator)
+
 # The reserved placeholder names shipped in bridgeData_template.yaml. The horde rejects a worker that
 # tries to register under one (names are unique horde-wide), so the editor must require the operator to
 # replace them. Kept as literals here so this module stays free of the heavy reGenBridgeData import; a
 # drift guard (tests/tui/test_config_form_defaults.py) pins them to the model's real field defaults.
 DREAMER_NAME_RESERVED_DEFAULT = "An Awesome Dreamer"
 ALCHEMIST_NAME_RESERVED_DEFAULT = "An Awesome Alchemist"
+SCRIBE_NAME_RESERVED_DEFAULT = "An Awesome Scribe"
 
 # Kept import-light on purpose: importing bridge_data.data_model here pulls the SDK into the TUI process.
 # A drift test pins this presentation bundle to the authoritative runtime bundle.
@@ -81,6 +89,17 @@ class FieldKind(enum.StrEnum):
     """A fixed set of multi-selectable string choices (e.g. alchemy forms)."""
     YAML = "yaml"
     """A raw YAML value edited in a text area and parsed on save."""
+
+
+class FieldPicker(enum.StrEnum):
+    """A browse-and-choose modal a STR field offers beside its input.
+
+    The input stays the authority on the saved value, so a field with a picker is still editable by
+    hand: the modal is a way to find a name, not a second source of truth.
+    """
+
+    TEXT_MODEL = "text_model"
+    """The text-generation catalogue, filtered to the models a file is on offer for."""
 
 
 # Sentinel for "no explicit default declared" so that a legitimate falsy explicit default
@@ -128,6 +147,8 @@ class ConfigField:
     non-minimum number, which would mislead the operator. Enforced against the model by
     ``tests/tui/test_config_form_defaults.py``.
     """
+    picker: FieldPicker | None = None
+    """The browse-and-choose modal this STR field offers, or None when it is typed by hand only."""
     hidden: bool = False
     """Whether the field stays in the catalog but is omitted from the operator-facing editor."""
     risk_level: str = "normal"
@@ -181,6 +202,7 @@ SECTIONS = (
     "Model pool",
     "Model downloads",
     "Alchemist",
+    "Scribe",
     "Logs",
     "Timeouts",
     "Retry & scheduling",
@@ -205,6 +227,7 @@ CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Features", ("Features",)),
     ("LoRA & Downloads", ("LoRA", "Model downloads")),
     ("Alchemy", ("Alchemist",)),
+    ("Text", ("Scribe",)),
     ("Timeouts", ("Timeouts", "Retry & scheduling")),
     (
         "Advanced",
@@ -253,6 +276,10 @@ SECTION_GUIDANCE: dict[str, str] = {
     "the editor blocks saving LoRA on because many LoRAs and popular checkpoints cannot be fetched.",
     "Alchemist": "Alchemy is a separate worker role (interrogation / post-processing), distinct from LoRA. "
     "Enabling it serves alchemy jobs alongside (or instead of) image generation.",
+    "Scribe": "A scribe is a separate worker role serving text-generation jobs, which run in a backend "
+    "program rather than in this worker's own inference processes, so a scribe can run on its own or "
+    "beside the other roles. The worker obtains, starts and supervises that backend for you; turn "
+    "'Worker runs the backend' off to attach to one you run yourself instead.",
     "Timeouts": "ADVANCED - most users should leave every field on this tab at its default. "
     "The defaults are tuned for the common case; wrong values here cause watchdog false-kills or "
     "let genuinely hung jobs linger too long. Only adjust if you understand the specific symptom "
@@ -945,6 +972,238 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=49152,
         unit="MB",
         explicit_default=2048,
+    ),
+    # Scribe
+    ConfigField(
+        "scribe",
+        "Enable scribe (text generation)",
+        FieldKind.BOOL,
+        "Scribe",
+        "Serve text-generation jobs. They run in a backend program rather than in this worker's own "
+        "inference processes, so a scribe can be combined with any other role or run on its own.",
+    ),
+    ConfigField(
+        "scribe_name",
+        "Scribe name",
+        FieldKind.STR,
+        "Scribe",
+        "Unique horde-wide name for the scribe worker. Each role registers as its own worker, so this "
+        "must differ from the dreamer and alchemist names.",
+    ),
+    ConfigField(
+        "text_model",
+        "Text model",
+        FieldKind.STR,
+        "Scribe",
+        "Which model the backend loads: a catalogued model's name, or the path to a model file of your "
+        "own. Choose browses the catalogue. A catalogued name is fetched into the text models folder once "
+        "and verified against its digest; a path is read where it sits. Applies when the worker runs the "
+        "backend.",
+        requires_restart=True,
+        picker=FieldPicker.TEXT_MODEL,
+    ),
+    ConfigField(
+        "text_backend_kind",
+        "Text backend",
+        FieldKind.SELECT,
+        "Scribe",
+        "Which backend program serves text jobs. It also decides how the advertised model name is "
+        "prefixed. koboldcpp is the one the worker can launch today; a backend it cannot launch yet is "
+        "refused by name at start-up.",
+        requires_restart=True,
+        choices=TEXT_BACKEND_CHOICES,
+        explicit_default=TEXT_BACKENDS.koboldcpp.value,
+    ),
+    ConfigField(
+        "text_backend_managed",
+        "Worker runs the backend",
+        FieldKind.BOOL,
+        "Scribe",
+        "Let the worker obtain the backend, start it, relaunch it if it exits, and stop it on shutdown. "
+        "Turn it off to attach to a backend you run yourself at the attached backend URL.",
+        requires_restart=True,
+        explicit_default=True,
+    ),
+    ConfigField(
+        "max_length",
+        "Max tokens per generation",
+        FieldKind.INT,
+        "Scribe",
+        "The largest answer this worker offers to produce, narrowed to what the backend says it will "
+        "accept. Also what the derived generation deadline is computed from.",
+        requires_restart=True,
+        minimum=1,
+        maximum=16384,
+        explicit_default=80,
+    ),
+    ConfigField(
+        "max_context_length",
+        "Max context length",
+        FieldKind.INT,
+        "Scribe",
+        "The largest prompt plus answer this worker offers to hold, narrowed to what the backend says it will accept.",
+        requires_restart=True,
+        minimum=1,
+        maximum=16384,
+        explicit_default=1024,
+    ),
+    ConfigField(
+        "text_model_name",
+        "Advertised model name",
+        FieldKind.STR,
+        "Scribe",
+        "Advertise the model under this name instead of the resolved one, spelled as the text model "
+        "reference spells it (author/Model). For a file of your own whose stem is not the name the horde "
+        "knows it by, or an attached backend reporting a name the horde does not recognise. Leave the "
+        "backend prefix off: the worker derives and applies it.",
+        requires_restart=True,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_models_dir",
+        "Text models folder",
+        FieldKind.STR,
+        "Scribe",
+        "Where model files the worker fetches are kept. Blank puts them beside the image weights under "
+        "the model cache. A text model naming a path is read where it sits and never copied here. "
+        "Applies when the worker runs the backend.",
+        requires_restart=True,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_backend_executable",
+        "Backend program",
+        FieldKind.STR,
+        "Scribe",
+        "A backend program to launch instead of the pinned release the worker would obtain: a build of "
+        "your own, a newer upstream release, or a backend the worker cannot yet provision. A .py path is "
+        "a source checkout's entry script and is run by the worker's own interpreter. Applies when the "
+        "worker runs the backend.",
+        requires_restart=True,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "kai_url",
+        "Attached backend URL",
+        FieldKind.STR,
+        "Scribe",
+        "Where the backend you run yourself listens. Applies when 'Worker runs the backend' is off; a "
+        "managed backend is reached on its own loopback port instead.",
+        explicit_default="http://localhost:5000",
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_backend_password",
+        "Attached backend password",
+        FieldKind.STR,
+        "Scribe",
+        "The password a backend you run yourself requires, sent with every request; blank sends none. "
+        "Applies when 'Worker runs the backend' is off, since a managed backend is started on loopback "
+        "with no password set.",
+        requires_restart=True,
+        secret=True,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_backend_port",
+        "Backend port",
+        FieldKind.INT,
+        "Scribe",
+        "Loopback port the managed backend listens on. The worker refuses to launch onto a port "
+        "something else still holds, because a backend that survived a previous run is the usual holder. "
+        "Applies when the worker runs the backend.",
+        requires_restart=True,
+        minimum=1,
+        maximum=65535,
+        explicit_default=5001,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_gpu_layers",
+        "Backend GPU layers",
+        FieldKind.INT,
+        "Scribe",
+        "How much of the model the managed backend places on the card, in the backend's own unit (layers, "
+        "for llama.cpp-based backends). A large value means the whole model; 0 keeps it on the CPU. "
+        "Applies when the worker runs the backend.",
+        requires_restart=True,
+        minimum=0,
+        explicit_default=99,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_gpu_device_index",
+        "Backend GPU device index",
+        FieldKind.INT,
+        "Scribe",
+        "The stable device index of the card the managed backend uses. Blank means the lowest driven "
+        "card, shared with image generation. Naming a card on a multi-GPU host dedicates it to text by "
+        "removing it from the image device map; on a single-card host the card stays shared whatever is "
+        "set here. Applies when the worker runs the backend.",
+        requires_restart=True,
+        minimum=0,
+        optional=True,
+        explicit_default=None,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_backend_accelerator",
+        "Backend compute path",
+        FieldKind.SELECT,
+        "Scribe",
+        "Which compute path the managed backend runs on. 'auto' follows the backend this install was set "
+        "up for: an NVIDIA build runs text on CUDA, an AMD build on Vulkan, a CPU build on the CPU. Set "
+        "it explicitly when text should differ from the install, as on a text-only worker installed with "
+        "the CPU build whose card should still serve text. Applies when the worker runs the backend.",
+        requires_restart=True,
+        choices=TEXT_BACKEND_ACCELERATOR_CHOICES,
+        explicit_default=TextBackendAccelerator.AUTO.value,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_threads",
+        "Concurrent text jobs",
+        FieldKind.INT,
+        "Scribe",
+        "How many text generations the managed backend is launched able to run at once, and the thread "
+        "count advertised on a text pop. Throughput per generation falls as this rises, so raise it only "
+        "after measuring it on the model you serve. Separate from Concurrent image jobs, which sizes GPU "
+        "inference lanes in this worker's own child processes.",
+        minimum=1,
+        maximum=16,
+        explicit_default=1,
+        risk_level="advanced",
+    ),
+    ConfigField(
+        "text_generation_timeout_seconds",
+        "Text generation timeout",
+        FieldKind.FLOAT,
+        "Scribe",
+        "Seconds to wait for one generation before abandoning it and faulting the job. Blank derives the "
+        "deadline from Max tokens per generation at a slow-hardware floor. Set it when the backend is "
+        "slower than that floor (a large model on a small card), or when jobs should be given up on "
+        "sooner.",
+        minimum=0,
+        exclusive_minimum=True,
+        unit="s",
+        optional=True,
+        explicit_default=None,
+        risk_level="dangerous",
+    ),
+    ConfigField(
+        "text_stall_seconds",
+        "Text stall timeout",
+        FieldKind.FLOAT,
+        "Scribe",
+        "Seconds without a single token arriving before a generation is abandoned and the job faulted. "
+        "The backend streams its answer, so a gap this long is a backend that stopped rather than one "
+        "that is slow; the generation timeout stays the outer limit. The first token after the backend "
+        "starts is exempt, because a cold backend spends seconds warming up.",
+        minimum=0,
+        exclusive_minimum=True,
+        unit="s",
+        explicit_default=30.0,
+        risk_level="dangerous",
     ),
     # Timeouts
     ConfigField(
@@ -2029,14 +2288,17 @@ def validate_identity_names(
     *,
     alchemist_enabled: bool,
     alchemist_name: str,
+    scribe_enabled: bool = False,
+    scribe_name: str = "",
 ) -> list[tuple[str, str]]:
     """Return ``(field_key, message)`` errors for any invalid worker identity name.
 
     Worker names are unique horde-wide and bound to the API key that first registers them, and each
-    worker *type* (image "dreamer", alchemy "alchemist") registers as its own separately-named worker.
-    A blank, still-default, or colliding name otherwise aborts the worker at startup (or fails with a
-    cryptic credentials error at pop time), so the editor blocks a save that would produce one. The
-    alchemist name is only checked when alchemy is enabled; an empty list means the names are valid.
+    worker *type* (image "dreamer", alchemy "alchemist", text "scribe") registers as its own
+    separately-named worker. A blank, still-default, or colliding name otherwise aborts the worker at
+    startup (or fails with a cryptic credentials error at pop time), so the editor blocks a save that
+    would produce one. A role's name is only checked while that role is enabled, so a placeholder left
+    in a role the operator does not serve blocks nothing; an empty list means the names are valid.
     """
     errors: list[tuple[str, str]] = []
     dreamer = dreamer_name.strip()
@@ -2051,8 +2313,8 @@ def validate_identity_names(
             ),
         )
 
+    alchemist = alchemist_name.strip()
     if alchemist_enabled:
-        alchemist = alchemist_name.strip()
         if not alchemist:
             errors.append(("alchemist_name", "Alchemist name is required when alchemy is enabled"))
         elif alchemist == ALCHEMIST_NAME_RESERVED_DEFAULT:
@@ -2067,6 +2329,31 @@ def validate_identity_names(
                     "on the horde)",
                 ),
             )
+
+    if scribe_enabled:
+        scribe = scribe_name.strip()
+        if not scribe:
+            errors.append(("scribe_name", "Scribe name is required when text generation is enabled"))
+        elif scribe == SCRIBE_NAME_RESERVED_DEFAULT:
+            errors.append(
+                ("scribe_name", "Scribe name is still the default placeholder; set a unique one"),
+            )
+        else:
+            # Only a name a role registers under can collide, so the alchemist counts as an occupant of
+            # its name only while alchemy is on.
+            occupied = [(dreamer, "dreamer")]
+            if alchemist_enabled:
+                occupied.append((alchemist, "alchemist"))
+            for other_name, other_label in occupied:
+                if other_name and scribe.lower() == other_name.lower():
+                    errors.append(
+                        (
+                            "scribe_name",
+                            f"Scribe name must differ from the {other_label} name (each worker type "
+                            "registers separately on the horde)",
+                        ),
+                    )
+                    break
     return errors
 
 

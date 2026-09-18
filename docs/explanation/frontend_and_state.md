@@ -69,7 +69,7 @@ defines the structured protocol over it:
   plus its fault reports, matching what the image job tracker's movement counter means; the same totals feed
   the stats sample and the durable `WorkerRunRecord`, which is what judges a session productive.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 28) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 29) so a frontend can detect a mismatch with a worker built from different code.
 
 ### The event ring
 
@@ -513,15 +513,17 @@ a durable preference.
 ## Worker identity preflight
 
 Worker names are unique horde-wide and tied to the API key that first registers
-them, and each worker *type* (the image "dreamer" and the alchemy "alchemist")
-registers as a separate, uniquely-named worker. Getting this wrong otherwise
-surfaces only as a late, cryptic "Wrong credentials to submit as this worker" at
+them, and each worker *type* (the image "dreamer", the alchemy "alchemist" and
+the text "scribe") registers as a separate, uniquely-named worker. Getting this
+wrong otherwise surfaces only as a late, cryptic "Wrong credentials to submit as
+this worker" at
 pop time. [`worker_identity.py`][horde_worker_regen.process_management.config.worker_identity]
 fails fast *before* any process spawns:
 
-1. A **local** check (no network): names must not be the reserved template
-   defaults, and the alchemist name must differ from the dreamer name when
-   alchemy is enabled.
+1. A **local** check (no network): the name of every enabled role must be set,
+   must not be its reserved template default, and must differ from the other
+   enabled roles' names. A role that is off is not checked, because its name is
+   never sent: a text-only worker may leave the dreamer placeholder in place.
 2. A **network** check: each enabled name must be either unregistered (a
    brand-new worker) or already owned by the configured API key. The name is
    resolved through the single-worker-by-name endpoint, not the all-workers list:
@@ -532,6 +534,14 @@ fails fast *before* any process spawns:
    chosen policy this hard-fails on any such failure, including the API being
    unreachable (after a small bounded retry), so the worker never silently runs
    under a name the horde will reject.
+
+The dashboard applies the same local rules before it writes the file, in
+[`config_form.py`][horde_worker_regen.tui.config_form]'s `validate_identity_names`:
+a save is blocked while an enabled role's name is blank, is still the reserved
+template placeholder, or matches the name another *enabled* role registers under.
+Every role is checked only while it is on, so a placeholder left in a role the
+operator does not serve blocks nothing, and a name shared with a role that is
+switched off is not a collision.
 
 ## Progressive experience levels
 

@@ -59,6 +59,7 @@ from horde_worker_regen.tui.widgets.experience import DashboardPreferencesView
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
 from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
+from horde_worker_regen.tui.widgets.text_model_picker import TextModelPickerModal
 
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot
@@ -70,6 +71,9 @@ _MODELS_SECTION = "Models"
 _DASHBOARD_SECTION = "Dashboard"
 # The section whose fields drive the (non-obvious) inference-process count; a live preview is appended here.
 _THROUGHPUT_SECTION = "Throughput"
+# The scribe's model field and the folder its picker resolves on-disk presence against.
+_TEXT_MODEL_KEY = "text_model"
+_TEXT_MODELS_DIR_KEY = "text_models_dir"
 _PROCESS_PREVIEW_ID = "config-process-preview"
 
 # The per-card multi-GPU editor is its own sub-tab, mounted after the catalog-driven tabs rather than
@@ -88,14 +92,16 @@ _ADVANCED_SECTIONS: set[str] = {
 }
 
 _SIMPLE_SUBTABS: frozenset[str] = frozenset(
-    {"Essentials", "Models", "Content", "Features", "Alchemy", "LoRA & Downloads"},
+    {"Essentials", "Models", "Content", "Features", "Alchemy", "Text", "LoRA & Downloads"},
 )
 """Sub-tab labels offered in the Simple experience.
 
 These carry the decisions a contributor makes about their own worker: its identity, the models and forms
 it offers, and the content it accepts. Alchemy belongs here because an alchemist is a worker role in the
 same sense a dreamer is; its role switch, name, and offered forms answer the same questions the dreamer
-settings on Essentials and Features do, and Simple is the level an alchemist lands in by default.
+settings on Essentials and Features do, and Simple is the level an alchemist lands in by default. Text
+follows the same reasoning for the scribe, whose normal-tier fields are its role switch, its name and
+which model it serves; the tuning its backend takes is tiered out of this level per field.
 
 LoRA & Downloads belongs here for a different reason: bandwidth, cache size and the disk floor decide
 how much of a contributor's machine the worker consumes, which they have a direct stake in whatever they
@@ -714,8 +720,13 @@ class ConfigEditorView(Vertical):
                 type=input_type,  # type: ignore[arg-type]
                 password=field.secret,
             )
+            row: list[Widget] = [Label(label_text), field_input]
+            if field.picker is not None:
+                # The button only fills the input, so the field stays typeable: a path of the operator's
+                # own is answered in the same control the picker writes into.
+                row.append(Button("Choose...", id=f"cfg-{field.key}-picker", variant="default"))
             control = Vertical(
-                Horizontal(Label(label_text), field_input, classes="config-row"),
+                Horizontal(*row, classes="config-row"),
                 Static(field.help, classes="config-help"),
                 classes="config-field",
             )
@@ -875,6 +886,8 @@ class ConfigEditorView(Vertical):
             self._open_preset_modal()
         elif event.button.id == "cfg-custom_models-add":
             self._open_custom_model_builder()
+        elif event.button.id == f"cfg-{_TEXT_MODEL_KEY}-picker":
+            self._open_text_model_picker()
         elif event.button.id == "config-save":
             self._save()
         elif event.button.id == "config-restart" and self._save():
@@ -1100,6 +1113,21 @@ class ConfigEditorView(Vertical):
         """Open the custom-model builder and append its result to the YAML field."""
         self.app.push_screen(CustomModelBuilderModal(), self._apply_custom_model_builder_result)
 
+    def _open_text_model_picker(self) -> None:
+        """Open the text model catalogue over the folder the form currently names."""
+        self.app.push_screen(
+            TextModelPickerModal(self._string_widget_value(_TEXT_MODELS_DIR_KEY)),
+            self._apply_text_model_choice,
+        )
+
+    def _apply_text_model_choice(self, chosen: str | None) -> None:
+        """Write the chosen model name into the field's input, leaving the save to the operator."""
+        if chosen is None:
+            return
+        self.query_one(f"#cfg-{_TEXT_MODEL_KEY}", Input).value = chosen
+        self._refresh_action_variants()
+        self._set_status(f"Set the scribe's model to {chosen!r} in the form; save to write it.", "yellow")
+
     def _apply_custom_model_builder_result(self, result: CustomModelBuilderResult | None) -> None:
         """Append a custom model record and optionally add it to the offer list."""
         if result is None:
@@ -1167,20 +1195,24 @@ class ConfigEditorView(Vertical):
     def _identity_name_errors(self) -> list[tuple[ConfigField, str]]:
         """Validate the worker identity names from the live widgets, mapped onto their ConfigFields.
 
-        Reads the dreamer name, the alchemist toggle, and the alchemist name straight from their
-        widgets so an unsaved edit is judged, falling back to the on-disk value if a widget cannot be
-        read. Delegates the actual rules to ``validate_identity_names`` and keys each error to its
-        ConfigField so ``_report_save_errors`` can jump to the right sub-tab.
+        Reads each role's toggle and name straight from their widgets so an unsaved edit is judged,
+        falling back to the on-disk value if a widget cannot be read. Delegates the actual rules to
+        ``validate_identity_names`` and keys each error to its ConfigField so ``_report_save_errors``
+        can jump to the right sub-tab.
         """
         dreamer = self._string_widget_value("dreamer_name")
         alchemist_enabled = self._bool_widget_value("alchemist")
         alchemist = self._string_widget_value("alchemist_name")
+        scribe_enabled = self._bool_widget_value("scribe")
+        scribe = self._string_widget_value("scribe_name")
         return [
             (_FIELD_BY_KEY[key], message)
             for key, message in validate_identity_names(
                 dreamer,
                 alchemist_enabled=alchemist_enabled,
                 alchemist_name=alchemist,
+                scribe_enabled=scribe_enabled,
+                scribe_name=scribe,
             )
         ]
 
@@ -1265,16 +1297,17 @@ class ConfigEditorView(Vertical):
 
     def _effective_summary(self, state: dict[str, object]) -> Text:
         """A compact, plain-language summary of what this config currently serves."""
-        dreamer = bool(state.get("dreamer"))
-        alchemist = bool(state.get("alchemist"))
-        if dreamer and alchemist:
-            role = "image + alchemy"
-        elif dreamer:
-            role = "image generation"
-        elif alchemist:
-            role = "alchemy only"
-        else:
+        served = [
+            label
+            for key, label in (("dreamer", "image"), ("alchemist", "alchemy"), ("scribe", "text"))
+            if bool(state.get(key))
+        ]
+        if not served:
             role = "nothing enabled"
+        elif len(served) == 1:
+            role = "image generation" if served == ["image"] else f"{served[0]} only"
+        else:
+            role = " + ".join(served)
 
         raw_load = state.get(MODELS_TO_LOAD_KEY)
         load_rules = [str(item) for item in raw_load] if isinstance(raw_load, list) else []
@@ -1316,7 +1349,7 @@ class ConfigEditorView(Vertical):
             pool_text = "pool: off"
 
         text = Text("Current: ", style="bold")
-        text.append(role, style="cyan" if dreamer or alchemist else "red")
+        text.append(role, style="cyan" if served else "red")
         text.append(f"  |  {process_text}  |  models: {model_text}  |  {pool_text}  |  ")
         text.append(" / ".join(feature_bits))
         return text

@@ -140,9 +140,10 @@ def test_secret_fields_flagged() -> None:
     """Sensitive fields are marked secret so the editor masks them."""
     assert _BY_KEY["api_key"].secret
     assert _BY_KEY["civitai_api_token"].secret
+    assert _BY_KEY["text_backend_password"].secret
 
 
-def test_no_obsolete_or_scribe_fields() -> None:
-    """Obsolete / unused-in-reGen / Scribe keys are intentionally excluded."""
-    for key in ("dynamic_models", "scribe_name", "kai_url", "vram_to_leave_free", "disable_disk_cache"):
+def test_no_obsolete_fields() -> None:
+    """Obsolete and unused-in-reGen keys are intentionally excluded."""
+    for key in ("dynamic_models", "vram_to_leave_free", "disable_disk_cache"):
         assert key not in _BY_KEY, key
