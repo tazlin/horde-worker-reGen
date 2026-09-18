@@ -63,7 +63,7 @@ def test_non_tag_clean_gets_dev_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path
 
 
 def test_non_tag_dirty_gets_dirty_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Uncommitted changes off the tag add a ``.dirty`` marker."""
+    """Uncommitted changes off the tag add a ``.modified`` marker."""
     _with_git(
         monkeypatch,
         tmp_path,
@@ -73,7 +73,7 @@ def test_non_tag_dirty_gets_dirty_suffix(monkeypatch: pytest.MonkeyPatch, tmp_pa
             ("rev-parse", "--short", "HEAD"): "abc1234",
         },
     )
-    assert rv.runtime_version() == f"{__version__}+dev.gabc1234.dirty"
+    assert rv.runtime_version() == f"{__version__}+dev.gabc1234.modified"
 
 
 def test_on_tag_but_dirty_still_marked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -87,7 +87,7 @@ def test_on_tag_but_dirty_still_marked(monkeypatch: pytest.MonkeyPatch, tmp_path
             ("rev-parse", "--short", "HEAD"): "abc1234",
         },
     )
-    assert rv.runtime_version() == f"{__version__}+dev.gabc1234.dirty"
+    assert rv.runtime_version() == f"{__version__}+dev.gabc1234.modified"
 
 
 def test_git_unavailable_degrades_to_plain(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

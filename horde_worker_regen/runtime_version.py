@@ -4,7 +4,7 @@ The release version itself lives in exactly one place: ``__version__`` in ``hord
 (read by hatchling at build time, see ``[tool.hatch.version]`` in ``pyproject.toml``). This module adds
 a thin, best-effort annotation on top of it: when the worker is being run straight out of a git checkout
 that is *not* sitting exactly on the matching release tag, the reported version gains a
-``+dev.g<shortsha>`` (and ``.dirty`` when there are uncommitted changes) suffix.
+``+dev.g<shortsha>`` (and ``.modified`` when there are uncommitted changes) suffix.
 
 The point is to make a developer's local run distinguishable from a real release on the AI Horde (the
 ``bridge_agent`` header) and in logs, without ever touching the clean ``__version__`` literal that hatch
@@ -42,11 +42,11 @@ def _git(*args: str) -> str | None:
 
 
 def _dev_suffix() -> str:
-    """Compute a ``+dev.g<sha>[.dirty]`` suffix, or an empty string for a release-equivalent checkout.
+    """Compute a ``+dev.g<sha>[.modified]`` suffix, or an empty string for a release-equivalent checkout.
 
     Returns an empty string when there is no usable git checkout, or when HEAD is exactly on the
     ``v{__version__}`` tag with a clean working tree (i.e. this *is* the release that ``__version__``
-    describes). A dirty tree on the tag still earns a ``.dirty`` marker, since it is no longer the
+    describes). A dirty tree on the tag still earns a ``.modified`` marker, since it is no longer the
     released bits.
     """
     if not (_REPO_ROOT / ".git").exists():
@@ -63,7 +63,7 @@ def _dev_suffix() -> str:
     if not short_sha:
         return ""
 
-    return f"+dev.g{short_sha}{'.dirty' if dirty else ''}"
+    return f"+dev.g{short_sha}{'.modified' if dirty else ''}"
 
 
 @cache
