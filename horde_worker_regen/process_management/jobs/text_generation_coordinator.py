@@ -1123,7 +1123,10 @@ class TextGenerationCoordinator:
 
         if isinstance(pop_response, RequestErrorResponse):
             self._handle_pop_error_response(pop_response)
-            self._enter_pop_error_backoff()
+            # Maintenance is a hold the operator chose, and the horde still hands the owner's jobs to
+            # this worker's pops, so backing off would only make it the slowest worker to reach them.
+            if pop_response.rc != RC.WorkerMaintenance:
+                self._enter_pop_error_backoff()
             return
 
         if self._maintenance_hold_logged:

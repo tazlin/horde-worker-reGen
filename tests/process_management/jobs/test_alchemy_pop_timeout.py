@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from horde_sdk import RequestErrorResponse
 from loguru import logger
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
@@ -50,6 +51,29 @@ async def test_alchemy_pop_times_out_and_enters_error_backoff(monkeypatch: pytes
     # backoff written into it would report a pop that has not happened yet.
     assert coordinator._pop_hold_until >= started_at + coordinator._error_pop_frequency
     assert coordinator.last_pop_time <= time.time()
+
+
+async def test_a_maintenance_refusal_keeps_the_pop_cadence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The horde still hands the owner's forms to a worker in maintenance, so its pops must not back off."""
+    manager = make_testable_process_manager(alchemist=True)
+    coordinator = manager._alchemy_coordinator
+    monkeypatch.setattr(coordinator, "_should_pop", lambda: True)
+    monkeypatch.setattr(alchemy_popper, "expand_offered_forms", lambda *_args, **_kwargs: ["nsfw"])
+    coordinator.bridge_data.priority_usernames = []
+    refusal = RequestErrorResponse(message="owner-only traffic", rc="WorkerMaintenance")
+    session = Mock()
+    session.submit_request = AsyncMock(return_value=refusal)
+    api_sessions = Mock()
+    api_sessions.require_horde_client_session.return_value = session
+    coordinator._api_sessions = api_sessions
+    hold_before = coordinator._pop_hold_until
+
+    await coordinator.api_alchemy_pop()
+    await coordinator.api_alchemy_pop()
+
+    assert session.submit_request.await_count == 2
+    assert coordinator._pop_hold_until == hold_before
+    assert coordinator._maintenance_hold_logged is True
 
 
 def test_the_spare_image_lane_rule_applies_only_where_image_generation_is_served() -> None:

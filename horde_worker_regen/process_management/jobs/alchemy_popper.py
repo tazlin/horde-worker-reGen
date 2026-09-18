@@ -44,6 +44,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     AlchemyPopRequest,
 )
 from horde_sdk.ai_horde_api.apimodels.alchemy.submit import AlchemyJobSubmitResponse
+from horde_sdk.ai_horde_api.consts import RC
 from horde_sdk.generation_parameters.alchemy.consts import (
     KNOWN_ALCHEMY_FORMS,
     KNOWN_ANNOTATION_CONTROL_TYPES,
@@ -543,6 +544,7 @@ class AlchemyCoordinator:
         # forms available" line is edge-triggered: it fires only when the reasons change (or a pop that did
         # find forms intervenes), never once per empty pop at steady state.
         self._last_logged_no_forms_skipped: dict[str, object] | None = None
+        self._maintenance_hold_logged = False
 
     @property
     def kind(self) -> WorkloadKind:
@@ -1019,12 +1021,27 @@ class AlchemyCoordinator:
         if self._run_metrics is not None:
             self._run_metrics.record_event(WorkerEventKind.POP_BACKOFF_LEFT, workload=WorkloadKind.ALCHEMY)
 
-    def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
-        """Log an alchemy pop error, with actionable guidance for common, recoverable causes."""
+    def _handle_pop_error_response(self, response: RequestErrorResponse) -> bool:
+        """Log an alchemy pop error with guidance for the common causes, and return whether it is one.
+
+        A worker in maintenance is refused with ``WorkerMaintenance`` and the operator's own message as
+        the text, so it is recognised by the return code. That is a deliberate operator state in which
+        the horde still hands the owner's forms to this worker's pops, so it is announced once, repeats
+        stay at TRACE, and False is returned: backing off would only make the worker slower than every
+        other one to reach the forms it is still owed.
+        """
+        if response.rc == RC.WorkerMaintenance:
+            if not self._maintenance_hold_logged:
+                logger.info(
+                    f"Alchemy pops are held: this worker is in maintenance on the horde ({response.message!r}). "
+                    "Only its owner's requests reach it until maintenance is lifted.",
+                )
+                self._maintenance_hold_logged = True
+            else:
+                logger.trace(f"Alchemy pop refused while in maintenance: {response.message!r}")
+            return False
         message_lower = response.message.lower()
-        if "maintenance mode" in message_lower:
-            logger.warning(f"Failed to pop alchemy job (Maintenance Mode): {response}")
-        elif "wrong credentials" in message_lower:
+        if "wrong credentials" in message_lower:
             logger.warning(f"Failed to pop alchemy job (Wrong Credentials): {response}")
             logger.error("Did you set a unique `alchemist_name` in bridgeData.yaml?")
             logger.error(
@@ -1033,6 +1050,7 @@ class AlchemyCoordinator:
             )
         else:
             logger.error(f"Failed to pop alchemy job (API Error): {response}")
+        return True
 
     @logger.catch(reraise=True)
     async def api_alchemy_pop(self) -> None:
@@ -1094,9 +1112,13 @@ class AlchemyCoordinator:
             return
 
         if isinstance(pop_response, RequestErrorResponse):
-            self._handle_pop_error_response(pop_response)
-            self._enter_pop_error_backoff()
+            if self._handle_pop_error_response(pop_response):
+                self._enter_pop_error_backoff()
             return
+
+        if self._maintenance_hold_logged:
+            logger.info("Alchemy pops resumed: the horde is accepting this worker's pops again.")
+            self._maintenance_hold_logged = False
 
         if not pop_response.forms:
             skipped = pop_response.skipped.model_dump(exclude_defaults=True) if pop_response.skipped else {}
