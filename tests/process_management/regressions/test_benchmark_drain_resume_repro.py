@@ -32,6 +32,10 @@ class _CountingInferenceLifecycle:
         self.inference_count = provisioned
         self.start_inference_calls = 0
 
+    def process_type_wanted(self, process_type: object) -> bool:
+        """Every process type is wanted: the worker under test serves image generation."""
+        return True
+
     def start_download_process(self) -> None:
         """The hold ensures the download process is up; irrelevant to inference capacity here."""
 

@@ -34,6 +34,7 @@ from horde_worker_regen.process_management.scheduling.workload_kind import Workl
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+    from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 
 # The one worker-local fact about feature extras: how a horde-engine feature extra is re-exported under
 # the worker's own ``[project.optional-dependencies]`` name. horde-engine's ``rembg`` extra is surfaced
@@ -177,6 +178,18 @@ def enabled_workloads(bridge_data: reGenBridgeData) -> frozenset[WorkloadKind]:
     if bridge_data.scribe is True:
         workloads.add(WorkloadKind.TEXT_GENERATION)
     return frozenset(workloads)
+
+
+def wanted_process_types(bridge_data: reGenBridgeData) -> frozenset[HordeProcessType]:
+    """Return the process types the served workloads need, before each type's own configuration gate.
+
+    The start sites consult this so a worker starts only what it will use: a text-only worker starts no
+    child at all, and an alchemy-only worker starts no inference process because no alchemy form runs on
+    one.
+    """
+    from horde_worker_regen.process_management.scheduling.workload_flow import process_types_for_workloads
+
+    return process_types_for_workloads(enabled_workloads(bridge_data))
 
 
 def _coerce_workload_config(bridge_data: reGenBridgeData, *, log: bool) -> list[str]:

@@ -463,10 +463,15 @@ def _maintenance_detail(
 
 
 def _is_warming_up(snapshot: WorkerStateSnapshot) -> bool:
-    """True before any process has become ready/serving (startup, first model load)."""
+    """True before any process has become ready/serving (startup, first model load).
+
+    A worker serving only text starts no child of its own, so an empty process list there is its steady
+    state and the text backend's posture is the headline instead. A snapshot that reports no workloads
+    is read as one that will start children.
+    """
     inference_processes = [process for process in snapshot.processes if not process.is_external]
     if not inference_processes:
-        return True
+        return snapshot.enabled_workloads != [WorkloadKind.TEXT_GENERATION.value]
     if any(process.last_process_state in (_READY_STATES | _INFERENCE_STATES) for process in inference_processes):
         return False
     return any(process.last_process_state in _LOADING_STATES for process in inference_processes)

@@ -25,7 +25,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
     is_upscaler_form,
 )
 
-from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
 
 # Re-exported from its leaf home so every existing importer of WorkloadKind from this module stays valid.
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
@@ -76,6 +76,37 @@ def capabilities_for_workload(kind: WorkloadKind) -> WorkerCapability:
     generation; callers looking for a process to dispatch to should find none rather than any.
     """
     return _WORKLOAD_CAPABILITIES[kind]
+
+
+_IMAGE_ONLY = frozenset({WorkloadKind.IMAGE_GENERATION})
+_IMAGE_AND_ALCHEMY = frozenset({WorkloadKind.IMAGE_GENERATION, WorkloadKind.ALCHEMY})
+
+_PROCESS_TYPE_WORKLOADS: dict[HordeProcessType, frozenset[WorkloadKind]] = {
+    HordeProcessType.INFERENCE: _IMAGE_ONLY,
+    HordeProcessType.COMPONENT: _IMAGE_ONLY,
+    HordeProcessType.VAE_LANE: _IMAGE_ONLY,
+    HordeProcessType.SAFETY: _IMAGE_AND_ALCHEMY,
+    HordeProcessType.POST_PROCESS: _IMAGE_AND_ALCHEMY,
+    HordeProcessType.UTILITIES: _IMAGE_AND_ALCHEMY,
+    HordeProcessType.DOWNLOAD: _IMAGE_AND_ALCHEMY,
+    HordeProcessType.TEXT_BACKEND: frozenset({WorkloadKind.TEXT_GENERATION}),
+}
+"""The workloads each process type exists for; a worker serving none of them never starts that type.
+
+Wider than the capability maps because a process can be needed without executing a routed unit of work:
+safety screens image results, the download process feeds the others their files, and the component and VAE
+lanes are stages of a disaggregated image job. No alchemy form routes to an inference process (see
+:func:`capability_for_alchemy_form`), so alchemy alone does not start one. A type's own configuration gate
+(the post-processing mode, the utilities flag, pipeline disaggregation) still applies on top."""
+
+
+def process_types_for_workloads(workloads: frozenset[WorkloadKind]) -> frozenset[HordeProcessType]:
+    """Return the process types at least one of the given workloads needs."""
+    return frozenset(
+        process_type
+        for process_type, needed_by in _PROCESS_TYPE_WORKLOADS.items()
+        if not needed_by.isdisjoint(workloads)
+    )
 
 
 def capability_for_alchemy_form(form: str) -> WorkerCapability:

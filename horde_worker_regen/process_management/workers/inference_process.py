@@ -390,8 +390,9 @@ class HordeInferenceProcess(HordeProcess):
         work even when the torch-free orchestrator's install sentinel (``bin/backend``) was never set to
         ``cpu`` (a manually installed CPU torch is the motivating case). The torch-bearing child is
         authoritative about the build, so it reports the fact; the parent latches it and the image popper
-        stops, while alchemy (which runs acceptably on CPU) keeps serving on this same process. Unlike
-        :meth:`_verify_torch_supports_gpu` this never exits: the process is still useful for alchemy.
+        stops, while alchemy (which runs acceptably on CPU) keeps serving on the safety process and the
+        auxiliary lanes; no alchemy form runs here. Unlike :meth:`_verify_torch_supports_gpu` this never
+        exits: the parent decides what becomes of the pool once it has the report.
 
         Build-based on purpose: it keys on the torch *build* having no GPU backend, so a merely masked or
         broken GPU on a real GPU build is not mistaken for a CPU install (which would wrongly disable image

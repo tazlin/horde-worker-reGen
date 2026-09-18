@@ -46,10 +46,14 @@ There are two ways to end up alchemist-only:
 
 ## What changes in alchemist-only mode
 
-- **One inference process per card.** Instead of the image-generation fleet, a single inference process
-  is spawned per card. Graph alchemy forms (upscale, face-fix) run on the dedicated post-processing
-  lane; background removal runs on the image-utilities lane. Text/CLIP forms (caption, interrogation,
-  NSFW, vectorize, palette, describe, aesthetic) run on the safety process.
+- **No inference processes.** No alchemy form runs on one, so none is started. Graph alchemy forms
+  (upscale, face-fix) run on the dedicated post-processing lane; background removal and annotation run
+  on the image-utilities lane (on by default, `enable_image_utilities`). Text/CLIP forms (caption,
+  interrogation, NSFW, vectorize, palette, describe, aesthetic) run on the safety process, which is
+  why it stays up; alchemy results are not safety-screened. The download process still runs to fetch
+  the models those three need.
+- **Pipeline disaggregation does nothing here.** Its text-encode and VAE lanes are stages of an image
+  job and are not started.
 - **No image models are loaded.** Any configured `models_to_load`/`dynamic_models` are coerced off, so
   the worker never advertises or pops an image job.
 - **The forms decide which auxiliary models are downloaded.** A worker offering `post-process` fetches
@@ -63,7 +67,8 @@ There are two ways to end up alchemist-only:
 
 ## Verifying it worked
 
-- On startup the log should show no image models loaded and exactly one inference process per card.
+- On startup the log should show no image models loaded and no inference process started; the safety
+  process and the enabled lanes come up once the on-disk scan completes.
 - The dashboard overview should display the alchemist-only identity and the alchemy pipeline.
 - Pop and complete a form (any offered form) and confirm it appears in the **Recent jobs** view (press
   the details view; alchemist-only retains more rows than a dreamer worker).

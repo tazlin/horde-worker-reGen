@@ -15,7 +15,12 @@ from loguru import logger
 
 from horde_worker_regen import capabilities, compute_mode
 from horde_worker_regen.process_management.jobs.alchemy_popper import expand_offered_forms
-from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+from horde_worker_regen.process_management.lifecycle.horde_process import DEFAULT_CAPABILITIES, HordeProcessType
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    WorkloadKind,
+    capabilities_for_workload,
+    process_types_for_workloads,
+)
 
 
 def _patch_utilities(monkeypatch: pytest.MonkeyPatch, available: bool) -> None:
@@ -293,6 +298,54 @@ def test_enabled_workloads_scribe_survives_a_cpu_only_install(monkeypatch: pytes
     bd = _bridge_data(dreamer=True, alchemist=False, scribe=True)
 
     assert capabilities.enabled_workloads(bd) == frozenset({WorkloadKind.TEXT_GENERATION})  # type: ignore[arg-type]
+
+
+def test_a_text_only_worker_wants_no_child_of_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text generation runs in an external program, so only the backend itself is wanted."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=False, alchemist=False, scribe=True)
+
+    assert capabilities.wanted_process_types(bd) == frozenset({HordeProcessType.TEXT_BACKEND})  # type: ignore[arg-type]
+
+
+def test_an_alchemy_only_worker_wants_no_inference_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No alchemy form routes to an inference process, and the disaggregation lanes are image stages."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=False, alchemist=True)
+
+    assert capabilities.wanted_process_types(bd) == frozenset(  # type: ignore[arg-type]
+        {
+            HordeProcessType.SAFETY,
+            HordeProcessType.POST_PROCESS,
+            HordeProcessType.UTILITIES,
+            HordeProcessType.DOWNLOAD,
+        },
+    )
+
+
+def test_an_image_worker_wants_every_type_but_the_text_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Image generation is the workload every in-worker process type exists for."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=True, alchemist=False)
+
+    assert capabilities.wanted_process_types(bd) == frozenset(HordeProcessType) - {  # type: ignore[arg-type]
+        HordeProcessType.TEXT_BACKEND,
+    }
+
+
+@pytest.mark.parametrize("workload", list(WorkloadKind))
+def test_a_process_type_that_executes_a_workload_is_wanted_by_it(workload: WorkloadKind) -> None:
+    """The start table may be wider than the routing maps and never narrower: a routed unit needs its executor."""
+    wanted = process_types_for_workloads(frozenset({workload}))
+
+    for process_type, declared in DEFAULT_CAPABILITIES.items():
+        if declared & capabilities_for_workload(workload):
+            assert process_type in wanted
+
+
+def test_every_process_type_states_which_workloads_need_it() -> None:
+    """A type missing from the start table would never start for any worker."""
+    assert process_types_for_workloads(frozenset(WorkloadKind)) == frozenset(HordeProcessType)
 
 
 def test_scribe_only_worker_is_not_warned_as_having_nothing_to_serve(monkeypatch: pytest.MonkeyPatch) -> None:

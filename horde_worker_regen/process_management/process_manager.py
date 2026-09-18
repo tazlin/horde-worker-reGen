@@ -592,10 +592,10 @@ def resolve_card_concurrency(
     the lease-aware inference-semaphore size from :func:`_resolve_inference_concurrency`. Passing one card's
     effective values reproduces today's globals exactly for a single-GPU host.
 
-    When this worker does not serve image generation (``serves_image_generation`` is false: an
-    alchemist-only worker, whether by CPU install or a deliberate ``dreamer: false`` opt-out) the
-    inference-process count is forced to one. The ceiling and semaphore sizes are left intact so the
-    single process is still sized correctly.
+    When this worker does not serve image generation (``serves_image_generation`` is false: alchemy or
+    text only, whether by CPU install or a deliberate ``dreamer: false`` opt-out) the inference-process
+    count is zero, because no other workload runs on an inference process. The semaphores are still sized
+    for one process so the primitives built from them stay valid.
     """
     ceiling = max(max_threads, max_threads_ceiling)
     max_concurrent = ceiling
@@ -603,12 +603,12 @@ def resolve_card_concurrency(
     if num_models_to_load == 1 and max_concurrent == 1:
         target_process_count = 1
     if not serves_image_generation:
-        target_process_count = 1
+        target_process_count = 0
     inference_semaphore_size, lease_slots = _resolve_inference_concurrency(
         gpu_sampling_lease_enabled=gpu_sampling_lease_enabled,
         configured_lease_slots=gpu_sampling_lease_slots,
         max_concurrent_inference_processes=max_concurrent,
-        max_inference_processes=target_process_count,
+        max_inference_processes=max(1, target_process_count),
     )
     # Tail overlap only applies when the lease itself gates denoise; without the lease there is no permit to
     # hand off. Compared against ``is True`` so a Mock/truthy config value never silently enables it.
@@ -2175,8 +2175,8 @@ class HordeWorkerProcessManager:
         device_indices = sorted(self._device_map.root) or [0]
         effective_configs = resolve_all_effective_gpu_configs(bridge_data, device_indices)
         # The dreamer/alchemist roles are worker-wide (not per-card overrides), so whether image
-        # generation is served is decided once for the whole worker. An alchemist-only worker collapses
-        # every card to a single inference process (graph alchemy serializes through it).
+        # generation is served is decided once for the whole worker. A worker that does not serve it
+        # plans no inference process on any card: no alchemy form and no text job runs on one.
         serves_image_generation = WorkloadKind.IMAGE_GENERATION in enabled_workloads(bridge_data)
         per_card_concurrency = {
             index: resolve_card_concurrency(
@@ -7762,10 +7762,10 @@ class HordeWorkerProcessManager:
 
         A worker whose install sentinel was never set (a manual CPU torch install) comes up sized for image
         generation. When an inference child reports a CPU-only torch build at runtime
-        (``torch_build_cpu_only``), image generation is disabled and a single inference process per card is
-        enough for the graph alchemy forms, so the extra contexts are reaped. This brings the runtime path
-        to parity with the startup ``serves_image_generation=False`` sizing the install sentinel would have
-        produced.
+        (``torch_build_cpu_only``), image generation is disabled and the extra contexts are reaped. No
+        alchemy form runs on an inference process, so the one left per card serves nothing; it is kept
+        because it is the process that made the report, and an install whose sentinel says ``cpu`` plans
+        none at all (``resolve_card_concurrency``).
 
         Each card's ``target_process_count`` is lowered to one (authoritative for recovery placement, the
         VRAM/RAM budget, and any target-based scale-up), then idle contexts are reaped toward one. Run every

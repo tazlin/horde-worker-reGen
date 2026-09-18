@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 from horde_sdk.ai_horde_api.fields import GenerationID
 
 from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
+from horde_worker_regen.capabilities import wanted_process_types
 from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
@@ -1086,7 +1087,13 @@ class ProcessLifecycleManager:
             )
 
     def _request_inference_process_start(self, pid: int, *, device_index: int, reason: str) -> bool:
-        """Start an inference slot now, or defer it until the assigned device has headroom."""
+        """Start an inference slot now, or defer it until the assigned device has headroom.
+
+        Every path that adds an inference process (the initial pool, scaling, replacement) comes through
+        here, so this is where a worker that serves no image generation is kept from growing one.
+        """
+        if not self.process_type_wanted(HordeProcessType.INFERENCE):
+            return False
         key = self._pending_gpu_start_key(HordeProcessType.INFERENCE, pid)
         if key in self._pending_gpu_starts:
             return False
@@ -1125,8 +1132,18 @@ class ProcessLifecycleManager:
                 self._pending_gpu_start_last_free_mb_by_device.pop(pending.device_index, None)
         return started
 
+    def process_type_wanted(self, process_type: HordeProcessType) -> bool:
+        """Whether a served workload needs this process type at all.
+
+        Read from the live config on every call, so a role switched by hot reload changes what the next
+        start hook does. A type's own configuration gate still applies on top.
+        """
+        return process_type in wanted_process_types(self._runtime_config.bridge_data)
+
     def _start_deferred_gpu_process(self, pending: _PendingGpuStart) -> bool:
         """Start one previously deferred GPU-bearing process if it is still wanted."""
+        if not self.process_type_wanted(pending.process_type):
+            return False
         logger.info(
             f"Starting deferred {pending.process_type.name} process"
             + (f" {pending.process_id}" if pending.process_id is not None else "")
@@ -1206,6 +1223,8 @@ class ProcessLifecycleManager:
 
     def start_safety_processes(self) -> bool:
         """Start all the safety processes configured to be used."""
+        if not self.process_type_wanted(HordeProcessType.SAFETY):
+            return False
         bridge_data = self._runtime_config.bridge_data
         num_processes_to_start = self._max_safety_processes - self._process_map.num_safety_processes()
 
@@ -1417,7 +1436,7 @@ class ProcessLifecycleManager:
 
     def start_post_process_processes(self) -> bool:
         """Start the dedicated post-processing process, if enabled and not already running."""
-        if not self.post_process_lane_enabled():
+        if not self.post_process_lane_enabled() or not self.process_type_wanted(HordeProcessType.POST_PROCESS):
             return False
 
         # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
@@ -1692,7 +1711,7 @@ class ProcessLifecycleManager:
         # the owner's restore clears the pause and starts the lane directly.
         if self._utilities_gpu_paused:
             return False
-        if not self.utilities_process_enabled():
+        if not self.utilities_process_enabled() or not self.process_type_wanted(HordeProcessType.UTILITIES):
             return False
 
         if self._process_map.num_utilities_processes() > 0:
@@ -1866,7 +1885,7 @@ class ProcessLifecycleManager:
 
     def start_component_processes(self) -> bool:
         """Start the dedicated text-encode service, if disaggregation is enabled and it is not running."""
-        if not self._component_lane_enabled():
+        if not self._component_lane_enabled() or not self.process_type_wanted(HordeProcessType.COMPONENT):
             return False
 
         # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
@@ -2077,7 +2096,7 @@ class ProcessLifecycleManager:
 
     def start_vae_lane_processes(self) -> bool:
         """Start the dedicated VAE lane, if disaggregation is enabled and it is not already running."""
-        if not self.vae_lane_enabled():
+        if not self.vae_lane_enabled() or not self.process_type_wanted(HordeProcessType.VAE_LANE):
             return False
 
         # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
@@ -2280,6 +2299,8 @@ class ProcessLifecycleManager:
         swept up by the hung-process logic); its messages are routed by its reserved process id.
         """
         if self._download_process_info is not None:
+            return
+        if not self.process_type_wanted(HordeProcessType.DOWNLOAD):
             return
 
         bridge_data = self._runtime_config.bridge_data
@@ -2628,20 +2649,23 @@ class ProcessLifecycleManager:
                 return index
         return min(self._card_runtimes)
 
-    def start_inference_processes(self) -> None:
-        """Start all the inference processes configured to be used, across every driven card."""
-        # The dedicated post-processing lane rides the same readiness gates as the inference pool (its
-        # models live in the same on-disk cache); starting it here covers every bring-up path and is a
-        # no-op when the lane is disabled or already running.
+    def start_auxiliary_lanes(self) -> None:
+        """Start every auxiliary lane that is enabled, wanted and not already running.
+
+        The lanes ride the same readiness gates as the inference pool (their models live in the same on-disk
+        cache), and an alchemy-only worker needs them without any inference process, so they are one
+        bring-up of their own. Each start is a no-op when its lane is disabled or already up.
+        """
         self.start_post_process_processes()
-        # The component lane is the disaggregated pipeline's text-encode service; it rides the same bring-up
-        # and is a no-op unless pipeline disaggregation is enabled.
         self.start_component_processes()
-        # The VAE lane is the disaggregated pipeline's VAE-encode/decode stage; likewise a no-op unless
-        # pipeline disaggregation is enabled.
         self.start_vae_lane_processes()
-        # The image-utilities lane is the out-of-venv capability service; a no-op unless it is enabled.
         self.start_utilities_processes()
+
+    def start_inference_processes(self) -> None:
+        """Start the auxiliary lanes, then the inference processes configured across every driven card."""
+        self.start_auxiliary_lanes()
+        if not self.process_type_wanted(HordeProcessType.INFERENCE):
+            return
 
         pending_inference_starts = sum(
             1 for pending in self._pending_gpu_starts.values() if pending.process_type is HordeProcessType.INFERENCE

@@ -111,10 +111,15 @@ def test_every_boundary_configuration_resolves_to_a_consistent_process_topology(
     )
 
     expected_processes = max_threads + queue_size
-    if not serves_image_generation or (num_models_to_load == 1 and max_threads == 1):
+    if num_models_to_load == 1 and max_threads == 1:
         expected_processes = 1
-
-    assert resolved.target_process_count == expected_processes
+    if not serves_image_generation:
+        # No other workload runs on an inference process, so none is planned; the semaphores are
+        # still sized as for one so the primitives built from them stay valid.
+        assert resolved.target_process_count == 0
+        expected_processes = 1
+    else:
+        assert resolved.target_process_count == expected_processes
     assert resolved.max_concurrent_inference == max_threads
     assert resolved.vae_decode_semaphore_size == 1
     assert resolved.gpu_sampling_lease_tail_overlap is (lease_enabled and tail_overlap)

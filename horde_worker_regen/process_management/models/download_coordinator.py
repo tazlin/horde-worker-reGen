@@ -16,6 +16,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerEventKind,
     WorkerEventSink,
 )
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.desired_state import DesiredState
@@ -283,6 +284,8 @@ class ModelDownloadCoordinator:
         """Start safety processes once the required safety models are on disk."""
         if self.safety_processes_started or not self._enable_background_downloads:
             return
+        if not self._process_lifecycle.process_type_wanted(HordeProcessType.SAFETY):
+            return
         if self._state.downloads_only_hold or self._state.recovery_parked:
             return
 
@@ -313,28 +316,45 @@ class ModelDownloadCoordinator:
             self.safety_processes_started = True
 
     def maybe_start_inference_processes(self) -> None:
-        """Start inference processes once at least one model is present."""
+        """Start the job-serving processes once what they need is on disk.
+
+        With image generation served that is one configured image model; the lanes come up with the pool.
+        Without it no inference process is wanted, so the lanes start as soon as the on-disk scan is done:
+        waiting for an image model would never end.
+        """
         if self.inference_processes_started or not self._enable_background_downloads:
             return
         if self._state.downloads_only_hold or self._state.recovery_parked:
             return
 
+        lifecycle = self._process_lifecycle
         availability = self._model_availability
 
-        # An alchemist-only worker (no image models configured, e.g. a CPU install) will never see an
-        # image model land, so it must not wait for one: start inference as soon as the on-disk scan has
-        # completed, which also brings up the post-processing lane the alchemy graph forms run on. Without
-        # this the worker would wait forever (none of the model-present branches below can fire with an
-        # empty configured set).
+        if not lifecycle.process_type_wanted(HordeProcessType.INFERENCE):
+            # No download process runs for a worker that wants none of these types, so no scan ever
+            # completes there and nothing below may be waited on.
+            if not lifecycle.process_type_wanted(HordeProcessType.DOWNLOAD):
+                return
+            if availability.scan_complete:
+                logger.info("Image generation is not served; starting the auxiliary lanes without an inference pool")
+                lifecycle.start_auxiliary_lanes()
+                self.inference_processes_started = True
+            return
+
+        # An empty configured set never sees a model land, and the lanes alchemy runs on come up with the
+        # pool, so an alchemist serving images with no model list starts once the scan is done.
         if not self.bridge_data.image_models_to_load and self.bridge_data.alchemist and availability.scan_complete:
-            logger.info("Alchemist-only worker (no image models configured); starting inference processes")
-            self._process_lifecycle.start_inference_processes()
+            logger.info("No image models configured; starting inference processes for the alchemy lanes")
+            lifecycle.start_inference_processes()
             self.inference_processes_started = True
             return
 
-        if availability.scan_complete and len(availability.present or set()) > 0:
-            logger.info("At least one model is present on disk; starting inference processes")
-            self._process_lifecycle.start_inference_processes()
+        # Models left on disk by an earlier configuration do not count: the pool exists to serve the
+        # configured set.
+        configured_present = set(availability.present or ()) & set(self.bridge_data.image_models_to_load)
+        if availability.scan_complete and configured_present:
+            logger.info("At least one configured model is present on disk; starting inference processes")
+            lifecycle.start_inference_processes()
             self.inference_processes_started = True
             return
 

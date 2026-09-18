@@ -22,6 +22,7 @@ from pydantic import JsonValue
 
 from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.capabilities import wanted_process_types
 from horde_worker_regen.model_download_core import ChunkPacer, CompVisLike, DownloadAborted
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
@@ -902,6 +903,59 @@ class TestManagerSafetyDeferral:
         )
 
         manager._process_lifecycle.start_safety_processes.assert_called_once()
+
+
+class TestBringUpFollowsServedWorkloads:
+    """The deferred bring-up starts only the process types a served workload needs."""
+
+    def _manager_serving(self, **bridge_overrides: object) -> Mock:
+        manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
+        manager._enable_background_downloads = True
+        coordinator = manager._download_coordinator
+        coordinator._enable_background_downloads = True
+        coordinator.download_wait_started = time.time() - (coordinator.DOWNLOAD_STARTUP_GRACE_SECONDS + 1.0)
+        lifecycle = Mock()
+        lifecycle.process_type_wanted.side_effect = lambda process_type: (
+            process_type
+            in wanted_process_types(
+                coordinator.bridge_data,
+            )
+        )
+        manager._process_lifecycle = lifecycle
+        coordinator._process_lifecycle = lifecycle
+        return manager  # type: ignore[return-value]
+
+    def test_a_text_only_worker_starts_nothing_even_past_the_grace_window(self) -> None:
+        """No download process reports for it, so the grace fallback is the path that must stay shut."""
+        manager = self._manager_serving(dreamer=False, alchemist=False, scribe=True, image_models_to_load=[])
+
+        manager._download_coordinator.maybe_start_safety_processes()
+        manager._download_coordinator.maybe_start_inference_processes()
+
+        manager._process_lifecycle.start_safety_processes.assert_not_called()
+        manager._process_lifecycle.start_inference_processes.assert_not_called()
+        manager._process_lifecycle.start_auxiliary_lanes.assert_not_called()
+
+    def test_an_alchemy_only_worker_starts_the_lanes_without_an_inference_pool(self) -> None:
+        """No alchemy form runs on an inference process, so the lanes come up on their own."""
+        manager = self._manager_serving(dreamer=False, alchemist=True, image_models_to_load=[])
+
+        manager._download_coordinator.on_download_availability(_availability_message([], safety_models_present=True))
+
+        manager._process_lifecycle.start_safety_processes.assert_called_once()
+        manager._process_lifecycle.start_auxiliary_lanes.assert_called_once()
+        manager._process_lifecycle.start_inference_processes.assert_not_called()
+
+    def test_a_model_outside_the_configured_set_does_not_start_the_pool(self) -> None:
+        """A checkpoint left on disk by an earlier configuration is not something this worker serves."""
+        manager = self._manager_serving(image_models_to_load=["configured"])
+        manager._download_coordinator.download_wait_started = time.time()
+
+        manager._download_coordinator.on_download_availability(_availability_message(["leftover"]))
+        manager._process_lifecycle.start_inference_processes.assert_not_called()
+
+        manager._download_coordinator.on_download_availability(_availability_message(["leftover", "configured"]))
+        manager._process_lifecycle.start_inference_processes.assert_called_once()
 
 
 class TestDispatcherRoutesDownloadMessages:
