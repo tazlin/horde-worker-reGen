@@ -52,6 +52,23 @@ async def test_alchemy_pop_times_out_and_enters_error_backoff(monkeypatch: pytes
     assert coordinator.last_pop_time <= time.time()
 
 
+async def test_a_dry_run_with_no_canned_source_sends_no_pop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dry run promises no API traffic, so an alchemist with nothing canned to serve pops nothing."""
+    manager = make_testable_process_manager(alchemist=True)
+    coordinator = manager._alchemy_coordinator
+    monkeypatch.setattr(coordinator, "_should_pop", lambda: True)
+    coordinator.bridge_data.dry_run_skip_api = True
+    session = Mock()
+    session.submit_request = AsyncMock()
+    api_sessions = Mock()
+    api_sessions.require_horde_client_session.return_value = session
+    coordinator._api_sessions = api_sessions
+
+    await coordinator.api_alchemy_pop()
+
+    session.submit_request.assert_not_awaited()
+
+
 async def test_an_alchemy_backoff_spell_reaches_the_event_ring_once_each_way(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

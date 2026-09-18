@@ -1030,6 +1030,11 @@ class AlchemyCoordinator:
             self._canned_alchemy_pop()
             return
 
+        # A dry run promises no API traffic, so with no canned source attached there is nothing to pop.
+        # Compared against True because a mocked config reads every unset attribute as truthy.
+        if self.bridge_data.dry_run_skip_api is True:
+            return
+
         if not self._should_pop():
             return
 
