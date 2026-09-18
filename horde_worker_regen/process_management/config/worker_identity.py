@@ -109,18 +109,31 @@ class _RoleName:
     reserved_default: str
 
 
-def _enabled_role_names(bridge_data: reGenBridgeData) -> list[_RoleName]:
-    """Return the name of every role that is on, since only those register a worker on the horde.
+def _enabled_roles(bridge_data: reGenBridgeData) -> list[tuple[str, str, str]]:
+    """Return each role that is on as (role, config key, name attribute), in the order dreamer, alchemist, scribe.
 
-    A role that is off never pops, so its name is never sent and a placeholder there harms nothing. The
-    scribe flag is compared against True because a mocked config reads every unset attribute as truthy.
+    Only an enabled role registers a worker on the horde. The scribe flag is compared against True because a
+    mocked config reads every unset attribute as truthy.
     """
-    fields = type(bridge_data).model_fields
     candidates = (
         (bool(bridge_data.dreamer), "image generation", "dreamer_name", "dreamer_worker_name"),
         (bool(bridge_data.alchemist), "alchemy", "alchemist_name", "alchemist_name"),
         (bridge_data.scribe is True, "text generation", "scribe_name", "scribe_name"),
     )
+    return [(role, config_key, attribute) for enabled, role, config_key, attribute in candidates if enabled]
+
+
+def enabled_worker_names(bridge_data: reGenBridgeData) -> list[str]:
+    """Return the horde worker name of every role that is on, in the order dreamer, alchemist, scribe."""
+    return [getattr(bridge_data, attribute) for _role, _config_key, attribute in _enabled_roles(bridge_data)]
+
+
+def _enabled_role_names(bridge_data: reGenBridgeData) -> list[_RoleName]:
+    """Return every enabled role's name with the reserved default the config model ships for it.
+
+    A role that is off never pops, so its name is never sent and a placeholder there harms nothing.
+    """
+    fields = type(bridge_data).model_fields
     return [
         _RoleName(
             role=role,
@@ -128,8 +141,7 @@ def _enabled_role_names(bridge_data: reGenBridgeData) -> list[_RoleName]:
             name=getattr(bridge_data, attribute),
             reserved_default=fields[attribute].default,
         )
-        for enabled, role, config_key, attribute in candidates
-        if enabled
+        for role, config_key, attribute in _enabled_roles(bridge_data)
     ]
 
 
@@ -163,7 +175,7 @@ def _validate_worker_names_local(bridge_data: reGenBridgeData) -> None:
 
 def _verify_worker_names_owned(bridge_data: reGenBridgeData) -> None:
     """Verify each enabled worker name is unregistered or owned by this API key (network, hard-fail)."""
-    names = [entry.name for entry in _enabled_role_names(bridge_data)]
+    names = enabled_worker_names(bridge_data)
 
     last_error: Exception | None = None
     for attempt in range(_OWNERSHIP_CHECK_ATTEMPTS):

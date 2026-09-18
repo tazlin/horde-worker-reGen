@@ -74,7 +74,10 @@ from horde_worker_regen.process_management._internal._aliased_types import Proce
 from horde_worker_regen.process_management._internal.util import throttled_log_level
 from horde_worker_regen.process_management.config.bridge_data_reloader import BridgeDataReloader
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.config.worker_identity import lookup_worker_by_name
+from horde_worker_regen.process_management.config.worker_identity import (
+    enabled_worker_names,
+    lookup_worker_by_name,
+)
 from horde_worker_regen.process_management.config.worker_state import PopGate, PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
@@ -2859,26 +2862,25 @@ class HordeWorkerProcessManager:
         :meth:`_apply_supervisor_command`).
         """
         simple_client = AIHordeAPISimpleClient()
-        worker_details = lookup_worker_by_name(simple_client, self.bridge_data.dreamer_worker_name)
-        if worker_details is None:
-            logger.debug(
-                f"Worker with name {self.bridge_data.dreamer_worker_name} is not registered yet "
-                f"(the horde creates it on first pop); nothing to set maintenance={enabled} on.",
-            )
-            return
-        modify_worker_request = ModifyWorkerRequest(
-            apikey=self.bridge_data.api_key,
-            worker_id=worker_details.id_,
-            maintenance=enabled,
-        )
-
-        simple_client.worker_modify(modify_worker_request)
-
         verb = "placed into" if enabled else "removed from"
-        logger.debug(
-            f"Ensured worker with name {self.bridge_data.dreamer_worker_name} "
-            f"({worker_details.id_}) is {verb} maintenance.",
-        )
+        # Each enabled role is its own worker on the horde, and a role that is off has no worker to
+        # change, so the flag goes to every name this worker actually pops under.
+        for worker_name in enabled_worker_names(self.bridge_data):
+            worker_details = lookup_worker_by_name(simple_client, worker_name)
+            if worker_details is None:
+                logger.debug(
+                    f"Worker with name {worker_name} is not registered yet (the horde creates it on first "
+                    f"pop); nothing to set maintenance={enabled} on.",
+                )
+                continue
+            simple_client.worker_modify(
+                ModifyWorkerRequest(
+                    apikey=self.bridge_data.api_key,
+                    worker_id=worker_details.id_,
+                    maintenance=enabled,
+                ),
+            )
+            logger.debug(f"Ensured worker with name {worker_name} ({worker_details.id_}) is {verb} maintenance.")
 
     def remove_maintenance(self) -> None:
         """Remove the server-side maintenance from the named worker.
@@ -3486,21 +3488,26 @@ class HordeWorkerProcessManager:
         """
         if self._state.shutting_down or self.bridge_data.dry_run_skip_api:
             return
-        worker_name = self.bridge_data.dreamer_worker_name
-        if not worker_name:
+        # Every enabled role is a worker of its own on the horde, so the flags are read for each and the
+        # dashboard shows maintenance or a pause when any of them is held.
+        found: list[WorkerDetailItem] = []
+        for worker_name in enabled_worker_names(self.bridge_data):
+            if not worker_name:
+                continue
+            try:
+                worker_details = await asyncio.to_thread(self._fetch_worker_details, worker_name)
+            except Exception as e:  # noqa: BLE001 - advisory poll must never disturb the worker
+                logger.trace(f"Worker-details refresh failed: {type(e).__name__} {e}")
+                return
+            if worker_details is not None:
+                found.append(worker_details)
+        if not found:
             return
-        try:
-            worker_details = await asyncio.to_thread(self._fetch_worker_details, worker_name)
-        except Exception as e:  # noqa: BLE001 - advisory poll must never disturb the worker
-            logger.trace(f"Worker-details refresh failed: {type(e).__name__} {e}")
-            return
-        if worker_details is None:
-            return
-        polled_maintenance = bool(worker_details.maintenance_mode)
+        polled_maintenance = any(bool(details.maintenance_mode) for details in found)
         if not polled_maintenance:
             self._state.server_maintenance_cleared_by_job_pop = False
         self._worker_details_maintenance = polled_maintenance and not self._state.server_maintenance_cleared_by_job_pop
-        self._worker_details_paused = bool(worker_details.paused)
+        self._worker_details_paused = any(bool(details.paused) for details in found)
 
     async def _api_get_user_info_loop(self) -> None:
         """Run the API get user info loop."""

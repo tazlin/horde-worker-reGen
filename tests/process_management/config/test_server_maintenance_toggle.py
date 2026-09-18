@@ -95,6 +95,34 @@ class TestSetMaintenanceApiCall:
 
         assert modified is False
 
+    def test_the_flag_goes_to_every_enabled_roles_worker_and_no_other(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each enabled role is its own worker on the horde, and a role that is off has none to change."""
+        looked_up: list[str | None] = []
+
+        class FakeClient:
+            def workers_all_details(self, worker_name: str | None = None, *, api_key: str | None = None) -> list[Mock]:
+                looked_up.append(worker_name)
+                details = Mock()
+                details.id_ = f"id-of-{worker_name}"
+                details.name = worker_name
+                return [details]
+
+            def worker_modify(self, request: object) -> None:
+                return None
+
+        monkeypatch.setattr(process_manager_module, "AIHordeAPISimpleClient", lambda: FakeClient())
+        manager = make_testable_process_manager(
+            dreamer=False,
+            alchemist=True,
+            alchemist_name="An Alchemist",
+            scribe=True,
+            scribe_name="A Scribe",
+        )
+
+        manager.set_maintenance(True)
+
+        assert looked_up == ["An Alchemist", "A Scribe"]
+
     def test_remove_maintenance_clears_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``remove_maintenance`` is the ``set_maintenance(False)`` convenience wrapper."""
         manager = make_testable_process_manager()
