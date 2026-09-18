@@ -348,13 +348,12 @@ def test_text_work_reaches_the_whole_worker_counters() -> None:
     assert (snapshot.text_total_submitted, snapshot.text_total_faulted, snapshot.text_jobs_in_flight) == (4, 1, 1)
 
 
-def test_a_worker_with_no_text_flow_counts_exactly_what_it_did_before() -> None:
-    """Every text term is zero on a worker that never had a text flow, so its snapshot is unchanged."""
+def test_a_worker_not_serving_text_counts_no_text_terms() -> None:
+    """The text flow is registered on every worker and idle unless `scribe` is on, so every text term is zero."""
     manager = make_testable_process_manager()
 
     snapshot = manager._build_worker_state_snapshot()
 
-    assert manager._text_coordinator is None
     counters = (
         snapshot.num_jobs_submitted,
         snapshot.num_jobs_faulted,

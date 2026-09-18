@@ -41,7 +41,7 @@ import contextlib
 import time
 from asyncio import CancelledError
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, override
 
 from horde_model_reference.meta_consts import TEXT_BACKENDS
 from horde_model_reference.text_backend_names import (
@@ -70,6 +70,7 @@ from horde_worker_regen.text_backends import (
     TextBackend,
     TextBackendBusy,
     TextBackendCapabilities,
+    TextBackendCredentialRefused,
     TextBackendDescription,
     TextBackendError,
     TextBackendRejectedPayload,
@@ -173,12 +174,39 @@ Bounded because the backend is another program: it may ignore the abort, or have
 and the worker cannot be held open on its behalf.
 """
 
+SHUTDOWN_FAULT_TIMEOUT_SECONDS: Final = 30.0
+"""Total time shutdown spends reporting the jobs that outlived the drain as faulted.
+
+One bound over all of them rather than one each: the per-job submit is already retried three times over
+its own timeouts, so a horde that has stopped answering could otherwise hold the worker open for minutes
+per job. A job whose fault report does not land inside this is one the server times out on its own.
+"""
+
+CREDENTIAL_RECHECK_INTERVAL_SECONDS: Final = 60.0
+"""How long the flow leaves a backend alone after it refused the worker's credentials.
+
+The refusal is a standing state only the operator clears, so probing it at the readiness gate's own pace
+would spend a request every few seconds to be told the same thing. It is re-checked at all because the
+correction arrives by hot reload, and nothing else would notice a `text_backend_password` that now works.
+"""
+
+ALREADY_SUBMITTED_PHRASES: Final = ("already submitted", "already been submitted")
+"""How the horde says it already holds this generation's result, in both the spellings it uses.
+
+Neither phrasing contains the other verbatim, so both are matched. The answer arrives when a submit's
+response was lost in transit and the retry reached a server that had already recorded the first one.
+"""
+
+STALE_JOB_PHRASE: Final = "does not exist"
+"""How the horde says it has no record of this generation, having written it off before the submit."""
+
 FAULTED_GENERATION_TEXT: Final = "Faulted"
 """What a faulted text submit carries in place of a generation.
 
-The submit model logs an error for an empty generation, and this is the spelling the SDK itself uses
-when it faults a text job on the worker's behalf, so a fault reported by the flow and one reported by
-the SDK read identically in the log and on the server.
+The submit model logs an error for an empty generation. The spelling matches the SDK's own cleanup
+submit so that a worker running against an older flow and this one read identically on the server, but
+nothing else relies on it: the SDK's cleanup never fires for this flow's pops (see
+[`_TextPopResponse`][horde_worker_regen.process_management.jobs.text_generation_coordinator._TextPopResponse]).
 """
 
 DRY_RUN_CANONICAL_MODEL_NAME: Final = "meta-llama/Llama-3.2-3B-Instruct"
@@ -203,6 +231,23 @@ class TextPayloadKeys:
 
     PROMPT: Final = "prompt"
     MAX_LENGTH: Final = "max_length"
+
+
+class _TextPopResponse(TextGenerateJobPopResponse):
+    """TextGenerateJobPopResponse opted out of the SDK session's failure-cleanup tracking.
+
+    The session appends an entry for every pop it answers and, when the session closes, submits
+    `state=faulted` for each entry still pending, whether or not anything went wrong. It clears an entry
+    only on a submit whose every id matches, which a pop answering with `ids` can never produce. Both
+    behaviours collide with this flow: the coordinator submits for every job it popped, including on the
+    way out, so the session's cleanup can only duplicate a fault the coordinator has already reported,
+    against an id the horde has already closed. Opting out leaves the coordinator the only fault writer.
+    """
+
+    @override
+    def ignore_failure(self) -> bool:
+        """Opt out of cleanup tracking; the coordinator owns fault submission."""
+        return True
 
 
 class _GenerationStalled(Exception):
@@ -353,6 +398,7 @@ def build_text_backend(
     api_sessions: ApiSessions,
     text_backend_kind: TEXT_BACKENDS,
     base_url: str | None = None,
+    password: str | None = None,
 ) -> TextBackend:
     """Create the backend the text flow generates through for this worker's configuration.
 
@@ -372,6 +418,8 @@ def build_text_backend(
             speak the KoboldAI API would also select a different driver here.
         base_url: Where the backend listens. None means the operator's `kai_url`; a worker that launches
             the backend itself passes the loopback URL of the process it started.
+        password: The password the backend requires, sent with every request. None sends none, which is
+            the whole of what a backend the worker launched on its own loopback port needs.
 
     Returns:
         A backend satisfying the protocol; which implementation is an implementation detail above here.
@@ -385,6 +433,7 @@ def build_text_backend(
     return KoboldApiTextBackend(
         base_url if base_url is not None else bridge_data.kai_url,
         api_sessions.require_aiohttp_session(),
+        password=password,
     )
 
 
@@ -403,6 +452,13 @@ class TextJobInFlight:
     """The payload the horde sent, as it was sent, forwarded to the backend untouched."""
     time_popped: float
     """When the job was popped, for the pop-to-submit timing in the submit log line."""
+    ttl_deadline: float | None = None
+    """The `time.monotonic()` reading past which the horde treats this job as stale, or None.
+
+    The pop's `ttl` is a count of seconds from the answer, so it is turned into a deadline here: the
+    figure a busy re-offer has to be judged against is how much of it is left, not what it was. None
+    when the pop carried no ttl, which leaves every bound on the job the worker's own.
+    """
     model_name: str | None = None
     """The model this job was popped against, as the worker advertised it.
 
@@ -567,11 +623,22 @@ class TextGenerationCoordinator:
         changes across such a relaunch, so a change in it is what says the kernels are cold again.
         """
 
-        self._backend_not_ready_since: float | None = time.time()
-        """When the readiness gate last opened, or None once the backend has answered.
+        self._backend_not_ready_since: float | None = time.time() if self.bridge_data.scribe is True else None
+        """When the readiness gate last opened, or None while nothing is waiting on the backend.
 
-        Stamped at construction because the flow starts with its gate open: a worker whose backend never
-        answers has to be able to say how long that has been true.
+        A scribe worker starts with its gate open, so the clock starts at construction: a worker whose
+        backend never answers has to be able to say how long that has been true. The flow is registered
+        on every worker, though, and one whose operator did not select the scribe role is not waiting for
+        anything, so its clock does not run; a role enabled by hot reload starts it at the gate that
+        follows, rather than back-dating the wait to the worker's start.
+        """
+
+        self._credential_refused_since: float | None = None
+        """When the backend last refused the worker's credentials, or None while it has not.
+
+        Both the latch that keeps the message to one line and the clock the slow re-check is measured
+        from, as a `time.monotonic()` reading: the interval is a duration rather than an instant anything
+        displays.
         """
 
         self.num_jobs_submitted = 0
@@ -653,6 +720,11 @@ class TextGenerationCoordinator:
         """
         return self._backend_not_ready_since
 
+    @property
+    def credentials_refused(self) -> bool:
+        """Whether the backend is refusing the worker's credentials, which no amount of waiting fixes."""
+        return self._credential_refused_since is not None
+
     def in_flight_view(self) -> list[TextJobInFlightRow]:
         """Return a frozen row per job the flow currently holds, in the order they were popped.
 
@@ -715,7 +787,7 @@ class TextGenerationCoordinator:
 
         Returns:
             `True` when the backend answered and described itself, `False` when shutdown interrupted the
-            wait.
+            wait or the backend refused the worker's credentials.
         """
         self._close_readiness_gate()
         self._backend_capabilities = None
@@ -727,27 +799,36 @@ class TextGenerationCoordinator:
         last_notice_at = gate_opened_at
 
         while not self._state.shutting_down:
-            if await backend.ready(deadline_seconds=READY_PROBE_DEADLINE_SECONDS):
-                description = await self._describe_backend(backend)
-                if description is not None:
-                    self._advertisement = build_text_flow_advertisement(
-                        bridge_data=self.bridge_data,
-                        description=description,
-                        backend=self._text_backend_kind,
-                        canonical_name=(
-                            self._canonical_name_provider() if self._canonical_name_provider is not None else None
-                        ),
-                    )
-                    logger.info(
-                        f"Text backend ready after {time.monotonic() - gate_opened_at:.1f}s; advertising "
-                        f"{self._advertisement.model_name} (max_length={self._advertisement.max_length}, "
-                        f"max_context_length={self._advertisement.max_context_length}, "
-                        f"soft_prompts={len(self._advertisement.soft_prompts)})",
-                    )
-                    self._backend_not_ready_since = None
-                    await self._note_backend_capabilities(backend)
-                    await self._warm_up_backend()
-                    return True
+            try:
+                if await backend.ready(deadline_seconds=READY_PROBE_DEADLINE_SECONDS):
+                    description = await self._describe_backend(backend)
+                    if description is not None:
+                        self._advertisement = build_text_flow_advertisement(
+                            bridge_data=self.bridge_data,
+                            description=description,
+                            backend=self._text_backend_kind,
+                            canonical_name=(
+                                self._canonical_name_provider() if self._canonical_name_provider is not None else None
+                            ),
+                        )
+                        logger.info(
+                            f"Text backend ready after {time.monotonic() - gate_opened_at:.1f}s; advertising "
+                            f"{self._advertisement.model_name} (max_length={self._advertisement.max_length}, "
+                            f"max_context_length={self._advertisement.max_context_length}, "
+                            f"soft_prompts={len(self._advertisement.soft_prompts)})",
+                        )
+                        self._backend_not_ready_since = None
+                        self._note_credentials_accepted()
+                        await self._note_backend_capabilities(backend)
+                        await self._warm_up_backend()
+                        return True
+            except TextBackendCredentialRefused as refusal:
+                # Caught around the whole gate, not around one call: a backend may answer the readiness
+                # probe and refuse the routes behind it (koboldcpp names its model to anyone and guards
+                # generation), so the advertisement can already be built when the refusal arrives and has
+                # to be taken back.
+                self._enter_credential_hold(refusal)
+                return False
 
             # Edge-triggered on the notice interval rather than emitted per probe: the gate polls every
             # few seconds and a cold start legitimately takes a minute or more.
@@ -756,8 +837,7 @@ class TextGenerationCoordinator:
                 last_notice_at = time.monotonic()
                 logger.warning(
                     f"Text backend at {self.backend_address} has not reported a loaded model after "
-                    f"{waited_seconds:.0f}s. {self._backend_not_answering_remedy()} A password-protected "
-                    "backend that refuses the worker's credentials reads as a backend that is down.",
+                    f"{waited_seconds:.0f}s. {self._backend_not_answering_remedy()}",
                 )
             else:
                 logger.trace(f"Text backend not ready after {waited_seconds:.1f}s; polling again")
@@ -777,6 +857,41 @@ class TextGenerationCoordinator:
         if self.bridge_data.text_backend_managed:
             return "The worker launches it, so its own output is in logs/text_backend.log."
         return "Is it running, and is `kai_url` its address?"
+
+    def _enter_credential_hold(self, refusal: TextBackendCredentialRefused) -> None:
+        """Close the gate on a backend that refused the worker's credentials, and say so once.
+
+        A refusal is not a backend that is coming back: every call will be refused the same way until an
+        operator changes the password, so the flow stops looking at it rather than polling it. Said once
+        per spell because the condition is constant and a line per probe would bury the one that matters.
+        """
+        self._close_readiness_gate()
+        if self._credential_refused_since is None:
+            logger.error(
+                f"The text backend at {self.backend_address} refused the worker's credentials: {refusal} "
+                "Set `text_backend_password` in bridgeData.yaml to the password the backend was started "
+                "with (koboldcpp's `--password`). No text jobs are popped until it is accepted, and the "
+                f"backend is re-checked every {CREDENTIAL_RECHECK_INTERVAL_SECONDS:.0f}s, so a corrected "
+                "password takes effect without a restart.",
+            )
+        self._credential_refused_since = time.monotonic()
+
+    def _note_credentials_accepted(self) -> None:
+        """Leave the credential hold when the backend has accepted the worker, saying so once."""
+        if self._credential_refused_since is None:
+            return
+        self._credential_refused_since = None
+        logger.info("The text backend accepted the worker's credentials; text pops resume.")
+
+    def _may_look_at_backend(self) -> bool:
+        """Return whether the gate may run this cycle, which a credential hold is the only bar to.
+
+        The hold is a wait rather than a stop so that a `text_backend_password` corrected by hot reload
+        recovers on its own; it is long because nothing else about the backend can change the answer.
+        """
+        if self._credential_refused_since is None:
+            return True
+        return (time.monotonic() - self._credential_refused_since) >= CREDENTIAL_RECHECK_INTERVAL_SECONDS
 
     def _close_readiness_gate(self) -> None:
         """Drop what the backend told the flow, and start the clock on how long it has been unready.
@@ -848,7 +963,11 @@ class TextGenerationCoordinator:
         may be serving other clients whose generation slot this is not the worker's to spend.
 
         A warm-up that fails changes nothing: the gate has already passed on the backend's own answers,
-        and the next real job will find out soon enough whether generation works.
+        and the next real job will find out soon enough whether generation works. A refused credential
+        is the exception, because it says every generation will fail, so it goes back to the gate.
+
+        Raises:
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
         """
         if self.bridge_data.text_backend_managed is not True:
             logger.debug("Skipping the text backend warm-up: the operator runs this backend, and it may be serving.")
@@ -861,6 +980,8 @@ class TextGenerationCoordinator:
                 generation_key=WARM_UP_GENERATION_KEY,
                 deadline_seconds=self.generation_deadline_seconds(),
             )
+        except TextBackendCredentialRefused:
+            raise
         except TextBackendError as warm_up_failure:
             logger.warning(f"The text backend warm-up generation did not complete: {warm_up_failure}")
             return
@@ -987,7 +1108,7 @@ class TextGenerationCoordinator:
             pop_response = await asyncio.wait_for(
                 self._api_sessions.require_horde_client_session().submit_request(
                     self._build_pop_request(advertisement),
-                    TextGenerateJobPopResponse,
+                    _TextPopResponse,
                 ),
                 timeout=TEXT_POP_REQUEST_TIMEOUT_SECONDS,
             )
@@ -1033,11 +1154,13 @@ class TextGenerationCoordinator:
         self._last_logged_no_jobs_skipped = None
 
         payload = dict(pop_response.payload.model_dump(by_alias=True, exclude_unset=True))
+        ttl_deadline = time.monotonic() + pop_response.ttl if pop_response.ttl is not None else None
         for job_id in job_ids:
             job = TextJobInFlight(
                 job_id=job_id,
                 payload=payload,
                 time_popped=time.time(),
+                ttl_deadline=ttl_deadline,
                 model_name=advertisement.model_name,
             )
             self._in_flight[job_id] = job
@@ -1076,7 +1199,8 @@ class TextGenerationCoordinator:
         """Generate one popped job and submit the outcome, faulting rather than dropping it.
 
         Every exit from here submits something: a job popped and then abandoned holds its requester until
-        the server times it out, which the horde charges the worker for.
+        the server times it out, which the horde charges the worker for. Cancellation is the one exit
+        that does not, and only because it comes from the close path, which submits for what it cancelled.
         """
         try:
             result = await self._generate_text(job)
@@ -1128,6 +1252,13 @@ class TextGenerationCoordinator:
         self._note_backend_launch_count()
 
         while True:
+            if _ttl_is_spent(job):
+                logger.warning(
+                    f"Text job {job.job_id[:8]} reached the ttl the horde popped it with before the "
+                    "backend took it; faulting it rather than generating an answer the server has "
+                    "already given up on",
+                )
+                return None
             # Re-stamped per attempt, so a job the backend turned away as busy measures its wait to the
             # offer that was actually taken rather than to the first one that was not.
             job.time_generation_started = time.time()
@@ -1150,6 +1281,11 @@ class TextGenerationCoordinator:
                 continue
             except TextBackendRejectedPayload as rejected:
                 logger.error(f"Text backend refused the payload for job {job.job_id[:8]}: {rejected}")
+                return None
+            except TextBackendCredentialRefused as refusal:
+                logger.error(f"Text backend refused the worker's credentials for job {job.job_id[:8]}")
+                await self._stop_generation(job)
+                self._enter_credential_hold(refusal)
                 return None
             except TextBackendUnavailable as unavailable:
                 logger.error(f"Text backend failed job {job.job_id[:8]}: {unavailable}")
@@ -1324,8 +1460,14 @@ class TextGenerationCoordinator:
                 continue
 
             if isinstance(response, RequestErrorResponse):
-                message_lower = response.message.lower()
-                if "does not exist" in message_lower or "already submitted" in message_lower:
+                if _is_already_submitted(response.message):
+                    # The first attempt's answer was lost rather than its submit: the horde holds this
+                    # result already, so the outcome is the one that was delivered, whichever attempt
+                    # carried it. Counting it as a fault would report a fault the requester never got.
+                    logger.debug(f"Text job {job.job_id[:8]} was already submitted: {response.message}")
+                    self._note_submitted(job, kudos_reward=None, is_faulted=is_faulted)
+                    return
+                if STALE_JOB_PHRASE in response.message.lower():
                     logger.warning(f"Text job {job.job_id[:8]} stale on submit: {response.message}")
                     self.num_jobs_faulted += 1
                     return
@@ -1334,13 +1476,21 @@ class TextGenerationCoordinator:
                     await asyncio.sleep(SUBMIT_RETRY_WAIT_SECONDS)
                 continue
 
-            self._note_submitted(job, response=response, is_faulted=is_faulted)
+            self._note_submitted(job, kudos_reward=response.reward, is_faulted=is_faulted)
             return
 
         logger.error(f"Gave up submitting text job {job.job_id[:8]} after {SUBMIT_MAX_ATTEMPTS} attempts")
 
-    def _note_submitted(self, job: TextJobInFlight, *, response: JobSubmitResponse, is_faulted: bool) -> None:
-        """Record and log one delivered submit. A fault report is delivered work the horde pays nothing for."""
+    def _note_submitted(self, job: TextJobInFlight, *, kudos_reward: float | None, is_faulted: bool) -> None:
+        """Record and log one delivered submit. A fault report is delivered work the horde pays nothing for.
+
+        Args:
+            job: The job whose outcome reached the horde.
+            kudos_reward: What the horde paid, or None when it did not say. None covers the submit whose
+                answer was lost and whose retry was told the result was already held: the reward was paid
+                against the attempt that landed, and a nominal zero would read as work valued at nothing.
+            is_faulted: Whether the outcome delivered was a fault report.
+        """
         submit_time = time.time()
         if is_faulted:
             self.num_jobs_faulted += 1
@@ -1349,17 +1499,18 @@ class TextGenerationCoordinator:
             return
 
         self.num_jobs_submitted += 1
-        # The session kudos pool is the account's, not one flow's: text earnings belong in the same
-        # total and on the same kudos/hr clock as image generation's and alchemy's.
-        self._state.note_first_kudos_event(submit_time)
-        self._state.kudos_generated_this_session += response.reward
-        self._state.kudos_events.append((submit_time, response.reward))
+        if kudos_reward is not None:
+            # The session kudos pool is the account's, not one flow's: text earnings belong in the same
+            # total and on the same kudos/hr clock as image generation's and alchemy's.
+            self._state.note_first_kudos_event(submit_time)
+            self._state.kudos_generated_this_session += kudos_reward
+            self._state.kudos_events.append((submit_time, kudos_reward))
         time_taken = round(submit_time - job.time_popped, 2)
+        paid_for = f"for {kudos_reward:,.2f} kudos" if kudos_reward is not None else "on an earlier attempt"
         logger.success(
-            f"Submitted text job {job.job_id[:8]} for {response.reward:,.2f} kudos. "
-            f"Job popped {time_taken} seconds ago.",
+            f"Submitted text job {job.job_id[:8]} {paid_for}. Job popped {time_taken} seconds ago.",
         )
-        self._record_job_metrics(job, submit_time=submit_time, faulted=False, kudos_reward=response.reward)
+        self._record_job_metrics(job, submit_time=submit_time, faulted=False, kudos_reward=kudos_reward)
 
     def _record_job_metrics(
         self,
@@ -1402,13 +1553,24 @@ class TextGenerationCoordinator:
     # endregion
 
     async def run(self) -> None:
-        """Run the text gate/pop/generate/submit loop until shutdown."""
+        """Run the text gate/pop/generate/submit loop until shutdown.
+
+        Registered on every worker and self-gating from the live configuration, the way the image and
+        alchemy flows are: a worker whose operator has not selected the scribe role builds no backend,
+        polls nothing and pops nothing, and one whose `scribe` is hot-reloaded on starts serving without
+        a restart.
+        """
         logger.debug("In TextGenerationCoordinator.run")
 
         while True:
             with logger.catch():
                 try:
-                    if self.bridge_data.scribe is True and self._advertisement is None:
+                    if self.bridge_data.scribe is not True:
+                        # Nothing is waiting on a backend while the role is off, so the clock a dashboard
+                        # reads must not accrue; leaving it running would make a role enabled later look
+                        # as though its backend had been missing since the worker started.
+                        self._backend_not_ready_since = None
+                    elif self._advertisement is None and self._may_look_at_backend():
                         await self.await_backend_ready()
                     await self.api_text_pop()
                 except CancelledError as cancelled:
@@ -1424,12 +1586,12 @@ class TextGenerationCoordinator:
         await self.stop_in_flight_and_close()
 
     async def stop_in_flight_and_close(self) -> None:
-        """Abandon every in-flight generation, wait a bounded time for the submits, and close the backend.
+        """Abandon every in-flight generation, drain what it can, and fault the rest before closing.
 
         The generations are abandoned before the wait, not after it, because a text generation can run
-        for minutes and the worker cannot hold the process open for one. Whatever comes back for an
-        abandoned generation is faulted by the job's own task, so the horde is told about every popped
-        job either way.
+        for minutes and the worker cannot hold the process open for one. What the drain does not finish
+        is then cancelled and faulted here rather than left to a task racing the closed backend: every
+        popped job is owed exactly one outcome, and the flow is the only thing that reports it.
         """
         if self._closed:
             return
@@ -1450,10 +1612,77 @@ class TextGenerationCoordinator:
             logger.info(f"Waiting up to {SHUTDOWN_DRAIN_TIMEOUT_SECONDS:.0f}s for {len(self._job_tasks)} text job(s)")
             await asyncio.wait(set(self._job_tasks), timeout=SHUTDOWN_DRAIN_TIMEOUT_SECONDS)
 
-        if self._in_flight:
-            logger.warning(f"{len(self._in_flight)} text job(s) did not finish before the flow closed")
+        await self._cancel_unfinished_job_tasks()
+        await self._fault_unfinished_jobs()
 
         await backend.close()
+
+    async def _cancel_unfinished_job_tasks(self) -> None:
+        """End the job tasks the drain did not finish, and wait for each to notice.
+
+        A task still running when the backend closes is a task generating against a driver that has been
+        released, and its submit would race the fault this close path reports for the same job. Cancelling
+        is safe because :meth:`run_job` re-raises the cancellation rather than submitting: the outcome for
+        the job it was holding is reported here instead.
+        """
+        unfinished = {task for task in self._job_tasks if not task.done()}
+        if not unfinished:
+            return
+        logger.warning(f"Cancelling {len(unfinished)} text job task(s) that outlived the shutdown drain")
+        for task in unfinished:
+            task.cancel()
+        await asyncio.gather(*unfinished, return_exceptions=True)
+
+    async def _fault_unfinished_jobs(self) -> None:
+        """Report every job still in hand as faulted, under one bound over all of them.
+
+        This is what the flow owes the horde for a job it popped and cannot finish. Bounded as a whole
+        because a horde that has stopped answering must not hold the worker open: a fault report that
+        cannot be delivered ends as the server timing the job out, which is what would have happened
+        anyway.
+        """
+        unfinished = list(self._in_flight.values())
+        if not unfinished:
+            return
+
+        logger.warning(f"Reporting {len(unfinished)} unfinished text job(s) as faulted before closing")
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(self.submit_job(job, generation="", state=GENERATION_STATE.faulted) for job in unfinished),
+                    return_exceptions=True,
+                ),
+                timeout=SHUTDOWN_FAULT_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.error(
+                f"The horde did not accept every fault report within {SHUTDOWN_FAULT_TIMEOUT_SECONDS:.0f}s; "
+                f"{len(self._in_flight)} text job(s) are left for the server to time out",
+            )
+
+
+def _is_already_submitted(message: str) -> bool:
+    """Return whether a submit refusal says the horde already holds this generation's result.
+
+    The image flow (`job_submitter.py`) reads the same answer the same way and treats it as a delivery;
+    it spells the test out at its own site rather than exposing a predicate, so this is the second
+    spelling of one rule rather than a second rule.
+    """
+    message_lower = message.lower()
+    return any(phrase in message_lower for phrase in ALREADY_SUBMITTED_PHRASES)
+
+
+def _ttl_is_spent(job: TextJobInFlight) -> bool:
+    """Return whether the horde's own patience for this job has run out.
+
+    A job offered to a busy backend can sit in the worker's hands for as long as the re-offers last, and
+    the horde has already said how long it will wait: past that it reassigns the generation, so both the
+    generation and the submit that followed it would be work nobody is waiting for. A pop that carried no
+    ttl leaves this answering False, which is the flow's own bounds and nothing else.
+    """
+    if job.ttl_deadline is None:
+        return False
+    return time.monotonic() >= job.ttl_deadline
 
 
 async def _generation_finished_first(

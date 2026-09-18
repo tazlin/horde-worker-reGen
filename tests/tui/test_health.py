@@ -674,6 +674,17 @@ def test_a_backend_within_its_readiness_patience_raises_nothing() -> None:
     assert _text_checks(_unready_scribe(seconds=90.0)) == []
 
 
+def test_a_refused_credential_is_an_error_at_once_with_the_password_as_the_remedy() -> None:
+    """The backend is up and waiting changes nothing, so the finding does not wait out the patience window."""
+    snapshot = _unready_scribe(seconds=5.0).model_copy(update={"text_backend_credentials_refused": True})
+
+    checks = _text_checks(snapshot)
+
+    assert [(check.name, check.status) for check in checks] == [(TEXT_BACKEND_CHECK_NAME, HealthStatus.ERROR)]
+    assert "refused the worker's credentials" in checks[0].detail
+    assert "text_backend_password" in checks[0].detail
+
+
 def test_a_backend_past_its_readiness_patience_warns_and_says_why_no_jobs_are_popped() -> None:
     """Past the gate's own patience the wait stops being a cold start and is worth an operator's eye."""
     checks = _text_checks(_unready_scribe(seconds=150.0))

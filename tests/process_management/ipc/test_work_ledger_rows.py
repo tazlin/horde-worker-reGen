@@ -250,11 +250,10 @@ async def test_the_backend_row_carries_what_the_flow_has_in_flight() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_worker_with_no_text_flow_reports_no_text_rows_and_no_activity() -> None:
-    """A dreamer worker has no text flow at all, which must read as nothing rather than raise."""
+async def test_a_worker_not_serving_text_reports_no_text_rows_and_no_activity() -> None:
+    """A dreamer worker's text flow is idle, which must read as nothing rather than raise."""
     manager = make_testable_process_manager()
 
-    assert manager._text_coordinator is None
     assert manager._text_in_flight_rows() == []
     assert manager._text_backend_activity().active_requests == 0
     assert manager._build_work_ledger([]) == []

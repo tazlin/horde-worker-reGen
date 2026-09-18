@@ -95,11 +95,11 @@ fails the fetch if the result does not match the declared digest. A file already
 size is left alone, so only the first launch pays for it. The image model download process is not
 involved at any point.
 
-A catalogued model whose file has no recorded origin cannot be fetched, and the worker says which file it
-wanted and where it looked for it. That is the state of every model in the catalogue today: the three
-measurements were taken from files on the operator's disk, and no quantiser repository is on record for
-them. Put the file at the named path (or set `text_models_dir` to where you keep it) and the catalogue
-still supplies its name, digest and measured footprint.
+Each model in the catalogue names the public Hugging Face file its measurement was taken from, matched to
+it by size and SHA-256, so a first launch fetches it. A catalogued model whose file has no recorded origin
+cannot be fetched, and the worker says which file it wanted and where it looked for it. Put the file at the
+named path (or set `text_models_dir` to where you keep it) and the catalogue still supplies its name, digest
+and measured footprint.
 
 ## Running the backend
 
@@ -148,11 +148,18 @@ start it and has no launch to measure from. Either way, a message about a backen
 names the address the worker is actually using: its own loopback port for a managed backend, `kai_url` for
 one you run.
 
-One thing to know about credentials: a backend started with a password (koboldcpp's `--password`)
-refuses a request carrying the wrong one in a way the worker cannot tell apart from a backend that is
-down. If your worker sits in the readiness gate forever against a backend you can see running, check the
-password before anything else. A backend you started for this worker needs no password, which is the
-case the worker is written for.
+A backend you started with a password (koboldcpp's `--password`) is told that password through
+`text_backend_password`, and the worker sends it as a bearer token on every request. Get it wrong and the
+worker says so by name rather than waiting: a refused credential is not a backend that is still starting,
+so nothing is popped, the reason is logged once, and the backend is re-checked a minute at a time until a
+`text_backend_password` you corrected in `bridgeData.yaml` is accepted. The key is for a backend you run;
+a backend the worker starts listens on a loopback port of the worker's own choosing with no password, so
+none is sent there.
+
+Where the refusal shows is worth knowing, because koboldcpp answers its model route to anyone: a worker
+whose password is wrong sees a ready backend reporting a model called `koboldcpp/protected-model`, and
+the refusal only arrives at the routes behind the guard. The worker therefore judges the credential at
+those, not at the readiness probe.
 
 ## What the worker advertises, and why it must not be double-prefixed
 
@@ -217,10 +224,17 @@ below ends in a submit, faulted where it has to be.
 | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
 | Says it is busy                            | Waits a moment and offers the same job again, a few times. The backend is healthy and the job is fine.            |
 | Refuses the payload                        | Faults the job immediately. It will be refused again, so re-offering it only burns the same failure repeatedly.   |
+| Refuses the worker's password              | Faults the job, then holds off popping until a corrected `text_backend_password` is accepted.                     |
 | Cannot be reached, or fails the generation | Faults the job, then goes back to polling readiness. While the backend is down every job fails the same way.      |
 | Takes longer than the deadline             | Asks the backend to abandon the generation, then faults the job.                                                  |
 | Stops producing text part way through      | Asks the backend to abandon the generation and faults the job, without waiting the deadline out.                  |
 | Breaks the stream part way through         | Faults the job. Half a generation reads as a whole one to a requester, so partial text is never submitted.        |
+
+A busy backend is also bounded by the horde rather than by the worker alone. A pop states a `ttl`, the
+seconds the server will wait before it reassigns the generation, and the worker keeps that as a deadline
+on the job: past it, the job is faulted instead of being offered again, and a job whose ttl has already
+run out is never started. Generating an answer the server has stopped waiting for spends the backend on
+nobody. A pop that states no ttl leaves the worker's own bounds as the only ones.
 
 The per-generation deadline is `text_generation_timeout_seconds` when you set it, and otherwise is
 derived from `max_length` at a deliberately slow tokens-per-second floor (`max_length / 2 + 10`, the
@@ -238,10 +252,15 @@ surprising: koboldcpp returns a success carrying the tokens it had produced so f
 that reads as complete is worse than no answer, so once the worker has given up on a generation it
 discards whatever comes back for it and reports the job faulted.
 
-On shutdown the worker stops popping, asks the backend to abandon everything still generating, waits a
-bounded time for those jobs to report themselves faulted, and closes. The wait is bounded because the
-backend is another program: it may have no abort route, or may ignore one, and the worker cannot be held
-open on its behalf.
+On shutdown the worker stops popping, asks the backend to abandon everything still generating, and waits
+a bounded time for those jobs to report themselves faulted. The wait is bounded because the backend is
+another program: it may have no abort route, or may ignore one, and the worker cannot be held open on its
+behalf. What the wait does not finish is then ended and reported by the flow itself, under a bound of its
+own, so every job the worker popped is accounted for exactly once and by one reporter.
+
+A submit whose answer was lost in transit is retried, and the horde then says it already holds the
+result. That is a delivery: the job is counted as the outcome it carried, with no kudos figure, because
+the reward was paid against the attempt whose answer went missing.
 
 ## Testing against the live horde without serving strangers
 
@@ -348,22 +367,25 @@ headline figure states.
 - **No activity feed carries text events.** Finished text jobs reach the Simple ticker through the
   recent-jobs list, so the feed is built from what finished rather than from events the worker emitted at
   the transitions themselves.
-- **Turning `scribe` on takes a restart.** Unlike most configuration, the role is read when the worker
-  builds its flows, so a hot reload of `bridgeData.yaml` will not start a text flow that was off at
-  launch (it will, however, stop one that was on).
+- **Turning `scribe` on mid-run does not start a worker-run backend.** The flow itself follows the live
+  configuration, so enabling the role by hot reload begins serving against a backend you run yourself
+  (`text_backend_managed: false`) with no restart. The supervisor that launches a managed backend is
+  still started on the role as it stood when the worker did, so switching the role on for one needs a
+  restart.
 
 ## Where it lives in the code
 
 - [`text_backends`][horde_worker_regen.text_backends]: the whole of the conversation with the external
   program. Six verbs (`ready`, `describe`, `capabilities`, `generate`, `stop`, `close`), the result
-  models, three exception types, and no HTTP visible above it. One driver serves every backend that
+  models, four exception types, and no HTTP visible above it. One driver serves every backend that
   speaks the KoboldAI API, streaming its generations and reporting them through a callback the flow
   hands in.
 - [`TextGenerationCoordinator`][horde_worker_regen.process_management.jobs.text_generation_coordinator.TextGenerationCoordinator]:
   the flow itself, satisfying the same
   [`FlowCoordinator`][horde_worker_regen.process_management.scheduling.workload_flow.FlowCoordinator]
-  surface as image generation and alchemy. Which backend it is talking to is one `TEXT_BACKENDS` value
-  on it, the single thing a further backend changes.
+  surface as image generation and alchemy, registered on every worker like those two and inert while
+  `scribe` is off. Which backend it is talking to is one `TEXT_BACKENDS` value on it, the single thing a
+  further backend changes.
 - [`capabilities.enabled_workloads`][horde_worker_regen.capabilities.enabled_workloads]: the one place
   the role flags become the workloads the worker serves.
 

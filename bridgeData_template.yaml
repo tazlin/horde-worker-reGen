@@ -529,6 +529,15 @@ text_backend_managed: true
 # (koboldcpp.py beside its compiled library) and runs under the worker's own Python.
 # text_backend_executable: "C:/tools/koboldcpp.exe"
 
+# The password a backend you run yourself (text_backend_managed: false) requires. Unset sends none.
+# text_backend_password: "my-backend-password"
+
+# Which compute path the managed backend runs on: auto, cuda, vulkan or cpu. auto follows the backend this
+# install was set up for: an NVIDIA build runs text on CUDA, an AMD build on Vulkan, a CPU build on the
+# CPU. Set it when text should differ from the install, as on a text-only worker installed with the CPU
+# build whose card should still serve text.
+text_backend_accelerator: auto
+
 # Loopback port the managed backend listens on.
 text_backend_port: 5001
 

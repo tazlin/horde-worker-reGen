@@ -281,11 +281,13 @@ from horde_worker_regen.text_backends import (
     TextBackendLaunchSettings,
     TextBackendLaunchSpec,
     TextGenerationProgress,
+    UnsupportedTextBackendError,
     build_launch_spec,
 )
 from horde_worker_regen.text_backends.model_catalogue import resolve_text_model, text_model_records
 from horde_worker_regen.text_backends.provision import (
     TextBackendProvisionError,
+    effective_text_backend_accelerator,
     ensure_text_model_file,
     provision_executable,
 )
@@ -2087,44 +2089,40 @@ class HordeWorkerProcessManager:
             WorkloadKind.ALCHEMY: self._alchemy_coordinator,
         }
 
-        # Text generation is registered only for a worker that selected the scribe role, unlike the two
-        # self-gating flows above: its generations run in a separate program reached over HTTP, so the
-        # flow polls an address rather than consulting local state, and there is nothing to poll for a
-        # worker whose operator never attached a backend.
-        self._text_coordinator: TextGenerationCoordinator | None = None
         self._text_backend_driver: TextBackend | None = None
         self._text_backend_supervisor: TextBackendSupervisor | None = None
         self._text_model_canonical_name: str | None = None
         """The advertised spelling of the managed backend's model, known once the model file is resolved."""
-        if WorkloadKind.TEXT_GENERATION in enabled_workloads(bridge_data):
-            text_coordinator = TextGenerationCoordinator(
-                state=self._state,
-                shutdown_manager=self._shutdown_manager,
-                runtime_config=self._runtime_config,
-                api_sessions=self._api_sessions,
-                # Built when the flow starts, not here: the driver borrows the shared aiohttp session,
-                # which the main loop only populates once it is running. The same driver object is handed
-                # to the backend supervisor when the worker launches the backend itself, so the flow and
-                # the supervisor agree on one address and one readiness view.
-                backend_factory=self._text_backend_for,
-                text_backend_kind=bridge_data.text_backend_kind,
-                run_metrics=self._run_metrics,
-                # Read through a callable rather than handed the supervisor: the supervisor is built
-                # once the loop is running, long after this, and the flow needs only the count. A
-                # backend the operator runs has no launch the worker can count, so it gets nothing.
-                launch_count_provider=(
-                    self._managed_text_backend_launch_count if bridge_data.text_backend_managed else None
-                ),
-                # Read through the same callable the driver's own address comes from, so the flow's
-                # messages and the driver's requests cannot name different backends, and a hot-reloaded
-                # `kai_url` reaches both.
-                backend_address_provider=self._text_backend_address,
-                # The managed model's advertised spelling is known only once its file is resolved, which
-                # happens in the supervisor's provisioning step, so the flow reads it at readiness.
-                canonical_name_provider=self._managed_text_model_canonical_name,
-            )
-            self._text_coordinator = text_coordinator
-            self._flows[WorkloadKind.TEXT_GENERATION] = text_coordinator
+        # Registered on every worker and self-gating like the two flows above: the coordinator re-reads
+        # `scribe` each cycle and does nothing at all while the role is off (no backend built, nothing
+        # polled, nothing popped), so enabling the role by hot reload starts text work without a restart.
+        self._text_coordinator = TextGenerationCoordinator(
+            state=self._state,
+            shutdown_manager=self._shutdown_manager,
+            runtime_config=self._runtime_config,
+            api_sessions=self._api_sessions,
+            # Built when the flow starts, not here: the driver borrows the shared aiohttp session,
+            # which the main loop only populates once it is running. The same driver object is handed
+            # to the backend supervisor when the worker launches the backend itself, so the flow and
+            # the supervisor agree on one address and one readiness view.
+            backend_factory=self._text_backend_for,
+            text_backend_kind=bridge_data.text_backend_kind,
+            run_metrics=self._run_metrics,
+            # Read through a callable rather than handed the supervisor: the supervisor is built
+            # once the loop is running, long after this, and the flow needs only the count. A
+            # backend the operator runs has no launch the worker can count, so it gets nothing.
+            launch_count_provider=(
+                self._managed_text_backend_launch_count if bridge_data.text_backend_managed else None
+            ),
+            # Read through the same callable the driver's own address comes from, so the flow's
+            # messages and the driver's requests cannot name different backends, and a hot-reloaded
+            # `kai_url` reaches both.
+            backend_address_provider=self._text_backend_address,
+            # The managed model's advertised spelling is known only once its file is resolved, which
+            # happens in the supervisor's provisioning step, so the flow reads it at readiness.
+            canonical_name_provider=self._managed_text_model_canonical_name,
+        )
+        self._flows[WorkloadKind.TEXT_GENERATION] = self._text_coordinator
 
         if stable_diffusion_reference is not None:
             self.stable_diffusion_reference = stable_diffusion_reference
@@ -8204,6 +8202,9 @@ class HordeWorkerProcessManager:
             text_backend_not_ready_since=(
                 text_coordinator.backend_not_ready_since if text_coordinator is not None else None
             ),
+            text_backend_credentials_refused=(
+                text_coordinator.credentials_refused if text_coordinator is not None else False
+            ),
             workload_totals={
                 workload: WorkloadTotalsSnapshot(
                     completed=totals.completed,
@@ -8507,7 +8508,9 @@ class HordeWorkerProcessManager:
                 coroutines.append(self._model_demand_poller_loop())
             if not self.bridge_data._loaded_from_env_vars:
                 coroutines.append(self._bridge_data_reloader.bridge_data_loop())
-            if self._text_backend_is_managed():
+            if not self.bridge_data.dry_run_skip_api:
+                # Scheduled whether or not the role is on: it waits for the live config to ask for a
+                # managed backend, so enabling `scribe` by hot reload launches one without a restart.
                 coroutines.append(self._run_text_backend_supervisor())
 
             tasks = [asyncio.create_task(coro) for coro in coroutines]
@@ -8574,11 +8577,16 @@ class HordeWorkerProcessManager:
         it polls, and so the address is decided once.
         """
         if self._text_backend_driver is None:
+            bridge_data = self.bridge_data
             self._text_backend_driver = build_text_backend(
-                bridge_data=self.bridge_data,
+                bridge_data=bridge_data,
                 api_sessions=self._api_sessions,
                 text_backend_kind=text_backend_kind,
                 base_url=self._text_backend_address(),
+                # Only a backend the operator runs can have a password: the worker starts its own on a
+                # loopback port with no password set, so a credential sent there would be one the worker
+                # invented and the backend would refuse.
+                password=None if self._text_backend_is_managed() else bridge_data.text_backend_password,
             )
         return self._text_backend_driver
 
@@ -8598,7 +8606,14 @@ class HordeWorkerProcessManager:
         handed the step that obtains it. That is what puts the backend's row on the dashboard for the
         minutes a first-run download takes, instead of leaving the worker looking as though it has no
         backend; a backend that cannot be obtained at all is reported on that row by the supervisor.
+
+        Waits first for the live config to call for a managed backend, on the shutdown-poll cadence the
+        other background loops use, so a worker that never serves text ends this task at shutdown.
         """
+        while not self._text_backend_is_managed():
+            if self.is_time_for_shutdown() or self._state.shut_down:
+                return
+            await asyncio.sleep(1)
         if self.bridge_data.text_model is None:
             logger.error("The text backend is managed but `text_model` is unset; it will not be launched.")
             return
@@ -8638,7 +8653,9 @@ class HordeWorkerProcessManager:
         resolved = resolve_text_model(bridge_data.text_model, records, bridge_data.text_models_dir)
         model_path = ensure_text_model_file(resolved)
         self._text_model_canonical_name = resolved.canonical_name
-        executable = bridge_data.text_backend_executable or provision_executable(kind)
+        # One resolution serves both the binary variant and the launch flag, so the two cannot disagree.
+        accelerator = effective_text_backend_accelerator(bridge_data.text_backend_accelerator)
+        executable = bridge_data.text_backend_executable or provision_executable(kind, accelerator=accelerator)
         settings = TextBackendLaunchSettings(
             executable=executable,
             model_path=model_path,
@@ -8647,8 +8664,17 @@ class HordeWorkerProcessManager:
             gpu_layers=bridge_data.text_gpu_layers,
             context_length=bridge_data.max_context_length,
             log_path=logs_dir(create=True) / TEXT_BACKEND_LOG_FILE_NAME,
+            accelerator=accelerator,
+            parallel_requests=bridge_data.text_threads,
         )
-        return build_launch_spec(kind, settings)
+        try:
+            return build_launch_spec(kind, settings)
+        except UnsupportedTextBackendError:
+            raise
+        except ValueError as unrenderable:
+            # A setting the backend's own command line cannot express (a device id outside what it lists)
+            # is reported on the backend's row like any other launch that cannot be prepared.
+            raise TextBackendProvisionError(str(unrenderable)) from unrenderable
 
     def _managed_text_model_canonical_name(self) -> str | None:
         """Return the managed model's advertised spelling, or None before its file has been resolved."""

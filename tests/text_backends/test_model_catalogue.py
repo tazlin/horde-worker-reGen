@@ -21,7 +21,6 @@ from horde_worker_regen.text_backends.model_catalogue import (
     MEASURED_TEXT_MODELS,
     TEXT_CATALOGUE_SOURCE_ID,
     TEXT_MODELS_FOLDER_NAME,
-    UNKNOWN_FILE_URL,
     TextMeasurementKey,
     TextModelResolutionError,
     default_text_models_dir,
@@ -108,10 +107,12 @@ class TestSeedRecords:
             prefix = f"{measurement.backend.value}/"
             assert any(variant.startswith(prefix) for variant in get_model_name_variants(name)), name
 
-    def test_the_seeds_origins_are_recorded_as_unknown_rather_than_guessed(self) -> None:
-        """No quantiser repository is on record for the measured files, and a guessed one would not verify."""
+    def test_every_seed_names_an_origin_for_the_file_it_declares(self) -> None:
+        """The origin is the declared file: a differently named one would land beside the name looked for."""
         for name, record in _seed_records().items():
-            assert record.config.download[0].file_url == UNKNOWN_FILE_URL, name
+            declared = record.config.download[0]
+            assert declared.file_url.startswith("https://"), name
+            assert declared.file_url.rsplit("/", 1)[-1] == declared.file_name, name
 
     def test_a_record_with_no_measurement_reads_as_unknown(self) -> None:
         """Most of the canonical text reference carries no measurement, which is not a statement about fit."""

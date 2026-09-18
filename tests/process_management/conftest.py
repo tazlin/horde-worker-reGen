@@ -16,6 +16,7 @@ from pydantic import JsonValue
 
 from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
+from horde_worker_regen.compute_mode import TextBackendAccelerator
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
@@ -349,6 +350,8 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.text_backend_kind = TEXT_BACKENDS.koboldcpp
     bd.text_backend_managed = False
     bd.text_backend_executable = None
+    bd.text_backend_password = None
+    bd.text_backend_accelerator = TextBackendAccelerator.AUTO
     bd.text_backend_port = 5001
     bd.text_gpu_layers = 99
     bd.text_gpu_device_index = None

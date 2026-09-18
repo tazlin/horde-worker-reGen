@@ -40,9 +40,56 @@ class TestLocalNameValidation:
     """Default/duplicate names fail fast without any network access."""
 
     def test_default_dreamer_name_fails(self) -> None:
-        """The reserved default dreamer name is rejected (image generation is always enabled)."""
+        """The reserved default dreamer name is rejected while image generation is on, as it is by default."""
         with pytest.raises(WorkerNameConfigError):
             verify_worker_identity(_bridge_data(dreamer=None, dry_run_skip_api=True))
+
+    def test_a_role_that_is_off_has_its_name_left_alone(self) -> None:
+        """A text-only worker never sends a dreamer name, so the template's placeholder there harms nothing."""
+        bridge_data = _bridge_data(dreamer=None, dry_run_skip_api=True)
+        bridge_data.dreamer = False
+        bridge_data.scribe = True
+        bridge_data.scribe_name = "Unique Scribe"
+
+        verify_worker_identity(bridge_data)
+
+    @pytest.mark.parametrize("scribe_name", [None, "   "])
+    def test_a_scribe_with_a_placeholder_or_blank_name_fails(self, scribe_name: str | None) -> None:
+        """The scribe registers a worker of its own, so its name gets the checks the other two get."""
+        bridge_data = _bridge_data(dry_run_skip_api=True)
+        bridge_data.scribe = True
+        if scribe_name is not None:
+            bridge_data.scribe_name = scribe_name
+
+        with pytest.raises(WorkerNameConfigError, match="scribe_name"):
+            verify_worker_identity(bridge_data)
+
+    def test_a_scribe_name_equal_to_another_enabled_roles_name_fails(self) -> None:
+        """Worker names are unique horde-wide whatever the worker type, compared without regard to case."""
+        bridge_data = _bridge_data(dreamer="Shared Name", dry_run_skip_api=True)
+        bridge_data.scribe = True
+        bridge_data.scribe_name = "shared name"
+
+        with pytest.raises(WorkerNameConfigError, match="must differ"):
+            verify_worker_identity(bridge_data)
+
+    def test_the_ownership_check_covers_exactly_the_enabled_roles(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A name that is never sent is never looked up, and the scribe's is looked up with the others."""
+        bridge_data = _bridge_data(dreamer=None)
+        bridge_data.dreamer = False
+        bridge_data.scribe = True
+        bridge_data.scribe_name = "Unique Scribe"
+        looked_up: list[str] = []
+        monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: (set(), "me#1"))
+        monkeypatch.setattr(
+            worker_identity,
+            "_lookup_registered_worker",
+            lambda name, api_key: looked_up.append(name),
+        )
+
+        verify_worker_identity(bridge_data)
+
+        assert looked_up == ["Unique Scribe"]
 
     def test_alchemist_enabled_with_default_alchemist_name_fails(self) -> None:
         """With alchemy enabled, the reserved default alchemist name is rejected."""

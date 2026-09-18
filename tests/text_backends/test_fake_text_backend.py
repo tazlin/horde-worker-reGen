@@ -18,6 +18,7 @@ from horde_worker_regen.text_backends import (
     FakeTextBackend,
     TextBackend,
     TextBackendBusy,
+    TextBackendCredentialRefused,
     TextBackendDescription,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
@@ -67,6 +68,48 @@ async def test_the_readiness_script_answers_false_until_it_runs_out() -> None:
     assert await backend.ready(deadline_seconds=1.0) is True
     assert await backend.ready(deadline_seconds=1.0) is True, "past the end of the script the fake is ready"
     assert len(backend.ready_calls) == 4, "a not-ready answer is still a call the flow made"
+
+
+async def test_a_scripted_credential_refusal_refuses_every_verb() -> None:
+    """A password-protected backend refuses the worker everywhere, which is what a flow has to handle."""
+    backend = FakeTextBackend(description=_DESCRIPTION, credential_refused=True)
+
+    with pytest.raises(TextBackendCredentialRefused):
+        await backend.ready(deadline_seconds=1.0)
+    with pytest.raises(TextBackendCredentialRefused):
+        await backend.describe()
+    with pytest.raises(TextBackendCredentialRefused):
+        await backend.capabilities()
+    with pytest.raises(TextBackendCredentialRefused):
+        await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=1.0)
+
+    assert len(backend.ready_calls) == 1, "a refused call is still a call the flow made"
+    assert len(backend.generate_calls) == 1
+
+
+async def test_a_corrected_credential_serves_again() -> None:
+    """An operator fixing the password is the whole remedy, so the stand-in has to be able to rehearse it."""
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="an answer", credential_refused=True)
+
+    with pytest.raises(TextBackendCredentialRefused):
+        await backend.ready(deadline_seconds=1.0)
+
+    backend.credential_refused = False
+
+    assert await backend.ready(deadline_seconds=1.0) is True
+    result = await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=1.0)
+    assert result.text == "an answer"
+
+
+async def test_stop_and_close_are_unaffected_by_a_refused_credential() -> None:
+    """Both run where a failure is already being handled, so neither may raise a second one."""
+    backend = FakeTextBackend(description=_DESCRIPTION, credential_refused=True)
+
+    await backend.stop(generation_key=_GENERATION_KEY)
+    await backend.close()
+
+    assert [call.generation_key for call in backend.stop_calls] == [_GENERATION_KEY]
+    assert backend.closed is True
 
 
 async def test_describe_returns_the_configured_description() -> None:

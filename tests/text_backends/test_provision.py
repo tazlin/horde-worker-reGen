@@ -10,11 +10,13 @@ from horde_model_reference.download_engine import DownloadOutcome
 from horde_model_reference.model_reference_records import TextGenerationModelRecord
 from horde_model_reference.text_backend_names import TEXT_BACKENDS
 
+from horde_worker_regen.compute_mode import TextBackendAccelerator
 from horde_worker_regen.text_backends import provision
 from horde_worker_regen.text_backends.model_catalogue import UNKNOWN_FILE_URL, ResolvedTextModel
 from horde_worker_regen.text_backends.provision import (
     EXECUTABLE_PROVISIONERS,
     TextBackendProvisionError,
+    effective_text_backend_accelerator,
     ensure_text_model_file,
     provision_executable,
 )
@@ -94,7 +96,7 @@ def test_a_backend_without_a_provisioner_is_refused_by_name() -> None:
     unsupported = next(kind for kind in TEXT_BACKENDS if kind not in EXECUTABLE_PROVISIONERS)
 
     with pytest.raises(TextBackendProvisionError) as raised:
-        provision_executable(unsupported)
+        provision_executable(unsupported, accelerator=TextBackendAccelerator.CUDA)
 
     assert str(unsupported) in str(raised.value)
     assert str(TEXT_BACKENDS.koboldcpp) in str(raised.value)
@@ -104,15 +106,22 @@ def test_a_backend_without_a_provisioner_is_refused_by_name() -> None:
 def test_provisioning_dispatches_to_the_registered_provisioner(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The registered callable's path is returned untouched."""
+    """The registered callable receives the compute path and its returned path is untouched."""
     expected = tmp_path / "backend.exe"
-    monkeypatch.setitem(provision.EXECUTABLE_PROVISIONERS, TEXT_BACKENDS.koboldcpp, lambda: expected)
+    asked: list[TextBackendAccelerator] = []
 
-    assert provision_executable(TEXT_BACKENDS.koboldcpp) == expected
+    def record(accelerator: TextBackendAccelerator) -> Path:
+        asked.append(accelerator)
+        return expected
+
+    monkeypatch.setitem(provision.EXECUTABLE_PROVISIONERS, TEXT_BACKENDS.koboldcpp, record)
+
+    assert provision_executable(TEXT_BACKENDS.koboldcpp, accelerator=TextBackendAccelerator.VULKAN) == expected
+    assert asked == [TextBackendAccelerator.VULKAN]
 
 
-def test_a_missing_bootstrap_package_is_a_named_provision_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without worker_bootstrap importable, koboldcpp provisioning tells the operator to point at a binary."""
+def _refuse_bootstrap_imports(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every ``worker_bootstrap`` import fail, as it does on a wheel-only install."""
     import builtins
 
     real_import = builtins.__import__
@@ -124,10 +133,96 @@ def test_a_missing_bootstrap_package_is_a_named_provision_error(monkeypatch: pyt
 
     monkeypatch.setattr(builtins, "__import__", refuse_bootstrap)
 
+
+def test_a_missing_bootstrap_package_is_a_named_provision_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without worker_bootstrap importable, koboldcpp provisioning tells the operator to point at a binary."""
+    _refuse_bootstrap_imports(monkeypatch)
+
     with pytest.raises(TextBackendProvisionError) as raised:
-        provision_executable(TEXT_BACKENDS.koboldcpp)
+        provision_executable(TEXT_BACKENDS.koboldcpp, accelerator=TextBackendAccelerator.CUDA)
 
     assert "text_backend_executable" in str(raised.value)
+
+
+class TestAcceleratorSelection:
+    """What the install declares decides the compute path; only an install that declares nothing is probed."""
+
+    def _backend_file(self, tmp_path: Path, token: str | None) -> Path:
+        """Return a ``bin/backend`` path holding *token*, or one that does not exist when it is None."""
+        backend_file = tmp_path / "bin" / "backend"
+        if token is not None:
+            backend_file.parent.mkdir(parents=True, exist_ok=True)
+            backend_file.write_text(token, encoding="utf-8")
+        return backend_file
+
+    @pytest.fixture(autouse=True)
+    def _clear_backend_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ensure a developer's HORDE_WORKER_BACKEND never leaks into these tests."""
+        monkeypatch.delenv("HORDE_WORKER_BACKEND", raising=False)
+
+    def test_a_declared_install_is_not_probed(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """The hardware probe answers a different question and must not override what was declared."""
+
+        def refuse_detection() -> TextBackendAccelerator:
+            raise AssertionError("a declared install must not be probed")
+
+        monkeypatch.setattr(provision, "detect_text_backend_accelerator", refuse_detection)
+
+        resolved = effective_text_backend_accelerator(
+            TextBackendAccelerator.AUTO,
+            backend_file=self._backend_file(tmp_path, "rocm-windows"),
+        )
+
+        assert resolved is TextBackendAccelerator.VULKAN
+
+    def test_an_undeclared_install_falls_back_to_the_hardware(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A hand-rolled install records no token, so the only thing left to ask is the hardware."""
+        monkeypatch.setattr(
+            provision,
+            "detect_text_backend_accelerator",
+            lambda: TextBackendAccelerator.VULKAN,
+        )
+
+        resolved = effective_text_backend_accelerator(
+            TextBackendAccelerator.AUTO,
+            backend_file=self._backend_file(tmp_path, None),
+        )
+
+        assert resolved is TextBackendAccelerator.VULKAN
+
+    @pytest.mark.parametrize(
+        ("detected", "expected"),
+        [
+            ("cuda", TextBackendAccelerator.CUDA),
+            ("vulkan", TextBackendAccelerator.VULKAN),
+            ("cpu", TextBackendAccelerator.CPU),
+        ],
+    )
+    def test_every_detected_path_has_a_worker_side_name(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        detected: str,
+        expected: TextBackendAccelerator,
+    ) -> None:
+        """The bootstrap spells the paths itself, so each answer it can give has to land on a member here."""
+        from worker_bootstrap import koboldcpp_bin
+
+        monkeypatch.setattr(koboldcpp_bin, "detected_accelerator", lambda: detected)
+
+        assert provision.detect_text_backend_accelerator() is expected
+
+    def test_an_install_that_cannot_probe_keeps_the_previous_command_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A wheel-only install carries no probe, and assuming CPU would strip a working card."""
+        _refuse_bootstrap_imports(monkeypatch)
+
+        assert provision.detect_text_backend_accelerator() is TextBackendAccelerator.CUDA
 
 
 class TestModelFileProvisioning:

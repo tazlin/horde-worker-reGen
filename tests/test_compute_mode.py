@@ -5,14 +5,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.compute_mode import (
     ComputeMode,
+    TextBackendAccelerator,
     compute_mode_display_label,
     intended_compute_mode,
     is_cpu_only_install,
     read_backend_token,
     reconcile_with_probe,
+    resolve_text_backend_accelerator,
 )
 
 _BACKEND_ENV = "HORDE_WORKER_BACKEND"
@@ -115,3 +118,87 @@ def test_display_label_gpu_is_none(tmp_path: Path) -> None:
     """A GPU install adds no label (the dashboard is unchanged)."""
     backend_file = _write_backend(tmp_path, "cu132")
     assert compute_mode_display_label(backend_file=backend_file) is None
+
+
+class TestTextBackendAcceleratorResolution:
+    """The declared install backend decides which compute path a managed text backend is launched on."""
+
+    @pytest.mark.parametrize("token", ["cu126", "cu130", "cu132", "cu128"])
+    def test_a_cuda_token_gives_cuda(self, tmp_path: Path, token: str) -> None:
+        """Every CUDA build token, including the retired one, wants the CUDA backend."""
+        backend_file = _write_backend(tmp_path, token)
+
+        resolved = resolve_text_backend_accelerator(TextBackendAccelerator.AUTO, backend_file=backend_file)
+
+        assert resolved is TextBackendAccelerator.CUDA
+
+    @pytest.mark.parametrize(
+        "token",
+        ["rocm", "rocm-windows", "rocm-gfx110x", "rocm-gfx1151", "rocm-gfx120x", "amd-unsupported"],
+    )
+    def test_an_amd_token_gives_vulkan(self, tmp_path: Path, token: str) -> None:
+        """Koboldcpp publishes no ROCm release, so every AMD install runs its Vulkan backend."""
+        backend_file = _write_backend(tmp_path, token)
+
+        resolved = resolve_text_backend_accelerator(TextBackendAccelerator.AUTO, backend_file=backend_file)
+
+        assert resolved is TextBackendAccelerator.VULKAN
+
+    def test_a_cpu_token_gives_cpu(self, tmp_path: Path) -> None:
+        """A CPU install keeps the text backend off any device too."""
+        backend_file = _write_backend(tmp_path, "cpu")
+
+        resolved = resolve_text_backend_accelerator(TextBackendAccelerator.AUTO, backend_file=backend_file)
+
+        assert resolved is TextBackendAccelerator.CPU
+
+    def test_no_token_is_undeclared(self, tmp_path: Path) -> None:
+        """A hand-rolled install declares nothing, which the caller answers from the hardware."""
+        backend_file = tmp_path / "bin" / "backend"
+
+        assert resolve_text_backend_accelerator(TextBackendAccelerator.AUTO, backend_file=backend_file) is None
+
+    def test_an_unknown_token_is_undeclared_and_reported(self, tmp_path: Path) -> None:
+        """A token this worker does not know cannot pick a binary either, so it is said once and dropped."""
+        backend_file = _write_backend(tmp_path, "xpu")
+        warnings: list[str] = []
+        sink_id = logger.add(warnings.append, level="WARNING")
+        try:
+            resolved = resolve_text_backend_accelerator(TextBackendAccelerator.AUTO, backend_file=backend_file)
+        finally:
+            logger.remove(sink_id)
+
+        assert resolved is None
+        assert len(warnings) == 1
+        assert "xpu" in warnings[0]
+
+    @pytest.mark.parametrize(
+        "configured",
+        [TextBackendAccelerator.CUDA, TextBackendAccelerator.VULKAN, TextBackendAccelerator.CPU],
+    )
+    def test_an_explicit_choice_beats_the_token(
+        self,
+        tmp_path: Path,
+        configured: TextBackendAccelerator,
+    ) -> None:
+        """An operator on a CPU torch install can still put the text backend on a card, and the reverse."""
+        backend_file = _write_backend(tmp_path, "cpu")
+
+        assert resolve_text_backend_accelerator(configured, backend_file=backend_file) is configured
+
+    def test_an_explicit_choice_needs_no_install_sentinel(self, tmp_path: Path) -> None:
+        """A declared path is the answer on its own, so an install that records nothing is not consulted."""
+        backend_file = tmp_path / "bin" / "backend"
+
+        resolved = resolve_text_backend_accelerator(TextBackendAccelerator.VULKAN, backend_file=backend_file)
+
+        assert resolved is TextBackendAccelerator.VULKAN
+
+    def test_auto_is_never_the_answer(self, tmp_path: Path) -> None:
+        """Nothing downstream has a command line for `auto`, so resolution never hands one back."""
+        for token in ("cu132", "rocm", "cpu"):
+            backend_file = _write_backend(tmp_path, token)
+            assert (
+                resolve_text_backend_accelerator(TextBackendAccelerator.AUTO, backend_file=backend_file)
+                is not TextBackendAccelerator.AUTO
+            )

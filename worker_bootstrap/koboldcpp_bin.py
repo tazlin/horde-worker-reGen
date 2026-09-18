@@ -12,10 +12,15 @@ Public surface:
 - :data:`KOBOLDCPP_VERSION`: the pinned upstream release tag; a bump changes the pin table in one diff.
 - :class:`KoboldcppVariant`: CUDA or no-CUDA (Vulkan plus CPU) asset selection.
 - :class:`KoboldcppAsset`: one published asset with its pinned digest.
+- :func:`detected_accelerator`: which compute path this host's hardware calls for.
+- :func:`variant_for_accelerator`: the asset variant that can run a given compute path.
 - :func:`koboldcpp_executable`: the published binary if this install has one.
 - :func:`ensure_koboldcpp`: idempotently download, verify, publish and probe the pinned binary.
 
-Nothing here is wired into a launch path yet; provisioning is on demand and the caller decides when.
+The sidecar beside the published binary (``bin/koboldcpp-version``) is one line of two space-separated
+fields, ``<release tag> <variant>`` (``v1.121 cuda``). A stamp of one field was written before the variant
+was recorded and says nothing about which build is on disk; see :func:`_published_is_usable` for what that
+costs. Provisioning is on demand and the caller decides when.
 """
 
 from __future__ import annotations
@@ -129,7 +134,16 @@ _ASSETS_BY_TARGET: dict[tuple[KoboldcppPlatform, KoboldcppVariant], KoboldcppAss
     (asset.host_platform, asset.variant): asset for asset in _SUPPORTED_ASSETS
 }
 
+_VARIANTS_BY_VALUE: dict[str, KoboldcppVariant] = {variant.value: variant for variant in KoboldcppVariant}
+
 _X64_MACHINES = ("amd64", "x86_64")
+
+# These spell the members of ``horde_worker_regen.compute_mode.TextBackendAccelerator``, which the worker
+# resolves and passes down here. This package is standard-library only (it runs before the project venv
+# exists), so it cannot import that enum; a guard test pins the spellings together.
+ACCELERATOR_CUDA = "cuda"
+ACCELERATOR_VULKAN = "vulkan"
+ACCELERATOR_CPU = "cpu"
 
 
 def pinned_version_number() -> str:
@@ -182,14 +196,50 @@ def host_platform() -> KoboldcppPlatform:
     return _platform_for(os_name=os.name, sys_platform=sys.platform, machine=platform.machine())
 
 
+def variant_for_accelerator(accelerator: str) -> KoboldcppVariant:
+    """Return the asset variant that can run *accelerator*.
+
+    Only CUDA needs the larger build; the no-CUDA build carries Vulkan and the CPU backend, so it serves
+    every other compute path.
+
+    Args:
+        accelerator: One of :data:`ACCELERATOR_CUDA`, :data:`ACCELERATOR_VULKAN`, :data:`ACCELERATOR_CPU`.
+    """
+    return KoboldcppVariant.CUDA if accelerator == ACCELERATOR_CUDA else KoboldcppVariant.NOCUDA
+
+
+def _intel_display_adapter_present() -> bool:
+    """Return whether an Intel display adapter is visible to the host's adapter enumeration.
+
+    :mod:`worker_bootstrap.detect` has no Intel predicate of its own because no torch build here is
+    selected for Intel, so the two adapter helpers it does have are composed instead.
+    """
+    if detect._is_windows():
+        return any("INTEL" in name.upper() for name in detect._windows_display_adapters())
+    return detect._linux_lspci_match(("Intel",))
+
+
+def detected_accelerator() -> str:
+    """Return the compute path this host's hardware calls for, for an install that declares no backend.
+
+    An NVIDIA card gets CUDA. Any other display adapter gets Vulkan, which the no-CUDA build carries and
+    which runs on AMD and Intel alike; a host with neither runs on the CPU backend. The ROCm fork is a
+    separate upstream project and is never chosen here.
+    """
+    if detect._nvidia_present():
+        return ACCELERATOR_CUDA
+    if detect._amd_present() or _intel_display_adapter_present():
+        return ACCELERATOR_VULKAN
+    return ACCELERATOR_CPU
+
+
 def default_variant() -> KoboldcppVariant:
     """Return the variant to install when the caller does not name one.
 
     An NVIDIA card gets the CUDA build; everything else gets the no-CUDA build, which still carries the
-    Vulkan and CPU backends and is therefore the working choice on AMD, Intel and CPU-only hosts. The ROCm
-    fork is a separate upstream project and is not a variant here.
+    Vulkan and CPU backends and is therefore the working choice on AMD, Intel and CPU-only hosts.
     """
-    return KoboldcppVariant.CUDA if detect._nvidia_present() else KoboldcppVariant.NOCUDA
+    return variant_for_accelerator(detected_accelerator())
 
 
 def koboldcpp_asset(*, variant: KoboldcppVariant | None = None) -> KoboldcppAsset:
@@ -223,21 +273,62 @@ def _versioned_path(root: Path) -> Path:
 
 
 def _version_stamp_path(root: Path) -> Path:
-    """Return the sidecar recording which release the stable path currently holds.
+    """Return the sidecar recording which release and variant the stable path currently holds.
 
     The stable path cannot carry the version in its name and still be the one name a launcher knows, and a
-    600 MB binary is not worth storing twice, so the published version is recorded beside it instead.
+    600 MB binary is not worth storing twice, so ``<release tag> <variant>`` is recorded beside it instead.
     """
     return paths.bin_dir(root) / "koboldcpp-version"
 
 
-def _published_version(root: Path) -> str | None:
-    """Return the release tag recorded for the published binary, or None when nothing is recorded."""
+@dataclass(frozen=True)
+class _PublishedStamp:
+    """Represents what the sidecar records about the binary at the stable path."""
+
+    release: str
+    """The upstream release tag the published binary reported when it was published."""
+    variant: KoboldcppVariant | None
+    """The accelerator variant published, or None for a stamp written before the variant was recorded."""
+
+
+def _read_version_stamp(root: Path) -> _PublishedStamp | None:
+    """Return what the sidecar records for the published binary, or None when nothing is recorded.
+
+    A stamp of one field, or one whose second field names no variant this module knows, reads as an unknown
+    variant rather than as a guess at which build is on disk.
+    """
     try:
         recorded = _version_stamp_path(root).read_text(encoding="utf-8").strip()
     except OSError:
         return None
-    return recorded or None
+    if not recorded:
+        return None
+    release, _, variant_field = recorded.partition(" ")
+    return _PublishedStamp(release=release, variant=_VARIANTS_BY_VALUE.get(variant_field.strip()))
+
+
+def _write_version_stamp(root: Path, variant: KoboldcppVariant) -> None:
+    """Record which release and variant the stable path now holds."""
+    _version_stamp_path(root).write_text(f"{KOBOLDCPP_VERSION} {variant}\n", encoding="utf-8")
+
+
+def _published_is_usable(root: Path, *, variant: KoboldcppVariant | None) -> bool:
+    """Return whether the published binary is the pinned release and can run the variant being asked for.
+
+    The CUDA build also carries the Vulkan and CPU backends, so it serves either ask; the asset is 600 MB
+    and an operator moving between compute paths should not pay for it each way. A stamp that records no
+    variant was published by detection alone, so it is read as what detection picks.
+
+    Args:
+        root: The install root holding the published binary and its sidecar.
+        variant: The variant being asked for, or None to ask for whatever detection picks.
+    """
+    stamp = _read_version_stamp(root)
+    if stamp is None or stamp.release != KOBOLDCPP_VERSION:
+        return False
+    published = stamp.variant if stamp.variant is not None else default_variant()
+    wanted = variant if variant is not None else default_variant()
+    return published is KoboldcppVariant.CUDA or published == wanted
 
 
 def _reported_version(executable: Path) -> str | None:
@@ -351,7 +442,7 @@ def _download_verified_koboldcpp(asset: KoboldcppAsset, root: Path) -> Path:
         # download, while a crash the other way round would claim the old binary is the new release.
         _version_stamp_path(root).unlink(missing_ok=True)
         os.replace(versioned, stable)
-        _version_stamp_path(root).write_text(f"{KOBOLDCPP_VERSION}\n", encoding="utf-8")
+        _write_version_stamp(root, asset.variant)
     except OSError as error:
         raise KoboldcppProvisionError(
             f"Could not publish koboldcpp {KOBOLDCPP_VERSION} to {stable}: {error}"
@@ -377,13 +468,16 @@ def koboldcpp_executable(root: Path | None = None) -> Path | None:
 def ensure_koboldcpp(root: Path | None = None, *, variant: KoboldcppVariant | None = None) -> Path:
     """Return a verified koboldcpp binary for this install, downloading the pinned release if needed.
 
-    Idempotent: when the stable path already holds the pinned release it is returned without any network
-    access or subprocess probe. Otherwise the pinned asset is downloaded, compared to its pinned SHA-256,
-    staged under a versioned name, probed with ``--version``, and only then published to the stable path.
+    Idempotent: when the stable path already holds the pinned release in the wanted variant it is returned
+    without any network access or subprocess probe. Otherwise the pinned asset is downloaded, compared to
+    its pinned SHA-256, staged under a versioned name, probed with ``--version``, and only then published to
+    the stable path.
 
     Args:
         root: The install root to provision into; defaults to this bundle's own install root.
-        variant: Force a variant instead of deriving it from the detected hardware.
+        variant: Force a variant instead of deriving it from the detected hardware. A published binary of
+            another variant is replaced, so the flag the worker launches with and the backends the binary
+            carries cannot disagree.
 
     Returns:
         The stable published path of the verified binary.
@@ -398,7 +492,7 @@ def ensure_koboldcpp(root: Path | None = None, *, variant: KoboldcppVariant | No
     """
     install_root = paths.install_root() if root is None else root
     published = koboldcpp_executable(install_root)
-    if published is not None and _published_version(install_root) == KOBOLDCPP_VERSION:
+    if published is not None and _published_is_usable(install_root, variant=variant):
         return published
     return _download_verified_koboldcpp(koboldcpp_asset(variant=variant), install_root)
 

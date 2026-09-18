@@ -656,6 +656,9 @@ class TextBackendWait:
 
     A backend that cannot be obtained is never launched and so never late, which is exactly why this is
     reported rather than waited on: no clock would ever run out."""
+    credentials_refused: bool = False
+    """Whether the backend answered and refused the worker's credentials, reported at once for the same
+    reason: it is not late, and waiting changes nothing."""
 
 
 def _text_backend_wait(snapshot: WorkerStateSnapshot) -> TextBackendWait | None:
@@ -678,6 +681,7 @@ def _text_backend_wait(snapshot: WorkerStateSnapshot) -> TextBackendWait | None:
     return TextBackendWait(
         managed=False,
         seconds=max(0.0, snapshot.timestamp - snapshot.text_backend_not_ready_since),
+        credentials_refused=snapshot.text_backend_credentials_refused,
     )
 
 
@@ -748,6 +752,8 @@ def _text_posture_report(snapshot: WorkerStateSnapshot, checks: list[HealthCheck
 
 def _text_backend_remedy(wait: TextBackendWait) -> str:
     """Return what an operator should look at for a backend that is not answering."""
+    if wait.credentials_refused:
+        return "Set `text_backend_password` to the password your backend was started with."
     if wait.managed:
         return "The worker launches it; see the Text Backend row and logs/text_backend.log."
     return "Check that it is running and that `kai_url` is its address."
@@ -773,6 +779,15 @@ def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
     patience = snapshot.config.text_backend_ready_patience_seconds
     if wait is not None and wait.provision_error is not None:
         rows.append(HealthCheck(TEXT_BACKEND_CHECK_NAME, HealthStatus.ERROR, wait.provision_error))
+    elif wait is not None and wait.credentials_refused:
+        rows.append(
+            HealthCheck(
+                TEXT_BACKEND_CHECK_NAME,
+                HealthStatus.ERROR,
+                "The text backend refused the worker's credentials; no text jobs are being popped. "
+                f"{_text_backend_remedy(wait)}",
+            ),
+        )
     elif wait is not None and wait.seconds is not None and wait.seconds > patience:
         failed = wait.seconds > patience * 2
         rows.append(

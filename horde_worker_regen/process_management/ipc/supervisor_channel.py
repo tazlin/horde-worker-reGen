@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 28
+SUPERVISOR_PROTOCOL_VERSION = 29
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -124,6 +124,9 @@ worker's own transitions as they happened (pops, preloads, finished and faulted 
 process recoveries, finished downloads, maintenance and pop-backoff edges), each with a per-session
 ``sequence`` so a reconnecting frontend can tell events it has shown from ones it has not. The ring is
 recorded where the finished-job records are, so it and ``recent_jobs`` cannot disagree about a job.
+v29 adds ``text_backend_credentials_refused``: the text backend answered and refused the worker's
+credentials, which the dashboard reports at once with its own remedy instead of as a backend that is
+late.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -1738,6 +1741,9 @@ class WorkerStateSnapshot(BaseModel):
 
     A gate that has been open for a long time is the difference between a backend still loading weights
     and one the operator never started, and a boolean cannot tell them apart."""
+    text_backend_credentials_refused: bool = False
+    """Whether the text backend is refusing the worker's credentials. Reported apart from an unready
+    backend because the backend is up and the remedy is a config value, not patience."""
 
     workload_totals: dict[WorkloadKind, WorkloadTotalsSnapshot] = Field(default_factory=dict)
     """This session's completed/faulted/kudos totals per workload, derived from the finished-job records.

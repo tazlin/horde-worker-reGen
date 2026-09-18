@@ -5,7 +5,7 @@ koboldcpp's: the same routes, the same JSON keys, the same server-sent-events fr
 booleans on abort, and the same 503 for "one generation at a time and I am on it". Three things they pin
 above all: the horde payload reaches the backend exactly as it arrived with only the generation key
 added, a generation is driven through the stream and reports itself as it arrives, and every failure
-mode surfaces as one of the three protocol exceptions so the flow never has to look at HTTP.
+mode surfaces as one of the four protocol exceptions so the flow never has to look at HTTP.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from horde_worker_regen.text_backends import (
     KoboldApiTextBackend,
     TextBackend,
     TextBackendBusy,
+    TextBackendCredentialRefused,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
     TextGenerationProgress,
@@ -38,6 +39,13 @@ from horde_worker_regen.text_backends import (
 )
 
 _MODEL_NAME = "koboldcpp/a-model.gguf"
+_PROTECTED_MODEL_NAME = "koboldcpp/protected-model"
+"""What koboldcpp names on its model route to a reader whose password it does not accept.
+
+The route is not guarded like the rest: it answers 200 to anyone, so a wrong password reads as a healthy
+backend until something behind the guard is asked.
+"""
+
 _MAX_CONTEXT_LENGTH = 4096
 _MAX_LENGTH = 512
 _STREAM_CHUNKS: Final = ("the backend's ", "own ", "words")
@@ -48,6 +56,11 @@ _GENERATION_KEY = "FEDCBA98"
 
 _BUSY_BODY = {"detail": {"msg": "Server is busy; please try again later.", "type": "service_unavailable"}}
 """koboldcpp's own 503 body, so the driver is exercised against the shape it will really see."""
+
+_UNAUTHORIZED_BODY = {
+    "detail": {"error": "Unauthorized", "msg": "Authentication key is missing or invalid.", "type": "unauthorized"},
+}
+"""koboldcpp's own 401 body, sent by every route it guards with the password it was launched with."""
 
 _SLOW_ANSWER_SECONDS = 0.5
 """Long enough to outlast a test's deadline, short enough that the server shuts down without waiting."""
@@ -113,6 +126,12 @@ class _KoboldBackendBehaviour:
     model_name: str = _MODEL_NAME
     model_status: int = HTTPStatus.OK
     model_delay_seconds: float = 0.0
+    required_password: str | None = None
+    """The password the backend was launched with, or `None` for one launched without.
+
+    Guards the routes koboldcpp guards (the generation routes, the statistics route and abort) with the
+    401 it answers; the model route stays open and names a placeholder instead, as the real one does.
+    """
     max_context_length: int = _MAX_CONTEXT_LENGTH
     max_length: int = _MAX_LENGTH
     soft_prompts: tuple[str, ...] | None = ()
@@ -149,12 +168,24 @@ class _KoboldBackendBehaviour:
 def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
     """Return an application answering the KoboldAI routes the way `behaviour` says to."""
 
+    def credential_refused(request: web.Request) -> bool:
+        """Return whether this request carries something other than the password the backend wants."""
+        if behaviour.required_password is None:
+            return False
+        return request.headers.get(aiohttp.hdrs.AUTHORIZATION) != f"Bearer {behaviour.required_password}"
+
+    def unauthorized() -> web.Response:
+        """Return the refusal koboldcpp answers a request whose credential it will not accept."""
+        return web.json_response(_UNAUTHORIZED_BODY, status=HTTPStatus.UNAUTHORIZED)
+
     async def handle_model(request: web.Request) -> web.Response:
         """Answer the model route, which is what readiness and the advertised name both read."""
         if behaviour.model_delay_seconds > 0:
             await asyncio.sleep(behaviour.model_delay_seconds)
         if behaviour.model_status != HTTPStatus.OK:
             return web.json_response({"detail": "no model"}, status=behaviour.model_status)
+        if credential_refused(request):
+            return web.json_response({KoboldApiJsonKeys.RESULT: _PROTECTED_MODEL_NAME})
         return web.json_response({KoboldApiJsonKeys.RESULT: behaviour.model_name})
 
     async def handle_max_context_length(request: web.Request) -> web.Response:
@@ -186,6 +217,8 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
         """Answer the blocking route, which says nothing at all until the generation is finished."""
         behaviour.blocking_generate_count += 1
         await record_generation_request(request)
+        if credential_refused(request):
+            return unauthorized()
         if behaviour.generate_delay_seconds > 0:
             await asyncio.sleep(behaviour.generate_delay_seconds)
         if behaviour.generate_status != HTTPStatus.OK:
@@ -209,6 +242,8 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
         """Stream the generation back the way koboldcpp does, one `event: message` record per chunk."""
         behaviour.stream_generate_count += 1
         await record_generation_request(request)
+        if credential_refused(request):
+            return unauthorized()
         if not behaviour.stream_route_present:
             return web.json_response({"detail": "not found"}, status=HTTPStatus.NOT_FOUND)
         if behaviour.generate_delay_seconds > 0:
@@ -240,6 +275,8 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
         """Answer per-request statistics as a patched build does, or 404 as a stock build does."""
         body = await request.json()
         behaviour.recorded_stats_bodies.append(body)
+        if credential_refused(request):
+            return unauthorized()
         if not behaviour.stats_route_present:
             return web.json_response({"detail": "not found"}, status=HTTPStatus.NOT_FOUND)
         if body.get(KoboldApiJsonKeys.GENERATION_KEY) == CAPABILITY_PROBE_GENERATION_KEY:
@@ -265,6 +302,8 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
     async def handle_abort(request: web.Request) -> web.Response:
         """Record the abort, end any stream in flight, and answer koboldcpp's two string flags."""
         behaviour.recorded_abort_bodies.append(await request.json())
+        if credential_refused(request):
+            return unauthorized()
         behaviour.abort_requested.set()
         return web.json_response({KoboldApiJsonKeys.SUCCESS: "true", KoboldApiJsonKeys.DONE: "true"})
 
@@ -286,14 +325,14 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
 async def _running_backend(
     behaviour: _KoboldBackendBehaviour,
     *,
-    api_key: str | None = None,
+    password: str | None = None,
 ) -> AsyncIterator[KoboldApiTextBackend]:
     """Serve `behaviour` on an ephemeral port and yield a driver pointed at it."""
     server = TestServer(_build_kobold_app(behaviour))
     await server.start_server()
     session = aiohttp.ClientSession()
     try:
-        yield KoboldApiTextBackend(f"http://{server.host}:{server.port}", session, api_key=api_key)
+        yield KoboldApiTextBackend(f"http://{server.host}:{server.port}", session, password=password)
     finally:
         await session.close()
         await server.close()
@@ -784,17 +823,17 @@ async def test_generate_raises_unavailable_when_the_backend_is_not_listening() -
             await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=5.0)
 
 
-async def test_generate_sends_the_api_key_as_a_bearer_token() -> None:
+async def test_generate_sends_the_password_as_a_bearer_token() -> None:
     """Koboldcpp launched with a password wants that password as a bearer token."""
     behaviour = _KoboldBackendBehaviour()
 
-    async with _running_backend(behaviour, api_key="a-launch-password") as backend:
+    async with _running_backend(behaviour, password="a-launch-password") as backend:
         await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
 
     assert behaviour.recorded_generate_authorizations == ["Bearer a-launch-password"]
 
 
-async def test_generate_sends_no_authorization_header_without_a_key() -> None:
+async def test_generate_sends_no_authorization_header_without_a_password() -> None:
     """An unprotected backend must not be sent an empty credential."""
     behaviour = _KoboldBackendBehaviour()
 
@@ -802,6 +841,65 @@ async def test_generate_sends_no_authorization_header_without_a_key() -> None:
         await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
 
     assert behaviour.recorded_generate_authorizations == [None]
+
+
+async def test_a_protected_backend_serves_a_driver_carrying_its_password() -> None:
+    """The password reaches every guarded route, so a protected backend behaves like any other."""
+    behaviour = _KoboldBackendBehaviour(required_password="a-launch-password", stats_route_present=True)
+
+    async with _running_backend(behaviour, password="a-launch-password") as backend:
+        assert await backend.ready(deadline_seconds=5.0) is True
+        description = await backend.describe()
+        capabilities = await backend.capabilities()
+        result = await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+
+    assert description.model_name == _MODEL_NAME
+    assert capabilities.generation_stats is True
+    assert result.text == _GENERATED_TEXT
+
+
+async def test_generate_raises_a_credential_refusal_when_the_password_is_wrong() -> None:
+    """The refusal is its own failure: polling a backend that will not accept the worker never ends."""
+    behaviour = _KoboldBackendBehaviour(required_password="the-real-password")
+
+    async with _running_backend(behaviour, password="the-wrong-password") as backend:
+        with pytest.raises(TextBackendCredentialRefused):
+            await backend.generate({}, generation_key=_GENERATION_KEY, deadline_seconds=10.0)
+
+    assert behaviour.blocking_generate_count == 0, "a refused credential is not a reason to try the other route"
+
+
+async def test_capabilities_raises_a_credential_refusal_rather_than_reporting_a_missing_route() -> None:
+    """A route behind a credential the worker does not have says nothing about whether the build has it."""
+    behaviour = _KoboldBackendBehaviour(required_password="the-real-password", stats_route_present=True)
+
+    async with _running_backend(behaviour) as backend:
+        with pytest.raises(TextBackendCredentialRefused):
+            await backend.capabilities()
+
+
+async def test_ready_raises_a_credential_refusal_when_the_model_route_itself_is_guarded() -> None:
+    """A backend (or a proxy in front of one) that guards every route is refusing, not starting up."""
+    behaviour = _KoboldBackendBehaviour(model_status=HTTPStatus.UNAUTHORIZED)
+
+    async with _running_backend(behaviour) as backend:
+        with pytest.raises(TextBackendCredentialRefused):
+            await backend.ready(deadline_seconds=5.0)
+
+
+async def test_a_protected_backend_names_a_placeholder_model_to_a_worker_it_will_not_serve() -> None:
+    """Koboldcpp answers its model route to anyone, which is why the refusal shows at the routes behind it.
+
+    A worker whose password is wrong sees a ready backend describing a model it has never heard of, so
+    the readiness probe alone cannot be where a credential is judged.
+    """
+    behaviour = _KoboldBackendBehaviour(required_password="the-real-password")
+
+    async with _running_backend(behaviour, password="the-wrong-password") as backend:
+        assert await backend.ready(deadline_seconds=5.0) is True
+        description = await backend.describe()
+
+    assert description.model_name == _PROTECTED_MODEL_NAME
 
 
 async def test_stop_names_the_generation_on_the_abort_route() -> None:
@@ -828,6 +926,14 @@ async def test_stop_returns_quietly_when_the_backend_has_no_abort_route() -> Non
 async def test_stop_returns_quietly_when_the_backend_is_gone() -> None:
     """Stopping a generation on a backend that has already exited is the expected shutdown ordering."""
     async with _backend_on_a_closed_port() as backend:
+        await backend.stop(generation_key=_GENERATION_KEY)
+
+
+async def test_stop_returns_quietly_when_the_backend_refuses_the_credential() -> None:
+    """Abandoning a generation runs where a failure is already being handled, so it raises nothing."""
+    behaviour = _KoboldBackendBehaviour(required_password="the-real-password")
+
+    async with _running_backend(behaviour, password="the-wrong-password") as backend:
         await backend.stop(generation_key=_GENERATION_KEY)
 
 

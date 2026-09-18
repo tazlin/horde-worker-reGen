@@ -9,7 +9,7 @@ to learn about a backend is another place the two programs can disagree, so the 
 a backend has demonstrated a stable interface for something the worker actually needs.
 
 Everything above this package (the flow that pops horde jobs, the lifecycle that launches the binary)
-sees these six verbs, the result models, and the three exception types. It never sees HTTP: no status
+sees these six verbs, the result models, and the four exception types. It never sees HTTP: no status
 codes, no routes, no response bodies. That keeps the retry decision where it belongs. The flow decides
 what to do about a failure because only the flow knows about the job, the horde and the operator's
 configuration; a driver that retried on its own behalf would be making that decision blind.
@@ -23,7 +23,7 @@ Public surface:
   [`TextGenerationProgress`][horde_worker_regen.text_backends.protocol.TextGenerationProgress] and
   [`TextGenerationResult`][horde_worker_regen.text_backends.protocol.TextGenerationResult]: the values
   the protocol returns and reports.
-- [`TextBackendError`][horde_worker_regen.text_backends.protocol.TextBackendError] and its three
+- [`TextBackendError`][horde_worker_regen.text_backends.protocol.TextBackendError] and its four
   subclasses: every way a call can fail.
 """
 
@@ -39,7 +39,7 @@ class TextBackendError(RuntimeError):
     """Base class for every failure a text backend call reports.
 
     Callers that do not care which failure occurred (shutdown paths, logging) catch this; callers that
-    decide what happens to the job catch the three subclasses, which each name one outcome.
+    decide what happens to the job catch the four subclasses, which each name one outcome.
     """
 
 
@@ -70,6 +70,16 @@ class TextBackendRejectedPayload(TextBackendError):
     Raised for the statuses a backend uses to say the request itself is wrong. The job cannot succeed
     on this backend no matter how often it is offered, so the flow faults it back to the horde without
     retrying rather than burning the same failure repeatedly.
+    """
+
+
+class TextBackendCredentialRefused(TextBackendError):
+    """The backend refused the worker's credentials, so every call it is given will be refused.
+
+    Raised for the statuses that mean the caller is not authorized (401 and 403). Separate from an
+    unavailable backend because the remedy is the opposite one: a backend that is down is worth polling
+    until it comes back, while a refused credential is a standing configuration state that no amount of
+    polling changes. The flow holds off and says which setting to correct.
     """
 
 
@@ -212,6 +222,11 @@ class TextBackend(Protocol):
 
         Returns:
             `True` when the backend answered and has a model loaded, `False` otherwise.
+
+        Raises:
+            TextBackendCredentialRefused: The backend refused the worker's credentials. The one failure
+                this verb raises rather than answering `False` for, because a `False` would be polled
+                for as long as the worker runs and the condition only an operator can clear.
         """
         ...
 
@@ -225,6 +240,7 @@ class TextBackend(Protocol):
             The backend's reported model name, its context and generation caps, and its soft prompts.
 
         Raises:
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendUnavailable: The backend did not answer, or answered something unreadable.
         """
         ...
@@ -234,11 +250,15 @@ class TextBackend(Protocol):
 
         A capability is a property of the running program rather than of a request, so the answer is
         settled once and reused: a build without a route will not grow one, and asking again on every
-        generation would spend a request per job to learn something already known. Never raises; a
-        route that cannot be probed is reported absent, which is what a stock build is.
+        generation would spend a request per job to learn something already known. A route that cannot
+        be probed is reported absent, which is what a stock build is.
 
         Returns:
             What the backend can do beyond the routes every backend has.
+
+        Raises:
+            TextBackendCredentialRefused: The backend refused the worker's credentials. A route behind
+                a credential the worker does not have says nothing about whether the build has it.
         """
         ...
 
@@ -272,6 +292,7 @@ class TextBackend(Protocol):
 
         Raises:
             TextBackendBusy: The backend is already generating; the same job can be offered again.
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendRejectedPayload: The backend refuses this payload and always will.
             TextBackendUnavailable: The backend is unreachable, too slow, answered unreadably, or
                 stopped part way through a generation it had begun.
@@ -282,8 +303,10 @@ class TextBackend(Protocol):
         """Ask the backend to abandon the generation with this key.
 
         Used on shutdown and when a generation outlives its deadline. Best effort by design: a backend
-        with no abort route, or one that has already exited, leaves nothing worth failing over, so the
-        outcome is logged at debug and the call returns. Never raises.
+        with no abort route, one that refuses the worker's credentials, or one that has already exited,
+        leaves nothing worth failing over, so the outcome is logged at debug and the call returns. Never
+        raises: its callers are already handling a job's failure or closing the worker down, and neither
+        has anywhere to put a second one.
 
         Args:
             generation_key: The key passed to the
@@ -301,6 +324,7 @@ __all__ = [
     "TextBackend",
     "TextBackendBusy",
     "TextBackendCapabilities",
+    "TextBackendCredentialRefused",
     "TextBackendDescription",
     "TextBackendError",
     "TextBackendRejectedPayload",

@@ -103,20 +103,30 @@ class _FakeHordeClientSession:
     the assertions here are about the request the flow built rather than about the call happening.
     """
 
-    def __init__(self, *, pop_responses: list[TextGenerateJobPopResponse] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        pop_responses: list[TextGenerateJobPopResponse] | None = None,
+        submit_errors: list[RequestErrorResponse] | None = None,
+    ) -> None:
         self.pop_requests: list[TextGenerateJobPopRequest] = []
+        self.pop_response_types: list[object] = []
         self.submit_requests: list[TextGenerationJobSubmitRequest] = []
         self._pop_responses = deque(pop_responses or [])
+        self._submit_errors = deque(submit_errors or [])
 
     async def submit_request(self, request: object, response_type: object) -> object:
-        """Return the next scripted pop answer, or a successful submit answer."""
+        """Return the next scripted pop answer, or the next scripted submit answer."""
         if isinstance(request, TextGenerateJobPopRequest):
             self.pop_requests.append(request)
+            self.pop_response_types.append(response_type)
             if self._pop_responses:
                 return self._pop_responses.popleft()
             return _empty_pop_response()
         if isinstance(request, TextGenerationJobSubmitRequest):
             self.submit_requests.append(request)
+            if self._submit_errors:
+                return self._submit_errors.popleft()
             return JobSubmitResponse(reward=_SUBMIT_REWARD)
         raise AssertionError(f"the text flow made an unexpected request: {request}")
 
@@ -126,13 +136,19 @@ def _empty_pop_response() -> TextGenerateJobPopResponse:
     return TextGenerateJobPopResponse(payload=ModelPayloadKobold(), ids=[])
 
 
-def _pop_response(*, prompt: str = "a prompt", job_id: str | None = None) -> TextGenerateJobPopResponse:
+def _pop_response(
+    *,
+    prompt: str = "a prompt",
+    job_id: str | None = None,
+    ttl: int | None = None,
+) -> TextGenerateJobPopResponse:
     """Create a pop answer carrying one generation for this worker."""
     return TextGenerateJobPopResponse(
         payload=ModelPayloadKobold(prompt=prompt),
         id=job_id or str(uuid.uuid4()),
         ids=[],
         model=_DESCRIPTION.model_name,
+        ttl=ttl,
     )
 
 
@@ -153,6 +169,9 @@ def _make_coordinator(
 ) -> tuple[TextGenerationCoordinator, FakeTextBackend, _FakeHordeClientSession]:
     """Create a coordinator over a fake backend and a fake horde session, with the scribe role on.
 
+    The role is an override like any other, so a test about a worker that did not select it passes
+    ``scribe=False``.
+
     ``state`` and ``run_metrics`` are passed by the tests that assert on what the flow writes into the
     shared session totals and the per-job records; the rest get a throwaway state and no aggregator,
     which is also the assembly a worker with no run metrics wired runs under.
@@ -162,7 +181,8 @@ def _make_coordinator(
     # An explicit empty list because the pop request validates the field as a list and the shared mock
     # bridge data leaves it as a Mock attribute.
     bridge_overrides.setdefault("priority_usernames", [])
-    bridge_data = make_mock_bridge_data(scribe=True, **bridge_overrides)
+    bridge_overrides.setdefault("scribe", True)
+    bridge_data = make_mock_bridge_data(**bridge_overrides)
     shutdown_manager = Mock()
     shutdown_manager.is_time_for_shutdown.return_value = False
 
@@ -1209,6 +1229,323 @@ async def test_the_slow_backend_notice_asks_about_kai_url_for_a_backend_the_oper
     assert notices
     assert "http://localhost:5000" in notices[0], "with no provider the address is the operator's `kai_url`"
     assert "is `kai_url` its address?" in notices[0]
+
+
+async def test_the_pop_asks_for_the_response_type_that_opts_out_of_the_sdk_cleanup() -> None:
+    """The SDK faults every pop it still holds when the session closes, which is this flow's own job.
+
+    Its cleanup submit would land on an id the coordinator has already reported, and for a pop answering
+    with several ids it can never be cleared at all, so the flow pops a type that opts out entirely.
+    """
+    coordinator, _backend, session = _make_coordinator()
+    await coordinator.await_backend_ready()
+
+    await coordinator.api_text_pop()
+
+    assert session.pop_response_types == [text_generation_coordinator._TextPopResponse]
+    assert text_generation_coordinator._TextPopResponse(payload=ModelPayloadKobold(), ids=[]).ignore_failure() is True
+
+
+async def test_a_job_that_outlives_the_shutdown_drain_is_faulted_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flow is the only thing that reports a text job's outcome, shutdown included.
+
+    A generation still running when the drain expires used to be left to a task that would submit after
+    the backend had closed, against an id the SDK's own session had already faulted. The close path ends
+    the task and reports the job itself, so the horde hears about it once.
+    """
+    monkeypatch.setattr(text_generation_coordinator, "SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05)
+    backend = _NeverAnsweringTextBackend(description=_DESCRIPTION)
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, _session = _make_coordinator(
+        backend=backend,
+        session=session,
+        text_generation_timeout_seconds=30.0,
+    )
+    await coordinator.await_backend_ready()
+    await coordinator.api_text_pop()
+    assert coordinator.num_in_flight == 1
+
+    await asyncio.wait_for(coordinator.stop_in_flight_and_close(), timeout=10.0)
+
+    assert [request.state for request in session.submit_requests] == [GENERATION_STATE.faulted]
+    assert coordinator.num_jobs_faulted == 1
+    assert coordinator.num_in_flight == 0
+    assert backend.closed is True
+
+    await asyncio.sleep(0.05)
+    assert len(session.submit_requests) == 1, "a cancelled job task submitted after the flow closed"
+
+
+async def test_a_finished_job_is_submitted_once_and_the_close_path_adds_nothing() -> None:
+    """A job that ended on its own is already accounted for, so shutdown has nothing to report for it."""
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="an answer")
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, _session = _make_coordinator(backend=backend, session=session)
+    await coordinator.await_backend_ready()
+
+    await coordinator.api_text_pop()
+    await _drain_job_tasks(coordinator)
+    await coordinator.stop_in_flight_and_close()
+
+    assert [request.state for request in session.submit_requests] == [GENERATION_STATE.ok]
+    assert coordinator.num_jobs_submitted == 1
+    assert coordinator.num_jobs_faulted == 0
+
+
+async def test_a_coordinator_fault_is_submitted_once_and_the_close_path_adds_nothing() -> None:
+    """The same holds for a job the flow faulted itself: one outcome, one submit."""
+    backend = FakeTextBackend(description=_DESCRIPTION, generate_failures=(TextBackendRejectedPayload("no"),))
+    session = _FakeHordeClientSession(pop_responses=[_pop_response()])
+    coordinator, _backend, _session = _make_coordinator(backend=backend, session=session)
+    await coordinator.await_backend_ready()
+
+    await coordinator.api_text_pop()
+    await _drain_job_tasks(coordinator)
+    await coordinator.stop_in_flight_and_close()
+
+    assert [request.state for request in session.submit_requests] == [GENERATION_STATE.faulted]
+    assert coordinator.num_jobs_faulted == 1
+
+
+async def test_a_submit_answered_already_submitted_is_the_delivery_it_describes() -> None:
+    """A lost answer is not a lost submit: the horde holds the result, so the job was delivered.
+
+    Counting it as a fault reported work the requester received as work they did not, and left the job
+    out of the run metrics entirely.
+    """
+    run_metrics = WorkerRunMetrics()
+    state = WorkerState()
+    session = _FakeHordeClientSession(
+        submit_errors=[RequestErrorResponse(message="Generation already submitted")],
+    )
+    coordinator, _backend, _session = _make_coordinator(session=session, state=state, run_metrics=run_metrics)
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=time.time(), model_name=_DESCRIPTION.model_name)
+    coordinator._in_flight[job.job_id] = job
+
+    await coordinator.submit_job(job, generation="an answer", state=GENERATION_STATE.ok)
+
+    assert coordinator.num_jobs_submitted == 1
+    assert coordinator.num_jobs_faulted == 0
+    assert len(session.submit_requests) == 1, "a delivered result was submitted again"
+    record = run_metrics.snapshot().jobs[0]
+    assert record.faulted is False
+    assert record.kudos_reward is None, "the reward was paid against the attempt whose answer was lost"
+    assert state.kudos_generated_this_session == 0.0
+
+
+async def test_a_faulted_submit_answered_already_submitted_is_a_delivered_fault() -> None:
+    """The retry of a fault report that landed is still a fault report that landed."""
+    run_metrics = WorkerRunMetrics()
+    session = _FakeHordeClientSession(
+        submit_errors=[RequestErrorResponse(message="Generation has already been submitted")],
+    )
+    coordinator, _backend, _session = _make_coordinator(session=session, run_metrics=run_metrics)
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=time.time(), model_name=_DESCRIPTION.model_name)
+    coordinator._in_flight[job.job_id] = job
+
+    await coordinator.submit_job(job, generation="", state=GENERATION_STATE.faulted)
+
+    assert coordinator.num_jobs_faulted == 1
+    assert coordinator.num_jobs_submitted == 0
+    assert run_metrics.snapshot().jobs[0].faulted is True
+
+
+async def test_the_pops_ttl_becomes_the_jobs_deadline_and_its_absence_leaves_none() -> None:
+    """The horde states how long it will wait in seconds; the job carries what is left of it."""
+    coordinator, _backend, _session = _make_coordinator()
+    await coordinator.await_backend_ready()
+    advertisement = coordinator.advertisement
+    assert advertisement is not None
+
+    offered_at = time.monotonic()
+    coordinator._start_popped_jobs(_pop_response(ttl=45), advertisement=advertisement)
+    coordinator._start_popped_jobs(_pop_response(), advertisement=advertisement)
+    with_ttl, without_ttl = (
+        job for job in sorted(coordinator._in_flight.values(), key=lambda held: held.ttl_deadline is None)
+    )
+
+    assert with_ttl.ttl_deadline is not None
+    assert offered_at + 45 <= with_ttl.ttl_deadline <= time.monotonic() + 45
+    assert without_ttl.ttl_deadline is None, "a pop that stated no ttl bounds the job with nothing"
+
+    await _drain_job_tasks(coordinator)
+
+
+async def test_a_job_whose_ttl_is_spent_is_never_offered_to_the_backend() -> None:
+    """Generating an answer the horde has already reassigned spends the backend on nobody."""
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="an answer")
+    coordinator, _backend, session = _make_coordinator(backend=backend)
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(
+        job_id=_job_id(),
+        payload={},
+        time_popped=0.0,
+        ttl_deadline=time.monotonic() - 1.0,
+    )
+    coordinator._in_flight[job.job_id] = job
+
+    await coordinator.run_job(job)
+
+    assert backend.generate_calls == (), "a job past its ttl was generated anyway"
+    assert session.submit_requests[0].state == GENERATION_STATE.faulted
+    assert coordinator.num_jobs_faulted == 1
+
+
+async def test_the_busy_re_offer_loop_stops_at_the_ttl_rather_than_its_own_attempt_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-offering a job the horde has stopped waiting for only holds a slot the next job could use."""
+    monkeypatch.setattr(text_generation_coordinator, "BUSY_RETRY_WAIT_SECONDS", 0.05)
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        generate_failures=tuple(
+            TextBackendBusy("busy") for _attempt in range(text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS)
+        ),
+    )
+    coordinator, _backend, session = _make_coordinator(backend=backend)
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(
+        job_id=_job_id(),
+        payload={},
+        time_popped=0.0,
+        ttl_deadline=time.monotonic() + 0.01,
+    )
+    coordinator._in_flight[job.job_id] = job
+
+    await asyncio.wait_for(coordinator.run_job(job), timeout=10.0)
+
+    assert len(backend.generate_calls) == 1, "the job was re-offered past the ttl the horde popped it with"
+    assert session.submit_requests[0].state == GENERATION_STATE.faulted
+
+
+async def test_a_refused_credential_holds_the_flow_off_and_names_the_setting_once() -> None:
+    """A wrong password is a standing state polling cannot clear, so the flow says so and stops looking."""
+    backend = FakeTextBackend(description=_DESCRIPTION, credential_refused=True)
+    coordinator, _backend, session = _make_coordinator(backend=backend)
+    logged: list[tuple[str, str]] = []
+    sink_id = logger.add(lambda m: logged.append((m.record["level"].name, m.record["message"])), level="TRACE")
+    try:
+        assert await coordinator.await_backend_ready() is False
+        assert await coordinator.await_backend_ready() is False
+    finally:
+        logger.remove(sink_id)
+
+    named = [message for level, message in logged if level == "ERROR" and "text_backend_password" in message]
+    assert len(named) == 1, "the standing hold was announced more than once"
+    assert coordinator.backend_ready is False
+    assert coordinator.backend_not_ready_since is not None, "the dashboard reads the hold as a backend not ready"
+
+    await coordinator.api_text_pop()
+    assert session.pop_requests == [], "the flow popped work it cannot generate"
+
+
+async def test_the_credential_hold_is_left_to_the_operator_for_a_while() -> None:
+    """Re-probing a refused credential every cycle spends a request to be told the same thing."""
+    backend = FakeTextBackend(description=_DESCRIPTION, credential_refused=True)
+    coordinator, _backend, _session = _make_coordinator(backend=backend)
+
+    assert await coordinator.await_backend_ready() is False
+
+    assert coordinator._may_look_at_backend() is False
+    assert len(backend.ready_calls) == 1
+
+
+async def test_a_corrected_password_recovers_without_a_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The correction arrives by hot reload, so the hold has to end on its own once it is made."""
+    monkeypatch.setattr(text_generation_coordinator, "CREDENTIAL_RECHECK_INTERVAL_SECONDS", 0.0)
+    backend = FakeTextBackend(description=_DESCRIPTION, credential_refused=True)
+    coordinator, _backend, session = _make_coordinator(backend=backend)
+    assert await coordinator.await_backend_ready() is False
+
+    backend.credential_refused = False
+    assert coordinator._may_look_at_backend() is True
+    assert await coordinator.await_backend_ready() is True
+
+    await coordinator.api_text_pop()
+    assert len(session.pop_requests) == 1
+    assert coordinator.backend_not_ready_since is None
+
+
+async def test_a_credential_refused_during_a_generation_faults_the_job_and_closes_the_gate() -> None:
+    """A password changed under a running worker refuses the generation, not just the next probe."""
+    backend = FakeTextBackend(description=_DESCRIPTION, response_text="an answer")
+    coordinator, _backend, session = _make_coordinator(backend=backend)
+    await coordinator.await_backend_ready()
+    backend.credential_refused = True
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=0.0)
+    coordinator._in_flight[job.job_id] = job
+
+    await coordinator.run_job(job)
+
+    assert session.submit_requests[0].state == GENERATION_STATE.faulted
+    assert coordinator.advertisement is None, "the flow kept advertising for a backend refusing it"
+    assert [call.generation_key for call in backend.stop_calls] == [job.job_id]
+
+    await coordinator.api_text_pop()
+    assert session.pop_requests == [], "the flow popped while the credential hold was on"
+
+
+async def test_a_worker_without_the_scribe_role_does_no_text_work() -> None:
+    """The flow is registered on every worker, so one whose role is off must be inert.
+
+    No backend built (which would reach for a session and an address nobody configured), no pop, and a
+    readiness clock that is not running, since nothing is waiting on a backend.
+    """
+    built: list[TEXT_BACKENDS] = []
+
+    def _build(text_backend_kind: TEXT_BACKENDS) -> FakeTextBackend:
+        built.append(text_backend_kind)
+        return FakeTextBackend(description=_DESCRIPTION)
+
+    session = _FakeHordeClientSession()
+    shutdown_manager = Mock()
+    shutdown_manager.is_time_for_shutdown.return_value = True
+    coordinator = TextGenerationCoordinator(
+        state=WorkerState(),
+        shutdown_manager=shutdown_manager,
+        runtime_config=make_test_runtime_config(
+            bridge_data=make_mock_bridge_data(scribe=False, priority_usernames=[]),
+        ),
+        api_sessions=make_test_api_sessions(horde_client_session=session),
+        backend_factory=_build,
+        text_backend_kind=TEXT_BACKENDS.koboldcpp,
+    )
+
+    assert coordinator.backend_not_ready_since is None
+
+    await asyncio.wait_for(coordinator.run(), timeout=10.0)
+
+    assert built == [], "a worker with the role off built a text backend"
+    assert session.pop_requests == []
+    assert coordinator.backend_ready is False
+    assert coordinator.backend_not_ready_since is None
+
+
+async def test_the_role_going_off_stops_the_readiness_clock() -> None:
+    """A clock left running would make a role enabled later look as though its backend were long overdue."""
+    coordinator, _backend, _session = _make_coordinator()
+    coordinator._shutdown_manager.is_time_for_shutdown.return_value = True
+    assert coordinator.backend_not_ready_since is not None
+
+    coordinator.bridge_data.scribe = False
+    await asyncio.wait_for(coordinator.run(), timeout=10.0)
+
+    assert coordinator.backend_not_ready_since is None
+
+
+def test_a_worker_with_the_role_off_starts_its_clock_when_the_role_comes_on() -> None:
+    """The wait a dashboard shows is measured from the role, not from the worker's start."""
+    coordinator, _backend, _session = _make_coordinator(scribe=False)
+
+    assert coordinator.backend_not_ready_since is None
+
+    coordinator._close_readiness_gate()
+
+    assert coordinator.backend_not_ready_since is not None
 
 
 async def test_a_failed_pop_holds_the_next_one_without_moving_the_last_pop_instant() -> None:

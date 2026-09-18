@@ -22,6 +22,7 @@ from horde_worker_regen.bridge_data.custom_models import (
     CustomModelPreparation,
     prepare_custom_models,
 )
+from horde_worker_regen.compute_mode import TextBackendAccelerator
 from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT, WORKER_KNOWN_EXTRA_ALCHEMY_FORMS
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
@@ -1198,6 +1199,22 @@ class reGenBridgeData(CombinedHordeBridgeData):
     build of your own, a newer upstream release, or a backend the worker cannot yet provision. A `.py`
     path is a source checkout's entry script (koboldcpp's `koboldcpp.py` beside its compiled library) and
     is run by the worker's own interpreter.
+    """
+
+    text_backend_password: str | None = Field(default=None)
+    """The password an attached backend (`text_backend_managed: false`) requires, sent with every request.
+
+    Unset sends none. A backend that refuses the worker's credential is reported as a credential error
+    rather than as a backend that is not up yet, because waiting cannot fix it.
+    """
+
+    text_backend_accelerator: TextBackendAccelerator = Field(default=TextBackendAccelerator.AUTO)
+    """Which compute path the managed backend runs on: `auto`, `cuda`, `vulkan` or `cpu`.
+
+    `auto` follows the backend this install was set up for (`HORDE_WORKER_BACKEND`, then `bin/backend`):
+    an NVIDIA build runs text on CUDA, an AMD build on Vulkan, a CPU build on the CPU, and an install
+    that recorded nothing is detected. Set it explicitly when text should differ from the install, as on
+    a text-only worker installed with the CPU build whose card should still serve text.
     """
 
     text_backend_port: int = Field(default=5001, ge=1, le=65535)

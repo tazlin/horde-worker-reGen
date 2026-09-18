@@ -21,11 +21,16 @@ def _stable_path(root: Path) -> Path:
     return root / "bin" / ("koboldcpp.exe" if os.name == "nt" else "koboldcpp")
 
 
-def _test_asset(payload: bytes, *, name: str = "koboldcpp-test-asset") -> koboldcpp_bin.KoboldcppAsset:
+def _test_asset(
+    payload: bytes,
+    *,
+    name: str = "koboldcpp-test-asset",
+    variant: koboldcpp_bin.KoboldcppVariant = koboldcpp_bin.KoboldcppVariant.CUDA,
+) -> koboldcpp_bin.KoboldcppAsset:
     """Return an asset whose pinned digest is the digest of *payload*, so verification stays genuine."""
     return koboldcpp_bin.KoboldcppAsset(
         host_platform=_HOST_PLATFORM,
-        variant=koboldcpp_bin.KoboldcppVariant.CUDA,
+        variant=variant,
         asset_name=name,
         sha256=hashlib.sha256(payload).hexdigest(),
     )
@@ -145,7 +150,7 @@ def test_verified_download_publishes_and_records_the_release(monkeypatch: pytest
     assert published == _stable_path(tmp_path)
     assert published.read_bytes() == payload
     assert (tmp_path / "bin" / "koboldcpp-version").read_text(encoding="utf-8").strip() == (
-        koboldcpp_bin.KOBOLDCPP_VERSION
+        f"{koboldcpp_bin.KOBOLDCPP_VERSION} {koboldcpp_bin.KoboldcppVariant.CUDA}"
     )
     assert koboldcpp_bin.koboldcpp_executable(tmp_path) == published
     assert {path.name for path in (tmp_path / "bin").iterdir()} == {published.name, "koboldcpp-version"}
@@ -227,6 +232,183 @@ def test_published_binary_from_another_release_is_replaced(monkeypatch: pytest.M
 
     assert koboldcpp_bin.ensure_koboldcpp(tmp_path) == stable
     assert stable.read_bytes() == payload
+
+
+class TestVariantFollowsTheAccelerator:
+    """The build that is downloaded is decided by the compute path the worker will launch it on."""
+
+    @pytest.mark.parametrize(
+        ("accelerator", "expected"),
+        [
+            (koboldcpp_bin.ACCELERATOR_CUDA, koboldcpp_bin.KoboldcppVariant.CUDA),
+            (koboldcpp_bin.ACCELERATOR_VULKAN, koboldcpp_bin.KoboldcppVariant.NOCUDA),
+            (koboldcpp_bin.ACCELERATOR_CPU, koboldcpp_bin.KoboldcppVariant.NOCUDA),
+        ],
+    )
+    def test_each_compute_path_selects_a_build(
+        self,
+        accelerator: str,
+        expected: koboldcpp_bin.KoboldcppVariant,
+    ) -> None:
+        """Only CUDA needs the larger asset; Vulkan and the CPU backend both ship in the smaller one."""
+        assert koboldcpp_bin.variant_for_accelerator(accelerator) == expected
+
+    def test_the_accelerator_names_match_the_worker_enum(self) -> None:
+        """The bootstrap cannot import the worker's enum, so the spellings are pinned here instead."""
+        from horde_worker_regen.compute_mode import TextBackendAccelerator
+
+        bootstrap_names = {
+            koboldcpp_bin.ACCELERATOR_CUDA,
+            koboldcpp_bin.ACCELERATOR_VULKAN,
+            koboldcpp_bin.ACCELERATOR_CPU,
+        }
+        assert bootstrap_names == {
+            member.value for member in TextBackendAccelerator if member is not TextBackendAccelerator.AUTO
+        }
+
+    @pytest.mark.parametrize(
+        ("nvidia", "amd", "intel", "expected"),
+        [
+            (True, False, False, koboldcpp_bin.ACCELERATOR_CUDA),
+            (True, True, False, koboldcpp_bin.ACCELERATOR_CUDA),
+            (False, True, False, koboldcpp_bin.ACCELERATOR_VULKAN),
+            (False, False, True, koboldcpp_bin.ACCELERATOR_VULKAN),
+            (False, False, False, koboldcpp_bin.ACCELERATOR_CPU),
+        ],
+    )
+    def test_detection_answers_with_a_compute_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        nvidia: bool,
+        amd: bool,
+        intel: bool,
+        expected: str,
+    ) -> None:
+        """An install that declares no backend gets the path its adapters can actually run."""
+        monkeypatch.setattr(detect, "_nvidia_present", lambda: nvidia)
+        monkeypatch.setattr(detect, "_amd_present", lambda: amd)
+        monkeypatch.setattr(koboldcpp_bin, "_intel_display_adapter_present", lambda: intel)
+
+        assert koboldcpp_bin.detected_accelerator() == expected
+
+
+class TestVariantAwareStamp:
+    """The sidecar records which build is published, so a wanted build is never assumed to be on disk."""
+
+    def _publish(self, root: Path, stamp_text: str) -> Path:
+        """Write a published binary under *root* with *stamp_text* as its sidecar."""
+        stable = _stable_path(root)
+        stable.parent.mkdir(parents=True, exist_ok=True)
+        stable.write_bytes(b"already-published")
+        (root / "bin" / "koboldcpp-version").write_text(stamp_text, encoding="utf-8")
+        return stable
+
+    def _refuse_download(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Fail the test if anything reaches the download path."""
+
+        def refuse(asset: koboldcpp_bin.KoboldcppAsset, root: Path) -> Path:
+            raise AssertionError("the published binary already satisfies the request")
+
+        monkeypatch.setattr(koboldcpp_bin, "_download_verified_koboldcpp", refuse)
+
+    def test_a_stamp_round_trips_its_release_and_variant(self, tmp_path: Path) -> None:
+        """Both fields have to survive the write, since the variant alone decides a 600 MB transfer."""
+        self._publish(tmp_path, f"{koboldcpp_bin.KOBOLDCPP_VERSION} {koboldcpp_bin.KoboldcppVariant.NOCUDA}\n")
+
+        stamp = koboldcpp_bin._read_version_stamp(tmp_path)
+
+        assert stamp is not None
+        assert stamp.release == koboldcpp_bin.KOBOLDCPP_VERSION
+        assert stamp.variant == koboldcpp_bin.KoboldcppVariant.NOCUDA
+
+    def test_a_one_field_stamp_records_no_variant(self, tmp_path: Path) -> None:
+        """A stamp written before the variant was recorded says nothing about which build is on disk."""
+        self._publish(tmp_path, f"{koboldcpp_bin.KOBOLDCPP_VERSION}\n")
+
+        stamp = koboldcpp_bin._read_version_stamp(tmp_path)
+
+        assert stamp is not None
+        assert stamp.release == koboldcpp_bin.KOBOLDCPP_VERSION
+        assert stamp.variant is None
+
+    def test_the_wanted_variant_already_published_does_not_download(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Provisioning stays idempotent once the variant is recorded."""
+        stable = self._publish(
+            tmp_path,
+            f"{koboldcpp_bin.KOBOLDCPP_VERSION} {koboldcpp_bin.KoboldcppVariant.NOCUDA}\n",
+        )
+        self._refuse_download(monkeypatch)
+
+        assert koboldcpp_bin.ensure_koboldcpp(tmp_path, variant=koboldcpp_bin.KoboldcppVariant.NOCUDA) == stable
+
+    def test_a_no_cuda_build_is_replaced_when_cuda_is_asked_for(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """The no-CUDA build carries no CUDA backend, so the release tag matching is not enough."""
+        self._publish(tmp_path, f"{koboldcpp_bin.KOBOLDCPP_VERSION} {koboldcpp_bin.KoboldcppVariant.NOCUDA}\n")
+        payload = b"the-cuda-build"
+        cuda = _test_asset(payload, variant=koboldcpp_bin.KoboldcppVariant.CUDA)
+        monkeypatch.setattr(koboldcpp_bin, "koboldcpp_asset", lambda **kwargs: cuda)
+        monkeypatch.setattr(koboldcpp_bin, "_stream_download_to", _fake_stream(payload))
+        monkeypatch.setattr(
+            koboldcpp_bin, "_reported_version", lambda executable: koboldcpp_bin.pinned_version_number()
+        )
+
+        published = koboldcpp_bin.ensure_koboldcpp(tmp_path, variant=koboldcpp_bin.KoboldcppVariant.CUDA)
+
+        assert published.read_bytes() == payload
+
+    def test_a_cuda_build_serves_a_no_cuda_ask_without_downloading(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """The CUDA build also carries Vulkan and the CPU backend, so moving off CUDA costs no transfer."""
+        stable = self._publish(
+            tmp_path,
+            f"{koboldcpp_bin.KOBOLDCPP_VERSION} {koboldcpp_bin.KoboldcppVariant.CUDA}\n",
+        )
+        self._refuse_download(monkeypatch)
+
+        assert koboldcpp_bin.ensure_koboldcpp(tmp_path, variant=koboldcpp_bin.KoboldcppVariant.NOCUDA) == stable
+
+    def test_an_old_stamp_is_trusted_for_what_detection_would_have_picked(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """An install published before the variant was recorded got detection's build; re-fetching it is 600 MB."""
+        stable = self._publish(tmp_path, f"{koboldcpp_bin.KOBOLDCPP_VERSION}\n")
+        monkeypatch.setattr(detect, "_nvidia_present", lambda: True)
+        self._refuse_download(monkeypatch)
+
+        assert koboldcpp_bin.ensure_koboldcpp(tmp_path, variant=koboldcpp_bin.KoboldcppVariant.CUDA) == stable
+
+    def test_an_old_stamp_is_replaced_when_it_cannot_serve_the_ask(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """An old stamp on a host without NVIDIA reads as the no-CUDA build, which cannot run CUDA."""
+        self._publish(tmp_path, f"{koboldcpp_bin.KOBOLDCPP_VERSION}\n")
+        monkeypatch.setattr(detect, "_nvidia_present", lambda: False)
+        payload = b"the-cuda-build"
+        cuda = _test_asset(payload, variant=koboldcpp_bin.KoboldcppVariant.CUDA)
+        monkeypatch.setattr(koboldcpp_bin, "koboldcpp_asset", lambda **kwargs: cuda)
+        monkeypatch.setattr(koboldcpp_bin, "_stream_download_to", _fake_stream(payload))
+        monkeypatch.setattr(
+            koboldcpp_bin, "_reported_version", lambda executable: koboldcpp_bin.pinned_version_number()
+        )
+
+        published = koboldcpp_bin.ensure_koboldcpp(tmp_path, variant=koboldcpp_bin.KoboldcppVariant.CUDA)
+
+        assert published.read_bytes() == payload
 
 
 @pytest.mark.slow

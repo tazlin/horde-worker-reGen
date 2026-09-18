@@ -7,8 +7,8 @@ otherwise surfaces only as a late, cryptic "Wrong credentials to submit as this 
 
 This module verifies the configuration *before* any processes spawn:
 
-1. A local check (no network): names must not be the reserved defaults, and the alchemist name must
-   differ from the dreamer name when alchemy is enabled.
+1. A local check (no network): the name of every enabled role must be set, must not be its reserved
+   default, and must differ from the other enabled roles' names. A role that is off is not checked.
 2. A network check: each enabled name must be either unregistered (a brand-new worker, the normal
    first-run case) or not *provably* owned by another account. The name is resolved through the
    single-worker-by-name endpoint, *not* the all-workers list: the list only returns workers that are
@@ -41,6 +41,7 @@ reject, but neither does an unverifiable name become a strange boot-blocking err
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import time
 
@@ -98,47 +99,71 @@ def verify_worker_identity(bridge_data: reGenBridgeData) -> None:
     _verify_worker_names_owned(bridge_data)
 
 
+@dataclasses.dataclass(frozen=True)
+class _RoleName:
+    """Represents one enabled role's worker name and the config key an operator sets it with."""
+
+    role: str
+    config_key: str
+    name: str
+    reserved_default: str
+
+
+def _enabled_role_names(bridge_data: reGenBridgeData) -> list[_RoleName]:
+    """Return the name of every role that is on, since only those register a worker on the horde.
+
+    A role that is off never pops, so its name is never sent and a placeholder there harms nothing. The
+    scribe flag is compared against True because a mocked config reads every unset attribute as truthy.
+    """
+    fields = type(bridge_data).model_fields
+    candidates = (
+        (bool(bridge_data.dreamer), "image generation", "dreamer_name", "dreamer_worker_name"),
+        (bool(bridge_data.alchemist), "alchemy", "alchemist_name", "alchemist_name"),
+        (bridge_data.scribe is True, "text generation", "scribe_name", "scribe_name"),
+    )
+    return [
+        _RoleName(
+            role=role,
+            config_key=config_key,
+            name=getattr(bridge_data, attribute),
+            reserved_default=fields[attribute].default,
+        )
+        for enabled, role, config_key, attribute in candidates
+        if enabled
+    ]
+
+
 def _validate_worker_names_local(bridge_data: reGenBridgeData) -> None:
     """Reject reserved-default or colliding worker names without touching the network."""
-    fields = type(bridge_data).model_fields
-    dreamer_default = fields["dreamer_worker_name"].default
-    alchemist_default = fields["alchemist_name"].default
-
-    if not bridge_data.dreamer_worker_name.strip():
-        raise WorkerNameConfigError(
-            "Your worker name (`dreamer_name`) is empty. Set a unique name in bridgeData.yaml; it is your "
-            "worker's horde-wide identity.",
-        )
-
-    if bridge_data.dreamer_worker_name == dreamer_default:
-        raise WorkerNameConfigError(
-            f"Your worker name is still the default ({dreamer_default!r}). Set a unique `dreamer_name` "
-            "in bridgeData.yaml; the default is reserved and the horde will reject it.",
-        )
-
-    if bridge_data.alchemist:
-        if not bridge_data.alchemist_name.strip():
+    enabled = _enabled_role_names(bridge_data)
+    for entry in enabled:
+        if not entry.name.strip():
             raise WorkerNameConfigError(
-                "Alchemy is enabled but `alchemist_name` is empty. Set a unique `alchemist_name` in "
-                "bridgeData.yaml; each worker type registers as a separate, uniquely-named worker.",
+                f"{entry.role.capitalize()} is enabled but `{entry.config_key}` is empty. Set a unique "
+                f"`{entry.config_key}` in bridgeData.yaml; each worker type registers as a separate, "
+                "uniquely-named worker.",
             )
-        if bridge_data.alchemist_name == alchemist_default:
+        if entry.name == entry.reserved_default:
             raise WorkerNameConfigError(
-                f"Alchemy is enabled but `alchemist_name` is still the default ({alchemist_default!r}). "
-                "Set a unique `alchemist_name` in bridgeData.yaml; the default is reserved.",
+                f"{entry.role.capitalize()} is enabled but `{entry.config_key}` is still the default "
+                f"({entry.reserved_default!r}). Set a unique `{entry.config_key}` in bridgeData.yaml; the "
+                "default is reserved and the horde will reject it.",
             )
-        if bridge_data.alchemist_name == bridge_data.dreamer_worker_name:
+
+    seen: dict[str, _RoleName] = {}
+    for entry in enabled:
+        other = seen.get(entry.name.strip().lower())
+        if other is not None:
             raise WorkerNameConfigError(
-                "`alchemist_name` must differ from `dreamer_name`: each worker type registers as a "
-                "separate, uniquely-named worker on the horde.",
+                f"`{entry.config_key}` must differ from `{other.config_key}`: each worker type registers as "
+                "a separate, uniquely-named worker on the horde.",
             )
+        seen[entry.name.strip().lower()] = entry
 
 
 def _verify_worker_names_owned(bridge_data: reGenBridgeData) -> None:
     """Verify each enabled worker name is unregistered or owned by this API key (network, hard-fail)."""
-    names = [bridge_data.dreamer_worker_name]
-    if bridge_data.alchemist:
-        names.append(bridge_data.alchemist_name)
+    names = [entry.name for entry in _enabled_role_names(bridge_data)]
 
     last_error: Exception | None = None
     for attempt in range(_OWNERSHIP_CHECK_ATTEMPTS):

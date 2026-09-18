@@ -15,6 +15,10 @@ module also offers :func:`reconcile_with_probe` to flag the case where declared 
 hardware disagree (a GPU install whose driver is broken, or a CPU install on a box that does have a
 GPU).
 
+The same token also decides which compute path a managed text backend is launched on
+(:func:`resolve_text_backend_accelerator`), so the binary the worker downloads for it and the flag it is
+started with follow the build torch itself got rather than a second, independent probe.
+
 The install root is located the same way the rest of the worker locates its writable files: relative to
 the current working directory, which the launch shims set to the install folder (matching
 ``app_state.py``'s use of ``Path.cwd()``). The ``HORDE_WORKER_BACKEND`` environment variable, which the
@@ -32,6 +36,13 @@ from loguru import logger
 _BACKEND_ENV = "HORDE_WORKER_BACKEND"
 _CPU_TOKEN = "cpu"
 
+# Backend tokens are classified by prefix rather than against ``worker_bootstrap.detect``'s constants: the
+# bootstrap package is not part of the worker's wheel, so the runtime cannot import it, and a prefix rule
+# also places a token the list does not carry yet (a later CUDA line, a further ``rocm-gfx*`` member)
+# instead of letting it fall through as unknown.
+_CUDA_TOKEN_PREFIX = "cu"
+_AMD_TOKEN_PREFIXES = ("rocm", "amd")
+
 # Accelerator kinds (as reported by the accelerator probe / hordelib) that count as a real GPU/NPU for
 # the intent-vs-reality reconciliation. Anything not here (notably ``cpu``) is "no accelerator".
 _ACCELERATED_KINDS = frozenset({"cuda", "rocm", "xpu", "npu", "mlu", "mps", "directml"})
@@ -44,6 +55,16 @@ class ComputeMode(enum.StrEnum):
     """CPU-only build: image generation is disabled; the worker runs in alchemist-only mode."""
     ACCELERATED = "accelerated"
     """A GPU/accelerator build (CUDA, ROCm, XPU, ...): full image generation is available."""
+
+
+class TextBackendAccelerator(enum.StrEnum):
+    """Which compute path a managed text backend is launched on."""
+
+    AUTO = "auto"
+    """Follow the install's declared backend token."""
+    CUDA = "cuda"
+    VULKAN = "vulkan"
+    CPU = "cpu"
 
 
 def _candidate_backend_files() -> list[Path]:
@@ -113,6 +134,48 @@ def is_cpu_only_install(*, backend_file: Path | None = None) -> bool:
     return intended_compute_mode(backend_file=backend_file) is ComputeMode.CPU
 
 
+def _accelerator_for_token(token: str) -> TextBackendAccelerator | None:
+    """Return the text backend accelerator a declared token implies, or None when the token is unrecognised.
+
+    An AMD build maps to Vulkan rather than to anything AMD-specific because koboldcpp publishes no ROCm
+    release; its no-CUDA build carries Vulkan, which is what an AMD card runs there.
+    """
+    if token.startswith(_CUDA_TOKEN_PREFIX) and token[len(_CUDA_TOKEN_PREFIX) :].isdigit():
+        return TextBackendAccelerator.CUDA
+    if token.startswith(_AMD_TOKEN_PREFIXES):
+        return TextBackendAccelerator.VULKAN
+    if token == _CPU_TOKEN:
+        return TextBackendAccelerator.CPU
+    return None
+
+
+def resolve_text_backend_accelerator(
+    configured: TextBackendAccelerator,
+    *,
+    backend_file: Path | None = None,
+) -> TextBackendAccelerator | None:
+    """Return the concrete accelerator a managed text backend runs on, or None when nothing declares one.
+
+    A ``configured`` value other than ``auto`` wins outright, so a host whose text backend wants a different
+    path from torch's can say so. ``auto`` follows the install's declared backend token, which keeps the
+    downloaded binary and the launch flag on the hardware torch was built for. None means the install
+    declares nothing, which the caller answers from the hardware; an unrecognised token is reported and
+    treated the same way, since guessing a path from it would pick the binary too.
+    """
+    if configured is not TextBackendAccelerator.AUTO:
+        return configured
+    token = read_backend_token(backend_file=backend_file)
+    if token is None:
+        return None
+    accelerator = _accelerator_for_token(token)
+    if accelerator is None:
+        logger.warning(
+            f"This install declares backend {token!r}, which names no text backend compute path; the text "
+            "backend will follow the detected hardware instead. Set `text_backend_accelerator` to choose.",
+        )
+    return accelerator
+
+
 def reconcile_with_probe(probed_kinds: list[str], *, backend_file: Path | None = None) -> str | None:
     """Return a human-readable warning when declared intent disagrees with the probed hardware, else None.
 
@@ -164,10 +227,12 @@ def compute_mode_display_label(*, backend_file: Path | None = None) -> str | Non
 
 __all__ = [
     "ComputeMode",
+    "TextBackendAccelerator",
     "compute_mode_display_label",
     "intended_compute_mode",
     "is_cpu_only_install",
     "log_compute_mode_reconciliation",
     "read_backend_token",
     "reconcile_with_probe",
+    "resolve_text_backend_accelerator",
 ]

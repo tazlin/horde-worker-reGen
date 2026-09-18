@@ -19,6 +19,7 @@ from loguru import logger
 
 from horde_worker_regen.text_backends.protocol import (
     TextBackendCapabilities,
+    TextBackendCredentialRefused,
     TextBackendDescription,
     TextBackendError,
     TextBackendUnavailable,
@@ -115,6 +116,7 @@ class FakeTextBackend:
         generation_stats: bool = False,
         stats_prompt_tokens: int = 0,
         stats_tokens_per_chunk: int = 1,
+        credential_refused: bool = False,
     ) -> None:
         """Create a fake backend that answers as configured.
 
@@ -148,6 +150,11 @@ class FakeTextBackend:
             stats_prompt_tokens: Prompt tokens the statistics report, when `generation_stats` is on.
             stats_tokens_per_chunk: How many tokens each chunk counts for in the statistics, since a
                 chunk is an arbitrary number of tokens on a real backend and never one by definition.
+            credential_refused: Whether every verb refuses the caller's credential, as a
+                password-protected backend does for a worker whose password is wrong. Settable
+                afterwards through
+                [`credential_refused`][horde_worker_regen.text_backends.fake_text_backend.FakeTextBackend.credential_refused],
+                which is how a caller rehearses an operator correcting the password.
         """
         self._description = description
         self._response_text = response_text
@@ -161,8 +168,29 @@ class FakeTextBackend:
         self._generation_stats = generation_stats
         self._stats_prompt_tokens = stats_prompt_tokens
         self._stats_tokens_per_chunk = stats_tokens_per_chunk
+        self._credential_refused = credential_refused
         self._calls = _FakeCallLog()
         self._closed = False
+
+    @property
+    def credential_refused(self) -> bool:
+        """Whether every verb refuses the caller's credential."""
+        return self._credential_refused
+
+    @credential_refused.setter
+    def credential_refused(self, refused: bool) -> None:
+        """Set whether the credential is refused, so a corrected password can be rehearsed mid-test."""
+        self._credential_refused = refused
+
+    def _raise_if_credential_refused(self, verb: str) -> None:
+        """Raise the refusal a password-protected backend answers a wrong credential with.
+
+        Raises:
+            TextBackendCredentialRefused: This stand-in is scripted to refuse the caller's credential.
+        """
+        if not self._credential_refused:
+            return
+        raise TextBackendCredentialRefused(f"Fake text backend refused the worker's credentials on {verb}")
 
     @property
     def ready_calls(self) -> tuple[FakeReadyCall, ...]:
@@ -206,21 +234,35 @@ class FakeTextBackend:
 
         Returns:
             The next entry in the configured readiness script, or `True` once it runs out.
+
+        Raises:
+            TextBackendCredentialRefused: This stand-in is scripted to refuse the caller's credential.
         """
         ready_index = len(self._calls.ready)
         self._calls.ready.append(FakeReadyCall(deadline_seconds=deadline_seconds))
+        self._raise_if_credential_refused("ready")
         if ready_index >= len(self._ready_results):
             return True
         return self._ready_results[ready_index]
 
     async def describe(self) -> TextBackendDescription:
-        """Return the configured description, recording the call."""
+        """Return the configured description, recording the call.
+
+        Raises:
+            TextBackendCredentialRefused: This stand-in is scripted to refuse the caller's credential.
+        """
         self._calls.describe_count += 1
+        self._raise_if_credential_refused("describe")
         return self._description
 
     async def capabilities(self) -> TextBackendCapabilities:
-        """Return the configured capabilities, recording the call."""
+        """Return the configured capabilities, recording the call.
+
+        Raises:
+            TextBackendCredentialRefused: This stand-in is scripted to refuse the caller's credential.
+        """
         self._calls.capabilities_count += 1
+        self._raise_if_credential_refused("capabilities")
         return TextBackendCapabilities(generation_stats=self._generation_stats)
 
     async def generate(
@@ -250,6 +292,7 @@ class FakeTextBackend:
             reports statistics, the token counts its final sample held.
 
         Raises:
+            TextBackendCredentialRefused: This stand-in is scripted to refuse the caller's credential.
             TextBackendError: The next entry in the configured failure script, whatever it is.
             TextBackendUnavailable: The configured latency exceeds `deadline_seconds`.
         """
@@ -261,6 +304,7 @@ class FakeTextBackend:
                 deadline_seconds=deadline_seconds,
             ),
         )
+        self._raise_if_credential_refused("generate")
 
         scripted_failure = self._scripted_failure(generation_index)
         if scripted_failure is not None:

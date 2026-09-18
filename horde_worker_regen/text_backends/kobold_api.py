@@ -45,6 +45,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from horde_worker_regen.text_backends.protocol import (
     TextBackendBusy,
     TextBackendCapabilities,
+    TextBackendCredentialRefused,
     TextBackendDescription,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
@@ -149,6 +150,15 @@ _AUTHORIZATION_BEARER_PREFIX: Final = "Bearer "
 
 _REJECTED_PAYLOAD_STATUSES: Final = frozenset({HTTPStatus.BAD_REQUEST, HTTPStatus.UNPROCESSABLE_ENTITY})
 """The statuses that mean the request itself is wrong, so re-offering the same job cannot help."""
+
+_REFUSED_CREDENTIAL_STATUSES: Final = frozenset({HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN})
+"""The statuses that mean the credential is wrong rather than the request or the backend.
+
+koboldcpp guards its text routes with the password it was launched with and answers 401 to a request
+carrying the wrong one or none; 403 is here because a backend behind a proxy answers that way for the
+same thing. The model route is the exception: it answers 200 naming `koboldcpp/protected-model`, so a
+refused credential can first show at the generation rather than at the readiness probe.
+"""
 
 _BODY_SUMMARY_CHARACTER_LIMIT: Final = 300
 """How much of an unreadable body is quoted in an exception message: enough to recognise what answered."""
@@ -436,18 +446,18 @@ class KoboldApiTextBackend:
         running.
     """
 
-    def __init__(self, base_url: str, session: aiohttp.ClientSession, *, api_key: str | None = None) -> None:
+    def __init__(self, base_url: str, session: aiohttp.ClientSession, *, password: str | None = None) -> None:
         """Create a driver for the backend serving at `base_url`.
 
         Args:
             base_url: Where the backend listens, with or without a trailing slash and optionally with a
                 path prefix (both backends match their routes by suffix).
             session: The caller's shared session. Not closed by this driver.
-            api_key: The password a backend was launched with, if any, sent as a bearer token.
+            password: The password the backend was launched with, if any, sent as a bearer token.
         """
         self._base_url = base_url.rstrip("/")
         self._session = session
-        self._api_key = api_key
+        self._password = password
         self._closed = False
         self._abort_route_missing_logged = False
         self._stream_route_missing = False
@@ -473,10 +483,10 @@ class KoboldApiTextBackend:
         return f"{self._base_url}{route}"
 
     def _headers(self) -> dict[str, str]:
-        """Return the request headers, carrying the bearer token only when a key was configured."""
-        if self._api_key is None:
+        """Return the request headers, carrying the bearer token only when a password was configured."""
+        if self._password is None:
             return {}
-        return {hdrs.AUTHORIZATION: f"{_AUTHORIZATION_BEARER_PREFIX}{self._api_key}"}
+        return {hdrs.AUTHORIZATION: f"{_AUTHORIZATION_BEARER_PREFIX}{self._password}"}
 
     async def _request(
         self,
@@ -515,6 +525,7 @@ class KoboldApiTextBackend:
 
         Raises:
             _RouteNotImplemented: The backend answered 404, so it has no such route.
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendUnavailable: The backend did not answer, answered another non-200 status, or
                 answered a body that is not the expected shape.
         """
@@ -524,6 +535,8 @@ class KoboldApiTextBackend:
             raise TextBackendUnavailable(
                 f"Text backend at {self._base_url} did not answer {route}: {request_error}",
             ) from request_error
+
+        self._raise_for_refused_credential(raw, detail=f"reading {route}")
 
         if raw.status == HTTPStatus.NOT_FOUND:
             raise _RouteNotImplemented(
@@ -544,6 +557,23 @@ class KoboldApiTextBackend:
                 f"{_summarise_body(raw.body_text)}",
             ) from parse_error
 
+    def _raise_for_refused_credential(self, raw: _RawResponse, *, detail: str) -> None:
+        """Raise when an answer says the worker's credentials were refused, returning otherwise.
+
+        Every route goes through this before its own status handling, so a refused credential is never
+        mistaken for a route the backend lacks or for a backend that is down: those are polled through,
+        and this one never resolves on its own.
+
+        Raises:
+            TextBackendCredentialRefused: The status was 401 or 403.
+        """
+        if raw.status not in _REFUSED_CREDENTIAL_STATUSES:
+            return
+        raise TextBackendCredentialRefused(
+            f"Text backend at {self._base_url} refused the worker's credentials {detail} "
+            f"(status {raw.status}): {_summarise_body(raw.body_text)}",
+        )
+
     async def ready(self, *, deadline_seconds: float) -> bool:
         """Return whether the model route answers within the deadline.
 
@@ -556,6 +586,10 @@ class KoboldApiTextBackend:
 
         Returns:
             `True` when the backend named a loaded model, `False` otherwise.
+
+        Raises:
+            TextBackendCredentialRefused: The backend refused the worker's credentials, which polling
+                cannot fix.
         """
         try:
             await self._read_json(
@@ -627,6 +661,9 @@ class KoboldApiTextBackend:
 
         Returns:
             Whether per-request generation statistics can be read from this backend.
+
+        Raises:
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
         """
         return TextBackendCapabilities(generation_stats=await self._generation_stats_available())
 
@@ -641,7 +678,11 @@ class KoboldApiTextBackend:
 
         Anything but a 200 is taken as the route being absent, which is what a stock build answers, and
         is not retried: the route is part of the program, so a build that does not have it now will not
-        grow one while it runs.
+        grow one while it runs. A refused credential is the exception, because the answer then describes
+        the worker's password rather than the build.
+
+        Raises:
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
         """
         try:
             raw = await self._request(
@@ -656,6 +697,8 @@ class KoboldApiTextBackend:
                 f"will be unknown for this backend: {probe_error}",
             )
             return False
+
+        self._raise_for_refused_credential(raw, detail="probing the statistics route")
 
         if raw.status != HTTPStatus.OK:
             logger.debug(
@@ -701,6 +744,7 @@ class KoboldApiTextBackend:
 
         Raises:
             TextBackendBusy: The backend answered 503, its generation slots being taken.
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendRejectedPayload: The backend refused the payload itself.
             TextBackendUnavailable: The backend was unreachable, outlived the deadline, failed with a
                 server error, answered without a usable generation, or stopped part way through one.
@@ -762,6 +806,7 @@ class KoboldApiTextBackend:
 
         Raises:
             TextBackendBusy: The backend answered 503.
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendRejectedPayload: The backend refused the payload.
             TextBackendUnavailable: Anything else, including a 200 with no usable generation.
         """
@@ -812,6 +857,7 @@ class KoboldApiTextBackend:
             _RouteNotImplemented: This backend has no stream route.
             _StreamUnusable: The stream would not start, or started and ended without one record.
             TextBackendBusy: The backend answered 503.
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
             TextBackendRejectedPayload: The backend refused the payload.
             TextBackendUnavailable: The generation outlived its deadline, or the stream broke after
                 text had already arrived, which leaves an incomplete answer that must not be submitted.
@@ -881,9 +927,12 @@ class KoboldApiTextBackend:
         Raises:
             _RouteNotImplemented: The status was 404.
             TextBackendBusy: The status was 503.
+            TextBackendCredentialRefused: The status was 401 or 403.
             TextBackendRejectedPayload: The status says the payload itself is wrong.
             _StreamUnusable: Any other non-200 status.
         """
+        self._raise_for_refused_credential(raw, detail=f"starting generation {generation_key}")
+
         failure_detail = (
             f"backend at {self._base_url}, generation {generation_key}, status {raw.status}: "
             f"{_summarise_body(raw.body_text)}"
@@ -1023,12 +1072,16 @@ class KoboldApiTextBackend:
 
         Raises:
             TextBackendBusy: The status was 503.
+            TextBackendCredentialRefused: The status was one of
+                [`_REFUSED_CREDENTIAL_STATUSES`][horde_worker_regen.text_backends.kobold_api].
             TextBackendRejectedPayload: The status was one of
                 [`_REJECTED_PAYLOAD_STATUSES`][horde_worker_regen.text_backends.kobold_api].
             TextBackendUnavailable: Any other non-200 status.
         """
         if raw.status == HTTPStatus.OK:
             return
+
+        self._raise_for_refused_credential(raw, detail=f"running generation {generation_key}")
 
         failure_detail = (
             f"backend at {self._base_url}, generation {generation_key}, status {raw.status}: "
@@ -1048,9 +1101,10 @@ class KoboldApiTextBackend:
     async def stop(self, *, generation_key: str) -> None:
         """Ask the backend to abandon the generation with this key, best effort.
 
-        The outcome is logged and never raised. This runs on shutdown and on a generation that outlived
-        its deadline, where the backend may have no abort route or may already be gone, and in neither
-        case is there anything left for the caller to do about it.
+        The outcome is logged and never raised, a refused credential included. This runs on shutdown and
+        on a generation the flow has already decided the fate of, where the backend may have no abort
+        route, may refuse the worker's password, or may already be gone; in none of those cases is there
+        anything left for the caller to do about it, and raising would displace the failure being handled.
 
         Args:
             generation_key: The key the abandoned generation was issued with.

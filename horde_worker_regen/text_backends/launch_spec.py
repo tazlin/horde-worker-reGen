@@ -1,8 +1,9 @@
 """What the worker needs to know to start a text backend process, independent of which backend it is.
 
 A launch has two halves. The operator-facing half is the same for every backend: which executable, which
-model, which loopback port, which card, how much of the model to offload, how much context to allocate,
-where the program's own output goes. That is :class:`TextBackendLaunchSettings`. The backend-specific half
+model, which loopback port, which card and compute path, how much of the model to offload, how much context
+to allocate, how many generations to run at once, where the program's own output goes. That is
+:class:`TextBackendLaunchSettings`. The backend-specific half
 is how those settings become a command line, and that lives in one module per backend (see
 [`launch`][horde_worker_regen.text_backends.launch]); its output is :class:`TextBackendLaunchSpec`, which is
 all the process supervisor ever sees.
@@ -13,7 +14,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from horde_worker_regen.compute_mode import TextBackendAccelerator
 
 LOOPBACK_HOST = "127.0.0.1"
 """Every text backend listens on loopback only; the worker is its sole client."""
@@ -35,7 +38,7 @@ class TextBackendLaunchSettings(BaseModel):
     port: int
     """Loopback port the backend listens on."""
     device_index: int | None
-    """Stable device index of the card the backend uses; None runs it without an accelerator flag."""
+    """Stable device index of the card the backend uses; None runs it without a device flag."""
     gpu_layers: int
     """How much of the model to place on the card, in the backend's own unit (layers for llama.cpp-based
     backends); a large value means all of it."""
@@ -43,6 +46,22 @@ class TextBackendLaunchSettings(BaseModel):
     """The context size the backend allocates for."""
     log_path: Path
     """Where the backend's stdout and stderr are appended."""
+    accelerator: TextBackendAccelerator = TextBackendAccelerator.CUDA
+    """Which compute path to launch on. The default renders what the worker rendered before the path could
+    be chosen, so a caller that sets nothing is unchanged; a launch resolves it from the install instead."""
+    parallel_requests: int = 1
+    """How many generations the backend may run at once; one leaves the backend's own default in place."""
+
+    @field_validator("accelerator")
+    @classmethod
+    def _accelerator_is_concrete(cls, value: TextBackendAccelerator) -> TextBackendAccelerator:
+        """Validate that the compute path was resolved, since no backend has a command line for ``auto``."""
+        if value is TextBackendAccelerator.AUTO:
+            raise ValueError(
+                "`accelerator` must name a concrete compute path by launch time; resolve it with "
+                "`text_backends.provision.effective_text_backend_accelerator` first.",
+            )
+        return value
 
 
 class TextBackendLaunchSpec(BaseModel):
