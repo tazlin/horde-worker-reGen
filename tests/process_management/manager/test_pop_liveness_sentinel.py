@@ -436,6 +436,46 @@ async def test_a_worker_not_serving_images_is_not_reported_as_silent(monkeypatch
     assert errors == []
 
 
+async def test_a_cpu_only_install_holds_the_not_served_gate_with_the_dreamer_role_left_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The install can take image generation away as well as the operator, and both are the same hold.
+
+    A CPU-only install leaves `dreamer` true and empties the model list by coercion, so a gate keyed on the
+    flag alone would land on the no-models gate, which recovery reads as an intake that has stopped.
+    """
+    manager = _pooled_manager()
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("horde_worker_regen.process_management.jobs.job_popper.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr("horde_worker_regen.compute_mode.is_cpu_only_install", lambda **_kwargs: True)
+    manager.bridge_data.dreamer = True
+    await manager._job_popper.api_job_pop(urgent=True)
+
+    assert manager._state.last_pop_gate == PopGate.IMAGE_GENERATION_NOT_SERVED
+
+
+def test_recovery_does_not_read_the_not_served_gate_as_a_wedge() -> None:
+    """Holding the not-served gate for any length of time is not a wedge, while another gate held as long is.
+
+    Every signal the pop-gate wedge judges belongs to the image intake, which a worker not serving images
+    never moves.
+    """
+    manager = _pooled_manager()
+    coordinator = manager._recovery_coordinator
+    long_ago = coordinator._clock() - (coordinator.POP_GATE_HELD_WEDGE_SECONDS * 4)
+    manager._state.last_pop_gate_since = long_ago
+    manager._state.last_pop_attempt_completed_at = long_ago
+
+    manager._state.last_pop_gate = str(PopGate.IMAGE_GENERATION_NOT_SERVED)
+    assert coordinator.pop_gate_wedge_active() is False
+
+    manager._state.last_pop_gate = str(PopGate.NO_MODELS_CONFIGURED)
+    assert coordinator.pop_gate_wedge_active() is True
+
+
 async def _full_queue_manager(head_model: str = "head_model") -> tuple[HordeWorkerProcessManager, float]:
     """Build a manager whose local queue is genuinely full and whose pops are held at that gate.
 

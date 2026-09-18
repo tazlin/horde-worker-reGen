@@ -13,6 +13,7 @@ from loguru import logger
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import (
+    PopGate,
     PopPauseOwner,
     RecoveryParkReason,
     WorkerState,
@@ -788,7 +789,10 @@ class WorkerRecoveryCoordinator:
         it can delay this once but never hold it off.
         """
         gate = self._state.last_pop_gate
-        if gate is None:
+        # A worker that serves no image generation holds this gate for its whole life by design. Every
+        # signal judged below belongs to the image intake (its pop attempts, its completed jobs), so none
+        # of them can move there, and the other flows account for their own liveness.
+        if gate is None or gate == str(PopGate.IMAGE_GENERATION_NOT_SERVED):
             self.pop_gate_hold_baseline = None
             self.pop_gate_wedge_disclosed_since = None
             self.pop_gate_provisioning_disclosed_since = None

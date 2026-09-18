@@ -23,6 +23,7 @@ from horde_sdk.worker.dispatch.ai_horde.image.convert import apply_image_worker_
 from loguru import logger
 
 from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_configs
+from horde_worker_regen.capabilities import enabled_workloads
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import PopGate, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import safety_permitted_card_indices
@@ -1937,10 +1938,11 @@ class JobPopper:
 
         cur_time = time.time()
         bridge_data = self._runtime_config.bridge_data
-        if bridge_data.dreamer is False:
-            # The operator deselected image generation (an alchemist-only or scribe-only worker). The role
-            # coercion has already emptied the image model list, so without this gate every cycle would
-            # report a configuration error for a configuration that is exactly what was asked for.
+        if WorkloadKind.IMAGE_GENERATION not in enabled_workloads(bridge_data):
+            # Image generation is not served, whether the operator deselected it or the install is CPU-only.
+            # The role coercion has already emptied the image model list, so without this gate every cycle
+            # would report a configuration error for a configuration that is exactly what was asked for,
+            # and the gate it would land on instead reads to recovery as an intake that has stopped.
             self._state.last_pop_no_jobs_available = False
             self._note_pop_gate(PopGate.IMAGE_GENERATION_NOT_SERVED)
             await asyncio.sleep(3)
