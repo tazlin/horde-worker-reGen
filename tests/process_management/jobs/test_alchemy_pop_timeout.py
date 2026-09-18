@@ -52,6 +52,17 @@ async def test_alchemy_pop_times_out_and_enters_error_backoff(monkeypatch: pytes
     assert coordinator.last_pop_time <= time.time()
 
 
+def test_the_spare_image_lane_rule_applies_only_where_image_generation_is_served() -> None:
+    """An alchemy-only worker starts no inference lane, so requiring a spare one would stop every graph form."""
+    alchemy_only = make_testable_process_manager(alchemist=True, dreamer=False)
+    with_images = make_testable_process_manager(alchemist=True, dreamer=True)
+
+    assert alchemy_only._alchemy_coordinator._has_spare_image_lane() is True
+    # No inference process is registered in the test manager either, so with image generation served the
+    # rule still finds no idle lane to spare.
+    assert with_images._alchemy_coordinator._has_spare_image_lane() is False
+
+
 async def test_a_dry_run_with_no_canned_source_sends_no_pop(monkeypatch: pytest.MonkeyPatch) -> None:
     """A dry run promises no API traffic, so an alchemist with nothing canned to serve pops nothing."""
     manager = make_testable_process_manager(alchemist=True)

@@ -56,7 +56,12 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 from loguru import logger
 
 from horde_worker_regen.alchemy_forms import configured_alchemy_forms
-from horde_worker_regen.capabilities import describe_available, strip_background_available, vectorize_available
+from horde_worker_regen.capabilities import (
+    describe_available,
+    enabled_workloads,
+    strip_background_available,
+    vectorize_available,
+)
 from horde_worker_regen.consts import (
     AESTHETIC_FORM_NAME,
     DESCRIBE_FORM_NAME,
@@ -800,7 +805,13 @@ class AlchemyCoordinator:
             logger.info("Alchemy: every configured post-processor's model is on disk; all are offered.")
 
     def _has_spare_image_lane(self) -> bool:
-        """Return True if an idle inference lane exists beyond what queued image jobs need."""
+        """Return True if an idle inference lane exists beyond what queued image jobs need.
+
+        The rule keeps graph alchemy from crowding image work, so it holds nothing back on a worker that
+        serves no image generation, which starts no inference lane for there to be a spare one of.
+        """
+        if WorkloadKind.IMAGE_GENERATION not in enabled_workloads(self.bridge_data):
+            return True
         idle_image_lanes = sum(
             1 for p in self._process_map.get_capable_processes(WorkerCapability.IMAGE_GEN) if p.can_accept_job()
         )
