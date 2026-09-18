@@ -174,9 +174,22 @@ owner will.
 
 A paused post-processing lane cannot run an upscale or a face-fix, so while it is down the worker stops
 advertising the capability: the image popper withholds `allow_post_processing`, and the alchemy popper drops the
-upscaler and face-fixer forms from its offer (`strip_background` runs on the image-utilities lane and keeps its
-own gate). Otherwise the horde keeps sending work nothing can serve, and those jobs strand until the orphan
-watchdog requeues them a bounded number of times and then faults them without images.
+upscaler and face-fixer forms from its offer. Otherwise the horde keeps sending work nothing can serve, and
+those jobs strand until the orphan watchdog requeues them a bounded number of times and then faults them
+without images.
+
+Alchemy applies that rule to all three of its families at once, keyed on the capability
+`capability_for_alchemy_form` routes each form to: upscalers and face-fixers need the post-processing lane,
+`strip_background` and `annotation` need the image-utilities lane, and the CLIP-stack forms (caption,
+interrogation, nsfw, aesthetic and the rest) need the safety process. No form has a second home, so each family
+leaves the offer while its own lane is down and returns when it is back. The offer and the dispatch read the
+same routing table, so the worker cannot advertise a form it would then have nowhere to send.
+
+A lane can also go away *after* a form is popped, and the form then sits in the alchemy coordinator's pending
+queue holding one of the `queue_size` slots the pop gate counts. Each pending form therefore carries a
+monotonic dispatch deadline (`PENDING_FORM_DISPATCH_DEADLINE_SECONDS`, the ceiling the lifecycle prices a
+lane's return at). A form still undispatchable at its deadline is submitted faulted so the horde can reissue it
+to a worker that has the lane; one that becomes dispatchable first is unaffected.
 
 While the lane is up, the alchemy offer is gated a second time, per model: an upscaler or face fixer is
 offered only once the download process reports its weight on disk and validated, so a worker still fetching

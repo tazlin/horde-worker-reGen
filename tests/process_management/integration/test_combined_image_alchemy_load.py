@@ -91,6 +91,9 @@ class _StubProcessMap:
     def num_loaded_post_process_processes(self) -> int:
         return 1  # a capable lane always exists for these admission tests
 
+    def num_loaded_safety_processes(self) -> int:
+        return 1  # a capable lane always exists for these admission tests
+
     def get_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
         return self._free_vram_mb
 
@@ -116,6 +119,7 @@ def _make_coordinator(
     coordinator._job_tracker = job_tracker  # type: ignore[assignment]
     coordinator._reserve_ledger = reserve_ledger
     coordinator._pending_forms = deque()
+    coordinator._pending_form_deadlines = {}
     coordinator._in_flight = {f"form-{i}": None for i in range(in_flight)}  # type: ignore[misc]
     coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}

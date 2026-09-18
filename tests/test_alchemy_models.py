@@ -1,5 +1,7 @@
 """Tests for the alchemy job models, form routing, and wire-format workarounds."""
 
+import time
+import uuid
 from collections import deque
 from io import BytesIO
 from typing import cast
@@ -7,6 +9,9 @@ from typing import cast
 import PIL.Image
 import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.ai_horde_api.apimodels.alchemy.pop import AlchemyPopFormPayload
+from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ALCHEMY_FORMS, KNOWN_ALCHEMY_TYPES
+from loguru import logger
 from pydantic import ValidationError
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -89,6 +94,23 @@ class TestRequiredCapability:
         for form in ("caption", "interrogation", "nsfw", "vectorize", "palette", "describe"):
             assert required_capability(form) == WorkerCapability.ALCHEMY_CLIP, form
 
+    def test_the_umbrella_name_parses_and_routes_to_the_clip_lane(self) -> None:
+        """A popped ``post_process`` would reach dispatch and route to ALCHEMY_CLIP, which cannot serve it.
+
+        The pop payload's ``form`` is typed ``KNOWN_ALCHEMY_TYPES | str`` and the umbrella name is not in that
+        enum, so nothing in parsing rejects it and the coordinator would queue it like any other form. The
+        routing table has no entry for it and falls through to the CLIP lane. Only the offer keeps this off
+        the worker: the expansion never emits the name, so the horde has nothing to hand back.
+        """
+        assert KNOWN_ALCHEMY_FORMS.post_process.value not in [member.value for member in KNOWN_ALCHEMY_TYPES]
+        parsed = AlchemyPopFormPayload(
+            id=str(uuid.uuid4()),
+            form=KNOWN_ALCHEMY_FORMS.post_process.value,
+            source_image="",
+        )
+        assert str(parsed.form) == KNOWN_ALCHEMY_FORMS.post_process.value
+        assert required_capability(str(parsed.form)) == WorkerCapability.ALCHEMY_CLIP
+
 
 class TestExpandOfferedForms:
     """Bridge-data forms expand to the individual form names the API expects."""
@@ -124,6 +146,71 @@ class TestExpandOfferedForms:
         assert "CodeFormers" not in offered
         assert "interrogation" in offered, "CLIP-stack forms do not touch the post-processing lane"
         assert "strip_background" in offered, "strip_background runs on the image-utilities lane"
+
+    def test_clip_forms_withheld_while_no_clip_lane_is_up(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CLIP-stack forms are dropped while the safety process is down; the other families are untouched."""
+        monkeypatch.setattr(alchemy_popper, "strip_background_available", lambda: True)
+        bridge_data = self._bridge_data(alchemy_caption_enabled=True)
+        offered = expand_offered_forms(bridge_data, clip_lane_healthy=False)
+
+        assert "interrogation" not in offered
+        assert "nsfw" not in offered
+        assert "caption" not in offered
+        assert "RealESRGAN_x4plus" in offered, "upscalers run on the post-processing lane"
+        assert "GFPGAN" in offered
+        assert "strip_background" in offered, "background removal runs on the image-utilities lane"
+
+    def test_clip_forms_return_when_the_clip_lane_comes_back(self) -> None:
+        """The withholding is a live reading, not a latch: the forms are offered again once safety is up."""
+        bridge_data = self._bridge_data(alchemy_caption_enabled=True)
+
+        assert "interrogation" not in expand_offered_forms(bridge_data, clip_lane_healthy=False)
+        offered = expand_offered_forms(bridge_data, clip_lane_healthy=True)
+        assert "interrogation" in offered
+        assert "nsfw" in offered
+        assert "caption" in offered
+
+    def test_lane_families_are_withheld_independently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each family follows only its own lane, so one lane going down never costs another's forms."""
+        monkeypatch.setattr(alchemy_popper, "strip_background_available", lambda: True)
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)
+        bridge_data = self._bridge_data()
+        types = frozenset({"canny"})
+
+        graph_only = expand_offered_forms(
+            bridge_data,
+            utilities_lane_healthy=False,
+            clip_lane_healthy=False,
+            annotation_types=types,
+        )
+        assert "RealESRGAN_x4plus" in graph_only
+        assert "strip_background" not in graph_only
+        assert "annotation" not in graph_only
+        assert "nsfw" not in graph_only
+
+        utilities_only = expand_offered_forms(
+            bridge_data,
+            post_process_lane_healthy=False,
+            clip_lane_healthy=False,
+            annotation_types=types,
+        )
+        assert "strip_background" in utilities_only
+        assert "annotation" in utilities_only
+        assert "RealESRGAN_x4plus" not in utilities_only
+        assert "nsfw" not in utilities_only
+
+    def test_the_post_process_umbrella_name_is_never_offered(self) -> None:
+        """The umbrella config name expands away, so the worker never invites the unexpanded form.
+
+        It routes to ALCHEMY_CLIP by falling off the end of the routing table rather than by belonging
+        there, and the safety process cannot run a post-processor, so a popped ``post_process`` would fault.
+        The worker's protection against that is simply never offering the name.
+        """
+        offered = expand_offered_forms(self._bridge_data(forms=["post-process"]))
+
+        assert KNOWN_ALCHEMY_FORMS.post_process.value not in offered
+        assert "post-process" not in offered
+        assert "RealESRGAN_x4plus" in offered
 
     def test_caption_offered_with_opt_in(self) -> None:
         """Caption is offered once alchemy_caption_enabled is set."""
@@ -621,6 +708,7 @@ def _make_coordinator(process_map: _StubProcessMap) -> AlchemyCoordinator:
     coordinator._job_tracker = _StubJobTracker()  # type: ignore[assignment]
     coordinator._reserve_ledger = CommittedReserveLedger()
     coordinator._pending_forms = deque()
+    coordinator._pending_form_deadlines = {}
     coordinator._in_flight = {}
     coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}
@@ -671,6 +759,96 @@ class TestAlchemyDispatch:
 
         assert list(coordinator._pending_forms) == [form]
         assert coordinator._in_flight == {}
+
+    def test_a_queued_form_carries_a_dispatch_deadline(self) -> None:
+        """Queueing a popped form starts its monotonic dispatch deadline."""
+        coordinator = _make_coordinator(_StubProcessMap({}))
+        form = AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi")
+
+        before = time.monotonic()
+        coordinator._queue_pending_form(form)
+
+        deadline = coordinator._pending_form_deadlines["form-1"]
+        assert deadline >= before + alchemy_popper.PENDING_FORM_DISPATCH_DEADLINE_SECONDS
+        assert list(coordinator._pending_forms) == [form]
+
+    def test_an_undispatchable_form_waits_until_its_deadline(self) -> None:
+        """A form no process can take is held, not faulted, while its deadline is still ahead."""
+        coordinator = _make_coordinator(_StubProcessMap({}))
+        coordinator._queue_pending_form(AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi"))
+
+        coordinator.dispatch_pending_forms()
+
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+        assert len(coordinator._pending_submits) == 0
+        assert "form-1" in coordinator._pending_form_deadlines
+
+    def test_an_undispatchable_form_is_faulted_once_at_its_deadline(self) -> None:
+        """A form whose lane never returned is handed back faulted exactly once, and logged once."""
+        coordinator = _make_coordinator(_StubProcessMap({}))
+        form = AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi", r2_upload="https://r2/put")
+        coordinator._queue_pending_form(form)
+        coordinator._form_time_popped["form-1"] = 123.0
+        coordinator._pending_form_deadlines["form-1"] = time.monotonic() - 1.0
+
+        lines: list[str] = []
+        sink_id = logger.add(lambda message: lines.append(message.record["message"]), level="WARNING")
+        try:
+            coordinator.dispatch_pending_forms()
+            coordinator.dispatch_pending_forms()
+        finally:
+            logger.remove(sink_id)
+
+        assert len(coordinator._pending_forms) == 0
+        assert coordinator._pending_form_deadlines == {}
+        assert len(coordinator._pending_submits) == 1
+        submit = coordinator._pending_submits[0]
+        assert submit.result_message.state == GENERATION_STATE.faulted
+        assert submit.form_id == "form-1"
+        assert submit.r2_upload == "https://r2/put"
+        # The fault is reported to the horde from the form's own pop instant, so its recorded e2e is real.
+        assert submit.time_popped == 123.0
+        assert len([line for line in lines if "form-1" in line]) == 1, lines
+
+    def test_a_form_dispatched_before_its_deadline_is_not_faulted(self) -> None:
+        """A lane that comes back in time serves the form; nothing is handed back."""
+        clip_process = _StubProcessInfo(process_id=2)
+        process_map = _StubProcessMap({})
+        coordinator = _make_coordinator(process_map)
+        coordinator._queue_pending_form(AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi"))
+
+        coordinator.dispatch_pending_forms()
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+
+        process_map.available[WorkerCapability.ALCHEMY_CLIP] = clip_process
+        coordinator.dispatch_pending_forms()
+
+        assert set(coordinator._in_flight) == {"form-1"}
+        assert coordinator._pending_form_deadlines == {}
+        assert len(coordinator._pending_submits) == 0
+        assert [m.form.form_id for m in clip_process.sent_messages] == ["form-1"]
+
+    def test_a_servable_form_is_dispatched_rather_than_faulted_at_its_deadline(self) -> None:
+        """The deadline only ever decides a form nothing can take; a free lane is served either way."""
+        clip_process = _StubProcessInfo(process_id=2)
+        coordinator = _make_coordinator(_StubProcessMap({WorkerCapability.ALCHEMY_CLIP: clip_process}))
+        coordinator._queue_pending_form(AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi"))
+        coordinator._pending_form_deadlines["form-1"] = time.monotonic() - 1.0
+
+        coordinator.dispatch_pending_forms()
+
+        assert set(coordinator._in_flight) == {"form-1"}
+        assert len(coordinator._pending_submits) == 0
+
+    def test_a_form_queued_without_a_deadline_never_expires(self) -> None:
+        """Only a deadline this coordinator set can fault a form, so an externally-queued form is safe."""
+        coordinator = _make_coordinator(_StubProcessMap({}))
+        coordinator._pending_forms.append(AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi"))
+
+        coordinator.dispatch_pending_forms()
+
+        assert [spec.form_id for spec in coordinator._pending_forms] == ["form-1"]
+        assert len(coordinator._pending_submits) == 0
 
     def test_result_moves_form_to_pending_submit(self) -> None:
         """A result message moves the form from in-flight to pending submit."""
@@ -855,6 +1033,10 @@ class _PolicyProcessMap:
         # The graph capability is served only by the post-processing lane, so the two readings agree.
         return 1 if self._graph is not None else 0
 
+    def num_loaded_safety_processes(self) -> int:
+        # The CLIP capability is served only by the safety process, so the two readings agree.
+        return 1 if self._clip is not None else 0
+
 
 def _make_policy_coordinator(
     *,
@@ -870,6 +1052,7 @@ def _make_policy_coordinator(
     coordinator._job_tracker = job_tracker  # type: ignore[assignment]
     coordinator._reserve_ledger = CommittedReserveLedger()
     coordinator._pending_forms = deque()
+    coordinator._pending_form_deadlines = {}
     coordinator._in_flight = {f"form-{i}": None for i in range(in_flight)}  # type: ignore[misc]
     coordinator._in_flight_card = {}
     coordinator._in_flight_owner = {}
@@ -1001,6 +1184,33 @@ class TestShouldPopPolicy:
         coordinator._state.downloads_only_hold = hold == "downloads-only"
 
         assert coordinator._should_pop() is should_pop
+
+    def test_a_down_clip_lane_narrows_the_offer_without_closing_the_pop_gate(self) -> None:
+        """With safety down the CLIP forms leave the offer, and the graph lane still pops its own work."""
+        bridge_data = self._bridge_data(alchemy_allow_concurrent=False)
+        process_map = _PolicyProcessMap(graph=object(), clip=None, idle_image_lanes=2, free_vram_mb=8000.0)
+        coordinator = _make_policy_coordinator(
+            bridge_data=bridge_data,
+            process_map=process_map,
+            job_tracker=_StubJobTracker(pending=0),
+        )
+
+        offered = expand_offered_forms(bridge_data, clip_lane_healthy=coordinator._clip_lane_healthy())
+        assert "nsfw" not in offered
+        assert "RealESRGAN_x4plus" in offered
+        assert coordinator._should_pop() is True
+
+    def test_a_clip_only_worker_stops_popping_while_safety_is_down(self) -> None:
+        """Nothing is left to offer when the only configured family's lane is down, so no pop goes out."""
+        bridge_data = self._bridge_data(forms=["nsfw"], alchemy_allow_concurrent=False)
+        process_map = _PolicyProcessMap(graph=object(), clip=None, idle_image_lanes=2, free_vram_mb=8000.0)
+        coordinator = _make_policy_coordinator(
+            bridge_data=bridge_data,
+            process_map=process_map,
+            job_tracker=_StubJobTracker(pending=0),
+        )
+
+        assert coordinator._should_pop() is False
 
     def test_unknown_vram_falls_back_to_backfill(self) -> None:
         """When VRAM telemetry is unavailable, alchemy only pops with an empty image queue."""

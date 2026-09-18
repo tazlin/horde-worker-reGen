@@ -15,7 +15,10 @@ form is dispatched to.
 
 Graph forms (upscalers, facefixers) are dispatched to the post-processing lane; strip_background to
 the image-utilities lane; text-output forms (caption, interrogation, nsfw, vectorize) to the safety
-process. Dispatch is keyed on :class:`WorkerCapability`, not process type.
+process. Dispatch is keyed on :class:`WorkerCapability`, not process type, and so is the offer: a form
+whose lane is not up is withheld from the pop (:func:`expand_offered_forms`), and one whose lane goes away
+after the pop is handed back faulted once its dispatch deadline passes, since no other process could ever
+take it.
 """
 
 from __future__ import annotations
@@ -181,6 +184,17 @@ child has already been reaped. Thirty seconds matches the image-generation pop b
 normal Horde API latency.
 """
 
+PENDING_FORM_DISPATCH_DEADLINE_SECONDS = 300.0
+"""How long a popped form may wait for a process able to serve it before it is handed back faulted.
+
+The alchemy pop answer carries no ttl of its own (``AlchemyJobPopResponse`` has only ``forms`` and
+``skipped``), so the bound is the worker's. It sits at the ceiling the process lifecycle prices a lane's
+return at (``SAFETY_READINESS_LATENCY_CEILING_SECONDS``), which covers a lane paused for reclaim, replaced
+after a crash, or cold-starting its weights. A form still undispatchable past that is waiting on a lane the
+worker's worst case says is not coming, and it holds a ``queue_size`` slot the pop gate counts, so holding
+it forever costs the flow every later form too.
+"""
+
 
 def lane_bound_post_processor_candidates() -> list[str]:
     """Return every upscaler and face fixer the worker may offer, beta names gated on server support.
@@ -210,11 +224,26 @@ def lane_bound_post_processor_candidates() -> list[str]:
     return candidates
 
 
+def _lane_health_by_capability(
+    *,
+    utilities_lane_healthy: bool,
+    post_process_lane_healthy: bool,
+    clip_lane_healthy: bool,
+) -> dict[WorkerCapability, bool]:
+    """Return, per alchemy capability, whether a lane able to serve it is up."""
+    return {
+        WorkerCapability.ALCHEMY_GRAPH: post_process_lane_healthy,
+        WorkerCapability.ALCHEMY_CLIP: clip_lane_healthy,
+        WorkerCapability.IMAGE_UTILITIES: utilities_lane_healthy,
+    }
+
+
 def expand_offered_forms(
     bridge_data: reGenBridgeData,
     *,
     utilities_lane_healthy: bool = True,
     post_process_lane_healthy: bool = True,
+    clip_lane_healthy: bool = True,
     annotation_types: frozenset[str] = frozenset(),
     presence: PostProcessorPresence = UNKNOWN_POST_PROCESSOR_PRESENCE,
 ) -> list[str]:
@@ -228,16 +257,17 @@ def expand_offered_forms(
     A part that is unknown withholds nothing, so config-only callers and workers without a download process
     keep offering what their configuration says.
 
-    ``strip_background`` runs only on the out-of-venv image-utilities lane and has no in-graph fallback,
-    so it is offered only when that lane is both provisioned (:func:`strip_background_available`) and
-    currently up (``utilities_lane_healthy``). The pure-torch upscalers and face-fixers are unaffected by
-    the lane's health. ``utilities_lane_healthy`` defaults True for the config-only callers that cannot see
-    runtime process state; the pop path passes the live reading.
+    Every form is then withheld unless the lane that would serve it is up, keyed on the capability
+    :func:`capability_for_alchemy_form` routes it to: upscalers and face-fixers on the post-processing lane,
+    ``strip_background`` and ``annotation`` on the image-utilities lane, and the CLIP-stack forms (caption,
+    interrogation, nsfw and the rest) on the safety process. None of the three has an alternative home, so an
+    accepted form whose lane is down, held off the GPU to reclaim its context, or momentarily restarting could
+    only strand. Offer and dispatch read the same routing, so the worker cannot advertise work it would then
+    send nowhere. The three flags default True for config-only callers that cannot see runtime process state;
+    the pop path passes the live readings.
 
-    The upscalers and face-fixers run on the dedicated post-processing lane, so they are withheld while no
-    such lane is up (``post_process_lane_healthy``), whether it is held off the GPU to reclaim its context or
-    momentarily restarting: nothing could serve them, and an accepted form would only strand.
-    ``post_process_lane_healthy`` defaults True for the same config-only callers.
+    ``strip_background`` additionally needs its lane provisioned at all (:func:`strip_background_available`),
+    which is a property of the install rather than of the running process.
     """
     offered: list[str] = []
     configured = configured_alchemy_forms(bridge_data.forms)
@@ -281,35 +311,33 @@ def expand_offered_forms(
         offered.append(AESTHETIC_FORM_NAME)
     if (
         KNOWN_ALCHEMY_FORMS.annotation in configured
-        and utilities_lane_healthy
         and annotation_types
         and server_supports_interrogation_form(KNOWN_ALCHEMY_FORMS.annotation.value)
     ):
         offered.append(KNOWN_ALCHEMY_FORMS.annotation.value)
     if KNOWN_ALCHEMY_FORMS.post_process in configured:
-        # Upscalers and face-fixers are the lane-bound half of the expansion: only the post-processing lane
-        # serves either, so both are dropped together while it is down, and each is dropped on its own while
-        # its model is known to be missing. strip_background below runs on the separate image-utilities lane
-        # and keeps its own gate.
-        if post_process_lane_healthy:
-            offered.extend(
-                name
-                for name in lane_bound_post_processor_candidates()
-                if presence.lane_bound is None or name in presence.lane_bound
-            )
-        # strip_background runs only on the image-utilities lane (no in-graph fallback); drop just it when
-        # that lane is not provisioned, is momentarily down, or its weight is known to be missing.
-        # Upscalers/face-fixers above are pure torch and stay on offer. Unlike image-generation
-        # post-processing, alchemy forms are enumerated per-form, so this granular drop is possible.
-        strip_background_servable = (
-            strip_background_available() and utilities_lane_healthy and presence.strip_background is not False
+        # Each lane-bound post-processor is dropped on its own while its model is known to be missing; the
+        # lane-health rule below drops the family together when nothing can run them.
+        offered.extend(
+            name
+            for name in lane_bound_post_processor_candidates()
+            if presence.lane_bound is None or name in presence.lane_bound
         )
+        # Background removal needs its own weight on disk as well as the lane, so it is dropped on its own
+        # while that weight is missing. Unlike image-generation post-processing, alchemy forms are
+        # enumerated per-form, so this granular drop is possible.
+        strip_background_servable = strip_background_available() and presence.strip_background is not False
         if strip_background_servable:
             offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS)
         else:
             offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS if not is_strip_background_form(m.value))
 
-    return offered
+    lane_health = _lane_health_by_capability(
+        utilities_lane_healthy=utilities_lane_healthy,
+        post_process_lane_healthy=post_process_lane_healthy,
+        clip_lane_healthy=clip_lane_healthy,
+    )
+    return [name for name in offered if lane_health.get(capability_for_alchemy_form(name), True)]
 
 
 class AlchemyHeadroomEstimator:
@@ -381,6 +409,11 @@ class AlchemyCoordinator:
     """The lane-bound post-processors last withheld for a missing model; logged when it changes."""
 
     _pending_forms: deque[AlchemyFormSpec]
+    _pending_form_deadlines: dict[str, float]
+    """form_id -> the monotonic instant past which a still-undispatchable form is faulted back to the horde.
+
+    Monotonic so a system clock correction cannot expire a form early or hold one forever. An entry lives
+    exactly as long as its form sits in ``_pending_forms``."""
     _in_flight: dict[str, AlchemyFormSpec]
     """Forms dispatched to a child process, keyed by form_id, awaiting a result message."""
     _in_flight_card: dict[str, int]
@@ -469,6 +502,7 @@ class AlchemyCoordinator:
         """Cumulative forms that permanently faulted (stale/invalid/unrecoverable) this session."""
 
         self._pending_forms = deque()
+        self._pending_form_deadlines = {}
         self._in_flight = {}
         self._in_flight_card = {}
         self._in_flight_owner = {}
@@ -668,6 +702,7 @@ class AlchemyCoordinator:
             bridge_data,
             utilities_lane_healthy=self._utilities_lane_healthy(),
             post_process_lane_healthy=self._post_process_lane_healthy(),
+            clip_lane_healthy=self._clip_lane_healthy(),
             annotation_types=self._annotation_types(),
             presence=self._post_processor_presence(),
         )
@@ -711,6 +746,15 @@ class AlchemyCoordinator:
         context or is momentarily restarting.
         """
         return self._process_map.num_loaded_post_process_processes() > 0
+
+    def _clip_lane_healthy(self) -> bool:
+        """Return True when a process able to run the CLIP stack is up and past startup.
+
+        Gates the caption, interrogation, nsfw and other CLIP-family offers at pop time. The safety process
+        is the only declarer of ``ALCHEMY_CLIP``, so its loaded count is that lane's reading, read the same
+        way the graph and utilities lanes read theirs.
+        """
+        return self._process_map.num_loaded_safety_processes() > 0
 
     def _annotation_types(self) -> frozenset[str]:
         """Return the servable annotation control types the pop request can carry.
@@ -932,7 +976,7 @@ class AlchemyCoordinator:
 
         self._form_time_popped[spec.form_id] = time.time()
         self._form_resolution[spec.form_id] = self._decode_image_resolution(spec.source_image_bytes)
-        self._pending_forms.append(spec)
+        self._queue_pending_form(spec)
         logger.opt(colors=True).info(
             "<fg #34c0eb>Popped canned alchemy form {} ({})</>",
             spec.form_id,
@@ -1089,7 +1133,7 @@ class AlchemyCoordinator:
             )
             self._form_time_popped[spec.form_id] = time.time()
             self._form_resolution[spec.form_id] = self._decode_image_resolution(source_image_bytes)
-            self._pending_forms.append(spec)
+            self._queue_pending_form(spec)
             logger.opt(colors=True).info(
                 "<fg #34c0eb>Popped alchemy form {} ({})</>",
                 spec.form_id,
@@ -1107,6 +1151,11 @@ class AlchemyCoordinator:
 
     # region dispatch
 
+    def _queue_pending_form(self, spec: AlchemyFormSpec) -> None:
+        """Queue a freshly popped form for dispatch and start its dispatch deadline."""
+        self._pending_forms.append(spec)
+        self._pending_form_deadlines[spec.form_id] = time.monotonic() + PENDING_FORM_DISPATCH_DEADLINE_SECONDS
+
     def dispatch_pending_forms(self) -> None:
         """Send queued forms to an available process declaring the needed capability.
 
@@ -1114,25 +1163,26 @@ class AlchemyCoordinator:
         covers the form, so the card the pop was promised against is the card the form lands on. A form already
         popped is owed to the horde, so when no card still has the headroom (or none reports one) it is placed
         on any available capable process rather than stranded.
+
+        A form nothing can take waits for its lane until its deadline, then goes back to the horde faulted
+        (:meth:`_fault_undispatchable_form`): the offer gate only ever advertises forms whose lane is up, so
+        a form that outlives the deadline is one whose lane went away after the pop and has not returned.
         """
         still_pending: deque[AlchemyFormSpec] = deque()
+        now = time.monotonic()
         while self._pending_forms:
             spec = self._pending_forms.popleft()
             capability = required_capability(spec.form)
             process_info = self._admissible_process(capability)
             if process_info is None:
                 process_info = self._process_map.get_first_available(capability)
-            if process_info is None:
-                still_pending.append(spec)
-                continue
 
-            sent = process_info.safe_send_message(
+            if process_info is not None and process_info.safe_send_message(
                 HordeAlchemyControlMessage(
                     control_flag=HordeControlFlag.START_ALCHEMY,
                     form=spec,
                 ),
-            )
-            if sent:
+            ):
                 process_info.last_control_flag = HordeControlFlag.START_ALCHEMY
                 self._in_flight[spec.form_id] = spec
                 self._in_flight_card[spec.form_id] = process_info.device_index
@@ -1140,13 +1190,49 @@ class AlchemyCoordinator:
                     process_info.process_id,
                     process_info.process_launch_identifier,
                 )
+                self._pending_form_deadlines.pop(spec.form_id, None)
                 logger.debug(
                     f"Dispatched alchemy form {spec.form_id} ({spec.form}) to process {process_info.process_id}",
                 )
-            else:
-                still_pending.append(spec)
+                continue
+
+            deadline = self._pending_form_deadlines.get(spec.form_id)
+            if deadline is not None and now >= deadline:
+                self._fault_undispatchable_form(spec, capability)
+                continue
+            still_pending.append(spec)
 
         self._pending_forms = still_pending
+
+    def _fault_undispatchable_form(self, spec: AlchemyFormSpec, capability: WorkerCapability) -> None:
+        """Hand a form back to the horde faulted after its dispatch deadline passed with no process to take it.
+
+        Nothing else expires a pending form, and a pending form holds one of the ``queue_size`` slots the pop
+        gate counts, so a form whose lane never returns would stop the flow popping anything else for the rest
+        of the session. Reporting the fault lets the horde reissue the form to a worker that has the lane,
+        which is the same trade :meth:`_reap_lost_in_flight_forms` makes for a form whose process died.
+        """
+        self._pending_form_deadlines.pop(spec.form_id, None)
+        time_popped = self._form_time_popped.pop(spec.form_id, time.time())
+        self._pending_submits.append(
+            PendingAlchemySubmitJob(
+                result_message=HordeAlchemyResultMessage(
+                    process_id=-1,
+                    process_launch_identifier=-1,
+                    info="No process able to serve this form became available",
+                    form_id=spec.form_id,
+                    form=spec.form,
+                    state=GENERATION_STATE.faulted,
+                ),
+                r2_upload=spec.r2_upload,
+                time_popped=time_popped,
+            ),
+        )
+        logger.warning(
+            f"Alchemy form {spec.form_id} ({spec.form}) passed its "
+            f"{PENDING_FORM_DISPATCH_DEADLINE_SECONDS:.0f}s dispatch deadline with no {capability.name} "
+            "process able to take it; faulting it back to the horde so another worker can serve it.",
+        )
 
     def _reap_lost_in_flight_forms(self) -> None:
         """Drop in-flight forms whose owning process launch is gone, before reconciling the reserve.
