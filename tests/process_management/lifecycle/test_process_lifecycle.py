@@ -405,6 +405,33 @@ def test_pending_inference_start_is_recoverable_capacity_during_backoff() -> Non
     assert coordinator.is_inference_pool_unrecoverable() is False
 
 
+def test_a_worker_that_plans_no_inference_process_has_no_unrecoverable_pool() -> None:
+    """With no slot planned, none quarantined is not "every slot quarantined", which would escalate to a reset."""
+    bridge_data = Mock()
+    bridge_data.max_threads = 1
+    lifecycle = Mock()
+    lifecycle.has_pending_inference_starts.return_value = False
+    lifecycle.pending_gpu_starts_backing_off.return_value = False
+    lifecycle.quarantined_inference_slots = frozenset()
+
+    coordinator = WorkerRecoveryCoordinator(
+        state=WorkerState(),
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+        job_tracker=JobTracker(),
+        process_map=ProcessMap({}),
+        process_lifecycle=lifecycle,
+        message_dispatcher=Mock(),
+        inference_scheduler=Mock(),
+        action_ledger=ActionLedger(),
+        reserve_ledger=CommittedReserveLedger(),
+        bridge_data_provider=lambda: bridge_data,
+        max_inference_processes_provider=lambda: 0,
+        terminal_recovery_callback=lambda: RecoveryDisposition.RESTART_PROCESS,
+    )
+
+    assert coordinator.is_inference_pool_unrecoverable() is False
+
+
 def test_inference_pids_never_take_the_reserved_safety_slot() -> None:
     """Inference process ids are allocated from 1 upward; slot 0 is reserved for the safety process.
 

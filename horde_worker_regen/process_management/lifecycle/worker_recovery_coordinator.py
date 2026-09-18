@@ -401,8 +401,12 @@ class WorkerRecoveryCoordinator:
         return self._process_map.num_available_inference_processes() > 0
 
     def is_inference_pool_unrecoverable(self) -> bool:
-        """Return whether every inference slot is crash-loop quarantined."""
-        if self._inference_starts_backing_off():
+        """Return whether every inference slot is crash-loop quarantined.
+
+        A worker that plans no inference process (it serves no image generation) has no slot to lose, so its
+        empty pool is never unrecoverable.
+        """
+        if self.max_inference_processes <= 0 or self._inference_starts_backing_off():
             return False
         return len(self._process_lifecycle.quarantined_inference_slots) >= self.max_inference_processes
 
