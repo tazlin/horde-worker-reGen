@@ -317,7 +317,10 @@ def _derive_phase(
             checks,
             False,
         )
-    serving = any(
+    # A text job runs in the external backend and moves no lane's state, so the flow's own count of jobs in
+    # hand is what says a text worker is working. The backend's process state is not read for this: a backend
+    # that is up is ready to serve, which is not the same as serving.
+    serving = snapshot.text_jobs_in_flight > 0 or any(
         process.last_process_state in _INFERENCE_STATES for process in snapshot.processes if not process.is_external
     )
     if serving:

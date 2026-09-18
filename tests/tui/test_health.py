@@ -602,6 +602,21 @@ def test_a_ready_text_backend_is_not_an_inference_lane_serving() -> None:
     assert report.phase is not WorkerPhase.SERVING
 
 
+def test_a_text_job_in_flight_reads_as_serving_with_no_lane_busy() -> None:
+    """A text job runs in the external backend, so the flow's in-flight count is what says the worker is working."""
+    snapshot = _snapshot(
+        config=_SCRIBE_CONFIG,
+        processes=[_text_backend_process()],
+        enabled_workloads=[WorkloadKind.TEXT_GENERATION.value],
+        text_backend_ready=True,
+        text_jobs_in_flight=1,
+    )
+
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    assert report.phase is WorkerPhase.SERVING
+
+
 def test_a_text_backend_alone_does_not_end_the_warm_up() -> None:
     """A worker whose only row is its external backend is still warming up, as one with no rows is."""
     snapshot = _snapshot(processes=[_text_backend_process()])

@@ -1350,8 +1350,11 @@ class ConfigEditorView(Vertical):
 
         text = Text("Current: ", style="bold")
         text.append(role, style="cyan" if served else "red")
-        text.append(f"  |  {process_text}  |  models: {model_text}  |  {pool_text}  |  ")
-        text.append(" / ".join(feature_bits))
+        if "image" in served:
+            # Inference contexts, the image model list, the pool and the image features describe image serving
+            # only, so a worker without it is not told it has two inference contexts and a default model set.
+            text.append(f"  |  {process_text}  |  models: {model_text}  |  {pool_text}  |  ")
+            text.append(" / ".join(feature_bits))
         return text
 
     def _change_summary(self) -> Text:
