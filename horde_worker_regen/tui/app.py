@@ -37,13 +37,19 @@ from horde_worker_regen.app_state import (
     AppStateStore,
     DisplayDensity,
     ExperienceLevel,
+    KnownGpu,
+    KnownGpuInventory,
     OnboardingChoice,
     OverviewTrendWindow,
     OverviewViewMode,
     benchmark_status_summary,
     should_prompt_onboarding,
 )
-from horde_worker_regen.process_management.ipc.supervisor_channel import DownloadPhase, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    CardSnapshot,
+    DownloadPhase,
+    WorkerStateSnapshot,
+)
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.runtime_version import runtime_version
@@ -171,6 +177,18 @@ served page's 10px readability floor.
 _CONFIG_TAB_ID = "tab-config"
 _DOWNLOADS_TAB_ID = "tab-downloads"
 _LIVE_TAB_ID = "tab-live"
+
+
+def _probe_installed_gpus() -> list[KnownGpu]:
+    """Enumerate the installed accelerators out of process; empty under the test harness or on failure.
+
+    Blocking for seconds per card, so callers run it off the UI thread.
+    """
+    if os.environ.get("AI_HORDE_TESTING"):
+        return []
+    from horde_worker_regen.utils.accelerator_probe import probe_accelerators
+
+    return [KnownGpu(index=device.index, name=device.name, kind=device.kind) for device in probe_accelerators()]
 
 
 def _no_inference_contexts(snapshot: WorkerStateSnapshot) -> bool:
@@ -470,10 +488,18 @@ class HordeWorkerTUI(App[None]):
         app_state_store: AppStateStore | None = None,
         load_config_from_env_vars: bool = False,
         remote_exposed: bool = False,
+        gpu_probe: Callable[[], list[KnownGpu]] = _probe_installed_gpus,
     ) -> None:
-        """Store the (unstarted) supervisor, config path, and durable state store."""
+        """Store the (unstarted) supervisor, config path, and durable state store.
+
+        ``gpu_probe`` enumerates the installed cards for the per-card editor; tests pass a fake.
+        """
         super().__init__()
         self._supervisor = supervisor
+        self._gpu_probe = gpu_probe
+        # The probe runs at most once per session: it takes a context on every card, and the installed set
+        # does not change while the dashboard runs.
+        self._gpu_probe_started = False
         self._benchmark_supervisor = BenchmarkSupervisor(config_path=config_path)
         self._config_path = config_path
         self._app_state_store = app_state_store if app_state_store is not None else AppStateStore()
@@ -518,6 +544,8 @@ class HordeWorkerTUI(App[None]):
         # Owed to an installation that predates the levels; consumed once on mount so the Simple default
         # is announced rather than looking like the dashboard lost its detail.
         self._needs_experience_introduction = persisted_state.needs_experience_introduction
+        # The card list a previous session saved; seeds the per-card editor until a live source answers.
+        self._known_gpus = persisted_state.known_gpus
         # Cached because the render loop asks every frame and the answer costs a YAML parse; invalidated
         # by the config file's own change stamp rather than by a save hook, so an external edit counts.
         self._setup_required = False
@@ -684,6 +712,8 @@ class HordeWorkerTUI(App[None]):
         if self._remote_exposed:
             self.screen.add_class(REMOTE_EXPOSED_CLASS)
         self._apply_experience_level(self._experience_level)
+        with contextlib.suppress(NoMatches):
+            self.query_one(ConfigEditorView).set_remembered_cards(self._known_gpus)
         # An installation that predates the levels answers the notice before anything else, so the choice
         # is made against an untouched dashboard rather than behind a start prompt.
         if self._needs_experience_introduction:
@@ -1033,6 +1063,7 @@ class HordeWorkerTUI(App[None]):
             )
             config_editor.update_cards(snapshot.per_card if snapshot is not None else [])
             if snapshot is not None:
+                self._remember_live_cards(snapshot.per_card)
                 self.query_one(LiveView).update_snapshot(
                     snapshot,
                     snapshot_age,
@@ -2063,6 +2094,61 @@ class HordeWorkerTUI(App[None]):
         """
         if message.restart:
             self.action_restart_worker()
+
+    def on_config_editor_view_gpu_inventory_wanted(self, _message: ConfigEditorView.GpuInventoryWanted) -> None:
+        """Enumerate the installed GPUs in the background the first time the per-card editor opens."""
+        if self._gpu_probe_started:
+            return
+        self._gpu_probe_started = True
+        # The worker numbers cards in PCI-bus order and sets this same default before its own probe. Without
+        # it CUDA enumerates fastest-first, so a mixed-card machine would number its cards differently here
+        # than in the worker, and an override would land on the wrong card. Set on the UI thread because the
+        # probe subprocess inherits this process's environment.
+        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+        with contextlib.suppress(NoMatches):
+            self.query_one(ConfigEditorView).set_gpu_probing(True)
+        self.run_worker(self._probe_gpus_blocking, thread=True, exclusive=True, group="gpu-probe")
+
+    def _probe_gpus_blocking(self) -> None:
+        """Run the GPU probe on the worker thread and hand the result back to the UI thread."""
+        try:
+            gpus = self._gpu_probe()
+        except Exception as probe_error:  # noqa: BLE001 - a failed probe leaves the other card sources in place
+            logger.warning(
+                f"GPU enumeration for the per-card editor failed: {type(probe_error).__name__}: {probe_error}"
+            )
+            gpus = []
+        self.call_from_thread(self._on_gpus_probed, gpus)
+
+    def _on_gpus_probed(self, gpus: list[KnownGpu]) -> None:
+        """Show the probed cards and, when the probe found any, replace the saved card list with them."""
+        with contextlib.suppress(NoMatches):
+            self.query_one(ConfigEditorView).set_installed_cards(gpus)
+        if gpus:
+            with contextlib.suppress(OSError):
+                self._known_gpus = self._app_state_store.record_known_gpus(gpus)
+
+    def _remember_live_cards(self, per_card: list[CardSnapshot]) -> None:
+        """Add any card the worker reports that the saved card list lacks, so the next session lists it.
+
+        Only additions are saved: the worker reports the cards it drives, not every installed card, so a card
+        missing from its report is not evidence the card is gone. Only the probe replaces the list.
+        """
+        saved = {gpu.index: gpu for gpu in self._known_gpus.gpus} if self._known_gpus is not None else {}
+        new_cards = [card for card in per_card if card.device_index not in saved]
+        if not new_cards:
+            return
+        for card in new_cards:
+            saved[card.device_index] = KnownGpu(index=card.device_index, name=card.device_name, kind=card.kind)
+        try:
+            self._known_gpus = self._app_state_store.record_known_gpus(saved.values())
+        except OSError as write_error:
+            logger.debug(f"Could not save the GPU list: {write_error}")
+            # Held in memory anyway so an unwritable state file costs one attempt, not one per tick.
+            self._known_gpus = KnownGpuInventory(
+                gpus=sorted(saved.values(), key=lambda gpu: gpu.index),
+                recorded_at=time.time(),
+            )
 
     def on_benchmark_view_run_requested(self, message: BenchmarkView.RunRequested) -> None:
         """Launch the benchmark, first gating on an in-progress download and the GPU takeover of a live worker."""

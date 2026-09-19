@@ -189,6 +189,25 @@ class OnboardingState(BaseModel):
     prompt_last_shown_at: float | None = None
 
 
+class KnownGpu(BaseModel):
+    """One card this machine was last seen to have, keyed by the worker's stable (PCI-bus) index."""
+
+    index: int
+    name: str | None = None
+    kind: str = "cuda"
+
+
+class KnownGpuInventory(BaseModel):
+    """The GPU list a previous dashboard session saw, so the per-card editor can list cards before any probe.
+
+    A saved list can be stale (a card added, removed or reseated since), so it is only a fallback and the
+    dashboard says so wherever it relies on one.
+    """
+
+    gpus: list[KnownGpu] = Field(default_factory=list)
+    recorded_at: float
+
+
 class WorkerAppState(BaseModel):
     """Represents the full durable application state persisted between worker runs."""
 
@@ -233,6 +252,8 @@ class WorkerAppState(BaseModel):
     last_worker_run: WorkerRunRecord | None = None
     last_benchmark: BenchmarkRecord | None = None
     last_known_good_settings: KnownGoodSettings | None = None
+    known_gpus: KnownGpuInventory | None = None
+    """The cards the dashboard last enumerated or saw a worker drive; None until any session has seen one."""
 
 
 def default_app_state_dir() -> Path:
@@ -481,6 +502,14 @@ class AppStateStore:
         state.developer_warning_acknowledged = True
         self.save(state)
 
+    def record_known_gpus(self, gpus: Iterable[KnownGpu]) -> KnownGpuInventory:
+        """Persist the card list the dashboard just saw, replacing the previous one, and return it."""
+        state = self.load()
+        inventory = KnownGpuInventory(gpus=sorted(gpus, key=lambda gpu: gpu.index), recorded_at=time.time())
+        state.known_gpus = inventory
+        self.save(state)
+        return inventory
+
     # endregion
 
 
@@ -495,6 +524,8 @@ __all__ = [
     "ExperienceLevel",
     "KnownGoodSettings",
     "KnownGoodSource",
+    "KnownGpu",
+    "KnownGpuInventory",
     "OnboardingChoice",
     "OnboardingState",
     "OverviewTrendWindow",

@@ -12,6 +12,7 @@ from horde_worker_regen.app_state import (
     BenchmarkRecord,
     KnownGoodSettings,
     KnownGoodSource,
+    KnownGpu,
     OnboardingChoice,
     OnboardingState,
     OverviewViewMode,
@@ -125,6 +126,21 @@ def test_record_mutators_preserve_unrelated_fields(tmp_path: Path) -> None:
     assert state.onboarding.prompt_last_shown_at is not None
     assert state.last_known_good_settings is not None
     assert state.last_known_good_settings.source is KnownGoodSource.CLEAN_RUN
+
+
+def test_known_gpus_replace_and_round_trip_sorted(tmp_path: Path) -> None:
+    """The saved card list is replaced whole on each record, sorted by index, and survives a reload."""
+    store = _store(tmp_path)
+    assert store.load().known_gpus is None
+
+    store.record_known_gpus([KnownGpu(index=2, name="Card B"), KnownGpu(index=0, name="Card A"), KnownGpu(index=5)])
+    returned = store.record_known_gpus([KnownGpu(index=1, name="Card C", kind="rocm"), KnownGpu(index=0)])
+
+    saved = store.load().known_gpus
+    assert saved is not None
+    assert saved == returned
+    assert [gpu.index for gpu in saved.gpus] == [0, 1]
+    assert saved.gpus[1].kind == "rocm"
 
 
 def test_auto_start_worker_defaults_off(tmp_path: Path) -> None:

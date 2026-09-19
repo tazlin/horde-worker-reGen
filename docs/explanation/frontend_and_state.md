@@ -691,7 +691,12 @@ benchmark and where its results live, the last worker run, the last-known-good
 settings, which worker version last ran (so a version bump can mark a stale
 benchmark for re-running), and the operator's durable UI preferences (the experience
 level, the theme and display density, the Overview density mode, the trend window,
-and which Overview panels are hidden). A hidden-panel key that no longer names a live
+and which Overview panels are hidden). It also keeps the GPU list the dashboard last
+saw (`known_gpus`), so the Per-GPU config tab can list cards before the running worker
+or the accelerator probe has answered. That list may be stale, so the tab labels any
+card it knows only from the saved list. A probe replaces the list; a live worker only
+adds to it, because the worker reports the cards it drives, not every installed card.
+A hidden-panel key that no longer names a live
 element is dropped on load, so a stale preference can never block the Overview from
 rendering; a `theme_name` this build cannot restore falls back to the default for the
 same reason. The known theme names are duplicated in `app_state` rather than imported

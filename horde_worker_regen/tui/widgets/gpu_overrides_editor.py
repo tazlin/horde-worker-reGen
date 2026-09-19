@@ -6,11 +6,17 @@ One worker can drive every GPU on the machine, with each card taking a delta ove
 The top of the tab is a single chip strip standing in for both index pickers the operator used to face:
 ``[All GPUs (auto)]`` is the empty-``gpu_device_indices`` "drive everything" state made visible, and the
 numbered chips (pre-populated 0-3, ``+`` to go further) are the explicit drive set. A chip is green when
-the running worker actually detected that card and blue when it is explicitly driven. Picking specific
-chips writes ``gpu_device_indices``; leaving Auto selected omits it. Either way, every detected,
-configured, or selected card gets a collapsible section below where each field is OFF (inherits the global
-value, shown in the disabled control) until its Override toggle is flipped, so a single-GPU or homogeneous
-box never grows a ``gpu_overrides`` block. Two cards lay out side by side when the terminal is wide enough.
+the card is confirmed present this session and blue when it is explicitly driven. Picking specific chips
+writes ``gpu_device_indices``; leaving Auto selected omits it. Either way, every known, configured, or
+selected card gets a collapsible section below where each field is OFF (inherits the global value, shown in
+the disabled control) until its Override toggle is flipped, so a single-GPU or homogeneous box never grows a
+``gpu_overrides`` block. Two cards lay out side by side when the terminal is wide enough.
+
+A card is known from three sources: the running worker's snapshot (the cards it drives), this session's
+accelerator probe (every installed card, driven or not), and the card list a previous session saved. The
+saved list lets the sections appear before either live source has answered, and the banner and card titles
+say when that list is all the editor has. Every source only adds cards, so a snapshot that goes missing
+during a worker restart never takes a section, or the edits in it, away.
 
 The widget operates on the same ruamel ``CommentedMap`` the parent :class:`ConfigEditorView` holds, and
 exposes ``is_dirty``/``apply_to``/``reload`` so the parent can drive save, dirty-detection, and reload
@@ -20,8 +26,11 @@ uniformly with the flat fields.
 from __future__ import annotations
 
 import contextlib
+import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
+from loguru import logger
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Collapsible, Input, Label, Static, Switch, TextArea
@@ -45,6 +54,7 @@ from horde_worker_regen.tui.config_form import (
 from horde_worker_regen.tui.formatters import gpu_label
 
 if TYPE_CHECKING:
+    from horde_worker_regen.app_state import KnownGpu, KnownGpuInventory
     from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot
 
 _GLOBAL_FIELD_BY_KEY: dict[str, ConfigField] = {field.key: field for field in CONFIG_FIELDS}
@@ -159,6 +169,8 @@ class GpuOverridesEditor(Vertical):
         self._data = data
         self._card_names: dict[int, str] = {}
         self._card_kinds: dict[int, str] = {}
+        # The most recent non-empty live card count. A snapshot is absent between a worker's spawn and its
+        # first report, so an empty tick keeps the last count rather than reading as "no worker".
         self._detected_count = 0
         # The explicit drive set (gpu_device_indices). Empty means Auto: drive every detected GPU.
         self._driven: set[int] = set(read_gpu_device_indices(data))
@@ -166,8 +178,15 @@ class GpuOverridesEditor(Vertical):
         self._configured: set[int] = set(read_gpu_overrides(data))
         # Cards the live worker actually reported, which always get a section so a present card is tweakable.
         self._detected: set[int] = set()
+        # Cards this session's accelerator probe enumerated, including any the worker does not drive (the
+        # card given to a text backend, or one outside the drive set).
+        self._installed: set[int] = set()
+        self._probing = False
+        # Cards from the list a previous session saved, and when it was saved. A fallback that may be stale.
+        self._remembered: set[int] = set()
+        self._remembered_at: float | None = None
         # The mounted per-card sections and numbered chips, kept as live handles so a drive-set change
-        # reconciles just the deltas (mount/remove the affected ones) and never tears down and rebuilds
+        # reconciles just the deltas (mount/remove the affected sections) and never tears down and rebuilds
         # another card's in-progress edits. Rebuilding via remove_children would also race the async
         # removal against the same-id remount (DuplicateIds), which incremental reconciliation avoids.
         self._card_widgets: dict[int, Collapsible] = {}
@@ -176,13 +195,21 @@ class GpuOverridesEditor(Vertical):
 
     # -- Card-set bookkeeping ------------------------------------------------------------------------
 
+    def _known_indices(self) -> set[int]:
+        """Cards known to exist: reported live, probed this session, or on a previous session's saved list."""
+        return self._detected | self._installed | self._remembered
+
+    def _confirmed_indices(self) -> set[int]:
+        """Cards confirmed present this session, by the live worker or the accelerator probe."""
+        return self._detected | self._installed
+
     def _section_indices(self) -> list[int]:
-        """Every card that gets an override section: driven, configured on disk, or live-detected."""
-        return sorted(self._driven | self._configured | self._detected)
+        """Every card that gets an override section: driven, configured on disk, or known to exist."""
+        return sorted(self._driven | self._configured | self._known_indices())
 
     def _chip_indices(self) -> list[int]:
         """The numbered chips to show: the pre-populated 0-3 plus any card otherwise in play."""
-        return sorted(set(_PREPOPULATED_CHIPS) | self._driven | self._configured | self._detected)
+        return sorted(set(_PREPOPULATED_CHIPS) | self._driven | self._configured | self._known_indices())
 
     # -- Composition ---------------------------------------------------------------------------------
 
@@ -224,23 +251,46 @@ class GpuOverridesEditor(Vertical):
             cards.styles.grid_size_columns = 2 if self.size.width >= _TWO_COLUMN_MIN_WIDTH else 1
 
     def _banner_text(self) -> str:
-        """A card-count-aware note on when per-card overrides actually apply."""
-        if self._detected_count == 0:
+        """A card-count-aware note on when per-card overrides apply, flagging a count taken from a saved list.
+
+        The live count wins because overrides apply to the cards the worker drives; the probe's installed
+        count and then the saved list stand in until a worker has reported.
+        """
+        count = self._detected_count or len(self._installed)
+        prefix = ""
+        if count == 0 and self._remembered:
+            count = len(self._remembered)
+            prefix = f"{self._saved_list_note()} "
+        if count == 0:
+            probing = " Enumerating this machine's GPUs now." if self._probing else ""
             return (
                 "[b]Per-card overrides[/b] apply only when this one worker drives more than one GPU. "
-                "No running worker is detected yet, so cards will be enumerated on start. You can still "
-                "pre-configure a card below by its stable PCI index."
+                f"No running worker is detected yet, so cards will be enumerated on start.{probing} You can "
+                "still pre-configure a card below by its stable PCI index."
             )
-        if self._detected_count == 1:
+        undriven = ""
+        if self._detected_count and len(self._installed) > self._detected_count:
+            undriven = f" {len(self._installed)} are installed; the worker does not drive the others."
+        if count == 1:
             return (
-                "[b]This machine has 1 GPU detected.[/b] Per-card overrides are IGNORED on a single-GPU "
-                "worker: the global config is used as-is. These settings only take effect once this worker "
-                "drives multiple cards. You may still pre-configure for a planned second card below."
+                f"{prefix}[b]This machine has 1 GPU detected.[/b]{undriven} Per-card overrides are IGNORED on a "
+                "single-GPU worker: the global config is used as-is. These settings only take effect once this "
+                "worker drives multiple cards. You may still pre-configure for a planned second card below."
             )
         return (
-            f"[b]{self._detected_count} GPUs detected.[/b] Each section below overrides the global config for "
+            f"{prefix}[b]{count} GPUs detected.[/b]{undriven} Each section below overrides the global config for "
             "one physical card, keyed by its stable PCI index. Fields you do not toggle on inherit the global "
             "value."
+        )
+
+    def _saved_list_note(self) -> str:
+        """The disclaimer shown wherever the editor relies on a previous session's saved card list."""
+        saved = "an earlier session"
+        if self._remembered_at is not None:
+            saved = time.strftime("%Y-%m-%d %H:%M", time.localtime(self._remembered_at))
+        return (
+            f"[b]Showing the GPU list saved {saved}.[/b] It is not yet confirmed this session and may be out of "
+            "date if cards were added, removed or moved."
         )
 
     def _drive_summary(self) -> str:
@@ -253,11 +303,12 @@ class GpuOverridesEditor(Vertical):
     # -- Chip strip ----------------------------------------------------------------------------------
 
     def _sync_strip(self) -> None:
-        """Reconcile the numbered chips with the current drive/detected sets, in place (no full rebuild).
+        """Add chips for newly in-play cards and refresh every chip's colour, in place (no full rebuild).
 
-        The Auto and add chips persist from compose; numbered chips are added/removed for only the indices
-        that changed and the rest just have their selected state and detected dot refreshed, so a chip tap
-        never races an async removal against a same-id remount.
+        The Auto and add chips persist from compose. Numbered chips are only ever added: a chip that has
+        dropped out of play stays as a grey, selectable chip. Removing it would free its id only once the
+        async removal completes, so re-adding the same index soon after (deselect, then "+ card") would
+        mount a second ``gpu-chip-N`` beside the one still pending removal and fail with DuplicateIds.
         """
         try:
             strip = self.query_one("#gpu-strip", Horizontal)
@@ -267,12 +318,7 @@ class GpuOverridesEditor(Vertical):
         with contextlib.suppress(Exception):
             self.query_one("#gpu-chip-auto", Button).variant = "primary" if not self._driven else "default"
 
-        desired = self._chip_indices()
-        for index in sorted(set(self._chip_buttons) - set(desired)):
-            button = self._chip_buttons.pop(index)
-            with contextlib.suppress(Exception):
-                button.remove()
-        for index in desired:
+        for index in self._chip_indices():
             existing = self._chip_buttons.get(index)
             if existing is not None:
                 existing.variant = self._chip_variant(index)
@@ -282,30 +328,36 @@ class GpuOverridesEditor(Vertical):
                 id=f"gpu-chip-{index}",
                 variant=self._chip_variant(index),
             )
-            self._chip_buttons[index] = button
             # Keep numbered chips ordered and always ahead of the trailing add button.
-            later = [other for other in sorted(self._chip_buttons) if other > index and other in self._chip_buttons]
-            before = self._chip_buttons[later[0]] if later and later[0] in self._chip_buttons else add_button
-            with contextlib.suppress(Exception):
+            later = [other for other in sorted(self._chip_buttons) if other > index]
+            before = self._chip_buttons[later[0]] if later else add_button
+            try:
                 strip.mount(button, before=before)
+            except Exception as mount_error:  # noqa: BLE001 - a chip that fails to mount is retried next sync
+                # Recorded only once mounted, so a failed mount leaves the index absent and the next sync
+                # retries it, where recording first would hold an unmounted chip for the rest of the session.
+                logger.debug(f"GPU chip {index} did not mount ({type(mount_error).__name__}: {mount_error})")
+                continue
+            self._chip_buttons[index] = button
         with contextlib.suppress(Exception):
             self.query_one("#gpu-drive-summary", Static).update(self._drive_summary())
 
     def _chip_variant(self, index: int) -> Literal["primary", "success", "default"]:
-        """A chip's colour: blue when explicitly driven, green when the worker detected the card, else grey.
+        """A chip's colour: blue when explicitly driven, green when confirmed present this session, else grey.
 
         Colour (not a glyph) carries the detected state because the marker characters that read as "present"
-        are East-Asian-ambiguous width and clip the button label.
+        are East-Asian-ambiguous width and clip the button label. A card known only from the saved list stays
+        grey, since nothing this session has confirmed it.
         """
         if index in self._driven:
             return "primary"
-        if index in self._detected:
+        if index in self._confirmed_indices():
             return "success"
         return "default"
 
     def _next_chip_index(self) -> int:
         """The next index the ``+`` button adds: one past the highest card already in play (min 4)."""
-        return max([*_PREPOPULATED_CHIPS, *self._driven, *self._configured, *self._detected]) + 1
+        return max([*_PREPOPULATED_CHIPS, *self._driven, *self._configured, *self._known_indices()]) + 1
 
     # -- Machine-wide knob ---------------------------------------------------------------------------
 
@@ -360,12 +412,14 @@ class GpuOverridesEditor(Vertical):
             return
         overrides = read_gpu_overrides(self._data)
         card = self._compose_card(index, overrides.get(index, {}))
-        self._card_widgets[index] = card
         later = [other for other in sorted(self._card_widgets) if other > index]
-        if later:
-            container.mount(card, before=self._card_widgets[later[0]])
-        else:
-            container.mount(card)
+        try:
+            container.mount(card, before=self._card_widgets[later[0]] if later else None)
+        except Exception as mount_error:  # noqa: BLE001 - a section that fails to mount is retried next sync
+            # Recorded only once mounted: _sync_cards treats a recorded index as present and never retries it.
+            logger.debug(f"GPU {index} section did not mount ({type(mount_error).__name__}: {mount_error})")
+            return
+        self._card_widgets[index] = card
         with contextlib.suppress(Exception):
             card.scroll_visible()
 
@@ -377,11 +431,15 @@ class GpuOverridesEditor(Vertical):
                 card.remove()
 
     def _card_title(self, index: int) -> str:
-        """A card's collapsible title: its index with the detected name, or a not-yet-detected note."""
+        """A card's collapsible title: its label, marked when it comes only from the saved list."""
         name = self._card_names.get(index)
         kind = self._card_kinds.get(index, "cuda")
-        if index in self._detected:
+        if index in self._confirmed_indices():
             return f"GPU {gpu_label(index, name, kind)}"
+        if index in self._remembered:
+            # Once this session's probe has answered without the card, the saved entry is likely stale.
+            status = "not found this session" if self._installed else "not yet confirmed"
+            return f"GPU {gpu_label(index, name, kind)} (from saved list, {status})"
         return f"GPU {index} (not detected yet)"
 
     def _compose_card(self, index: int, card: dict[str, Any]) -> Collapsible:
@@ -524,15 +582,16 @@ class GpuOverridesEditor(Vertical):
 
     # -- Parent-driven lifecycle ---------------------------------------------------------------------
 
-    def update_cards(self, per_card: list[CardSnapshot]) -> None:
+    def update_cards(self, per_card: Sequence[CardSnapshot]) -> None:
         """Learn detected card indices/names from a live snapshot, mounting any newly-seen cards.
 
         Only a genuinely new index triggers a mount, and titles refresh in place, so the per-tick refresh
-        never clobbers in-progress edits to existing card sections.
+        never clobbers in-progress edits to existing card sections. An empty list (no snapshot yet, or a
+        worker between spawns) changes nothing.
         """
+        if not per_card:
+            return
         self._detected_count = len(per_card)
-        with contextlib.suppress(Exception):
-            self.query_one("#gpu-banner", Static).update(self._banner_text())
         new_index = False
         for card in per_card:
             self._card_names[card.device_index] = card.device_name or ""
@@ -540,10 +599,55 @@ class GpuOverridesEditor(Vertical):
             if card.device_index not in self._detected:
                 self._detected.add(card.device_index)
                 new_index = True
-        if new_index:
+        self._refresh_card_presence(reconcile=new_index)
+
+    def set_installed_cards(self, gpus: Sequence[KnownGpu]) -> None:
+        """Take this session's accelerator probe result, mounting a section for each installed card.
+
+        An empty result is a probe that could not enumerate anything, not proof of an empty machine, so it
+        only ends the probing state and leaves every other source in place.
+        """
+        self._probing = False
+        new_index = False
+        for gpu in gpus:
+            # The live snapshot's name comes from the worker's own device map; it wins where both exist.
+            if gpu.index not in self._detected:
+                self._card_names[gpu.index] = gpu.name or ""
+                self._card_kinds[gpu.index] = gpu.kind
+            if gpu.index not in self._installed:
+                self._installed.add(gpu.index)
+                new_index = True
+        self._refresh_card_presence(reconcile=new_index)
+
+    def set_remembered_cards(self, inventory: KnownGpuInventory | None) -> None:
+        """Seed the editor with a previous session's saved card list, the fallback until a live source answers."""
+        if inventory is None or not inventory.gpus:
+            return
+        self._remembered_at = inventory.recorded_at
+        new_index = False
+        for gpu in inventory.gpus:
+            if gpu.index not in self._card_names:
+                self._card_names[gpu.index] = gpu.name or ""
+                self._card_kinds[gpu.index] = gpu.kind
+            if gpu.index not in self._remembered:
+                self._remembered.add(gpu.index)
+                new_index = True
+        self._refresh_card_presence(reconcile=new_index)
+
+    def set_probing(self, probing: bool) -> None:
+        """Mark whether the accelerator probe is running, so the banner can say cards are being enumerated."""
+        self._probing = probing
+        with contextlib.suppress(Exception):
+            self.query_one("#gpu-banner", Static).update(self._banner_text())
+
+    def _refresh_card_presence(self, *, reconcile: bool) -> None:
+        """Re-render everything that depends on which cards are known, mounting sections for new ones."""
+        with contextlib.suppress(Exception):
+            self.query_one("#gpu-banner", Static).update(self._banner_text())
+        if reconcile:
             self._sync_strip()
             self._sync_cards()
-        # Refresh card titles and chip colours for cards whose detected state only just arrived.
+        # Refresh card titles and chip colours for cards whose known state only just changed.
         for index, card_widget in self._card_widgets.items():
             with contextlib.suppress(Exception):
                 card_widget.title = self._card_title(index)
@@ -563,12 +667,12 @@ class GpuOverridesEditor(Vertical):
         return current != self._clean_state
 
     def _widget_state(self) -> dict[str, object]:
-        """Snapshot config-owned GPU state, ignoring live-only cards that still inherit everything.
+        """Snapshot config-owned GPU state, ignoring known cards that still inherit everything.
 
-        The running worker can report detected cards after the Config page opens. Those cards are useful
-        editing affordances, but their mere presence is live state, not a user config change. A detected
-        card enters the dirty snapshot only once it is explicitly driven, already configured on disk, or
-        has at least one Override toggle enabled in the current form.
+        The running worker, the accelerator probe and the saved card list can all add cards after the Config
+        page opens. Those cards are useful editing affordances, but their mere presence is not a user config
+        change. A known card enters the dirty snapshot only once it is explicitly driven, already configured
+        on disk, or has at least one Override toggle enabled in the current form.
         """
         state: dict[str, object] = {
             "gpu-driven": tuple(sorted(self._driven)),

@@ -28,7 +28,13 @@ from textual.widgets import (
     TextArea,
 )
 
-from horde_worker_regen.app_state import DisplayDensity, ExperienceLevel, OverviewViewMode
+from horde_worker_regen.app_state import (
+    DisplayDensity,
+    ExperienceLevel,
+    KnownGpu,
+    KnownGpuInventory,
+    OverviewViewMode,
+)
 from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     CONFIG_SUBTABS,
@@ -471,6 +477,13 @@ class ConfigEditorView(Vertical):
             """Record that the worker should restart (only restart is routed through this message)."""
             super().__init__()
             self.restart = restart
+
+    class GpuInventoryWanted(Message):
+        """Posted when the per-card editor is opened, so the app can enumerate the installed GPUs.
+
+        The enumeration takes a context on every card, so it runs only for an operator who opens the
+        per-card editor rather than on every launch. The app decides whether one is already done.
+        """
 
     def __init__(
         self,
@@ -917,6 +930,31 @@ class ConfigEditorView(Vertical):
         if gpu_editor is not None:
             with contextlib.suppress(Exception):
                 gpu_editor.update_cards(per_card)
+
+    def set_remembered_cards(self, inventory: KnownGpuInventory | None) -> None:
+        """Forward a previous session's saved card list to the multi-GPU editor."""
+        gpu_editor = self._gpu_editor()
+        if gpu_editor is not None:
+            gpu_editor.set_remembered_cards(inventory)
+
+    def set_installed_cards(self, gpus: Sequence[KnownGpu]) -> None:
+        """Forward this session's accelerator probe result to the multi-GPU editor."""
+        gpu_editor = self._gpu_editor()
+        if gpu_editor is not None:
+            gpu_editor.set_installed_cards(gpus)
+
+    def set_gpu_probing(self, probing: bool) -> None:
+        """Tell the multi-GPU editor whether the accelerator probe is running."""
+        gpu_editor = self._gpu_editor()
+        if gpu_editor is not None:
+            gpu_editor.set_probing(probing)
+
+    def on_tabbed_content_tab_activated(self, message: TabbedContent.TabActivated) -> None:
+        """Ask the app for the installed-GPU list whenever the per-card sub-tab is opened."""
+        if message.tabbed_content.id != "config-subtabs" or message.pane is None:
+            return
+        if message.pane.id == _GPU_SUBTAB_ID:
+            self.post_message(self.GpuInventoryWanted())
 
     def reload_from_disk(self) -> None:
         """Re-read the config file and refresh every widget (e.g. after the setup wizard writes it)."""

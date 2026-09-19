@@ -28,8 +28,14 @@ Leave it unset to drive all detected cards.
 
 In the dashboard, the **Config → Per-GPU** tab does this for you with a card strip:
 `All GPUs (auto)` keeps the list empty (drive everything), while the numbered chips (`GPU 0`, `GPU 1`, …,
-plus `+ card` for higher indices) pick an explicit set. A chip is green when the running worker actually
-detected that card and blue when you have selected it, so you never have to type an index.
+plus `+ card` for higher indices) pick an explicit set. A chip is green when the card is confirmed present
+this session and blue when you have selected it, so you never have to type an index.
+
+The tab learns which cards exist from three places. The running worker reports the cards it drives.
+Opening the tab for the first time in a session also runs the accelerator probe, which lists every installed
+card, including one given to a text backend. The probe briefly takes a GPU context on each card and can take
+a few seconds per card. Until either answers, the tab shows the card list a previous session saved and says
+so in its banner and in each card's title, because that list may be out of date after a hardware change.
 
 ## Per-card overrides
 
@@ -40,7 +46,7 @@ everything else inherits.
 Per-card overrides work the same whether the worker reads `bridgeData.yaml`, JSON, or environment variables;
 the YAML parser's private state is not carried into the resolved per-card runtime configs.
 
-The easiest path is the **Config → Per-GPU** tab: each driven, detected, or selected card gets a
+The easiest path is the **Config → Per-GPU** tab: each driven, known, or selected card gets a
 collapsible section (two laid out side by side on a wide terminal, so comparing a pair of cards is easy).
 Inside, every overridable knob has an *Override* toggle that is off (the disabled control shows the
 inherited global value, tagged `inherited`) until you flip it (`custom`). Only toggled-on fields are

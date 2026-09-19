@@ -14,9 +14,17 @@ from types import SimpleNamespace
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Button, Input, Switch
+from textual.widgets import Button, Input, Switch, TabbedContent
 
+from horde_worker_regen.app_state import (
+    AppStateStore,
+    ExperienceLevel,
+    KnownGpu,
+    KnownGpuInventory,
+    OnboardingChoice,
+)
 from horde_worker_regen.bridge_data.data_model import GpuOverride
+from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.config_form import (
     GPU_OVERRIDE_FIELDS,
     apply_gpu_config,
@@ -27,6 +35,7 @@ from horde_worker_regen.tui.config_form import (
 )
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
+from tests.tui._fake_supervisor import FakeSupervisor
 
 pytestmark = pytest.mark.slow
 
@@ -273,3 +282,146 @@ async def test_add_card_button_mounts_the_next_card(tmp_path: Path) -> None:
         assert editor._save() is True
 
     assert read_gpu_device_indices(load_config(path)) == [4]
+
+
+def _harness(path: Path) -> App[None]:
+    """A bare app hosting one ConfigEditorView over ``path``."""
+
+    class _Harness(App[None]):
+        def compose(self) -> ComposeResult:
+            yield ConfigEditorView(config_path=path)
+
+    return _Harness()
+
+
+def _card(index: int, name: str = "RTX 4090") -> SimpleNamespace:
+    return SimpleNamespace(device_index=index, device_name=name, kind="cuda")
+
+
+@pytest.mark.e2e
+async def test_a_missing_snapshot_keeps_the_known_cards(tmp_path: Path) -> None:
+    """A tick with no snapshot (a worker between spawns) neither drops sections nor resets the banner count."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _harness(path)
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        gpu = editor.query_one(GpuOverridesEditor)
+        await pilot.pause()
+        editor.update_cards([_card(0), _card(1)])
+        await pilot.pause()
+        editor.update_cards([])
+        await pilot.pause()
+        assert editor.query("#gpuovr-0-max_threads") and editor.query("#gpuovr-1-max_threads")
+        assert "2 GPUs detected" in gpu._banner_text()
+
+
+@pytest.mark.e2e
+async def test_saved_card_list_shows_sections_with_a_disclaimer(tmp_path: Path) -> None:
+    """A previous session's card list mounts sections before any live source, and says it is unconfirmed."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _harness(path)
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        gpu = editor.query_one(GpuOverridesEditor)
+        await pilot.pause()
+        editor.set_remembered_cards(
+            KnownGpuInventory(gpus=[KnownGpu(index=0, name="Card A"), KnownGpu(index=1)], recorded_at=0.0),
+        )
+        await pilot.pause()
+        assert editor.query("#gpuovr-1-max_threads")
+        assert "Showing the GPU list saved" in gpu._banner_text()
+        assert "2 GPUs detected" in gpu._banner_text()
+        assert "from saved list, not yet confirmed" in gpu._card_title(1)
+        assert gpu._chip_variant(1) == "default"
+
+        # The probe confirms card 0 only: the disclaimer goes, and card 1 reads as missing, not unconfirmed.
+        editor.set_installed_cards([KnownGpu(index=0, name="Card A")])
+        await pilot.pause()
+        assert "Showing the GPU list saved" not in gpu._banner_text()
+        assert gpu._chip_variant(0) == "success"
+        assert "not found this session" in gpu._card_title(1)
+        # Sections are never removed by a source update, so card 1's section (and any edit in it) remains.
+        assert editor.query("#gpuovr-1-max_threads")
+
+
+@pytest.mark.e2e
+async def test_probe_lists_cards_the_worker_does_not_drive(tmp_path: Path) -> None:
+    """An installed card the worker leaves undriven still gets a section, and the banner says why it is idle."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _harness(path)
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        gpu = editor.query_one(GpuOverridesEditor)
+        await pilot.pause()
+        editor.update_cards([_card(0)])
+        editor.set_installed_cards([KnownGpu(index=0), KnownGpu(index=1, name="Text card")])
+        await pilot.pause()
+        assert editor.query("#gpuovr-1-max_threads")
+        assert "1 GPU detected" in gpu._banner_text()
+        assert "2 are installed" in gpu._banner_text()
+
+
+@pytest.mark.e2e
+async def test_re_adding_a_just_dropped_chip_keeps_it_mounted(tmp_path: Path) -> None:
+    """Deselecting an added card and adding it again in one burst leaves a mounted, selected chip.
+
+    A chip removed and re-added before its async removal completes would collide on its id; the chip must
+    end up both recorded and actually mounted, never recorded while absent from the strip.
+    """
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _harness(path)
+    async with app.run_test() as pilot:
+        gpu = app.query_one(GpuOverridesEditor)
+        await pilot.pause()
+        add = gpu.query_one("#gpu-chip-add", Button)
+        gpu.on_button_pressed(Button.Pressed(add))
+        gpu.on_button_pressed(Button.Pressed(gpu._chip_buttons[4]))
+        gpu.on_button_pressed(Button.Pressed(add))
+        await pilot.pause()
+        assert gpu._driven == {4}
+        chip = gpu._chip_buttons[4]
+        assert chip.is_mounted and chip.parent is gpu.query_one("#gpu-strip")
+        assert list(gpu.query("#gpu-chip-4")) == [chip]
+        assert chip.variant == "primary"
+
+
+@pytest.mark.e2e
+async def test_opening_the_per_card_tab_probes_once_and_saves_the_list(tmp_path: Path) -> None:
+    """The first open of the per-card sub-tab enumerates the cards, shows them, and saves them for next time."""
+    config_path = tmp_path / "bridgeData.yaml"
+    config_path.write_text("api_key: test\ndreamer_name: TestWorker\n", encoding="utf-8")
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    store.set_experience_level(ExperienceLevel.ADVANCED)
+    calls: list[int] = []
+
+    def _probe() -> list[KnownGpu]:
+        calls.append(1)
+        return [KnownGpu(index=0, name="Card A"), KnownGpu(index=1, name="Card B")]
+
+    app = HordeWorkerTUI(FakeSupervisor(), config_path=config_path, app_state_store=store, gpu_probe=_probe)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-config"
+        await pilot.pause()
+        editor = app.query_one(ConfigEditorView)
+        subtabs = editor.query_one("#config-subtabs", TabbedContent)
+        subtabs.active = "cfgtab-per-gpu"
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert editor.query("#gpuovr-1-max_threads")
+
+        subtabs.active = "cfgtab-dashboard"
+        await pilot.pause()
+        subtabs.active = "cfgtab-per-gpu"
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+
+    assert calls == [1]
+    saved = store.load().known_gpus
+    assert saved is not None and [gpu.index for gpu in saved.gpus] == [0, 1]
