@@ -378,22 +378,25 @@ def _prepare_runtime(options: WorkerLaunchOptions, *, supervised: bool = False) 
 
     os.environ["HORDE_SDK_DISABLE_CUSTOM_SINKS"] = "1"
 
-    # Spawned workers can't see the CLI -v count, so pass the operator's verbosity intent down
-    # via env (inherited across the spawn). Workers floor it at DEBUG; setdefault lets an
-    # explicitly-exported value win. See worker_entry_points.resolve_worker_log_verbosity.
-    from horde_worker_regen.process_management.worker_entry_points import WORKER_LOG_VERBOSITY_ENV
-
-    os.environ.setdefault(WORKER_LOG_VERBOSITY_ENV, str(options.verbosity))
-
     if options.worker_name:
         os.environ["AIWORKER_DREAMER_WORKER_NAME"] = options.worker_name
 
+    # Must run before anything imports horde_model_reference: its path singleton reads
+    # AIWORKER_CACHE_HOME at import, while spawned children import it after this sets the variable.
+    # Importing it first splits the orchestrator and its children across two cache roots.
     from horde_worker_regen.load_env_vars import load_env_vars_from_config
 
     if not options.load_config_from_env_vars:
         # Note: 'load_env_vars_from_config' means to translate the config file to environment variables
         # if 'load_config_from_env_vars' is True, then we are ignoring the config file
         load_env_vars_from_config()
+
+    # Spawned workers can't see the CLI -v count, so pass the operator's verbosity intent down
+    # via env (inherited across the spawn). Workers floor it at DEBUG; setdefault lets an
+    # explicitly-exported value win. See worker_entry_points.resolve_worker_log_verbosity.
+    from horde_worker_regen.process_management.worker_entry_points import WORKER_LOG_VERBOSITY_ENV
+
+    os.environ.setdefault(WORKER_LOG_VERBOSITY_ENV, str(options.verbosity))
 
     from horde_worker_regen.version_meta import do_version_check
 

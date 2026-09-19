@@ -10,6 +10,8 @@ LOWEST precedence, so the ladder is: user/system env var > config ``cache_home``
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -126,3 +128,62 @@ def test_huggingface_cache_untouched_without_a_cache_home(tmp_path: Path, monkey
     load_env_vars_from_config()
 
     assert os.environ["HF_HOME"] == str(tmp_path / "ambient")
+
+
+_PREPARE_RUNTIME_PROBE = """
+import sys
+
+import horde_worker_regen.load_env_vars as load_env_vars
+from horde_worker_regen import run_worker
+
+real_load = load_env_vars.load_env_vars_from_config
+
+
+class _StopAfterEnvLoad(Exception):
+    pass
+
+
+def _probe() -> None:
+    assert "horde_model_reference" not in sys.modules, "horde_model_reference imported before the config load"
+    real_load()
+    raise _StopAfterEnvLoad
+
+
+load_env_vars.load_env_vars_from_config = _probe
+try:
+    run_worker._prepare_runtime(run_worker.WorkerLaunchOptions())
+except _StopAfterEnvLoad:
+    pass
+
+from horde_model_reference.path_consts import horde_model_reference_paths
+
+print(horde_model_reference_paths.base_path)
+"""
+
+
+def test_worker_preflight_loads_config_before_model_reference_import(tmp_path: Path) -> None:
+    """The orchestrator's reference path lands under the same cache root its spawned children inherit.
+
+    horde_model_reference fixes its base path from AIWORKER_CACHE_HOME at import. An import ahead of the
+    config load pins the orchestrator to ``./models`` while children read the peered data dir, so the
+    download process finds no reference files and no model ever downloads. A fresh interpreter is needed
+    because this test session has already imported the package.
+    """
+    _write_bridge_data(tmp_path)
+    data_dir = tmp_path / "HordeWorker-data"
+    env = {key: value for key, value in os.environ.items() if key != "AIWORKER_CACHE_HOME"}
+    env["HORDE_WORKER_DATA_DIR"] = str(data_dir)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _PREPARE_RUNTIME_PROBE],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    base_path = Path(completed.stdout.strip().splitlines()[-1])
+    assert base_path == (data_dir / "models" / "horde_model_reference").resolve()
