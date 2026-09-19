@@ -58,7 +58,11 @@ from horde_worker_regen.tui.config_form import (
     validate_identity_names,
 )
 from horde_worker_regen.tui.config_presets import BUILT_IN_PRESETS, ConfigPreset, PresetChange, diff_preset
-from horde_worker_regen.tui.config_validation import ConfigValidationSeverity, validate_config_interlocks
+from horde_worker_regen.tui.config_validation import (
+    ConfigValidationIssue,
+    ConfigValidationSeverity,
+    validate_config_interlocks,
+)
 from horde_worker_regen.tui.responsive import ResponsiveModalScreen
 from horde_worker_regen.tui.widgets.custom_model_builder import CustomModelBuilderModal, CustomModelBuilderResult
 from horde_worker_regen.tui.widgets.experience import DashboardPreferencesView
@@ -117,6 +121,24 @@ The remaining pages are tuning surfaces. Their settings are interpretable only a
 measurements that would justify changing them, so this level does not offer them. The Dashboard page is
 always offered, since it is the route to a fuller view.
 """
+
+
+def _blocks_save(issue: ConfigValidationIssue, saved_issues: frozenset[ConfigValidationIssue]) -> bool:
+    """Whether an interlock finding blocks the save: an error the pending edits introduce.
+
+    An error the file already has is not made worse by this save, and refusing the save would strand an
+    operator who cannot fix it from here, such as a missing Civitai token on a remote dashboard, which
+    withholds the token field. Such an error is reported beside the warnings instead.
+    """
+    return issue.severity is ConfigValidationSeverity.ERROR and issue not in saved_issues
+
+
+def _advisory_text(issue: ConfigValidationIssue) -> str:
+    """A non-blocking finding's text, marking an error that is already in the saved file."""
+    if issue.severity is ConfigValidationSeverity.ERROR:
+        return f"{issue.message} (already in the saved file; does not block saving)"
+    return issue.message
+
 
 # Only fields whose section is bundled into a sub-tab get widgets in ``compose``. A section that is
 # absent from ``CONFIG_SUBTABS`` (e.g. the developer-only "Dry-run" flags, which stay editable via YAML
@@ -1050,15 +1072,16 @@ class ConfigEditorView(Vertical):
         gpu_dirty = gpu_editor.is_dirty() if gpu_editor is not None else False
         # The per-card editor validates and writes its own nested block; an error here aborts the save
         # alongside any flat-field error so the operator sees both at once.
+        saved_issues = frozenset(validate_config_interlocks(self._merged_config_state([])))
         gpu_errors = gpu_editor.apply_to(self._data) if gpu_editor is not None else []
         validation_issues = validate_config_interlocks(self._merged_config_state(coerced))
         interlock_errors = [
             (_FIELD_BY_KEY.get(issue.field_key, _FIELD_BY_KEY["dreamer"]), issue.message)
             for issue in validation_issues
-            if issue.severity is ConfigValidationSeverity.ERROR
+            if _blocks_save(issue, saved_issues)
         ]
         validation_warnings = [
-            issue.message for issue in validation_issues if issue.severity is ConfigValidationSeverity.WARNING
+            _advisory_text(issue) for issue in validation_issues if not _blocks_save(issue, saved_issues)
         ]
 
         if errors or identity_errors or gpu_errors or interlock_errors:
@@ -1462,8 +1485,9 @@ class ConfigEditorView(Vertical):
             target.update("")
             return
         target.display = True
-        errors = [issue.message for issue in issues if issue.severity is ConfigValidationSeverity.ERROR]
-        warnings = [issue.message for issue in issues if issue.severity is ConfigValidationSeverity.WARNING]
+        saved_issues = frozenset(validate_config_interlocks(self._merged_config_state([])))
+        errors = [issue.message for issue in issues if _blocks_save(issue, saved_issues)]
+        warnings = [_advisory_text(issue) for issue in issues if not _blocks_save(issue, saved_issues)]
         shown = errors[:3] if errors else warnings[:3]
         prefix = "Blocking config issue" if len(shown) == 1 else "Blocking config issues"
         style = "bold red"

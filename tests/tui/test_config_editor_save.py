@@ -442,6 +442,56 @@ async def test_interlock_validation_blocks_save_without_worker(tmp_path: Path) -
 
 
 @pytest.mark.e2e
+async def test_the_wizard_top_one_config_saves_without_a_civitai_token(tmp_path: Path) -> None:
+    """The model list the first-run wizard writes, with no token, saves an unrelated edit with a warning."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\nmodels_to_load:\n  - top 1\nmax_threads: 1\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-max_threads", Input).value = "2"
+        assert editor._save() is True
+        await pilot.pause()
+        assert "can pick Civitai-hosted models" in _plain(editor.query_one("#config-status", Static))
+
+    assert load_config(path)["max_threads"] == 2
+
+
+@pytest.mark.e2e
+async def test_an_error_already_in_the_file_does_not_block_an_unrelated_save(tmp_path: Path) -> None:
+    """LoRA on without a token, already saved, is reported but does not block saving another field."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\nallow_lora: true\nmax_threads: 1\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-max_threads", Input).value = "2"
+        assert editor._save() is True
+        await pilot.pause()
+        assert "already in the saved file" in _plain(editor.query_one("#config-status", Static))
+
+    assert load_config(path)["max_threads"] == 2
+
+
+@pytest.mark.e2e
+async def test_turning_lora_on_without_a_token_still_blocks(tmp_path: Path) -> None:
+    """An edit that introduces the LoRA-without-token error is refused, as before."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-allow_lora", Switch).value = True
+        assert editor._save() is False
+        await pilot.pause()
+
+    assert "allow_lora" not in load_config(path)
+
+
+@pytest.mark.e2e
 async def test_preset_changes_apply_to_live_form_before_save(tmp_path: Path) -> None:
     """Preset application updates widgets but still requires an explicit save."""
     app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\nmax_threads: 1\nqueue_size: 1\n')

@@ -84,9 +84,17 @@ no worker process is running. Persistent warnings stay visible above the tabs;
 blocking errors still stop the save and jump to the relevant tab. The guarded
 combinations include inpainting without img2img, SDXL ControlNet without
 ControlNet, post-processing enabled while the post-processing lane is off, LoRA
-or `TOP`/`ALL` model rules without a CivitAI token, both worker roles disabled,
-extra-slow mode combined with incompatible throughput settings, and exact model
-names present in both load and skip lists.
+without a CivitAI token, both worker roles disabled, extra-slow mode combined
+with incompatible throughput settings, and exact model names present in both
+load and skip lists. A `TOP`/`BOTTOM`/`ALL` model rule without a CivitAI token is
+a warning: the worker downloads without one, and only a selected Civitai-hosted
+model that requires a login fails. The token checks apply only while the dreamer
+role is on, since LoRA and the image model list serve image generation alone.
+
+Only an error the pending edits introduce blocks the save. An error already in
+the saved file is reported beside the warnings, because refusing the save cannot
+fix it and would strand an operator who cannot fix it from the editor, such as a
+missing token on a remote dashboard that withholds credential fields.
 
 The **Apply preset** action offers built-in hardware starting points (for example
 4090/64 GB SDXL balanced, 4090/64 GB large-model, 2080/32 GB SD1.5-safe, and

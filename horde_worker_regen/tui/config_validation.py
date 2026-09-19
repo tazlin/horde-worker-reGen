@@ -98,13 +98,21 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
     if _str(config, "dedicated_post_processing") == "off" and _bool(config, "allow_post_processing"):
         error("dedicated_post_processing", "Post-processing lane mode 'off' also disables offered post-processing.")
 
-    civitai_token = _str(config, "civitai_api_token")
-    if _bool(config, "allow_lora") and not civitai_token:
-        error("allow_lora", "Offering LoRA jobs requires a CivitAI API token.")
-
     models_to_load = _list(config, "models_to_load")
-    if _uses_meta_command(models_to_load) and not civitai_token:
-        error("models_to_load", "TOP/BOTTOM/ALL model load rules require a CivitAI API token.")
+    civitai_token = _str(config, "civitai_api_token")
+    # LoRA jobs and the image model list serve only image generation; the worker clears the model list when
+    # the dreamer role is off, so a text- or alchemy-only worker is never asked for a token it cannot use.
+    if _bool(config, "dreamer") and not civitai_token:
+        if _bool(config, "allow_lora"):
+            error("allow_lora", "Offering LoRA jobs requires a CivitAI API token.")
+        # A warning, not an error: the worker downloads without a token, and only a selected model hosted
+        # on Civitai behind a login fails. Which models a popularity rule picks changes with the horde's usage.
+        if _uses_meta_command(models_to_load):
+            warning(
+                "models_to_load",
+                "TOP/BOTTOM/ALL model load rules can pick Civitai-hosted models; those that require a login "
+                "will not download without a CivitAI API token.",
+            )
 
     if not _bool(config, "dreamer") and not _bool(config, "alchemist") and not _bool(config, "scribe"):
         error("dreamer", "Enable Dreamer image generation, Alchemist or Scribe; all off serves nothing.")

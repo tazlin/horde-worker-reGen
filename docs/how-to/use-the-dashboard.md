@@ -378,7 +378,9 @@ Saving writes only the fields you changed. Values you never touched, including s
 at their default, are left exactly as they are on disk, so a no-op Save changes nothing at all. An
 out-of-range value blocks the save, lists every problem at once, and jumps to the first offending
 field. A value that was already invalid on disk and that you did not touch never blocks an unrelated
-change.
+change. The same holds for conflicting settings: a conflict already in the saved file (LoRA on without a
+Civitai token, say) is listed beside the warnings, and only a conflict your edit introduces blocks the
+save.
 
 The tab also holds a models editor and a searchable model picker: search across name, description,
 tags, and triggers, filter by baseline, by SFW/NSFW/inpainting, and by on-disk status, sort by any

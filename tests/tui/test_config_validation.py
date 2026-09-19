@@ -33,15 +33,24 @@ def test_hard_feature_interlocks_block_save() -> None:
     assert any("lane mode 'off'" in message for message in errors)
 
 
-def test_lora_and_meta_commands_require_civitai_token() -> None:
-    """LoRA and TOP/ALL model selectors are blocked without a CivitAI token."""
-    errors = _messages(
-        {"allow_lora": True, "models_to_load": ["top 2"], "dreamer": True},
-        ConfigValidationSeverity.ERROR,
-    )
+def test_lora_requires_civitai_token_and_meta_commands_warn() -> None:
+    """Without a CivitAI token, LoRA is an error and a TOP/ALL model selector only a warning."""
+    config: dict[str, object] = {"allow_lora": True, "models_to_load": ["top 2"], "dreamer": True}
+    errors = _messages(config, ConfigValidationSeverity.ERROR)
+    warnings = _messages(config, ConfigValidationSeverity.WARNING)
 
     assert any("LoRA jobs requires" in message for message in errors)
-    assert any("model load rules require" in message for message in errors)
+    assert not any("model load rules" in message for message in errors)
+    assert any("model load rules can pick Civitai-hosted models" in message for message in warnings)
+
+
+def test_civitai_token_is_not_asked_of_a_worker_without_image_generation() -> None:
+    """With the dreamer role off, neither the LoRA flag nor the model list raises a token finding."""
+    issues = validate_config_interlocks(
+        {"allow_lora": True, "models_to_load": ["top 1"], "dreamer": False, "scribe": True},
+    )
+
+    assert not [issue for issue in issues if "CivitAI" in issue.message]
 
 
 def test_extra_slow_conflicts_are_errors() -> None:
