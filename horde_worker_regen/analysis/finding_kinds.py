@@ -97,6 +97,7 @@ class FindingKind(enum.StrEnum):
     POP_LIVENESS_FULL_QUEUE = "pop_liveness_full_queue"
     PARENT_LOOP_STALL = "parent_loop_stall"
     LANE_PLACEMENT = "lane_placement"
+    UTILITIES_LANE_BRINGUP_TIMEOUT = "utilities_lane_bringup_timeout"
 
     FORCED_MAINTENANCE = "forced_maintenance"
     CONSECUTIVE_FAILURE_PAUSE = "consecutive_failure_pause"
@@ -552,6 +553,22 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "memory and duty change with them."
         ),
         see_also=FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
+    ),
+    FindingSpec(
+        kind=FindingKind.UTILITIES_LANE_BRINGUP_TIMEOUT,
+        title="Image utilities ran out of time starting up",
+        action=(
+            "The worker starts it again by itself and a later attempt usually succeeds, once the files it "
+            "reads are cached. If every attempt ran out of time, read the image utilities log for what it "
+            "was loading. Turn off `enable_image_utilities` to stop offering the jobs it serves."
+        ),
+        detail=(
+            "Image utilities runs as a separate program and the worker waits for it to answer a health "
+            "check. It loads its whole image stack before it can answer. That is slow the first time after "
+            "a reboot and quick once those files are cached. When the wait runs out the worker stops it and "
+            "starts a new one, losing the loading already done. Control map and background removal jobs "
+            "cannot run until it answers."
+        ),
     ),
     # --- Pops, faults, and the horde ---
     FindingSpec(

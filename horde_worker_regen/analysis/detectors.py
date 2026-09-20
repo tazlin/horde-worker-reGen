@@ -2757,6 +2757,9 @@ _SAFETY_GPU_DEVICE_INDEX = 0
 this is the only way to reason about what shares a card with it."""
 
 _AUX_LANE_SAFETY_SHARING_RE = pattern_for("auxiliary_lane_safety_sharing")
+_UTILITIES_BRINGUP_FAILED_RE = pattern_for("utilities_bringup_failed")
+_UTILITIES_BRINGUP_HEALTHY_RE = pattern_for("utilities_bringup_healthy")
+_UTILITIES_LANE_STARTED_RE = pattern_for("utilities_lane_started")
 """The worker's own edge-triggered disclosure that safety came back to a card a pinned lane holds.
 
 It corroborates the stacking the occupancy map already shows, and it carries what the map cannot: the
@@ -2820,6 +2823,71 @@ def detect_lane_placement(context: SessionContext) -> list[Finding]:
             severity=Severity.WARNING,
             headline=verdict_parts[0],
             evidence=verdict_parts[1:] + evidence,
+        ),
+    ]
+
+
+def detect_utilities_lane_bringup_timeout(context: SessionContext) -> list[Finding]:
+    """The image-utilities lane's health wait expiring before its capability service could answer.
+
+    The service must import its whole image stack before uvicorn binds a port, so a start against a cold
+    file cache can outlast the launcher's fixed startup budget while it is still making progress. The
+    launcher then kills it, throwing that loading away, and the lane restarts from nothing. The kills warm
+    the file cache, so a later attempt usually wins the same race; the cost is the lane's features being
+    unavailable throughout, and each replacement counting against the session's process recoveries.
+
+    Reported from the parent log alone: the timeout line names neither what the service was loading nor how
+    far it got, which live in the lane's own console file, so the evidence points the reader at it.
+    """
+    records = context.session.records
+    timeouts = _matching(records, _UTILITIES_BRINGUP_FAILED_RE)
+    if not timeouts:
+        return []
+
+    healthy = _matching(records, _UTILITIES_BRINGUP_HEALTHY_RE)
+    starts = _matching(records, _UTILITIES_LANE_STARTED_RE)
+    last_timeout = timeouts[-1].timestamp
+    # The recovery is the first healthy report *after* the last expiry, not merely any healthy report: a
+    # program that came up, was restarted later and then timed out has not recovered from that timeout.
+    recovery = next(
+        (
+            record
+            for record in healthy
+            if record.timestamp is not None and last_timeout is not None and record.timestamp > last_timeout
+        ),
+        None,
+    )
+    recovered = recovery is not None or (bool(healthy) and last_timeout is None)
+
+    # How long the features were unavailable: the first expiry until the program answered, or until the
+    # last expiry when it never did. A later restart's own healthy report is outside that span.
+    first_timeout = timeouts[0].timestamp
+    span_end = recovery.timestamp if recovery is not None else last_timeout
+    lost_seconds = (span_end - first_timeout).total_seconds() if first_timeout and span_end else 0.0
+    lost_clause = f", over {lost_seconds / 60:.0f} minutes" if lost_seconds >= 90 else ""
+
+    attempts = "once" if len(timeouts) == 1 else f"{len(timeouts)} times"
+    if recovered:
+        headline = f"Image utilities ran out of time starting {attempts} before it came up{lost_clause}."
+    else:
+        headline = f"Image utilities ran out of time starting {attempts} and never came up{lost_clause}."
+
+    narrative = [f"Starts: {len(starts)}. Timed out: {len(timeouts)}. Reported healthy: {len(healthy)}."]
+    if not recovered:
+        narrative.append(
+            "Nothing reported healthy after the last time it ran out, so the features it serves were "
+            "unavailable for the rest of the session.",
+        )
+    narrative.append('The program\'s own output is in the log file named "bridge_utilities_<slot>.log".')
+
+    evidence = timeouts[:2] + ([recovery] if recovery is not None else [])
+    return [
+        Finding(
+            kind=FindingKind.UTILITIES_LANE_BRINGUP_TIMEOUT,
+            severity=Severity.WARNING,
+            headline=headline,
+            evidence=narrative + [_evidence(record) for record in evidence],
+            see_also=FindingKind.SESSION_SUMMARY,
         ),
     ]
 
@@ -2985,6 +3053,7 @@ DETECTORS: list[Detector] = [
     detect_parent_loop_stall,
     detect_model_churn,
     detect_lane_placement,
+    detect_utilities_lane_bringup_timeout,
     detect_safety_stage_stall,
     detect_safety_stage_capacity,
     detect_whole_card_convergence_wedge,

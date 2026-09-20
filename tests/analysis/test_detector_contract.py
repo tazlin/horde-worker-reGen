@@ -72,6 +72,7 @@ from tests.analysis.test_job_lifecycle import (
     safety_lane_started,
     startup_line,
     status_block,
+    utilities_lane_started,
 )
 
 # --- Golden lines for detectors whose trigger is not already a reusable helper in test_detectors. ---
@@ -205,6 +206,24 @@ def _lifecycle_job_id(index: int) -> str:
     return f"{index:08x}-0000-4000-8000-000000000000"
 
 
+def _utilities_bringup_timed_out(ts: str) -> str:
+    """utilities_adapter._bringup_loop: the capability service's launcher gave up waiting for health."""
+    return (
+        f"2026-09-09 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.utilities_adapter:"
+        "_bringup_loop:316 - Image utilities service failed to become healthy: TimeoutError Capability "
+        "service did not become healthy within 60.0s."
+    )
+
+
+def _utilities_bringup_healthy(ts: str) -> str:
+    """message_dispatcher._dispatch_buffered_message: the lane's own healthy state change, relayed."""
+    return (
+        f"2026-09-09 {ts} | DEBUG    | horde_worker_regen.process_management.ipc.message_dispatcher:"
+        "_dispatch_buffered_message:640 - Received HordeProcessStateChangeMessage from process 2: "
+        "Image utilities service healthy"
+    )
+
+
 @dataclass
 class Contract:
     """A detector paired with a golden log that must make it fire, and the severity it must report."""
@@ -322,6 +341,18 @@ CONTRACTS: dict[str, Contract] = {
             post_process_lane_started(_lifecycle_stamp(2), process=1, device=2),
             inference_lane_started(_lifecycle_stamp(3), process=3, device=1),
             post_process_lane_started(_lifecycle_stamp(600), process=1, device=0),
+        ),
+        severity=Severity.WARNING,
+    ),
+    "detect_utilities_lane_bringup_timeout": Contract(
+        # The image-utilities lane's health wait expiring twice before the third service answered.
+        bridge=_lifecycle_bridge(
+            utilities_lane_started(_lifecycle_stamp(0), process=2, device=0),
+            _utilities_bringup_timed_out(_lifecycle_stamp(61)),
+            utilities_lane_started(_lifecycle_stamp(62), process=2, device=0),
+            _utilities_bringup_timed_out(_lifecycle_stamp(123)),
+            utilities_lane_started(_lifecycle_stamp(124), process=2, device=0),
+            _utilities_bringup_healthy(_lifecycle_stamp(158)),
         ),
         severity=Severity.WARNING,
     ),

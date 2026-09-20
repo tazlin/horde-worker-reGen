@@ -70,6 +70,7 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 | `pop_liveness_full_queue` | critical | The queue was full and nothing moved: no job started and none finished. | The most severe stall signal there is. Read it with the dispatch or process finding beside it, and report it with the log around the freeze. |
 | `parent_loop_stall` | varies | The main process stopped reading its workers' messages for longer than the status cadence allows. Nothing starts, finishes or is sent back meanwhile. | Run `horde-log timeline` over the gap to see what the main process was doing just before it went quiet, then report it. |
 | `lane_placement` | warning | A helper process (safety, post-processing, utilities) restarted onto a different card, or several stacked onto one card while others were free. | Compare that card's duty and free VRAM with the rest before reading its low duty as a GPU problem. Pin the helpers if the move was not intended. |
+| `utilities_lane_bringup_timeout` | warning | The image-utilities lane's capability service did not answer its health check before the launcher's startup budget ran out, so the lane was killed and started again. | The worker retries by itself and a later attempt usually wins once the file cache is warm. If every attempt timed out, read the lane's own console log. `enable_image_utilities` turns the lane off. |
 
 ## Pops, faults, and the horde
 

@@ -68,8 +68,13 @@ defines the structured protocol over it:
   and Stats tab do not read zero while its own counters climb. Each flow contributes its delivered submits
   plus its fault reports, matching what the image job tracker's movement counter means; the same totals feed
   the stats sample and the durable `WorkerRunRecord`, which is what judges a session productive.
+  `num_process_recoveries` counts the child processes the session has replaced and only ever rises, so
+  `last_process_recovery_time` and `last_process_recovery_lane` travel beside it: without them a frontend
+  cannot tell a lane cycling now from one replaced once at startup, and the bounded event ring below has
+  evicted a startup recovery long before the session ends. The dashboard's health checklist reads the pair
+  to warn while a replacement is recent and report the count as information afterwards.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 29) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 30) so a frontend can detect a mismatch with a worker built from different code.
 
 ### The event ring
 

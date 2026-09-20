@@ -74,6 +74,9 @@ _NOT_DETERMINISTIC = (
     "reachable only through a scheduling race a short deterministic run cannot be relied on to produce"
 )
 _SAFETY_PLACEMENT_NOT_EXERCISED = "the dry-run harness never pauses or restores the safety process's GPU placement"
+_UTILITIES_LANE_NOT_EXERCISED = (
+    "the image-utilities lane runs an out-of-venv capability service the dry-run harness does not launch"
+)
 _WHOLE_CARD_NOT_EXERCISED = (
     "reachable only with a whole-card-class model (e.g. Flux fp8) and a multi-process pool, which the "
     "dry-run harness's fake models never trigger"
@@ -207,6 +210,23 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"Started image utilities process \(id: (?P<process>\d+), device_index: (?P<device>\d+)\)",
         emitter="process_management.lifecycle.process_lifecycle:start_utilities_processes",
         sample="Started image utilities process (id: 2, device_index: 1)",
+    ),
+    _signature(
+        "utilities_bringup_failed",
+        r"Image utilities service failed to become healthy: (?P<error>\S+)",
+        emitter="process_management.lifecycle.utilities_adapter:_bringup_loop",
+        sample=(
+            "Image utilities service failed to become healthy: TimeoutError Capability service did not "
+            "become healthy within 60.0s."
+        ),
+        dry_run_reason=_UTILITIES_LANE_NOT_EXERCISED,
+    ),
+    _signature(
+        "utilities_bringup_healthy",
+        r"from process (?P<process>\d+): Image utilities service healthy",
+        emitter="process_management.lifecycle.utilities_adapter:_bringup_loop",
+        sample="Received HordeProcessStateChangeMessage from process 2: Image utilities service healthy",
+        dry_run_reason=_UTILITIES_LANE_NOT_EXERCISED,
     ),
     _signature(
         "safety_lane_started",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.health import (
+    PROCESS_RECOVERY_WARN_SECONDS,
     TEXT_BACKEND_CHECK_NAME,
     TEXT_GENERATION_CHECK_NAME,
     HealthCheck,
@@ -449,6 +451,68 @@ def test_checks_cover_core_dimensions() -> None:
     )
     names = {check.name for check in report.checks}
     assert {"API", "Disk", "Job health"} <= names
+
+
+def test_no_process_recovery_check_without_a_recovery() -> None:
+    """A session that has replaced no process gets no 'Processes' row at all."""
+    report = derive(_snapshot(processes=[_process("WAITING_FOR_JOB")]), SupervisorStatus.RUNNING, 0.5)
+    assert all(check.name != "Processes" for check in report.checks)
+    job_health = next(check for check in report.checks if check.name == "Job health")
+    assert job_health.status is HealthStatus.OK
+
+
+def test_process_recovery_does_not_report_as_job_health() -> None:
+    """A replaced lane leaves 'Job health' OK and reports under its own name instead."""
+    now = time.time()
+    report = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            timestamp=now,
+            num_process_recoveries=6,
+            last_process_recovery_time=now - 30.0,
+            last_process_recovery_lane="image utilities",
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    job_health = next(check for check in report.checks if check.name == "Job health")
+    assert job_health.status is HealthStatus.OK
+
+    recoveries = next(check for check in report.checks if check.name == "Processes")
+    assert recoveries.status is HealthStatus.WARN
+    assert "6 process recoveries this session" in recoveries.detail
+    assert "image utilities" in recoveries.detail
+
+
+def test_process_recovery_stops_warning_once_it_is_old() -> None:
+    """Past the warn window the recovery count is reported as information, not a live warning."""
+    now = time.time()
+    report = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            timestamp=now,
+            num_process_recoveries=1,
+            last_process_recovery_time=now - PROCESS_RECOVERY_WARN_SECONDS - 1.0,
+            last_process_recovery_lane="image utilities",
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    recoveries = next(check for check in report.checks if check.name == "Processes")
+    assert recoveries.status is HealthStatus.INFO
+    assert "1 process recovery this session" in recoveries.detail
+
+
+def test_process_recovery_without_a_recorded_time_is_informational() -> None:
+    """A count from a worker too old to report the instant is shown without a false 'happening now'."""
+    report = derive(
+        _snapshot(processes=[_process("WAITING_FOR_JOB")], num_process_recoveries=3),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    recoveries = next(check for check in report.checks if check.name == "Processes")
+    assert recoveries.status is HealthStatus.INFO
+    assert recoveries.detail == "3 process recoveries this session"
 
 
 def test_api_check_folds_reachability_and_registration() -> None:

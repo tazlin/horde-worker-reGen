@@ -491,6 +491,8 @@ class ProcessLifecycleManager:
 
     num_processes_launched: int
     _num_process_recoveries: int
+    _last_process_recovery_time: float | None
+    _last_process_recovery_lane: HordeProcessType | None
     _safety_processes_should_be_replaced: bool
     _safety_processes_ending: bool
     _post_process_processes_should_be_replaced: bool
@@ -658,6 +660,8 @@ class ProcessLifecycleManager:
 
         self.num_processes_launched = 0
         self._num_process_recoveries = 0
+        self._last_process_recovery_time = None
+        self._last_process_recovery_lane = None
         self._num_slowdown_events = 0
         # Count of inference slots replaced as the reclaim ladder's last rung (a crawling sampler on a card
         # that has been SATURATED past the kill horizon with every softer reclaim rung exhausted). Surfaced on
@@ -865,22 +869,29 @@ class ProcessLifecycleManager:
     def _count_process_recovery(
         self,
         *,
+        lane: HordeProcessType,
         reason: str | None,
         process_id: int | None = None,
         device_index: int | None = None,
     ) -> None:
-        """Count one recovered process and record it on the event ring.
+        """Count one recovered process, note when and where, and record it on the event ring.
 
         The single place the recovery count rises, so a surface reading the ring and one reading the count
         cannot disagree about how much a session has recovered. A service lane rebuilt as a whole has
         neither a slot id nor a reason of its own, and passes None for both rather than a manufactured one.
 
+        The count alone is monotonic for the session, so a reader cannot tell a lane cycling now from one
+        replaced once at startup; the instant and the lane recorded here are what let it tell them apart.
+
         Args:
+            lane: Which kind of process was replaced.
             reason: Why the process was replaced, or None where the site has no reason to give.
             process_id: The worker's own id for the replaced slot, or None for a whole-lane rebuild.
             device_index: The card the slot was pinned to, where the site knows it.
         """
         self._num_process_recoveries += 1
+        self._last_process_recovery_time = time.time()
+        self._last_process_recovery_lane = lane
         if self._event_sink is None:
             return
         self._event_sink(
@@ -1591,7 +1602,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._post_process_replacement_intentional = False
             else:
-                self._count_process_recovery(reason=None)
+                self._count_process_recovery(lane=HordeProcessType.POST_PROCESS, reason=None)
 
     @property
     def post_process_processes_should_be_replaced(self) -> bool:
@@ -1829,7 +1840,7 @@ class ProcessLifecycleManager:
                 # commit-charge reset is not read as a crash loop.
                 self._utilities_replacement_intentional = False
             else:
-                self._count_process_recovery(reason=None)
+                self._count_process_recovery(lane=HordeProcessType.UTILITIES, reason=None)
 
     @property
     def utilities_processes_should_be_replaced(self) -> bool:
@@ -1992,7 +2003,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._component_lane_replacement_intentional = False
             else:
-                self._count_process_recovery(reason=None)
+                self._count_process_recovery(lane=HordeProcessType.COMPONENT, reason=None)
 
     def component_lane_enabled(self) -> bool:
         """Whether the dedicated component (text-encode) lane should run (public view of the config gate)."""
@@ -2206,7 +2217,7 @@ class ProcessLifecycleManager:
                 # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
                 self._vae_lane_replacement_intentional = False
             else:
-                self._count_process_recovery(reason=None)
+                self._count_process_recovery(lane=HordeProcessType.VAE_LANE, reason=None)
 
     @property
     def vae_lane_processes_should_be_replaced(self) -> bool:
@@ -3541,7 +3552,7 @@ class ProcessLifecycleManager:
             else:
                 self._safety_replacement_intentional = False
                 self._safety_replacement_intentional_until_ready = False
-                self._count_process_recovery(reason=None)
+                self._count_process_recovery(lane=HordeProcessType.SAFETY, reason=None)
                 self._record_safety_recovery()
 
     def _safety_replacement_is_suppressed(self) -> bool:
@@ -3869,6 +3880,8 @@ class ProcessLifecycleManager:
         spanning levels is still caught.
         """
         self._num_process_recoveries = 0
+        self._last_process_recovery_time = None
+        self._last_process_recovery_lane = None
         self._num_slowdown_events = 0
         self._paging_victim_replacements = 0
 
@@ -4277,6 +4290,7 @@ class ProcessLifecycleManager:
 
         self._end_inference_process(process_info, join_deadline=end_join_deadline)
         self._count_process_recovery(
+            lane=process_info.process_type,
             reason=recovery_reason,
             process_id=process_info.process_id,
             device_index=process_info.device_index,

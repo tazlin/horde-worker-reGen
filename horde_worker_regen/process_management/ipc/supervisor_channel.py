@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 29
+SUPERVISOR_PROTOCOL_VERSION = 30
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -127,6 +127,11 @@ recorded where the finished-job records are, so it and ``recent_jobs`` cannot di
 v29 adds ``text_backend_credentials_refused``: the text backend answered and refused the worker's
 credentials, which the dashboard reports at once with its own remedy instead of as a backend that is
 late.
+v30 adds ``last_process_recovery_time`` and ``last_process_recovery_lane``, which say when the session's
+most recent process recovery happened and which lane it replaced. ``num_process_recoveries`` beside them
+only ever rises, so a frontend reading it alone cannot tell a lane cycling now from one replaced once at
+startup, and reports the latter for the rest of the run. The bounded ``recent_events`` ring cannot answer
+this either: it evicts a startup recovery within the first minutes of ordinary work.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -1633,6 +1638,13 @@ class WorkerStateSnapshot(BaseModel):
     num_jobs_faulted: int = 0
     num_job_slowdowns: int = 0
     num_process_recoveries: int = 0
+    last_process_recovery_time: float | None = None
+    """Worker wall clock of the most recent counted recovery; None until a process has been replaced.
+
+    On the same clock as :attr:`timestamp`, so a reader takes the age by subtracting the two rather than
+    against its own clock, which a remote frontend does not share."""
+    last_process_recovery_lane: str | None = None
+    """Which lane that recovery replaced, in operator words ("image utilities", "inference slot")."""
     pending_megapixelsteps: int = 0
     jobs_pending_inference: int = 0
     jobs_in_progress: int = 0

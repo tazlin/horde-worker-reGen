@@ -2273,3 +2273,90 @@ class TestDedicatedPostProcessMarkers:
             # The child reading has to fall inside the session, which ends at the last parent record.
         )
         assert "post_processing_vram_stall" not in findings
+
+
+class TestUtilitiesLaneBringupTimeout:
+    """The image-utilities lane's health wait expiring before its capability service answered."""
+
+    @staticmethod
+    def _bridge(*lines: str) -> str:
+        return "\n".join([f"2026-06-25 07:50:00.000 | INFO | x:y:1 - {_STARTUP}", *lines]) + "\n"
+
+    @staticmethod
+    def _started(ts: str) -> str:
+        return (
+            f"2026-06-25 {ts} | INFO     | horde_worker_regen.process_management.lifecycle.process_lifecycle:"
+            "start_utilities_processes:1781 - Started image utilities process (id: 2, device_index: 0)"
+        )
+
+    @staticmethod
+    def _timed_out(ts: str) -> str:
+        return (
+            f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.utilities_adapter:"
+            "_bringup_loop:316 - Image utilities service failed to become healthy: TimeoutError Capability "
+            "service did not become healthy within 60.0s."
+        )
+
+    @staticmethod
+    def _healthy(ts: str) -> str:
+        return (
+            f"2026-06-25 {ts} | DEBUG    | horde_worker_regen.process_management.ipc.message_dispatcher:"
+            "_dispatch_buffered_message:640 - Received HordeProcessStateChangeMessage from process 2: "
+            "Image utilities service healthy"
+        )
+
+    def test_a_lane_that_never_times_out_reports_nothing(self, tmp_path: Path) -> None:
+        """A lane that answers its health check on the first attempt is not worth a finding."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(self._started("07:50:16.000"), self._healthy("07:50:25.000")),
+        )
+        assert "utilities_lane_bringup_timeout" not in findings
+
+    def test_timeouts_before_a_healthy_lane_report_that_it_came_up(self, tmp_path: Path) -> None:
+        """Two expired waits followed by a healthy lane: the retries won, and the headline says so."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                self._started("07:50:16.000"),
+                self._timed_out("07:51:17.000"),
+                self._started("07:51:18.000"),
+                self._timed_out("07:52:19.000"),
+                self._started("07:52:20.000"),
+                self._healthy("07:52:59.000"),
+            ),
+        )
+        finding = findings["utilities_lane_bringup_timeout"]
+        assert finding.severity is Severity.WARNING
+        assert "2 times before it came up" in finding.headline
+        # The span is the first expiry to the recovery, not the whole stretch of restarts.
+        assert "over 2 minutes" in finding.headline
+
+    def test_a_lane_that_never_answers_says_so(self, tmp_path: Path) -> None:
+        """With no healthy report after the last timeout the features stay unavailable, and the copy says it."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                self._started("07:50:16.000"),
+                self._timed_out("07:51:17.000"),
+                self._started("07:51:18.000"),
+                "2026-06-25 07:52:30.000 | INFO | x:y:1 - still working",
+            ),
+        )
+        finding = findings["utilities_lane_bringup_timeout"]
+        assert "never came up" in finding.headline
+        assert any("unavailable for the rest of the session" in line for line in finding.evidence)
+
+    def test_a_healthy_lane_before_the_last_timeout_does_not_count_as_recovery(self, tmp_path: Path) -> None:
+        """A lane that came up and then timed out on a later restart has not recovered from that timeout."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                self._started("07:50:16.000"),
+                self._healthy("07:50:25.000"),
+                self._started("07:51:18.000"),
+                self._timed_out("07:52:19.000"),
+                "2026-06-25 07:52:30.000 | INFO | x:y:1 - still working",
+            ),
+        )
+        assert "never came up" in findings["utilities_lane_bringup_timeout"].headline

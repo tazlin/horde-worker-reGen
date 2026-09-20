@@ -42,6 +42,13 @@ healthy WAN transfer. Applied via :func:`_stale_threshold`."""
 IDLE_SECONDS = 600.0
 """No work for this long is treated as an idle/low-demand state rather than active serving."""
 
+PROCESS_RECOVERY_WARN_SECONDS = 600.0
+"""A process replaced within this long still reads as something happening now.
+
+The session's recovery count never falls, so severity has to come from the last replacement's age or the
+dashboard warns for the rest of the run over a lane that came back at startup. Past the window the count
+is reported as information, which keeps the history visible without standing in for a live problem."""
+
 _DISK_FLOOR_BYTES = 20 * 1024**3
 
 _INFERENCE_STATES = frozenset(
@@ -542,12 +549,12 @@ def _build_checks(
         checks.append(
             HealthCheck("Job health", HealthStatus.WARN, f"{snapshot.consecutive_failed_jobs} consecutive failure(s)")
         )
-    elif snapshot.num_process_recoveries > 0:
-        checks.append(
-            HealthCheck("Job health", HealthStatus.WARN, f"{snapshot.num_process_recoveries} process recover(ies)")
-        )
     else:
         checks.append(HealthCheck("Job health", HealthStatus.OK, "OK"))
+
+    recovery_check = _process_recovery_check(snapshot)
+    if recovery_check is not None:
+        checks.append(recovery_check)
 
     skips = summarize_skips(snapshot.last_pop_skipped_reasons)
     if skips:
@@ -562,6 +569,32 @@ def _build_checks(
         checks.append(HealthCheck("Responsiveness", status, f"Last update {human_duration(snapshot_age)} ago"))
 
     return checks
+
+
+def _process_recovery_check(snapshot: WorkerStateSnapshot) -> HealthCheck | None:
+    """Report the child processes this session has replaced, or None while it has replaced none.
+
+    Its own check rather than a branch of the job-failure one: a replaced lane is not a failed job, and
+    reporting it under that name sent operators looking through job diagnostics that had nothing to show.
+    The count only ever rises, so severity follows how recently the last replacement happened: a lane that
+    is cycling now is worth attention, while a startup replacement the worker recovered from hours ago is
+    history, and keeping it at WARN would leave the dashboard's headline warning for the rest of the run.
+    """
+    if snapshot.num_process_recoveries <= 0:
+        return None
+
+    count = snapshot.num_process_recoveries
+    detail = f"{count} process {'recovery' if count == 1 else 'recoveries'} this session"
+
+    last = snapshot.last_process_recovery_time
+    if last is None:
+        return HealthCheck("Processes", HealthStatus.INFO, detail)
+
+    age = max(0.0, snapshot.timestamp - last)
+    lane = snapshot.last_process_recovery_lane
+    detail = f"{detail}; last {human_duration(age)} ago{f' ({lane})' if lane else ''}"
+    status = HealthStatus.WARN if age <= PROCESS_RECOVERY_WARN_SECONDS else HealthStatus.INFO
+    return HealthCheck("Processes", status, detail)
 
 
 def _api_check(

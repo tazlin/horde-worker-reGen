@@ -88,6 +88,28 @@ class HordeProcessType(enum.Enum):
     It holds the annotator/background-removal stack away from the worker's main environment and answers over
     loopback HTTP. See ``lifecycle/utilities_adapter.py``."""
 
+    @property
+    def display_name(self) -> str:
+        """The lane's name in the words an operator uses for it.
+
+        The enum names are lifecycle vocabulary (``VAE_LANE``, ``POST_PROCESS``); a surface that tells a
+        reader which lane something happened to needs the words the docs and the dashboard use instead.
+        """
+        return _PROCESS_TYPE_DISPLAY_NAMES[self]
+
+
+_PROCESS_TYPE_DISPLAY_NAMES: dict[HordeProcessType, str] = {
+    HordeProcessType.INFERENCE: "inference slot",
+    HordeProcessType.SAFETY: "safety",
+    HordeProcessType.DOWNLOAD: "download",
+    HordeProcessType.TEXT_BACKEND: "text backend",
+    HordeProcessType.POST_PROCESS: "post-processing",
+    HordeProcessType.COMPONENT: "component lane",
+    HordeProcessType.VAE_LANE: "VAE lane",
+    HordeProcessType.UTILITIES: "image utilities",
+}
+"""Operator-facing name per process type, backing :attr:`HordeProcessType.display_name`."""
+
 
 ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES: frozenset[HordeProcessType] = frozenset(
     {
