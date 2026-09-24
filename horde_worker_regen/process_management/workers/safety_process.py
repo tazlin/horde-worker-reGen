@@ -691,12 +691,15 @@ class HordeSafetyProcess(HordeProcess):
     def unload_transient_models_from_ram(self) -> None:
         """Discard optional alchemy companions while retaining the safety lane's base models."""
         if not self._dry_run_skip_safety:
-            caption_model = self._interrogator.caption_model  # type: ignore[attr-defined]
-            if caption_model is not None:
-                self._interrogator.caption_model = None  # type: ignore[attr-defined]
-                del caption_model
-            self._interrogator.caption_offloaded = False  # type: ignore[attr-defined]
-            self._caption_model_loaded = False
+            # ``get_interrogator_no_blip`` builds the interrogator without ever assigning ``caption_model``.
+            # The attribute exists only after ``_ensure_caption_model`` has run for a caption form.
+            if self._caption_model_loaded:
+                caption_model = self._interrogator.caption_model  # type: ignore[attr-defined]
+                if caption_model is not None:
+                    self._interrogator.caption_model = None  # type: ignore[attr-defined]
+                    del caption_model
+                self._interrogator.caption_offloaded = False  # type: ignore[attr-defined]
+                self._caption_model_loaded = False
             self._label_tables.clear()
             self._ranking_lists = None
             self._aesthetic_scorer = None

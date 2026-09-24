@@ -133,6 +133,53 @@ def test_ram_unload_discards_optional_cpu_alchemy_models_but_keeps_clip() -> Non
     )
 
 
+def test_ram_unload_tolerates_an_interrogator_that_never_loaded_a_caption_model() -> None:
+    """``get_interrogator_no_blip`` never assigns ``caption_model``; the unload still completes and reports."""
+    clip = _MovableModel()
+    process = HordeSafetyProcess.__new__(HordeSafetyProcess)
+    process._dry_run_skip_safety = False
+    process._safety_device = "cpu"
+    process._caption_model_loaded = False
+    process._interrogator = type("FakeInterrogator", (), {"clip_model": clip})()
+    process._label_tables = {"mediums": object()}
+    process._ranking_lists = {"mediums": ["photo"]}
+    process._aesthetic_scorer = Mock()
+    process.send_process_state_change_message = Mock()  # type: ignore[method-assign]
+    process.send_memory_report_message = Mock()  # type: ignore[method-assign]
+
+    process.unload_transient_models_from_ram()
+
+    assert process._interrogator.clip_model is clip  # type: ignore[attr-defined]
+    assert process._caption_model_loaded is False
+    assert process._label_tables == {}
+    assert process._aesthetic_scorer is None
+    process.send_process_state_change_message.assert_any_call(  # type: ignore[attr-defined]
+        process_state=HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+        info="Unloaded transient safety/alchemy models from RAM",
+    )
+    process.send_process_state_change_message.assert_called_with(  # type: ignore[attr-defined]
+        HordeProcessState.WAITING_FOR_JOB,
+        "Waiting for job",
+    )
+
+
+def test_idle_offload_tolerates_an_interrogator_that_never_loaded_a_caption_model() -> None:
+    """The GPU idle offload skips BLIP when it was never loaded instead of reading the missing attribute."""
+    clip = _MovableModel()
+    aesthetic = _MovableModel()
+    process = HordeSafetyProcess.__new__(HordeSafetyProcess)
+    process._safety_device = "cuda"
+    process._caption_model_loaded = False
+    process._interrogator = type("FakeInterrogator", (), {"clip_model": clip})()
+    process._aesthetic_scorer = aesthetic  # type: ignore[assignment]
+    process._clip_residency = None
+
+    process._offload_transient_models()
+
+    assert clip.moves == []
+    assert aesthetic.moves == ["cpu"]
+
+
 class _FakeClipModel:
     def __init__(self) -> None:
         self.moves: list[str] = []
