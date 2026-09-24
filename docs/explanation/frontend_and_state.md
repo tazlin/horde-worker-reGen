@@ -699,8 +699,12 @@ level, the theme and display density, the Overview density mode, the trend windo
 and which Overview panels are hidden). It also keeps the GPU list the dashboard last
 saw (`known_gpus`), so the Per-GPU config tab can list cards before the running worker
 or the accelerator probe has answered. That list may be stale, so the tab labels any
-card it knows only from the saved list. A probe replaces the list; a live worker only
+card it knows only from the saved list, and its banner never calls those cards detected.
+A probe replaces the list; a live worker only
 adds to it, because the worker reports the cards it drives, not every installed card.
+A probe that finds no cards leaves the saved list as it was, and the banner reports the
+empty result. The probe runs once per dashboard session, so the running worker is then
+the only live source.
 A hidden-panel key that no longer names a live
 element is dropped on load, so a stale preference can never block the Overview from
 rendering; a `theme_name` this build cannot restore falls back to the default for the

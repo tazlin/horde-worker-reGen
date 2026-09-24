@@ -13,8 +13,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.widgets import Button, Input, Switch, TabbedContent
+from textual.containers import Horizontal
+from textual.errors import NoWidget
+from textual.pilot import Pilot
+from textual.widget import Widget
+from textual.widgets import Button, Collapsible, Input, Label, Static, Switch, TabbedContent, TextArea
+from textual.widgets._collapsible import CollapsibleTitle
 
 from horde_worker_regen.app_state import (
     AppStateStore,
@@ -23,16 +29,19 @@ from horde_worker_regen.app_state import (
     KnownGpuInventory,
     OnboardingChoice,
 )
-from horde_worker_regen.bridge_data.data_model import GpuOverride
+from horde_worker_regen.bridge_data.data_model import GpuOverride, reGenBridgeData
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.config_form import (
     GPU_OVERRIDE_FIELDS,
+    MODELS_TO_LOAD_KEY,
+    FieldKind,
     apply_gpu_config,
     load_config,
     read_gpu_device_indices,
     read_gpu_overrides,
     read_gpu_pop_balance_threshold,
 )
+from horde_worker_regen.tui.model_resolution import DEFAULT_WHEN_EMPTY
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 from tests.tui._fake_supervisor import FakeSupervisor
@@ -106,17 +115,46 @@ def test_apply_gpu_config_omits_empty_pieces(tmp_path: Path) -> None:
 
 
 def test_banner_reflects_detected_card_count(tmp_path: Path) -> None:
-    """The banner text states the single-GPU caveat, the no-worker case, and the multi-GPU case."""
+    """The banner text states the single-GPU caveat, the no-card case, and the multi-GPU case."""
     path = tmp_path / "bridgeData.yaml"
     path.write_text('api_key: "x"\n', encoding="utf-8")
     editor = GpuOverridesEditor(load_config(path))
 
     editor._detected_count = 0
-    assert "No running worker" in editor._banner_text()
+    assert "No card has been reported yet" in editor._banner_text()
     editor._detected_count = 1
     assert "1 GPU detected" in editor._banner_text() and "IGNORED" in editor._banner_text()
     editor._detected_count = 2
     assert "2 GPUs detected" in editor._banner_text()
+
+
+def test_banner_wording_per_probe_state(tmp_path: Path) -> None:
+    """Probing, an empty probe, and a saved list each get their own wording, and none points below at nothing."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\n', encoding="utf-8")
+    editor = GpuOverridesEditor(load_config(path))
+
+    before_probe = editor._banner_text()
+    assert "below" not in before_probe
+
+    editor.set_probing(True)
+    probing = editor._banner_text()
+    assert "Looking for this machine's GPUs now" in probing and "below" not in probing
+
+    # An empty probe result is reported as such, with the next step, not by reverting to the pre-probe text.
+    editor.set_installed_cards([])
+    empty = editor._banner_text()
+    assert "No GPUs were found by the probe" in empty and "Start the worker" in empty
+    assert empty != before_probe and "below" not in empty
+
+    # A saved list after an empty probe keeps the saved-list banner, which never calls its cards detected.
+    editor.set_remembered_cards(KnownGpuInventory(gpus=[KnownGpu(index=0), KnownGpu(index=1)], recorded_at=0.0))
+    saved = editor._banner_text()
+    assert "Showing the GPU list saved" in saved and "It lists 2 GPUs" in saved
+    assert "detected" not in saved
+
+    # With no card known, the drive summary does not point below either.
+    assert "below" not in editor._drive_summary()
 
 
 @pytest.mark.e2e
@@ -332,7 +370,8 @@ async def test_saved_card_list_shows_sections_with_a_disclaimer(tmp_path: Path) 
         await pilot.pause()
         assert editor.query("#gpuovr-1-max_threads")
         assert "Showing the GPU list saved" in gpu._banner_text()
-        assert "2 GPUs detected" in gpu._banner_text()
+        assert "It lists 2 GPUs" in gpu._banner_text()
+        assert "detected" not in gpu._banner_text()
         assert "from saved list, not yet confirmed" in gpu._card_title(1)
         assert gpu._chip_variant(1) == "default"
 
@@ -425,3 +464,230 @@ async def test_opening_the_per_card_tab_probes_once_and_saves_the_list(tmp_path:
     assert calls == [1]
     saved = store.load().known_gpus
     assert saved is not None and [gpu.index for gpu in saved.gpus] == [0, 1]
+
+
+class _PerGpuHost(App[None]):
+    """A small host showing the Per-GPU sub-tab at the Advanced level, the way the dashboard applies it."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self._path = path
+
+    def compose(self) -> ComposeResult:
+        yield ConfigEditorView(config_path=self._path, experience_level=ExperienceLevel.ADVANCED)
+
+    def on_mount(self) -> None:
+        self.query_one(ConfigEditorView).set_experience_level(ExperienceLevel.ADVANCED)
+
+
+async def _open_per_gpu_with_two_cards(app: _PerGpuHost, pilot: Pilot[None]) -> GpuOverridesEditor:
+    """Open the Per-GPU sub-tab and feed it a live snapshot of two cards."""
+    await pilot.pause()
+    app.query_one("#config-subtabs", TabbedContent).active = "cfgtab-per-gpu"
+    await pilot.pause()
+    app.query_one(ConfigEditorView).update_cards([_card(0, "RTX 3080"), _card(1, "RTX 5090")])
+    for _ in range(3):
+        await pilot.pause()
+    return app.query_one(GpuOverridesEditor)
+
+
+def _visible_height(app: App[None], widget: Widget) -> int:
+    """The rows of ``widget`` actually painted on screen, after its ancestors' clipping."""
+    try:
+        geometry = app.screen.find_widget(widget)
+    except NoWidget:
+        return 0
+    return geometry.region.intersection(geometry.clip).height
+
+
+def _plain(static: Static) -> str:
+    """Return a Static's visible text without styling."""
+    renderable = static.render()
+    return renderable.plain if isinstance(renderable, Text) else str(renderable)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width", [160, 110])
+async def test_two_card_titles_are_visible_and_clickable(tmp_path: Path, width: int) -> None:
+    """With two cards, each collapsed title is painted and clickable, and an expanded section loses no row.
+
+    The card grid sizes an auto row to the section without its margin, so a Collapsible margin clipped a
+    collapsed title to zero height. Checked at a two-column (160) and a one-column (110) width.
+    """
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _PerGpuHost(path)
+    async with app.run_test(size=(width, 250)) as pilot:
+        gpu = await _open_per_gpu_with_two_cards(app, pilot)
+        sections = list(gpu.query(Collapsible))
+        assert len(sections) == 2
+
+        for section in sections:
+            assert section.max_scroll_y == 0, f"expanded section {section.title!r} clips its content"
+
+        for target in sections:
+            for section in sections:
+                section.collapsed = True
+            for _ in range(3):
+                await pilot.pause()
+            title = target.query_one(CollapsibleTitle)
+            assert _visible_height(app, title) >= 1, f"{target.title!r} title is clipped at width {width}"
+            assert await pilot.click(title) is True
+            await pilot.pause()
+            assert target.collapsed is False
+
+
+@pytest.mark.e2e
+async def test_every_section_starts_expanded_with_a_column_header(tmp_path: Path) -> None:
+    """Two or more cards all open expanded, and each section names its columns, Override first."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _PerGpuHost(path)
+    async with app.run_test(size=(160, 60)) as pilot:
+        gpu = await _open_per_gpu_with_two_cards(app, pilot)
+        sections = list(gpu.query(Collapsible))
+        assert len(sections) == 2
+        assert all(section.collapsed is False for section in sections)
+        for section in sections:
+            header = section.query_one(".gpu-ovr-header", Horizontal)
+            assert [str(label.render()) for label in header.query(Label)] == ["Override", "Setting", "Value", "Source"]
+        hint = " ".join(_plain(static) for static in gpu.query(".gpu-hint").results(Static))
+        assert "Override switch at the left" in hint
+
+
+@pytest.mark.e2e
+async def test_chip_press_marks_dirty_without_opening_a_section(tmp_path: Path) -> None:
+    """A chip press changes the drive set, says so, and refreshes the status line, leaving the sections alone."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _PerGpuHost(path)
+    async with app.run_test(size=(160, 60)) as pilot:
+        gpu = await _open_per_gpu_with_two_cards(app, pilot)
+        editor = app.query_one(ConfigEditorView)
+        status = editor.query_one("#config-change-summary", Static)
+        assert "No unsaved changes" in _plain(status)
+        sections_before = {section.title: section.collapsed for section in gpu.query(Collapsible)}
+
+        assert await pilot.click("#gpu-chip-0") is True
+        for _ in range(3):
+            await pilot.pause()
+
+        assert gpu._driven == {0}
+        assert gpu.is_dirty() is True
+        assert "Unsaved" in _plain(status)
+        assert "Driving only the selected card(s): 0" in _plain(gpu.query_one("#gpu-drive-summary", Static))
+        assert {section.title: section.collapsed for section in gpu.query(Collapsible)} == sections_before
+
+        # Collapsing and reopening a section is a configuring act and leaves the drive set as it was.
+        first = gpu.query(Collapsible).first()
+        first.collapsed = True
+        await pilot.pause()
+        first.collapsed = False
+        await pilot.pause()
+        assert gpu._driven == {0}
+
+
+def _first_field_of_kind(kind: FieldKind) -> str:
+    """The key of the first per-card field of ``kind``, so the alignment test covers each row shape."""
+    return next(field.key for field in GPU_OVERRIDE_FIELDS if field.kind is kind)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("width", [160, 110])
+async def test_header_columns_line_up_with_every_row_kind(tmp_path: Path, width: int) -> None:
+    """Each header label starts on the same column as the widget under it, for switch, input and list rows."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _PerGpuHost(path)
+    async with app.run_test(size=(width, 400)) as pilot:
+        gpu = await _open_per_gpu_with_two_cards(app, pilot)
+        section = gpu._card_widgets[0]
+        header_labels = list(section.query_one(".gpu-ovr-header", Horizontal).query(Label))
+        header_columns = [label.region.x for label in header_labels]
+        header_widths = [label.region.width for label in header_labels[:-1]]
+
+        for kind in (FieldKind.BOOL, FieldKind.INT, FieldKind.STR_LIST):
+            toggle = section.query_one(f"#gpuovr-0-{_first_field_of_kind(kind)}", Switch)
+            row = toggle.parent
+            assert isinstance(row, Horizontal)
+            cells = list(row.children)
+            assert len(cells) == len(header_labels), f"{kind} row has a different column count"
+            assert [cell.region.x for cell in cells] == header_columns, f"{kind} row misaligned at width {width}"
+            assert [cell.region.width for cell in cells[:-1]] == header_widths
+
+
+@pytest.mark.e2e
+async def test_section_button_adds_a_card_without_driving_it(tmp_path: Path) -> None:
+    """The section button mounts the lowest unlisted card's section and leaves Auto and the file alone."""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text('api_key: "x"\ndreamer_name: "n"\n', encoding="utf-8")
+    app = _harness(path)
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        gpu = editor.query_one(GpuOverridesEditor)
+        await pilot.pause()
+        assert not editor.query("#gpuovr-0-max_threads")
+        note = gpu.query_one("#gpu-section-add-note", Static)
+        assert "GPU 0" in _plain(note) and "without changing which cards the worker drives" in _plain(note)
+
+        gpu.on_button_pressed(Button.Pressed(gpu.query_one("#gpu-section-add", Button)))
+        await pilot.pause()
+        assert editor.query("#gpuovr-0-max_threads")
+        assert gpu._driven == set()
+        assert gpu.query_one("#gpu-chip-auto", Button).variant == "primary"
+        assert gpu.is_dirty() is False
+        assert "GPU 1" in _plain(note)
+
+        # A numbered chip is still the drive-set action.
+        gpu.on_button_pressed(Button.Pressed(gpu.query_one("#gpu-chip-1", Button)))
+        await pilot.pause()
+        assert gpu._driven == {1}
+        gpu.on_button_pressed(Button.Pressed(gpu.query_one("#gpu-chip-auto", Button)))
+        await pilot.pause()
+
+        editor.query_one("#gpuovr-0-max_threads", Switch).value = True
+        editor.query_one("#gpuval-0-max_threads", Input).value = "2"
+        await pilot.pause()
+        assert editor._save() is True
+
+    saved = load_config(path)
+    assert read_gpu_overrides(saved) == {0: {"max_threads": 2}}
+    assert "gpu_device_indices" not in saved
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    ("list_written", "expected_text", "expected_meta"),
+    [(True, DEFAULT_WHEN_EMPTY, [DEFAULT_WHEN_EMPTY]), (False, "", None)],
+    ids=["empty_list", "absent_key"],
+)
+async def test_inherited_models_to_load_matches_the_worker(
+    tmp_path: Path,
+    list_written: bool,
+    expected_text: str,
+    expected_meta: list[str] | None,
+) -> None:
+    """A card's inherited "Models to load" shows what the worker resolves for the global list.
+
+    The worker turns an explicitly empty list into the ``top 2`` rule. An absent key loads nothing from the list.
+    """
+    worker_config: dict[str, object] = {"api_key": "0000000000"}
+    if list_written:
+        worker_config[MODELS_TO_LOAD_KEY] = []
+    worker = reGenBridgeData.model_validate(worker_config)
+    assert worker.meta_load_instructions == expected_meta
+    assert worker.image_models_to_load == []
+
+    models_line = f"{MODELS_TO_LOAD_KEY}: []\n" if list_written else ""
+    path = tmp_path / "bridgeData.yaml"
+    path.write_text(
+        f'api_key: "x"\ndreamer_name: "n"\n{models_line}gpu_overrides:\n  0:\n    allow_lora: true\n',
+        encoding="utf-8",
+    )
+    app = _harness(path)
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        control = editor.query_one(f"#gpuval-0-{MODELS_TO_LOAD_KEY}", TextArea)
+        assert control.text == expected_text
+        assert control.disabled is True

@@ -914,7 +914,7 @@ class ConfigEditorView(Vertical):
         return state
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Dispatch the action-bar buttons (model-list buttons are handled by their own editor)."""
+        """Dispatch the action-bar buttons and refresh the status line after a GPU chip press."""
         if event.button.id == "config-reload":
             self._reload_from_disk()
         elif event.button.id == "config-preset":
@@ -927,6 +927,10 @@ class ConfigEditorView(Vertical):
             self._save()
         elif event.button.id == "config-restart" and self._save():
             self.post_message(self.ApplyRequested(restart=True))
+        elif (event.button.id or "").startswith("gpu-chip-"):
+            # A chip press bubbles here after GpuOverridesEditor has changed the drive set, so the status line
+            # picks up that unsaved change the same way a Switch or Input change does.
+            self._refresh_action_variants()
 
     def set_view_mode(self, mode: OverviewViewMode) -> None:
         """Apply the shared F6 density contract to the config sub-tabs.

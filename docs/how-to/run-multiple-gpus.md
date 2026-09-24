@@ -29,13 +29,17 @@ Leave it unset to drive all detected cards.
 In the dashboard, the **Config → Per-GPU** tab does this for you with a card strip:
 `All GPUs (auto)` keeps the list empty (drive everything), while the numbered chips (`GPU 0`, `GPU 1`, …,
 plus `+ card` for higher indices) pick an explicit set. A chip is green when the card is confirmed present
-this session and blue when you have selected it, so you never have to type an index.
+this session and blue when you have selected it, so you never have to type an index. Selecting a chip
+changes which cards the worker drives, and the line under the strip says so. Each card's settings are in
+its own section below the strip, which opens expanded.
 
 The tab learns which cards exist from three places. The running worker reports the cards it drives.
 Opening the tab for the first time in a session also runs the accelerator probe, which lists every installed
 card, including one given to a text backend. The probe briefly takes a GPU context on each card and can take
 a few seconds per card. Until either answers, the tab shows the card list a previous session saved and says
-so in its banner and in each card's title, because that list may be out of date after a hardware change.
+so in its banner and in each card's title, because that list may be out of date after a hardware change. If
+the probe finds no cards, the banner says so. The probe runs once per dashboard session, so start the worker
+and its cards appear as it reports them.
 
 ## Per-card overrides
 
@@ -48,10 +52,21 @@ the YAML parser's private state is not carried into the resolved per-card runtim
 
 The easiest path is the **Config → Per-GPU** tab: each driven, known, or selected card gets a
 collapsible section (two laid out side by side on a wide terminal, so comparing a pair of cards is easy).
-Inside, every overridable knob has an *Override* toggle that is off (the disabled control shows the
-inherited global value, tagged `inherited`) until you flip it (`custom`). Only toggled-on fields are
-written, so a single-GPU or homogeneous machine never grows an override block. On a single-GPU machine the
-tab shows a banner reminding you the per-card rules only apply once multiple cards are driven.
+Every section starts expanded, and its title collapses it. A header row names the columns: *Override*,
+*Setting*, *Value* and *Source*. The *Override* switch at the left of each row is off (the disabled control
+shows the inherited global value, and the *Source* column reads `inherited`) until you turn it on
+(`custom`). Only toggled-on fields are written, so a single-GPU or homogeneous machine never grows an
+override block. On a single-GPU machine the tab shows a banner reminding you the per-card rules only apply
+once multiple cards are driven.
+
+An inherited *Models to load* shows what the worker makes of the global list. It reads `top 2` when the
+global `models_to_load` is an empty list, and stays empty when the key is absent, because the worker then
+loads no model from the list.
+
+To configure a card before the worker or the probe has reported it, press `+ card section` under
+*Per-card settings*. It adds a section for the lowest card index without one and leaves the drive set
+alone, so the worker still drives the cards the chips select. Selecting a numbered chip is what limits the
+worker to a card.
 
 The equivalent YAML is a `gpu_overrides` map keyed by device index:
 

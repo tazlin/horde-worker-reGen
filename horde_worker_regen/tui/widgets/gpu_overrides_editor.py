@@ -9,8 +9,14 @@ numbered chips (pre-populated 0-3, ``+`` to go further) are the explicit drive s
 the card is confirmed present this session and blue when it is explicitly driven. Picking specific chips
 writes ``gpu_device_indices``; leaving Auto selected omits it. Either way, every known, configured, or
 selected card gets a collapsible section below where each field is OFF (inherits the global value, shown in
-the disabled control) until its Override toggle is flipped, so a single-GPU or homogeneous box never grows a
-``gpu_overrides`` block. Two cards lay out side by side when the terminal is wide enough.
+the disabled control) until the Override switch at the left of its row is turned on, so a single-GPU or
+homogeneous box never grows a ``gpu_overrides`` block. A header row in each section names the columns, and
+the header and every row take each column's width from one CSS class, so they cannot drift apart. The
+sections start expanded, and two cards lay out side by side when the terminal is wide enough.
+
+The ``+ card section`` button under "Per-card settings" adds a section for the lowest index without one and
+leaves the drive set alone, so a card can be configured before it is detected without restricting the
+worker to it. The chips stay the only drive-set control.
 
 A card is known from three sources: the running worker's snapshot (the cards it drives), this session's
 accelerator probe (every installed card, driven or not), and the card list a previous session saved. The
@@ -26,13 +32,14 @@ uniformly with the flat fields.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from loguru import logger
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, HorizontalGroup, Vertical
 from textual.widgets import Button, Collapsible, Input, Label, Static, Switch, TextArea
 
 from horde_worker_regen.tui.config_form import (
@@ -42,6 +49,7 @@ from horde_worker_regen.tui.config_form import (
     GPU_OVERRIDE_SECTIONS,
     GPU_POP_BALANCE_THRESHOLD_DEFAULT,
     GPU_POP_BALANCE_THRESHOLD_KEY,
+    MODELS_TO_LOAD_KEY,
     ConfigField,
     FieldKind,
     apply_gpu_config,
@@ -52,6 +60,7 @@ from horde_worker_regen.tui.config_form import (
     read_gpu_pop_balance_threshold,
 )
 from horde_worker_regen.tui.formatters import gpu_label
+from horde_worker_regen.tui.model_resolution import DEFAULT_WHEN_EMPTY
 
 if TYPE_CHECKING:
     from horde_worker_regen.app_state import KnownGpu, KnownGpuInventory
@@ -119,23 +128,40 @@ class GpuOverridesEditor(Vertical):
         padding: 1 1 0 1;
     }
     /* The card grid's column count is set from on_resize (a widget's DEFAULT_CSS is auto-scoped to its
-       own subtree, so an ancestor breakpoint selector like Screen.-wide cannot reach it). */
+       own subtree, so an ancestor breakpoint selector like Screen.-wide cannot reach it). The space between
+       stacked cards is the grid's row gutter: an auto grid row is sized to the section without its margin,
+       so a Collapsible margin would take a row from the section and clip a collapsed title to nothing. */
     GpuOverridesEditor #gpu-cards {
         height: auto;
         layout: grid;
         grid-size: 1;
         grid-rows: auto;
-        grid-gutter: 0 2;
+        grid-gutter: 1 2;
     }
+    GpuOverridesEditor .gpu-ovr-header {
+        height: 1;
+        color: $text-muted;
+        text-style: bold;
+        padding: 0 1;
+    }
+    GpuOverridesEditor .gpu-ovr-header Label {
+        height: 1;
+    }
+    /* The column widths below are the only ones: the header labels and the row widgets carry the same
+       classes, so every kind of row lines up under the header. */
     GpuOverridesEditor .gpu-ovr-toggle {
         width: 8;
+        /* Keeps the header's "Override" apart from "Setting". */
+        margin-right: 1;
     }
     GpuOverridesEditor .gpu-ovr-label {
         width: 32;
         height: 3;
         content-align: left middle;
     }
-    GpuOverridesEditor .gpu-ovr-input {
+    /* A cell wrapping the value control: an Input fills it, a Switch keeps its own width at the left, and a
+       list field's row leaves it empty (its TextArea sits below), so the Source column never shifts. */
+    GpuOverridesEditor .gpu-ovr-value {
         width: 12;
     }
     GpuOverridesEditor .gpu-state-tag {
@@ -155,11 +181,19 @@ class GpuOverridesEditor(Vertical):
         color: $text-disabled;
         padding-left: 1;
     }
+    GpuOverridesEditor #gpu-section-add-row {
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    GpuOverridesEditor #gpu-section-add-note {
+        width: 1fr;
+        height: auto;
+        /* The top pad sets the first line level with the button's label. */
+        padding: 1 0 0 1;
+        color: $text-muted;
+    }
     GpuOverridesEditor TextArea {
         height: 5;
-    }
-    GpuOverridesEditor Collapsible {
-        margin: 0 0 1 0;
     }
     """
 
@@ -181,7 +215,11 @@ class GpuOverridesEditor(Vertical):
         # Cards this session's accelerator probe enumerated, including any the worker does not drive (the
         # card given to a text backend, or one outside the drive set).
         self._installed: set[int] = set()
+        # Cards the operator added a section for with the section button. Adding one never drives it.
+        self._pinned: set[int] = set()
         self._probing = False
+        # Whether this session's probe has returned, so an empty result reads as "none found", not "not yet".
+        self._probe_answered = False
         # Cards from the list a previous session saved, and when it was saved. A fallback that may be stale.
         self._remembered: set[int] = set()
         self._remembered_at: float | None = None
@@ -204,12 +242,12 @@ class GpuOverridesEditor(Vertical):
         return self._detected | self._installed
 
     def _section_indices(self) -> list[int]:
-        """Every card that gets an override section: driven, configured on disk, or known to exist."""
-        return sorted(self._driven | self._configured | self._known_indices())
+        """Every card that gets an override section: driven, configured on disk, known, or added by hand."""
+        return sorted(self._driven | self._configured | self._known_indices() | self._pinned)
 
     def _chip_indices(self) -> list[int]:
         """The numbered chips to show: the pre-populated 0-3 plus any card otherwise in play."""
-        return sorted(set(_PREPOPULATED_CHIPS) | self._driven | self._configured | self._known_indices())
+        return sorted(set(_PREPOPULATED_CHIPS) | set(self._section_indices()))
 
     # -- Composition ---------------------------------------------------------------------------------
 
@@ -227,10 +265,14 @@ class GpuOverridesEditor(Vertical):
         yield self._compose_pop_balance_field()
         yield Label("Per-card settings", classes="gpu-heading")
         yield Static(
-            "Each card inherits the global config. Open a card and flip a field's Override toggle to give "
-            "that one card a different value; everything else keeps the global setting.",
+            "Each card inherits the global config. To give one card its own value for a setting, turn on the "
+            "Override switch at the left of that setting's row. Settings left off keep the global value.",
             classes="gpu-hint",
         )
+        # Kept out of the chip strip: everything in the strip changes the drive set, and this does not.
+        with HorizontalGroup(id="gpu-section-add-row"):
+            yield Button("+ card section", id="gpu-section-add", variant="default")
+            yield Static(self._section_add_note(), id="gpu-section-add-note")
         yield Vertical(id="gpu-cards")
 
     def on_mount(self) -> None:
@@ -238,7 +280,9 @@ class GpuOverridesEditor(Vertical):
         self._sync_strip()
         self._sync_cards()
         self._apply_card_columns()
-        self._capture_clean()
+        # The configured sections' controls are mounted asynchronously, so a baseline taken now lacks their
+        # keys and the first snapshot after mount reads as dirty; ``reload`` defers the capture the same way.
+        self.call_after_refresh(self._capture_clean)
 
     def on_resize(self) -> None:
         """Re-pick the per-card grid column count for the new width (two cards side by side if it fits)."""
@@ -254,34 +298,41 @@ class GpuOverridesEditor(Vertical):
         """A card-count-aware note on when per-card overrides apply, flagging a count taken from a saved list.
 
         The live count wins because overrides apply to the cards the worker drives; the probe's installed
-        count and then the saved list stand in until a worker has reported.
+        count and then the saved list stand in until a worker has reported. The saved list is never called
+        detected, since nothing this session has confirmed it.
         """
         count = self._detected_count or len(self._installed)
-        prefix = ""
-        if count == 0 and self._remembered:
+        if count:
+            prefix = ""
+            headline = "This machine has 1 GPU detected." if count == 1 else f"{count} GPUs detected."
+        elif self._remembered:
             count = len(self._remembered)
             prefix = f"{self._saved_list_note()} "
-        if count == 0:
-            probing = " Enumerating this machine's GPUs now." if self._probing else ""
-            return (
-                "[b]Per-card overrides[/b] apply only when this one worker drives more than one GPU. "
-                f"No running worker is detected yet, so cards will be enumerated on start.{probing} You can "
-                "still pre-configure a card below by its stable PCI index."
-            )
+            headline = "It lists 1 GPU." if count == 1 else f"It lists {count} GPUs."
+        else:
+            return self._no_card_banner()
         undriven = ""
         if self._detected_count and len(self._installed) > self._detected_count:
             undriven = f" {len(self._installed)} are installed; the worker does not drive the others."
         if count == 1:
             return (
-                f"{prefix}[b]This machine has 1 GPU detected.[/b]{undriven} Per-card overrides are IGNORED on a "
-                "single-GPU worker: the global config is used as-is. These settings only take effect once this "
-                "worker drives multiple cards. You may still pre-configure for a planned second card below."
+                f"{prefix}[b]{headline}[/b]{undriven} Per-card overrides are IGNORED on a single-GPU worker, which "
+                "uses the global config as-is. They take effect once this worker drives more than one card."
             )
         return (
-            f"{prefix}[b]{count} GPUs detected.[/b]{undriven} Each section below overrides the global config for "
-            "one physical card, keyed by its stable PCI index. Fields you do not toggle on inherit the global "
-            "value."
+            f"{prefix}[b]{headline}[/b]{undriven} Each section below overrides the global config for one physical "
+            "card, keyed by its stable PCI index. Settings whose Override switch is off inherit the global value."
         )
+
+    def _no_card_banner(self) -> str:
+        """The banner while no source has named a card: probing, probed and empty, or not yet probed."""
+        lead = "[b]Per-card overrides[/b] apply only when this worker drives more than one GPU."
+        if self._probing:
+            return f"{lead} Looking for this machine's GPUs now."
+        if self._probe_answered:
+            # The probe runs once per session, so the next step is the worker, which reports its own cards.
+            return f"{lead} [b]No GPUs were found by the probe.[/b] Start the worker to list the cards it drives."
+        return f"{lead} No card has been reported yet. The cards appear here once the worker starts."
 
     def _saved_list_note(self) -> str:
         """The disclaimer shown wherever the editor relies on a previous session's saved card list."""
@@ -296,9 +347,12 @@ class GpuOverridesEditor(Vertical):
     def _drive_summary(self) -> str:
         """A one-line, mode-aware explainer of what the chip selection means right now."""
         if not self._driven:
-            return "Auto: driving every detected GPU. Open a card below to give just that card custom settings."
+            return "Auto: driving every detected GPU. Selecting a numbered chip limits the worker to those cards."
         listed = ", ".join(str(index) for index in sorted(self._driven))
-        return f"Driving only the selected card(s): {listed}. Select [b]All GPUs[/b] to drive every card instead."
+        return (
+            f"Driving only the selected card(s): {listed}. Other cards stay idle. Select [b]All GPUs[/b] to drive "
+            "every card."
+        )
 
     # -- Chip strip ----------------------------------------------------------------------------------
 
@@ -357,7 +411,19 @@ class GpuOverridesEditor(Vertical):
 
     def _next_chip_index(self) -> int:
         """The next index the ``+`` button adds: one past the highest card already in play (min 4)."""
-        return max([*_PREPOPULATED_CHIPS, *self._driven, *self._configured, *self._known_indices()]) + 1
+        return max(self._chip_indices()) + 1
+
+    def _next_section_index(self) -> int:
+        """The index the section button adds: the lowest stable index that has no section yet."""
+        present = set(self._section_indices())
+        return next(index for index in itertools.count() if index not in present)
+
+    def _section_add_note(self) -> str:
+        """The copy beside the section button, naming the card it adds and that the drive set stays as is."""
+        return (
+            f"Adds a settings section for GPU {self._next_section_index()} without changing which cards the "
+            "worker drives. The chips above set those."
+        )
 
     # -- Machine-wide knob ---------------------------------------------------------------------------
 
@@ -368,7 +434,7 @@ class GpuOverridesEditor(Vertical):
         return Vertical(
             Horizontal(
                 Label(self._label_text(field), classes="gpu-ovr-label"),
-                Input(value=str(value), id=f"gpucfg-{field.key}", type="number", classes="gpu-ovr-input"),
+                Input(value=str(value), id=f"gpucfg-{field.key}", type="number"),
                 classes="gpu-row",
             ),
             Static(field.help, classes="gpu-hint"),
@@ -396,6 +462,8 @@ class GpuOverridesEditor(Vertical):
             self._remove_card(index)
         for index in sorted(wanted - set(self._card_widgets)):
             self._mount_card(index)
+        with contextlib.suppress(Exception):
+            self.query_one("#gpu-section-add-note", Static).update(self._section_add_note())
 
     def _capture_clean(self) -> None:
         """Capture the current widget state as the clean (unchanged) baseline for dirty-detection."""
@@ -420,8 +488,6 @@ class GpuOverridesEditor(Vertical):
             logger.debug(f"GPU {index} section did not mount ({type(mount_error).__name__}: {mount_error})")
             return
         self._card_widgets[index] = card
-        with contextlib.suppress(Exception):
-            card.scroll_visible()
 
     def _remove_card(self, index: int) -> None:
         """Drop one card section (used when a chip the worker never detected is deselected)."""
@@ -444,7 +510,7 @@ class GpuOverridesEditor(Vertical):
 
     def _compose_card(self, index: int, card: dict[str, Any]) -> Collapsible:
         """One card's collapsible block: a toggled override row per field, grouped by subsection."""
-        rows: list[Vertical] = []
+        rows: list[Horizontal | Vertical] = [self._compose_column_header()]
         for section in GPU_OVERRIDE_SECTIONS:
             section_fields = [field for field in GPU_OVERRIDE_FIELDS if field.section == section]
             if not section_fields:
@@ -452,10 +518,25 @@ class GpuOverridesEditor(Vertical):
             rows.append(Vertical(Label(section, classes="gpu-section"), classes="gpu-field"))
             for field in section_fields:
                 rows.append(self._compose_override_row(index, field, card))
-        # Collapse a card that has no overrides yet when several cards are listed, so the page is not a
-        # wall of mostly-inherited fields; a single card (or one already overridden) opens expanded.
-        collapsed = (not card) and len(self._section_indices()) > 1
-        return Collapsible(*rows, title=self._card_title(index), collapsed=collapsed)
+        # Every section starts expanded, however many cards are listed, so no card's settings sit hidden
+        # behind a title the operator has to find and open first.
+        return Collapsible(*rows, title=self._card_title(index), collapsed=False)
+
+    @staticmethod
+    def _compose_column_header() -> Horizontal:
+        """The row naming each column, aligned with the override rows, so the left switch reads as Override.
+
+        One header per section instead of a label on every switch: the rows are uniform, so a single header
+        is unambiguous and keeps each row within the narrow two-column layout. Each label carries the class
+        of the row widget below it, so the header and the rows read their widths from the same rule.
+        """
+        return Horizontal(
+            Label("Override", classes="gpu-ovr-toggle"),
+            Label("Setting", classes="gpu-ovr-label"),
+            Label("Value", classes="gpu-ovr-value"),
+            Label("Source"),
+            classes="gpu-ovr-header",
+        )
 
     def _compose_override_row(self, index: int, field: ConfigField, card: dict[str, Any]) -> Vertical:
         """A single inherit-or-override field: an Override toggle plus the (disabled-until-on) control.
@@ -484,6 +565,7 @@ class GpuOverridesEditor(Vertical):
                 Horizontal(
                     Switch(value=override_on, id=toggle_id, classes="gpu-ovr-toggle"),
                     Label(field.label, classes="gpu-ovr-label"),
+                    HorizontalGroup(classes="gpu-ovr-value"),
                     tag,
                     classes="gpu-row",
                 ),
@@ -500,14 +582,13 @@ class GpuOverridesEditor(Vertical):
                 id=control_id,
                 type=input_type,  # type: ignore[arg-type]
                 disabled=not override_on,
-                classes="gpu-ovr-input",
             )
 
         return Vertical(
             Horizontal(
                 Switch(value=override_on, id=toggle_id, classes="gpu-ovr-toggle"),
                 Label(self._label_text(field), classes="gpu-ovr-label"),
-                control,
+                HorizontalGroup(control, classes="gpu-ovr-value"),
                 tag,
                 classes="gpu-row",
             ),
@@ -525,12 +606,24 @@ class GpuOverridesEditor(Vertical):
         return "gpu-state-tag -custom" if override_on else "gpu-state-tag"
 
     def _inherited_value(self, field: ConfigField) -> Any:  # noqa: ANN401 - kind-dependent
-        """The global value a card inherits when the field is not overridden."""
+        """The global value a card inherits when the field is not overridden, as the worker resolves it.
+
+        The worker's bridge data turns an explicitly empty ``models_to_load`` list into the ``top 2`` meta rule,
+        so that rule is what the card inherits. An absent key never reaches that validator and loads nothing
+        from the list, so it stays empty here.
+        """
+        raw_value = self._raw_global(field.key)
+        if field.key == MODELS_TO_LOAD_KEY and isinstance(raw_value, list) and not raw_value:
+            return [DEFAULT_WHEN_EMPTY]
         global_field = _GLOBAL_FIELD_BY_KEY.get(field.key)
         if global_field is not None:
             return current_value(global_field, self._data)
+        return raw_value
+
+    def _raw_global(self, key: str) -> Any:  # noqa: ANN401 - whatever the YAML holds
+        """The global config's value for ``key`` as written in the file, or None when absent."""
         try:
-            return self._data.get(field.key)
+            return self._data.get(key)
         except AttributeError:
             return None
 
@@ -550,18 +643,37 @@ class GpuOverridesEditor(Vertical):
             tag.set_class(event.value, "-custom")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Handle the card-chip strip: Auto, a numbered card, or the add-a-card button."""
+        """Handle the card-chip strip (Auto, a numbered card, the add-a-card chip) and the section button."""
         button_id = event.button.id or ""
-        if button_id == "gpu-chip-auto":
+        if button_id == "gpu-section-add":
+            added = self._next_section_index()
+            self._pinned.add(added)
+            self._sync_strip()
+            self._sync_cards()
+            self._reveal_card(added)
+        elif button_id == "gpu-chip-auto":
             self._driven.clear()
             self._refresh_after_chip_change()
         elif button_id == "gpu-chip-add":
-            self._driven.add(self._next_chip_index())
+            added = self._next_chip_index()
+            self._driven.add(added)
             self._refresh_after_chip_change()
+            self._reveal_card(added)
         elif button_id.startswith("gpu-chip-"):
             with contextlib.suppress(ValueError):
                 index = int(button_id[len("gpu-chip-") :])
                 self._toggle_driven(index)
+
+    def _reveal_card(self, index: int) -> None:
+        """Scroll a just-added card's section into view once it has laid out.
+
+        Only the two add buttons reveal their section, since that section is new and may land below the fold. A mount
+        from a live source or a chip press leaves the scroll alone: sections start expanded and tall, so
+        scrolling to each one would carry the banner and chip strip off screen.
+        """
+        card = self._card_widgets.get(index)
+        if card is not None:
+            self.call_after_refresh(card.scroll_visible)
 
     def _toggle_driven(self, index: int) -> None:
         """Flip whether a card is in the explicit drive set, adding/removing its section to match."""
@@ -604,10 +716,11 @@ class GpuOverridesEditor(Vertical):
     def set_installed_cards(self, gpus: Sequence[KnownGpu]) -> None:
         """Take this session's accelerator probe result, mounting a section for each installed card.
 
-        An empty result is a probe that could not enumerate anything, not proof of an empty machine, so it
-        only ends the probing state and leaves every other source in place.
+        An empty result is a probe that could not enumerate anything, not proof of an empty machine. It ends
+        the probing state, which the banner then reports as no GPUs found, and leaves every other source in place.
         """
         self._probing = False
+        self._probe_answered = True
         new_index = False
         for gpu in gpus:
             # The live snapshot's name comes from the worker's own device map; it wins where both exist.
