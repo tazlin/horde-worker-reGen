@@ -62,6 +62,28 @@ class PopGate(enum.StrEnum):
     EMPTY_OFFER = "empty_offer"
     """The narrowing stages left no model to advertise; an empty offer is never sent, since the server matches
     it to unconstrained requests and can answer with a job carrying no model name."""
+    ALCHEMY_NOT_SERVED = "alchemy_not_served"
+    """The alchemist role is off, so the worker serves no alchemy forms and the alchemy flow stays quiet.
+
+    The alchemy flow is always present and self-gates, so this holds its pops for as long as the role is off,
+    exactly as ``IMAGE_GENERATION_NOT_SERVED`` holds the image offer. Like that gate it is the operator's own
+    choice, so the alchemy liveness disclosure stays silent for it."""
+    ALCHEMY_NO_FORMS_OFFERED = "alchemy_no_forms_offered"
+    """Nothing is left to advertise: no forms are configured, or the offer narrowed to empty.
+
+    The narrowing withholds a form whose model is missing and one whose lane is down, so an empty offer means
+    no configured form can currently be served by any process. An empty offer is never sent."""
+    ALCHEMY_IMAGE_PRIORITY = "alchemy_image_priority"
+    """Image generation owns the lanes alchemy's graph forms share, so those forms wait.
+
+    Image work always wins contention: in backfill mode alchemy pops only while the image queue is drained, and
+    in concurrent mode a graph form (upscaler, face-fixer, strip-background) is held off while no spare image
+    lane is idle. CLIP-only forms do not contend and are not held by this."""
+    ALCHEMY_VRAM_HEADROOM = "alchemy_vram_headroom"
+    """Measured free VRAM on every card a form could land on does not cover a typical alchemy form.
+
+    Read per card against the committed ledger, so a form is not admitted against room another flow is about
+    to claim. Distinct from ``RAM_PRESSURE`` (host RAM) and from the post-processing breaker."""
 
 
 class PopPauseOwner(enum.StrEnum):
@@ -143,6 +165,26 @@ class WorkerState:
     loop starts, so a worker that never completes an attempt measures its silence from the loop's start
     rather than from the epoch."""
 
+    alchemy_last_pop_gate: str | None = None
+    """Short stable name of the gate holding alchemy pops, or None when the last cycle reached the API.
+
+    An alchemist-only worker's only intake path is its alchemy pop, and that coroutine returns early at
+    several preconditions that log nothing of their own, so a worker held at one of them looks exactly like
+    a worker the horde has no forms for. Naming the gate is what lets the alchemy liveness disclosure report
+    which condition is in force. Mirrors :attr:`last_pop_gate` for the image intake."""
+
+    alchemy_last_pop_gate_since: float = 0.0
+    """Wall-clock time :attr:`alchemy_last_pop_gate` last changed to its current name.
+
+    Stamped on the name change rather than every tick, so it measures how long this gate has held rather
+    than when it was last observed."""
+
+    alchemy_last_pop_attempt_completed_at: float = 0.0
+    """Wall-clock time the most recent alchemy pop attempt against the horde concluded, work, none, or error.
+
+    This is the alchemist-only worker's proof that its only intake path is still running end to end. Seeded
+    when the alchemy loop starts, so a worker that never completes an attempt measures its silence from the
+    loop's start rather than from the epoch. Mirrors :attr:`last_pop_attempt_completed_at`."""
     server_maintenance_cleared_by_job_pop: bool = False
     """A real popped job proved the horde is sending work again, even if worker-details polling is stale."""
 

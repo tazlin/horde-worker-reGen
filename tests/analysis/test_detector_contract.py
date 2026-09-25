@@ -216,8 +216,19 @@ class Contract:
 
 _REPLACED = "inference process replaced (crashed or hung)"
 
+
 # One contract per detector, keyed by the detector's function name. The no-orphan test asserts this
 # mapping covers every entry in DETECTORS, so a new detector forces a fixture to be added here.
+def _alchemy_silence(ts: str, *, gate: str = "alchemy_vram_headroom", seconds: int = 301) -> str:
+    """alchemy_popper._alchemy_pop_liveness_line: alchemy intake held at a gate with no pop reaching the horde."""
+    return (
+        f"2026-06-24 {ts} | ERROR    | horde_worker_regen.process_management.jobs.alchemy_popper:_alchemy_pop_liveness_line:1 - "
+        f"Alchemy pop liveness: no alchemy pop has reached the horde for {seconds}s; pops are held at gate "
+        f"'{gate}' (held {seconds}s). This worker has served no alchemy work while that gate stands, so "
+        "check whatever it waits on (the lanes, the queue, or the horde)."
+    )
+
+
 CONTRACTS: dict[str, Contract] = {
     "detect_crash_on_start_loop": Contract(
         bridge=_bridge(
@@ -461,6 +472,10 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "detect_pop_liveness_full_queue": Contract(
         bridge=_bridge(_full_queue_frozen("18:31:00.000")),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_alchemy_pop_liveness": Contract(
+        bridge=_bridge(_alchemy_silence("18:31:00.000")),
         severity=Severity.CRITICAL,
     ),
     "detect_model_reference_sample_fault": Contract(

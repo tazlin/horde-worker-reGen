@@ -40,6 +40,9 @@ class _StubState:
     self_throttle_paused = False
     gpu_torch_incompatible = False
     workload_intake_paused = False
+    alchemy_last_pop_gate: str | None = None
+    alchemy_last_pop_gate_since = 0.0
+    alchemy_last_pop_attempt_completed_at = 0.0
 
 
 class _StubRuntimeConfig:

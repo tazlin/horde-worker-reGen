@@ -72,7 +72,7 @@ from horde_worker_regen.consts import (
     WORKER_KNOWN_BETA_UPSCALERS,
 )
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import PopGate, WorkerState
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
@@ -189,6 +189,19 @@ main-loop task, so allowing that default to govern shutdown can keep the whole w
 child has already been reaped. Thirty seconds matches the image-generation pop bound and remains well above
 normal Horde API latency.
 """
+
+ALCHEMY_POP_LIVENESS_WARN_SECONDS = 60.0
+"""How long the alchemy flow may go without a pop attempt reaching the horde before it says so.
+
+Long enough that no ordinary gate (the four-second pop cadence, the error backoff, a brief full queue) trips
+it, and short enough that an operator watching a live worker learns of a silent intake path within a minute.
+Matches the image flow's pop-liveness notice so the two read alike."""
+
+ALCHEMY_POP_LIVENESS_ERROR_SECONDS = 300.0
+"""Alchemy silence past which a held intake path is a wedge rather than a slow patch.
+
+At this point the worker has served no alchemy work for minutes with no worker-wide pause to account for it,
+so the condition is escalated from a notice to an error. Matches the image flow's pop-liveness escalation."""
 
 PENDING_FORM_DISPATCH_DEADLINE_SECONDS = 300.0
 """How long a popped form may wait for a process able to serve it before it is handed back faulted.
@@ -546,6 +559,13 @@ class AlchemyCoordinator:
         self._last_logged_no_forms_skipped: dict[str, object] | None = None
         self._maintenance_hold_logged = False
 
+        # Edge state for the alchemy pop-liveness disclosure: the attempt stamp each episode of silence was
+        # armed against, so a completed attempt re-arms it, and the times the notice and the escalation last
+        # fired. Mirrors the image pop-liveness sentinel's edge state on the process manager.
+        self._alchemy_pop_liveness_attempt_seen = 0.0
+        self._alchemy_pop_liveness_warned_at = 0.0
+        self._alchemy_pop_liveness_errored_at = 0.0
+
     @property
     def kind(self) -> WorkloadKind:
         """The workload flow this coordinator runs (satisfies the ``FlowCoordinator`` protocol)."""
@@ -681,29 +701,43 @@ class AlchemyCoordinator:
     # region pop
 
     def _should_pop(self) -> bool:
-        """Return True when an alchemy pop is appropriate this cycle.
+        """Return True when an alchemy pop is appropriate this cycle, stamping the gate when it is not.
 
-        Image work always wins contention. In concurrent mode alchemy may pop while image
-        jobs are queued, but only into a spare process lane and only with VRAM headroom for
-        a typical alchemy form; otherwise it falls back to backfill (image queue empty).
+        The gate is stamped here rather than by the callers so every path that consults the policy records the
+        same hold for the liveness disclosure, and so callers (and tests) keep their single boolean seam.
+        """
+        gate = self._pop_gate()
+        self._note_pop_gate(gate)
+        return gate is None
+
+    def _pop_gate(self) -> PopGate | None:
+        """Return the :class:`PopGate` holding this cycle's alchemy pop, or None when it may proceed.
+
+        Image work always wins contention. In concurrent mode alchemy may pop while image jobs are queued, but
+        only into a spare process lane and only with VRAM headroom for a typical alchemy form; otherwise it
+        falls back to backfill (image queue empty).
+
+        Naming the hold rather than returning a bare bool is what lets the alchemy liveness disclosure say why
+        the flow is quiet: an alchemist-only worker's pop is its whole intake path, so silence with no gate
+        named is indistinguishable from a loop that stopped running.
         """
         bridge_data = self.bridge_data
         if not bridge_data.alchemist:
-            return False
+            return PopGate.ALCHEMY_NOT_SERVED
         if self._state.workload_intake_paused:
-            return False
+            return PopGate.INTAKE_PAUSED
         if self._state.gpu_torch_incompatible:
             # The installed PyTorch cannot run this GPU; alchemy forms would fail the same way. Don't pop.
-            return False
+            return PopGate.TORCH_UNUSABLE
         if len(self._pending_forms) + len(self._in_flight) >= max(bridge_data.queue_size, 1):
-            return False
+            return PopGate.QUEUE_FULL
         if len(self._in_flight) >= max(bridge_data.alchemy_max_concurrency, 1):
-            return False
+            return PopGate.QUEUE_FULL
         now = time.time()
         if now < self._pop_hold_until:
-            return False
+            return PopGate.POP_FREQUENCY_GATE
         if (now - self._last_pop_time) < self._pop_frequency:
-            return False
+            return PopGate.POP_FREQUENCY_GATE
 
         offered = expand_offered_forms(
             bridge_data,
@@ -714,7 +748,7 @@ class AlchemyCoordinator:
             presence=self._post_processor_presence(),
         )
         if not offered:
-            return False
+            return PopGate.ALCHEMY_NO_FORMS_OFFERED
 
         # Don't pop work no process can currently take. strip_background runs on the image-utilities lane,
         # so that lane counts as a place work can land alongside the graph and CLIP lanes.
@@ -722,20 +756,101 @@ class AlchemyCoordinator:
         clip_available = self._process_map.get_first_available(WorkerCapability.ALCHEMY_CLIP) is not None
         utilities_available_lane = self._process_map.get_first_available(WorkerCapability.IMAGE_UTILITIES) is not None
         if not (graph_available or clip_available or utilities_available_lane):
-            return False
+            return PopGate.ALCHEMY_NO_FORMS_OFFERED
 
         # Legacy backfill: only pop when the image queue is fully drained.
         if not bridge_data.alchemy_allow_concurrent:
-            return len(self._job_tracker.jobs_pending_inference) == 0
+            if len(self._job_tracker.jobs_pending_inference) != 0:
+                return PopGate.ALCHEMY_IMAGE_PRIORITY
+            return None
 
         # Concurrent mode: graph forms share a GPU-bearing lane with image work's post-processing tail, so
         # only pop them while image generation has a spare dispatch lane. CLIP-only forms run on the safety
         # process and don't contend for image lanes, so they skip this check.
         offers_graph = any(required_capability(form) is WorkerCapability.ALCHEMY_GRAPH for form in offered)
         if offers_graph and not self._has_spare_image_lane():
-            return False
+            return PopGate.ALCHEMY_IMAGE_PRIORITY
 
-        return self._has_vram_headroom() and self._has_ram_headroom()
+        if not self._has_vram_headroom():
+            return PopGate.ALCHEMY_VRAM_HEADROOM
+        if not self._has_ram_headroom():
+            return PopGate.RAM_PRESSURE
+        return None
+
+    def _note_pop_gate(self, gate: PopGate | None) -> None:
+        """Stamp the gate holding alchemy pops, recording its engagement time on a name change.
+
+        Stamped on the change rather than every tick so :attr:`WorkerState.alchemy_last_pop_gate_since`
+        measures how long this gate has held. The image intake stamps the same shape into
+        ``last_pop_gate``; this is the alchemy mirror.
+        """
+        name = None if gate is None else str(gate)
+        if name != self._state.alchemy_last_pop_gate:
+            self._state.alchemy_last_pop_gate = name
+            self._state.alchemy_last_pop_gate_since = time.time()
+
+    def _note_pop_attempt_completed(self, now: float) -> None:
+        """Stamp proof that an alchemy pop concluded against the horde, whatever it returned."""
+        self._state.alchemy_last_pop_attempt_completed_at = now
+
+    def _check_pop_liveness(self, now: float) -> None:
+        """Disclose an alchemy intake path that has gone silent, naming the gate that is holding it.
+
+        Mirrors the image flow's pop-liveness sentinel for the alchemy flow, which that sentinel does not
+        cover: on an alchemist-only worker the alchemy pop is the whole intake path, and every early return in
+        :meth:`_pop_gate` is silent, so a worker held at one of them is indistinguishable in the log from a
+        worker the horde has no forms for. This turns that silence into a line an operator can act on.
+
+        Stays quiet where the silence is already accounted for: the operator deselected the role
+        (``ALCHEMY_NOT_SERVED``), or a worker-wide intake hold stands (the operator's own pause or a terminal
+        state). Disclosure only; the remedies live with the watchdogs that own each condition.
+        """
+        last_attempt = self._state.alchemy_last_pop_attempt_completed_at
+        if last_attempt != self._alchemy_pop_liveness_attempt_seen:
+            # An attempt concluded, so this episode of silence is over; re-arm for the next one.
+            self._alchemy_pop_liveness_attempt_seen = last_attempt
+            self._alchemy_pop_liveness_warned_at = 0.0
+            self._alchemy_pop_liveness_errored_at = 0.0
+
+        if last_attempt == 0.0:
+            # The loop has not completed a first attempt yet; its start seeds the stamp, so nothing is owed.
+            return
+        silent_seconds = now - last_attempt
+        if silent_seconds < ALCHEMY_POP_LIVENESS_WARN_SECONDS:
+            return
+        if self._state.workload_intake_paused:
+            return
+        if self._state.alchemy_last_pop_gate == str(PopGate.ALCHEMY_NOT_SERVED):
+            return
+
+        if silent_seconds >= ALCHEMY_POP_LIVENESS_ERROR_SECONDS:
+            if (
+                self._alchemy_pop_liveness_errored_at == 0.0
+                or (now - self._alchemy_pop_liveness_errored_at) >= ALCHEMY_POP_LIVENESS_ERROR_SECONDS
+            ):
+                self._alchemy_pop_liveness_errored_at = now
+                logger.error(self._alchemy_pop_liveness_line(now, silent_seconds))
+            return
+
+        if self._alchemy_pop_liveness_warned_at == 0.0:
+            self._alchemy_pop_liveness_warned_at = now
+            logger.warning(self._alchemy_pop_liveness_line(now, silent_seconds))
+
+    def _alchemy_pop_liveness_line(self, now: float, silent_seconds: float) -> str:
+        """Compose the disclosure for an alchemy pop loop that has been silent for ``silent_seconds``."""
+        gate = self._state.alchemy_last_pop_gate
+        if gate is None:
+            return (
+                f"Alchemy pop liveness: no alchemy pop has reached the horde for {silent_seconds:.0f}s, and no "
+                "gate is holding pops back, so a pop request is still outstanding or the alchemy loop is no "
+                "longer running. This worker has served no alchemy work in that time."
+            )
+        held_seconds = now - self._state.alchemy_last_pop_gate_since
+        return (
+            f"Alchemy pop liveness: no alchemy pop has reached the horde for {silent_seconds:.0f}s; pops are "
+            f"held at gate '{gate}' (held {held_seconds:.0f}s). This worker has served no alchemy work while "
+            "that gate stands, so check whatever it waits on (the lanes, the queue, or the horde)."
+        )
 
     def _utilities_lane_healthy(self) -> bool:
         """Return True when an image-utilities lane process is up and past startup.
@@ -983,6 +1098,7 @@ class AlchemyCoordinator:
             return
 
         self._last_pop_time = time.time()
+        self._note_pop_attempt_completed(self._last_pop_time)
         spec = self._canned_alchemy_source.next_form()
         if spec is None:
             return
@@ -1101,15 +1217,19 @@ class AlchemyCoordinator:
                 timeout=ALCHEMY_POP_REQUEST_TIMEOUT_SECONDS,
             )
         except TimeoutError:
+            self._note_pop_attempt_completed(time.time())
             logger.warning(
                 f"Alchemy pop request timed out after {ALCHEMY_POP_REQUEST_TIMEOUT_SECONDS:.0f} seconds",
             )
             self._enter_pop_error_backoff()
             return
         except Exception as e:
+            self._note_pop_attempt_completed(time.time())
             logger.warning(f"Failed to pop alchemy job (Unexpected Error): {e}")
             self._enter_pop_error_backoff()
             return
+
+        self._note_pop_attempt_completed(time.time())
 
         if isinstance(pop_response, RequestErrorResponse):
             if self._handle_pop_error_response(pop_response):
@@ -1540,6 +1660,11 @@ class AlchemyCoordinator:
         """Run the alchemy pop/dispatch/submit loop."""
         logger.debug("In AlchemyCoordinator.run")
 
+        # Seed the liveness stamp so a worker that never completes a pop attempt measures its silence from the
+        # loop's start rather than from the epoch, mirroring the image pop-liveness sentinel. The disclosure
+        # then speaks for a loop that started and stopped reaching the horde, not for one that never ran.
+        self._note_pop_attempt_completed(time.time())
+
         while True:
             with logger.catch():
                 try:
@@ -1557,6 +1682,7 @@ class AlchemyCoordinator:
                     logger.debug(f"CancelledError: {e}")
 
             # Checked outside the catch block so persistent errors cannot prevent shutdown.
+            self._check_pop_liveness(time.time())
             if self._shutdown_manager.is_time_for_shutdown() or self._state.shut_down:
                 break
 
