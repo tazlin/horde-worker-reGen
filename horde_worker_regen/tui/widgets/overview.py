@@ -62,6 +62,7 @@ from horde_worker_regen.tui.health import (
     gpu_duty_low_cards,
     summarize_reduced_skips,
     summarize_skips,
+    text_backend_wait,
 )
 from horde_worker_regen.tui.responsive import (
     PHONE_BAND_MAX_WIDTH,
@@ -1690,12 +1691,10 @@ class OverviewView(Vertical):
         if snapshot.text_backend_ready:
             model = snapshot.text_model_name or "an unnamed model"
             return Text.assemble(("ready", "green"), (f" · {shorten(model, 36)}", "grey70"))
-        not_ready_since = snapshot.text_backend_not_ready_since
-        waited = (
-            f" for {human_duration(max(0.0, snapshot.timestamp - not_ready_since))}"
-            if not_ready_since is not None and snapshot.timestamp
-            else ""
-        )
+        # The health ladder's clock, so this row and the headline count the same wait: from the launch
+        # attempt for a backend the worker runs, which excludes the time spent obtaining its program.
+        wait = text_backend_wait(snapshot)
+        waited = f" for {human_duration(wait.seconds)}" if wait is not None and wait.seconds is not None else ""
         return Text.assemble(("not ready", "yellow"), (f"{waited} · no jobs are popped until it answers", "grey62"))
 
     @classmethod

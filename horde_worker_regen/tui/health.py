@@ -792,7 +792,7 @@ class TextBackendWait:
     reason: it is not late, and waiting changes nothing."""
 
 
-def _text_backend_wait(snapshot: WorkerStateSnapshot) -> TextBackendWait | None:
+def text_backend_wait(snapshot: WorkerStateSnapshot) -> TextBackendWait | None:
     """Return how long the scribe's backend has been unready, or None when there is nothing to report.
 
     The clock a managed backend is judged by starts at its launch attempt rather than at the flow's first
@@ -832,7 +832,7 @@ def _text_posture_report(snapshot: WorkerStateSnapshot, checks: list[HealthCheck
     worker is serving nothing, which is a degraded worker rather than a slow one; past twice that, the
     headline carries the remedy, because by then nothing is going to happen without the operator.
     """
-    wait = _text_backend_wait(snapshot)
+    wait = text_backend_wait(snapshot)
     if wait is None:
         return None
     if wait.provision_error is not None:
@@ -906,7 +906,7 @@ def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
     if not snapshot.config.scribe:
         return []
     rows: list[HealthCheck] = []
-    wait = _text_backend_wait(snapshot)
+    wait = text_backend_wait(snapshot)
     patience = snapshot.config.text_backend_ready_patience_seconds
     if wait is not None and wait.provision_error is not None:
         rows.append(HealthCheck(TEXT_BACKEND_CHECK_NAME, HealthStatus.ERROR, wait.provision_error))

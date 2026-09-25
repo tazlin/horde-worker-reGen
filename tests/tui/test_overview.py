@@ -1437,6 +1437,29 @@ def test_the_text_panel_says_how_long_a_backend_has_not_answered() -> None:
     assert "no jobs are popped until it answers" in text
 
 
+def test_the_text_panel_counts_a_managed_backend_wait_from_its_launch_like_the_health_ladder() -> None:
+    """The panel and the headline read one clock: obtaining the program is not the backend failing to answer."""
+    launching = _text_backend_process().model_copy(
+        update={
+            "display_state": "launching",
+            "text_backend": TextBackendDetail(kind="koboldcpp", port=5011, launching_since=1120.0),
+        },
+    )
+    snapshot = _scribe_snapshot(
+        config=_scribe_config(text_backend_managed=True),
+        processes=[launching],
+        text_backend_ready=False,
+        text_model_name=None,
+        text_backend_not_ready_since=1000.0,
+        timestamp=1180.0,
+    )
+
+    text = _render(OverviewView._render_text_panel(snapshot), width=200)
+
+    assert "not ready for 1m" in text
+    assert "3m" not in text
+
+
 def test_the_text_panel_names_an_unmeasured_token_rate_rather_than_dashing_it() -> None:
     """A stock backend counts no tokens for its whole life, which is not "none right now"."""
     snapshot = _scribe_snapshot(processes=[_text_backend_process(rate=None)])
