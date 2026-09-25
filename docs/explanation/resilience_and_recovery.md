@@ -963,8 +963,13 @@ no horde-side release**. The local latch
 which cannot happen while every pop is rejected, so a forced pause lasted until an
 operator noticed and cleared it by hand. Worse, it was nearly invisible: the pop
 rejection is logged once, the periodic status print is suppressed while the latch
-holds, and the kudos loop returns early, so hours of five-second retries read in
-the log exactly like a dead pop loop.
+holds, and the kudos loop returns early, so hours of rejected pops read in the
+log exactly like a dead pop loop.
+
+A maintenance rejection (`WorkerMaintenance`) is a hold, never an API error. The
+horde still hands the owner's own requests to a worker in maintenance, so the
+image, text and alchemy pop flows all keep their normal pop cadence through it and
+none of them enters its pop error backoff.
 
 The episode is driven once per control-loop tick by
 `HordeWorkerProcessManager._drive_server_maintenance_recovery`, and it has two

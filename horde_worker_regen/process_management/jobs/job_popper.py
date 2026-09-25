@@ -18,6 +18,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopRequest,
     ImageGenerateJobPopResponse,
 )
+from horde_sdk.ai_horde_api.consts import RC
 from horde_sdk.generation_parameters.image.sampler_work import SamplerExecutionContractVersion
 from horde_sdk.worker.dispatch.ai_horde.image.convert import apply_image_worker_feature_flags_to_pop_request
 from loguru import logger
@@ -1770,10 +1771,17 @@ class JobPopper:
             logger.error(f"Failed to process API messages: {e}")
 
     def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
-        """Log and categorize an error response from the pop API."""
-        message_lower = response.message.lower()
+        """Log and categorize an error response from the pop API, backing off the pop cadence for real errors.
 
-        if "maintenance mode" in message_lower:
+        A worker in maintenance is refused every pop with ``WorkerMaintenance`` as the return code. That is a
+        hold the operator chose or the horde imposed, never an API error, and the horde still hands the owner's
+        own jobs to this worker's pops. Backing off would only make the worker the slowest one to reach them,
+        so a maintenance reply keeps the normal cadence, as it does in the text and alchemy flows.
+        """
+        message_lower = response.message.lower()
+        is_maintenance = response.rc == RC.WorkerMaintenance or "maintenance mode" in message_lower
+
+        if is_maintenance:
             if not self._state.last_pop_maintenance_mode:
                 logger.warning(f"Failed to pop job (Maintenance Mode): {response}")
                 MaintenanceModeMessenger.print_maintenance_mode_messages()
@@ -1788,10 +1796,17 @@ class JobPopper:
                         workload=WorkloadKind.IMAGE_GENERATION,
                         detail=response.message,
                     )
+            else:
+                logger.trace(f"Image pop refused while in maintenance: {response.message!r}")
             # Counted on every rejection, not only on the edge: the log line above fires once per episode, so
             # this counter is the worker's only measure of how much work the maintenance is costing it.
             self._state.server_maintenance_pop_rejections += 1
-        elif "we cannot accept workers serving" in message_lower:
+            # The throttler is not told either way. A maintenance reply says nothing about whether an earlier
+            # real error has cleared, so a backoff that error opened is neither extended nor ended here.
+            self._state.last_pop_no_jobs_available = True
+            return
+
+        if "we cannot accept workers serving" in message_lower:
             logger.warning(f"Failed to pop job (Unrecognized Model): {response}")
             logger.error(
                 "Your worker is configured to use a model that is not accepted by the API. "

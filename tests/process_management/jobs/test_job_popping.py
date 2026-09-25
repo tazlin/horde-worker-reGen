@@ -22,7 +22,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopResponse,
     LorasPayloadEntry,
 )
-from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE, RC
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import ModelPoolConfig
@@ -1526,9 +1526,7 @@ class TestHandlePopErrorResponse:
     """Tests for _handle_pop_error_response."""
 
     def _make_error_response(self, message: str) -> RequestErrorResponse:
-        resp = Mock(spec=RequestErrorResponse)
-        resp.message = message
-        return resp
+        return RequestErrorResponse(message=message)
 
     def test_maintenance_mode_sets_state_flag(self) -> None:
         """Maintenance mode messages cause last_pop_maintenance_mode and last_pop_no_jobs_available to be True."""
@@ -1640,6 +1638,58 @@ class TestHandlePopErrorResponse:
         popper._handle_pop_error_response(resp)
 
         assert popper._pop_throttler.current_pop_frequency > original_frequency
+
+    def test_a_maintenance_reply_keeps_the_normal_pop_cadence(self) -> None:
+        """The horde still sends the owner's jobs to a worker in maintenance, so its pops must not slow down."""
+        state = WorkerState()
+        popper = _make_popper(state=state)
+
+        for _ in range(3):
+            popper._handle_pop_error_response(
+                RequestErrorResponse(message="owner-only traffic", rc=RC.WorkerMaintenance),
+            )
+
+        assert popper.is_in_error_backoff is False
+        assert popper._pop_throttler.current_pop_frequency == popper._pop_throttler._default_pop_frequency
+        # Past the default interval but well inside the error one, so a backed-off popper would still wait.
+        assert popper._pop_throttler.is_pop_too_soon(time.time() - 2.0) is False
+        assert state.last_pop_maintenance_mode is True
+        assert state.server_maintenance_pop_rejections == 3
+
+    def test_a_maintenance_message_without_the_return_code_keeps_the_normal_cadence(self) -> None:
+        """The message-text recognition still applies when the reply carries no return code."""
+        popper = _make_popper()
+
+        popper._handle_pop_error_response(self._make_error_response("Server is in maintenance mode"))
+
+        assert popper.is_in_error_backoff is False
+
+    def test_a_real_error_still_backs_off_after_maintenance(self) -> None:
+        """Exempting maintenance must not exempt the errors that follow it."""
+        popper = _make_popper()
+        popper._handle_pop_error_response(RequestErrorResponse(message="owner-only traffic", rc=RC.WorkerMaintenance))
+
+        popper._handle_pop_error_response(RequestErrorResponse(message="Internal server error"))
+
+        assert popper.is_in_error_backoff is True
+
+    def test_a_maintenance_reply_during_a_backoff_neither_extends_nor_ends_it(self) -> None:
+        """A maintenance reply says nothing about whether the earlier error cleared, so the backoff stands."""
+        run_metrics = WorkerRunMetrics()
+        popper = _make_popper(run_metrics=run_metrics)
+        popper._handle_pop_error_response(RequestErrorResponse(message="Internal server error"))
+        frequency_in_backoff = popper._pop_throttler.current_pop_frequency
+
+        popper._handle_pop_error_response(RequestErrorResponse(message="owner-only traffic", rc=RC.WorkerMaintenance))
+
+        assert popper.is_in_error_backoff is True
+        assert popper._pop_throttler.current_pop_frequency == frequency_in_backoff
+        backoff_events = [
+            event.kind
+            for event in run_metrics.recent_events()
+            if event.kind in (WorkerEventKind.POP_BACKOFF_ENTERED, WorkerEventKind.POP_BACKOFF_LEFT)
+        ]
+        assert backoff_events == [WorkerEventKind.POP_BACKOFF_ENTERED]
 
 
 class TestApplySdkWorkarounds:
@@ -2009,9 +2059,7 @@ class TestApiJobPopFullFlow:
     @_full_flow_patches
     async def test_error_response_handled(self, _mock_req_cls: Mock) -> None:
         """RequestErrorResponse should be handled by _handle_pop_error_response."""
-        error_resp = Mock(spec=RequestErrorResponse)
-        error_resp.message = "Server is in maintenance mode"
-        error_resp.__class__ = RequestErrorResponse
+        error_resp = RequestErrorResponse(message="Server is in maintenance mode")
 
         horde_session = AsyncMock()
         horde_session.submit_request = AsyncMock(return_value=error_resp)
@@ -2027,6 +2075,10 @@ class TestApiJobPopFullFlow:
         )
 
         await popper.api_job_pop()
+
+        horde_session.submit_request.assert_awaited_once()
+        assert state.last_pop_maintenance_mode is True
+        assert popper.is_in_error_backoff is False
 
     @_full_flow_patches
     async def test_job_faults_initialized_for_popped_job(self, _mock_req_cls: Mock) -> None:
