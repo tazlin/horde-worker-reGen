@@ -762,6 +762,8 @@ class TextGenerationCoordinator:
         self._relaunch_bound_reported = False
         """Whether the flow has said it stopped relaunching, since the last successful generation."""
 
+        self.num_jobs_popped = 0
+        """Cumulative text jobs popped from the API this session."""
         self.num_jobs_submitted = 0
         """Cumulative text jobs successfully submitted to the API this session."""
         self.num_jobs_faulted = 0
@@ -1550,6 +1552,7 @@ class TextGenerationCoordinator:
             )
             self._in_flight[job_id] = job
             self._state.text_jobs_in_flight = len(self._in_flight)
+            self.num_jobs_popped += 1
             logger.info(
                 f"Popped text job {job_id[:8]} for {pop_response.model} "
                 f"(softprompt: {pop_response.softprompt}, ttl: {pop_response.ttl})",

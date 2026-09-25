@@ -96,6 +96,7 @@ def _snapshot() -> WorkerStateSnapshot:
         kudos_per_hour=900.0,
         kudos_this_session=1234.0,
         gpu_utilization_mean_percent=72.0,
+        jobs_in_hand=15,
         jobs_pending_inference=5,
         jobs_in_progress=2,
         jobs_pending_post_processing=1,
@@ -174,6 +175,7 @@ def test_state_projection_is_small_and_preserves_high_level_facts() -> None:
 
     assert state.worker_name == "Native Worker"
     assert state.jobs_submitted == 17
+    assert state.jobs_in_hand == 15
     assert state.jobs_post_processing == 2
     assert state.jobs_safety == 3
     assert state.local_paused is True

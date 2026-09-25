@@ -138,6 +138,7 @@ class NativeDashboardState(BaseModel):
     kudos_this_session: float | None = None
     gpu_duty_percent: float | None = None
 
+    jobs_in_hand: int = 0
     jobs_queued: int = 0
     jobs_active: int = 0
     jobs_post_processing: int = 0
@@ -365,6 +366,7 @@ def build_native_dashboard_state(supervisor: NativeSupervisor) -> NativeDashboar
         kudos_per_hour=snapshot.kudos_per_hour,
         kudos_this_session=snapshot.kudos_this_session,
         gpu_duty_percent=snapshot.gpu_utilization_mean_percent,
+        jobs_in_hand=snapshot.jobs_in_hand,
         jobs_queued=snapshot.jobs_pending_inference,
         jobs_active=snapshot.jobs_in_progress,
         jobs_post_processing=snapshot.jobs_pending_post_processing + snapshot.jobs_being_post_processed,

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 31
+SUPERVISOR_PROTOCOL_VERSION = 32
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -139,6 +139,10 @@ youngest flow's figure, so a text pop hides an image intake that has been silent
 ``pop_liveness`` (:class:`PopLivenessSnapshot`), the pop-liveness sentinel's verdict on the image intake with
 the line it logs, so the dashboard's pop-intake check shows the worker's own judgement and holds no bounds or
 exemptions of its own.
+v32 makes ``num_jobs_popped`` cumulative: each flow counts at its own pop site, so the figure only climbs
+and a Session card's "Popped" reads as the session's total. Up to v31 it carried the work held at that
+instant; that figure moves to ``jobs_in_hand``, every image job from pop to submit plus the other flows'
+in-flight work, which no sum of the per-stage fields reproduces.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -1671,6 +1675,7 @@ class WorkerStateSnapshot(BaseModel):
 
     # Headline job counters (from the job tracker / submitter / popper).
     num_jobs_popped: int = 0
+    """Work units popped this session across every workload, cumulative; :attr:`jobs_in_hand` is what is held now."""
     num_jobs_submitted: int = 0
     num_jobs_faulted: int = 0
     num_job_slowdowns: int = 0
@@ -1683,6 +1688,9 @@ class WorkerStateSnapshot(BaseModel):
     last_process_recovery_lane: str | None = None
     """Which lane that recovery replaced, in operator words ("image utilities", "inference slot")."""
     pending_megapixelsteps: int = 0
+    jobs_in_hand: int = 0
+    """Work units the worker holds right now across every workload: every image job from pop to submit, whatever
+    its stage, plus the alchemy forms and text jobs in flight. The per-stage figures below split the image part."""
     jobs_pending_inference: int = 0
     jobs_in_progress: int = 0
     jobs_pending_safety_check: int = 0

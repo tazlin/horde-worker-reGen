@@ -875,6 +875,8 @@ class OverviewView(Vertical):
             (f"{human_duration(age)} ago", "grey70"),
             ("  ·  last pop ", "grey50"),
             *since_pop,
+            ("  ·  in hand ", "grey50"),
+            (str(snapshot.jobs_in_hand), "grey70"),
             ("  ·  in progress ", "grey50"),
             (str(snapshot.jobs_in_progress), "grey70"),
             ("  ·  queued ", "grey50"),

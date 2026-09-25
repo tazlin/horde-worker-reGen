@@ -451,6 +451,7 @@ class AttachSupervisor:
             "procs": procs,
             "queue": snapshot.jobs_pending_inference,
             "in_progress": snapshot.jobs_in_progress,
+            "in_hand": snapshot.jobs_in_hand,
             "popped": snapshot.num_jobs_popped,
             "submitted": snapshot.num_jobs_submitted,
             "faulted": snapshot.num_jobs_faulted,

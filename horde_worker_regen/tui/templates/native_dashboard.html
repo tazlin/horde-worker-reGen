@@ -375,7 +375,7 @@
         <p class="insight" id="insight">Connecting to the worker host…</p>
       </section>
       <section class="core-pipeline">
-        <h2>Pipeline</h2>
+        <h2>Pipeline <span id="pipe-in-hand" class="label"></span></h2>
         <div class="pipeline">
           <div class="stage"><b id="pipe-queue">0</b><span>Queue</span></div>
           <div class="stage"><b id="pipe-active">0</b><span>Inference</span></div>
@@ -681,6 +681,7 @@
         setText("kudos-session", formatNumber(state.kudos_this_session));
         setText("gpu-duty", state.gpu_duty_percent === null ? "—" : `${Math.round(state.gpu_duty_percent)}%`);
         setText("freshness", state.snapshot_timestamp ? `updated ${formatDuration(state.server_time - state.snapshot_timestamp)} ago` : "No snapshot");
+        setText("pipe-in-hand", `${formatNumber(state.jobs_in_hand)} in hand`);
         setText("pipe-queue", formatNumber(state.jobs_queued));
         setText("pipe-active", formatNumber(state.jobs_active));
         setText("pipe-post", formatNumber(state.jobs_post_processing));

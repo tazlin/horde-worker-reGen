@@ -507,6 +507,8 @@ class AlchemyCoordinator:
         self._withheld_post_processors = frozenset()
         self.num_canned_forms_completed = 0
         self.num_canned_forms_faulted = 0
+        self.num_forms_popped = 0
+        """Cumulative forms popped from the API (or taken from the canned source) this session."""
         self.num_forms_submitted = 0
         """Cumulative forms successfully submitted to the API (or recorded in canned mode) this session."""
         self.num_forms_faulted = 0
@@ -1207,6 +1209,7 @@ class AlchemyCoordinator:
             self._form_time_popped[spec.form_id] = time.time()
             self._form_resolution[spec.form_id] = self._decode_image_resolution(source_image_bytes)
             self._queue_pending_form(spec)
+            self.num_forms_popped += 1
             logger.opt(colors=True).info(
                 "<fg #34c0eb>Popped alchemy form {} ({})</>",
                 spec.form_id,

@@ -331,6 +331,7 @@ def test_text_work_reaches_the_whole_worker_counters() -> None:
     assert coordinator is not None
     coordinator.num_jobs_submitted = 4
     coordinator.num_jobs_faulted = 1
+    coordinator.num_jobs_popped = 6
     coordinator._in_flight["in-hand"] = TextJobInFlight(
         job_id="in-hand",
         payload={},
@@ -344,7 +345,8 @@ def test_text_work_reaches_the_whole_worker_counters() -> None:
     assert snapshot.num_jobs_submitted == 5
     assert snapshot.num_jobs_faulted == 1
     assert snapshot.jobs_in_progress == 1
-    assert snapshot.num_jobs_popped == 1
+    assert snapshot.num_jobs_popped == 6, "popped is the cumulative count, not the work in hand"
+    assert snapshot.jobs_in_hand == 1
     assert snapshot.seconds_since_last_pop is not None
     assert snapshot.seconds_since_last_pop < 60.0
     assert snapshot.latest_stats_sample is not None

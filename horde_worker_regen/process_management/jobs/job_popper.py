@@ -2449,6 +2449,7 @@ class JobPopper:
             job_pop_response.id_,
             job_pop_response.model,
         )
+        self._state.num_jobs_popped += 1
         if self._run_metrics is not None:
             self._run_metrics.record_event(
                 WorkerEventKind.JOB_POPPED,

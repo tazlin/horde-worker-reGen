@@ -164,6 +164,9 @@ class WorkerState:
     server_maintenance_pop_rejections: int = 0
     """Pops the horde has rejected for maintenance since :attr:`server_maintenance_latched_at` engaged."""
 
+    num_jobs_popped: int = 0
+    """Image jobs popped this session, cumulative; a batch pop counts once, as one job."""
+
     server_maintenance_locally_intended: bool = False
     """A local surface (dashboard key, supervisor command, attach-supervisor guard) last set maintenance on.
 

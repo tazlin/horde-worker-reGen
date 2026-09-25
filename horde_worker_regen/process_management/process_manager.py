@@ -8042,6 +8042,16 @@ class HordeWorkerProcessManager:
         faulted = self._job_tracker.num_jobs_faulted + self._alchemy_coordinator.num_forms_faulted
         return faulted if text is None else faulted + text.num_jobs_faulted
 
+    def _popped_jobs_every_flow(self) -> int:
+        """Return the work units popped across every workload this session, cumulative.
+
+        Each flow counts at its own pop site, so the figure only climbs; what the worker holds right now is the
+        snapshot's ``jobs_in_hand``, never this one.
+        """
+        text = self._text_coordinator
+        popped = self._state.num_jobs_popped + self._alchemy_coordinator.num_forms_popped
+        return popped if text is None else popped + text.num_jobs_popped
+
     def _jobs_in_hand_other_flows(self) -> int:
         """Return the work units the non-image flows currently hold, popped through to awaiting submit.
 
@@ -8272,7 +8282,8 @@ class HordeWorkerProcessManager:
             api_messages=api_messages,
             config=config,
             processes=processes,
-            num_jobs_popped=self.num_jobs_total + jobs_in_hand_other_flows,
+            num_jobs_popped=self._popped_jobs_every_flow(),
+            jobs_in_hand=self.num_jobs_total + jobs_in_hand_other_flows,
             num_jobs_submitted=jobs_submitted_total,
             num_jobs_faulted=jobs_faulted_total,
             num_job_slowdowns=self._job_submitter.num_job_slowdowns,
