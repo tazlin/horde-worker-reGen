@@ -558,6 +558,138 @@ class TestConsecutiveFailurePause:
         assert "consecutive_failure_pause" not in _diagnose(tmp_path, bridge)
 
 
+_TEXT_FLOW = "horde_worker_regen.process_management.jobs.text_generation_coordinator"
+_TEXT_BUSY_REASON = (
+    "Text backend is already generating (backend at http://127.0.0.1:5001, generation "
+    "6dbc2470-de25-45d6-b003-606cc79cd552, status 503: ...)"
+)
+
+
+def _text_wedge_hold(ts: str, *, relaunch_bound: bool = False) -> str:
+    """The text flow's wedge-hold line: a relaunch, or the exhausted relaunch bound."""
+    busy_for = (
+        "The text backend at http://127.0.0.1:5001 has answered busy for 64s (5 busy answers) with no job "
+        "receiving text"
+    )
+    if relaunch_bound:
+        return (
+            f"2026-09-21 {ts} | ERROR    | {_TEXT_FLOW}:_enter_wedge_hold:1167 - {busy_for}, after 3 relaunches "
+            "with no successful generation between them. It is not relaunched again, and no text jobs are popped "
+            "until it generates or restarts."
+        )
+    return (
+        f"2026-09-21 {ts} | WARNING  | {_TEXT_FLOW}:_enter_wedge_hold:1184 - {busy_for}; it looks wedged. "
+        "Relaunching it (relaunch 1 of 3 without a successful generation). No text jobs are popped until it "
+        "answers again."
+    )
+
+
+def _text_busy_reoffer(ts: str, job: str) -> str:
+    """The flow re-offering a job the backend refused as busy (DEBUG, so present only at debug level)."""
+    return (
+        f"2026-09-21 {ts} | DEBUG    | {_TEXT_FLOW}:_offer_until_answered:1282 - Text backend busy for job {job}, "
+        f"re-offering it: {_TEXT_BUSY_REASON}"
+    )
+
+
+def _text_busy_fault_legacy(ts: str, job: str) -> str:
+    """An older worker faulting a job after a fixed number of busy answers."""
+    return (
+        f"2026-09-21 {ts} | WARNING  | {_TEXT_FLOW}:_offer_until_answered:1277 - Text backend was busy for all 5 "
+        f"attempts at job {job}; faulting it rather than holding it longer: {_TEXT_BUSY_REASON}"
+    )
+
+
+def _text_fault_reported(ts: str, job: str) -> str:
+    return f"2026-09-21 {ts} | INFO     | {_TEXT_FLOW}:_note_submitted:1500 - Reported text job {job} as faulted to the horde"
+
+
+def _text_submitted(ts: str, job: str) -> str:
+    return (
+        f"2026-09-21 {ts} | SUCCESS  | {_TEXT_FLOW}:_note_submitted:1514 - Submitted text job {job} for 0.66 kudos. "
+        "Job popped 3.84 seconds ago."
+    )
+
+
+class TestTextBackendWedged:
+    """A text backend refusing every job as busy while it generates nothing, from either worker generation."""
+
+    def _bridge(self, *lines: str) -> str:
+        return "\n".join(
+            [f"2026-09-21 20:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    @staticmethod
+    def _refused_and_faulted(minute: int, job: str, *, legacy_warning: bool) -> list[str]:
+        """One job refused as busy, then faulted back to the horde, a minute into the hour given."""
+        refusal = _text_busy_fault_legacy if legacy_warning else _text_busy_reoffer
+        return [refusal(f"20:{minute:02d}:10.000", job), _text_fault_reported(f"20:{minute:02d}:12.000", job)]
+
+    def test_fires_on_the_wedge_hold_lines(self, tmp_path: Path) -> None:
+        """A current worker's own wedge lines are the finding, and an exhausted relaunch bound is named."""
+        bridge = self._bridge(
+            _text_wedge_hold("20:05:00.000"),
+            _text_wedge_hold("20:15:00.000", relaunch_bound=True),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["text_backend_wedged"]
+
+        assert finding.severity is Severity.CRITICAL
+        assert "2 times" in finding.headline
+        assert "restarting it did not help" in finding.headline
+        assert "`text_threads`" in finding.action
+        assert "failed to find a memory slot" in finding.action
+        assert finding.see_also is FindingKind.FORCED_MAINTENANCE
+
+    def test_fires_on_the_legacy_run_of_busy_faults(self, tmp_path: Path) -> None:
+        """An older worker left only busy refusals and fault reports, with no submit, for hours."""
+        lines: list[str] = []
+        for minute in range(0, 60, 5):
+            lines.extend(self._refused_and_faulted(minute, f"{minute:08x}", legacy_warning=True))
+
+        finding = _diagnose(tmp_path, self._bridge(*lines))["text_backend_wedged"]
+
+        assert finding.severity is Severity.CRITICAL
+        assert "12 text jobs in a row" in finding.headline
+        assert "55 minutes" in finding.headline
+
+    def test_the_legacy_run_is_read_from_debug_refusals_too(self, tmp_path: Path) -> None:
+        """At debug level the re-offer lines alone show which faulted jobs were refused as busy."""
+        lines: list[str] = []
+        for minute in range(0, 30, 5):
+            lines.extend(self._refused_and_faulted(minute, f"{minute:08x}", legacy_warning=False))
+
+        assert "text_backend_wedged" in _diagnose(tmp_path, self._bridge(*lines))
+
+    def test_silent_on_a_busy_backend_that_then_submits(self, tmp_path: Path) -> None:
+        """Busy refusals that end in submitted jobs are a full backend doing its work."""
+        lines: list[str] = []
+        for minute in range(0, 60, 5):
+            job = f"{minute:08x}"
+            lines.extend(
+                [_text_busy_reoffer(f"20:{minute:02d}:10.000", job), _text_submitted(f"20:{minute:02d}:40.000", job)],
+            )
+
+        assert "text_backend_wedged" not in _diagnose(tmp_path, self._bridge(*lines))
+
+    def test_a_submit_inside_the_run_breaks_it(self, tmp_path: Path) -> None:
+        """Faults on either side of one delivered job are two short runs, not one stuck backend."""
+        lines: list[str] = []
+        for minute in range(0, 20, 5):
+            lines.extend(self._refused_and_faulted(minute, f"{minute:08x}", legacy_warning=True))
+        lines.append(_text_submitted("20:22:00.000", "aaaaaaaa"))
+        for minute in range(25, 45, 5):
+            lines.extend(self._refused_and_faulted(minute, f"{minute:08x}", legacy_warning=True))
+
+        assert "text_backend_wedged" not in _diagnose(tmp_path, self._bridge(*lines))
+
+    def test_silent_on_faults_the_backend_never_refused(self, tmp_path: Path) -> None:
+        """Text jobs faulted for another reason are not this finding's business."""
+        lines = [_text_fault_reported(f"20:{minute:02d}:12.000", f"{minute:08x}") for minute in range(0, 60, 5)]
+
+        assert "text_backend_wedged" not in _diagnose(tmp_path, self._bridge(*lines))
+
+
 def _oom_coresident(ts: str, *, slot: int = 4, model: str = "Z-Image-Turbo") -> str:
     """A faulted-inference OOM carrying the allocator's co-residency accounting (the over-admission case).
 

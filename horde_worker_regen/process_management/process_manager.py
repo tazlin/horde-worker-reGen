@@ -287,6 +287,7 @@ from horde_worker_regen.text_backends import (
     UnsupportedTextBackendError,
     build_launch_spec,
 )
+from horde_worker_regen.text_backends.launch_spec import choose_text_backend_device
 from horde_worker_regen.text_backends.model_catalogue import resolve_text_model, text_model_records
 from horde_worker_regen.text_backends.provision import (
     TextBackendProvisionError,
@@ -2124,6 +2125,11 @@ class HordeWorkerProcessManager:
             # The managed model's advertised spelling is known only once its file is resolved, which
             # happens in the supervisor's provisioning step, so the flow reads it at readiness.
             canonical_name_provider=self._managed_text_model_canonical_name,
+            # Through a callable for the same reason as the launch count. A backend the operator runs is
+            # not the worker's to restart, so a wedge there holds the flow and is reported instead.
+            relaunch_backend=(
+                self._request_managed_text_backend_relaunch if bridge_data.text_backend_managed else None
+            ),
         )
         self._flows[WorkloadKind.TEXT_GENERATION] = self._text_coordinator
 
@@ -8603,14 +8609,39 @@ class HordeWorkerProcessManager:
             )
         return self._text_backend_driver
 
-    def _text_backend_device_index(self) -> int | None:
-        """Return the card the managed backend uses: the configured one, else the lowest driven card."""
+    def _text_backend_device_index(self, *, model_file_mb: float) -> int | None:
+        """Return the card the managed backend uses: the configured one, else the driven card with most room.
+
+        Each card's free VRAM is the reading the scheduler places the safety process by, and the card's total
+        where nothing has reported yet. The choice itself is
+        [`choose_text_backend_device`][horde_worker_regen.text_backends.launch_spec.choose_text_backend_device].
+
+        Args:
+            model_file_mb: The size of the model file the backend loads, which sets how close two cards'
+                readings must be to count as equal.
+        """
         configured = self.bridge_data.text_gpu_device_index
-        if configured is not None:
-            return configured
-        if not self._device_map.root:
-            return None
-        return min(self._device_map.root)
+        free_mb_by_device: dict[int, float] = {}
+        for device_index, device_info in self._device_map.root.items():
+            measured_free_mb = self._inference_scheduler._measured_free_vram_mb(device_index=device_index)
+            free_mb_by_device[device_index] = (
+                measured_free_mb if measured_free_mb is not None else device_info.total_memory / (1024 * 1024)
+            )
+        chosen = choose_text_backend_device(
+            configured_index=configured,
+            free_mb_by_device=free_mb_by_device,
+            model_file_mb=model_file_mb,
+            safety_device_index=self._process_lifecycle.safety_gpu_card_index(),
+        )
+        if configured is None and len(free_mb_by_device) > 1:
+            readings = ", ".join(
+                f"card {device_index} {free_mb:.0f} MB" for device_index, free_mb in sorted(free_mb_by_device.items())
+            )
+            logger.info(
+                f"Text backend placed on card {chosen}: the most free VRAM for a {model_file_mb:.0f} MB model "
+                f"(free: {readings}). Set `text_gpu_device_index` to choose the card yourself.",
+            )
+        return chosen
 
     async def _run_text_backend_supervisor(self) -> None:
         """Keep the managed text backend alive for the worker's lifetime, from obtaining it onwards.
@@ -8673,7 +8704,7 @@ class HordeWorkerProcessManager:
             executable=executable,
             model_path=model_path,
             port=bridge_data.text_backend_port,
-            device_index=self._text_backend_device_index(),
+            device_index=self._text_backend_device_index(model_file_mb=model_path.stat().st_size / (1024 * 1024)),
             gpu_layers=bridge_data.text_gpu_layers,
             context_length=bridge_data.max_context_length,
             log_path=logs_dir(create=True) / TEXT_BACKEND_LOG_FILE_NAME,
@@ -8706,6 +8737,14 @@ class HordeWorkerProcessManager:
         """
         supervisor = self._text_backend_supervisor
         return 0 if supervisor is None else supervisor.launch_count
+
+    def _request_managed_text_backend_relaunch(self, reason: str) -> bool:
+        """Ask the managed text backend's supervisor to relaunch it, returning whether one was scheduled.
+
+        False before the supervisor exists, when there is no process to relaunch.
+        """
+        supervisor = self._text_backend_supervisor
+        return False if supervisor is None else supervisor.request_relaunch(reason)
 
     def _cancel_main_loop_siblings(self, tasks: list[asyncio.Task[None]]) -> None:
         """Cancel background loops after the control loop has completed final child teardown.

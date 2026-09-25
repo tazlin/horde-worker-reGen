@@ -75,7 +75,13 @@ def koboldcpp_launch_spec(settings: TextBackendLaunchSettings) -> TextBackendLau
     None device index states the compute path without a device, which koboldcpp reads as every device on
     that path. koboldcpp caps an oversized layer count at the model's layer count, so a large `gpu_layers`
     means the whole model. One parallel request is koboldcpp's own default, so the flag is left off.
+
+    With several parallel requests the context is sized for all of them at once. koboldcpp gives its batching
+    slots one shared KV pool of ``--contextsize`` cells and clamps each request only to that pool, while the
+    worker advertises the full context per job and takes that many jobs at a time. A pool of one context
+    runs out of cells once two long requests overlap, and every later request is answered busy.
     """
+    context_cells = settings.context_length * settings.parallel_requests
     arguments: list[str] = [
         KoboldcppArguments.MODEL,
         str(settings.model_path),
@@ -85,7 +91,7 @@ def koboldcpp_launch_spec(settings: TextBackendLaunchSettings) -> TextBackendLau
         LOOPBACK_HOST,
         *_device_arguments(settings),
         KoboldcppArguments.CONTEXT_SIZE,
-        str(settings.context_length),
+        str(context_cells),
         KoboldcppArguments.SKIP_LAUNCHER,
         KoboldcppArguments.QUIET,
     ]
@@ -97,6 +103,8 @@ def koboldcpp_launch_spec(settings: TextBackendLaunchSettings) -> TextBackendLau
         port=settings.port,
         log_path=settings.log_path,
         device_index=settings.device_index,
+        context_cells=context_cells,
+        parallel_requests=settings.parallel_requests,
     )
 
 

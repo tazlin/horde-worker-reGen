@@ -26,6 +26,14 @@ early, with the first token after a backend starts exempted because a cold backe
 warming its kernels. The flow spends one short generation of its own on that warm-up where it owns the
 backend, so the first popped job does not.
 
+A backend can also stop producing without going silent: one whose generation lock never releases answers
+every request busy, which to a single job looks like a backend that is merely full. The difference shows
+only across jobs, so the flow keeps one busy spell for the whole backend, ended by any text it produces.
+A spell that outlasts :data:`TEXT_BACKEND_WEDGE_BUSY_SECONDS` (or one generation deadline, when longer)
+with nothing in hand producing text is a wedge: the flow closes its readiness gate so nothing more is
+popped, asks the worker to relaunch a backend it owns, and tells the operator of one it does not. Jobs
+already in hand are re-offered until the horde's ttl for them is spent rather than faulted early.
+
 Which backend is attached is a constructor argument twice over: the object the flow generates through
 (the [`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend] protocol, never a concrete
 driver) and the `TEXT_BACKENDS` value naming which one it is, which is all that decides how the
@@ -126,15 +134,32 @@ operator fixed it.
 """
 
 BUSY_RETRY_MAX_ATTEMPTS: Final = 5
-"""How many times one job is re-offered to a busy backend before it is faulted.
+"""How many busy answers a busy spell must hold before it can be judged a wedge.
 
-A busy answer means the backend is healthy and the payload is fine, so the job is worth re-offering;
-but a backend that is busy this long is over-subscribed (or `text_threads` is set above what it will
-actually run in parallel), and holding the job any longer only risks the server timing it out.
+A backend full of the worker's own generations answers busy routinely, so a few refusals are no
+evidence of anything. The count faults no job: a busy job is re-offered until the horde's ttl for it is
+spent, because a backend that is merely full frees a slot within one generation.
 """
 
 BUSY_RETRY_WAIT_SECONDS: Final = 2.0
 """Wait between re-offers of a job the backend was too busy to take."""
+
+TEXT_BACKEND_WEDGE_BUSY_SECONDS: Final = 60.0
+"""Shortest busy spell judged a wedge while no job in hand is producing text.
+
+The bound applied is the longer of this and one generation deadline. The flow lets one of its own
+generations stay silent for up to that deadline (the first token of a cold backend), so a shorter spell
+can be the backend serving the worker's own work. A spell starts at the first busy answer after the
+backend last produced text and spans jobs, so jobs each refused a few times add up to one spell.
+"""
+
+TEXT_BACKEND_WEDGE_MAX_RELAUNCHES: Final = 3
+"""How many wedge relaunches the flow requests in a row with no successful generation between them.
+
+A backend that wedges again after every relaunch has a fault a relaunch does not reach, such as a model
+that its launch settings do not suit, and relaunching it again only reloads its weights again. Past this
+the flow keeps its pops held and says so once.
+"""
 
 SUBMIT_MAX_ATTEMPTS: Final = 3
 """How many times a text submit is attempted before the result is given up on."""
@@ -485,6 +510,12 @@ class TextJobInFlight:
     """Generated tokens the backend reported for this job, or None when nothing reported them."""
     busy_attempts: int = 0
     """How many times the backend has answered busy for this job."""
+    first_busy_at: float | None = None
+    """The `time.monotonic()` reading of the backend's first busy answer for this job, or None.
+
+    The bound on re-offering a job whose pop carried no ttl, which then gets one generation deadline of
+    busy answers before it is faulted.
+    """
     stopped: bool = False
     """Whether the flow has asked the backend to abandon this generation.
 
@@ -524,6 +555,32 @@ class TextJobInFlightRow:
         return self.time_generation_started is not None
 
 
+@dataclass
+class _WedgeEpisode:
+    """Represents one spell during which the flow judged its backend wedged and holds its pops.
+
+    Ends on a successful generation, or on a readiness answer from a backend that has restarted since
+    the spell began. A wedged backend still answers the readiness probe, so an answer on its own proves
+    nothing; one that follows a refused probe or a new launch comes from a backend that went away.
+    """
+
+    busy_seconds: float
+    """How long the backend had answered busy when the wedge was judged."""
+    launch_count_at_start: int | None
+    """The backend's launch count when the spell began, or None for a backend the operator runs."""
+    last_probe_at: float
+    """The `time.monotonic()` reading of the hold's last readiness probe, or of the spell's start."""
+    saw_unready: bool = False
+    """Whether a readiness probe or a generation during the spell found the backend not answering."""
+
+
+def _is_producing(job: TextJobInFlight) -> bool:
+    """Return whether the backend has acknowledged this job's current generation by sending it text."""
+    if job.stopped or job.time_generation_finished is not None or job.progress is None:
+        return False
+    return job.progress.chunks_received > 0
+
+
 class TextGenerationCoordinator:
     """Owns the text-generation job lifecycle in the main process: gate, pop, generate, submit."""
 
@@ -541,6 +598,7 @@ class TextGenerationCoordinator:
         launch_count_provider: Callable[[], int] | None = None,
         backend_address_provider: Callable[[], str] | None = None,
         canonical_name_provider: Callable[[], str | None] | None = None,
+        relaunch_backend: Callable[[str], bool] | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators and the backend to generate through.
 
@@ -576,6 +634,9 @@ class TextGenerationCoordinator:
                 managed backend, read at readiness because the file is resolved in the supervisor's
                 provisioning step. None, or a provider answering None, leaves the spelling to
                 `text_model_name` and then to what the backend reports.
+            relaunch_backend: Stops a backend the worker owns so its supervisor relaunches it, handed the
+                reason, and answering whether a relaunch was scheduled. Called once per wedge. None for a
+                backend the operator runs, which the flow holds its pops for and reports instead.
 
         Raises:
             ValueError: Neither `backend` nor `backend_factory` was given, leaving nothing to generate
@@ -595,6 +656,7 @@ class TextGenerationCoordinator:
         self._launch_count_provider = launch_count_provider
         self._backend_address_provider = backend_address_provider
         self._canonical_name_provider = canonical_name_provider
+        self._relaunch_backend = relaunch_backend
 
         self._in_flight: dict[str, TextJobInFlight] = {}
         self._job_tasks: set[asyncio.Task[None]] = set()
@@ -640,6 +702,21 @@ class TextGenerationCoordinator:
         from, as a `time.monotonic()` reading: the interval is a duration rather than an instant anything
         displays.
         """
+
+        self._busy_spell_started_at: float | None = None
+        """The `time.monotonic()` reading of the first busy answer since the backend last produced text.
+
+        None while no spell is running. One clock for the backend rather than one per job, because a
+        wedged backend refuses every job and each job alone is refused only for as long as it is held.
+        """
+        self._busy_answers_in_spell = 0
+        """How many busy answers the current spell holds, across every job."""
+        self._wedge: _WedgeEpisode | None = None
+        """The wedge the flow is holding its pops for, or None while it has judged none."""
+        self._wedge_relaunches_without_success = 0
+        """Wedge relaunches requested since the last successful generation."""
+        self._relaunch_bound_reported = False
+        """Whether the flow has said it stopped relaunching, since the last successful generation."""
 
         self.num_jobs_submitted = 0
         """Cumulative text jobs successfully submitted to the API this session."""
@@ -787,7 +864,8 @@ class TextGenerationCoordinator:
 
         Returns:
             `True` when the backend answered and described itself, `False` when shutdown interrupted the
-            wait or the backend refused the worker's credentials.
+            wait, the backend refused the worker's credentials, or a job judged the backend wedged while
+            the gate was running.
         """
         self._close_readiness_gate()
         self._backend_capabilities = None
@@ -798,7 +876,7 @@ class TextGenerationCoordinator:
         backoff_seconds = READY_BACKOFF_INITIAL_SECONDS
         last_notice_at = gate_opened_at
 
-        while not self._state.shutting_down:
+        while not self._state.shutting_down and self._wedge is None:
             try:
                 if await backend.ready(deadline_seconds=READY_PROBE_DEADLINE_SECONDS):
                     description = await self._describe_backend(backend)
@@ -821,6 +899,11 @@ class TextGenerationCoordinator:
                         self._note_credentials_accepted()
                         await self._note_backend_capabilities(backend)
                         await self._warm_up_backend()
+                        if self._wedge is not None:
+                            # A job still being re-offered judged the backend wedged while the gate was
+                            # talking to it, and that judgement outranks the answers the gate got.
+                            self._close_readiness_gate()
+                            return False
                         return True
             except TextBackendCredentialRefused as refusal:
                 # Caught around the whole gate, not around one call: a backend may answer the readiness
@@ -991,6 +1074,159 @@ class TextGenerationCoordinator:
             f"Text backend warmed up in {time.monotonic() - warm_up_started_at:.1f}s "
             f"({WARM_UP_MAX_LENGTH} tokens, discarded); the first popped job starts on warm kernels.",
         )
+
+    # endregion
+
+    # region wedge
+
+    @property
+    def backend_wedged(self) -> bool:
+        """Whether the flow is holding its pops for a backend it judged wedged.
+
+        The hold is the readiness gate's own, so :attr:`backend_ready` reads False for as long as this
+        reads True; this says which of the gate's reasons is the one in force.
+        """
+        return self._wedge is not None
+
+    def _wedge_busy_bound_seconds(self) -> float:
+        """Return how long a busy spell must last before it can be judged a wedge."""
+        return max(TEXT_BACKEND_WEDGE_BUSY_SECONDS, self.generation_deadline_seconds())
+
+    def _backend_is_wedged(self, now: float) -> bool:
+        """Return whether the current busy spell, as of `now`, is a wedge rather than a full backend.
+
+        A wedge is a spell holding at least :data:`BUSY_RETRY_MAX_ATTEMPTS` busy answers, lasting at
+        least :meth:`_wedge_busy_bound_seconds`, while no job in hand is receiving text. A backend
+        producing text for any job is full, not wedged, whatever it answers the others.
+        """
+        if self._busy_spell_started_at is None:
+            return False
+        if self._busy_answers_in_spell < BUSY_RETRY_MAX_ATTEMPTS:
+            return False
+        if now - self._busy_spell_started_at < self._wedge_busy_bound_seconds():
+            return False
+        return not any(_is_producing(job) for job in self._in_flight.values())
+
+    def _note_busy_answer(self) -> None:
+        """Count one busy answer into the backend's spell, and judge a wedge when the spell has become one."""
+        now = time.monotonic()
+        if self._busy_spell_started_at is None:
+            self._busy_spell_started_at = now
+        self._busy_answers_in_spell += 1
+        if self._wedge is None and self._backend_is_wedged(now):
+            self._enter_wedge_hold(busy_seconds=now - self._busy_spell_started_at)
+
+    def _reset_busy_spell(self) -> None:
+        """End the busy spell: a backend that sent text has a working generation path."""
+        self._busy_spell_started_at = None
+        self._busy_answers_in_spell = 0
+
+    def _note_generation_succeeded(self) -> None:
+        """End the busy spell, any wedge hold, and the run of wedge relaunches, on a delivered generation."""
+        self._reset_busy_spell()
+        self._wedge_relaunches_without_success = 0
+        self._relaunch_bound_reported = False
+        self._end_wedge_hold("a generation completed")
+
+    def _current_launch_count(self) -> int | None:
+        """Return the backend's launch count, or None for a backend the operator runs."""
+        if self._launch_count_provider is None:
+            return None
+        return self._launch_count_provider()
+
+    def _enter_wedge_hold(self, *, busy_seconds: float) -> None:
+        """Close the readiness gate on a wedged backend, relaunch it when the worker owns it, and say so once.
+
+        The gate is the hold, so the dashboard reads a wedged backend the way it reads any backend that
+        is not ready. The relaunch is requested once per wedge; the hold then ends through the readiness
+        probe once the backend answers from its new process.
+        """
+        self._close_readiness_gate()
+        self._wedge = _WedgeEpisode(
+            busy_seconds=busy_seconds,
+            launch_count_at_start=self._current_launch_count(),
+            last_probe_at=time.monotonic(),
+        )
+        busy_for = (
+            f"has answered busy for {busy_seconds:.0f}s ({self._busy_answers_in_spell} busy answers) with no "
+            "job receiving text"
+        )
+
+        if self._relaunch_backend is None:
+            logger.error(
+                f"The text backend at {self.backend_address} {busy_for}; it looks wedged. No text jobs are "
+                "popped until it answers again. Restart the backend; the worker resumes on its own. In the "
+                "backend's own output, `find_slot` or `failed to find a memory slot` means its context ran "
+                "out: parallel requests share one context pool, which must hold `text_threads` x "
+                "`max_context_length` tokens, so start it with `--contextsize` sized that way. "
+                "`text_threads: 1` only confirms that cause; it is not the fix.",
+            )
+            return
+
+        if self._wedge_relaunches_without_success >= TEXT_BACKEND_WEDGE_MAX_RELAUNCHES:
+            if not self._relaunch_bound_reported:
+                self._relaunch_bound_reported = True
+                logger.error(
+                    f"The text backend at {self.backend_address} {busy_for}, after "
+                    f"{self._wedge_relaunches_without_success} relaunches with no successful generation "
+                    "between them. It is not relaunched again, and no text jobs are popped until it "
+                    "generates or restarts. Look in logs/text_backend.log for `find_slot` or `failed to "
+                    "find a memory slot`: parallel requests share one context pool of `text_threads` x "
+                    "`max_context_length` tokens, which the worker opens at launch, so those lines mean the "
+                    "pool still ran out. `text_threads: 1` only confirms that cause; it is not the fix.",
+                )
+            return
+
+        reason = f"wedged: {busy_for}"
+        if not self._relaunch_backend(reason):
+            logger.warning(
+                f"The text backend at {self.backend_address} {busy_for}; it looks wedged, but it is not "
+                "serving, so it is already being relaunched. No text jobs are popped until it answers again.",
+            )
+            return
+        self._wedge_relaunches_without_success += 1
+        logger.warning(
+            f"The text backend at {self.backend_address} {busy_for}; it looks wedged. Relaunching it "
+            f"(relaunch {self._wedge_relaunches_without_success} of {TEXT_BACKEND_WEDGE_MAX_RELAUNCHES} "
+            "without a successful generation). No text jobs are popped until it answers again.",
+        )
+
+    def _end_wedge_hold(self, reason: str) -> None:
+        """Leave the wedge hold, saying so once, and leave the readiness gate to re-open on its own answers."""
+        if self._wedge is None:
+            return
+        self._wedge = None
+        self._reset_busy_spell()
+        logger.info(f"The text backend is no longer held as wedged ({reason}); the readiness gate runs again.")
+
+    async def _probe_wedged_backend(self) -> None:
+        """Probe a wedged backend's readiness at the gate's slowest cadence, ending the hold on a restart.
+
+        A wedged backend answers the readiness probe, so the hold cannot end on an answer alone; it ends
+        on an answer from a backend that has since been launched again, or that was seen not answering
+        in between, which is the only way an operator's restart shows from outside.
+        """
+        wedge = self._wedge
+        if wedge is None:
+            return
+        now = time.monotonic()
+        if now - wedge.last_probe_at < READY_BACKOFF_MAX_SECONDS:
+            return
+        wedge.last_probe_at = now
+        try:
+            answered = await self.require_backend().ready(deadline_seconds=READY_PROBE_DEADLINE_SECONDS)
+        except TextBackendCredentialRefused as refusal:
+            self._end_wedge_hold("the backend now refuses the worker's credentials")
+            self._enter_credential_hold(refusal)
+            return
+        if not answered:
+            wedge.saw_unready = True
+            return
+        relaunched = wedge.launch_count_at_start is not None and self._current_launch_count() != (
+            wedge.launch_count_at_start
+        )
+        if relaunched or wedge.saw_unready:
+            self._end_wedge_hold("the backend answered again after restarting")
 
     # endregion
 
@@ -1273,13 +1509,23 @@ class TextGenerationCoordinator:
                 )
             except TextBackendBusy as busy:
                 job.busy_attempts += 1
-                if job.busy_attempts >= BUSY_RETRY_MAX_ATTEMPTS:
+                if job.first_busy_at is None:
+                    job.first_busy_at = time.monotonic()
+                self._note_busy_answer()
+                if _busy_bound_without_ttl_is_spent(job, deadline_seconds=deadline_seconds):
                     logger.warning(
-                        f"Text backend was busy for all {BUSY_RETRY_MAX_ATTEMPTS} attempts at job "
-                        f"{job.job_id[:8]}; faulting it rather than holding it longer: {busy}",
+                        f"Text backend answered busy to job {job.job_id[:8]} {job.busy_attempts} times over "
+                        f"its {deadline_seconds:.0f}s generation deadline, and the pop carried no ttl; "
+                        f"faulting it: {busy}",
                     )
                     return None
-                logger.debug(f"Text backend busy for job {job.job_id[:8]}, re-offering it: {busy}")
+                # Re-offered every couple of seconds for as long as the ttl allows, so only the first
+                # refusal of each job is worth a line at debug.
+                busy_line = f"Text backend busy for job {job.job_id[:8]}, re-offering it: {busy}"
+                if job.busy_attempts == 1:
+                    logger.debug(busy_line)
+                else:
+                    logger.trace(busy_line)
                 await asyncio.sleep(BUSY_RETRY_WAIT_SECONDS)
                 continue
             except TextBackendRejectedPayload as rejected:
@@ -1294,6 +1540,10 @@ class TextGenerationCoordinator:
                 logger.error(f"Text backend failed job {job.job_id[:8]}: {unavailable}")
                 await self._stop_generation(job)
                 self._close_readiness_gate()
+                if self._wedge is not None:
+                    # A wedged backend that stops answering is one going away, which is what lets the
+                    # hold end on its next answer.
+                    self._wedge.saw_unready = True
                 return None
             except _GenerationStalled as stalled:
                 logger.error(f"Text job {job.job_id[:8]} stalled: {stalled}. Abandoning the generation.")
@@ -1313,6 +1563,7 @@ class TextGenerationCoordinator:
                     f"{job.job_id[:8]}; a stopped generation is incomplete however much of it came back",
                 )
                 return None
+            self._note_generation_succeeded()
             return result
 
     async def _generate_until_stalled_or_answered(
@@ -1386,6 +1637,7 @@ class TextGenerationCoordinator:
             job.progress = progress
             if progress.chunks_received > chunks_before:
                 self._backend_is_cold = False
+                self._reset_busy_spell()
                 chunk_arrived.set()
 
         return record_progress
@@ -1573,6 +1825,8 @@ class TextGenerationCoordinator:
                         # reads must not accrue; leaving it running would make a role enabled later look
                         # as though its backend had been missing since the worker started.
                         self._backend_not_ready_since = None
+                    elif self._wedge is not None:
+                        await self._probe_wedged_backend()
                     elif self._advertisement is None and self._may_look_at_backend():
                         await self.await_backend_ready()
                     await self.api_text_pop()
@@ -1686,6 +1940,17 @@ def _ttl_is_spent(job: TextJobInFlight) -> bool:
     if job.ttl_deadline is None:
         return False
     return time.monotonic() >= job.ttl_deadline
+
+
+def _busy_bound_without_ttl_is_spent(job: TextJobInFlight, *, deadline_seconds: float) -> bool:
+    """Return whether a job whose pop carried no ttl has been refused as busy for one generation deadline.
+
+    A job with a ttl is re-offered until the ttl is spent, which :func:`_ttl_is_spent` judges. One without
+    has no figure from the horde, so the flow's own bound on one generation stands in for it.
+    """
+    if job.ttl_deadline is not None or job.first_busy_at is None:
+        return False
+    return time.monotonic() - job.first_busy_at >= deadline_seconds
 
 
 async def _generation_finished_first(

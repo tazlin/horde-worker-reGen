@@ -19,6 +19,7 @@ import aiohttp
 import psutil
 import pytest
 from horde_model_reference.text_backend_names import TEXT_BACKENDS
+from loguru import logger
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     TEXT_BACKEND_PROCESS_ID,
@@ -405,6 +406,63 @@ async def test_an_exit_while_serving_is_relaunched(tmp_path: Path) -> None:
     await asyncio.wait_for(task, timeout=5.0)
 
 
+async def test_a_requested_relaunch_stops_the_serving_tree_and_launches_again(tmp_path: Path) -> None:
+    """A process that answers but will not generate is stopped on request and relaunched like one that exited."""
+    first = FakeLaunched(pid=33)
+    second = FakeLaunched(pid=34)
+    registry = OwnedProcessRegistry(tmp_path / "owned.json")
+    recorded: list[WorkerEventKind] = []
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
+        backend=StubBackend(ready_results=[True, True]),
+        owned_registry=registry,
+        launch_process=Launcher([first, second]),
+        timings=FAST,
+        on_event=lambda kind, **_fields: recorded.append(kind),
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.is_serving)
+    assert supervisor.request_relaunch("wedged") is True
+    assert supervisor.request_relaunch("wedged again") is False, "a pending request was scheduled twice"
+    await wait_until(lambda: supervisor.launch_count == 2 and supervisor.is_serving)
+
+    assert first.terminate_calls == 1
+    assert second.terminate_calls == 0, "the request outlived the process it was made against"
+    assert [record.os_pid for record in registry._load()] == [34]
+    assert WorkerEventKind.BACKEND_RELAUNCHED in recorded
+
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_a_relaunch_is_refused_while_nothing_is_serving(tmp_path: Path) -> None:
+    """A backend launching, backing off or stopped is already on its way to a launch of its own."""
+    exited = FakeLaunched(pid=35)
+    exited.exit(2)
+    slow_backoff = FAST.model_copy(update={"relaunch_backoff": (30.0,)})
+    launcher = Launcher([exited, FakeLaunched(pid=36)])
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
+        backend=StubBackend(ready_results=[True]),
+        launch_process=launcher,
+        timings=slow_backoff,
+    )
+
+    assert supervisor.request_relaunch("before any launch") is False
+
+    task = asyncio.create_task(supervisor.run())
+    await wait_until(lambda: supervisor.state is TextBackendState.BACKING_OFF)
+
+    assert supervisor.request_relaunch("while backing off") is False
+
+    await supervisor.stop()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(launcher.specs) == 1
+
+
 async def test_a_held_port_defers_the_launch_without_starting_anything(tmp_path: Path) -> None:
     """A port another process holds defers the launch into backoff; no process is started."""
     launcher = Launcher([FakeLaunched(pid=41)])
@@ -617,6 +675,77 @@ async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_si
 
     await supervisor.stop()
     await asyncio.wait_for(task, timeout=5.0)
+
+
+def _kv_buffer_reported(supervisor: TextBackendSupervisor) -> bool:
+    """Return whether the serving row carries the KV figure, which is set in the same step as the VRAM check."""
+    detail = supervisor.to_process_snapshot().text_backend
+    return detail is not None and detail.kv_buffer_mb is not None
+
+
+async def _ready_lines_for(spec: TextBackendLaunchSpec, *, card_total_mb: float) -> list[tuple[str, str]]:
+    """Serve ``spec`` once on a card of ``card_total_mb`` and return the WARNING and INFO lines it logged.
+
+    The backend prints the real load log, whose CUDA0 buffers sum to about 2673 MB, and the free-VRAM
+    delta measures 1900 MB, as a card that spilled the rest to system memory would read.
+    """
+    readings = iter([(1900.0, card_total_mb), (0.0, card_total_mb), (0.0, card_total_mb)])
+    logged: list[tuple[str, str]] = []
+    sink_id = logger.add(lambda message: logged.append((message.record["level"].name, message.record["message"])))
+    try:
+        supervisor = TextBackendSupervisor(
+            launch_spec_factory=factory_for(spec),
+            backend=StubBackend(ready_results=[True]),
+            launch_process=LoggingLauncher([FakeLaunched(pid=72)], [BACKEND_LOAD_LOG]),
+            read_device_free_total_mb=lambda device_index: next(readings),
+            timings=FAST,
+        )
+        task = asyncio.create_task(supervisor.run())
+        await wait_until(lambda: _kv_buffer_reported(supervisor))
+        await supervisor.stop()
+        await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        logger.remove(sink_id)
+    return [(level, message) for level, message in logged if level in {"INFO", "WARNING"}]
+
+
+async def test_the_footprint_line_states_the_context_sized_for_parallel_requests(tmp_path: Path) -> None:
+    """A batched launch says how many context cells it opened and for how many requests."""
+    spec = spec_on(free_port(), tmp_path).model_copy(update={"context_cells": 16384, "parallel_requests": 4})
+
+    lines = await _ready_lines_for(spec, card_total_mb=32000.0)
+
+    ready_line = next(message for _, message in lines if message.startswith("Text backend ready after"))
+    assert "VRAM footprint 1900 MB" in ready_line
+    assert "context 16384 cells (4 parallel requests x 4096)" in ready_line
+    assert not [message for level, message in lines if level == "WARNING"]
+
+
+async def test_the_footprint_line_is_unchanged_for_one_request(tmp_path: Path) -> None:
+    """A single-generation launch logs its footprint exactly as before and is never warned about."""
+    spec = spec_on(free_port(), tmp_path).model_copy(update={"context_cells": 4096, "parallel_requests": 1})
+
+    lines = await _ready_lines_for(spec, card_total_mb=2000.0)
+
+    ready_line = next(message for _, message in lines if message.startswith("Text backend ready after"))
+    assert ready_line.endswith("VRAM footprint 1900 MB")
+    assert not [message for level, message in lines if level == "WARNING"]
+
+
+async def test_a_batched_context_larger_than_the_card_is_warned_about_once(tmp_path: Path) -> None:
+    """The printed card buffers exceed the card, so one WARNING names the need, the extra context and the card.
+
+    The measured delta alone (1900 MB) would fit a 2000 MB card; the backend's own figures show it did not.
+    """
+    spec = spec_on(free_port(), tmp_path).model_copy(update={"context_cells": 16384, "parallel_requests": 4})
+
+    lines = await _ready_lines_for(spec, card_total_mb=2000.0)
+
+    warnings = [message for level, message in lines if level == "WARNING"]
+    assert len(warnings) == 1
+    assert "needs about 2673 MB" in warnings[0]
+    assert "about 357 MB is the context for 4 parallel requests" in warnings[0]
+    assert "the card holds 2000 MB" in warnings[0]
 
 
 async def test_the_launching_row_reports_launching_before_readiness(tmp_path: Path) -> None:

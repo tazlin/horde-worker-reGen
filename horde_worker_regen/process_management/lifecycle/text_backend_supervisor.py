@@ -39,8 +39,9 @@ off rather than a reason to guess a different port.
 The relaunch ladder is deliberately one rung: the process exited, or it never answered `ready()` within
 the patience window, so kill the tree and launch again with backoff. Finer detection (an alive process
 that stopped answering mid-generation) is left to the flow, whose `generate()` raises
-`TextBackendUnavailable` and re-runs its own readiness gate; it is added here only once a backend proves a
-stable interface for it.
+`TextBackendUnavailable` and re-runs its own readiness gate. A process that answers but will not generate
+is also the flow's to judge, since only the flow sees its jobs refused; it asks for a relaunch through
+`request_relaunch()`, which stops the tree on the supervisor's own task and lets the same rung relaunch it.
 """
 
 from __future__ import annotations
@@ -223,6 +224,39 @@ def _sum_buffer_lines(backend_output: str, signature_name: str) -> int | None:
     return round(sum(mebibytes)) if mebibytes else None
 
 
+_BUFFER_SIGNATURES = ("text_backend_model_buffer", "text_backend_kv_buffer", "text_backend_compute_buffer")
+"""Every buffer kind a llama.cpp-based backend prints at load."""
+
+_HOST_BUFFER_DEVICE_MARKERS = ("Host", "CPU")
+"""Substrings of the device names llama.cpp gives buffers in system memory (``CUDA_Host``, ``CPU_Mapped``)."""
+
+
+def _card_buffer_mebibytes(backend_output: str) -> float | None:
+    """Return the sum of every buffer the backend printed for a GPU device, or None when it printed none.
+
+    Unlike the free-VRAM delta, this is what the backend asked for rather than what the card gave it, so it
+    still reads true when the driver spills an over-commit to system memory.
+    """
+    on_card = [
+        float(match.group("mebibytes"))
+        for signature_name in _BUFFER_SIGNATURES
+        for match in pattern_for(signature_name).finditer(backend_output)
+        if not any(marker in match.group("device") for marker in _HOST_BUFFER_DEVICE_MARKERS)
+    ]
+    return sum(on_card) if on_card else None
+
+
+def _batched_context_note(spec: TextBackendLaunchSpec) -> str:
+    """Return the launch's shared context and its multiplier, or an empty string for one parallel request."""
+    if spec.parallel_requests <= 1 or spec.context_cells is None:
+        return ""
+    per_request = spec.context_cells // spec.parallel_requests
+    return (
+        f"; context {spec.context_cells} cells ({spec.parallel_requests} parallel requests x {per_request}), "
+        "sized so every parallel request can use its full context at once"
+    )
+
+
 DeviceFreeTotalReader = Callable[[int], tuple[float, float] | None]
 """Reads a device's ``(free_mb, total_mb)``; None when the reading is unavailable."""
 
@@ -306,6 +340,11 @@ class TextBackendSupervisor:
         self._next_launch_identifier = first_launch_identifier
         self._sleep = sleep
         self._on_event = on_event
+        self._relaunch_request: str | None = None
+        """Why the flow asked for the serving process to be relaunched, or None while it has not.
+
+        Acted on by the liveness watch rather than by the caller, so the tree is stopped and relaunched on
+        this task alone and never races a launch the ladder is already making."""
         self._relaunch_pending = False
         """Whether the next launch follows a back-off, which is what makes it a relaunch.
 
@@ -401,6 +440,26 @@ class TextBackendSupervisor:
             await self._back_off()
         self._state = TextBackendState.STOPPED
 
+    def request_relaunch(self, reason: str) -> bool:
+        """Ask for the serving backend to be stopped and launched again, for a fault its process survives.
+
+        The tree is stopped by the liveness watch within one poll, and the ordinary exit path then backs
+        off and relaunches it, so a requested relaunch is paced and recorded like any other.
+
+        Args:
+            reason: Why the relaunch is wanted, for the line the supervisor logs when it acts.
+
+        Returns:
+            Whether a relaunch was scheduled. False while nothing is serving (a launch, back-off or stop
+            is already under way, each of which ends in a launch of its own) or a request is pending.
+        """
+        if self._stop_requested or self._state is not TextBackendState.SERVING or self._process is None:
+            return False
+        if self._relaunch_request is not None:
+            return False
+        self._relaunch_request = reason
+        return True
+
     async def stop(self) -> None:
         """Stop the backend's whole process tree and end `run()`."""
         self._stop_requested = True
@@ -432,6 +491,8 @@ class TextBackendSupervisor:
         """
         self._state = TextBackendState.LAUNCHING
         self._clear_launch_detail()
+        # A request made against the previous process is spent: that process is gone.
+        self._relaunch_request = None
         self._launching_since = time.time()
         if not port_is_free(spec.port):
             logger.warning(
@@ -481,7 +542,8 @@ class TextBackendSupervisor:
                 footprint = "unmeasured" if self._footprint_mb is None else f"{self._footprint_mb:.0f} MB"
                 ready_after_seconds = time.monotonic() - started
                 logger.info(
-                    f"Text backend ready after {ready_after_seconds:.1f}s; VRAM footprint {footprint}",
+                    f"Text backend ready after {ready_after_seconds:.1f}s; VRAM footprint {footprint}"
+                    f"{_batched_context_note(spec)}",
                 )
                 if self._on_event is not None:
                     self._on_event(
@@ -503,9 +565,16 @@ class TextBackendSupervisor:
         return False
 
     async def _watch_until_exit(self) -> None:
-        """Poll the process until it exits or a stop is requested."""
+        """Poll the process until it exits, a relaunch is requested, or a stop is requested."""
         while not self._stop_requested:
             if self._process is None:
+                return
+            if self._relaunch_request is not None:
+                logger.warning(
+                    f"Stopping the text backend (pid {self._process.pid}) to relaunch it: {self._relaunch_request}",
+                )
+                self._relaunch_request = None
+                await self._stop_tree()
                 return
             exit_code = self._process.poll()
             if exit_code is not None:
@@ -548,6 +617,41 @@ class TextBackendSupervisor:
             self._log_bytes_at_launch,
         )
         self._buffer_sizes = parse_backend_buffer_sizes(backend_output)
+        self._warn_when_batched_context_overfills_card(spec, backend_output)
+
+    def _warn_when_batched_context_overfills_card(self, spec: TextBackendLaunchSpec, backend_output: str) -> None:
+        """Log one WARNING when a launch sized for parallel requests asked for more VRAM than the card holds.
+
+        The launch is kept: it serves, only slower once the driver spills what does not fit to system memory.
+        What the launch asked for is the larger of the measured footprint and the buffers the backend printed
+        for the card, because a spilled allocation reads as a smaller free-VRAM delta than it is.
+        """
+        if spec.parallel_requests <= 1 or spec.device_index is None or self._read_device_free_total_mb is None:
+            return
+        reading = self._read_device_free_total_mb(spec.device_index)
+        if reading is None:
+            return
+        card_total_mb = reading[1]
+        asked_candidates = [
+            figure for figure in (self._footprint_mb, _card_buffer_mebibytes(backend_output)) if figure is not None
+        ]
+        if not asked_candidates:
+            return
+        asked_mb = max(asked_candidates)
+        if asked_mb <= card_total_mb:
+            return
+        kv_mebibytes = self._buffer_sizes.kv_mebibytes
+        extra_context = (
+            "an unknown share"
+            if kv_mebibytes is None
+            else f"about {kv_mebibytes * (spec.parallel_requests - 1) / spec.parallel_requests:.0f} MB"
+        )
+        logger.warning(
+            f"The text backend on card {spec.device_index} needs about {asked_mb:.0f} MB, of which {extra_context} "
+            f"is the context for {spec.parallel_requests} parallel requests beyond the first, but the card holds "
+            f"{card_total_mb:.0f} MB. What does not fit spills to system memory and slows every generation. "
+            "Lower `max_context_length` or `text_gpu_layers` to fit it on the card.",
+        )
 
     def _clear_launch_detail(self) -> None:
         """Drop the facts that belong to a launch that is over, so no row outlives its process."""

@@ -17,7 +17,11 @@ from horde_worker_regen.text_backends.launch import (
     build_launch_spec,
     launchable_backends,
 )
-from horde_worker_regen.text_backends.launch_spec import LOOPBACK_HOST, TextBackendLaunchSettings
+from horde_worker_regen.text_backends.launch_spec import (
+    LOOPBACK_HOST,
+    TextBackendLaunchSettings,
+    choose_text_backend_device,
+)
 
 
 def settings_in(
@@ -191,6 +195,44 @@ class TestKoboldcppAcceleratorRendering:
         index = spec.arguments.index(KoboldcppArguments.PARALLEL_REQUESTS)
         assert spec.arguments[index + 1] == "4"
 
+    def test_one_parallel_request_sizes_the_context_for_one(self, tmp_path: Path) -> None:
+        """A single-generation launch allocates the configured context, as it always has."""
+        spec = build_launch_spec(TEXT_BACKENDS.koboldcpp, settings_in(tmp_path, parallel_requests=1))
+
+        assert spec.arguments[spec.arguments.index(KoboldcppArguments.CONTEXT_SIZE) + 1] == "4096"
+        assert spec.context_cells == 4096
+        assert spec.parallel_requests == 1
+
+    def test_several_parallel_requests_size_the_shared_context_for_all_of_them(self, tmp_path: Path) -> None:
+        """The slots share one context pool, so four full-length requests need four contexts of cells.
+
+        Only the context value changes: every other argument keeps its place.
+        """
+        settings = settings_in(tmp_path, parallel_requests=4)
+
+        spec = build_launch_spec(TEXT_BACKENDS.koboldcpp, settings)
+
+        assert spec.arguments == (
+            KoboldcppArguments.MODEL,
+            str(settings.model_path),
+            KoboldcppArguments.PORT,
+            "5001",
+            KoboldcppArguments.HOST,
+            LOOPBACK_HOST,
+            KoboldcppArguments.USE_CUDA,
+            "1",
+            KoboldcppArguments.GPU_LAYERS,
+            "99",
+            KoboldcppArguments.CONTEXT_SIZE,
+            str(4 * 4096),
+            KoboldcppArguments.SKIP_LAUNCHER,
+            KoboldcppArguments.QUIET,
+            KoboldcppArguments.PARALLEL_REQUESTS,
+            "4",
+        )
+        assert spec.context_cells == 4 * 4096
+        assert spec.parallel_requests == 4
+
     def test_an_unresolved_compute_path_is_refused(self, tmp_path: Path) -> None:
         """`auto` has no flag anywhere, so it is caught where it is set rather than rendered as something."""
         with pytest.raises(ValidationError):
@@ -207,3 +249,73 @@ def test_a_backend_without_a_renderer_is_refused_by_name(tmp_path: Path) -> None
     assert raised.value.kind is unsupported
     assert str(unsupported) in str(raised.value)
     assert str(TEXT_BACKENDS.koboldcpp) in str(raised.value)
+
+
+class TestTextBackendDeviceChoice:
+    """With no configured card, the managed backend goes where there is room for it."""
+
+    def test_the_roomier_of_two_cards_is_chosen(self) -> None:
+        """A 10 GB card beside a 32 GB card loses, whatever the index order."""
+        chosen = choose_text_backend_device(
+            configured_index=None,
+            free_mb_by_device={0: 9_000.0, 1: 30_000.0},
+            model_file_mb=20_000.0,
+            safety_device_index=None,
+        )
+
+        assert chosen == 1
+
+    def test_a_configured_card_is_used_as_given(self) -> None:
+        """The operator's `text_gpu_device_index` wins even over a roomier card."""
+        chosen = choose_text_backend_device(
+            configured_index=0,
+            free_mb_by_device={0: 9_000.0, 1: 30_000.0},
+            model_file_mb=20_000.0,
+            safety_device_index=None,
+        )
+
+        assert chosen == 0
+
+    def test_a_single_card_is_the_card(self) -> None:
+        """One driven card is chosen whatever its reading, as the lowest driven card always was."""
+        chosen = choose_text_backend_device(
+            configured_index=None,
+            free_mb_by_device={0: 1_000.0},
+            model_file_mb=20_000.0,
+            safety_device_index=0,
+        )
+
+        assert chosen == 0
+
+    def test_no_driven_card_leaves_the_device_unset(self) -> None:
+        """Without a card the backend is launched without a device flag."""
+        chosen = choose_text_backend_device(
+            configured_index=None,
+            free_mb_by_device={},
+            model_file_mb=1_000.0,
+            safety_device_index=None,
+        )
+
+        assert chosen is None
+
+    def test_a_card_without_safety_wins_a_tie_within_the_model_size(self) -> None:
+        """A gap smaller than the model does not outweigh the safety process's VRAM on the roomier card."""
+        chosen = choose_text_backend_device(
+            configured_index=None,
+            free_mb_by_device={0: 20_000.0, 1: 18_500.0},
+            model_file_mb=2_000.0,
+            safety_device_index=0,
+        )
+
+        assert chosen == 1
+
+    def test_a_gap_larger_than_the_model_outweighs_the_safety_process(self) -> None:
+        """Beyond one model's size the free readings decide, safety or not."""
+        chosen = choose_text_backend_device(
+            configured_index=None,
+            free_mb_by_device={0: 20_000.0, 1: 10_000.0},
+            model_file_mb=2_000.0,
+            safety_device_index=0,
+        )
+
+        assert chosen == 0

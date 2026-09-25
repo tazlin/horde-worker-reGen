@@ -1228,7 +1228,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     text_gpu_device_index: int | None = Field(default=None, ge=0)
     """The stable device index of the card the managed backend uses.
 
-    Unset means the lowest driven card, shared with image generation. Naming a card on a multi-GPU host
+    Unset means the driven card with the most free VRAM at launch (a card not hosting the safety process
+    wins a tie), shared with image generation; the choice is logged. Naming a card on a multi-GPU host
     dedicates it to text: it is removed from the image device map, so image work never competes with the
     backend for its VRAM. On a single-card host the card stays shared whatever is set here.
     """

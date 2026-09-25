@@ -545,8 +545,9 @@ text_backend_port: 5001
 # A large number means all of it; 0 keeps the model on the CPU.
 text_gpu_layers: 99
 
-# Which card (stable device index, as in gpu_device_indices) the managed backend runs on. Unset shares the
-# lowest driven card with image generation. On a multi-GPU host, naming a card dedicates it to text: image
+# Which card (stable device index, as in gpu_device_indices) the managed backend runs on. Unset picks the
+# driven card with the most free VRAM at launch and shares it with image generation, logging the choice.
+# On a multi-GPU host, naming a card dedicates it to text: image
 # generation stops driving that card entirely, so the two never compete for its VRAM.
 # text_gpu_device_index: 1
 

@@ -105,6 +105,7 @@ class FindingKind(enum.StrEnum):
     POP_GOVERNOR_DOMINANCE = "pop_governor_dominance"
     FAULTED_JOB_CENSUS = "faulted_job_census"
     MODEL_REFERENCE_SAMPLE_FAULT = "model_reference_sample_fault"
+    TEXT_BACKEND_WEDGED = "text_backend_wedged"
 
     SESSION_SUMMARY = "session_summary"
 
@@ -592,6 +593,25 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "broken worker does not keep taking jobs it will drop. The pause is a symptom of whatever "
             "failed the jobs."
         ),
+    ),
+    FindingSpec(
+        kind=FindingKind.TEXT_BACKEND_WEDGED,
+        title="The text backend refused every job as busy while generating nothing",
+        action=(
+            'Look in the backend output for "find_slot" or "failed to find a memory slot". It is in '
+            '"logs/text_backend.log" when the worker starts the backend. Parallel requests share one context, '
+            "so size a backend you start yourself for `text_threads` times `max_context_length`."
+        ),
+        detail=(
+            "With `text_threads` above one, koboldcpp runs that many generations at once from one shared "
+            "context pool. The worker offers the full `max_context_length` on every job it takes, so several "
+            "long jobs at once can exhaust the pool. The backend then answers every request as busy and "
+            "generates nothing. A current worker stops taking text jobs while this lasts, restarts a backend it "
+            "launched, and launches it with context for every parallel request, which costs VRAM. Setting "
+            "`text_threads` to 1 for a while confirms this cause. It is not the fix."
+        ),
+        see_also=FindingKind.FORCED_MAINTENANCE,
+        reference_page="docs/explanation/text_generation.md",
     ),
     FindingSpec(
         kind=FindingKind.POP_API_ERROR_DOMINANCE,

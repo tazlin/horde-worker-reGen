@@ -7,11 +7,14 @@ to allocate, how many generations to run at once, where the program's own output
 is how those settings become a command line, and that lives in one module per backend (see
 [`launch`][horde_worker_regen.text_backends.launch]); its output is :class:`TextBackendLaunchSpec`, which is
 all the process supervisor ever sees.
+
+:func:`choose_text_backend_device` picks the card a managed backend launches on when the operator names none.
 """
 
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -43,7 +46,8 @@ class TextBackendLaunchSettings(BaseModel):
     """How much of the model to place on the card, in the backend's own unit (layers for llama.cpp-based
     backends); a large value means all of it."""
     context_length: int
-    """The context size the backend allocates for."""
+    """The context one generation may use. A backend whose parallel requests share one context pool renders
+    the pool from this and `parallel_requests`."""
     log_path: Path
     """Where the backend's stdout and stderr are appended."""
     accelerator: TextBackendAccelerator = TextBackendAccelerator.CUDA
@@ -79,6 +83,10 @@ class TextBackendLaunchSpec(BaseModel):
     """Where the backend's own stdout and stderr go."""
     device_index: int | None = None
     """The stable device index the backend was told to use, for footprint measurement; None off-GPU."""
+    context_cells: int | None = None
+    """The context the backend was told to allocate, across every parallel request; None when not stated."""
+    parallel_requests: int = 1
+    """How many generations the backend was told to run at once."""
 
     @property
     def runs_from_source(self) -> bool:
@@ -104,9 +112,54 @@ class TextBackendLaunchSpec(BaseModel):
         return f"http://{LOOPBACK_HOST}:{self.port}"
 
 
+def choose_text_backend_device(
+    *,
+    configured_index: int | None,
+    free_mb_by_device: Mapping[int, float],
+    model_file_mb: float,
+    safety_device_index: int | None,
+) -> int | None:
+    """Return the card a managed text backend launches on.
+
+    A configured index is used as given. Otherwise the card with the most free VRAM wins, because the model
+    and its context have to fit beside whatever already occupies the card. Cards whose free VRAM is within
+    one model file of the roomiest are treated as equal, and among those a card without the safety process
+    is preferred: a gap smaller than the model is noise next to what the backend is about to place, while
+    the safety process on a card is VRAM that never leaves it. Remaining ties go to the lowest index.
+
+    Args:
+        configured_index: The operator's `text_gpu_device_index`, or None when unset.
+        free_mb_by_device: Each driven card's free VRAM in MB, or its total where no reading exists yet.
+        model_file_mb: The size of the model file the backend loads.
+        safety_device_index: The card the safety process occupies, or None when it is on none.
+
+    Returns:
+        The chosen card's stable index, or None when there is no configured index and no driven card.
+    """
+    if configured_index is not None:
+        return configured_index
+    if not free_mb_by_device:
+        return None
+    roomiest_free_mb = max(free_mb_by_device.values())
+    comparable = [
+        device_index
+        for device_index, free_mb in free_mb_by_device.items()
+        if roomiest_free_mb - free_mb <= model_file_mb
+    ]
+    return min(
+        comparable,
+        key=lambda device_index: (
+            device_index == safety_device_index,
+            -free_mb_by_device[device_index],
+            device_index,
+        ),
+    )
+
+
 __all__ = [
     "LOOPBACK_HOST",
     "SOURCE_SCRIPT_SUFFIX",
     "TextBackendLaunchSettings",
     "TextBackendLaunchSpec",
+    "choose_text_backend_device",
 ]

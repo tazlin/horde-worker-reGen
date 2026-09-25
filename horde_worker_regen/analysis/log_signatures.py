@@ -88,6 +88,7 @@ _HORDELIB_READOUT_NOT_EXERCISED = (
 _TEXT_BACKEND_NOT_LAUNCHED = (
     "printed once by the text backend into its own `logs/text_backend.log`, which a dry run never launches"
 )
+_TEXT_FLOW_NOT_EXERCISED = "the dry-run contract scenario serves image jobs only, so the text flow never runs"
 
 _SIGNATURE_LIST: list[LogSignature] = [
     # --- Per-job lifecycle ---
@@ -1043,6 +1044,74 @@ _SIGNATURE_LIST: list[LogSignature] = [
         sample="sched_reserve:      CUDA0 compute buffer size =   278.79 MiB",
         dry_run_reason=_TEXT_BACKEND_NOT_LAUNCHED,
         flags=re.MULTILINE,
+    ),
+    # --- Text generation flow: jobs a backend refuses as busy ---
+    _signature(
+        "text_backend_wedged",
+        r"The text backend at (?P<address>\S+) has answered busy for (?P<seconds>\d+)s "
+        r"\((?P<answers>\d+) busy answers\) with no job receiving text",
+        # Every line the wedge hold writes opens this way: the relaunch, the relaunch already under way, the
+        # attached backend, and the exhausted relaunch bound.
+        emitter="process_management.jobs.text_generation_coordinator:_enter_wedge_hold",
+        sample=(
+            "The text backend at http://127.0.0.1:5001 has answered busy for 64s (5 busy answers) with no job "
+            "receiving text; it looks wedged. Relaunching it (relaunch 1 of 3 without a successful generation). "
+            "No text jobs are popped until it answers again."
+        ),
+        dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
+    ),
+    _signature(
+        "text_backend_wedge_relaunch_bound",
+        r"after (?P<relaunches>\d+) relaunches with no successful generation between them\. "
+        r"It is not relaunched again",
+        emitter="process_management.jobs.text_generation_coordinator:_enter_wedge_hold",
+        sample=(
+            "The text backend at http://127.0.0.1:5001 has answered busy for 64s (5 busy answers) with no job "
+            "receiving text, after 3 relaunches with no successful generation between them. It is not relaunched "
+            "again, and no text jobs are popped until it generates or restarts. Look in logs/text_backend.log for "
+            "`find_slot` or `failed to find a memory slot`: parallel requests share one context pool of "
+            "`text_threads` x `max_context_length` tokens, which the worker opens at launch, so those lines mean "
+            "the pool still ran out. `text_threads: 1` only confirms that cause; it is not the fix."
+        ),
+        dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
+    ),
+    _signature(
+        "text_backend_busy_reoffer",
+        r"Text backend busy for job (?P<job>[0-9a-fA-F]{8}), re-offering it",
+        emitter="process_management.jobs.text_generation_coordinator:_offer_until_answered",
+        sample=(
+            "Text backend busy for job 6dbc2470, re-offering it: Text backend is already generating (backend at "
+            'http://127.0.0.1:5001, generation 6dbc2470-de25-45d6-b003-606cc79cd552, status 503: {"detail": '
+            '{"msg": "Server is busy; please try again later.", "type": "service_unavailable"}})'
+        ),
+        dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
+    ),
+    _signature(
+        "text_backend_busy_fault_legacy",
+        r"Text backend was busy for all (?P<attempts>\d+) attempts at job (?P<job>[0-9a-fA-F]{8}); faulting it",
+        # Written by workers from before the wedge hold, which faulted a job after a fixed number of busy
+        # answers. Kept so their bundles still diagnose; a current worker re-offers until the job's ttl.
+        emitter="process_management.jobs.text_generation_coordinator:_offer_until_answered",
+        sample=(
+            "Text backend was busy for all 5 attempts at job 6dbc2470; faulting it rather than holding it longer: "
+            "Text backend is already generating (backend at http://127.0.0.1:5001, generation "
+            "6dbc2470-de25-45d6-b003-606cc79cd552, status 503: ...)"
+        ),
+        dry_run_reason="written only by workers from before the wedge hold, which this codebase no longer emits",
+    ),
+    _signature(
+        "text_job_fault_reported",
+        r"Reported text job (?P<job>[0-9a-fA-F]{8}) as faulted to the horde",
+        emitter="process_management.jobs.text_generation_coordinator:_note_submitted",
+        sample="Reported text job 6dbc2470 as faulted to the horde",
+        dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
+    ),
+    _signature(
+        "text_job_submitted",
+        r"Submitted text job (?P<job>[0-9a-fA-F]{8}) ",
+        emitter="process_management.jobs.text_generation_coordinator:_note_submitted",
+        sample="Submitted text job 817d78c0 for 0.66 kudos. Job popped 3.84 seconds ago.",
+        dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
     ),
 ]
 

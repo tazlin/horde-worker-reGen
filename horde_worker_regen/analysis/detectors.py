@@ -118,6 +118,22 @@ _HEAD_STARVATION_AVAILABLE_RE = pattern_for("head_starvation_available")
 _DEVICE_FREE_VRAM_RE = re.compile(r"device_free_vram=(\d+)MB")
 # The worker self-pausing pops after three consecutive faults.
 _CONSECUTIVE_PAUSE_RE = pattern_for("consecutive_pause")
+# A text backend refusing every job as busy while it generates nothing. A current worker writes one line
+# per episode as it holds its text jobs; an older one faulted each job after a fixed number of busy answers,
+# which shows only as busy re-offers and fault reports with no submitted text job between them.
+_TEXT_BACKEND_WEDGED_RE = pattern_for("text_backend_wedged")
+_TEXT_BACKEND_RELAUNCH_BOUND_RE = pattern_for("text_backend_wedge_relaunch_bound")
+_TEXT_BUSY_REOFFER_RE = pattern_for("text_backend_busy_reoffer")
+_TEXT_BUSY_FAULT_LEGACY_RE = pattern_for("text_backend_busy_fault_legacy")
+_TEXT_JOB_FAULT_REPORTED_RE = pattern_for("text_job_fault_reported")
+_TEXT_JOB_SUBMITTED_RE = pattern_for("text_job_submitted")
+_TEXT_BUSY_FAULT_RUN_MIN_JOBS = 5
+"""Busy-refused text jobs faulted in a row, with no text job submitted between them, that make a stuck backend.
+
+A backend that is merely full finishes one of the jobs it holds within a generation deadline, and that
+submit ends the run, so a run this long is a backend that took nothing at all."""
+_TEXT_BUSY_FAULT_RUN_MIN_SPAN = timedelta(minutes=10)
+"""How long such a run must last, so a burst of refusals while one long generation finishes never qualifies."""
 # The horde aborting a generation server-side because the worker submitted it after the per-job deadline
 # (the verbatim server message the submitter logs). Each such abort is a faulted job the horde counts
 # against the worker, and a *sustained* run of them is the slow-generation death spiral that ends in
@@ -1273,6 +1289,82 @@ def detect_consecutive_failure_pause(context: SessionContext) -> list[Finding]:
             severity=Severity.WARNING,
             headline=f"The worker paused asking for work {len(pauses)} times after three failed jobs in a row.",
             evidence=[_evidence(r) for r in pauses[:3]],
+        ),
+    ]
+
+
+def _longest_busy_fault_run(records: list[LogRecord]) -> list[LogRecord]:
+    """Return the fault reports of the longest run of busy-refused text jobs with no text job submitted between.
+
+    A fault counts toward a run only for a job the backend was seen refusing as busy; a fault for another
+    reason neither extends nor ends it. A submitted text job ends it. Returns the empty list when no run
+    reaches :data:`_TEXT_BUSY_FAULT_RUN_MIN_JOBS` jobs over :data:`_TEXT_BUSY_FAULT_RUN_MIN_SPAN`.
+    """
+    refused_jobs: set[str] = set()
+    longest: list[LogRecord] = []
+    current: list[LogRecord] = []
+
+    def qualifies(run: list[LogRecord]) -> bool:
+        if len(run) < _TEXT_BUSY_FAULT_RUN_MIN_JOBS:
+            return False
+        first, last = run[0].timestamp, run[-1].timestamp
+        return first is not None and last is not None and last - first >= _TEXT_BUSY_FAULT_RUN_MIN_SPAN
+
+    for record in records:
+        refusal = _TEXT_BUSY_REOFFER_RE.search(record.message) or _TEXT_BUSY_FAULT_LEGACY_RE.search(record.message)
+        if refusal is not None:
+            refused_jobs.add(refusal.group("job"))
+            continue
+        fault = _TEXT_JOB_FAULT_REPORTED_RE.search(record.message)
+        if fault is not None:
+            if fault.group("job") in refused_jobs:
+                current.append(record)
+            continue
+        if _TEXT_JOB_SUBMITTED_RE.search(record.message):
+            if qualifies(current) and len(current) > len(longest):
+                longest = current
+            current = []
+    if qualifies(current) and len(current) > len(longest):
+        longest = current
+    return longest
+
+
+def detect_text_backend_wedged(context: SessionContext) -> list[Finding]:
+    """A text backend refusing every job as busy while it generates nothing, from either worker generation.
+
+    A current worker states the episode itself when it holds its text jobs. An older worker only faulted the
+    refused jobs one by one, so its bundles are read for a long run of busy-refused faults with no text job
+    submitted in between; the horde counts each of those faults toward maintenance.
+    """
+    records = context.session.records
+    held = _matching(records, _TEXT_BACKEND_WEDGED_RE)
+    if held:
+        times = "once" if len(held) == 1 else f"{len(held)} times"
+        restarts_exhausted = bool(_matching(held, _TEXT_BACKEND_RELAUNCH_BOUND_RE))
+        outcome = ", and restarting it did not help" if restarts_exhausted else ""
+        return [
+            Finding(
+                kind=FindingKind.TEXT_BACKEND_WEDGED,
+                severity=Severity.CRITICAL,
+                headline=f"The text backend refused every job as busy while generating nothing, {times}{outcome}.",
+                evidence=[_evidence(record) for record in held[:3]],
+            ),
+        ]
+
+    run = _longest_busy_fault_run(records)
+    if not run:
+        return []
+    first_ts, last_ts = run[0].timestamp, run[-1].timestamp
+    minutes = round((last_ts - first_ts).total_seconds() / 60) if first_ts and last_ts else 0
+    return [
+        Finding(
+            kind=FindingKind.TEXT_BACKEND_WEDGED,
+            severity=Severity.CRITICAL,
+            headline=(
+                f"The text backend refused {len(run)} text jobs in a row as busy over {minutes} minutes, and "
+                "each went back to the horde unfinished."
+            ),
+            evidence=[_evidence(record) for record in (run[:2] + run[-1:])],
         ),
     ]
 
@@ -3067,6 +3159,7 @@ DETECTORS: list[Detector] = [
     detect_faulted_job_census,
     detect_model_reference_sample_fault,
     detect_consecutive_failure_pause,
+    detect_text_backend_wedged,
     detect_pop_governor_dominance,
     detect_pop_api_error_dominance,
     detect_stuck_inference_step,

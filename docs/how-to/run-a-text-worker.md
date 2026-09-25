@@ -71,8 +71,10 @@ never compete for it:
 text_gpu_device_index: 1
 ```
 
-Left unset, text shares the lowest card with image generation. On a single-card host it is always shared,
-so choose a text model and an image model list that fit side by side.
+Left unset, text shares a card with image generation: the worker picks the card with the most free VRAM
+when it launches the backend, preferring one without the safety process when two are close, and logs the
+choice with each card's free VRAM. On a single-card host it is always shared, so choose a text model and an
+image model list that fit side by side.
 
 The compute path follows the backend your install was set up for: an NVIDIA install runs text on CUDA, an
 AMD install on Vulkan, a CPU install on the CPU. Override it when text should differ from the install, for
@@ -92,6 +94,16 @@ used, try the other index. Vulkan and CPU launches have not been verified by the
 do so and holds that many jobs. Each generation gets slower as the number rises (two at once ran at about
 half speed each in our measurement, for the same total), so raise it only after measuring on your model,
 and leave it at 1 if unsure.
+
+The parallel generations share one context, so the worker launches the backend with `text_threads` ×
+`max_context_length` of it: four at a 4096 context opens 16384. That context costs VRAM in proportion,
+which the line reporting the backend ready states along with the backend's footprint. If the total no longer
+fits the card, the worker warns once at launch and runs anyway, slower; lower `max_context_length` or
+`text_gpu_layers` to bring it back onto the card.
+
+If you run the backend yourself, start it with `--contextsize` sized the same way. Too small a context makes
+the backend refuse every request as busy while generating nothing, with `find_slot` or `failed to find a
+memory slot` in its own output.
 
 ## Attach to a backend you already run
 

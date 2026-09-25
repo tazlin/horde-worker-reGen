@@ -112,11 +112,30 @@ stops it when the worker stops. The backend's own output goes to `logs/text_back
 launched, and with what command line, follows `text_backend_kind`; a kind the worker cannot launch yet is
 refused by name at start-up with the supported list.
 
-The backend runs on the card `text_gpu_device_index` names, or on the lowest driven card when unset. On a
-multi-GPU host, naming a card dedicates it: image generation stops driving that card, so the two workloads
-never compete for its VRAM. On a single-card host the card stays shared whatever is configured, and the
-worker's VRAM accounting sees the backend as memory another process holds. The worker measures the
-backend's footprint once, as the card's free-VRAM drop between launch and ready, and logs it.
+The backend runs on the card `text_gpu_device_index` names. When it is unset, the worker picks the driven
+card with the most free VRAM at launch (the same per-card reading the safety process is placed by, or the
+card's total where nothing has reported yet), because the model and its context have to fit beside
+whatever already occupies the card. Cards whose free VRAM is within one model file of the roomiest count
+as equal, and among those a card without the safety process wins. The choice is logged once with each
+card's reading and the model file size. On a multi-GPU host, naming a card dedicates it: image generation
+stops driving that card, so the two workloads never compete for its VRAM. An unnamed card stays shared. On
+a single-card host the card stays shared whatever is configured. The worker measures the backend's footprint
+once, as the card's free-VRAM drop between launch and ready, and logs it. While the backend serves, that
+footprint is charged to its card as a standing floor (see the [VRAM arbiter](vram_arbiter.md#the-decision-pipeline)).
+Image admission, the models offered for that card, the safety process's card choice and the start of a GPU
+child all see the card as that much smaller, without waiting for the arbiter's learned foreign floor to observe
+the backend. A relaunch re-measures the footprint, and a backend that stops serving is no longer charged.
+
+With `text_threads` above 1 the worker launches koboldcpp with `--parallelrequests` set to that many, and
+sizes its context for all of them: `--contextsize` is `text_threads` × `max_context_length`. koboldcpp's
+parallel requests draw on one shared KV pool of `--contextsize` cells and clamp each request only to that
+pool, while the worker advertises the full `max_context_length` on every job and holds `text_threads` jobs
+at once. A pool of one context runs out as soon as two long requests overlap. The extra context costs VRAM
+in proportion: the footprint line at ready states the cells opened and the multiplier, and when what the
+backend allocated for the card (the larger of the measured footprint and the buffers it printed for a GPU
+device) exceeds the card's total, the worker logs one warning naming both numbers. It launches anyway; what
+does not fit spills to system memory and generation slows. One parallel request renders the context
+exactly as configured.
 
 Two process facts shape how the worker stops a backend, and they hold for any backend that behaves this
 way. A packaged program may run its real server as a child of the process the worker started (koboldcpp
@@ -222,7 +241,8 @@ below ends in a submit, faulted where it has to be.
 
 | What the backend does                      | What the worker does                                                                                              |
 | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| Says it is busy                            | Waits a moment and offers the same job again, a few times. The backend is healthy and the job is fine.            |
+| Says it is busy                            | Waits a moment and offers the same job again until the job's ttl runs out. The job itself is fine.                |
+| Says it is busy to everything, for minutes | Stops popping and, for a backend the worker launched, relaunches it. See the wedged backend section below.        |
 | Refuses the payload                        | Faults the job immediately. It will be refused again, so re-offering it only burns the same failure repeatedly.   |
 | Refuses the worker's password              | Faults the job, then holds off popping until a corrected `text_backend_password` is accepted.                     |
 | Cannot be reached, or fails the generation | Faults the job, then goes back to polling readiness. While the backend is down every job fails the same way.      |
@@ -234,7 +254,60 @@ A busy backend is also bounded by the horde rather than by the worker alone. A p
 seconds the server will wait before it reassigns the generation, and the worker keeps that as a deadline
 on the job: past it, the job is faulted instead of being offered again, and a job whose ttl has already
 run out is never started. Generating an answer the server has stopped waiting for spends the backend on
-nobody. A pop that states no ttl leaves the worker's own bounds as the only ones.
+nobody. A pop that states no ttl leaves the worker's own bounds as the only ones: such a job is offered
+for one generation deadline and then faulted.
+
+### A backend that is busy to everything
+
+A backend can stop generating while still answering. koboldcpp run with parallel requests
+(`--parallelrequests`, which the worker passes when `text_threads` is above 1) holds a generation lock,
+queues a few requests behind it, and refuses the rest as busy. If a generation fails inside the backend
+in a way that never releases that lock, every later request is refused as busy, indefinitely, while the
+backend still reports its model loaded. To one job this looks exactly like a backend that is merely full.
+The known way in is a context pool too small for the requests sharing it: the backend's own output then
+shows `find_slot` or `failed to find a memory slot`. The pool must hold `text_threads` ×
+`max_context_length`, which is why the managed launch sizes it that way (see
+[Running the backend](#running-the-backend)).
+
+The difference shows only across jobs, so the worker keeps one busy clock for the backend rather than
+one per job. The clock starts at the first busy answer after the backend last produced text, and any
+text from any job stops it. The worker judges the backend **wedged** when all of these hold:
+
+- the clock has run for at least a minute, or one generation deadline when that is longer, because the
+  worker itself tolerates one of its own generations staying silent that long;
+- the backend has refused at least five offers in that time;
+- no job the worker holds is receiving text. A backend streaming one job while refusing another is
+  full, not wedged.
+
+While the backend is wedged the worker pops nothing. The hold is the readiness gate's, so the dashboard
+shows the backend as not ready and for how long. Jobs already in hand keep being offered until their
+ttl runs out, in case the backend recovers.
+
+What happens next depends on who runs the backend:
+
+- **A backend the worker launched** is stopped and launched again, once per wedge, through the same
+  relaunch path as a backend that exited, and the worker logs one warning naming the backend's address
+  and how long it was busy. The hold ends when the new process answers, and the worker then warms it up
+  and resumes popping. If three relaunches in a row each wedge again with no successful generation
+  between them, the worker stops relaunching, keeps the hold, and logs one error saying so. That error
+  points at `logs/text_backend.log` and the `find_slot` lines: with the pool already sized for every
+  request, those lines mean it still ran out.
+- **A backend you run yourself** is not the worker's to restart. The worker holds, logs one error per
+  wedge naming the backend's address, and keeps checking readiness on the gate's usual cadence. Because
+  a wedged backend still answers that check, the hold ends only on a successful generation or once the
+  backend has been seen restarting: a check that finds it gone, then one that finds it back. The error
+  asks you to restart it and to start it with `--contextsize` of `text_threads` × `max_context_length`.
+
+Either error mentions `text_threads: 1` only as a way to confirm the cause: a backend that stops wedging
+with one request at a time ran out of shared context. Parallel requests remain a supported setting, and
+the fix is a context pool large enough for them. `horde-log diagnose` reports these episodes as
+`text_backend_wedged`, and also recognises the run of busy-refused faults an older worker left behind.
+
+The worker's own hold and the horde's maintenance flag are independent. The horde sets maintenance when
+a worker drops too many jobs; that refuses pops at the server, and the worker keeps asking so it notices
+when maintenance is lifted. The wedge hold stops the worker asking at all. A pop goes out only when the
+wedge hold is off, and the horde answers it only when maintenance is off, so pops resume once both
+holds have ended.
 
 The per-generation deadline is `text_generation_timeout_seconds` when you set it, and otherwise is
 derived from `max_length` at a deliberately slow tokens-per-second floor (`max_length / 2 + 10`, the

@@ -96,6 +96,39 @@ class _NeverAnsweringTextBackend(FakeTextBackend):
         raise AssertionError("a generation that never returns cannot produce a result")
 
 
+class _LockedTextBackend(FakeTextBackend):
+    """A fake that answers every job busy while `locked`, as a backend whose generation lock is stuck does.
+
+    The warm-up is let through, because a backend the worker just launched has not wedged yet, and the
+    readiness probe keeps answering, because a wedged backend's model route still does.
+    """
+
+    def __init__(self, *, description: TextBackendDescription, response_text: str = "an answer") -> None:
+        super().__init__(description=description, response_text=response_text)
+        self.locked = False
+        self.busy_answers = 0
+
+    @override
+    async def generate(
+        self,
+        payload: Mapping[str, object],
+        *,
+        generation_key: str,
+        deadline_seconds: float,
+        on_progress: TextGenerationProgressCallback | None = None,
+    ) -> TextGenerationResult:
+        """Answer busy while locked, otherwise generate as the plain fake does."""
+        if self.locked and generation_key != text_generation_coordinator.WARM_UP_GENERATION_KEY:
+            self.busy_answers += 1
+            raise TextBackendBusy("the generation lock is held")
+        return await super().generate(
+            payload,
+            generation_key=generation_key,
+            deadline_seconds=deadline_seconds,
+            on_progress=on_progress,
+        )
+
+
 class _FakeHordeClientSession:
     """Answers text pops from a script and accepts every submit, recording both.
 
@@ -165,6 +198,7 @@ def _make_coordinator(
     run_metrics: WorkerRunMetrics | None = None,
     launch_count_provider: Callable[[], int] | None = None,
     backend_address_provider: Callable[[], str] | None = None,
+    relaunch_backend: Callable[[str], bool] | None = None,
     **bridge_overrides: object,
 ) -> tuple[TextGenerationCoordinator, FakeTextBackend, _FakeHordeClientSession]:
     """Create a coordinator over a fake backend and a fake horde session, with the scribe role on.
@@ -196,6 +230,7 @@ def _make_coordinator(
         run_metrics=run_metrics,
         launch_count_provider=launch_count_provider,
         backend_address_provider=backend_address_provider,
+        relaunch_backend=relaunch_backend,
     )
     return coordinator, resolved_backend, resolved_session
 
@@ -507,24 +542,46 @@ async def test_a_busy_backend_is_re_offered_the_same_job(monkeypatch: pytest.Mon
     assert session.submit_requests[0].generation == "answered at last"
 
 
-async def test_a_persistently_busy_backend_faults_the_job(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Holding a job the backend will not take only risks the server timing it out first."""
-    monkeypatch.setattr(text_generation_coordinator, "BUSY_RETRY_WAIT_SECONDS", 0.0)
-    monkeypatch.setattr(text_generation_coordinator, "BUSY_RETRY_MAX_ATTEMPTS", 2)
-    backend = FakeTextBackend(
-        description=_DESCRIPTION,
-        generate_failures=(TextBackendBusy("busy"), TextBackendBusy("busy"), TextBackendBusy("busy")),
-    )
+async def test_a_busy_job_is_re_offered_past_the_attempt_cap_until_its_ttl_is_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full backend frees a slot within one generation, so the horde's own patience is the job's bound.
+
+    The attempt cap is only the count a busy spell needs before it can be judged a wedge; it faults no job.
+    """
+    monkeypatch.setattr(text_generation_coordinator, "BUSY_RETRY_WAIT_SECONDS", 0.02)
+    backend = _LockedTextBackend(description=_DESCRIPTION)
+    backend.locked = True
     coordinator, _backend, session = _make_coordinator(backend=backend)
+    await coordinator.await_backend_ready()
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=0.0, ttl_deadline=time.monotonic() + 0.3)
+    coordinator._in_flight[job.job_id] = job
+
+    await asyncio.wait_for(coordinator.run_job(job), timeout=10.0)
+
+    assert backend.busy_answers > text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS
+    assert session.submit_requests[0].state == GENERATION_STATE.faulted
+    assert coordinator.num_jobs_faulted == 1
+
+
+async def test_a_busy_job_whose_pop_carried_no_ttl_is_bounded_by_one_generation_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no figure from the horde, the flow's own bound on one generation stands in for the ttl."""
+    monkeypatch.setattr(text_generation_coordinator, "BUSY_RETRY_WAIT_SECONDS", 0.02)
+    backend = _LockedTextBackend(description=_DESCRIPTION)
+    backend.locked = True
+    coordinator, _backend, session = _make_coordinator(backend=backend, text_generation_timeout_seconds=0.2)
     await coordinator.await_backend_ready()
     job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=0.0)
     coordinator._in_flight[job.job_id] = job
 
-    await coordinator.run_job(job)
+    started_at = time.monotonic()
+    await asyncio.wait_for(coordinator.run_job(job), timeout=10.0)
 
-    assert len(backend.generate_calls) == 2
+    assert time.monotonic() - started_at >= 0.2
+    assert backend.busy_answers > text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS
     assert session.submit_requests[0].state == GENERATION_STATE.faulted
-    assert coordinator.num_jobs_faulted == 1
 
 
 async def test_a_rejected_payload_faults_the_job_without_retrying() -> None:
@@ -1561,3 +1618,253 @@ async def test_a_failed_pop_holds_the_next_one_without_moving_the_last_pop_insta
     assert coordinator.last_pop_time == popped_at
     assert coordinator.last_pop_time <= time.time()
     assert coordinator._should_pop() is False, "the hold is what keeps the next pop off"
+
+
+def _quicken_wedge_judgement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the busy spell a wedge needs, the re-offer wait, and the hold's probe cadence to test scale.
+
+    The bound applied is the longer of the floor and one generation deadline, so the rows that use this
+    also set a short `text_generation_timeout_seconds`.
+    """
+    monkeypatch.setattr(text_generation_coordinator, "TEXT_BACKEND_WEDGE_BUSY_SECONDS", 0.0)
+    monkeypatch.setattr(text_generation_coordinator, "BUSY_RETRY_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(text_generation_coordinator, "READY_BACKOFF_MAX_SECONDS", 0.0)
+
+
+async def _hold_one_job_against_the_backend(coordinator: TextGenerationCoordinator) -> TextJobInFlight:
+    """Run one job, popped with a short ttl, until the backend takes it or the ttl is spent."""
+    job = TextJobInFlight(job_id=_job_id(), payload={}, time_popped=0.0, ttl_deadline=time.monotonic() + 0.3)
+    coordinator._in_flight[job.job_id] = job
+    await asyncio.wait_for(coordinator.run_job(job), timeout=10.0)
+    return job
+
+
+def _judge_wedged_without_waiting(coordinator: TextGenerationCoordinator) -> None:
+    """Feed the flow a busy spell that already outlasts the bound, with nothing in hand producing text."""
+    coordinator._busy_spell_started_at = time.monotonic() - 1.0
+    for _answer in range(text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS):
+        coordinator._note_busy_answer()
+
+
+def _capture_logs() -> tuple[list[tuple[str, str]], int]:
+    """Start collecting every log line as (level, message), returning the list and the sink to remove."""
+    logged: list[tuple[str, str]] = []
+    sink_id = logger.add(lambda m: logged.append((m.record["level"].name, m.record["message"])), level="TRACE")
+    return logged, sink_id
+
+
+async def test_a_full_backend_with_a_job_receiving_text_is_not_wedged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Busy answers beside a generation that is producing are a full backend, however long they last."""
+    _quicken_wedge_judgement(monkeypatch)
+    coordinator, _backend, session = _make_coordinator(text_generation_timeout_seconds=0.05, text_threads=2)
+    await coordinator.await_backend_ready()
+    streaming = TextJobInFlight(
+        job_id=_job_id(),
+        payload={},
+        time_popped=0.0,
+        time_generation_started=time.time(),
+        progress=TextGenerationProgress(chunks_received=3, characters_received=12, elapsed_seconds=1.0),
+    )
+    coordinator._in_flight[streaming.job_id] = streaming
+    coordinator._busy_spell_started_at = time.monotonic() - 10.0
+
+    for _answer in range(text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS * 2):
+        coordinator._note_busy_answer()
+
+    assert coordinator.backend_wedged is False
+    assert coordinator.backend_ready is True
+    await coordinator.api_text_pop()
+    assert len(session.pop_requests) == 1, "a full backend held the flow's pops"
+
+    streaming.stopped = True
+    coordinator._note_busy_answer()
+
+    assert coordinator.backend_wedged is True, "with nothing producing, the same spell is a wedge"
+
+
+async def test_a_wedged_managed_backend_holds_pops_and_is_relaunched_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker owns this backend, so it restarts it rather than faulting job after job into it."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _LockedTextBackend(description=_DESCRIPTION)
+    relaunch_reasons: list[str] = []
+
+    def _relaunch(reason: str) -> bool:
+        relaunch_reasons.append(reason)
+        return True
+
+    coordinator, _backend, session = _make_coordinator(
+        backend=backend,
+        text_backend_managed=True,
+        text_generation_timeout_seconds=0.05,
+        launch_count_provider=lambda: 1,
+        relaunch_backend=_relaunch,
+    )
+    assert await coordinator.await_backend_ready() is True
+    backend.locked = True
+    logged, sink_id = _capture_logs()
+    try:
+        await _hold_one_job_against_the_backend(coordinator)
+        await _hold_one_job_against_the_backend(coordinator)
+    finally:
+        logger.remove(sink_id)
+
+    assert len(relaunch_reasons) == 1, "one wedge was relaunched more than once"
+    assert coordinator.backend_wedged is True
+    assert coordinator.backend_ready is False
+    assert coordinator.backend_not_ready_since is not None, "the dashboard reads the hold as a backend not ready"
+    relaunch_lines = [message for level, message in logged if level == "WARNING" and "Relaunching it" in message]
+    assert len(relaunch_lines) == 1
+    assert coordinator.backend_address in relaunch_lines[0]
+    assert "answered busy for" in relaunch_lines[0]
+
+    await coordinator.api_text_pop()
+    assert session.pop_requests == [], "the flow popped into a wedged backend"
+
+
+async def test_a_wedged_backend_the_operator_runs_is_held_and_reported_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker cannot restart an attached backend, so it stops feeding it and tells the operator."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _LockedTextBackend(description=_DESCRIPTION)
+    coordinator, _backend, session = _make_coordinator(backend=backend, text_generation_timeout_seconds=0.05)
+    assert await coordinator.await_backend_ready() is True
+    backend.locked = True
+    logged, sink_id = _capture_logs()
+    try:
+        await _hold_one_job_against_the_backend(coordinator)
+        await _hold_one_job_against_the_backend(coordinator)
+        await coordinator._probe_wedged_backend()
+    finally:
+        logger.remove(sink_id)
+
+    wedge_errors = [message for level, message in logged if level == "ERROR" and "wedged" in message]
+    assert len(wedge_errors) == 1, "the standing wedge was reported more than once"
+    assert coordinator.backend_address in wedge_errors[0]
+    assert "Restart the backend" in wedge_errors[0]
+    assert "failed to find a memory slot" in wedge_errors[0], "the copy does not name the line that shows the cause"
+    assert "`text_threads` x `max_context_length`" in wedge_errors[0]
+    assert "`--contextsize`" in wedge_errors[0], "an attached backend's context is the operator's to size"
+    assert "it is not the fix" in wedge_errors[0], "one generation at a time was offered as the fix"
+    assert coordinator.backend_wedged is True, "a readiness answer alone ended the hold on a wedged backend"
+
+    await coordinator.api_text_pop()
+    assert session.pop_requests == []
+
+
+async def test_a_completed_generation_ends_the_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A held job the backend finally takes proves the lock released, so the gate may open again."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _LockedTextBackend(description=_DESCRIPTION)
+    coordinator, _backend, session = _make_coordinator(backend=backend, text_generation_timeout_seconds=0.05)
+    await coordinator.await_backend_ready()
+    backend.locked = True
+    await _hold_one_job_against_the_backend(coordinator)
+    assert coordinator.backend_wedged is True
+
+    backend.locked = False
+    await _hold_one_job_against_the_backend(coordinator)
+
+    assert coordinator.backend_wedged is False
+    assert coordinator._busy_spell_started_at is None
+    assert session.submit_requests[-1].state == GENERATION_STATE.ok
+    assert await coordinator.await_backend_ready() is True
+    await coordinator.api_text_pop()
+    assert len(session.pop_requests) == 1, "pops did not resume once the backend generated again"
+
+
+async def test_a_readiness_answer_after_the_relaunch_ends_the_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The new process answering is the relaunch working; the gate then runs as it does after any launch."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _LockedTextBackend(description=_DESCRIPTION)
+    launches = [1]
+
+    def _relaunch(_reason: str) -> bool:
+        launches[0] += 1
+        backend.locked = False
+        return True
+
+    coordinator, _backend, session = _make_coordinator(
+        backend=backend,
+        text_backend_managed=True,
+        text_generation_timeout_seconds=0.05,
+        launch_count_provider=lambda: launches[0],
+        relaunch_backend=_relaunch,
+    )
+    await coordinator.await_backend_ready()
+    backend.locked = True
+    _judge_wedged_without_waiting(coordinator)
+    assert coordinator.backend_wedged is True
+    assert launches[0] == 2
+
+    await coordinator._probe_wedged_backend()
+
+    assert coordinator.backend_wedged is False
+    assert await coordinator.await_backend_ready() is True
+    assert coordinator._backend_is_cold is False, "the relaunched backend was not warmed up again"
+    await coordinator.api_text_pop()
+    assert len(session.pop_requests) == 1
+
+
+async def test_an_attached_backend_seen_restarting_ends_the_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An operator's restart shows from outside as a backend that stopped answering and then answered."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = FakeTextBackend(description=_DESCRIPTION, ready_results=(True, True, False, True))
+    coordinator, _backend, _session = _make_coordinator(backend=backend, text_generation_timeout_seconds=0.05)
+    await coordinator.await_backend_ready()
+    _judge_wedged_without_waiting(coordinator)
+    assert coordinator.backend_wedged is True
+
+    await coordinator._probe_wedged_backend()
+    assert coordinator.backend_wedged is True, "an answer from the same wedged process ended the hold"
+    await coordinator._probe_wedged_backend()
+    assert coordinator.backend_wedged is True
+    await coordinator._probe_wedged_backend()
+
+    assert coordinator.backend_wedged is False
+
+
+async def test_relaunches_stop_at_the_bound_until_a_generation_completes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A backend that wedges again after every relaunch is not fixed by another, so the flow holds and says so."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _LockedTextBackend(description=_DESCRIPTION)
+    launches = [1]
+    relaunch_reasons: list[str] = []
+
+    def _relaunch(reason: str) -> bool:
+        relaunch_reasons.append(reason)
+        launches[0] += 1
+        return True
+
+    coordinator, _backend, _session = _make_coordinator(
+        backend=backend,
+        text_backend_managed=True,
+        text_generation_timeout_seconds=0.05,
+        launch_count_provider=lambda: launches[0],
+        relaunch_backend=_relaunch,
+    )
+    await coordinator.await_backend_ready()
+    backend.locked = True
+    bound = text_generation_coordinator.TEXT_BACKEND_WEDGE_MAX_RELAUNCHES
+    logged, sink_id = _capture_logs()
+    try:
+        for _episode in range(bound + 2):
+            _judge_wedged_without_waiting(coordinator)
+            assert coordinator.backend_wedged is True
+            launches[0] += 1
+            await coordinator._probe_wedged_backend()
+            assert coordinator.backend_wedged is False
+    finally:
+        logger.remove(sink_id)
+
+    assert len(relaunch_reasons) == bound
+    bound_lines = [message for level, message in logged if level == "ERROR" and "not relaunched again" in message]
+    assert len(bound_lines) == 1, "the exhausted relaunch bound was reported more than once"
+    assert "logs/text_backend.log" in bound_lines[0]
+    assert "`find_slot`" in bound_lines[0]
+    assert "`text_threads` x `max_context_length`" in bound_lines[0]
+    assert "it is not the fix" in bound_lines[0], "one generation at a time was offered as the fix"
+
+    backend.locked = False
+    await _hold_one_job_against_the_backend(coordinator)
+    _judge_wedged_without_waiting(coordinator)
+
+    assert len(relaunch_reasons) == bound + 1, "a completed generation did not restore the relaunch"

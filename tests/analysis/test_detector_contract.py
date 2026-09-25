@@ -54,6 +54,7 @@ from tests.analysis.test_detectors import (
     _server_slow_abort,
     _soft_reset,
     _starvation_diagnostic,
+    _text_wedge_hold,
     _whole_card_reserve,
 )
 from tests.analysis.test_dispatch_detectors import _multi_card_session, _safety_stage_session
@@ -441,6 +442,10 @@ CONTRACTS: dict[str, Contract] = {
     "detect_consecutive_failure_pause": Contract(
         bridge=_bridge(_consecutive_pause("15:19:11.000")),
         severity=Severity.WARNING,
+    ),
+    "detect_text_backend_wedged": Contract(
+        bridge=_bridge(_text_wedge_hold("20:05:00.000")),
+        severity=Severity.CRITICAL,
     ),
     "detect_stuck_inference_step": Contract(
         bridge=_bridge(_stuck_step("09:48:02.000")),
