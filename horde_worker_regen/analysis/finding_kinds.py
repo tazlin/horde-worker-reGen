@@ -75,6 +75,8 @@ class FindingKind(enum.StrEnum):
     STUCK_INFERENCE_STEP = "stuck_inference_step"
     POST_PROCESSING_VRAM_STALL = "post_processing_vram_stall"
     ORPHAN_WEDGE = "orphan_wedge"
+    INFERENCE_SLOT_RETIRED = "inference_slot_retired"
+    SAFETY_START_ESCALATED_TO_CPU = "safety_start_escalated_to_cpu"
 
     OOM = "oom"
     SWALLOWED_OOM = "swallowed_oom"
@@ -273,6 +275,31 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "picked the job up, the worker drops it so the queue can move. A run of these means something "
             "keeps taking processes out, most often a card that hangs on every job or runs out of memory."
         ),
+    ),
+    FindingSpec(
+        kind=FindingKind.INFERENCE_SLOT_RETIRED,
+        title="A card ran fewer image processes than planned",
+        detail=(
+            "The worker starts an image process only when its card has enough free memory. It gives up on a "
+            "start that makes no progress for several minutes. It also gives up at once when the card can never "
+            "free enough beside the other programs using it. The worker then takes that process out of the "
+            "card's plan and serves with the rest (a retired inference slot). It plans the process again once "
+            "the card has held enough room for a few minutes. A card that can never free enough does not get it "
+            "back while that lasts."
+        ),
+        reference_page="docs/explanation/process_lifecycle.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.SAFETY_START_ESCALATED_TO_CPU,
+        title="The safety check moved to the CPU because its card had no room",
+        detail=(
+            "Every finished image waits for the safety check before it is sent back. When the safety check's "
+            "card cannot give it room, the worker starts it on the CPU rather than hold all finished work. It "
+            "runs on the CPU from then on, until its card has held room for a while and the worker moves it "
+            "back. The evidence says whether that happened. A check on the CPU takes longer, so each job does too."
+        ),
+        see_also=FindingKind.SAFETY_STAGE_STALL,
+        reference_page="docs/explanation/process_lifecycle.md",
     ),
     # --- Memory and residency ---
     FindingSpec(

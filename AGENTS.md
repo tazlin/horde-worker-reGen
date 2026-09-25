@@ -60,6 +60,16 @@ their emitting sites. Before changing a log message in `process_management/`, gr
 line is registered, update the pattern, the sample, and any detector in the same change, then re-run
 `tests/analysis/test_log_signatures.py` and `-m slow tests/analysis/test_log_contract_dry_run.py`.
 
+**Symptom to first command:**
+
+| Symptom | Finding | First command | Bundle file |
+| ------- | ------- | ------------- | ----------- |
+| Image intake held | `pop_liveness_full_queue` | `horde-log diagnose --last`, then `pop_gate` and `pop_gate_since` on the snapshot | `bridge.log` |
+| Text backend wedged | `text_backend_wedged` | `horde-log diagnose --last`, then the backend counters in the hold line | `text_backend.log` |
+| Inference slot retired, safety moved to the CPU | `inference_slot_retired`, `safety_start_escalated_to_cpu` | `horde-log timeline --last` for the `INFERENCE_START_RETIRED`, `INFERENCE_SLOT_RESTORED` and `SAFETY_START_ESCALATED_TO_CPU` ledger events | `action_ledger.jsonl` |
+| Benchmark beside a worker | findings tagged as the benchmark run | `horde-log diagnose --last-benchmark`, stopped with `.abort_benchmark` | `bridge_harness.log` |
+| No image models configured | `image_models_unconfigured` | `horde-log diagnose --last`, and the config editor's Models banner | `config/bridgeData.redacted.yaml` |
+
 ## The map (most important files & classes)
 
 Almost all orchestration lives in `horde_worker_regen/process_management/`. The main process is a set

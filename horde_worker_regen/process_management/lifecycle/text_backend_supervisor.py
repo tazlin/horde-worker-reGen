@@ -652,11 +652,17 @@ class TextBackendSupervisor:
             if kv_mebibytes is None
             else f"about {kv_mebibytes * (spec.parallel_requests - 1) / spec.parallel_requests:.0f} MB"
         )
+        per_request_context = (
+            f"about 1/{spec.parallel_requests} of it"
+            if spec.context_cells is None
+            else f"about {spec.context_cells // spec.parallel_requests} tokens"
+        )
         logger.warning(
             f"The text backend on card {spec.device_index} needs about {asked_mb:.0f} MB, of which {extra_context} "
             f"is the context for {spec.parallel_requests} parallel requests beyond the first, but the card holds "
             f"{card_total_mb:.0f} MB. What does not fit spills to system memory and slows every generation. "
-            "Lower `max_context_length` or `text_gpu_layers` to fit it on the card.",
+            "The maximum context the backend reports is one pool every parallel request shares, so each request "
+            f"gets {per_request_context}. Lower `max_context_length` or `text_gpu_layers` to fit it on the card.",
         )
 
     def _clear_launch_detail(self) -> None:

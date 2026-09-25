@@ -236,6 +236,20 @@ _POP_API_ERROR_CODE_RE = pattern_for("pop_api_error_code")
 # so the pair together is an attribution rather than a guess.
 _SAFETY_PLACEMENT_CYCLE_RE = pattern_for("safety_placement_cycle")
 _RETIRED_SAFETY_RESULT_RE = pattern_for("retired_safety_result")
+# A deferred GPU start that gave up on its card. Producers: ``process_lifecycle._escalate_safety_start_off_gpu``
+# (safety moves to the CPU), ``_retire_stalled_inference_start`` (the inference slot leaves the card's plan)
+# and ``_restore_retired_inference_slot`` (it rejoins the plan). Each gives-up line has a stalled-wait and a
+# structural variant; the structural one states the card's achievable room, which is the operator's number.
+_SAFETY_START_ESCALATED_RE = pattern_for("safety_start_escalated_to_cpu")
+_SAFETY_START_ESCALATED_STRUCTURAL_RE = pattern_for("safety_start_escalated_structural")
+_INFERENCE_START_RETIRED_RE = pattern_for("inference_start_retired")
+_INFERENCE_START_RETIRED_STRUCTURAL_RE = pattern_for("inference_start_retired_structural")
+_INFERENCE_SLOT_RESTORED_RE = pattern_for("inference_slot_restored")
+# The text backend the worker launches, charged against its card. A structural shortfall on a card it holds
+# is fixed by moving the backend, which the advice can then name. Producer:
+# ``inference_scheduler._note_managed_tenant_charge``.
+_MANAGED_TEXT_BACKEND_CHARGED_RE = pattern_for("managed_text_backend_charged")
+_MANAGED_TEXT_BACKEND_RELEASED_RE = pattern_for("managed_text_backend_released")
 # A child that died installing or repairing the shared ComfyUI environment rather than importing the
 # inference stack. Concurrent cold starts clone into one environment directory, and a half-written clone
 # leaves the tree in a state a later checkout refuses; the fix is the directory, never the torch install.
@@ -1449,6 +1463,286 @@ def detect_image_models_unconfigured(context: SessionContext) -> list[Finding]:
             severity=Severity.CRITICAL,
             headline="The worker ran with image generation on and no model list, so it loaded no image models.",
             evidence=[_evidence(warned[0])],
+        ),
+    ]
+
+
+@dataclass(frozen=True)
+class _DeferredStartGaveUp:
+    """Represents a deferred GPU start that gave up on its card, as its escalation or retirement line states it."""
+
+    record: LogRecord
+    position: int
+    """The line's index in the session's records, so later lines can be paired against it."""
+    device: int
+    required_mb: int
+    room_mb: int | None
+    """The most the card can free beside its standing tenants for a structural shortfall; None for a stalled wait."""
+    waited_seconds: int | None
+    """How long a stalled wait lasted; None for a structural shortfall, which gives up without waiting."""
+    text_backend_on_card: bool
+    """Whether the text backend the worker launches was charged against this card when the start gave up."""
+
+    @property
+    def structural(self) -> bool:
+        """Whether the card can never free what the start needs, rather than having stopped freeing it."""
+        return self.room_mb is not None
+
+    @property
+    def room_text(self) -> str:
+        """The card's achievable room as a headline states it; a room below zero reads as none."""
+        return f"{max(self.room_mb or 0, 0)}MB"
+
+
+def _deferred_starts_gave_up(
+    records: list[LogRecord],
+    *,
+    stalled: re.Pattern[str],
+    structural: re.Pattern[str],
+) -> list[_DeferredStartGaveUp]:
+    """Return every gives-up line of one process kind, noting whether the text backend held that card then.
+
+    The text backend's charge lines are edge-triggered, so the set of cards it holds is replayed in order.
+    """
+    charged_devices: set[int] = set()
+    gave_up: list[_DeferredStartGaveUp] = []
+    for position, record in enumerate(records):
+        charged = _MANAGED_TEXT_BACKEND_CHARGED_RE.search(record.message)
+        if charged is not None:
+            charged_devices.add(int(charged.group("device")))
+            continue
+        released = _MANAGED_TEXT_BACKEND_RELEASED_RE.search(record.message)
+        if released is not None:
+            charged_devices.discard(int(released.group("device")))
+            continue
+        stalled_match = stalled.search(record.message)
+        structural_match = None if stalled_match is not None else structural.search(record.message)
+        match = stalled_match or structural_match
+        if match is None:
+            continue
+        device = int(match.group("device"))
+        gave_up.append(
+            _DeferredStartGaveUp(
+                record=record,
+                position=position,
+                device=device,
+                required_mb=int(match.group("required")),
+                room_mb=int(structural_match.group("room")) if structural_match is not None else None,
+                waited_seconds=int(stalled_match.group("waited")) if stalled_match is not None else None,
+                text_backend_on_card=device in charged_devices,
+            ),
+        )
+    return gave_up
+
+
+def _span_text(seconds: float | None) -> str:
+    """Return a duration in the unit a reader would say it in: minutes under an hour, hours above."""
+    if seconds is None:
+        return "an unknown time"
+    if seconds < 3600:
+        minutes = max(1, round(seconds / 60))
+        return "1 minute" if minutes == 1 else f"{minutes} minutes"
+    return f"{seconds / 3600:.1f} hours"
+
+
+def _clock_text(moment: datetime | None) -> str:
+    """Return a line's time of day, or the placeholder evidence lines use for a line without one."""
+    return moment.strftime("%H:%M:%S") if moment is not None else "--:--:--"
+
+
+def _seconds_between(start: datetime | None, end: datetime | None) -> float | None:
+    """Return the seconds from ``start`` to ``end``, or None when either timestamp is missing."""
+    if start is None or end is None:
+        return None
+    return max(0.0, (end - start).total_seconds())
+
+
+def _structural_shortfall_action(gave_up: _DeferredStartGaveUp, *, remedy: str) -> str:
+    """Return the advice for a card that cannot free what a start needs, naming the text backend when it is there."""
+    if gave_up.text_backend_on_card:
+        return (
+            "The text backend the worker runs holds memory on that card. Set `text_gpu_device_index` to another "
+            f"card, or {remedy}."
+        )
+    return f"Close the other programs using memory on that card, or {remedy}."
+
+
+@dataclass
+class _RetiredInferenceStart:
+    """Represents one inference start taken out of its card's plan, and the line that put it back, if any."""
+
+    gave_up: _DeferredStartGaveUp
+    restored: LogRecord | None = None
+
+
+def _inference_slot_retired_finding(
+    device: int,
+    retirements: list[_RetiredInferenceStart],
+    *,
+    session_end: datetime | None,
+) -> Finding:
+    """Return the finding for one card's retired inference starts.
+
+    A retirement never restored is a card serving short for the rest of the session, so it leads the
+    headline and makes the finding a warning. A structural one is the card's configuration: it cannot hold
+    every process planned for it beside what else runs there, and the advice says so. Retirements that all
+    came back are context.
+    """
+    evidence: list[str] = []
+    for retirement in retirements[:3]:
+        began_text = _clock_text(retirement.gave_up.record.timestamp)
+        ended_text = "the session end" if retirement.restored is None else _clock_text(retirement.restored.timestamp)
+        evidence.append(f"card {device}: out of the plan from {began_text} to {ended_text}")
+    evidence.append(_evidence(retirements[0].gave_up.record))
+    evidence.extend(_evidence(retirement.restored) for retirement in retirements[:2] if retirement.restored)
+
+    never_restored = [retirement for retirement in retirements if retirement.restored is None]
+    if not never_restored:
+        total_seconds = sum(
+            _seconds_between(retirement.gave_up.record.timestamp, retirement.restored.timestamp) or 0.0
+            for retirement in retirements
+            if retirement.restored is not None
+        )
+        times = "once" if len(retirements) == 1 else f"{len(retirements)} times"
+        return Finding(
+            kind=FindingKind.INFERENCE_SLOT_RETIRED,
+            severity=Severity.INFO,
+            headline=(
+                f"Card {device} ran one image process fewer {times}, for {_span_text(total_seconds)} in total, "
+                "and the worker started it again each time."
+            ),
+            action_addendum=(
+                "No action needed. If it happens often, look for another program using memory on that card."
+            ),
+            evidence=evidence,
+        )
+
+    first = never_restored[0].gave_up
+    count = len(never_restored)
+    processes = "1 image process" if count == 1 else f"{count} image processes"
+    lasted = _span_text(_seconds_between(first.record.timestamp, session_end))
+    if first.structural:
+        headline = (
+            f"Card {device} ran {processes} fewer for the session's last {lasted}, because it can free "
+            f"{first.room_text} and a start needs {first.required_mb}MB."
+        )
+        action = (
+            "This card cannot hold every image process planned for it. "
+            f"{_structural_shortfall_action(first, remedy='lower `max_threads`')}"
+        )
+    else:
+        headline = (
+            f"Card {device} ran {processes} fewer for the session's last {lasted}, because free memory stayed "
+            f"below the {first.required_mb}MB a start needs."
+        )
+        action = (
+            "Look for another program holding memory on that card and close it. The worker starts the process "
+            "again once the card has had room for a few minutes."
+        )
+    return Finding(
+        kind=FindingKind.INFERENCE_SLOT_RETIRED,
+        severity=Severity.WARNING,
+        headline=headline,
+        action_addendum=action,
+        evidence=evidence,
+    )
+
+
+def detect_inference_slot_retired(context: SessionContext) -> list[Finding]:
+    """A card that served with fewer image processes than planned because a start could not get room on it.
+
+    A retired inference slot leaves no idle process and no error behind, so without this the session reads
+    as spare capacity. Each retirement is paired with the next restore on the same card; one never restored
+    lasted until the session ended. One finding per card.
+    """
+    records = context.session.records
+    retirements_by_device: dict[int, list[_RetiredInferenceStart]] = {}
+    for gave_up in _deferred_starts_gave_up(
+        records,
+        stalled=_INFERENCE_START_RETIRED_RE,
+        structural=_INFERENCE_START_RETIRED_STRUCTURAL_RE,
+    ):
+        retirements_by_device.setdefault(gave_up.device, []).append(_RetiredInferenceStart(gave_up=gave_up))
+    if not retirements_by_device:
+        return []
+    for position, record in enumerate(records):
+        restored = _INFERENCE_SLOT_RESTORED_RE.search(record.message)
+        if restored is None:
+            continue
+        open_retirement = next(
+            (
+                retirement
+                for retirement in retirements_by_device.get(int(restored.group("device")), [])
+                if retirement.restored is None and retirement.gave_up.position < position
+            ),
+            None,
+        )
+        if open_retirement is not None:
+            open_retirement.restored = record
+    session_end = context.session.end_ts
+    return [
+        _inference_slot_retired_finding(device, retirements, session_end=session_end)
+        for device, retirements in sorted(retirements_by_device.items())
+    ]
+
+
+def _safety_returned_to_card_after(records: list[LogRecord], escalation: _DeferredStartGaveUp) -> LogRecord | None:
+    """Return the first line restoring the safety process to a GPU after ``escalation``, or None."""
+    for record in records[escalation.position + 1 :]:
+        cycle = _SAFETY_PLACEMENT_CYCLE_RE.search(record.message)
+        if cycle is not None and "restoring the safety process to the GPU" in cycle.group(0):
+            return record
+    return None
+
+
+def detect_safety_start_escalated_to_cpu(context: SessionContext) -> list[Finding]:
+    """A safety start that could not get room on its card, so the worker started safety on the CPU instead.
+
+    The headline states the first escalation's numbers; the evidence says whether safety went back to a card
+    before the session ended, which is when the slower CPU checks stopped.
+    """
+    records = context.session.records
+    escalations = _deferred_starts_gave_up(
+        records,
+        stalled=_SAFETY_START_ESCALATED_RE,
+        structural=_SAFETY_START_ESCALATED_STRUCTURAL_RE,
+    )
+    if not escalations:
+        return []
+    first = escalations[0]
+    if first.structural:
+        headline = (
+            f"The safety check started on the CPU because card {first.device} can free {first.room_text} and the "
+            f"check needs {first.required_mb}MB."
+        )
+        action = _structural_shortfall_action(first, remedy="lower `max_threads` to leave it room")
+    else:
+        headline = (
+            f"The safety check started on the CPU after card {first.device} spent "
+            f"{_span_text(first.waited_seconds)} failing to free the {first.required_mb}MB it needs."
+        )
+        action = (
+            "Look for another program holding memory on that card and close it. Checks run slower on the CPU "
+            "until the card has room again."
+        )
+    returned = _safety_returned_to_card_after(records, escalations[-1])
+    outcome = (
+        "stayed on the CPU until the session ended"
+        if returned is None
+        else f"returned to a card at {_clock_text(returned.timestamp)}"
+    )
+    count_note = [] if len(escalations) == 1 else [f"{len(escalations)} escalations to the CPU this session"]
+    return [
+        Finding(
+            kind=FindingKind.SAFETY_START_ESCALATED_TO_CPU,
+            severity=Severity.WARNING,
+            headline=headline,
+            action_addendum=action,
+            evidence=[
+                f"safety check after the last escalation: {outcome}",
+                *count_note,
+                *(_evidence(escalation.record) for escalation in escalations[:3]),
+            ],
         ),
     ]
 
@@ -3231,6 +3525,8 @@ DETECTORS: list[Detector] = [
     detect_model_churn,
     detect_lane_placement,
     detect_utilities_lane_bringup_timeout,
+    detect_inference_slot_retired,
+    detect_safety_start_escalated_to_cpu,
     detect_safety_stage_stall,
     detect_safety_stage_capacity,
     detect_whole_card_convergence_wedge,

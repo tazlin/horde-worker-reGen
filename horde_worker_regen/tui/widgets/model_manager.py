@@ -198,7 +198,8 @@ class ModelManagerView(Vertical):
                     yield Label("Offer list", classes="mm-rules-label")
                     yield Static(
                         "Start here. Add exact model names or meta rules such as TOP 2 / ALL SDXL. "
-                        "If this list is empty, the worker behaves as TOP 2.",
+                        "An empty list behaves as TOP 2, but if models_to_load is not set at all, no image models "
+                        "will load.",
                         classes="mm-rules-help",
                     )
                     yield ModelListEditor("models_to_load", self._load_values, sibling_values=self._skip_editor_values)

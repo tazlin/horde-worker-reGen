@@ -44,14 +44,17 @@ from tests.analysis.test_detectors import (
     _full_queue_frozen,
     _give_up,
     _image_models_unconfigured,
+    _inference_start_retired,
     _load_failure_recovery,
     _maintenance_pop,
+    _managed_text_backend_charged,
     _pop_api_error,
     _pop_claim_engaged,
     _pop_claim_released,
     _recovery,
     _safety_lost_result,
     _safety_requeue,
+    _safety_start_escalated,
     _sample_stage_fault,
     _server_slow_abort,
     _soft_reset,
@@ -365,6 +368,18 @@ CONTRACTS: dict[str, Contract] = {
             inference_lane_started(_lifecycle_stamp(3), process=3, device=1),
             post_process_lane_started(_lifecycle_stamp(600), process=1, device=0),
         ),
+        severity=Severity.WARNING,
+    ),
+    "detect_inference_slot_retired": Contract(
+        # A structural retirement beside the text backend the worker launched, never restored.
+        bridge=_bridge(
+            _managed_text_backend_charged("01:05:00.000"),
+            _inference_start_retired("01:17:51.000", structural=True),
+        ),
+        severity=Severity.WARNING,
+    ),
+    "detect_safety_start_escalated_to_cpu": Contract(
+        bridge=_bridge(_safety_start_escalated("01:26:33.000")),
         severity=Severity.WARNING,
     ),
     "detect_utilities_lane_bringup_timeout": Contract(

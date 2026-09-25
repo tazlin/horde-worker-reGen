@@ -115,6 +115,12 @@ prefer models already loaded in VRAM when popping. Higher stickiness reduces
 model-switching overhead on slow disks at the cost of occasionally missing jobs
 for other models.
 
+An absent key and an empty list are different. An explicit `models_to_load: []` loads the top 2 models.
+A config with no `models_to_load` at all, globally or for any card, resolves to no models: with `dreamer`
+on, the worker loads no image model and takes no image job. It says so in three places: a startup
+warning in the log (the `image_models_unconfigured` finding in `horde-log diagnose`), an "Image models"
+error row in the dashboard's health checks, and a banner on the config editor's Models section.
+
 Stickiness only activates when the number of configured models exceeds
 `max_inference_processes` (`queue_size + max_threads`) **and** every inference
 process already has a model loaded. When it fires, the pop is restricted to

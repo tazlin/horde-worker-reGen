@@ -92,6 +92,10 @@ _TEXT_BACKEND_NOT_LAUNCHED = (
 )
 _TEXT_FLOW_NOT_EXERCISED = "the dry-run contract scenario serves image jobs only, so the text flow never runs"
 _RUN_NOT_ABORTED = "a completed dry run ends through a graceful shutdown; only an abort writes the sentinel file"
+_DEFERRED_GPU_START_NOT_EXERCISED = (
+    "the dry-run harness's fake children report no free-VRAM reading that falls short of a GPU start, so no "
+    "start is ever deferred"
+)
 
 _ABORT_SENTINEL_NAMES_PATTERN = "|".join(re.escape(abort_sentinel_name(kind)) for kind in AbortSentinelKind)
 
@@ -685,6 +689,98 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.ipc.message_dispatcher:_classify_retired_launch_message",
         sample="Ignoring result message from retired safety process (launch retired by a placement cycle).",
         dry_run_reason=_SAFETY_PLACEMENT_NOT_EXERCISED,
+    ),
+    # --- Deferred GPU starts: a safety start moved to the CPU, an inference start retired and restored ---
+    _signature(
+        "safety_start_escalated_to_cpu",
+        r"Deferred SAFETY process start on device (?P<device>\d+) has waited (?P<waited>\d+)s with no headroom "
+        r"progress \((?P<free>\d+MB|unreported) free, governor (?P<governor>\w+); the start needs at least "
+        r"(?P<required>\d+)MB",
+        emitter="process_management.lifecycle.process_lifecycle:_escalate_safety_start_off_gpu",
+        sample=(
+            "Deferred SAFETY process start on device 0 has waited 612s with no headroom progress (650MB free, "
+            "governor pressure; the start needs at least 1631MB and a healthy governor). Starting the safety "
+            "process on the CPU so finished images can be checked; runtime safety placement returns it to a GPU "
+            "once a permitted card shows durable room."
+        ),
+        dry_run_reason=_DEFERRED_GPU_START_NOT_EXERCISED,
+    ),
+    _signature(
+        "safety_start_escalated_structural",
+        r"Deferred SAFETY process start on device (?P<device>\d+) has a structural shortfall\. It needs "
+        r"(?P<required>\d+)MB free and the card can give back at most (?P<room>-?\d+)MB",
+        emitter="process_management.lifecycle.process_lifecycle:_escalate_safety_start_off_gpu",
+        sample=(
+            "Deferred SAFETY process start on device 0 has a structural shortfall. It needs 1631MB free and the "
+            "card can give back at most 677MB beside its standing tenants (650MB free now, waited 3s). Starting the "
+            "safety process on the CPU so finished images can be checked; runtime safety placement returns it to "
+            "a GPU once a permitted card shows durable room."
+        ),
+        dry_run_reason=_DEFERRED_GPU_START_NOT_EXERCISED,
+    ),
+    _signature(
+        "inference_start_retired",
+        r"Deferred INFERENCE process (?P<process>\d+) start on device (?P<device>\d+) has waited (?P<waited>\d+)s "
+        r"with no headroom progress \((?P<free>\d+MB|unreported) free, governor (?P<governor>\w+); the start needs "
+        r"at least (?P<required>\d+)MB and a healthy governor\)\. Retiring the slot",
+        emitter="process_management.lifecycle.process_lifecycle:_retire_stalled_inference_start",
+        sample=(
+            "Deferred INFERENCE process 2 start on device 0 has waited 604s with no headroom progress (552MB free, "
+            "governor pressure; the start needs at least 3044MB and a healthy governor). Retiring the slot: device "
+            "0 now plans 1 inference process(es) and the worker plans 1. It is planned again once the card has "
+            "held room for a start for 300s."
+        ),
+        dry_run_reason=_DEFERRED_GPU_START_NOT_EXERCISED,
+    ),
+    _signature(
+        "inference_start_retired_structural",
+        r"Deferred INFERENCE process (?P<process>\d+) start on device (?P<device>\d+) has a structural shortfall "
+        r"\(it needs (?P<required>\d+)MB free and the card can give back at most (?P<room>-?\d+)MB beside its "
+        r"standing tenants.*?\)\. Retiring the slot",
+        emitter="process_management.lifecycle.process_lifecycle:_retire_stalled_inference_start",
+        sample=(
+            "Deferred INFERENCE process 2 start on device 0 has a structural shortfall (it needs 3044MB free and "
+            "the card can give back at most 677MB beside its standing tenants, 552MB free now, waited 2s). "
+            "Retiring the slot: device 0 now plans 1 inference process(es) and the worker plans 1. It is planned "
+            "again once the card has held room for a start for 300s."
+        ),
+        dry_run_reason=_DEFERRED_GPU_START_NOT_EXERCISED,
+    ),
+    _signature(
+        "inference_slot_restored",
+        r"Restoring a retired INFERENCE slot on device (?P<device>\d+) as process (?P<process>\d+): the card has "
+        r"held room for a start for (?P<held>\d+)s",
+        emitter="process_management.lifecycle.process_lifecycle:_restore_retired_inference_slot",
+        sample=(
+            "Restoring a retired INFERENCE slot on device 0 as process 3: the card has held room for a start for "
+            "301s (8120MB free, the start needs 3044MB). Device 0 now plans 2 inference process(es) and the worker "
+            "plans 2."
+        ),
+        dry_run_reason=_DEFERRED_GPU_START_NOT_EXERCISED,
+    ),
+    # The text backend the worker launches, charged against its card's room: what a structural shortfall on
+    # that card is standing beside.
+    _signature(
+        "managed_text_backend_charged",
+        r"VRAM: the managed text backend holds (?P<footprint>\d+) MB on device (?P<device>\d+); it is charged as a "
+        r"standing floor there",
+        emitter="process_management.scheduling.inference_scheduler:_note_managed_tenant_charge",
+        sample=(
+            "VRAM: the managed text backend holds 5120 MB on device 0; it is charged as a standing floor there and "
+            "the most one load on device 0 can now be offered is 17800 MB."
+        ),
+        dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
+    ),
+    _signature(
+        "managed_text_backend_released",
+        r"VRAM: the managed text backend no longer serves on device (?P<device>\d+); its (?P<footprint>\d+) MB "
+        r"standing floor there is released",
+        emitter="process_management.scheduling.inference_scheduler:_note_managed_tenant_charge",
+        sample=(
+            "VRAM: the managed text backend no longer serves on device 0; its 5120 MB standing floor there is "
+            "released."
+        ),
+        dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
     ),
     # --- Dispatch stall and whole-card residency ---
     _signature(

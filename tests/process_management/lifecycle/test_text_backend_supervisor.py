@@ -746,6 +746,7 @@ async def test_a_batched_context_larger_than_the_card_is_warned_about_once(tmp_p
     assert "needs about 2673 MB" in warnings[0]
     assert "about 357 MB is the context for 4 parallel requests" in warnings[0]
     assert "the card holds 2000 MB" in warnings[0]
+    assert "each request gets about 4096 tokens" in warnings[0], "the reported maximum is the shared pool"
 
 
 async def test_the_launching_row_reports_launching_before_readiness(tmp_path: Path) -> None:

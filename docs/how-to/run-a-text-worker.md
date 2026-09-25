@@ -99,7 +99,9 @@ The parallel generations share one context, so the worker launches the backend w
 `max_context_length` of it: four at a 4096 context opens 16384. That context costs VRAM in proportion,
 which the line reporting the backend ready states along with the backend's footprint. If the total no longer
 fits the card, the worker warns once at launch and runs anyway, slower; lower `max_context_length` or
-`text_gpu_layers` to bring it back onto the card.
+`text_gpu_layers` to bring it back onto the card. Under `--parallelrequests` the maximum context the backend
+reports is that whole pool, which every request shares, so each request gets roughly `--contextsize` divided
+by the number of parallel requests.
 
 If you run the backend yourself, start it with `--contextsize` sized the same way. Too small a context makes
 the backend refuse every request as busy while generating nothing, with `find_slot` or `failed to find a

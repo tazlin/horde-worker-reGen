@@ -828,6 +828,236 @@ class TestTextBackendWedged:
         assert "text_backend_wedged" not in _diagnose(tmp_path, self._bridge(*lines))
 
 
+_PROCESS_LIFECYCLE = "horde_worker_regen.process_management.lifecycle.process_lifecycle"
+_INFERENCE_SCHEDULER = "horde_worker_regen.process_management.scheduling.inference_scheduler"
+
+
+def _inference_start_retired(ts: str, *, device: int = 0, structural: bool = False) -> str:
+    """The lifecycle retiring a deferred inference start: a stalled wait, or a structural shortfall."""
+    cause = (
+        "has a structural shortfall (it needs 3044MB free and the card can give back at most 677MB beside its "
+        "standing tenants, 552MB free now, waited 2s)"
+        if structural
+        else "has waited 604s with no headroom progress (552MB free, governor pressure; the start needs at least "
+        "3044MB and a healthy governor)"
+    )
+    return (
+        f"2026-06-25 {ts} | WARNING  | {_PROCESS_LIFECYCLE}:_retire_stalled_inference_start:1424 - Deferred "
+        f"INFERENCE process 2 start on device {device} {cause}. Retiring the slot: device {device} now plans 1 "
+        "inference process(es) and the worker plans 1. It is planned again once the card has held room for a "
+        "start for 300s."
+    )
+
+
+def _inference_slot_restored(ts: str, *, device: int = 0) -> str:
+    """The lifecycle planning a retired inference slot again once its card held room through the dwell."""
+    return (
+        f"2026-06-25 {ts} | INFO     | {_PROCESS_LIFECYCLE}:_restore_retired_inference_slot:1518 - Restoring a "
+        f"retired INFERENCE slot on device {device} as process 3: the card has held room for a start for 301s "
+        f"(8120MB free, the start needs 3044MB). Device {device} now plans 2 inference process(es) and the worker "
+        "plans 2."
+    )
+
+
+def _safety_start_escalated(ts: str, *, device: int = 0, structural: bool = False) -> str:
+    """The lifecycle starting a deferred safety process on the CPU: a stalled wait, or a structural shortfall."""
+    cause = (
+        "has a structural shortfall. It needs 1631MB free and the card can give back at most 677MB beside its "
+        "standing tenants (650MB free now, waited 3s)."
+        if structural
+        else "has waited 612s with no headroom progress (650MB free, governor pressure; the start needs at least "
+        "1631MB and a healthy governor)."
+    )
+    return (
+        f"2026-06-25 {ts} | WARNING  | {_PROCESS_LIFECYCLE}:_escalate_safety_start_off_gpu:1338 - Deferred SAFETY "
+        f"process start on device {device} {cause} Starting the safety process on the CPU so finished images can "
+        "be checked; runtime safety placement returns it to a GPU once a permitted card shows durable room."
+    )
+
+
+def _managed_text_backend_charged(ts: str, *, device: int = 0) -> str:
+    """The scheduler charging the text backend it launched against its card."""
+    return (
+        f"2026-06-25 {ts} | INFO     | {_INFERENCE_SCHEDULER}:_note_managed_tenant_charge:5097 - VRAM: the managed "
+        f"text backend holds 5120 MB on device {device}; it is charged as a standing floor there and the most one "
+        f"load on device {device} can now be offered is 17800 MB."
+    )
+
+
+def _managed_text_backend_released(ts: str, *, device: int = 0) -> str:
+    """The scheduler releasing the text backend's charge when it stops serving."""
+    return (
+        f"2026-06-25 {ts} | INFO     | {_INFERENCE_SCHEDULER}:_note_managed_tenant_charge:5077 - VRAM: the managed "
+        f"text backend no longer serves on device {device}; its 5120 MB standing floor there is released."
+    )
+
+
+def _session_line(ts: str) -> str:
+    """An unrelated line that carries the session on to ``ts``."""
+    return f"2026-06-25 {ts} | INFO     | x:y:1 - working"
+
+
+class TestInferenceSlotRetired:
+    """A card serving with fewer image processes than planned, which otherwise reads as idle capacity."""
+
+    def _bridge(self, *lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 01:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_a_structural_retirement_never_restored_reads_as_the_cards_configuration(self, tmp_path: Path) -> None:
+        """The card cannot hold its planned processes, so the numbers lead and the advice changes the plan."""
+        bridge = self._bridge(_inference_start_retired("01:17:51.000", structural=True), _session_line("04:08:00.000"))
+
+        finding = _diagnose(tmp_path, bridge)["inference_slot_retired"]
+
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "Card 0 ran 1 image process fewer for the session's last 2.8 hours, because it can free 677MB and a "
+            "start needs 3044MB."
+        )
+        assert "cannot hold every image process" in finding.action
+        assert "`max_threads`" in finding.action
+        assert "`text_gpu_device_index`" not in finding.action
+        assert any("to the session end" in line for line in finding.evidence)
+
+    def test_the_text_backend_on_the_card_is_named_as_what_to_move(self, tmp_path: Path) -> None:
+        """A structural shortfall beside the backend the worker launched is fixed by moving the backend."""
+        bridge = self._bridge(
+            _managed_text_backend_charged("01:05:00.000"),
+            _inference_start_retired("01:17:51.000", structural=True),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["inference_slot_retired"]
+
+        assert "`text_gpu_device_index`" in finding.action
+
+    def test_a_released_text_backend_is_not_named(self, tmp_path: Path) -> None:
+        """The charge is replayed in order, so a backend that stopped serving before the retirement is not blamed."""
+        bridge = self._bridge(
+            _managed_text_backend_charged("01:05:00.000"),
+            _managed_text_backend_released("01:10:00.000"),
+            _inference_start_retired("01:17:51.000", structural=True),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["inference_slot_retired"]
+
+        assert "`text_gpu_device_index`" not in finding.action
+
+    def test_a_stalled_retirement_never_restored_names_the_free_memory_it_waited_for(self, tmp_path: Path) -> None:
+        """A drainable wait that never recovered is a warning about what holds the card."""
+        bridge = self._bridge(_inference_start_retired("01:17:51.000"), _session_line("01:47:51.000"))
+
+        finding = _diagnose(tmp_path, bridge)["inference_slot_retired"]
+
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "Card 0 ran 1 image process fewer for the session's last 30 minutes, because free memory stayed below "
+            "the 3044MB a start needs."
+        )
+        assert "another program" in finding.action
+
+    def test_a_restored_retirement_is_context(self, tmp_path: Path) -> None:
+        """The worker got the process back, so the finding is a note with how long the card ran short."""
+        bridge = self._bridge(
+            _inference_start_retired("01:17:51.000"),
+            _inference_slot_restored("01:42:51.000"),
+            _session_line("04:00:00.000"),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["inference_slot_retired"]
+
+        assert finding.severity is Severity.INFO
+        assert finding.headline == (
+            "Card 0 ran one image process fewer once, for 25 minutes in total, and the worker started it again "
+            "each time."
+        )
+        assert finding.action.startswith("No action needed.")
+        assert any("from 01:17:51 to 01:42:51" in line for line in finding.evidence)
+
+    def test_a_restore_on_another_card_does_not_close_the_retirement(self, tmp_path: Path) -> None:
+        """Retirements pair with restores on their own card only."""
+        bridge = self._bridge(
+            _inference_start_retired("01:17:51.000", device=0),
+            _inference_slot_restored("01:42:51.000", device=1),
+            _session_line("02:17:51.000"),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["inference_slot_retired"]
+
+        assert finding.severity is Severity.WARNING
+        assert "for the session's last 1.0 hours" in finding.headline
+
+    def test_silent_without_a_retirement(self, tmp_path: Path) -> None:
+        """A restore line alone, or no lifecycle line at all, is no finding."""
+        assert "inference_slot_retired" not in _diagnose(tmp_path, self._bridge(_session_line("01:10:00.000")))
+
+
+class TestSafetyStartEscalatedToCpu:
+    """A safety start that could not get room on its card, started on the CPU instead."""
+
+    def _bridge(self, *lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 01:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_a_stalled_wait_states_how_long_the_card_failed_to_free_room(self, tmp_path: Path) -> None:
+        """The headline carries the wait and the requirement; the evidence says safety stayed on the CPU."""
+        bridge = self._bridge(_safety_start_escalated("01:26:33.000"), _session_line("04:00:00.000"))
+
+        finding = _diagnose(tmp_path, bridge)["safety_start_escalated_to_cpu"]
+
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "The safety check started on the CPU after card 0 spent 10 minutes failing to free the 1631MB it needs."
+        )
+        assert "slower on the CPU" in finding.action
+        assert (
+            finding.evidence[0] == "safety check after the last escalation: stayed on the CPU until the session ended"
+        )
+        assert finding.see_also is FindingKind.SAFETY_STAGE_STALL
+
+    def test_a_structural_shortfall_states_the_cards_room(self, tmp_path: Path) -> None:
+        """The card can never free what the check needs, so the advice changes what shares it."""
+        bridge = self._bridge(
+            _managed_text_backend_charged("01:05:00.000"),
+            _safety_start_escalated("01:16:33.000", structural=True),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["safety_start_escalated_to_cpu"]
+
+        assert finding.headline == (
+            "The safety check started on the CPU because card 0 can free 677MB and the check needs 1631MB."
+        )
+        assert "`text_gpu_device_index`" in finding.action
+
+    def test_the_evidence_says_when_safety_went_back_to_a_card(self, tmp_path: Path) -> None:
+        """Runtime safety placement restoring the process ends the CPU checks, and the evidence dates it."""
+        bridge = self._bridge(
+            _safety_start_escalated("01:26:33.000"),
+            _safety_placement_cycle("02:10:00.000", owner="Runtime safety placement", restoring=True),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["safety_start_escalated_to_cpu"]
+
+        assert finding.evidence[0] == "safety check after the last escalation: returned to a card at 02:10:00"
+
+    def test_a_restore_before_the_escalation_is_not_a_return(self, tmp_path: Path) -> None:
+        """Only a restore after the escalation counts."""
+        bridge = self._bridge(
+            _safety_placement_cycle("01:10:00.000", owner="Runtime safety placement", restoring=True),
+            _safety_start_escalated("01:26:33.000"),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["safety_start_escalated_to_cpu"]
+
+        assert "stayed on the CPU" in finding.evidence[0]
+
+    def test_silent_without_an_escalation(self, tmp_path: Path) -> None:
+        """A session whose safety process started where it was planned has no such finding."""
+        assert "safety_start_escalated_to_cpu" not in _diagnose(tmp_path, self._bridge(_session_line("01:10:00.000")))
+
+
 def _oom_coresident(ts: str, *, slot: int = 4, model: str = "Z-Image-Turbo") -> str:
     """A faulted-inference OOM carrying the allocator's co-residency accounting (the over-admission case).
 
