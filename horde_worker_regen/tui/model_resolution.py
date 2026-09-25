@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 
+from horde_worker_regen.capabilities import DEFAULT_IMAGE_MODELS_TO_LOAD
 from horde_worker_regen.tui.model_catalog import MetaKind, ModelInfo, parse_meta_instruction
 
 # Baselines the worker excludes from ALL/TOP meta selections unless large models are opted in.
@@ -24,9 +25,6 @@ _SD21_BASELINES = frozenset({"stable_diffusion_2_512", "stable_diffusion_2_768"}
 
 # The worker unconditionally appends this placeholder to the skip list (horde_sdk bridge_data).
 ALWAYS_SKIP = ("SDXL_beta::stability.ai#6901",)
-
-# What an empty models_to_load falls back to worker-side (validate_models_to_load).
-DEFAULT_WHEN_EMPTY = "top 2"
 
 
 class EffectiveStatus(enum.StrEnum):
@@ -159,7 +157,7 @@ def resolve_effective_models(
     by_name = {model.name: model for model in catalog}
 
     default_applied = not load_entries
-    effective_load = [DEFAULT_WHEN_EMPTY] if default_applied else load_entries
+    effective_load = list(DEFAULT_IMAGE_MODELS_TO_LOAD) if default_applied else load_entries
 
     needs_resolve: list[str] = []
     warnings: list[str] = []

@@ -42,6 +42,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, HorizontalGroup, Vertical
 from textual.widgets import Button, Collapsible, Input, Label, Static, Switch, TextArea
 
+from horde_worker_regen.capabilities import DEFAULT_IMAGE_MODELS_TO_LOAD, image_models_unconfigured
 from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     GPU_GLOBAL_FIELDS,
@@ -60,13 +61,13 @@ from horde_worker_regen.tui.config_form import (
     read_gpu_pop_balance_threshold,
 )
 from horde_worker_regen.tui.formatters import gpu_label
-from horde_worker_regen.tui.model_resolution import DEFAULT_WHEN_EMPTY
 
 if TYPE_CHECKING:
     from horde_worker_regen.app_state import KnownGpu, KnownGpuInventory
     from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot
 
 _GLOBAL_FIELD_BY_KEY: dict[str, ConfigField] = {field.key: field for field in CONFIG_FIELDS}
+_DREAMER_KEY = "dreamer"
 
 # Chips always offered even before any card is detected, so the common 1-4 GPU box needs no typing.
 _PREPOPULATED_CHIPS = (0, 1, 2, 3)
@@ -608,17 +609,31 @@ class GpuOverridesEditor(Vertical):
     def _inherited_value(self, field: ConfigField) -> Any:  # noqa: ANN401 - kind-dependent
         """The global value a card inherits when the field is not overridden, as the worker resolves it.
 
-        The worker's bridge data turns an explicitly empty ``models_to_load`` list into the ``top 2`` meta rule,
-        so that rule is what the card inherits. An absent key never reaches that validator and loads nothing
-        from the list, so it stays empty here.
+        See :meth:`_global_models_default_applies` for when the inherited ``models_to_load`` is the default list.
         """
-        raw_value = self._raw_global(field.key)
-        if field.key == MODELS_TO_LOAD_KEY and isinstance(raw_value, list) and not raw_value:
-            return [DEFAULT_WHEN_EMPTY]
+        if field.key == MODELS_TO_LOAD_KEY and self._global_models_default_applies():
+            return list(DEFAULT_IMAGE_MODELS_TO_LOAD)
         global_field = _GLOBAL_FIELD_BY_KEY.get(field.key)
         if global_field is not None:
             return current_value(global_field, self._data)
-        return raw_value
+        return self._raw_global(field.key)
+
+    def _global_models_default_applies(self) -> bool:
+        """Return whether the worker loads the default model list for the global ``models_to_load``.
+
+        The SDK substitutes the default for an explicitly empty list. For an absent key the config loader applies
+        it on an image worker where no card sets its own list; when a card does, the global list stays empty.
+        """
+        raw_value = self._raw_global(MODELS_TO_LOAD_KEY)
+        if isinstance(raw_value, list):
+            return not raw_value
+        if raw_value is not None:
+            return False
+        a_card_sets_its_own_list = any(MODELS_TO_LOAD_KEY in card for card in read_gpu_overrides(self._data).values())
+        return image_models_unconfigured(
+            dreamer=bool(current_value(_GLOBAL_FIELD_BY_KEY[_DREAMER_KEY], self._data)),
+            models_to_load_configured=a_card_sets_its_own_list,
+        )
 
     def _raw_global(self, key: str) -> Any:  # noqa: ANN401 - whatever the YAML holds
         """The global config's value for ``key`` as written in the file, or None when absent."""

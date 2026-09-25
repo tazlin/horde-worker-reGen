@@ -43,7 +43,6 @@ from tests.analysis.test_detectors import (
     _fault_report,
     _full_queue_frozen,
     _give_up,
-    _image_models_unconfigured,
     _inference_start_retired,
     _load_failure_recovery,
     _maintenance_pop,
@@ -260,10 +259,6 @@ _REPLACED = "inference process replaced (crashed or hung)"
 # One contract per detector, keyed by the detector's function name. The no-orphan test asserts this
 # mapping covers every entry in DETECTORS, so a new detector forces a fixture to be added here.
 CONTRACTS: dict[str, Contract] = {
-    "detect_image_models_unconfigured": Contract(
-        bridge=_bridge(_image_models_unconfigured("18:29:21.000")),
-        severity=Severity.CRITICAL,
-    ),
     "detect_crash_on_start_loop": Contract(
         bridge=_bridge(
             _recovery("18:29:31.000", 1, reason=_REPLACED),

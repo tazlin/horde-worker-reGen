@@ -489,19 +489,3 @@ def test_the_run_record_counts_every_flows_delivered_work() -> None:
 
     assert record.jobs_submitted == 6
     assert record.jobs_faulted == 1
-
-
-def test_an_image_worker_with_no_model_list_says_so_on_the_snapshot() -> None:
-    """The snapshot reads the flag from the live bridge data, so the health row and the banner follow the config."""
-    manager = make_testable_process_manager()
-    bridge_data = manager._runtime_config.bridge_data
-    bridge_data.dreamer = True
-
-    bridge_data.models_to_load_configured = True
-    assert manager._build_worker_state_snapshot().image_models_unconfigured is False
-
-    bridge_data.models_to_load_configured = False
-    assert manager._build_worker_state_snapshot().image_models_unconfigured is True
-
-    bridge_data.dreamer = False
-    assert manager._build_worker_state_snapshot().image_models_unconfigured is False, "no image role, no concern"

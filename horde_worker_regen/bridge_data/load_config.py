@@ -26,7 +26,11 @@ from horde_worker_regen.bridge_data.disagg_model_selection import (
     is_disagg_optimized_candidate,
     select_disagg_optimized_models,
 )
-from horde_worker_regen.capabilities import IMAGE_MODELS_UNCONFIGURED_MESSAGE, image_models_unconfigured_in
+from horde_worker_regen.bridge_data.gpu_config import _split_meta_instructions
+from horde_worker_regen.capabilities import DEFAULT_IMAGE_MODELS_TO_LOAD, image_models_unconfigured
+
+DEFAULT_IMAGE_MODELS_MESSAGE = "No models_to_load in bridgeData.yaml; loading the default top 2 models."
+"""The line logged when :data:`DEFAULT_IMAGE_MODELS_TO_LOAD` is applied. ``analysis/log_signatures.py`` pins it."""
 
 # The worker-local ``disagg_optimized N`` model-load meta command. The SDK's meta-instruction parser does not
 # recognise it, so it survives as a literal name in ``image_models_to_load`` for this module to expand (the
@@ -181,23 +185,32 @@ class ConfigFormat(StrEnum):
 class BridgeDataLoader:
     """Contains methods for loading the config file."""
 
-    _image_models_unconfigured_reported: ClassVar[bool] = False
-    """Whether the last config this process loaded drew the missing model list warning.
+    _default_image_models_applied: ClassVar[bool] = False
+    """Whether the last config this process loaded had the default model list applied.
 
-    Every hot reload goes through :meth:`load`, so the warning is edge-triggered rather than repeated on each
-    save of a config that still lacks the key."""
+    Every hot reload goes through :meth:`load`, so :data:`DEFAULT_IMAGE_MODELS_MESSAGE` is edge-triggered on it
+    rather than repeated on each save of a config that still lacks the key."""
 
     @staticmethod
-    def _report_unconfigured_image_models(bridge_data: reGenBridgeData) -> None:
-        """Warn when a loaded config serves image generation with no model list.
+    def _apply_default_image_models(bridge_data: reGenBridgeData) -> None:
+        """Mutate an image worker's config that has no ``models_to_load`` to load the default top 2.
 
-        Fires on the first load that shows the condition, which is startup for a worker, and again only after
-        a reload has cleared it.
+        The SDK validator that substitutes ``top 2`` for an empty list does not run on the field's default, so an
+        absent key would otherwise load no image model. The meta instruction is split out the way the SDK's
+        validation does. A worker without the image role keeps its empty list. The line is logged on the first
+        load that applies the default and again only after a load that did not.
         """
-        unconfigured = image_models_unconfigured_in(bridge_data)
-        if unconfigured and not BridgeDataLoader._image_models_unconfigured_reported:
-            logger.warning(IMAGE_MODELS_UNCONFIGURED_MESSAGE)
-        BridgeDataLoader._image_models_unconfigured_reported = unconfigured
+        applies = image_models_unconfigured(
+            dreamer=bridge_data.dreamer,
+            models_to_load_configured=bridge_data.models_to_load_configured,
+        )
+        if applies:
+            bridge_data.image_models_to_load, bridge_data._meta_load_instructions = _split_meta_instructions(
+                list(DEFAULT_IMAGE_MODELS_TO_LOAD),
+            )
+            if not BridgeDataLoader._default_image_models_applied:
+                logger.warning(DEFAULT_IMAGE_MODELS_MESSAGE)
+        BridgeDataLoader._default_image_models_applied = applies
 
     @staticmethod
     def _infer_format(file_path: str | Path) -> ConfigFormat:
@@ -271,7 +284,7 @@ class BridgeDataLoader:
         if not bridge_data:
             raise UnsupportedConfigFormat(file_path, file_format)
 
-        BridgeDataLoader._report_unconfigured_image_models(bridge_data)
+        BridgeDataLoader._apply_default_image_models(bridge_data)
 
         if not horde_model_reference_manager:
             logger.warning(
@@ -342,7 +355,7 @@ class BridgeDataLoader:
                 )
             logger.info(f"Config `{set_field}` was set by an environment variable.")
 
-        BridgeDataLoader._report_unconfigured_image_models(bridge_data)
+        BridgeDataLoader._apply_default_image_models(bridge_data)
 
         if horde_model_reference_manager is not None:
             bridge_data.image_models_to_load = BridgeDataLoader._resolve_meta_instructions(

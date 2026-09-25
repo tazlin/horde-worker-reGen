@@ -67,7 +67,6 @@ from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_
 from horde_worker_regen.capabilities import (
     coerce_bridge_data_to_capabilities,
     enabled_workloads,
-    image_models_unconfigured_in,
 )
 from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
@@ -8350,7 +8349,6 @@ class HordeWorkerProcessManager:
             },
             snapshot_interval_seconds=self._supervisor_publish_floor_interval,
             enabled_workloads=sorted(self._served_workloads(bridge_data)),
-            image_models_unconfigured=image_models_unconfigured_in(bridge_data),
             pending_jobs=self._build_pending_jobs_list(),
             orchestration_intent=orchestration_intent,
             work_ledger=self._build_work_ledger(recent_jobs),

@@ -138,9 +138,7 @@ healthy for as long as another flow keeps working, and the whole-worker ``second
 youngest flow's figure, so a text pop hides an image intake that has been silent for hours. v31 also adds
 ``pop_liveness`` (:class:`PopLivenessSnapshot`), the pop-liveness sentinel's verdict on the image intake with
 the line it logs, so the dashboard's pop-intake check shows the worker's own judgement and holds no bounds or
-exemptions of its own. v31 also adds ``image_models_unconfigured``: the worker serves image generation while
-``models_to_load`` is absent from its config, so it loads no image model. The dashboard shows it as an error
-check and does not derive it.
+exemptions of its own.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -1816,12 +1814,6 @@ class WorkerStateSnapshot(BaseModel):
     consumers reconstruct the typed enum. The dashboard uses this to identify the worker's mode (an
     alchemist-only worker reshapes around alchemy) rather than inferring it from model counts. Empty only
     before the first snapshot or for a worker configured to serve nothing."""
-
-    image_models_unconfigured: bool = False
-    """Image generation is served while ``models_to_load`` is absent from the config, so no image model loads.
-
-    The worker computes it with :func:`horde_worker_regen.capabilities.image_models_unconfigured_in`, which is
-    False for a worker without the image role."""
 
     pending_jobs: list[JobQueueEntry] = Field(default_factory=list)
     """Pending-inference jobs (capped at :data:`PENDING_JOBS_IN_SNAPSHOT`), oldest first."""

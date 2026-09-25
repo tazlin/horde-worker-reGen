@@ -22,6 +22,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Collapsible, Input, Label, Static, Switch, TabbedContent, TextArea
 from textual.widgets._collapsible import CollapsibleTitle
 
+from horde_worker_regen import compute_mode
 from horde_worker_regen.app_state import (
     AppStateStore,
     ExperienceLevel,
@@ -29,7 +30,9 @@ from horde_worker_regen.app_state import (
     KnownGpuInventory,
     OnboardingChoice,
 )
-from horde_worker_regen.bridge_data.data_model import GpuOverride, reGenBridgeData
+from horde_worker_regen.bridge_data.data_model import GpuOverride
+from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
+from horde_worker_regen.capabilities import DEFAULT_IMAGE_MODELS_TO_LOAD
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.config_form import (
     GPU_OVERRIDE_FIELDS,
@@ -41,7 +44,6 @@ from horde_worker_regen.tui.config_form import (
     read_gpu_overrides,
     read_gpu_pop_balance_threshold,
 )
-from horde_worker_regen.tui.model_resolution import DEFAULT_WHEN_EMPTY
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 from tests.tui._fake_supervisor import FakeSupervisor
@@ -657,33 +659,39 @@ async def test_section_button_adds_a_card_without_driving_it(tmp_path: Path) -> 
 
 @pytest.mark.e2e
 @pytest.mark.parametrize(
-    ("list_written", "expected_text", "expected_meta"),
-    [(True, DEFAULT_WHEN_EMPTY, [DEFAULT_WHEN_EMPTY]), (False, "", None)],
-    ids=["empty_list", "absent_key"],
+    ("extra_yaml", "card_1_yaml", "default_applies"),
+    [
+        pytest.param(f"{MODELS_TO_LOAD_KEY}: []\n", "", True, id="empty_list"),
+        pytest.param("", "", True, id="absent_key"),
+        pytest.param("", f"  1:\n    {MODELS_TO_LOAD_KEY}:\n      - top 3\n", False, id="absent_key_card_list"),
+        pytest.param("dreamer: false\nalchemist: true\n", "", False, id="absent_key_no_image_role"),
+    ],
 )
 async def test_inherited_models_to_load_matches_the_worker(
     tmp_path: Path,
-    list_written: bool,
-    expected_text: str,
-    expected_meta: list[str] | None,
+    monkeypatch: pytest.MonkeyPatch,
+    extra_yaml: str,
+    card_1_yaml: str,
+    default_applies: bool,
 ) -> None:
-    """A card's inherited "Models to load" shows what the worker resolves for the global list.
+    """A card's inherited "Models to load" shows what the config loader resolves for the global list.
 
-    The worker turns an explicitly empty list into the ``top 2`` rule. An absent key loads nothing from the list.
+    The default list applies to an explicitly empty list, and to an absent key on an image worker where no card
+    sets its own list. Otherwise an absent key leaves the global list empty.
     """
-    worker_config: dict[str, object] = {"api_key": "0000000000"}
-    if list_written:
-        worker_config[MODELS_TO_LOAD_KEY] = []
-    worker = reGenBridgeData.model_validate(worker_config)
-    assert worker.meta_load_instructions == expected_meta
-    assert worker.image_models_to_load == []
-
-    models_line = f"{MODELS_TO_LOAD_KEY}: []\n" if list_written else ""
+    monkeypatch.setattr(compute_mode, "is_cpu_only_install", lambda **_: False)
     path = tmp_path / "bridgeData.yaml"
     path.write_text(
-        f'api_key: "x"\ndreamer_name: "n"\n{models_line}gpu_overrides:\n  0:\n    allow_lora: true\n',
+        f'api_key: "0000000000"\ndreamer_name: "n"\n{extra_yaml}'
+        f"gpu_overrides:\n  0:\n    allow_lora: true\n{card_1_yaml}",
         encoding="utf-8",
     )
+    worker = BridgeDataLoader.load(path)
+    expected_meta = list(DEFAULT_IMAGE_MODELS_TO_LOAD) if default_applies else None
+    assert worker.meta_load_instructions == expected_meta
+    assert worker.image_models_to_load == []
+    expected_text = "\n".join(DEFAULT_IMAGE_MODELS_TO_LOAD) if default_applies else ""
+
     app = _harness(path)
     async with app.run_test() as pilot:
         editor = app.query_one(ConfigEditorView)

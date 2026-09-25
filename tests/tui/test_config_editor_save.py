@@ -11,8 +11,6 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.widgets import Button, Input, Select, Static, Switch, TabbedContent, TextArea
 
-from horde_worker_regen import compute_mode
-from horde_worker_regen.capabilities import IMAGE_MODELS_UNCONFIGURED_MESSAGE
 from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot
 from horde_worker_regen.tui.config_form import load_config
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
@@ -629,69 +627,22 @@ async def test_live_validation_warnings_are_persistent_before_save(tmp_path: Pat
         assert "inpainting requires" in _plain(warning_strip)
 
 
-_MODELS_BANNER = "#config-models-unconfigured"
-
-
-@pytest.fixture
-def gpu_install(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the install to a GPU build, where the dreamer role serves image generation."""
-    monkeypatch.setattr(compute_mode, "is_cpu_only_install", lambda **_: False)
-
-
 @pytest.mark.e2e
-@pytest.mark.usefixtures("gpu_install")
-async def test_an_absent_model_list_reads_none_configured_under_a_banner(tmp_path: Path) -> None:
-    """An image config with no models_to_load key says so in the summary and on the Models page."""
-    app, _path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\n')
-    async with app.run_test() as pilot:
-        editor = app.query_one(ConfigEditorView)
-        await pilot.pause()
-        banner = editor.query_one(_MODELS_BANNER, Static)
-
-        assert "models: none configured" in _plain(editor.query_one("#config-effective-summary", Static))
-        assert banner.display is True
-        assert _plain(banner) == IMAGE_MODELS_UNCONFIGURED_MESSAGE
-
-        editor.query_one("#mle-root-models_to_load", ModelListEditor).add_entry("top 2")
-        await _wait_until(pilot, lambda: not banner.display, what="the banner to clear once the list has an entry")
-        assert "models: top 2" in _plain(editor.query_one("#config-effective-summary", Static))
-
-
-@pytest.mark.e2e
-@pytest.mark.usefixtures("gpu_install")
-async def test_an_explicit_empty_list_reads_default_top_two_with_no_banner(tmp_path: Path) -> None:
-    """An explicit empty list resolves to top 2, so the summary says so and no banner shows."""
-    app, _path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\nmodels_to_load: []\n')
+@pytest.mark.parametrize(
+    "models_yaml",
+    [
+        pytest.param("", id="key absent"),
+        pytest.param("models_to_load: []\n", id="explicit empty list"),
+    ],
+)
+async def test_an_absent_or_empty_model_list_reads_default_top_two(tmp_path: Path, models_yaml: str) -> None:
+    """The worker loads top 2 for an absent key and an explicit empty list alike, and the summary says so."""
+    app, _path = await _mount(tmp_path, f'api_key: "x"\ndreamer_name: "Good Name"\n{models_yaml}')
     async with app.run_test() as pilot:
         editor = app.query_one(ConfigEditorView)
         await pilot.pause()
 
         assert "models: default TOP 2" in _plain(editor.query_one("#config-effective-summary", Static))
-        assert editor.query_one(_MODELS_BANNER, Static).display is False
-
-
-@pytest.mark.e2e
-@pytest.mark.usefixtures("gpu_install")
-@pytest.mark.parametrize(
-    "role_yaml",
-    [
-        pytest.param('dreamer: false\nalchemist: true\nalchemist_name: "Alchemy Name"\n', id="alchemy only"),
-        pytest.param("dreamer: false\nscribe: true\n", id="text only"),
-        pytest.param(
-            'dreamer: false\nalchemist: true\nalchemist_name: "Alchemy Name"\nscribe: true\n',
-            id="alchemy and text",
-        ),
-        pytest.param("gpu_overrides:\n  0:\n    models_to_load:\n      - top 3\n", id="a card lists its own models"),
-    ],
-)
-async def test_no_banner_without_the_hazard(tmp_path: Path, role_yaml: str) -> None:
-    """A worker without the image role, or with a card's own list, gets no banner for an absent global key."""
-    app, _path = await _mount(tmp_path, f'api_key: "x"\ndreamer_name: "Good Name"\n{role_yaml}')
-    async with app.run_test() as pilot:
-        editor = app.query_one(ConfigEditorView)
-        await pilot.pause()
-
-        assert editor.query_one(_MODELS_BANNER, Static).display is False
 
 
 @pytest.mark.e2e

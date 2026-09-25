@@ -60,12 +60,10 @@ override block. On a single-GPU machine the tab shows a banner reminding you the
 once multiple cards are driven.
 
 An inherited *Models to load* shows what the worker makes of the global list. It reads `top 2` when the
-global `models_to_load` is an empty list, and stays empty when the key is absent, because the worker then
-loads no model from the list.
-
-With image generation on and no `models_to_load` anywhere, globally or for any card, the worker loads no image
-models. It logs a warning at startup, the dashboard's health checklist shows an Image models error, and the
-Config tab's Models page shows a banner until a list is set. A card that sets its own list counts as configured.
+global `models_to_load` is an empty list. It also reads `top 2` when the key is absent, image generation is on
+and no card sets its own list: the worker then loads the default and logs "No models_to_load in
+bridgeData.yaml; loading the default top 2 models." A card that sets its own list counts as configured, so
+with the global key absent the other cards inherit an empty list and load no model from it.
 
 To configure a card before the worker or the probe has reported it, press `+ card section` under
 *Per-card settings*. It adds a section for the lowest card index without one and leaves the drive set

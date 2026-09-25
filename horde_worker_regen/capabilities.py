@@ -152,14 +152,6 @@ def post_processing_install_hint() -> str:
     return UTILITIES_LANE_HINT
 
 
-IMAGE_MODELS_UNCONFIGURED_MESSAGE: str = (
-    "Image generation is on, but models_to_load is not set, so no image models will load. Set models_to_load "
-    "in bridgeData.yaml (top 2 is the usual choice), or set dreamer: false to turn off image generation."
-)
-"""The wording for :func:`image_models_unconfigured`, shared by the startup warning, the dashboard's health
-check and the config editor's Models banner. ``analysis/log_signatures.py`` pins the log line."""
-
-
 def serves_image_generation(*, dreamer: bool) -> bool:
     """Return whether the ``dreamer`` role flag yields the image-generation workload on this install.
 
@@ -172,13 +164,19 @@ def serves_image_generation(*, dreamer: bool) -> bool:
     return dreamer and not is_cpu_only_install()
 
 
+DEFAULT_IMAGE_MODELS_TO_LOAD: tuple[str, ...] = ("top 2",)
+"""The model list an image worker loads when :func:`image_models_unconfigured` holds: the SDK validator's
+substitute for an explicit empty list, which pydantic does not run on the field's default. It lives here rather
+than in the config loader so the dashboard can read it without importing the loader."""
+
+
 def image_models_unconfigured(*, dreamer: bool, models_to_load_configured: bool) -> bool:
     """Return whether image generation is served while ``models_to_load`` is absent from the config.
 
-    The SDK substitutes ``top 2`` only for an explicit empty list. An absent key resolves to no meta
-    instruction and an empty list, so the worker loads no image model and serves no image job. That resolution
-    stands; every surface that reports the state calls this predicate. A worker without the image role never
-    satisfies it.
+    The SDK substitutes ``top 2`` only for an explicit empty list, because pydantic does not validate the
+    field's default. The config loader applies the same default when this predicate holds, and the per-GPU
+    editor shows it as the inherited list. A worker without the image role never satisfies it, so its model list
+    stays empty. It takes plain facts because the editor holds raw YAML rather than a validated config.
 
     Args:
         dreamer: The ``dreamer`` role flag.
@@ -188,18 +186,6 @@ def image_models_unconfigured(*, dreamer: bool, models_to_load_configured: bool)
         True while the worker serves image generation with no model list configured.
     """
     return not models_to_load_configured and serves_image_generation(dreamer=dreamer)
-
-
-def image_models_unconfigured_in(bridge_data: reGenBridgeData) -> bool:
-    """Return :func:`image_models_unconfigured` for a validated config.
-
-    ``models_to_load_configured`` is compared against False rather than read for truthiness, so a ``Mock``
-    bridge data, whose every attribute reads truthy, counts as configured.
-    """
-    return image_models_unconfigured(
-        dreamer=bridge_data.dreamer,
-        models_to_load_configured=bridge_data.models_to_load_configured is not False,
-    )
 
 
 def enabled_workloads(bridge_data: reGenBridgeData) -> frozenset[WorkloadKind]:

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from horde_worker_regen.capabilities import IMAGE_MODELS_UNCONFIGURED_MESSAGE
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PopLivenessSnapshot,
     ProcessSnapshot,
@@ -22,7 +21,6 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.health import (
-    IMAGE_MODELS_CHECK_NAME,
     POP_INTAKE_CHECK_NAME,
     PROCESS_RECOVERY_WARN_SECONDS,
     TEXT_BACKEND_CHECK_NAME,
@@ -446,46 +444,6 @@ def test_offline_disk_check_warns_below_floor(tmp_path: Path, monkeypatch: pytes
     checks = build_offline_checks(tmp_path / "bridgeData.yaml")
     disk_check = next(check for check in checks if check.name == "Disk")
     assert disk_check.status is HealthStatus.WARN
-
-
-def _image_models_check(checks: list[HealthCheck]) -> HealthCheck | None:
-    return next((check for check in checks if check.name == IMAGE_MODELS_CHECK_NAME), None)
-
-
-def test_a_missing_model_list_is_an_error_check_carrying_the_worker_warning() -> None:
-    """The worker's flag becomes an ERROR row with the startup warning's copy, named ahead of its symptoms."""
-    snapshot = _snapshot(
-        processes=[_process("WAITING_FOR_JOB")],
-        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value],
-        image_models_unconfigured=True,
-    )
-    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
-
-    check = _image_models_check(report.checks)
-    assert check is not None
-    assert check.status is HealthStatus.ERROR
-    assert check.detail == IMAGE_MODELS_UNCONFIGURED_MESSAGE
-    assert [row.name for row in report.checks[:2]] == ["API", IMAGE_MODELS_CHECK_NAME]
-    assert report.severity is HealthStatus.ERROR
-
-
-@pytest.mark.parametrize(
-    "workloads",
-    [
-        pytest.param([WorkloadKind.IMAGE_GENERATION], id="image"),
-        pytest.param([WorkloadKind.ALCHEMY], id="alchemy only"),
-        pytest.param([WorkloadKind.TEXT_GENERATION], id="text only"),
-        pytest.param([WorkloadKind.ALCHEMY, WorkloadKind.TEXT_GENERATION], id="alchemy and text"),
-    ],
-)
-def test_no_model_list_check_while_the_worker_reports_none_missing(workloads: list[WorkloadKind]) -> None:
-    """The row follows the worker's flag, which is never set on a worker without the image role."""
-    snapshot = _snapshot(
-        processes=[_process("WAITING_FOR_JOB")],
-        enabled_workloads=sorted(workload.value for workload in workloads),
-    )
-
-    assert _image_models_check(derive(snapshot, SupervisorStatus.RUNNING, 0.5).checks) is None
 
 
 def test_checks_cover_core_dimensions() -> None:

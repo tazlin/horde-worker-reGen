@@ -40,7 +40,6 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 
 | Id | Severity | Fires when | Remedy |
 |----|----------|------------|--------|
-| `image_models_unconfigured` | critical | The worker started with image generation on and no `models_to_load` in its config, globally or for any card, so it loaded no image models and took no image jobs. The worker reads an explicit empty list as `top 2`, so that does not fire it. | Set `models_to_load`, usually to `top 2`, or set `dreamer: false` if this worker should not make images. |
 | `crash_on_start_loop` | critical | Image processes crash before they are ready, repeatedly. The error is lifted from the process's own start-up log. | Fix the error it names. A git clone failure points at the shared ComfyUI environment directory, not at torch: delete that directory and let one process rebuild it. |
 | `preload_kills_child_loop` | critical | One model crashes every process that loads it: repeated process deaths naming the same model. | Remove the model from your list and download it again before adding it back. |
 | `empty_model_pop_cascade` | varies | The horde sent job offers with no model name. On an old worker the blank name was loaded, crashed processes and got blocked; a current worker hands the offer back. | Update the worker. If it keeps happening, report it to the horde; your models are not at fault. |

@@ -125,8 +125,6 @@ _CONSECUTIVE_PAUSE_RE = pattern_for("consecutive_pause")
 # per episode as it holds its text jobs; an older one faulted each job after a fixed number of busy answers,
 # which shows only as busy re-offers and fault reports with no submitted text job between them.
 _TEXT_BACKEND_WEDGED_RE = pattern_for("text_backend_wedged")
-# The config loader's warning for an image worker whose config has no model list.
-_IMAGE_MODELS_UNCONFIGURED_RE = pattern_for("image_models_unconfigured")
 _TEXT_BACKEND_RELAUNCH_BOUND_RE = pattern_for("text_backend_wedge_relaunch_bound")
 _TEXT_BUSY_REOFFER_RE = pattern_for("text_backend_busy_reoffer")
 _TEXT_BUSY_FAULT_LEGACY_RE = pattern_for("text_backend_busy_fault_legacy")
@@ -1448,21 +1446,6 @@ def detect_text_backend_wedged(context: SessionContext) -> list[Finding]:
                 "each went back to the horde unfinished."
             ),
             evidence=[_evidence(record) for record in (run[:2] + run[-1:])],
-        ),
-    ]
-
-
-def detect_image_models_unconfigured(context: SessionContext) -> list[Finding]:
-    """An image worker started with no ``models_to_load``, so it loaded no image model and took no image job."""
-    warned = _matching(context.session.records, _IMAGE_MODELS_UNCONFIGURED_RE)
-    if not warned:
-        return []
-    return [
-        Finding(
-            kind=FindingKind.IMAGE_MODELS_UNCONFIGURED,
-            severity=Severity.CRITICAL,
-            headline="The worker ran with image generation on and no model list, so it loaded no image models.",
-            evidence=[_evidence(warned[0])],
         ),
     ]
 
@@ -3510,7 +3493,6 @@ def detect_safety_stage_capacity(context: SessionContext) -> list[Finding]:
 
 
 DETECTORS: list[Detector] = [
-    detect_image_models_unconfigured,
     detect_crash_on_start_loop,
     detect_empty_model_pop_cascade,
     detect_preload_kills_child_loop,

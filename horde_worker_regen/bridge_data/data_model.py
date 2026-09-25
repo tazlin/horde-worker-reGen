@@ -1737,7 +1737,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     def models_to_load_configured(self) -> bool:
         """Whether ``models_to_load`` was present in the loaded config, globally or for any card.
 
-        :func:`horde_worker_regen.capabilities.image_models_unconfigured` says why an absent key matters.
+        The config loader passes it to :func:`horde_worker_regen.capabilities.image_models_unconfigured`.
         """
         return self._models_to_load_configured
 

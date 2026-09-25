@@ -115,11 +115,12 @@ prefer models already loaded in VRAM when popping. Higher stickiness reduces
 model-switching overhead on slow disks at the cost of occasionally missing jobs
 for other models.
 
-An absent key and an empty list are different. An explicit `models_to_load: []` loads the top 2 models.
-A config with no `models_to_load` at all, globally or for any card, resolves to no models: with `dreamer`
-on, the worker loads no image model and takes no image job. It says so in three places: a startup
-warning in the log (the `image_models_unconfigured` finding in `horde-log diagnose`), an "Image models"
-error row in the dashboard's health checks, and a banner on the config editor's Models section.
+An explicit `models_to_load: []` and an absent key both load the top 2 models on a worker that serves image
+generation. The SDK substitutes `top 2` for the empty list. Pydantic does not validate a field's default,
+so for an absent key the config loader applies the same default when no card sets its own list, and logs
+"No models_to_load in bridgeData.yaml; loading the default top 2 models." Hot reloads that keep applying the
+default do not repeat the line; it is logged again only after a reload that set the key. A worker with
+`dreamer: false`, or a CPU-only install, keeps an empty list.
 
 Stickiness only activates when the number of configured models exceeds
 `max_inference_processes` (`queue_size + max_threads`) **and** every inference

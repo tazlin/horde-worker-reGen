@@ -261,13 +261,9 @@ _SIGNATURE_LIST: list[LogSignature] = [
     # --- Configuration ---
     _signature(
         "image_models_unconfigured",
-        r"Image generation is on, but models_to_load is not set, so no image models will load\.",
-        emitter="bridge_data.load_config:_report_unconfigured_image_models",
-        sample=(
-            "Image generation is on, but models_to_load is not set, so no image models will load. Set "
-            "models_to_load in bridgeData.yaml (top 2 is the usual choice), or set dreamer: false to turn off "
-            "image generation."
-        ),
+        r"No models_to_load in bridgeData\.yaml; loading the default top 2 models\.",
+        emitter="bridge_data.load_config:_apply_default_image_models",
+        sample="No models_to_load in bridgeData.yaml; loading the default top 2 models.",
         dry_run_reason="the dry-run harness builds its config with a model list, never through the config loader",
     ),
     # --- Worker-wide shape ---
