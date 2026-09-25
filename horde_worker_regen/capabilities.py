@@ -152,6 +152,56 @@ def post_processing_install_hint() -> str:
     return UTILITIES_LANE_HINT
 
 
+IMAGE_MODELS_UNCONFIGURED_MESSAGE: str = (
+    "Image generation is on, but models_to_load is not set, so no image models will load. Set models_to_load "
+    "in bridgeData.yaml (top 2 is the usual choice), or set dreamer: false to turn off image generation."
+)
+"""The wording for :func:`image_models_unconfigured`, shared by the startup warning, the dashboard's health
+check and the config editor's Models banner. ``analysis/log_signatures.py`` pins the log line."""
+
+
+def serves_image_generation(*, dreamer: bool) -> bool:
+    """Return whether the ``dreamer`` role flag yields the image-generation workload on this install.
+
+    A CPU-only install cannot serve image generation whatever ``dreamer`` says (CPU inference is impractically
+    slow). This is the rule :func:`enabled_workloads` applies, exposed for callers holding the role flag
+    without a validated config, such as the config editor's unsaved form.
+    """
+    from horde_worker_regen.compute_mode import is_cpu_only_install
+
+    return dreamer and not is_cpu_only_install()
+
+
+def image_models_unconfigured(*, dreamer: bool, models_to_load_configured: bool) -> bool:
+    """Return whether image generation is served while ``models_to_load`` is absent from the config.
+
+    The SDK substitutes ``top 2`` only for an explicit empty list. An absent key resolves to no meta
+    instruction and an empty list, so the worker loads no image model and serves no image job. That resolution
+    stands; every surface that reports the state calls this predicate. A worker without the image role never
+    satisfies it.
+
+    Args:
+        dreamer: The ``dreamer`` role flag.
+        models_to_load_configured: Whether ``models_to_load`` is set, globally or for any card.
+
+    Returns:
+        True while the worker serves image generation with no model list configured.
+    """
+    return not models_to_load_configured and serves_image_generation(dreamer=dreamer)
+
+
+def image_models_unconfigured_in(bridge_data: reGenBridgeData) -> bool:
+    """Return :func:`image_models_unconfigured` for a validated config.
+
+    ``models_to_load_configured`` is compared against False rather than read for truthiness, so a ``Mock``
+    bridge data, whose every attribute reads truthy, counts as configured.
+    """
+    return image_models_unconfigured(
+        dreamer=bridge_data.dreamer,
+        models_to_load_configured=bridge_data.models_to_load_configured is not False,
+    )
+
+
 def enabled_workloads(bridge_data: reGenBridgeData) -> frozenset[WorkloadKind]:
     """Return the workloads this worker actually serves, derived from config and the install.
 
@@ -165,10 +215,8 @@ def enabled_workloads(bridge_data: reGenBridgeData) -> frozenset[WorkloadKind]:
     rather than threading another boolean through every site.
 
     """
-    from horde_worker_regen.compute_mode import is_cpu_only_install
-
     workloads: set[WorkloadKind] = set()
-    if bridge_data.dreamer and not is_cpu_only_install():
+    if serves_image_generation(dreamer=bridge_data.dreamer):
         workloads.add(WorkloadKind.IMAGE_GENERATION)
     if bridge_data.alchemist:
         workloads.add(WorkloadKind.ALCHEMY)

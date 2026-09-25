@@ -22,6 +22,7 @@ from horde_worker_regen.analysis.detectors import (
 )
 from horde_worker_regen.analysis.log_ingest import LogRecord
 from horde_worker_regen.analysis.sessions import segment_sessions
+from horde_worker_regen.capabilities import IMAGE_MODELS_UNCONFIGURED_MESSAGE
 
 
 def _diagnose(tmp_path: Path, bridge_log: str, child_logs: dict[str, str] | None = None) -> dict[str, Finding]:
@@ -673,6 +674,38 @@ def _text_submitted(ts: str, job: str) -> str:
         f"2026-09-21 {ts} | SUCCESS  | {_TEXT_FLOW}:_note_submitted:1514 - Submitted text job {job} for 0.66 kudos. "
         "Job popped 3.84 seconds ago."
     )
+
+
+def _image_models_unconfigured(ts: str) -> str:
+    """The config loader's startup warning for an image worker whose config has no model list."""
+    return (
+        f"2026-06-24 {ts} | WARNING  | horde_worker_regen.bridge_data.load_config:_report_unconfigured_image_models:"
+        f"238 - {IMAGE_MODELS_UNCONFIGURED_MESSAGE}"
+    )
+
+
+class TestImageModelsUnconfigured:
+    """An image worker that started with no models_to_load and so loaded no image model."""
+
+    def _bridge(self, *lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-24 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_fires_critical_on_the_startup_warning(self, tmp_path: Path) -> None:
+        """The loader's warning is the finding, with the warning itself as the evidence."""
+        finding = _diagnose(tmp_path, self._bridge(_image_models_unconfigured("18:29:21.000")))[
+            "image_models_unconfigured"
+        ]
+
+        assert finding.severity is Severity.CRITICAL
+        assert "no model list" in finding.headline
+        assert "`dreamer`" in finding.action
+        assert len(finding.evidence) == 1
+
+    def test_silent_without_the_warning(self, tmp_path: Path) -> None:
+        """A session whose config named its models has no such finding."""
+        assert "image_models_unconfigured" not in _diagnose(tmp_path, self._bridge())
 
 
 class TestTextBackendWedged:

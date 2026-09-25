@@ -616,6 +616,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     _custom_model_issue_summaries: tuple[str, ...] = PrivateAttr(default=())
     _custom_model_registry_path: Path | None = PrivateAttr(default=None)
     _custom_model_configured_count: int = PrivateAttr(default=0)
+    _models_to_load_configured: bool = PrivateAttr(default=True)
 
     gpu_device_indices: list[int] | None = Field(default=None)
     """Which accelerator indices (stable PCI-bus order) this one worker drives.
@@ -1719,6 +1720,26 @@ class reGenBridgeData(CombinedHordeBridgeData):
                 "text generation in bridgeData.yaml.",
             )
         return self
+
+    @model_validator(mode="after")
+    def record_models_to_load_presence(self) -> Self:
+        """Record whether the operator set ``models_to_load``, globally or for any card.
+
+        Meta-instruction resolution and custom-model preparation assign ``image_models_to_load`` after
+        validation, which adds it to ``model_fields_set``, so the key's presence can only be read here.
+        """
+        self._models_to_load_configured = "image_models_to_load" in self.model_fields_set or any(
+            override.image_models_to_load is not None for override in self.gpu_overrides.values()
+        )
+        return self
+
+    @property
+    def models_to_load_configured(self) -> bool:
+        """Whether ``models_to_load`` was present in the loaded config, globally or for any card.
+
+        :func:`horde_worker_regen.capabilities.image_models_unconfigured` says why an absent key matters.
+        """
+        return self._models_to_load_configured
 
     @model_validator(mode="after")
     def validate_managed_text_backend(self) -> Self:

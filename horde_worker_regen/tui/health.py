@@ -14,6 +14,7 @@ import os
 import shutil
 from pathlib import Path
 
+from horde_worker_regen.capabilities import IMAGE_MODELS_UNCONFIGURED_MESSAGE
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     TextBackendDetail,
     WorkerFatalConfigError,
@@ -51,6 +52,9 @@ is reported as information, which keeps the history visible without standing in 
 
 POP_INTAKE_CHECK_NAME = "Pop intake"
 """Names the held-image-intake row, which the status bar shows when it is the worst check."""
+
+IMAGE_MODELS_CHECK_NAME = "Image models"
+"""Names the row reporting an image worker whose config has no ``models_to_load``."""
 
 _DISK_FLOOR_BYTES = 20 * 1024**3
 
@@ -596,7 +600,11 @@ def _build_checks(
     checks: list[HealthCheck] = []
 
     checks.append(_api_check(snapshot, optimistic_server_maintenance=optimistic_server_maintenance))
-    # Second, so that when it ties another row for the worst status the status bar names the held intake.
+    # Ahead of the pop-intake row: a missing model list also holds the image intake, and the status bar names the
+    # first of the worst rows, so the cause is named over its symptom.
+    if snapshot.image_models_unconfigured:
+        checks.append(HealthCheck(IMAGE_MODELS_CHECK_NAME, HealthStatus.ERROR, IMAGE_MODELS_UNCONFIGURED_MESSAGE))
+    # Next, so that when it ties another row for the worst status the status bar names the held intake.
     pop_intake = _pop_intake_check(snapshot)
     if pop_intake is not None:
         checks.append(pop_intake)

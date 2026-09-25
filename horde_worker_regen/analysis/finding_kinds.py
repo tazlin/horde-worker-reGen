@@ -66,6 +66,7 @@ class FindingKind(enum.StrEnum):
     renaming one is a breaking change to all three, not a refactor.
     """
 
+    IMAGE_MODELS_UNCONFIGURED = "image_models_unconfigured"
     CRASH_ON_START_LOOP = "crash_on_start_loop"
     PRELOAD_KILLS_CHILD_LOOP = "preload_kills_child_loop"
     EMPTY_MODEL_POP_CASCADE = "empty_model_pop_cascade"
@@ -166,6 +167,18 @@ def _spec_table(*specs: FindingSpec) -> Mapping[FindingKind, FindingSpec]:
 
 FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     # --- Startup and process lifecycle ---
+    FindingSpec(
+        kind=FindingKind.IMAGE_MODELS_UNCONFIGURED,
+        title="Image generation is on but no image models are set",
+        action=(
+            'Add a model list under "models_to_load" in the config file. Top 2 is the usual choice. If this '
+            "worker should not make images, set `dreamer` to false instead."
+        ),
+        detail=(
+            "The worker loads the image models its config file lists. When that list is missing entirely, it "
+            "loads none and takes no image jobs. An empty list is different, because it means the top 2 models."
+        ),
+    ),
     FindingSpec(
         kind=FindingKind.CRASH_ON_START_LOOP,
         title="Image processes crash on start",

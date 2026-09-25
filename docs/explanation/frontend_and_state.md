@@ -86,6 +86,13 @@ defines the structured protocol over it:
   value and publishes it. The health checklist's Pop intake row renders it, and a verdict leads the headline
   as "Image intake held for ..." ahead of the serving headline, with any work that goes on without the image
   intake named after the sentinel's line. The dashboard holds no pop-liveness bound of its own.
+  `image_models_unconfigured` is true while the worker serves image generation and `models_to_load` is absent
+  from its config, globally and for every card. The SDK reads only an explicit empty list as `top 2`, so such a
+  worker loads no image model. The worker computes the flag with `capabilities.image_models_unconfigured_in`,
+  logs one warning at startup, and the health checklist shows the warning's text as an Image models error. The
+  config editor applies the same predicate to its unsaved form. Its summary reads "none configured" for an
+  absent key and "default TOP 2" only for an explicit empty list, and the Models page shows the warning as a
+  banner.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
   (currently 31) so a frontend can detect a mismatch with a worker built from different code.
 

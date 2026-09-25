@@ -35,6 +35,7 @@ from horde_worker_regen.app_state import (
     KnownGpuInventory,
     OverviewViewMode,
 )
+from horde_worker_regen.capabilities import IMAGE_MODELS_UNCONFIGURED_MESSAGE, image_models_unconfigured
 from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     CONFIG_SUBTABS,
@@ -53,6 +54,7 @@ from horde_worker_regen.tui.config_form import (
     format_yaml_value,
     load_config,
     read_gpu_device_indices,
+    read_gpu_overrides,
     save_config,
     set_field_value,
     validate_identity_names,
@@ -85,6 +87,7 @@ _THROUGHPUT_SECTION = "Throughput"
 _TEXT_MODEL_KEY = "text_model"
 _TEXT_MODELS_DIR_KEY = "text_models_dir"
 _PROCESS_PREVIEW_ID = "config-process-preview"
+_MODELS_UNCONFIGURED_BANNER_ID = "config-models-unconfigured"
 
 # The per-card multi-GPU editor is its own sub-tab, mounted after the catalog-driven tabs rather than
 # composed from flat ConfigFields (it edits the nested gpu_overrides block, not top-level keys).
@@ -473,6 +476,13 @@ class ConfigEditorView(Vertical):
         color: $warning;
         height: auto;
     }
+    ConfigEditorView #config-models-unconfigured {
+        margin: 0 1 1 1;
+        padding: 0 1;
+        border-left: thick $error;
+        color: $error;
+        height: auto;
+    }
     ConfigEditorView TextArea {
         height: 5;
     }
@@ -635,6 +645,9 @@ class ConfigEditorView(Vertical):
             yield Rule()
             if section in SECTION_GUIDANCE:
                 yield Static(SECTION_GUIDANCE[section], classes="config-guidance")
+            banner = Static(IMAGE_MODELS_UNCONFIGURED_MESSAGE, id=_MODELS_UNCONFIGURED_BANNER_ID)
+            banner.display = self._image_models_unconfigured(self._merged_config_state([]))
+            yield banner
             yield ModelManagerView(
                 [str(item) for item in current_value(_FIELD_BY_KEY[MODELS_TO_LOAD_KEY], self._data)],
                 [str(item) for item in current_value(_FIELD_BY_KEY[MODELS_TO_SKIP_KEY], self._data)],
@@ -1359,6 +1372,36 @@ class ConfigEditorView(Vertical):
             self.query_one("#config-effective-summary", Static).update(self._effective_summary(state))
             self.query_one("#config-change-summary", Static).update(self._change_summary())
             self._refresh_live_warnings(state)
+            self.query_one(f"#{_MODELS_UNCONFIGURED_BANNER_ID}", Static).display = self._image_models_unconfigured(
+                state
+            )
+
+    @staticmethod
+    def _load_entries(state: dict[str, object]) -> list[str]:
+        """The models-to-load entries in a form state, as strings."""
+        raw_load = state.get(MODELS_TO_LOAD_KEY)
+        return [str(item) for item in raw_load] if isinstance(raw_load, list) else []
+
+    def _models_to_load_key_present(self) -> bool:
+        """Whether the loaded file carries a global ``models_to_load`` key, empty or not."""
+        return field_key_present(_FIELD_BY_KEY[MODELS_TO_LOAD_KEY], self._data)
+
+    def _models_to_load_configured(self, load_entries: Sequence[str]) -> bool:
+        """Whether saving the form leaves ``models_to_load`` set, globally or for any card.
+
+        Mirrors the save rule: an absent global key is written only once the list has entries, so an untouched
+        empty list stays absent.
+        """
+        if load_entries or self._models_to_load_key_present():
+            return True
+        return any(MODELS_TO_LOAD_KEY in card for card in read_gpu_overrides(self._data).values())
+
+    def _image_models_unconfigured(self, state: dict[str, object]) -> bool:
+        """Apply the worker's missing model list predicate to a form state."""
+        return image_models_unconfigured(
+            dreamer=bool(state.get("dreamer")),
+            models_to_load_configured=self._models_to_load_configured(self._load_entries(state)),
+        )
 
     def _effective_summary(self, state: dict[str, object]) -> Text:
         """A compact, plain-language summary of what this config currently serves."""
@@ -1374,9 +1417,14 @@ class ConfigEditorView(Vertical):
         else:
             role = " + ".join(served)
 
-        raw_load = state.get(MODELS_TO_LOAD_KEY)
-        load_rules = [str(item) for item in raw_load] if isinstance(raw_load, list) else []
-        model_text = "default TOP 2" if not load_rules else ", ".join(load_rules[:2])
+        # The SDK substitutes TOP 2 only for an explicit empty list; an absent key loads no image model.
+        load_rules = self._load_entries(state)
+        if load_rules:
+            model_text = ", ".join(load_rules[:2])
+        elif self._models_to_load_key_present():
+            model_text = "default TOP 2"
+        else:
+            model_text = "none configured"
         if len(load_rules) > 2:
             model_text += f" +{len(load_rules) - 2}"
 

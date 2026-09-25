@@ -63,6 +63,10 @@ An inherited *Models to load* shows what the worker makes of the global list. It
 global `models_to_load` is an empty list, and stays empty when the key is absent, because the worker then
 loads no model from the list.
 
+With image generation on and no `models_to_load` anywhere, globally or for any card, the worker loads no image
+models. It logs a warning at startup, the dashboard's health checklist shows an Image models error, and the
+Config tab's Models page shows a banner until a list is set. A card that sets its own list counts as configured.
+
 To configure a card before the worker or the probe has reported it, press `+ card section` under
 *Per-card settings*. It adds a section for the lowest card index without one and leaves the drive set
 alone, so the worker still drives the cards the chips select. Selecting a numbered chip is what limits the

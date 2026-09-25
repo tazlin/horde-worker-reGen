@@ -6,6 +6,7 @@ import re
 from collections.abc import Iterable, Mapping
 from enum import auto
 from pathlib import Path
+from typing import ClassVar
 
 from horde_model_reference.component_hash import ComponentKind, component_kind_for_purpose
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
@@ -25,6 +26,7 @@ from horde_worker_regen.bridge_data.disagg_model_selection import (
     is_disagg_optimized_candidate,
     select_disagg_optimized_models,
 )
+from horde_worker_regen.capabilities import IMAGE_MODELS_UNCONFIGURED_MESSAGE, image_models_unconfigured_in
 
 # The worker-local ``disagg_optimized N`` model-load meta command. The SDK's meta-instruction parser does not
 # recognise it, so it survives as a literal name in ``image_models_to_load`` for this module to expand (the
@@ -179,6 +181,24 @@ class ConfigFormat(StrEnum):
 class BridgeDataLoader:
     """Contains methods for loading the config file."""
 
+    _image_models_unconfigured_reported: ClassVar[bool] = False
+    """Whether the last config this process loaded drew the missing model list warning.
+
+    Every hot reload goes through :meth:`load`, so the warning is edge-triggered rather than repeated on each
+    save of a config that still lacks the key."""
+
+    @staticmethod
+    def _report_unconfigured_image_models(bridge_data: reGenBridgeData) -> None:
+        """Warn when a loaded config serves image generation with no model list.
+
+        Fires on the first load that shows the condition, which is startup for a worker, and again only after
+        a reload has cleared it.
+        """
+        unconfigured = image_models_unconfigured_in(bridge_data)
+        if unconfigured and not BridgeDataLoader._image_models_unconfigured_reported:
+            logger.warning(IMAGE_MODELS_UNCONFIGURED_MESSAGE)
+        BridgeDataLoader._image_models_unconfigured_reported = unconfigured
+
     @staticmethod
     def _infer_format(file_path: str | Path) -> ConfigFormat:
         """Infer the config file format from the file extension.
@@ -251,6 +271,8 @@ class BridgeDataLoader:
         if not bridge_data:
             raise UnsupportedConfigFormat(file_path, file_format)
 
+        BridgeDataLoader._report_unconfigured_image_models(bridge_data)
+
         if not horde_model_reference_manager:
             logger.warning(
                 "No model reference manager provided. The config file will not be able to resolve meta instructions.",
@@ -319,6 +341,8 @@ class BridgeDataLoader:
                     f"However, it is not a valid field in the config file.",
                 )
             logger.info(f"Config `{set_field}` was set by an environment variable.")
+
+        BridgeDataLoader._report_unconfigured_image_models(bridge_data)
 
         if horde_model_reference_manager is not None:
             bridge_data.image_models_to_load = BridgeDataLoader._resolve_meta_instructions(
