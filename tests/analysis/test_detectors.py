@@ -630,12 +630,24 @@ _TEXT_BUSY_REASON = (
 )
 
 
-def _text_wedge_hold(ts: str, *, relaunch_bound: bool = False) -> str:
-    """The text flow's wedge-hold line: a relaunch, or the exhausted relaunch bound."""
+_TEXT_WEDGE_COUNTERS = "[backend counters: 41 generations completed at spell start, 41 now, idle no, queue 2]"
+"""The bracket a current worker's wedge line carries for a backend that reports its own counters."""
+_TEXT_WEDGE_NO_COUNTERS = "[backend reports no counters]"
+"""The bracket a current worker's wedge line carries for a backend that keeps no counters."""
+
+
+def _text_wedge_hold(ts: str, *, relaunch_bound: bool = False, counters: str | None = None) -> str:
+    """The text flow's wedge-hold line: a relaunch, or the exhausted relaunch bound.
+
+    ``counters`` is the bracket a current worker writes after the busy figures; None is the line a worker
+    from before the counters wrote.
+    """
     busy_for = (
         "The text backend at http://127.0.0.1:5001 has answered busy for 64s (5 busy answers) with no job "
         "receiving text"
     )
+    if counters is not None:
+        busy_for = f"{busy_for} {counters}"
     if relaunch_bound:
         return (
             f"2026-09-21 {ts} | ERROR    | {_TEXT_FLOW}:_enter_wedge_hold:1167 - {busy_for}, after 3 relaunches "
@@ -737,6 +749,35 @@ class TestTextBackendWedged:
         assert "`text_threads`" in finding.action
         assert "failed to find a memory slot" in finding.action
         assert finding.see_also is FindingKind.FORCED_MAINTENANCE
+
+    def test_the_headline_states_the_backends_standing_count(self, tmp_path: Path) -> None:
+        """The count of finished generations standing still is the proof, so the headline carries it."""
+        bridge = self._bridge(
+            _text_wedge_hold("20:05:00.000", counters=_TEXT_WEDGE_COUNTERS),
+            _text_wedge_hold("20:15:00.000", relaunch_bound=True, counters=_TEXT_WEDGE_COUNTERS),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["text_backend_wedged"]
+
+        assert "finished generations stopped at 41" in finding.headline
+        assert "2 times" in finding.headline
+        assert "restarting it did not help" in finding.headline
+        assert "generating nothing" not in finding.headline, "the count replaces the claim it proves"
+
+    def test_the_headline_says_when_the_backend_reported_no_counts(self, tmp_path: Path) -> None:
+        """A hold on busy answers alone says so, since nothing but the refusals backs it."""
+        bridge = self._bridge(_text_wedge_hold("20:05:00.000", counters=_TEXT_WEDGE_NO_COUNTERS))
+
+        finding = _diagnose(tmp_path, bridge)["text_backend_wedged"]
+
+        assert "once" in finding.headline
+        assert "reported no generation counts" in finding.headline
+
+    def test_a_line_from_before_the_counters_keeps_its_headline(self, tmp_path: Path) -> None:
+        """An older worker's line states no counters, and its headline claims none."""
+        finding = _diagnose(tmp_path, self._bridge(_text_wedge_hold("20:05:00.000")))["text_backend_wedged"]
+
+        assert finding.headline == "The text backend refused every job as busy while generating nothing, once."
 
     def test_fires_on_the_legacy_run_of_busy_faults(self, tmp_path: Path) -> None:
         """An older worker left only busy refusals and fault reports, with no submit, for hours."""

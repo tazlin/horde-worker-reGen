@@ -401,6 +401,66 @@ class TestFootprintStore:
             assert zf.read("config/vram_footprints.json").decode() == '{"schema_version": 2}'
 
 
+class TestTextBackendLog:
+    """The text backend's own output ships beside the worker's logs, capped the same way, when there is one."""
+
+    _BACKEND_LINES = (
+        "find_slot: non-consecutive token position 4096 after 4095 for sequence 1\n"
+        f"decode: failed to find a memory slot for batch of size 1024 (key {_API_KEY} echoed)\n"
+    )
+
+    def test_the_backend_log_ships_redacted_when_present(self, tmp_path: Path) -> None:
+        """A worker that launched a backend bundles its log, scrubbed like every other member."""
+        logs = _worker_dir(tmp_path)
+        (logs / "text_backend.log").write_text(self._BACKEND_LINES, encoding="utf-8")
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        backend_log = _read_member(out, "logs/text_backend.log")
+        assert "failed to find a memory slot" in backend_log
+        assert _API_KEY not in backend_log
+
+    def test_the_backend_log_is_capped_from_the_front(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An oversized backend log keeps its most recent lines, as the worker's own logs do."""
+        logs = _worker_dir(tmp_path)
+        (logs / "text_backend.log").write_text(("old load line\n" * 200) + self._BACKEND_LINES, encoding="utf-8")
+        monkeypatch.setattr(support_bundle, "_MAX_FILE_BYTES", 256)
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        backend_log = _read_member(out, "logs/text_backend.log")
+        assert backend_log.startswith("[... truncated to the most recent")
+        assert "failed to find a memory slot" in backend_log
+        body = backend_log.split("\n", 1)[1]
+        assert body.count("old load line") < 200, "the front of the log was not trimmed"
+        assert all(line == "old load line" or "slot" in line for line in body.splitlines()), "a torn line survived"
+
+    def test_a_worker_without_a_text_backend_bundles_as_before(self, tmp_path: Path) -> None:
+        """No backend log on disk adds no member: the logs are exactly the worker's own."""
+        logs = _worker_dir(tmp_path)
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        with zipfile.ZipFile(out) as zf:
+            log_members = {name for name in zf.namelist() if name.startswith("logs/")}
+        assert log_members == {"logs/bridge.log", "logs/bridge_inference_1_startup.log"}
+
+    def test_a_bundle_of_one_parent_log_carries_the_backend_log_beside_it(self, tmp_path: Path) -> None:
+        """Pointing the bundle at one log file still ships the backend output its wedge lines refer to."""
+        logs = _worker_dir(tmp_path)
+        (logs / "text_backend.log").write_text(self._BACKEND_LINES, encoding="utf-8")
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs / "bridge.log", out, config_path=tmp_path / "bridgeData.yaml")
+
+        with zipfile.ZipFile(out) as zf:
+            log_members = {name for name in zf.namelist() if name.startswith("logs/")}
+        assert log_members == {"logs/bridge.log", "logs/text_backend.log"}
+
+
 _HARNESS_LOG = (
     "2026-06-24 18:00:03.000 | DEBUG | horde_worker_regen.process_management.process_manager:__init__:1 - "
     "Models to load: []\n"

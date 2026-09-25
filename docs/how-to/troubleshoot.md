@@ -113,7 +113,8 @@ Every finding id is explained in [Log findings](../reference/log_findings.md).
 
 When a maintainer asks for your logs, run `horde-log bundle` (or press **Support bundle** / `Ctrl+B` on
 the dashboard's **Logs** tab). It writes one `horde_support_<timestamp>.zip` containing the diagnosis,
-your logs, retained stats JSONL files when present, the redacted config, and a system/cache report. It
+your logs, the text backend's own output (`logs/text_backend.log`) when the worker launched one, retained
+stats JSONL files when present, the redacted config, and a system/cache report. It
 **scrubs your API key and CivitAI token** (and, by default, your home-directory path, username, and
 worker name) before writing, and tells you how
 many things it redacted. Redaction is best-effort, so skim the archive before you send it. See

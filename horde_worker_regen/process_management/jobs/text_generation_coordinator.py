@@ -34,6 +34,13 @@ with nothing in hand producing text is a wedge: the flow closes its readiness ga
 popped, asks the worker to relaunch a backend it owns, and tells the operator of one it does not. Jobs
 already in hand are re-offered until the horde's ttl for them is spent rather than faulted early.
 
+Busy answers alone cannot tell a stuck backend from one shared with other clients and full of their
+work, so where the backend keeps its own count of finished generations the flow reads it through
+[`generation_progress`][horde_worker_regen.text_backends.protocol.TextBackend.generation_progress]. A
+count that moves during the spell is a full backend; a count that stands still for the whole bound, from a
+backend that says it is not idle, is the wedge. The same count moving ends a hold. A backend that keeps
+no count is judged on busy answers alone.
+
 Which backend is attached is a constructor argument twice over: the object the flow generates through
 (the [`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend] protocol, never a concrete
 driver) and the `TEXT_BACKENDS` value naming which one it is, which is all that decides how the
@@ -87,6 +94,7 @@ from horde_worker_regen.text_backends import (
     TextGenerationProgressCallback,
     TextGenerationResult,
 )
+from horde_worker_regen.text_backends.protocol import TextBackendProgress
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -556,12 +564,34 @@ class TextJobInFlightRow:
 
 
 @dataclass
+class _BusySpellCounters:
+    """Represents what the backend's own generation counters said during one busy spell."""
+
+    first: TextBackendProgress
+    """The first reading of the spell, which the wedge line reports as the count at the spell's start."""
+    baseline: TextBackendProgress
+    """The reading the count last changed at, or the first reading when it has not changed."""
+    baseline_at: float
+    """The `time.monotonic()` reading when `baseline` was read."""
+    latest: TextBackendProgress
+    """The most recent reading."""
+    latest_at: float
+    """The `time.monotonic()` reading when `latest` was read."""
+
+    @property
+    def stood_still_seconds(self) -> float:
+        """How long the readings have shown the same count, from the baseline to the latest reading."""
+        return self.latest_at - self.baseline_at
+
+
+@dataclass
 class _WedgeEpisode:
     """Represents one spell during which the flow judged its backend wedged and holds its pops.
 
-    Ends on a successful generation, or on a readiness answer from a backend that has restarted since
-    the spell began. A wedged backend still answers the readiness probe, so an answer on its own proves
-    nothing; one that follows a refused probe or a new launch comes from a backend that went away.
+    Ends on a successful generation, on the backend's own count of finished generations moving, or on a
+    readiness answer from a backend that has restarted since the spell began. A wedged backend still
+    answers the readiness probe, so an answer on its own proves nothing; one that follows a refused probe
+    or a new launch comes from a backend that went away.
     """
 
     busy_seconds: float
@@ -572,6 +602,12 @@ class _WedgeEpisode:
     """The `time.monotonic()` reading of the hold's last readiness probe, or of the spell's start."""
     saw_unready: bool = False
     """Whether a readiness probe or a generation during the spell found the backend not answering."""
+    generations_at_start: int | None = None
+    """The backend's count of finished generations when the hold began, or None before one was read.
+
+    A hold judged without counters takes the first count its probe reads, so a backend that starts
+    reporting one mid-hold is still measured from inside the hold.
+    """
 
 
 def _is_producing(job: TextJobInFlight) -> bool:
@@ -711,6 +747,14 @@ class TextGenerationCoordinator:
         """
         self._busy_answers_in_spell = 0
         """How many busy answers the current spell holds, across every job."""
+        self._spell_counters: _BusySpellCounters | None = None
+        """What the backend's own counters said during the current spell, or None without a reading.
+
+        None both before the first reading and after a reading that carried no count, and either way the
+        spell is judged on busy answers alone.
+        """
+        self._spell_counters_read_at: float | None = None
+        """The `time.monotonic()` reading of the spell's last attempt to read the counters."""
         self._wedge: _WedgeEpisode | None = None
         """The wedge the flow is holding its pops for, or None while it has judged none."""
         self._wedge_relaunches_without_success = 0
@@ -1096,8 +1140,9 @@ class TextGenerationCoordinator:
         """Return whether the current busy spell, as of `now`, is a wedge rather than a full backend.
 
         A wedge is a spell holding at least :data:`BUSY_RETRY_MAX_ATTEMPTS` busy answers, lasting at
-        least :meth:`_wedge_busy_bound_seconds`, while no job in hand is receiving text. A backend
-        producing text for any job is full, not wedged, whatever it answers the others.
+        least :meth:`_wedge_busy_bound_seconds`, while no job in hand is receiving text and the backend's
+        own counters show no work either. A backend producing text for any job is full, not wedged,
+        whatever it answers the others.
         """
         if self._busy_spell_started_at is None:
             return False
@@ -1105,7 +1150,84 @@ class TextGenerationCoordinator:
             return False
         if now - self._busy_spell_started_at < self._wedge_busy_bound_seconds():
             return False
-        return not any(_is_producing(job) for job in self._in_flight.values())
+        if any(_is_producing(job) for job in self._in_flight.values()):
+            return False
+        return self._counters_show_a_stall()
+
+    def _counters_show_a_stall(self) -> bool:
+        """Return whether the backend's own counters agree that it is stuck, or True when it keeps none.
+
+        A shared backend generating for other clients answers the worker busy for as long as they keep
+        it full, and only its own count of finished generations shows that it is working. So the count
+        must have stood still across a whole bound, and the backend must not say it is idle. A backend
+        with no count is judged on busy answers alone.
+        """
+        counters = self._spell_counters
+        if counters is None:
+            return True
+        if counters.latest.idle is True:
+            return False
+        return counters.stood_still_seconds >= self._wedge_busy_bound_seconds()
+
+    async def _refresh_spell_counters(self) -> None:
+        """Read the backend's own counters for the busy spell: as it opens, then at the gate's slowest cadence.
+
+        Never on every busy answer: each job in hand is re-offered every couple of seconds, and one
+        reading per readiness-probe interval is enough to see a count move within a bound.
+        """
+        if self._wedge is not None:
+            return
+        now = time.monotonic()
+        spell_started_at = self._busy_spell_started_at
+        read_recently = (
+            self._spell_counters_read_at is not None and now - self._spell_counters_read_at < READY_BACKOFF_MAX_SECONDS
+        )
+        if spell_started_at is not None and read_recently:
+            return
+        self._spell_counters_read_at = now
+        progress = await self.require_backend().generation_progress()
+        if spell_started_at is not None and self._busy_spell_started_at != spell_started_at:
+            # The spell this reading was taken for ended while it was in flight; the next spell reads its own.
+            return
+        self._note_spell_counters(progress, now=now)
+
+    def _note_spell_counters(self, progress: TextBackendProgress | None, *, now: float) -> None:
+        """Record one reading of the backend's counters into the spell.
+
+        Any change in the count moves the baseline, so a stall that follows a burst of work is measured
+        from the last change. A lower count counts as a change too: it is a backend that restarted.
+        """
+        if progress is None or progress.generations_completed is None:
+            self._spell_counters = None
+            return
+        counters = self._spell_counters
+        if counters is None:
+            self._spell_counters = _BusySpellCounters(
+                first=progress,
+                baseline=progress,
+                baseline_at=now,
+                latest=progress,
+                latest_at=now,
+            )
+            return
+        counters.latest = progress
+        counters.latest_at = now
+        if progress.generations_completed != counters.baseline.generations_completed:
+            counters.baseline = progress
+            counters.baseline_at = now
+
+    def _spell_counters_note(self) -> str:
+        """Return the bracketed statement of the spell's counters that the wedge line carries."""
+        counters = self._spell_counters
+        if counters is None:
+            return "[backend reports no counters]"
+        latest = counters.latest
+        idle = "unknown" if latest.idle is None else ("yes" if latest.idle else "no")
+        queue = "unknown" if latest.queue_depth is None else str(latest.queue_depth)
+        return (
+            f"[backend counters: {counters.first.generations_completed} generations completed at spell start, "
+            f"{latest.generations_completed} now, idle {idle}, queue {queue}]"
+        )
 
     def _note_busy_answer(self) -> None:
         """Count one busy answer into the backend's spell, and judge a wedge when the spell has become one."""
@@ -1120,6 +1242,8 @@ class TextGenerationCoordinator:
         """End the busy spell: a backend that sent text has a working generation path."""
         self._busy_spell_started_at = None
         self._busy_answers_in_spell = 0
+        self._spell_counters = None
+        self._spell_counters_read_at = None
 
     def _note_generation_succeeded(self) -> None:
         """End the busy spell, any wedge hold, and the run of wedge relaunches, on a delivered generation."""
@@ -1142,14 +1266,16 @@ class TextGenerationCoordinator:
         probe once the backend answers from its new process.
         """
         self._close_readiness_gate()
+        counters = self._spell_counters
         self._wedge = _WedgeEpisode(
             busy_seconds=busy_seconds,
             launch_count_at_start=self._current_launch_count(),
             last_probe_at=time.monotonic(),
+            generations_at_start=counters.latest.generations_completed if counters is not None else None,
         )
         busy_for = (
             f"has answered busy for {busy_seconds:.0f}s ({self._busy_answers_in_spell} busy answers) with no "
-            "job receiving text"
+            f"job receiving text {self._spell_counters_note()}"
         )
 
         if self._relaunch_backend is None:
@@ -1200,11 +1326,13 @@ class TextGenerationCoordinator:
         logger.info(f"The text backend is no longer held as wedged ({reason}); the readiness gate runs again.")
 
     async def _probe_wedged_backend(self) -> None:
-        """Probe a wedged backend's readiness at the gate's slowest cadence, ending the hold on a restart.
+        """Probe a wedged backend at the gate's slowest cadence, ending the hold on a restart or on new work.
 
         A wedged backend answers the readiness probe, so the hold cannot end on an answer alone; it ends
         on an answer from a backend that has since been launched again, or that was seen not answering
-        in between, which is the only way an operator's restart shows from outside.
+        in between, which is the only way an operator's restart shows from outside. It also ends when
+        the backend's own count of finished generations moves, restart or not: a backend finishing
+        generations is not stuck, whoever they were for.
         """
         wedge = self._wedge
         if wedge is None:
@@ -1227,6 +1355,18 @@ class TextGenerationCoordinator:
         )
         if relaunched or wedge.saw_unready:
             self._end_wedge_hold("the backend answered again after restarting")
+            return
+        progress = await self.require_backend().generation_progress()
+        if progress is None or progress.generations_completed is None:
+            return
+        if wedge.generations_at_start is None:
+            wedge.generations_at_start = progress.generations_completed
+            return
+        if progress.generations_completed != wedge.generations_at_start:
+            self._end_wedge_hold(
+                f"its count of finished generations moved from {wedge.generations_at_start} to "
+                f"{progress.generations_completed}",
+            )
 
     # endregion
 
@@ -1511,6 +1651,7 @@ class TextGenerationCoordinator:
                 job.busy_attempts += 1
                 if job.first_busy_at is None:
                     job.first_busy_at = time.monotonic()
+                await self._refresh_spell_counters()
                 self._note_busy_answer()
                 if _busy_bound_without_ttl_is_spent(job, deadline_seconds=deadline_seconds):
                     logger.warning(

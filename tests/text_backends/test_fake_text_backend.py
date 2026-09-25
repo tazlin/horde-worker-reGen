@@ -24,6 +24,7 @@ from horde_worker_regen.text_backends import (
     TextBackendUnavailable,
     TextGenerationProgress,
 )
+from horde_worker_regen.text_backends.protocol import TextBackendProgress
 
 _DESCRIPTION = TextBackendDescription(
     model_name="koboldcpp/a-model.gguf",
@@ -377,3 +378,38 @@ async def test_a_stand_in_that_stalls_never_answers() -> None:
         )
 
     assert [report.chunks_received for report in progress.reports] == [1]
+
+
+async def test_the_stand_in_keeps_no_counters_unless_given_them() -> None:
+    """The default is a backend with no counters, which is also what the dry run stands in for."""
+    backend = FakeTextBackend(description=_DESCRIPTION)
+
+    assert await backend.generation_progress() is None
+    assert backend.generation_progress_call_count == 1
+
+
+async def test_the_stand_ins_counters_can_be_moved_between_readings() -> None:
+    """A caller rehearses a backend finishing generations for other clients by setting the next reading."""
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        backend_progress=TextBackendProgress(generations_completed=3, idle=False, queue_depth=1),
+    )
+    first = await backend.generation_progress()
+    backend.backend_progress = TextBackendProgress(generations_completed=4, idle=True, queue_depth=0)
+
+    second = await backend.generation_progress()
+
+    assert first is not None
+    assert first.generations_completed == 3
+    assert second == TextBackendProgress(generations_completed=4, idle=True, queue_depth=0)
+
+
+async def test_a_stand_in_refusing_credentials_reports_no_counters() -> None:
+    """The protocol has every backend answer None rather than raise when its credential is refused."""
+    backend = FakeTextBackend(
+        description=_DESCRIPTION,
+        backend_progress=TextBackendProgress(generations_completed=3),
+        credential_refused=True,
+    )
+
+    assert await backend.generation_progress() is None

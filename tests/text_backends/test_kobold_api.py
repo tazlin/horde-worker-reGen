@@ -37,6 +37,7 @@ from horde_worker_regen.text_backends import (
     TextGenerationProgress,
     kobold_api,
 )
+from horde_worker_regen.text_backends.protocol import TextBackendProgress
 
 _MODEL_NAME = "koboldcpp/a-model.gguf"
 _PROTECTED_MODEL_NAME = "koboldcpp/protected-model"
@@ -152,6 +153,12 @@ class _KoboldBackendBehaviour:
     stats_samples: tuple[Mapping[str, object], ...] = _STATS_SAMPLES
     perf_last_token_count: int = 0
     perf_last_input_count: int = 0
+    perf_total_generations: int | None = None
+    """The running count the perf route reports, or `None` to leave the field out as an older build does."""
+    perf_idle: int = 1
+    perf_queue: int = 0
+    perf_route_present: bool = True
+    """Whether the perf route exists. `False` answers 404 there, as sonar does."""
     abort_route_present: bool = True
     abort_requested: asyncio.Event = field(default_factory=asyncio.Event)
     recorded_generate_bodies: list[object] = field(default_factory=list)
@@ -290,14 +297,17 @@ def _build_kobold_app(behaviour: _KoboldBackendBehaviour) -> web.Application:
     async def handle_perf(request: web.Request) -> web.Response:
         """Answer the counters describing whichever generation finished most recently."""
         behaviour.perf_request_count += 1
-        return web.json_response(
-            {
-                KoboldApiJsonKeys.LAST_TOKEN_COUNT: behaviour.perf_last_token_count,
-                KoboldApiJsonKeys.LAST_INPUT_COUNT: behaviour.perf_last_input_count,
-                "idle": 1,
-                "queue": 0,
-            },
-        )
+        if not behaviour.perf_route_present:
+            return web.Response(status=HTTPStatus.NOT_FOUND)
+        perf_body: dict[str, object] = {
+            KoboldApiJsonKeys.LAST_TOKEN_COUNT: behaviour.perf_last_token_count,
+            KoboldApiJsonKeys.LAST_INPUT_COUNT: behaviour.perf_last_input_count,
+            KoboldApiJsonKeys.IDLE: behaviour.perf_idle,
+            KoboldApiJsonKeys.QUEUE: behaviour.perf_queue,
+        }
+        if behaviour.perf_total_generations is not None:
+            perf_body[KoboldApiJsonKeys.TOTAL_GENERATIONS] = behaviour.perf_total_generations
+        return web.json_response(perf_body)
 
     async def handle_abort(request: web.Request) -> web.Response:
         """Record the abort, end any stream in flight, and answer koboldcpp's two string flags."""
@@ -944,3 +954,33 @@ async def test_close_is_idempotent_and_leaves_the_session_open() -> None:
         await backend.close()
 
         assert await backend.ready(deadline_seconds=5.0) is True
+
+
+async def test_generation_progress_reports_the_perf_routes_running_totals() -> None:
+    """Koboldcpp's count, its 0-or-1 idle flag and its queue depth arrive as the protocol's progress."""
+    behaviour = _KoboldBackendBehaviour(perf_total_generations=41, perf_idle=0, perf_queue=2)
+
+    async with _running_backend(behaviour) as backend:
+        progress = await backend.generation_progress()
+
+    assert progress == TextBackendProgress(generations_completed=41, idle=False, queue_depth=2)
+
+
+async def test_generation_progress_leaves_a_missing_count_unknown() -> None:
+    """A perf answer without the running count reports the fields it has and no count."""
+    async with _running_backend(_KoboldBackendBehaviour()) as backend:
+        progress = await backend.generation_progress()
+
+    assert progress == TextBackendProgress(generations_completed=None, idle=True, queue_depth=0)
+
+
+async def test_generation_progress_is_none_without_a_perf_route() -> None:
+    """A backend with no perf route keeps no counters the worker can read."""
+    async with _running_backend(_KoboldBackendBehaviour(perf_route_present=False)) as backend:
+        assert await backend.generation_progress() is None
+
+
+async def test_generation_progress_is_none_when_the_backend_is_gone() -> None:
+    """A backend that does not answer at all has no counters to give, and the call does not raise."""
+    async with _backend_on_a_closed_port() as backend:
+        assert await backend.generation_progress() is None

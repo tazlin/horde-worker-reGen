@@ -32,6 +32,7 @@ from tests.analysis.test_detectors import (
     _DISPATCH_RECONCILE_REASON,
     _DISPATCH_WHOLE_CARD_REASON,
     _STARTUP,
+    _TEXT_WEDGE_COUNTERS,
     _TRACEBACK,
     _blank_model_quarantine,
     _blank_preload,
@@ -465,7 +466,7 @@ CONTRACTS: dict[str, Contract] = {
         severity=Severity.WARNING,
     ),
     "detect_text_backend_wedged": Contract(
-        bridge=_bridge(_text_wedge_hold("20:05:00.000")),
+        bridge=_bridge(_text_wedge_hold("20:05:00.000", relaunch_bound=True, counters=_TEXT_WEDGE_COUNTERS)),
         severity=Severity.CRITICAL,
     ),
     "detect_stuck_inference_step": Contract(

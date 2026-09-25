@@ -47,6 +47,7 @@ from horde_worker_regen.text_backends.protocol import (
     TextBackendCapabilities,
     TextBackendCredentialRefused,
     TextBackendDescription,
+    TextBackendProgress,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
     TextGenerationProgress,
@@ -107,6 +108,12 @@ class KoboldApiJsonKeys:
     GENERATION_SECONDS: Final = "generation_seconds"
     LAST_TOKEN_COUNT: Final = "last_token_count"
     LAST_INPUT_COUNT: Final = "last_input_count"
+    TOTAL_GENERATIONS: Final = "total_gens"
+    """koboldcpp's count of generations it has finished since it started, on the perf route."""
+    IDLE: Final = "idle"
+    """koboldcpp's perf-route flag, sent as `1` while no generation runs and `0` while one does."""
+    QUEUE: Final = "queue"
+    """koboldcpp's perf-route count of requests waiting for a generation."""
     SUCCESS: Final = "success"
     DONE: Final = "done"
 
@@ -264,14 +271,18 @@ class _KoboldGenerationStats(_KoboldResponseModel):
 
 
 class _KoboldPerfResponse(_KoboldResponseModel):
-    """Represents the counters a backend keeps about the generation that finished most recently.
+    """Represents the perf route's answer: the last generation's counts and the backend's running totals.
 
-    Process-global and overwritten by every generation, so they describe one generation only when one
-    generation ran.
+    The `last_` counts are process-global and overwritten by every generation, so they describe one
+    generation only when one generation ran. The other three describe the backend as a whole and hold
+    whatever the worker has in flight. koboldcpp sends `idle` as `1` or `0`, which validates as a bool.
     """
 
     last_token_count: int | None = None
     last_input_count: int | None = None
+    total_gens: int | None = None
+    idle: bool | None = None
+    queue: int | None = None
 
 
 class _KoboldAbortResponse(_KoboldResponseModel):
@@ -441,9 +452,10 @@ class KoboldApiTextBackend:
 
     Concurrency:
         Safe to drive several generations at once on one event loop; each owns its own stream and its
-        own statistics sampler. The one figure that cannot be shared is the perf counters, which are
-        process-global in the backend, so they are read only when this driver has a single generation
-        running.
+        own statistics sampler. The one figure that cannot be shared is the perf route's last-generation
+        counts, which are process-global in the backend, so they are read for a result only when this
+        driver has a single generation running. The route's running totals describe the whole backend
+        and are read at any time.
     """
 
     def __init__(self, base_url: str, session: aiohttp.ClientSession, *, password: str | None = None) -> None:
@@ -666,6 +678,23 @@ class KoboldApiTextBackend:
             TextBackendCredentialRefused: The backend refused the worker's credentials.
         """
         return TextBackendCapabilities(generation_stats=await self._generation_stats_available())
+
+    async def generation_progress(self) -> TextBackendProgress | None:
+        """Return the perf route's running totals, or None when the backend has none to give.
+
+        A backend whose perf answer carries none of the three fields (sonar has no such route; a
+        koboldcpp older than the fields would answer without them) keeps no counters as far as the
+        worker can tell, which is None rather than a progress with every field unknown.
+        """
+        when_unknown = "its generation counters stay unknown"
+        try:
+            perf = await self._read_perf_counters(when_unknown=when_unknown)
+        except TextBackendCredentialRefused as refusal:
+            logger.debug(f"{refusal}; {when_unknown}")
+            return None
+        if perf is None or (perf.total_gens is None and perf.idle is None and perf.queue is None):
+            return None
+        return TextBackendProgress(generations_completed=perf.total_gens, idle=perf.idle, queue_depth=perf.queue)
 
     async def _generation_stats_available(self) -> bool:
         """Return whether the statistics route answers, probing it the first time this is asked."""
@@ -1050,13 +1079,20 @@ class KoboldApiTextBackend:
         if self._generations_in_flight > 1:
             return None, None
 
-        perf = await self._read_perf_counters()
+        perf = await self._read_perf_counters(when_unknown="the finished generation's token counts stay unknown")
         if perf is None:
             return None, None
         return _reported_count(perf.last_input_count), _reported_count(perf.last_token_count)
 
-    async def _read_perf_counters(self) -> _KoboldPerfResponse | None:
-        """Return the backend's last-generation counters, or None when it has no such route or is mute."""
+    async def _read_perf_counters(self, *, when_unknown: str) -> _KoboldPerfResponse | None:
+        """Return the perf route's answer, or None when the backend has no such route or is mute.
+
+        Args:
+            when_unknown: What the caller goes without when there is no answer, for the debug line.
+
+        Raises:
+            TextBackendCredentialRefused: The backend refused the worker's credentials.
+        """
         try:
             return await self._read_json(
                 route=KoboldApiRoutes.PERF,
@@ -1064,7 +1100,7 @@ class KoboldApiTextBackend:
                 timeout_seconds=KoboldApiTimeouts.PERF_SECONDS,
             )
         except TextBackendUnavailable as no_counters:
-            logger.debug(f"{no_counters}; the finished generation's token counts stay unknown")
+            logger.debug(f"{no_counters}; {when_unknown}")
             return None
 
     def _raise_for_generate_status(self, raw: _RawResponse, *, generation_key: str) -> None:

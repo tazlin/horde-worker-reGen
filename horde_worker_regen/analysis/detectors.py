@@ -1375,12 +1375,35 @@ def _longest_busy_fault_run(records: list[LogRecord]) -> list[LogRecord]:
     return longest
 
 
+def _text_backend_wedged_headline(record: LogRecord, *, times: str, outcome: str) -> str:
+    """Return the headline for the wedge-hold lines, stating the backend's own counters from the first line.
+
+    The count of finished generations standing still is what proves the hold was not a shared backend busy
+    with other clients' work, so the headline carries it. A line from before the counters keeps the wording
+    those workers' bundles have always had.
+    """
+    match = _TEXT_BACKEND_WEDGED_RE.search(record.message)
+    if match is not None and match.group("generations_now") is not None:
+        return (
+            f"The text backend refused every job as busy {times}{outcome}, while its finished generations "
+            f"stopped at {match.group('generations_now')}."
+        )
+    if match is not None and match.group("no_counters") is not None:
+        return (
+            f"The text backend refused every job as busy while generating nothing, {times}{outcome}, and it "
+            "reported no generation counts."
+        )
+    return f"The text backend refused every job as busy while generating nothing, {times}{outcome}."
+
+
 def detect_text_backend_wedged(context: SessionContext) -> list[Finding]:
     """A text backend refusing every job as busy while it generates nothing, from either worker generation.
 
-    A current worker states the episode itself when it holds its text jobs. An older worker only faulted the
-    refused jobs one by one, so its bundles are read for a long run of busy-refused faults with no text job
-    submitted in between; the horde counts each of those faults toward maintenance.
+    A current worker states the episode itself when it holds its text jobs, with the backend's own counters
+    at the decision, and the headline carries the count of finished generations from the first such line.
+    An older worker only faulted the refused jobs one by one, so its bundles are read for a long run of
+    busy-refused faults with no text job submitted in between; the horde counts each of those faults toward
+    maintenance.
     """
     records = context.session.records
     held = _matching(records, _TEXT_BACKEND_WEDGED_RE)
@@ -1392,7 +1415,7 @@ def detect_text_backend_wedged(context: SessionContext) -> list[Finding]:
             Finding(
                 kind=FindingKind.TEXT_BACKEND_WEDGED,
                 severity=Severity.CRITICAL,
-                headline=f"The text backend refused every job as busy while generating nothing, {times}{outcome}.",
+                headline=_text_backend_wedged_headline(held[0], times=times, outcome=outcome),
                 evidence=[_evidence(record) for record in held[:3]],
             ),
         ]

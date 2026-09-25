@@ -22,6 +22,7 @@ from horde_worker_regen.text_backends.protocol import (
     TextBackendCredentialRefused,
     TextBackendDescription,
     TextBackendError,
+    TextBackendProgress,
     TextBackendUnavailable,
     TextGenerationProgress,
     TextGenerationProgressCallback,
@@ -63,6 +64,7 @@ class _FakeCallLog:
     ready: list[FakeReadyCall] = field(default_factory=list)
     describe_count: int = 0
     capabilities_count: int = 0
+    generation_progress_count: int = 0
     generate: list[FakeGenerateCall] = field(default_factory=list)
     stop: list[FakeStopCall] = field(default_factory=list)
 
@@ -117,6 +119,7 @@ class FakeTextBackend:
         stats_prompt_tokens: int = 0,
         stats_tokens_per_chunk: int = 1,
         credential_refused: bool = False,
+        backend_progress: TextBackendProgress | None = None,
     ) -> None:
         """Create a fake backend that answers as configured.
 
@@ -155,6 +158,12 @@ class FakeTextBackend:
                 afterwards through
                 [`credential_refused`][horde_worker_regen.text_backends.fake_text_backend.FakeTextBackend.credential_refused],
                 which is how a caller rehearses an operator correcting the password.
+            backend_progress: What
+                [`generation_progress`][horde_worker_regen.text_backends.fake_text_backend.FakeTextBackend.generation_progress]
+                answers. `None`, the default, is a backend that keeps no counters, which is also what the
+                dry run stands in for. Settable afterwards through
+                [`backend_progress`][horde_worker_regen.text_backends.fake_text_backend.FakeTextBackend.backend_progress],
+                which is how a caller rehearses a backend finishing generations for other clients.
         """
         self._description = description
         self._response_text = response_text
@@ -169,6 +178,7 @@ class FakeTextBackend:
         self._stats_prompt_tokens = stats_prompt_tokens
         self._stats_tokens_per_chunk = stats_tokens_per_chunk
         self._credential_refused = credential_refused
+        self._backend_progress = backend_progress
         self._calls = _FakeCallLog()
         self._closed = False
 
@@ -181,6 +191,16 @@ class FakeTextBackend:
     def credential_refused(self, refused: bool) -> None:
         """Set whether the credential is refused, so a corrected password can be rehearsed mid-test."""
         self._credential_refused = refused
+
+    @property
+    def backend_progress(self) -> TextBackendProgress | None:
+        """What `generation_progress` answers."""
+        return self._backend_progress
+
+    @backend_progress.setter
+    def backend_progress(self, progress: TextBackendProgress | None) -> None:
+        """Set what `generation_progress` answers, so a counter that moves or stands can be rehearsed."""
+        self._backend_progress = progress
 
     def _raise_if_credential_refused(self, verb: str) -> None:
         """Raise the refusal a password-protected backend answers a wrong credential with.
@@ -206,6 +226,11 @@ class FakeTextBackend:
     def capabilities_call_count(self) -> int:
         """How many times `capabilities` was called."""
         return self._calls.capabilities_count
+
+    @property
+    def generation_progress_call_count(self) -> int:
+        """How many times `generation_progress` was called."""
+        return self._calls.generation_progress_count
 
     @property
     def generate_calls(self) -> tuple[FakeGenerateCall, ...]:
@@ -264,6 +289,16 @@ class FakeTextBackend:
         self._calls.capabilities_count += 1
         self._raise_if_credential_refused("capabilities")
         return TextBackendCapabilities(generation_stats=self._generation_stats)
+
+    async def generation_progress(self) -> TextBackendProgress | None:
+        """Return the configured progress, recording the call.
+
+        A refused credential answers `None`, as the protocol has every backend do.
+        """
+        self._calls.generation_progress_count += 1
+        if self._credential_refused:
+            return None
+        return self._backend_progress
 
     async def generate(
         self,

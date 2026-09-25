@@ -1083,14 +1083,19 @@ _SIGNATURE_LIST: list[LogSignature] = [
     _signature(
         "text_backend_wedged",
         r"The text backend at (?P<address>\S+) has answered busy for (?P<seconds>\d+)s "
-        r"\((?P<answers>\d+) busy answers\) with no job receiving text",
+        r"\((?P<answers>\d+) busy answers\) with no job receiving text"
+        r"(?: \[(?:backend counters: (?P<generations_at_start>\d+) generations completed at spell start, "
+        r"(?P<generations_now>\d+) now, idle (?P<idle>yes|no|unknown), queue (?P<queue>\d+|unknown)"
+        r"|(?P<no_counters>backend reports no counters))\])?",
         # Every line the wedge hold writes opens this way: the relaunch, the relaunch already under way, the
-        # attached backend, and the exhausted relaunch bound.
+        # attached backend, and the exhausted relaunch bound. The bracket states the backend's own counters at
+        # the decision; a worker from before the counters wrote no bracket, so the group is optional.
         emitter="process_management.jobs.text_generation_coordinator:_enter_wedge_hold",
         sample=(
             "The text backend at http://127.0.0.1:5001 has answered busy for 64s (5 busy answers) with no job "
-            "receiving text; it looks wedged. Relaunching it (relaunch 1 of 3 without a successful generation). "
-            "No text jobs are popped until it answers again."
+            "receiving text [backend counters: 41 generations completed at spell start, 41 now, idle no, queue 2]; "
+            "it looks wedged. Relaunching it (relaunch 1 of 3 without a successful generation). No text jobs are "
+            "popped until it answers again."
         ),
         dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
     ),
@@ -1101,8 +1106,9 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.jobs.text_generation_coordinator:_enter_wedge_hold",
         sample=(
             "The text backend at http://127.0.0.1:5001 has answered busy for 64s (5 busy answers) with no job "
-            "receiving text, after 3 relaunches with no successful generation between them. It is not relaunched "
-            "again, and no text jobs are popped until it generates or restarts. Look in logs/text_backend.log for "
+            "receiving text [backend reports no counters], after 3 relaunches with no successful generation "
+            "between them. It is not relaunched again, and no text jobs are popped until it generates or restarts. "
+            "Look in logs/text_backend.log for "
             "`find_slot` or `failed to find a memory slot`: parallel requests share one context pool of "
             "`text_threads` x `max_context_length` tokens, which the worker opens at launch, so those lines mean "
             "the pool still ran out. `text_threads: 1` only confirms that cause; it is not the fix."

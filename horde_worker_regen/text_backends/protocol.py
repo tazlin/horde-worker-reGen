@@ -1,15 +1,16 @@
-"""The six-verb contract between the worker and a text-inference program it does not own.
+"""The seven-verb contract between the worker and a text-inference program it does not own.
 
 A text backend is a separate program (koboldcpp today, sonar next) that the worker launches and then
 talks to over HTTP. The worker cannot see inside it, cannot depend on its internals staying put, and
 cannot fix it when it misbehaves, so the boundary is deliberately narrow:
 [`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend] exposes `ready`, `describe`,
-`capabilities`, `generate`, `stop` and `close` and nothing else. Every additional fact the worker tries
-to learn about a backend is another place the two programs can disagree, so the protocol grows only when
-a backend has demonstrated a stable interface for something the worker actually needs.
+`capabilities`, `generation_progress`, `generate`, `stop` and `close` and nothing else. Every additional
+fact the worker tries to learn about a backend is another place the two programs can disagree, so the
+protocol grows only when a backend has demonstrated a stable interface for something the worker actually
+needs.
 
 Everything above this package (the flow that pops horde jobs, the lifecycle that launches the binary)
-sees these six verbs, the result models, and the four exception types. It never sees HTTP: no status
+sees these seven verbs, the result models, and the four exception types. It never sees HTTP: no status
 codes, no routes, no response bodies. That keeps the retry decision where it belongs. The flow decides
 what to do about a failure because only the flow knows about the job, the horde and the operator's
 configuration; a driver that retried on its own behalf would be making that decision blind.
@@ -20,6 +21,7 @@ Public surface:
   and the in-process fake satisfy.
 - [`TextBackendDescription`][horde_worker_regen.text_backends.protocol.TextBackendDescription],
   [`TextBackendCapabilities`][horde_worker_regen.text_backends.protocol.TextBackendCapabilities],
+  [`TextBackendProgress`][horde_worker_regen.text_backends.protocol.TextBackendProgress],
   [`TextGenerationProgress`][horde_worker_regen.text_backends.protocol.TextGenerationProgress] and
   [`TextGenerationResult`][horde_worker_regen.text_backends.protocol.TextGenerationResult]: the values
   the protocol returns and reports.
@@ -126,6 +128,32 @@ class TextBackendCapabilities(BaseModel):
     then unknown for the whole of that backend's life, because the stream carries text and nothing a
     token count can honestly be derived from.
     """
+
+
+class TextBackendProgress(BaseModel):
+    """Represents what a backend reports about its own work, across every client it serves.
+
+    Separate from
+    [`TextGenerationProgress`][horde_worker_regen.text_backends.protocol.TextGenerationProgress], which
+    is one of the worker's own generations as its stream shows it. This is the backend's own count, which
+    moves when it finishes a generation for anyone. That is the only evidence the worker has that a
+    backend refusing it as busy is serving other clients, because the refusal reads the same whether the
+    backend is full or stuck.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    generations_completed: int | None = None
+    """How many generations the backend has finished since it started, or `None` when it does not say.
+
+    A process-lifetime count, so it starts again from zero when the backend restarts. koboldcpp does not
+    count a generation that ended in an error, and a stock build does not count one served through its
+    batching path (`--parallelrequests` above one), so there the count stands still while it batches.
+    """
+    idle: bool | None = None
+    """Whether the backend says it is running no generation, or `None` when it does not say."""
+    queue_depth: int | None = None
+    """How many requests the backend says are waiting for a generation, or `None` when it does not say."""
 
 
 class TextGenerationProgress(BaseModel):
@@ -262,6 +290,20 @@ class TextBackend(Protocol):
         """
         ...
 
+    async def generation_progress(self) -> TextBackendProgress | None:
+        """Return the backend's own count of finished generations, its idle flag and its queue depth.
+
+        One request, read fresh on every call, because the answer changes with every generation the
+        backend finishes. Never raises: the caller reads this to judge a backend that is already
+        refusing it, and an answer it cannot get is the same to that judgement as a backend that keeps
+        no counters.
+
+        Returns:
+            What the backend reported, or `None` when it has no route for it, did not answer, answered
+            something unreadable, or refused the worker's credentials.
+        """
+        ...
+
     async def generate(
         self,
         payload: Mapping[str, object],
@@ -327,6 +369,7 @@ __all__ = [
     "TextBackendCredentialRefused",
     "TextBackendDescription",
     "TextBackendError",
+    "TextBackendProgress",
     "TextBackendRejectedPayload",
     "TextBackendUnavailable",
     "TextGenerationProgress",

@@ -34,6 +34,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 from horde_sdk.ai_horde_api.consts import RC
 from loguru import logger
 
+from horde_worker_regen.analysis.log_signatures import pattern_for
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs import text_generation_coordinator
@@ -55,6 +56,7 @@ from horde_worker_regen.text_backends import (
     TextGenerationProgressCallback,
     TextGenerationResult,
 )
+from horde_worker_regen.text_backends.protocol import TextBackendProgress
 from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_test_api_sessions,
@@ -1868,3 +1870,211 @@ async def test_relaunches_stop_at_the_bound_until_a_generation_completes(monkeyp
     _judge_wedged_without_waiting(coordinator)
 
     assert len(relaunch_reasons) == bound + 1, "a completed generation did not restore the relaunch"
+
+
+class _CountingLockedTextBackend(_LockedTextBackend):
+    """A locked fake that reports its own count of finished generations, as koboldcpp's perf route does.
+
+    With `count_moves` on, every reading finds the count one higher: a backend shared with other clients,
+    full of their work, finishing generations while it refuses the worker. With it off, the count stands,
+    which with `idle` False is a backend holding its generation lock and doing nothing.
+    """
+
+    def __init__(self, *, description: TextBackendDescription, generations: int = 41, idle: bool = False) -> None:
+        super().__init__(description=description)
+        self.generations = generations
+        self.idle = idle
+        self.count_moves = False
+
+    @override
+    async def generation_progress(self) -> TextBackendProgress | None:
+        """Report the count, moving it first when the backend is serving someone else."""
+        await super().generation_progress()
+        if self.count_moves:
+            self.generations += 1
+        return TextBackendProgress(generations_completed=self.generations, idle=self.idle, queue_depth=2)
+
+
+def _make_wedge_coordinator(
+    backend: FakeTextBackend,
+    *,
+    managed: bool,
+) -> tuple[TextGenerationCoordinator, _FakeHordeClientSession, list[str]]:
+    """Create a coordinator judging wedges at test scale, over a backend the worker launched or one it attached to.
+
+    A managed backend's relaunch is recorded and reported scheduled, but the launch count never moves, so
+    the only way its hold ends here is through what the backend itself reports.
+    """
+    relaunch_reasons: list[str] = []
+
+    def _relaunch(reason: str) -> bool:
+        relaunch_reasons.append(reason)
+        return True
+
+    if managed:
+        coordinator, _backend, session = _make_coordinator(
+            backend=backend,
+            text_backend_managed=True,
+            text_generation_timeout_seconds=0.05,
+            launch_count_provider=lambda: 1,
+            relaunch_backend=_relaunch,
+        )
+    else:
+        coordinator, _backend, session = _make_coordinator(backend=backend, text_generation_timeout_seconds=0.05)
+    return coordinator, session, relaunch_reasons
+
+
+_OWNERSHIP = pytest.mark.parametrize("managed", [True, False], ids=["managed", "attached"])
+
+
+def _wedge_lines(logged: list[tuple[str, str]]) -> list[str]:
+    """Return the logged lines the registered wedge signature matches."""
+    wedge_pattern = pattern_for("text_backend_wedged")
+    return [message for _level, message in logged if wedge_pattern.search(message) is not None]
+
+
+@_OWNERSHIP
+async def test_a_backend_whose_own_count_moves_is_full_not_wedged(
+    monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
+) -> None:
+    """A shared backend busy with other clients' work refuses the worker for as long as it likes, and is not held."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _CountingLockedTextBackend(description=_DESCRIPTION)
+    coordinator, session, relaunch_reasons = _make_wedge_coordinator(backend, managed=managed)
+    assert await coordinator.await_backend_ready() is True
+    backend.locked = True
+    backend.count_moves = True
+
+    await _hold_one_job_against_the_backend(coordinator)
+    await _hold_one_job_against_the_backend(coordinator)
+
+    assert backend.busy_answers >= text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS
+    assert backend.generation_progress_call_count > 0, "the spell never read the backend's counters"
+    assert coordinator.backend_wedged is False, "a backend finishing generations was held as stuck"
+    assert relaunch_reasons == []
+    await coordinator.api_text_pop()
+    assert len(session.pop_requests) == 1, "a full backend held the flow's pops"
+
+    backend.count_moves = False
+    await _hold_one_job_against_the_backend(coordinator)
+
+    assert coordinator.backend_wedged is True, "a stall after the count stopped moving was not caught"
+
+
+@_OWNERSHIP
+async def test_a_count_that_stands_past_the_bound_holds_and_the_line_states_it(
+    monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
+) -> None:
+    """A backend that says it is working and finishes nothing for a whole bound is the wedge, stated with counts."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _CountingLockedTextBackend(description=_DESCRIPTION)
+    coordinator, session, relaunch_reasons = _make_wedge_coordinator(backend, managed=managed)
+    assert await coordinator.await_backend_ready() is True
+    backend.locked = True
+    logged, sink_id = _capture_logs()
+    try:
+        await _hold_one_job_against_the_backend(coordinator)
+    finally:
+        logger.remove(sink_id)
+
+    assert coordinator.backend_wedged is True
+    assert len(relaunch_reasons) == (1 if managed else 0)
+    lines = _wedge_lines(logged)
+    assert len(lines) == 1
+    assert "[backend counters: 41 generations completed at spell start, 41 now, idle no, queue 2]" in lines[0]
+    match = pattern_for("text_backend_wedged").search(lines[0])
+    assert match is not None
+    assert match.group("generations_at_start") == "41"
+    assert match.group("generations_now") == "41"
+    assert match.group("idle") == "no"
+    assert match.group("queue") == "2"
+    await coordinator.api_text_pop()
+    assert session.pop_requests == []
+
+
+@_OWNERSHIP
+async def test_a_backend_that_says_it_is_idle_is_not_held(monkeypatch: pytest.MonkeyPatch, managed: bool) -> None:
+    """A standing count from a backend reporting no generation running is not a held generation lock."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _CountingLockedTextBackend(description=_DESCRIPTION, idle=True)
+    coordinator, _session, relaunch_reasons = _make_wedge_coordinator(backend, managed=managed)
+    assert await coordinator.await_backend_ready() is True
+    backend.locked = True
+
+    await _hold_one_job_against_the_backend(coordinator)
+
+    assert backend.busy_answers >= text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS
+    assert coordinator.backend_wedged is False
+    assert relaunch_reasons == []
+
+
+@_OWNERSHIP
+async def test_the_hold_ends_when_the_backends_count_moves(monkeypatch: pytest.MonkeyPatch, managed: bool) -> None:
+    """A held backend that finishes a generation again is not stuck, whether or not it restarted."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _CountingLockedTextBackend(description=_DESCRIPTION)
+    coordinator, session, _relaunch_reasons = _make_wedge_coordinator(backend, managed=managed)
+    assert await coordinator.await_backend_ready() is True
+    backend.locked = True
+    await _hold_one_job_against_the_backend(coordinator)
+    assert coordinator.backend_wedged is True
+
+    await coordinator._probe_wedged_backend()
+    assert coordinator.backend_wedged is True, "a readiness answer and a standing count ended the hold"
+
+    backend.count_moves = True
+    await coordinator._probe_wedged_backend()
+
+    assert coordinator.backend_wedged is False
+    backend.locked = False
+    assert await coordinator.await_backend_ready() is True
+    await coordinator.api_text_pop()
+    assert len(session.pop_requests) == 1, "pops did not resume once the backend finished generations again"
+
+
+@_OWNERSHIP
+async def test_a_backend_with_no_counters_is_judged_on_busy_answers_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
+) -> None:
+    """A backend with no counters route is held as it always was, and the line says the counts were absent."""
+    _quicken_wedge_judgement(monkeypatch)
+    backend = _LockedTextBackend(description=_DESCRIPTION)
+    coordinator, _session, relaunch_reasons = _make_wedge_coordinator(backend, managed=managed)
+    assert await coordinator.await_backend_ready() is True
+    backend.locked = True
+    logged, sink_id = _capture_logs()
+    try:
+        await _hold_one_job_against_the_backend(coordinator)
+    finally:
+        logger.remove(sink_id)
+
+    assert backend.generation_progress_call_count > 0
+    assert coordinator.backend_wedged is True
+    assert len(relaunch_reasons) == (1 if managed else 0)
+    lines = _wedge_lines(logged)
+    assert len(lines) == 1
+    match = pattern_for("text_backend_wedged").search(lines[0])
+    assert match is not None
+    assert match.group("no_counters") is not None
+    assert match.group("generations_now") is None
+
+
+async def test_the_counters_are_read_at_the_probe_cadence_not_on_every_busy_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Jobs are re-offered every couple of seconds each, so the spell reads the counters once as it opens."""
+    _quicken_wedge_judgement(monkeypatch)
+    monkeypatch.setattr(text_generation_coordinator, "READY_BACKOFF_MAX_SECONDS", 60.0)
+    backend = _CountingLockedTextBackend(description=_DESCRIPTION)
+    coordinator, _session, _relaunch_reasons = _make_wedge_coordinator(backend, managed=False)
+    assert await coordinator.await_backend_ready() is True
+    backend.locked = True
+
+    await _hold_one_job_against_the_backend(coordinator)
+
+    assert backend.busy_answers >= text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS
+    assert backend.generation_progress_call_count == 1
+    assert coordinator.backend_wedged is False, "one reading cannot show a count standing for a whole bound"

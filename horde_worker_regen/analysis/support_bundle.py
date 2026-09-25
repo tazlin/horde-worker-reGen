@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from horde_worker_regen.process_management.lifecycle.text_backend_supervisor import TEXT_BACKEND_LOG_FILE_NAME
 from horde_worker_regen.process_management.resources.vram_footprints import FOOTPRINT_STORE_FILENAME
 
 from . import ledger_ingest
@@ -87,9 +88,17 @@ def _all_log_files(path: Path, *, include_rotations: bool) -> tuple[Path, list[P
     Only the top level of the logs directory is bundled: the worker writes all its logs flat in ``logs/``,
     so a nested subdirectory (e.g. an ``external_logs/`` archive of unrelated captures) is not this
     worker's evidence and must not bloat the bundle. Rotation archives are excluded unless requested.
+
+    A bundle of one parent log still carries the text backend's own output from beside it, when the worker
+    launched one: the wedge and launch lines in the parent log name that file as where the cause shows.
+    The supervisor appends to that one file across launches rather than rotating it.
     """
     if path.is_file():
-        return path.parent, [path]
+        files = [path]
+        text_backend_log = path.parent / TEXT_BACKEND_LOG_FILE_NAME
+        if text_backend_log.is_file() and text_backend_log != path:
+            files.append(text_backend_log)
+        return path.parent, files
     files = sorted(p for p in path.glob("*") if p.is_file() and (include_rotations or not _is_rotation(p)))
     return path, files
 

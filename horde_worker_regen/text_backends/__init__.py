@@ -2,8 +2,8 @@
 
 The worker does not implement text inference; it launches a separate program (koboldcpp today, sonar
 next) and asks it for generations over HTTP. This package is the whole of that conversation. Everything
-above it sees the six verbs of
-[`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend], the result models, and three
+above it sees the seven verbs of
+[`TextBackend`][horde_worker_regen.text_backends.protocol.TextBackend], the result models, and four
 exception types, and never sees HTTP.
 
 - [`protocol`][horde_worker_regen.text_backends.protocol]: the contract, the result models and the
@@ -49,6 +49,7 @@ from horde_worker_regen.text_backends.protocol import (
     TextBackendCredentialRefused,
     TextBackendDescription,
     TextBackendError,
+    TextBackendProgress,
     TextBackendRejectedPayload,
     TextBackendUnavailable,
     TextGenerationProgress,
@@ -75,6 +76,7 @@ __all__ = [
     "TextBackendCredentialRefused",
     "TextBackendDescription",
     "TextBackendError",
+    "TextBackendProgress",
     "TextBackendRejectedPayload",
     "TextBackendLaunchSettings",
     "TextBackendLaunchSpec",

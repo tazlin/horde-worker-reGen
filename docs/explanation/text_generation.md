@@ -277,7 +277,20 @@ text from any job stops it. The worker judges the backend **wedged** when all of
   worker itself tolerates one of its own generations staying silent that long;
 - the backend has refused at least five offers in that time;
 - no job the worker holds is receiving text. A backend streaming one job while refusing another is
-  full, not wedged.
+  full, not wedged;
+- the backend's own count of finished generations has not moved for the whole bound, and the backend
+  does not say it is idle.
+
+The last condition is the proof. A backend other clients share answers the worker busy for as long as
+they keep it full, and nothing the worker sees of its own jobs tells that apart from a stuck backend.
+koboldcpp's `/api/extra/perf` route reports a running count of finished generations (`total_gens`),
+whether it is idle, and how many requests are queued. The worker reads it when a busy spell opens and
+then once per readiness-probe interval, never on every busy answer. A count that moves is a backend
+doing work for someone, and a count that stands still while the backend says it is not idle is the
+wedge. A backend with no such route (sonar) is judged on the first three conditions alone. Two limits
+of koboldcpp's count are worth knowing: it skips a generation that ended in an error, which is what a
+wedge is, and a stock build does not count generations served through its batching path, so a stock
+koboldcpp running more than one parallel request is judged as though it had no count.
 
 While the backend is wedged the worker pops nothing. The hold is the readiness gate's, so the dashboard
 shows the backend as not ready and for how long. Jobs already in hand keep being offered until their
@@ -286,22 +299,27 @@ ttl runs out, in case the backend recovers.
 What happens next depends on who runs the backend:
 
 - **A backend the worker launched** is stopped and launched again, once per wedge, through the same
-  relaunch path as a backend that exited, and the worker logs one warning naming the backend's address
-  and how long it was busy. The hold ends when the new process answers, and the worker then warms it up
+  relaunch path as a backend that exited, and the worker logs one warning naming the backend's address,
+  how long it was busy, and the backend's counts at the decision (or that it reports none). The hold ends
+  when the new process answers, or when the backend's count moves, and the worker then warms it up
   and resumes popping. If three relaunches in a row each wedge again with no successful generation
   between them, the worker stops relaunching, keeps the hold, and logs one error saying so. That error
   points at `logs/text_backend.log` and the `find_slot` lines: with the pool already sized for every
   request, those lines mean it still ran out.
 - **A backend you run yourself** is not the worker's to restart. The worker holds, logs one error per
   wedge naming the backend's address, and keeps checking readiness on the gate's usual cadence. Because
-  a wedged backend still answers that check, the hold ends only on a successful generation or once the
-  backend has been seen restarting: a check that finds it gone, then one that finds it back. The error
+  a wedged backend still answers that check, the hold ends only on a successful generation, on the
+  backend's own count of finished generations moving, or once the backend has been seen restarting: a
+  check that finds it gone, then one that finds it back. The error
   asks you to restart it and to start it with `--contextsize` of `text_threads` × `max_context_length`.
 
 Either error mentions `text_threads: 1` only as a way to confirm the cause: a backend that stops wedging
 with one request at a time ran out of shared context. Parallel requests remain a supported setting, and
 the fix is a context pool large enough for them. `horde-log diagnose` reports these episodes as
 `text_backend_wedged`, and also recognises the run of busy-refused faults an older worker left behind.
+The finding's headline states the count of finished generations the backend reported, so a bundle shows
+whether a hold was a stuck backend or one busy with other clients, and a support bundle carries
+`logs/text_backend.log` for a backend the worker launched.
 
 The worker's own hold and the horde's maintenance flag are independent. The horde sets maintenance when
 a worker drops too many jobs; that refuses pops at the server, and the worker keeps asking so it notices
