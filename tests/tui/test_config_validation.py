@@ -152,6 +152,20 @@ def test_a_scribe_only_worker_is_a_valid_worker() -> None:
     assert errors == []
 
 
+def test_a_scribe_on_the_default_context_length_is_warned_that_most_work_passes_it_by() -> None:
+    """The horde routes only requests that fit the advertised context, so the bridge default reaches little."""
+    at_default = {"scribe": True, "max_context_length": 1024}
+    unset = {"scribe": True}
+    raised = {"scribe": True, "max_context_length": 4096}
+    not_a_scribe = {"dreamer": True, "max_context_length": 1024}
+
+    for config in (at_default, unset):
+        warnings = _messages(config, ConfigValidationSeverity.WARNING)
+        assert any("Max context length is the default of 1024" in message for message in warnings), config
+    for config in (raised, not_a_scribe):
+        assert not any("Max context length" in m for m in _messages(config, ConfigValidationSeverity.WARNING)), config
+
+
 def test_every_role_off_serves_nothing() -> None:
     """A worker with no role selected has nothing to pop, whichever role the operator forgot."""
     errors = _role_errors({"dreamer": False, "alchemist": False, "scribe": False})

@@ -1041,7 +1041,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max context length",
         FieldKind.INT,
         "Scribe",
-        "The largest prompt plus answer this worker offers to hold, narrowed to what the backend says it will accept.",
+        "The largest prompt plus answer this worker offers to hold, narrowed to what the backend says it will "
+        "accept. The horde accepts a request that asks for more than this and never sends it here, so the "
+        "default of 1024 reaches very little work; the backend is launched with this much context per thread, "
+        "and that context costs VRAM.",
         requires_restart=True,
         minimum=1,
         maximum=16384,

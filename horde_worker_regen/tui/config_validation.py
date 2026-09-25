@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from horde_worker_regen.tui.config_form import CONFIG_FIELDS
+
 
 class ConfigValidationSeverity(StrEnum):
     """How strongly a config validation finding should affect save."""
@@ -25,6 +27,11 @@ class ConfigValidationIssue:
 
 
 _META_PREFIXES = ("top", "bottom", "all")
+
+
+def _field_default(key: str) -> Any:  # noqa: ANN401 - defaults are heterogeneous by field kind
+    """The value a form field takes when the key is absent from the file, read from the field's own row."""
+    return next(field for field in CONFIG_FIELDS if field.key == key).default()
 
 
 def _bool(config: dict[str, Any], key: str) -> bool:
@@ -116,6 +123,19 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
 
     if not _bool(config, "dreamer") and not _bool(config, "alchemist") and not _bool(config, "scribe"):
         error("dreamer", "Enable Dreamer image generation, Alchemist or Scribe; all off serves nothing.")
+
+    # The horde routes a text request only to a worker whose advertised context holds it, and a request
+    # that fits no worker is accepted and left waiting rather than refused. The bridge default is small
+    # enough that a scribe left on it is passed over by most text work, which the operator only ever sees
+    # as a worker that pops nothing.
+    context_default = _field_default("max_context_length")
+    if _bool(config, "scribe") and _int(config, "max_context_length", context_default) <= context_default:
+        warning(
+            "max_context_length",
+            f"Max context length is the default of {context_default}; the horde only sends this worker "
+            "requests that fit the advertised context, so most text work passes it by. Raise it to what the "
+            "model and card can hold.",
+        )
 
     if _bool(config, "extra_slow_worker"):
         if _bool(config, "high_performance_mode"):
