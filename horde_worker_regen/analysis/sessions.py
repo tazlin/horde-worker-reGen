@@ -30,6 +30,7 @@ from .duty_log_report import (
     _IDENTITY_RE,
 )
 from .log_ingest import LogRecord
+from .log_signatures import pattern_for
 
 _VERSION_RE = re.compile(r"\(v(?P<version>[^)]+)\)")
 _RECOVERIES_RE = re.compile(r"process_recoveries: (?P<count>\d+)")
@@ -43,7 +44,7 @@ _MAIN_STARTUP_RE = re.compile(r"Setting up logger for main process")
 
 # End-of-life markers, most-specific first; the first match wins when classifying a session.
 _ABANDON_SHIP_RE = re.compile(r"cannot restore a working process pool|abandoning ship")
-_ABORT_FILE_RE = re.compile(r"Found \.abort file")
+_ABORT_FILE_RE = pattern_for("abort_sentinel_found")
 _SUPERVISOR_SHUTDOWN_RE = re.compile(r"Supervisor requested shutdown")
 # This is emitted only after ``start_working`` returns through session persistence. The process manager's
 # earlier "Shutting down process manager" line proves only that child teardown began/completed; a gathered

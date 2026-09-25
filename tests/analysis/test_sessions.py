@@ -26,7 +26,7 @@ _LOG = """\
 2026-06-24 18:00:05.000 | INFO     | horde_worker_regen.reporting.status_reporter:_print_worker_info:442 -   dreamer_name: tazlin-tui-example | (v12.28.0+dev.gabc.dirty) | horde user: Tazlin#6572 | num_models: 113 | custom_models: False | max_power: 32 (1024x1024) | max_threads: 1 | queue_size: 3 | safety_on_gpu: True
 2026-06-24 18:00:10.000 | INFO     | horde_worker_regen.reporting.status_reporter:_print_job_info:295 -   Session job info: ... | process_recoveries: 17 | 0.00 seconds without jobs
 2026-06-24 18:00:20.000 | CRITICAL | horde_worker_regen.process_management.process_manager:_give_up_on_wedged_jobs:2123 - Save-our-ship: the worker cannot restore a working process pool; abandoning ship
-2026-06-24 18:00:21.000 | WARNING  | horde_worker_regen.process_management.process_manager:_process_control_loop:2156 - Found .abort file - aborting immediately
+2026-06-24 18:00:21.000 | WARNING  | horde_worker_regen.process_management.process_manager:_process_control_loop:2156 - Found .abort file; aborting immediately
 2026-06-24 18:00:22.000 | INFO     | horde_worker_regen.run_worker:main:106 - Worker has finished working.
 2026-06-24 18:01:00.000 | DEBUG    | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process
 2026-06-24 18:01:05.000 | INFO     | horde_worker_regen.reporting.status_reporter:_print_worker_info:442 -   dreamer_name: tazlin-tui-example | (v12.28.0+dev.gabc.dirty) | horde user: Tazlin#6572 | num_models: 113 | custom_models: False | max_power: 32 (1024x1024) | max_threads: 1 | queue_size: 3 | safety_on_gpu: True
@@ -123,6 +123,28 @@ class TestEndReason:
         sessions = segment_sessions(parse_lines(log.splitlines(), Path("bridge.log")))
         assert sessions[0].end_reason is SessionEndReason.KILLED_OR_CRASHED
         assert sessions[1].end_reason is SessionEndReason.STILL_RUNNING
+
+    @pytest.mark.parametrize(
+        ("sentinel_name", "expected"),
+        [
+            (".abort", SessionEndReason.ABORTED),
+            (".abort_benchmark", SessionEndReason.ABORTED),
+            (".abort_other", SessionEndReason.STILL_RUNNING),
+        ],
+    )
+    def test_the_abort_line_names_either_sentinel(self, sentinel_name: str, expected: SessionEndReason) -> None:
+        """The worker's and the benchmark's sentinel both end a session as aborted; another file name does not."""
+        log = (
+            "2026-06-24 18:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - "
+            "Setting up logger for main process\n"
+            "2026-06-24 18:00:10.000 | WARNING | "
+            "horde_worker_regen.process_management.process_manager:_process_control_loop:1 - "
+            f"Found {sentinel_name} file; aborting immediately\n"
+        )
+
+        session = segment_sessions(parse_lines(log.splitlines(), Path("bridge.log")))[0]
+
+        assert session.end_reason is expected
 
     def test_child_teardown_line_alone_is_not_a_clean_process_exit(self) -> None:
         """The manager can reap every child while a gathered sibling still pins the worker process."""

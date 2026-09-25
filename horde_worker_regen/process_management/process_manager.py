@@ -5335,10 +5335,11 @@ class HordeWorkerProcessManager:
             try:
                 if self.stable_diffusion_reference is None:
                     return
-                # Watch for an externally-created .abort file as a signal-less
+                # Watch for an externally-created abort sentinel as a signal-less
                 # abort trigger (e.g. for process managers that cannot send signals).
-                if abort_sentinel_path().exists():
-                    logger.warning("Found .abort file; aborting immediately")
+                abort_sentinel = abort_sentinel_path()
+                if abort_sentinel.exists():
+                    logger.warning(f"Found {abort_sentinel.name} file; aborting immediately")
                     self._abort()
                     break
                 if not await self._control_loop_tick():

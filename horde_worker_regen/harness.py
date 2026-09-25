@@ -28,7 +28,7 @@ import multiprocessing
 import os
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from multiprocessing.managers import SyncManager
 from typing import TYPE_CHECKING, Literal
@@ -98,7 +98,7 @@ from horde_worker_regen.process_management.simulation.fake_worker_processes impo
 from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
 from horde_worker_regen.process_management.simulation.sim_vram import SimVramLedger
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
-from horde_worker_regen.run_root import abort_sentinel_path
+from horde_worker_regen.run_root import AbortSentinelKind, abort_sentinel_path, claim_abort_sentinel
 from horde_worker_regen.run_root import logs_dir as run_logs_dir
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 
@@ -1583,16 +1583,28 @@ async def _watch_for_soak_period(
 
 
 def _cleanup_stale_abort_file() -> None:
-    """Remove a stale `.abort` file left behind by a previous crashed or aborted run.
+    """Remove a stale benchmark abort sentinel left behind by a previous crashed or aborted benchmark run.
 
-    The process manager checks for this sentinel file on every control-loop tick
-    and aborts immediately if it exists.  Leaving one behind guarantees the next
-    harness run will exit instantly with zero jobs processed.
+    The process manager checks its sentinel on every control-loop tick and aborts immediately if it
+    exists, so a leftover one makes the next harness run exit with zero jobs processed. Only the
+    benchmark's own sentinel is removed: the worker's ``.abort`` in the same run root may belong to a live
+    worker that is stopping.
     """
-    abort_path = abort_sentinel_path()
+    abort_path = abort_sentinel_path(AbortSentinelKind.BENCHMARK)
     if abort_path.exists():
-        logger.warning(f"Removing stale .abort file from {abort_path}")
+        logger.warning(f"Removing stale benchmark abort sentinel {abort_path}")
         abort_path.unlink()
+
+
+def _claim_benchmark_abort_sentinel() -> AbortSentinelKind:
+    """Make this process watch the benchmark's own abort sentinel, clearing a stale one; return the prior claim.
+
+    A benchmark usually runs in a checkout where a live worker also runs, and both resolve the same run
+    root. Without its own sentinel, either run's abort stops the other.
+    """
+    previous = claim_abort_sentinel(AbortSentinelKind.BENCHMARK)
+    _cleanup_stale_abort_file()
+    return previous
 
 
 def _apply_production_worker_env(process_mode: HarnessProcessMode) -> None:
@@ -1717,17 +1729,37 @@ def _arm_harness_log_sink() -> None:
         logger.warning(f"Could not arm the harness parent log sink: {error}")
 
 
-async def run_harness_async(config: HarnessConfig) -> HarnessResult:
-    """Run a full worker lifecycle against the configured scenario and report the outcome."""
+@contextlib.contextmanager
+def _harness_run_context() -> Iterator[None]:
+    """Context manager that marks this process as a harness run for as long as the run lasts.
+
+    A harness run is a harness in every place that asks: its parent log goes to ``bridge_harness.log`` and
+    its embedded worker obeys the benchmark's own abort sentinel. Arming both here means neither can be
+    engaged without the other. Telemetry is configured first because it replaces every loguru handler and
+    would strip a sink armed before it.
+
+    On exit the previous sentinel claim is restored. The log sink stays attached until the next run re-arms
+    it, so lines logged while the caller finishes up still reach the harness log.
+    """
     from horde_worker_regen.telemetry import configure_telemetry
 
     configure_telemetry()
     _arm_harness_log_sink()
-    _apply_production_worker_env(config.process_mode)
+    previous_abort_sentinel_kind = _claim_benchmark_abort_sentinel()
+    try:
+        yield
+    finally:
+        claim_abort_sentinel(previous_abort_sentinel_kind)
 
-    # Remove any stale .abort sentinel before starting, so a previous crashed/
-    # aborted run doesn't cause an immediate spurious abort.
-    _cleanup_stale_abort_file()
+
+async def run_harness_async(config: HarnessConfig) -> HarnessResult:
+    """Run a full worker lifecycle against the configured scenario and report the outcome."""
+    with _harness_run_context():
+        return await _run_harness_in_run_context(config)
+
+
+async def _run_harness_in_run_context(config: HarnessConfig) -> HarnessResult:
+    _apply_production_worker_env(config.process_mode)
 
     diagnostics: list[str] = []
 
@@ -2049,7 +2081,7 @@ def _collect_run_diagnostics(
     if num_jobs_expected > 0 and completed == 0 and faulted == 0 and elapsed > 2.0:
         diags.append(
             f"No jobs completed or faulted after {elapsed:.1f}s "
-            f"(expected {num_jobs_expected}); check for stale .abort file or blocked job pop"
+            f"(expected {num_jobs_expected}); check for a stale {abort_sentinel_path().name} file or blocked job pop"
         )
 
     source = manager._job_popper._canned_job_source
@@ -2306,6 +2338,7 @@ class WarmHarnessSession:
             scenarios=scenarios,
         )
         self._applied_bridge_overrides: dict[str, object] = {}
+        self._run_context: contextlib.ExitStack | None = None
 
     @property
     def manager(self) -> HordeWorkerProcessManager:
@@ -2360,17 +2393,23 @@ class WarmHarnessSession:
         )
 
     async def __aenter__(self) -> WarmHarnessSession:
-        """Build the worker and start its main loop; wait briefly for processes to come up."""
-        from horde_worker_regen.telemetry import configure_telemetry
+        """Build the worker and start its main loop; wait briefly for processes to come up.
 
-        configure_telemetry()
-        _arm_harness_log_sink()
-        _apply_production_worker_env(self._process_mode)
-        _cleanup_stale_abort_file()
-
-        self._manager = self._build_manager()
-        self._loop_task = asyncio.create_task(self._manager._main_loop())
-        await self._wait_for_inference_ready()
+        The harness run context is held from here until :meth:`aclose`. ``async with`` never calls
+        ``__aexit__`` when ``__aenter__`` raises, so a failure after the context is entered closes the session
+        here: otherwise the process would keep the benchmark's sentinel claim after the session is gone.
+        """
+        run_context = contextlib.ExitStack()
+        run_context.enter_context(_harness_run_context())
+        self._run_context = run_context
+        try:
+            _apply_production_worker_env(self._process_mode)
+            self._manager = self._build_manager()
+            self._loop_task = asyncio.create_task(self._manager._main_loop())
+            await self._wait_for_inference_ready()
+        except BaseException:
+            await self.aclose()
+            raise
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:

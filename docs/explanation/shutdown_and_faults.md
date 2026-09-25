@@ -20,10 +20,10 @@ error recovery work together.
 
 There are two termination paths:
 
-| Path                  | Trigger                                                 | Behavior                                                       |
-| --------------------- | ------------------------------------------------------- | -------------------------------------------------------------- |
-| **Graceful shutdown** | SIGINT, SIGTERM, or `shutdown()` call                   | Finish in-progress jobs, submit all pending results, then exit |
-| **Abort**             | Three SIGINTs, `.abort` file created, or `abort()` call | Purge all jobs, hard-kill all processes, exit immediately      |
+| Path                  | Trigger                                                                                  | Behavior                                                       |
+| --------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| **Graceful shutdown** | SIGINT, SIGTERM, or `shutdown()` call                                                    | Finish in-progress jobs, submit all pending results, then exit |
+| **Abort**             | Three SIGINTs, `.abort` file created (`.abort_benchmark` for a benchmark), or `abort()` call | Purge all jobs, hard-kill all processes, exit immediately      |
 
 ### Graceful shutdown sequence
 
@@ -239,6 +239,13 @@ writable), so a file that landed in an unexpected place is traceable from the
 top of the log. Two runs that share a working directory used to couple through
 these paths (one run's abort stopped the other); giving each run its own root
 is what lets the test suite run its worker fleets side by side.
+
+A `horde-benchmark` run, and any other harness run, watches `.abort_benchmark`
+in the same run root instead (`run_root.AbortSentinelKind`). A live worker and
+a benchmark launched in one checkout stop independently: `.abort` stops the
+worker, `.abort_benchmark` stops the benchmark, and the benchmark's startup
+cleanup removes only its own stale file. The abort log line names the file the
+run found (`Found .abort_benchmark file; aborting immediately`).
 
 ## See also
 

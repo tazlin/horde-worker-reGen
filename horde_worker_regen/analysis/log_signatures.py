@@ -19,6 +19,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from horde_worker_regen.run_root import AbortSentinelKind, abort_sentinel_name
+
 
 @dataclass(frozen=True)
 class LogSignature:
@@ -89,6 +91,9 @@ _TEXT_BACKEND_NOT_LAUNCHED = (
     "printed once by the text backend into its own `logs/text_backend.log`, which a dry run never launches"
 )
 _TEXT_FLOW_NOT_EXERCISED = "the dry-run contract scenario serves image jobs only, so the text flow never runs"
+_RUN_NOT_ABORTED = "a completed dry run ends through a graceful shutdown; only an abort writes the sentinel file"
+
+_ABORT_SENTINEL_NAMES_PATTERN = "|".join(re.escape(abort_sentinel_name(kind)) for kind in AbortSentinelKind)
 
 _SIGNATURE_LIST: list[LogSignature] = [
     # --- Per-job lifecycle ---
@@ -379,6 +384,13 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"Received (?P<message_type>\w+) from process (?P<process>\d+)",
         emitter="process_management.ipc.message_dispatcher:_dispatch_buffered_message",
         sample="Received HordeInferenceResultMessage from process 7: 3.42 iterations per second",
+    ),
+    _signature(
+        "abort_sentinel_found",
+        rf"Found (?:{_ABORT_SENTINEL_NAMES_PATTERN}) file",
+        emitter="process_management.process_manager:_process_control_loop",
+        sample="Found .abort_benchmark file; aborting immediately",
+        dry_run_reason=_RUN_NOT_ABORTED,
     ),
     # --- Recovery supervisor (save-our-ship) ---
     _signature(

@@ -16,10 +16,17 @@ what it was set to and where that resolved), at DEBUG when the working directory
 WARNING when the named directory is missing or not writable. A developer chasing a file that landed in
 the wrong place, or a CI run whose variable was set to the wrong path, finds the answer at the top of
 the log rather than by reading this module.
+
+A benchmark run (``horde-benchmark``, the harness) shares the checkout's run root with any live worker but
+watches a sentinel of its own, :data:`BENCHMARK_ABORT_SENTINEL_NAME`. The harness claims it for the
+process with :func:`claim_abort_sentinel`, so the worker it embeds reads, writes and clears that file
+instead of ``.abort``: one run's abort never stops the other, and a benchmark's startup cleanup never
+deletes a live worker's sentinel.
 """
 
 from __future__ import annotations
 
+import enum
 import os
 from pathlib import Path
 
@@ -27,7 +34,24 @@ from loguru import logger
 
 RUN_ROOT_ENV_VAR = "HORDE_WORKER_RUN_ROOT"
 ABORT_SENTINEL_NAME = ".abort"
+BENCHMARK_ABORT_SENTINEL_NAME = ".abort_benchmark"
 LOGS_DIR_NAME = "logs"
+
+
+class AbortSentinelKind(enum.StrEnum):
+    """Which kind of run an abort sentinel belongs to."""
+
+    WORKER = enum.auto()
+    BENCHMARK = enum.auto()
+
+
+_ABORT_SENTINEL_NAMES: dict[AbortSentinelKind, str] = {
+    AbortSentinelKind.WORKER: ABORT_SENTINEL_NAME,
+    AbortSentinelKind.BENCHMARK: BENCHMARK_ABORT_SENTINEL_NAME,
+}
+
+_claimed_abort_sentinel_kind: AbortSentinelKind = AbortSentinelKind.WORKER
+"""The sentinel this process watches and writes; a worker unless a benchmark run has claimed its own."""
 
 _announced: str | None = None
 """The last ``source:path`` announced in this process, so a repeat resolution stays silent."""
@@ -68,9 +92,33 @@ def describe_run_root() -> str:
     return f"run root: {root} ({source})"
 
 
-def abort_sentinel_path() -> Path:
-    """The ``.abort`` file whose presence aborts this run."""
-    return run_root() / ABORT_SENTINEL_NAME
+def abort_sentinel_name(kind: AbortSentinelKind) -> str:
+    """Return the sentinel file name a run of ``kind`` watches."""
+    return _ABORT_SENTINEL_NAMES[kind]
+
+
+def claimed_abort_sentinel_kind() -> AbortSentinelKind:
+    """Return the kind of sentinel this process watches and writes."""
+    return _claimed_abort_sentinel_kind
+
+
+def claim_abort_sentinel(kind: AbortSentinelKind) -> AbortSentinelKind:
+    """Make this process watch and write the sentinel of ``kind``, returning the kind it replaced.
+
+    The claim is process-wide because the worker's control loop and abort path resolve the sentinel through
+    :func:`abort_sentinel_path` with no run context of their own. A caller that embeds a benchmark run in a
+    longer-lived process restores the returned kind when the run ends.
+    """
+    global _claimed_abort_sentinel_kind
+    previous = _claimed_abort_sentinel_kind
+    _claimed_abort_sentinel_kind = kind
+    return previous
+
+
+def abort_sentinel_path(kind: AbortSentinelKind | None = None) -> Path:
+    """Return the sentinel file whose presence aborts a run of ``kind``, by default this process's claim."""
+    resolved_kind = _claimed_abort_sentinel_kind if kind is None else kind
+    return run_root() / abort_sentinel_name(resolved_kind)
 
 
 def logs_dir(*, create: bool = False) -> Path:

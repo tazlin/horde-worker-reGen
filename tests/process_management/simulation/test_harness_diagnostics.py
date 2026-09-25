@@ -29,6 +29,7 @@ from horde_worker_regen.process_management.simulation.fake_worker_processes impo
     start_fake_inference_process,
     start_fake_safety_process,
 )
+from horde_worker_regen.run_root import ABORT_SENTINEL_NAME, BENCHMARK_ABORT_SENTINEL_NAME
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
@@ -91,32 +92,38 @@ class TestCleanupStaleAbortFile:
     """Tests for `_cleanup_stale_abort_file`."""
 
     def test_removes_file_when_present(self, tmp_path: Path) -> None:
-        """When a .abort file exists, it should be removed."""
-        abort_file = tmp_path / ".abort"
+        """A stale benchmark sentinel should be removed."""
+        abort_file = tmp_path / BENCHMARK_ABORT_SENTINEL_NAME
         abort_file.write_text("")
 
-        with patch("os.getcwd", return_value=str(tmp_path)):
-            _cleanup_stale_abort_file()
+        _cleanup_stale_abort_file()
 
-        assert not abort_file.exists(), ".abort file should have been removed"
+        assert not abort_file.exists(), "the benchmark sentinel should have been removed"
+
+    def test_leaves_the_worker_sentinel_alone(self, tmp_path: Path) -> None:
+        """A worker's ``.abort`` in the same run root may belong to a live worker, so it stays."""
+        worker_abort_file = tmp_path / ABORT_SENTINEL_NAME
+        worker_abort_file.write_text("")
+
+        _cleanup_stale_abort_file()
+
+        assert worker_abort_file.exists()
 
     def test_noop_when_file_absent(self, tmp_path: Path) -> None:
-        """When no .abort file exists, the call should be a no-op."""
-        abort_file = tmp_path / ".abort"
+        """When no benchmark sentinel exists, the call should be a no-op."""
+        abort_file = tmp_path / BENCHMARK_ABORT_SENTINEL_NAME
         assert not abort_file.exists()
 
-        with patch("os.getcwd", return_value=str(tmp_path)):
-            _cleanup_stale_abort_file()
+        _cleanup_stale_abort_file()
 
         assert not abort_file.exists()
 
     def test_noop_when_os_remove_raises(self, tmp_path: Path) -> None:
         """If the unlink fails the exception should propagate so the caller knows cleanup couldn't proceed."""
-        abort_file = tmp_path / ".abort"
+        abort_file = tmp_path / BENCHMARK_ABORT_SENTINEL_NAME
         abort_file.write_text("")
 
         with (
-            patch("os.getcwd", return_value=str(tmp_path)),
             patch("pathlib.Path.unlink", side_effect=PermissionError("access denied")),
             pytest.raises(PermissionError),
         ):
