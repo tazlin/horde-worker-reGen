@@ -925,6 +925,13 @@ close that class:
   completing behind it is [a wedge in its own right](#layer-3-save-our-ship-sos-escalation),
   so a condition no watchdog owns still reaches the escalation.
 
+  The image sentinel covers the image pop only. An alchemist-only worker starts no image pop to watch, so
+  the alchemy flow carries its own gate stamp (`WorkerState.alchemy_last_pop_gate`) and its own disclosure
+  (`AlchemyCoordinator._check_pop_liveness`). It fires on the same 60-second window and names the alchemy
+  hold that stood, because a quiet alchemist-only worker is otherwise indistinguishable between the horde
+  having no forms and the flow never asking. No recovery rung reads the alchemy stamp yet, so this
+  disclosure reports the hold rather than acting on it.
+
 ## Rejoining after horde-forced maintenance
 
 Every throttle above exists so the horde never has to force this worker into

@@ -84,6 +84,10 @@ _MODEL_REFERENCE_STALE_RE = pattern_for("model_reference_stale")
 # ``process_manager._full_queue_frozen_line``, logged at ERROR on a repeat clock.
 _POP_LIVENESS_FROZEN_RE = pattern_for("pop_liveness_frozen")
 _POP_LIVENESS_FROZEN_FIELDS_RE = pattern_for("pop_liveness_frozen_fields")
+# The alchemy flow's own silence disclosure: an alchemist-only worker's whole intake path held at a gate.
+# Producer: ``alchemy_popper._alchemy_pop_liveness_line``, logged at WARNING then ERROR on a repeat clock.
+_ALCHEMY_POP_LIVENESS_RE = pattern_for("alchemy_pop_liveness")
+_ALCHEMY_POP_LIVENESS_FIELDS_RE = pattern_for("alchemy_pop_liveness_fields")
 # The whole-card residency governor's ENTER parenthetical names the model holding the card. Producer:
 # ``PopGovernorRegistry`` via the scheduler's residency spell.
 _RESIDENCY_GOVERNOR_MODEL_RE = pattern_for("residency_governor_model")
@@ -2278,6 +2282,44 @@ def detect_pop_liveness_full_queue(context: SessionContext) -> list[Finding]:
     ]
 
 
+def detect_alchemy_pop_liveness(context: SessionContext) -> list[Finding]:
+    """The alchemy flow went silent with no pop reaching the horde: an alchemist-only worker served nothing.
+
+    On an alchemist-only worker the alchemy pop is the whole intake path, so its silence is the whole story:
+    no alchemy work was served, and the gate the worker named says why. It is the alchemy mirror of
+    :func:`detect_pop_liveness_full_queue`, and the one line that separates "the horde had no forms" from
+    "the worker never asked".
+    """
+    silent = _matching(context.session.records, _ALCHEMY_POP_LIVENESS_RE)
+    if not silent:
+        return []
+    worst = 0
+    gates: list[str] = []
+    for record in silent:
+        fields = _ALCHEMY_POP_LIVENESS_FIELDS_RE.search(record.message)
+        if fields is None:
+            continue
+        worst = max(worst, int(fields.group("seconds")))
+        gates.append(fields.group("gate"))
+    named = _distinct_ordered(gates)
+    if named:
+        headline = (
+            f'Alchemy work was held {len(silent)} times, for as long as {worst} seconds, at "{_clause_join(named)}".'
+        )
+    elif worst:
+        headline = f"Alchemy work went quiet {len(silent)} times, for as long as {worst} seconds."
+    else:
+        headline = f"Alchemy work went quiet {len(silent)} times with no condition named."
+    return [
+        Finding(
+            kind=FindingKind.ALCHEMY_POP_LIVENESS,
+            severity=Severity.CRITICAL if worst >= 300 else Severity.WARNING,
+            headline=headline,
+            evidence=[_evidence(record) for record in silent[:3]],
+        ),
+    ]
+
+
 def detect_model_reference_sample_fault(context: SessionContext) -> list[Finding]:
     """A sample stage faulted because the model reference was unreadable while the job was in flight.
 
@@ -2993,6 +3035,7 @@ DETECTORS: list[Detector] = [
     detect_whole_card_pop_claim_monopoly,
     detect_whole_card_pop_claim_episodes,
     detect_pop_liveness_full_queue,
+    detect_alchemy_pop_liveness,
     detect_head_dispatch_stall,
     detect_residency_reconciliation_holds,
     detect_faulted_job_census,

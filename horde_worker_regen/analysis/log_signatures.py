@@ -85,6 +85,9 @@ _HORDELIB_READOUT_NOT_EXERCISED = (
 _TEXT_BACKEND_NOT_LAUNCHED = (
     "printed once by the text backend into its own `logs/text_backend.log`, which a dry run never launches"
 )
+_ALCHEMY_SILENCE_NOT_EXERCISED = (
+    "the dry-run harness never leaves alchemy pops held for a minute, so the silence disclosure never fires"
+)
 
 _SIGNATURE_LIST: list[LogSignature] = [
     # --- Per-job lifecycle ---
@@ -510,6 +513,29 @@ _SIGNATURE_LIST: list[LogSignature] = [
         ),
         dry_run_reason=_NO_FAULT,
         field_of="pop_liveness_frozen",
+    ),
+    _signature(
+        "alchemy_pop_liveness",
+        r"Alchemy pop liveness: no alchemy pop has reached the horde",
+        emitter="process_management.jobs.alchemy_popper:_alchemy_pop_liveness_line",
+        sample=(
+            "Alchemy pop liveness: no alchemy pop has reached the horde for 301s; pops are held at gate "
+            "'alchemy_vram_headroom' (held 301s). This worker has served no alchemy work while that gate "
+            "stands, so check whatever it waits on (the lanes, the queue, or the horde)."
+        ),
+        dry_run_reason=_ALCHEMY_SILENCE_NOT_EXERCISED,
+    ),
+    _signature(
+        "alchemy_pop_liveness_fields",
+        r"Alchemy pop liveness: no alchemy pop has reached the horde for (?P<seconds>\d+)s; pops are held at "
+        r"gate '(?P<gate>[^']*)' \(held (?P<held>\d+)s\)",
+        emitter="process_management.jobs.alchemy_popper:_alchemy_pop_liveness_line",
+        sample=(
+            "Alchemy pop liveness: no alchemy pop has reached the horde for 301s; pops are held at gate "
+            "'alchemy_vram_headroom' (held 301s)"
+        ),
+        dry_run_reason=_ALCHEMY_SILENCE_NOT_EXERCISED,
+        field_of="alchemy_pop_liveness",
     ),
     _signature(
         "residency_governor_model",

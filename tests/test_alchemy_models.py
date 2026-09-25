@@ -950,6 +950,10 @@ class _StubState:
         self.gpu_torch_incompatible = gpu_torch_incompatible
         self.recovery_parked = recovery_parked
         self.downloads_only_hold = downloads_only_hold
+        # Alchemy pop-liveness stamps the coordinator writes; the policy-only double has no disclosure to drive.
+        self.alchemy_last_pop_gate: str | None = None
+        self.alchemy_last_pop_gate_since = 0.0
+        self.alchemy_last_pop_attempt_completed_at = 0.0
 
     @property
     def workload_intake_paused(self) -> bool:

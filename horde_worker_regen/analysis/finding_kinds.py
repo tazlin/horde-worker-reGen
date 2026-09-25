@@ -95,6 +95,7 @@ class FindingKind(enum.StrEnum):
     SAFETY_STAGE_STALL = "safety_stage_stall"
     SAFETY_STAGE_CAPACITY = "safety_stage_capacity"
     POP_LIVENESS_FULL_QUEUE = "pop_liveness_full_queue"
+    ALCHEMY_POP_LIVENESS = "alchemy_pop_liveness"
     PARENT_LOOP_STALL = "parent_loop_stall"
     LANE_PLACEMENT = "lane_placement"
 
@@ -522,6 +523,20 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "pacing itself. The log names what the next job was waiting for where the scheduler knows."
         ),
         see_also=FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
+    ),
+    FindingSpec(
+        kind=FindingKind.ALCHEMY_POP_LIVENESS,
+        title="Alchemy work stopped reaching the horde",
+        action=(
+            "Open the log line named in the evidence. It names the condition that held the work back. Fix that "
+            "condition."
+        ),
+        detail=(
+            "The alchemy flow is the whole intake path on a worker that serves no image work. Every condition "
+            "that holds it back is silent, so a quiet worker read the same whether the horde had no forms or "
+            "the worker never asked. It now says so and names the condition."
+        ),
+        see_also=FindingKind.POP_LIVENESS_FULL_QUEUE,
     ),
     FindingSpec(
         kind=FindingKind.PARENT_LOOP_STALL,

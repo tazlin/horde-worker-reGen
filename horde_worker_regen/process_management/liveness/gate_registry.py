@@ -125,6 +125,16 @@ _POP_GATE_WEDGE_BACKSTOP = (
 )
 """The escalation that covers a pop gate which stands with no pop attempt reaching the horde."""
 
+_ALCHEMY_POP_GATE_BACKSTOP = (
+    "AlchemyCoordinator._check_pop_liveness (ALCHEMY_POP_LIVENESS_ERROR_SECONDS), which discloses the hold "
+    "the way HordeWorkerProcessManager._check_pop_liveness does for the image intake"
+)
+"""The disclosure that covers an alchemy pop gate which stands with no pop attempt reaching the horde.
+
+The image flow's recovery coordinator reads ``WorkerState.last_pop_gate``; the alchemy flow keeps its own
+``alchemy_last_pop_gate`` and no recovery rung reads it yet, so a held alchemy pop is reported, not acted on.
+"""
+
 _FULL_QUEUE_BACKSTOP = (
     "HordeWorkerProcessManager._check_full_queue_liveness (POP_LIVENESS_FROZEN_QUEUE_SECONDS), then "
     + _POP_GATE_WEDGE_BACKSTOP
@@ -680,6 +690,76 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         bound_source="",
         backstop=_POP_GATE_WEDGE_BACKSTOP,
         observable_at="the edge-triggered empty-offer warning line, and the last_pop_gate stamp",
+    ),
+    GateEntry(
+        key="alchemy_not_served",
+        surface=GateSurface.POP_GATE,
+        kind=GateKind.HOLD,
+        subsystem="process_management.config.worker_state",
+        engaged_by=(
+            "the alchemist role is off, so the worker serves no alchemy forms and the alchemy flow stays quiet"
+        ),
+        released_by="the operator turning the alchemist role on, which a config reload picks up",
+        bound_seconds=None,
+        bound_source="",
+        backstop=(
+            "none by design; the operator chose not to serve alchemy, and the alchemy liveness disclosure "
+            "stays silent for it rather than reporting an intended stop as a wedge"
+        ),
+        observable_at="the alchemy_last_pop_gate stamp, and the enabled-workloads set",
+    ),
+    GateEntry(
+        key="alchemy_no_forms_offered",
+        surface=GateSurface.POP_GATE,
+        kind=GateKind.HOLD,
+        subsystem="process_management.jobs.alchemy_popper",
+        engaged_by=(
+            "no alchemy form can be advertised: none is configured, an empty offer is never sent, or the offer "
+            "narrowed to empty because every configured form's model is missing or its serving lane is down"
+        ),
+        released_by=(
+            "the inputs changing on a later cycle: a form configured, a download finishing, or the lane that "
+            "serves a form coming up"
+        ),
+        bound_seconds=None,
+        bound_source="",
+        backstop=_ALCHEMY_POP_GATE_BACKSTOP,
+        observable_at=(
+            "the 'No alchemy forms available' line with its skipped reasons, and the alchemy_last_pop_gate stamp"
+        ),
+    ),
+    GateEntry(
+        key="alchemy_image_priority",
+        surface=GateSurface.POP_GATE,
+        kind=GateKind.HOLD,
+        subsystem="process_management.jobs.alchemy_popper",
+        engaged_by=(
+            "image generation owns the lanes a graph alchemy form would share: in backfill mode the image queue "
+            "is not drained, or in concurrent mode no spare image lane is idle for a graph form"
+        ),
+        released_by=(
+            "the image queue draining, or an image lane freeing up. CLIP-only alchemy forms do not contend and "
+            "are never held by this gate"
+        ),
+        bound_seconds=None,
+        bound_source="",
+        backstop=_ALCHEMY_POP_GATE_BACKSTOP,
+        observable_at="WorkerState.alchemy_last_pop_gate, and the alchemy liveness disclosure",
+    ),
+    GateEntry(
+        key="alchemy_vram_headroom",
+        surface=GateSurface.POP_GATE,
+        kind=GateKind.HOLD,
+        subsystem="process_management.jobs.alchemy_popper",
+        engaged_by=(
+            "measured free VRAM on every card a form could land on, minus the committed ledger, does not cover "
+            "a typical alchemy form"
+        ),
+        released_by="free VRAM recovering above the estimator's requirement on some capable card",
+        bound_seconds=None,
+        bound_source="",
+        backstop=_ALCHEMY_POP_GATE_BACKSTOP,
+        observable_at="the alchemy headroom samples, and the alchemy_last_pop_gate stamp",
     ),
     # endregion
     # region whole-card churn governors
