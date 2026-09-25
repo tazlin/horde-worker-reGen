@@ -23,7 +23,8 @@ child that dies on every start, indefinitely, while every signal that would esca
 3. No failure-independent backstop. Job pops can be held at a gate (``no_safety_process`` among them) for
    hours with no jobs flowing. The pop-liveness sentinel logs that, and nothing consumes it: no wedge
    assessment keys on a held gate. Contract: a pop gate held past a threshold with zero job flow is a wedge
-   regardless of which gate it is, since the gate's own cause cannot satisfy a completed-work signal.
+   regardless of which gate it is, since the gate's own cause cannot satisfy a completed-work signal. Job flow
+   means a job reaching submit: an inference result that then waits on a stalled safety stage is not flow.
 
 4. A backstop that recreates its own trigger. The remedy for a held gate is a pool teardown, and a worker on
    its first run is held at ``no_safety_process`` precisely because its safety models are still downloading.
@@ -44,6 +45,7 @@ import time
 from typing import Any
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -67,7 +69,12 @@ from horde_worker_regen.process_management.models.model_availability import (
     ModelAvailability,
 )
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
-from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_mock_process_info,
+    make_testable_process_manager,
+    track_popped_job_async,
+)
 
 _SLOW_RESPAWN_SECONDS = CRASH_LOOP_WINDOW_SECONDS / 2
 """Spacing between rebuilds that the sliding-window breaker can never accumulate past its threshold.
@@ -91,6 +98,9 @@ _GATE_HELD_SECONDS = 3600.0
 
 _BRIEF_GATE_HELD_SECONDS = 30.0
 """A gate hold short enough that no threshold should treat it as a wedge."""
+
+_PARKED_RESULTS = 6
+"""Inference results that land after a hold begins and then wait on a safety stage that never drains."""
 
 _STARTUP_HANG_TIMEOUT_SECONDS = 60.0
 """The startup timeout a wedged safety child is judged against."""
@@ -219,6 +229,34 @@ def _safety_child_reaches_readiness(lifecycle: ProcessLifecycleManager) -> None:
         process_type=HordeProcessType.SAFETY,
     )
     lifecycle._observe_safety_pool_readiness()
+
+
+async def _park_a_result_behind_safety(pm: HordeWorkerProcessManager) -> ImageGenerateJobPopResponse:
+    """Carry one popped job through inference into the safety queue, counting its result as the dispatcher does."""
+    tracker = pm._job_tracker
+    job = await track_popped_job_async(tracker, make_job_pop_response())
+    await tracker.mark_inference_started(job)
+    await tracker.release_in_progress(job)
+    assert job.id_ is not None
+    await tracker.drop_pending_inference_by_id(job.id_)
+    job_info = await tracker.get_job_info(job)
+    assert job_info is not None
+    await tracker.queue_for_safety(job_info)
+    await tracker.increment_jobs_completed()
+    return job
+
+
+async def _submit_after_safety(pm: HordeWorkerProcessManager, job: ImageGenerateJobPopResponse) -> None:
+    """Carry a job waiting on safety through its check and its submit."""
+    tracker = pm._job_tracker
+    job_info = await tracker.get_job_info(job)
+    assert job_info is not None
+    await tracker.begin_safety_check(job_info)
+    assert job.id_ is not None
+    checked = await tracker.take_being_safety_checked(job.id_)
+    assert checked is not None
+    await tracker.queue_for_submit(checked)
+    await tracker.finalize_submitted(checked)
 
 
 def _hold_pop_gate(pm: HordeWorkerProcessManager, clock: _FakeClock, gate: str, held_seconds: float) -> None:
@@ -566,6 +604,80 @@ class TestHeldPopGateBackstop:
         pm._state.last_pop_attempt_completed_at = clock.now
 
         assert pm._recovery_coordinator.assess_wedge() is False
+
+    async def test_results_parked_behind_safety_do_not_excuse_the_hold(self) -> None:
+        """Inference results that land and then wait on safety are not work completing behind the gate.
+
+        Every result raises ``total_num_completed_jobs``, including one that parks in the safety queue, so a
+        backstop that took that counter as its proof let a wedged safety stage excuse its own hold.
+        """
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        pm._recovery_coordinator._clock = clock
+        _hold_pop_gate(pm, clock, "no_safety_process", 0.0)
+        assert pm._recovery_coordinator.pop_gate_wedge_active() is False
+
+        for _ in range(_PARKED_RESULTS):
+            await _park_a_result_behind_safety(pm)
+        clock.advance(_GATE_HELD_SECONDS)
+
+        assert len(pm._job_tracker.jobs_pending_safety_check) == _PARKED_RESULTS
+        assert pm._job_tracker.total_num_completed_jobs == _PARKED_RESULTS
+        assert pm._recovery_coordinator.pop_gate_wedge_active() is True, (
+            f"{_PARKED_RESULTS} results parked behind a safety stage that never drained excused a pop gate "
+            f"held for {_GATE_HELD_SECONDS:.0f}s, though not one job reached submit"
+        )
+
+    async def test_a_job_that_submits_excuses_the_hold(self) -> None:
+        """A job that clears safety and submits while the gate holds is the proof the hold is backpressure."""
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        pm._recovery_coordinator._clock = clock
+        _hold_pop_gate(pm, clock, "queue_full", 0.0)
+        assert pm._recovery_coordinator.pop_gate_wedge_active() is False
+
+        job = await _park_a_result_behind_safety(pm)
+        await _submit_after_safety(pm, job)
+        clock.advance(_GATE_HELD_SECONDS)
+
+        assert pm._job_tracker.total_num_successful_submits == 1
+        assert pm._recovery_coordinator.pop_gate_wedge_active() is False
+
+
+class TestEpisodeProgressNeedsASubmit:
+    """A recovery episode's aggregate progress proof is a job reaching submit, the proof the held gate uses."""
+
+    async def test_results_parked_behind_safety_are_not_episode_progress(self) -> None:
+        """Results that land and then wait on a stalled safety stage do not close or reset the escalation.
+
+        Each one raises ``total_num_completed_jobs``, so a proof taken from that counter let the stalled stage
+        manufacture its own recovery.
+        """
+        pm = make_testable_process_manager()
+        coordinator = pm._recovery_coordinator
+        coordinator._capture_progress_baseline()
+        assert coordinator.episode_frontier_baseline is None
+
+        for _ in range(_PARKED_RESULTS):
+            await _park_a_result_behind_safety(pm)
+
+        assert pm._job_tracker.total_num_completed_jobs == _PARKED_RESULTS
+        assert coordinator.made_progress_since_episode() is False, (
+            f"{_PARKED_RESULTS} results parked behind a safety stage that never drained counted as progress "
+            "since the episode opened, though not one job reached submit"
+        )
+
+    async def test_a_job_that_submits_is_episode_progress(self) -> None:
+        """A job that clears safety and submits after the baseline is forward motion."""
+        pm = make_testable_process_manager()
+        coordinator = pm._recovery_coordinator
+        coordinator._capture_progress_baseline()
+
+        job = await _park_a_result_behind_safety(pm)
+        await _submit_after_safety(pm, job)
+
+        assert pm._job_tracker.total_num_successful_submits == 1
+        assert coordinator.made_progress_since_episode() is True
 
 
 def _safety_download_status(downloaded_bytes: int) -> DownloadStatusSnapshot:

@@ -1339,6 +1339,13 @@ class JobPopper:
         """Seconds the megapixelstep wait is still holding pops, or None when it is not engaged."""
         return self._pop_throttler.megapixelstep_wait_remaining(bridge_data, now=now)
 
+    def set_max_inference_processes(self, max_inference_processes: int) -> None:
+        """Mutate the cached worker-wide inference ceiling after the per-card targets change at runtime.
+
+        Fed by :meth:`ProcessLifecycleManager.refresh_max_inference_processes` through the process manager.
+        """
+        self._max_inference_processes = max_inference_processes
+
     def set_canned_job_source(self, source: CannedJobSource | None) -> None:
         """Swap the canned job source at runtime (a warm benchmark worker's level boundary)."""
         self._canned_job_source = source

@@ -492,7 +492,7 @@ manager-side **actions**:
   every process idle, held long enough to rule out the transient all-idle gap
   between jobs), a recurring [orphaned-job](#stranded-in-progress-jobs) punt
   storm, or job pops held at one gate past `POP_GATE_HELD_WEDGE_SECONDS` with
-  nothing completing behind it. A busy, slow, replacing, or model-loading worker is never wedged, and a
+  no job submitted behind it. A busy, slow, replacing, or model-loading worker is never wedged, and a
   queue deliberately held while a heavy model establishes whole-card residency is
   excused by a bounded grace, as is one held while a churn governor defers a new
   whole-card establishment (see
@@ -521,7 +521,17 @@ manager-side **actions**:
   from `ProcessMap` while its respawn waits for device-free headroom, but SOS
   treats that as recoverable capacity while the wait is young or free-VRAM
   readings show drain progress. If the card never recovers past the bounded
-  no-progress window, the normal unrecoverable-pool checks resume.
+  no-progress window, the normal unrecoverable-pool checks resume. A deferred
+  safety start does not wait on them: at the same window the lifecycle starts
+  safety on the CPU (see
+  [deferred GPU starts](process_lifecycle.md#process-replacement)), because every
+  SOS remedy rebuilds the pool and re-defers the start against the same card. A
+  deferred inference start is retired at that window while another inference
+  lane exists, so its entry stops counting as recoverable capacity; the worker's
+  last lane stays pending and is left to these checks. A retired slot returns once
+  its card has held room for a start through a restore dwell. Retired and
+  quarantined slots count together against the planned ceiling, so a pool whose
+  last lane is quarantined after the others were retired is unrecoverable.
   `run_recovery_supervisor()` runs each control-loop tick and applies the
   returned action.
 
@@ -529,13 +539,18 @@ manager-side **actions**:
   intake path just as effectively, so the assessment also carries one
   **failure-independent backstop**: pops held at the same gate for longer than
   `POP_GATE_HELD_WEDGE_SECONDS` (15 minutes), with no pop attempt reaching the
-  horde in that span and no job completed since the hold began, is a wedge
-  whichever gate it is. Completed work is the proof it keys on precisely because
-  no gate-holding failure can produce one on its own, which is what lets the check
-  stand over gates added later. The two liveness clauses are also what keep
-  ordinary backpressure out: a worker whose local queue is full holds a gate
-  continuously and attempts no pops while doing so, and its completions excuse the
-  hold whatever its length. The threshold sits above every in-place remedy window
+  horde in that span and no job submitted since the hold began, is a wedge
+  whichever gate it is. Work completed end to end is the proof it keys on
+  precisely because no gate-holding failure can produce it on its own, which is
+  what lets the check stand over gates added later. The count is
+  `JobTracker.total_num_successful_submits`: jobs whose unfaulted generation
+  cleared every stage, safety included, and finished submitting.
+  `total_num_completed_jobs` cannot serve here, because it rises on every inference
+  result, including results that then wait on a safety stage that never drains, so
+  a wedge behind the sampler would excuse its own hold. The two liveness clauses
+  are also what keep ordinary backpressure out: a worker whose local queue is full
+  holds a gate continuously and attempts no pops while doing so, and its submits
+  excuse the hold whatever its length. The threshold sits above every in-place remedy window
   the worker gives a condition to clear itself (600 s at the widest), so the
   watchdog that owns the condition always acts first and this only sees what it
   left unresolved. A held-gate wedge escalates through the same ladder as any
@@ -600,12 +615,24 @@ manager-side **actions**:
   across the transient window, so a pool that keeps rebuilding without ever serving
   work climbs the ladder to give-up instead.
 
+  Safety readiness is part of the close as well. While a safety start is deferred,
+  or pops are held at `no_safety_process` with no safety process ready, the episode
+  stays open and `Save-our-ship: pools recovered` is not logged, whatever the streak
+  and the frontier say: every finished image waits on safety, so a rebuilt pool
+  without one has not recovered. This holds the close only. It is not a wedge
+  signal and triggers no action; the deferred start's own CPU escalation is what
+  brings safety back.
+
   When accepted work exists, the progress signal is movement of the episode's
   recovery frontier: the oldest unresolved accepted job must advance to a later stage
   or complete successfully. Faulting or requeueing that head is not progress the
   recovery path may use to prove itself. A follower starting or completing cannot prove that an unchanged
-  blocked head recovered. Aggregate completion and stage counters remain the
-  fallback for pool-level episodes with no accepted frontier. If unrelated work
+  blocked head recovered. Aggregate submit and stage counters remain the
+  fallback for pool-level episodes with no accepted frontier. Their end-to-end
+  proof is `JobTracker.total_num_successful_submits`, the count the held-gate
+  backstop uses, never `total_num_completed_jobs`: results that land and then park
+  behind a stalled safety stage raise the latter, and would close the episode that
+  stage should be climbing. If unrelated work
   advances while the frontier does not, it may earn one observation interval for
   that throughput to reach the head; this delay neither closes the episode nor
   consumes a reset/give-up rung, and it cannot repeat within the episode. The
@@ -760,8 +787,9 @@ declares that something outside the worker will restart it. See
 
 ## What counts as progress
 
-An escalation resets only on forward motion the failure could not have produced itself. A completed job
-counts unconditionally: it proves every downstream stage cleared. An inference *start* is only an attempt,
+An escalation resets only on forward motion the failure could not have produced itself. A job that
+reaches submit counts unconditionally: it proves every downstream stage cleared. A completed inference
+result does not, since it may be waiting on a stage that never drains. An inference *start* is only an attempt,
 so it counts only while no downstream stage is holding accepted work. A post-processing or safety backlog
 keeps admitting fresh starts while nothing leaves the stage, so crediting those starts would let the
 stalled stage manufacture its own proof of recovery and close the very episode that should be climbing.

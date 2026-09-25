@@ -258,6 +258,9 @@ def test_a_lane_paused_while_safety_is_off_gpu_returns_to_its_own_card() -> None
     Re-deriving the placement at the restore reads a card map the pause itself distorted (with safety held
     off-GPU, its card looks like the emptiest one), which is how the lane landed on card 0 on top of the
     safety context and a whole-card model.
+
+    On a host with more than one card safety's residency is fixed, so the reclaim ladder cannot take it off
+    its card. It still leaves the card when the card's config stops permitting it, which is the route here.
     """
     adapters: list[_FakeUtilitiesAdapter] = []
     plm = _make_placement_plm(
@@ -269,9 +272,12 @@ def test_a_lane_paused_while_safety_is_off_gpu_returns_to_its_own_card() -> None
     assert plm.start_safety_processes() is True
     assert plm.start_post_process_processes() is True
     assert _post_process_device(plm) == 1
+    assert plm.safety_residency_fixed is True
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is False
 
-    # The reclaim ladder takes safety off-GPU, then stops the lane.
-    assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    # A config reload withdraws the permission, which takes safety off-GPU; the reclaim ladder stops the lane.
+    plm._runtime_config.bridge_data.safety_on_gpu = False
+    assert plm.demote_safety_from_unpermitted_card() is True
     assert plm.safety_gpu_card_index() is None
     assert plm.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
     _tear_down_paused_post_process_lane(plm)
@@ -459,3 +465,61 @@ def test_a_ready_safety_process_does_not_disturb_a_lane_on_another_card() -> Non
         assert _post_process_device(plm) == 1
 
     assert notices == []
+
+
+def _drive_safety_rebuild(plm: ProcessLifecycleManager) -> None:
+    """Rebuild the safety pool the way a soft reset does and drive the replacement until a new child exists."""
+    original = plm._process_map.get_safety_process()
+    plm.rebuild_safety_pool(reason="soft reset #1")
+    for _ in range(4):
+        plm._replace_all_safety_process()
+        replacement = plm._process_map.get_safety_process()
+        if replacement is not None and replacement is not original:
+            return
+        if original is not None and original.process_id in plm._process_map:
+            # The old child has been asked to end; it exits and reports so.
+            original.mp_process.is_alive.return_value = False  # pyrefly: ignore[missing-attribute]
+            original.last_process_state = HordeProcessState.PROCESS_ENDED
+    raise AssertionError("the supervised rebuild did not spawn a replacement safety process")
+
+
+def test_a_soft_reset_rebuild_places_safety_on_the_card_with_the_most_headroom() -> None:
+    """A rebuild re-runs the headroom chooser instead of keeping the pin safety had before the reset."""
+    adapters: list[_FakeUtilitiesAdapter] = []
+    free_mb_by_device = {0: 23000.0, 1: 20000.0}
+    plm = _make_placement_plm(
+        device_indices=(0, 1),
+        free_mb_by_device=free_mb_by_device,
+        safety_on_gpu=True,
+        utilities_adapters=adapters,
+    )
+    plm.set_safety_card_chooser(lambda: max(free_mb_by_device, key=lambda index: free_mb_by_device[index]))
+    assert plm.start_safety_processes() is True
+    assert plm.safety_gpu_card_index() == 0
+
+    # Card 0 fills with a tenant the reclaim ladder cannot evict; card 1 now holds the most headroom.
+    free_mb_by_device[0] = 600.0
+    _drive_safety_rebuild(plm)
+
+    assert plm.safety_gpu_card_index() == 1
+    assert plm._new_process.call_args.kwargs["kwargs"]["device_index"] == 1  # pyrefly: ignore[missing-attribute]
+
+
+def test_a_single_card_rebuild_keeps_the_historical_pin() -> None:
+    """With one card the rebuild leaves the desired card unset, so the spawn is unchanged."""
+    adapters: list[_FakeUtilitiesAdapter] = []
+    plm = _make_placement_plm(
+        device_indices=(0,),
+        free_mb_by_device={0: 20000.0},
+        safety_on_gpu=True,
+        utilities_adapters=adapters,
+    )
+    chooser = Mock(return_value=0)
+    plm.set_safety_card_chooser(chooser)
+    assert plm.start_safety_processes() is True
+
+    _drive_safety_rebuild(plm)
+
+    chooser.assert_not_called()
+    assert plm._desired_safety_card is None
+    assert plm.safety_gpu_card_index() == 0

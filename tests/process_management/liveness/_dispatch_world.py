@@ -3175,6 +3175,7 @@ def _make_mock_lifecycle(world: _DispatchWorld) -> Mock:
     lifecycle.pending_gpu_starts_backing_off = Mock(return_value=False)
     lifecycle.has_pending_safety_starts = Mock(return_value=False)
     lifecycle.quarantined_inference_slots = frozenset()
+    lifecycle.num_inference_slots_retired = 0
     lifecycle.safety_pool_failing = False
     lifecycle.safety_pool_start_failing = False
     return lifecycle

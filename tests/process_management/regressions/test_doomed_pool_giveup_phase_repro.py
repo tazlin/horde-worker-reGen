@@ -366,9 +366,11 @@ class TestGiveUpDoesNotOverAbort:
         pm._recovery_coordinator.run_recovery_supervisor()
         assert pm._recovery_coordinator.episode_saw_unrecoverable_pool is True
 
-        # The pool genuinely recovers and serves a job: un-quarantine and record a completion past the baseline.
+        # The pool genuinely recovers and serves a job: un-quarantine and record a submit past the baseline (a
+        # result landing is not progress the episode accepts).
         lifecycle._quarantined_inference_slots = set()
         pm._job_tracker._total_num_completed_jobs += 1
+        pm._job_tracker._total_num_successful_submits += 1
 
         # Tick well past the give-up age. The served progress clears the latch, so give-up declines to abort.
         for _ in range(6):

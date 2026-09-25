@@ -34,6 +34,7 @@ from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator
     WorkerRecoveryCoordinator,
 )
 from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
+from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
@@ -44,6 +45,16 @@ from tests.process_management.conftest import (
     make_test_card_runtimes,
     make_test_runtime_config,
     track_popped_job_async,
+)
+from tests.process_management.regressions.test_inference_start_retirement_repro import (
+    _CARD_TOTAL_MB as _RETIREMENT_CARD_TOTAL_MB,
+)
+from tests.process_management.regressions.test_inference_start_retirement_repro import (
+    _STALLED_CARD,
+    _bring_up_the_pool,
+    _Cards,
+    _retirement_events,
+    _two_card_lifecycle,
 )
 
 
@@ -428,6 +439,51 @@ def test_a_worker_that_plans_no_inference_process_has_no_unrecoverable_pool() ->
         max_inference_processes_provider=lambda: 0,
         terminal_recovery_callback=lambda: RecoveryDisposition.RESTART_PROCESS,
     )
+
+    assert coordinator.is_inference_pool_unrecoverable() is False
+
+
+def _coordinator_over_lost_slots(
+    *,
+    quarantined: frozenset[int],
+    retired: int,
+    live_ceiling: int,
+) -> WorkerRecoveryCoordinator:
+    """Build a coordinator whose lifecycle reports these lost slots against a ceiling retirement already lowered."""
+    bridge_data = Mock()
+    bridge_data.max_threads = 1
+    lifecycle = Mock()
+    lifecycle.has_pending_inference_starts.return_value = False
+    lifecycle.pending_gpu_starts_backing_off.return_value = False
+    lifecycle.quarantined_inference_slots = quarantined
+    lifecycle.num_inference_slots_retired = retired
+
+    return WorkerRecoveryCoordinator(
+        state=WorkerState(),
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+        job_tracker=JobTracker(),
+        process_map=ProcessMap({}),
+        process_lifecycle=lifecycle,
+        message_dispatcher=Mock(),
+        inference_scheduler=Mock(),
+        action_ledger=ActionLedger(),
+        reserve_ledger=CommittedReserveLedger(),
+        bridge_data_provider=lambda: bridge_data,
+        max_inference_processes_provider=lambda: live_ceiling,
+        terminal_recovery_callback=lambda: RecoveryDisposition.RESTART_PROCESS,
+    )
+
+
+def test_retired_and_quarantined_slots_together_make_the_pool_unrecoverable() -> None:
+    """Two planned lanes, one retired and the other quarantined: no slot is left to serve on."""
+    coordinator = _coordinator_over_lost_slots(quarantined=frozenset({2}), retired=1, live_ceiling=1)
+
+    assert coordinator.is_inference_pool_unrecoverable() is True
+
+
+def test_a_retired_slot_beside_a_serving_lane_is_not_an_unrecoverable_pool() -> None:
+    """The pair: with the other lane still serving, a retirement alone loses only the retired slot."""
+    coordinator = _coordinator_over_lost_slots(quarantined=frozenset(), retired=1, live_ceiling=1)
 
     assert coordinator.is_inference_pool_unrecoverable() is False
 
@@ -2213,6 +2269,7 @@ class TestGiveUpDefersToAuxPrefetch:
         lifecycle.pending_gpu_starts_backing_off.return_value = False
         lifecycle.has_pending_safety_starts.return_value = False
         lifecycle.quarantined_inference_slots = frozenset()
+        lifecycle.num_inference_slots_retired = 0
         lifecycle.safety_pool_failing = False
 
         dispatcher = Mock()
@@ -2623,3 +2680,58 @@ class TestEnvironmentFatalCrashSurfacing:
             logger.remove(handler_id)
 
         assert [line for line in captured if "host-environment failure" in line] == []
+
+
+class TestStructuralInferenceStartShortfall:
+    """A deferred inference start its card can never make room for takes its bounded outcome at once."""
+
+    @staticmethod
+    def _lifecycle_with_standing_floor(*, room_mb: float) -> tuple[ProcessLifecycleManager, float]:
+        """Return a two-card lifecycle whose stalled card has a standing floor leaving ``room_mb``, and the floor."""
+        lifecycle = _two_card_lifecycle(_Cards())
+        lifecycle._card_runtimes[_STALLED_CARD].config.vram_admission_noise_mb = None
+        floor_mb = _RETIREMENT_CARD_TOTAL_MB - admission_margin_mb(_RETIREMENT_CARD_TOTAL_MB) - room_mb
+        lifecycle.set_standing_floor_provider(
+            lambda device_index: floor_mb if device_index == _STALLED_CARD else None,
+        )
+        return lifecycle, floor_mb
+
+    def test_a_structural_shortfall_retires_the_slot_on_the_next_drain(self) -> None:
+        """No wait for the no-progress window: the first drain retires the slot and says why, with both numbers."""
+        from loguru import logger
+
+        lifecycle, _floor_mb = self._lifecycle_with_standing_floor(room_mb=677.0)
+        _bring_up_the_pool(lifecycle)
+        required_mb = lifecycle._gpu_start_required_free_mb(_STALLED_CARD)
+        assert required_mb > 677.0
+        warnings: list[str] = []
+        sink_id = logger.add(lambda message: warnings.append(message.record["message"]), level="WARNING")
+        try:
+            lifecycle.drain_pending_gpu_starts()
+        finally:
+            logger.remove(sink_id)
+
+        assert lifecycle.has_pending_inference_starts() is False
+        assert lifecycle.num_inference_slots_retired == 1
+        assert lifecycle._card_runtimes[_STALLED_CARD].target_process_count == 0
+        events = _retirement_events(lifecycle)
+        assert len(events) == 1
+        assert "structural shortfall" in events[0].reason
+        assert any(
+            "structural shortfall" in message
+            and f"needs {required_mb:.0f}MB" in message
+            and "at most 677MB" in message
+            for message in warnings
+        )
+
+    def test_a_drainable_shortfall_keeps_the_slot_pending(self) -> None:
+        """Room the card could still give back leaves the start waiting on headroom."""
+        lifecycle, _floor_mb = self._lifecycle_with_standing_floor(room_mb=4000.0)
+        _bring_up_the_pool(lifecycle)
+        assert lifecycle._gpu_start_required_free_mb(_STALLED_CARD) < 4000.0
+
+        lifecycle.drain_pending_gpu_starts()
+
+        assert lifecycle.has_pending_inference_starts() is True
+        assert lifecycle.num_inference_slots_retired == 0
+        assert _retirement_events(lifecycle) == []

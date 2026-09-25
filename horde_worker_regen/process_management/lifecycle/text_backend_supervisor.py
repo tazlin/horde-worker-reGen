@@ -405,6 +405,12 @@ class TextBackendSupervisor:
         return self._footprint_mb
 
     @property
+    def device_index(self) -> int | None:
+        """Return the card the current launch spec pins the backend to, or None when unpinned or not rendered."""
+        spec = self._launch_spec
+        return None if spec is None else spec.device_index
+
+    @property
     def launch_count(self) -> int:
         """Return how many times a process has been started."""
         return self._launch_count

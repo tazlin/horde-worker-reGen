@@ -452,7 +452,9 @@ async def test_follower_throughput_defers_exactly_one_recovery_action() -> None:
 
     world.structural_wedge = True
     world.tick_recovery()
+    # Served work is a job reaching submit; a result landing is not progress the episode accepts.
     await world.tracker.increment_jobs_completed()
+    world.tracker._total_num_successful_submits += 1
 
     world.tick_recovery()
     assert world.coordinator.unrelated_progress_deferral_spent is True

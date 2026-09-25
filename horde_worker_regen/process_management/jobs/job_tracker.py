@@ -541,6 +541,7 @@ class JobTracker:
 
         self._num_jobs_faulted = 0
         self._total_num_completed_jobs = 0
+        self._total_num_successful_submits = 0
         self._total_num_inference_starts = 0
         self._total_num_post_processing_progress = 0
         self._max_pending_megapixelsteps = 25
@@ -1331,6 +1332,16 @@ class JobTracker:
     def total_num_completed_jobs(self) -> int:
         """Return the total number of completed jobs recorded this session."""
         return self._total_num_completed_jobs
+
+    @property
+    def total_num_successful_submits(self) -> int:
+        """Return how many jobs with an unfaulted generation were finalized through the submit path this session.
+
+        End-to-end completions only: a job counts once it has cleared every stage, safety included, and its
+        submit has finished. Unlike :attr:`total_num_completed_jobs`, which rises on every inference result
+        and every terminal fault, a stall anywhere downstream of the sampler cannot raise it.
+        """
+        return self._total_num_successful_submits
 
     @property
     def total_num_inference_starts(self) -> int:
@@ -2263,6 +2274,7 @@ class JobTracker:
         else:
             self._advance_chain(tracked, GENERATION_PROGRESS.SUBMITTING)
             self._advance_chain(tracked, GENERATION_PROGRESS.SUBMIT_COMPLETE)
+            self._total_num_successful_submits += 1
 
         if self._finalize_observer is not None:
             try:

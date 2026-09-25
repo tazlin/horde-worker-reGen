@@ -306,6 +306,7 @@ class RecoverySupervisor:
         boot_in_progress: bool = False,
         constructive_remedy_available: bool = False,
         unrelated_progress_deferral_available: bool = False,
+        safety_start_pending: bool = False,
     ) -> RecoveryAction:
         """Advance the escalation state machine one tick and return the action to take.
 
@@ -344,6 +345,11 @@ class RecoverySupervisor:
             unrelated_progress_deferral_available: Whether work outside the unchanged recovery frontier moved
                 and the caller still permits its single observation delay. This never closes the episode or
                 spends a recovery rung. The caller must bound it; False preserves the ordinary escalation.
+            safety_start_pending: Whether the safety process is not yet back: its start is deferred, or pops are
+                held for want of a safety process. Every finished image waits on safety, so a pool rebuilt without
+                one has not recovered however the rest of it reads, and the episode stays open until safety is
+                ready. It holds the close only; it never counts as a wedge and never triggers an action.
+                Defaults to False for callers that do not track safety.
         """
         now = self._clock()
         self._give_up_is_terminal = False
@@ -368,13 +374,15 @@ class RecoverySupervisor:
         # transient window to guard against, so the streak alone suffices (a self-healed wedge needs no proof).
         # The gate reads the episode-scoped "spent a reset" fact rather than the remaining budget, because the
         # give-up continuation restores the budget: keying on the budget would re-arm this exemption mid-episode
-        # and let the same rebuild window close an episode that has demonstrably not recovered.
+        # and let the same rebuild window close an episode that has demonstrably not recovered. A pool without a
+        # ready safety process has not recovered either, whatever the streak and the frontier say.
         if (
             self._episode_start is not None
             and not is_wedged
             and self._clean_since is not None
             and (now - self._clean_since) >= self._clean_streak_seconds
             and (not self._episode_spent_a_soft_reset or made_progress)
+            and not safety_start_pending
         ):
             self._close_episode()
             return RecoveryAction.NONE

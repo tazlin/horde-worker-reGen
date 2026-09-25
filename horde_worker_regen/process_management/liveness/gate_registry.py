@@ -120,8 +120,8 @@ def entry_for(surface: GateSurface, key: str) -> GateEntry | None:
 
 
 _POP_GATE_WEDGE_BACKSTOP = (
-    "WorkerRecoveryCoordinator.pop_gate_held_wedge_active (POP_GATE_HELD_WEDGE_SECONDS), with "
-    "HordeWorkerProcessManager._check_pop_liveness disclosing the hold first"
+    "WorkerRecoveryCoordinator.pop_gate_wedge_active (POP_GATE_HELD_WEDGE_SECONDS, with no job submitted "
+    "since the hold began), with HordeWorkerProcessManager._check_pop_liveness disclosing the hold first"
 )
 """The escalation that covers a pop gate which stands with no pop attempt reaching the horde."""
 
@@ -533,10 +533,12 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         bound_seconds=None,
         bound_source="",
         backstop=(
-            "the safety respawn ladder and its futility check, which escalate a safety pool that will not "
-            "come up rather than leaving intake held on a process nothing is rebuilding; on a first run the "
-            "held-gate escalation stands down while the safety models are still arriving, since its remedy "
-            "restarts the very transfer the hold waits on"
+            "a safety start deferred for card headroom that makes no progress for "
+            "PENDING_GPU_START_NO_PROGRESS_SECONDS starts on the CPU instead, and runtime safety placement "
+            "returns it to a permitting card once that card shows durable room; the safety respawn ladder and "
+            "its futility check escalate a safety pool that will not come up rather than leaving intake held on "
+            "a process nothing is rebuilding; on a first run the held-gate escalation stands down while the "
+            "safety models are still arriving, since its remedy restarts the very transfer the hold waits on"
         ),
         observable_at="the process map's safety slot state, and the last_pop_gate stamp",
     ),
@@ -1064,7 +1066,10 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         surface=GateSurface.LANE_PAUSE,
         kind=GateKind.HOLD,
         subsystem="process_management.lifecycle.process_lifecycle",
-        engaged_by="the runtime placement policy moved safety off-GPU because its context did not fit beside sampling",
+        engaged_by=(
+            "the runtime placement policy moved safety off-GPU because its context did not fit beside sampling, "
+            "or a deferred safety GPU start made no headroom progress and was started on the CPU instead"
+        ),
         released_by="the placement policy re-evaluating once sampling frees the room its context needs",
         bound_seconds=None,
         bound_source="",

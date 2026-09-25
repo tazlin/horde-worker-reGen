@@ -246,6 +246,79 @@ inventing a floor. Each deferred start records `PROCESS_START_DEFERRED` in the
 action ledger and is drained by `replace_hung_processes()` before ordinary hung
 detection runs.
 
+Headroom is the only thing that retries a deferred start, and a card whose
+pressure comes from a tenant the reclaim ladder cannot evict (a worker-managed
+text backend, another program) never reaches the floor. A deferred **safety**
+start therefore escalates: once it has waited `PENDING_GPU_START_NO_PROGRESS_SECONDS`
+(600 s) with no free-VRAM progress on its card, the safety process starts on the
+CPU instead. The escalation goes through the existing off-GPU placement: it is
+recorded as a runtime safety placement pause, so
+[runtime safety placement](vram_arbiter.md#runtime-safety-placement) returns
+safety to a card that permits it once that card shows durable room, under the
+same restore dwell a pressure demotion earns. It logs one WARNING naming the
+card, its free reading, the start requirement and the wait, and records
+`SAFETY_START_ESCALATED_TO_CPU` in the action ledger. Drain progress inside the
+window (a free reading rising by at least `PENDING_GPU_START_PROGRESS_EPSILON_MB`)
+keeps the start waiting for the GPU.
+
+The window covers only a shortfall the card could drain. When the start
+requirement exceeds the card's achievable room (its total less the admission
+margin and its standing foreign floor, which includes the worker's managed text
+backend on its card; see [the VRAM arbiter](vram_arbiter.md#the-decision-pipeline)),
+no eviction can meet it and the wait is structural. The next drain escalates a
+safety start to the CPU, or retires an inference slot, exactly as the window
+would. The WARNING and the ledger reason say "structural shortfall" and carry
+the requirement and the room, and the deferral reason logged when the start is
+first deferred carries the same note. A shortfall below the room keeps waiting.
+
+A deferred **inference** start has no CPU fallback. After the same window with no
+progress it is retired, provided another inference lane exists:
+the pending entry is dropped, the slot comes off its card's `target_process_count`
+(the per-card plan the scheduler reads) and off the worker-wide ceiling, so no pool
+start or scale-up places it on that card again, and the worker serves on its other
+lanes. It logs one WARNING naming the card, its free reading, the start
+requirement, the wait and the card's new lane count, and records
+`INFERENCE_START_RETIRED` in the action ledger. The slot is not moved to another
+card, since each card's target is sized from that card's own config. The worker's
+last inference lane is never retired: it stays pending, and once the window has
+passed `pending_gpu_starts_backing_off()` stops excusing it, so the recovery
+escalation treats the pool normally.
+
+A retired slot comes back on its own card once that card has durably had room for
+it (`restore_retired_inference_slots`, run each control tick beside the
+deferred-start drain). The condition is the one a start needs: measured free at or
+above the start requirement, a `HEALTHY` governor, and the requirement within the
+card's achievable room. It must hold without a break for
+`RETIRED_INFERENCE_SLOT_RESTORE_DWELL_SECONDS` (half the no-progress window), and
+any reading that breaks it restarts the clock, so memory a lane frees between jobs
+does not bring the slot back into a start that defers again. A structural shortfall
+never restores. The restore raises the card's target by one, refreshes the
+worker-wide ceiling, records `INFERENCE_SLOT_RESTORED`, logs one INFO line and
+starts the slot on that card. One slot per card is restored per dwell. This matters
+most on a single card, where the retired slot is the second lane on the only card:
+it returns without a restart once the tenant that took its room leaves. Nothing is
+restored while image generation is not served, including after a runtime CPU-only
+torch build.
+
+Every change to the per-card targets goes through `refresh_max_inference_processes`,
+which publishes the new worker-wide ceiling to one listener. The process manager
+updates its own `max_inference_processes`, the scheduler's and the job popper's
+copies from it, so pricing lookahead, affinity and the planned-count budget split
+follow a retirement or a restore. The runtime CPU-only collapse caps each card at
+the smaller of its target and one (`cap_inference_targets`): a card that retired its
+only lane stays at zero, since the collapse only ever removes lanes. The
+recovery coordinator counts retired and quarantined slots together against the
+planned ceiling, so a worker whose remaining lane is quarantined after the others
+were retired reads as an unrecoverable pool.
+
+A supervised safety rebuild (`rebuild_safety_pool`, which the soft reset runs)
+is a fresh placement. On a multi-card host its respawn re-runs the scheduler's
+headroom card choice instead of keeping the card the previous process was pinned
+to, so a card that has since filled with a tenant the reclaim ladder cannot evict
+is not chosen again while another card has room. Each card's `safety_on_gpu`
+permission and whole-card residency apply as at any bring-up. A crash respawn
+keeps its card, and a single-card host is unchanged.
+
 Each replacement is also reported to a **process-recovery observer**
 (`set_process_recovery_observer`); the process manager wires this to
 `WorkerRunMetrics.record_process_crash`, so every crash/hang/replacement lands in
@@ -262,7 +335,23 @@ crash loop spanning levels is still caught.
 
 The safety process gets special treatment: if it dies, the
 `safety_processes_should_be_replaced` flag is set, and any jobs in
-`jobs_being_safety_checked` are requeued to `jobs_pending_safety_check`. A safety
+`jobs_being_safety_checked` are requeued to `jobs_pending_safety_check`.
+
+The safety, post-processing, image-utilities, component and VAE lanes are replaced
+over several control-loop ticks (end, retire, start), and a replaced child is ended
+as an OS process before its map
+entry is retired, whatever state it was in. Retiring an entry only forgets the
+child, and every teardown path walks the process map, so a child that was never
+ended would outlive both its replacement and the parent. A child still in
+`PROCESS_STARTING` has not reached its control loop and cannot read `END_PROCESS`,
+so it is terminated. A child past startup was sent `END_PROCESS` when the
+replacement began and gets the same end grace an inference slot does. A straggler
+is killed. Asking a lane to end does not drop its child from the owned-PID
+registry. A child confirmed dead leaves the registry and records
+`PROCESS_ENDED`; one the kill could not end stays in the registry. The shutdown
+reap and the hard kill both kill whatever the registry still holds outside the map
+before clearing it, so a front end that drives the main loop directly, without the
+atexit backstop, still ends those children. A safety
 placement change also replaces the process, but that is intentional rather than
 crash recovery. Runtime fit policy, whole-card residency, and verified reclaim do
 not issue those replacements independently: they contribute demand to the

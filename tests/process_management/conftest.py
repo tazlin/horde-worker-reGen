@@ -733,6 +733,7 @@ def make_test_recovery_coordinator(
     lifecycle.pending_gpu_starts_backing_off.return_value = False
     lifecycle.has_pending_safety_starts.return_value = False
     lifecycle.quarantined_inference_slots = frozenset()
+    lifecycle.num_inference_slots_retired = 0
     lifecycle.safety_pool_failing = False
     lifecycle.safety_pool_start_failing = False
 

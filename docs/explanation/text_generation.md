@@ -425,9 +425,9 @@ headline figure states.
 
 ## What is not supported yet
 
-- **A shared card is not priced.** When the backend shares a card with image generation, the worker's VRAM
-  admission sees the backend's memory only as the card's foreign floor; it does not yet treat the backend
-  as a tenant it can plan around, pause, or wake.
+- **A shared card is charged, not planned around.** When the backend shares a card with image generation,
+  the worker charges its measured footprint to that card as a standing floor; it does not yet pause, wake
+  or shrink the backend to make room for image work.
 - **The backend cannot be swapped or reconfigured while the worker runs.** Changing which model the
   backend serves means restarting the backend; the worker will notice when the generation it is waiting
   on fails and re-run its readiness gate, but nothing coordinates the two. Which *kind* of backend is

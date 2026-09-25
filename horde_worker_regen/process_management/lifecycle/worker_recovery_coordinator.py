@@ -332,8 +332,8 @@ class WorkerRecoveryCoordinator:
         # closes.
         self.head_recovery_in_flight_since: float | None = None
         # The pop-gate hold currently being judged: the ``last_pop_gate_since`` stamp it is keyed on, and the
-        # completed-job count when that hold was first observed. None while no gate holds pops. Keying on the
-        # stamp means a new hold gets its own baseline without any explicit reset.
+        # successful-submit count when that hold was first observed. None while no gate holds pops. Keying on
+        # the stamp means a new hold gets its own baseline without any explicit reset.
         self.pop_gate_hold_baseline: tuple[float, int] | None = None
         # Edge latch so one held-gate wedge is disclosed once per hold rather than on every assessment tick.
         self.pop_gate_wedge_disclosed_since: float | None = None
@@ -389,6 +389,23 @@ class WorkerRecoveryCoordinator:
             for process_info in self._process_map.values()
         )
 
+    def intake_held_without_safety(self) -> bool:
+        """Return whether the image intake is held because no safety process can accept a check.
+
+        The held gate counts only while no safety process is ready, because the gate stamp is refreshed by the
+        pop loop alone and can outlive the condition it names.
+        """
+        return self._state.last_pop_gate == str(PopGate.NO_SAFETY_PROCESS) and not self.is_safety_pool_ready()
+
+    def safety_start_pending(self) -> bool:
+        """Return whether the safety process has yet to come back: deferred, or intake held waiting on it.
+
+        The recovery episode reads this to decide whether a rebuilt pool has recovered.
+        """
+        if self._process_lifecycle.has_pending_safety_starts() is True:
+            return True
+        return self.intake_held_without_safety()
+
     def is_inference_pool_ready(self) -> bool:
         """Return whether the inference pool has reached an accepting state (a lane can take a job).
 
@@ -402,14 +419,18 @@ class WorkerRecoveryCoordinator:
         return self._process_map.num_available_inference_processes() > 0
 
     def is_inference_pool_unrecoverable(self) -> bool:
-        """Return whether every inference slot is crash-loop quarantined.
+        """Return whether every planned inference slot is lost, to the crash-loop quarantine or to retirement.
 
-        A worker that plans no inference process (it serves no image generation) has no slot to lose, so its
-        empty pool is never unrecoverable.
+        The ceiling follows the live per-card targets, which a retirement has already lowered, so the slots
+        the pool was planned with are that ceiling plus the retired ones, and both kinds of loss count against
+        them. A worker that plans no inference process (it serves no image generation) has no slot to lose, so
+        its empty pool is never unrecoverable.
         """
         if self.max_inference_processes <= 0 or self._inference_starts_backing_off():
             return False
-        return len(self._process_lifecycle.quarantined_inference_slots) >= self.max_inference_processes
+        num_retired = self._process_lifecycle.num_inference_slots_retired
+        num_lost = len(self._process_lifecycle.quarantined_inference_slots) + num_retired
+        return num_lost >= self.max_inference_processes + num_retired
 
     def is_safety_pool_unrecoverable(self) -> bool:
         """Return whether the safety pool cannot be restored and is not currently ready.
@@ -772,13 +793,16 @@ class WorkerRecoveryCoordinator:
         The pop coroutine returns early at any of a dozen preconditions, each owned by a different watchdog,
         and a condition none of them models holds intake exactly as effectively. This keys on the hold itself
         rather than on the condition, so it covers the gates nobody anticipated, and it takes its liveness
-        proof from completed jobs, which no gate-holding failure can produce on its own.
+        proof from jobs completed end to end (:attr:`JobTracker.total_num_successful_submits`), which no
+        gate-holding failure can produce on its own. ``total_num_completed_jobs`` is not that proof: it rises
+        on every inference result, including results that then wait on a safety stage that never drains, so
+        a wedge downstream of the sampler would excuse its own hold.
 
         Three facts must hold together: the same gate has held pops for longer than
         ``POP_GATE_HELD_WEDGE_SECONDS``, no pop attempt has reached the horde in that span, and no job has
-        completed since the hold was first observed. The last two are what keep ordinary backpressure out: a
-        worker whose queue is full holds a gate continuously and attempts no pops while doing so, and its
-        completions are the proof that the hold is capacity management rather than a wedge.
+        been submitted since the hold was first observed. The last two are what keep ordinary backpressure
+        out: a worker whose queue is full holds a gate continuously and attempts no pops while doing so, and
+        its submits are the proof that the hold is capacity management rather than a wedge.
 
         A worker that has never served a job and is still receiving the weights it needs is the one hold this
         cannot act on. Its remedy is a pool teardown, and every teardown restarts the transfer the hold is
@@ -800,12 +824,12 @@ class WorkerRecoveryCoordinator:
 
         held_since = self._state.last_pop_gate_since
         if self.pop_gate_hold_baseline is None or self.pop_gate_hold_baseline[0] != held_since:
-            self.pop_gate_hold_baseline = (held_since, self._job_tracker.total_num_completed_jobs)
+            self.pop_gate_hold_baseline = (held_since, self._job_tracker.total_num_successful_submits)
 
         now = self._clock()
         if (now - held_since) < self.POP_GATE_HELD_WEDGE_SECONDS:
             return False
-        if self._job_tracker.total_num_completed_jobs > self.pop_gate_hold_baseline[1]:
+        if self._job_tracker.total_num_successful_submits > self.pop_gate_hold_baseline[1]:
             return False
         if (now - self._state.last_pop_attempt_completed_at) < self.POP_GATE_HELD_WEDGE_SECONDS:
             return False
@@ -852,7 +876,7 @@ class WorkerRecoveryCoordinator:
         Taken when a wedge episode opens and re-taken on every soft reset, so ``made_progress`` measures
         forward motion since the most recent recovery attempt rather than since the episode began.
         """
-        self.episode_progress_baseline = self._job_tracker.total_num_completed_jobs
+        self.episode_progress_baseline = self._job_tracker.total_num_successful_submits
         self.episode_inference_start_baseline = self._job_tracker.total_num_inference_starts
         self.episode_post_processing_progress_baseline = self._job_tracker.total_num_post_processing_progress
         self.episode_frontier_baseline = self._current_recovery_frontier()
@@ -921,8 +945,10 @@ class WorkerRecoveryCoordinator:
         if self._job_tracker.post_processing_backlog_depth > 0:
             # A downstream post-processing drain stall is not disproved by starting more upstream inference.
             return False
-        if self._job_tracker.total_num_completed_jobs > self.episode_progress_baseline:
-            # A completion is end-to-end proof: the job cleared every downstream stage, safety included.
+        if self._job_tracker.total_num_successful_submits > self.episode_progress_baseline:
+            # A submit is end-to-end proof: the job cleared every downstream stage, safety included. A completion
+            # is not, since ``total_num_completed_jobs`` rises as each result lands, including one that then
+            # parks behind a stalled safety stage.
             return True
         if self._job_tracker.jobs_pending_safety_check or self._job_tracker.jobs_being_safety_checked:
             # A safety-stage drain stall is not disproved by more upstream inference starting either. Generated
@@ -1160,6 +1186,7 @@ class WorkerRecoveryCoordinator:
             boot_in_progress=boot_in_progress,
             constructive_remedy_available=constructive_remedy_available,
             unrelated_progress_deferral_available=self._unrelated_progress_deferral_available(),
+            safety_start_pending=self.safety_start_pending(),
         )
         if self.recovery_supervisor.is_in_episode:
             if self.episode_progress_baseline is None:

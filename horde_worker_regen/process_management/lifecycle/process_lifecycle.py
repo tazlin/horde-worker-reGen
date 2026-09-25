@@ -9,7 +9,7 @@ import os
 import sys
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import BoundedSemaphore as BoundedSemaphore_MultiProcessing
@@ -57,6 +57,7 @@ from horde_worker_regen.process_management.models.component_residency_map import
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_sizing import any_offered_model_wants_whole_card
+from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, soft_floor_mb
 from horde_worker_regen.process_management.resources.resource_budget import ram_pressure_floor_mb
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
@@ -114,6 +115,16 @@ class _PendingGpuStart:
     device_index: int
     reason: str
     created_at: float
+
+
+@dataclass(frozen=True)
+class _StructuralShortfall:
+    """Represents a GPU start whose required free VRAM exceeds the most its card can ever give back."""
+
+    required_mb: float
+    """The free VRAM (MB) the start waits for."""
+    room_mb: float
+    """The card's achievable ceiling (MB): total net of noise and its standing foreign floor."""
 
 
 SAFETY_PROCESS_ID: int = 0
@@ -273,10 +284,27 @@ rather than started onto a pressured card. It is a placeholder to be recalibrate
 footprint of the capability service once the job-flow routing exercises it."""
 
 PENDING_GPU_START_NO_PROGRESS_SECONDS: float = 600.0
-"""How long deferred GPU starts may show no free-VRAM progress before recovery may escalate normally."""
+"""How long deferred GPU starts may show no free-VRAM progress before recovery may escalate normally.
+
+A deferred safety start that outlives this window with no progress on its card is started on the CPU instead,
+and a deferred inference start is retired while another inference lane is serving
+(:meth:`ProcessLifecycleManager.drain_pending_gpu_starts`) until its card's room returns
+(:meth:`ProcessLifecycleManager.restore_retired_inference_slots`). Headroom is the only thing that retries a deferred
+start, and a card whose pressure comes from a tenant the reclaim ladder cannot evict never drains, so without
+those outcomes intake stays held on a safety process nothing will start, and the plan keeps counting a lane
+that will not come. The window covers only a shortfall the card could drain: one that exceeds the card's
+achievable ceiling is structural and takes the same outcome on the next drain."""
 
 PENDING_GPU_START_PROGRESS_EPSILON_MB: float = 128.0
 """Minimum free-VRAM increase that counts as drain progress for deferred GPU starts."""
+
+RETIRED_INFERENCE_SLOT_RESTORE_DWELL_SECONDS: float = PENDING_GPU_START_NO_PROGRESS_SECONDS / 2
+"""How long a card with a retired inference slot must hold room for a GPU start before the slot is planned again.
+
+The room is measured free at or above the start requirement, a healthy governor and no structural shortfall,
+held continuously. A lane's own churn (a model unloading between jobs, a tenant restarting) frees memory for
+seconds to a few minutes, and a restore on that returns the slot to a start that defers again. Half the window
+that retired the slot keeps a lost lane coming back within minutes of the tenant leaving."""
 
 MODEL_INCIDENT_WINDOW_SECONDS: float = 600.0
 """Sliding window over which a single model's incidents are counted for quarantine.
@@ -507,6 +535,9 @@ class ProcessLifecycleManager:
     _slot_consecutive_start_failures: dict[int, int]
     _quarantined_inference_slots: set[int]
     _num_slots_quarantined: int
+    _retired_inference_slots_by_device: dict[int, int]
+    _retired_slot_room_since_by_device: dict[int, float]
+    _max_inference_processes_listener: Callable[[int], None] | None
     _safety_recovery_history: list[float]
     _safety_consecutive_start_failures: int
     _safety_intentional_window_rebuilds: int
@@ -639,6 +670,13 @@ class ProcessLifecycleManager:
         self._gpu_start_context_mb_provider: Callable[[], float] = (
             gpu_start_context_mb_provider if gpu_start_context_mb_provider is not None else (lambda: 0.0)
         )
+        # Each card's standing foreign floor (the learned floor, or the managed text backend's footprint when
+        # larger) and the headroom-aware safety card choice. Both belong to the scheduler, which is built after
+        # this manager and registers them; the defaults (no floor, no chooser) keep every deferred start
+        # drainable and a rebuild on the recorded pin in standalone tests.
+        self._standing_floor_mb_provider: Callable[[int], float | None] = lambda _device_index: None
+        self._safety_card_chooser: Callable[[], int | None] | None = None
+        self._safety_rebuild_places_afresh = False
         # Register a freshly spawned inference child's clearance proxy with its card's controller, and notify
         # the controller when a child is replaced so it discards that child's grant state. Bound lazily through
         # the parent because the controllers are built after this manager; the no-op defaults keep the manager
@@ -785,6 +823,13 @@ class ProcessLifecycleManager:
         self._slot_consecutive_start_failures = {}
         self._quarantined_inference_slots = set()
         self._num_slots_quarantined = 0
+        # Inference slots whose deferred start stalled on a card that never drained, taken out of the plan per
+        # card (:meth:`_retire_stalled_inference_start`), and when each such card last began holding room for a
+        # start (:meth:`restore_retired_inference_slots`).
+        self._retired_inference_slots_by_device = {}
+        self._retired_slot_room_since_by_device = {}
+        # Told the new worker-wide ceiling whenever the per-card targets change at runtime.
+        self._max_inference_processes_listener = None
         self._safety_recovery_history = []
         # Rebuilds of the safety pool since one last reached readiness, the rebuilds an open intentional
         # window has absorbed so far, and the earliest time the next safety start may be attempted.
@@ -928,6 +973,11 @@ class ProcessLifecycleManager:
         return frozenset(self._quarantined_inference_slots)
 
     @property
+    def num_inference_slots_retired(self) -> int:
+        """How many inference slots are retired now (a stalled deferred start whose card has not earned a restore)."""
+        return sum(self._retired_inference_slots_by_device.values())
+
+    @property
     def download_process_info(self) -> HordeProcessInfo | None:
         """The background download process, or None if one is not running."""
         return self._download_process_info
@@ -971,7 +1021,11 @@ class ProcessLifecycleManager:
 
         A pending start stays protected while it is young, or while device-free readings show recent drain
         progress. Once all pending starts have outlived the no-progress window and no card has made progress,
-        the higher-level recovery backstop may treat the pool normally again.
+        the higher-level recovery backstop may treat the pool normally again. A deferred safety start does not
+        wait on that backstop: the same stall starts it on the CPU (:meth:`drain_pending_gpu_starts`), because
+        the backstop's remedies rebuild the pool and re-defer the start against the same card. A deferred
+        inference start is retired on the same stall while another inference lane exists, which removes its
+        entry; the worker's last inference lane stays pending and is left to the backstop.
         """
         if not self._pending_gpu_starts:
             return False
@@ -996,12 +1050,17 @@ class ProcessLifecycleManager:
             self._pending_gpu_start_last_progress_at_by_device[device_index] = time.monotonic()
         self._pending_gpu_start_last_free_mb_by_device[device_index] = free_mb
 
-    def _gpu_start_required_free_mb(self, device_index: int) -> float:
-        """Return the free-VRAM floor needed before starting another CUDA-bearing child."""
+    def _gpu_start_device_total_mb(self, device_index: int) -> float | None:
+        """Return the card's measured total VRAM (MB), else its planned total, else None."""
         total_mb = self._device_total_vram_mb_provider(device_index)
         if total_mb is None:
             card = self._card_runtimes.get(device_index)
             total_mb = card.total_vram_mb if card is not None else None
+        return total_mb
+
+    def _gpu_start_required_free_mb(self, device_index: int) -> float:
+        """Return the free-VRAM floor needed before starting another CUDA-bearing child."""
+        total_mb = self._gpu_start_device_total_mb(device_index)
         try:
             context_mb = max(0.0, float(self._gpu_start_context_mb_provider()))
         except Exception as e:
@@ -1032,11 +1091,51 @@ class ProcessLifecycleManager:
         if free_mb >= required_mb and governor_state == GovernorState.HEALTHY:
             return True, ""
         self._note_pending_gpu_start_sample(device_index, free_mb)
+        room_mb = self._achievable_room_mb(device_index)
+        structural_note = (
+            f" (a structural shortfall, the card can give back at most {room_mb:.0f}MB beside its standing tenants)"
+            if room_mb is not None and required_mb > room_mb
+            else ""
+        )
         return (
             False,
             f"device {device_index} is {governor_state.value} with {free_mb:.0f}MB free; "
-            f"waiting for at least {required_mb:.0f}MB before starting another GPU process",
+            f"waiting for at least {required_mb:.0f}MB before starting another GPU process{structural_note}",
         )
+
+    def _achievable_room_mb(self, device_index: int) -> float | None:
+        """Return the most free VRAM (MB) a card can ever give back, or None while its standing floor is unknown.
+
+        The card's achievable ceiling: its total net of the admission margin and the standing foreign floor
+        (:meth:`set_standing_floor_provider`), which includes the worker's managed text backend on its card. No
+        eviction the worker can make frees more than that. The total is the one the start requirement is sized
+        from, and the margin is the card's operator override, else the platform default, as the scheduler's
+        ceiling takes it.
+        """
+        floor_mb = self._standing_floor_mb_provider(device_index)
+        if floor_mb is None:
+            return None
+        total_mb = self._gpu_start_device_total_mb(device_index)
+        if total_mb is None:
+            return None
+        card = self._card_runtimes.get(device_index)
+        override_mb = card.config.vram_admission_noise_mb if card is not None else None
+        margin_mb = admission_margin_mb(total_mb, override_mb=None if override_mb is None else float(override_mb))
+        return total_mb - margin_mb - floor_mb
+
+    def _structural_shortfall(self, device_index: int) -> _StructuralShortfall | None:
+        """Return the shortfall when a GPU start needs more free VRAM than its card can ever give back, else None.
+
+        The room is :meth:`_achievable_room_mb`, so a requirement above it is never met by waiting. None while
+        the room is unknown.
+        """
+        room_mb = self._achievable_room_mb(device_index)
+        if room_mb is None:
+            return None
+        required_mb = self._gpu_start_required_free_mb(device_index)
+        if required_mb <= room_mb:
+            return None
+        return _StructuralShortfall(required_mb=required_mb, room_mb=room_mb)
 
     def _defer_gpu_start(
         self,
@@ -1126,6 +1225,12 @@ class ProcessLifecycleManager:
     def drain_pending_gpu_starts(self) -> int:
         """Retry deferred GPU-bearing starts whose devices have recovered enough headroom.
 
+        A deferred start whose card has shown no headroom progress for the no-progress window is resolved
+        instead of retried forever: safety starts on the CPU (:meth:`_escalate_safety_start_off_gpu`), and an
+        inference slot is retired until its card's room returns (:meth:`_retire_stalled_inference_start`). A
+        start whose shortfall is structural (:meth:`_structural_shortfall`) is resolved the same way without
+        waiting out the window, because no drain can meet it.
+
         Returns:
             Number of pending starts that were launched on this tick.
         """
@@ -1137,6 +1242,17 @@ class ProcessLifecycleManager:
             self._note_pending_gpu_start_sample(pending.device_index)
             can_start, _ = self._gpu_start_has_headroom(pending.device_index)
             if not can_start:
+                structural = self._structural_shortfall(pending.device_index)
+                if structural is None and not self._pending_start_stalled(pending):
+                    continue
+                if pending.process_type is HordeProcessType.SAFETY and self._escalate_safety_start_off_gpu(
+                    key,
+                    pending,
+                    structural=structural,
+                ):
+                    started += 1
+                elif pending.process_type is HordeProcessType.INFERENCE:
+                    self._retire_stalled_inference_start(key, pending, structural=structural)
                 continue
 
             self._pending_gpu_starts.pop(key, None)
@@ -1145,6 +1261,268 @@ class ProcessLifecycleManager:
             else:
                 self._pending_gpu_start_last_free_mb_by_device.pop(pending.device_index, None)
         return started
+
+    def _pending_start_stalled(self, pending: _PendingGpuStart) -> bool:
+        """Return whether a deferred start has outlived the no-progress window with no drain on its card."""
+        now = time.monotonic()
+        if (now - pending.created_at) < PENDING_GPU_START_NO_PROGRESS_SECONDS:
+            return False
+        progressed_at = self._pending_gpu_start_last_progress_at_by_device.get(pending.device_index)
+        return progressed_at is None or (now - progressed_at) >= PENDING_GPU_START_NO_PROGRESS_SECONDS
+
+    def _escalate_safety_start_off_gpu(
+        self,
+        key: tuple[HordeProcessType, int],
+        pending: _PendingGpuStart,
+        *,
+        structural: _StructuralShortfall | None = None,
+    ) -> bool:
+        """Start a deferred safety process on the CPU because its card has stopped draining or never can.
+
+        Every finished image waits on safety, and a card held by a tenant the reclaim ladder cannot evict
+        never reaches the start threshold, so waiting on headroom alone holds intake indefinitely. The start
+        goes through the existing off-GPU placement: the pause flag makes the bring-up ``cpu_only``, and it is
+        recorded as a runtime safety placement pause so the scheduler's placement reconciler owns the way back.
+        That reconciler restores safety to a card whose effective ``safety_on_gpu`` permits it once forecast
+        headroom has held for the restore dwell, the same rule a pressure demotion earns its return by.
+
+        Args:
+            key: The pending-start key to remove.
+            pending: The deferred start.
+            structural: The shortfall when the card's achievable ceiling is below the requirement, so the
+                escalation does not wait out the no-progress window; None for a stalled drainable wait.
+
+        Returns:
+            True if a CPU safety process was started.
+        """
+        self._pending_gpu_starts.pop(key, None)
+        if not self.process_type_wanted(HordeProcessType.SAFETY) or self._process_map.num_safety_processes() > 0:
+            return False
+        device_index = pending.device_index
+        waited_seconds = time.monotonic() - pending.created_at
+        free_mb = self._pending_gpu_start_last_free_mb_by_device.get(device_index)
+        required_mb = self._gpu_start_required_free_mb(device_index)
+        governor_state = self._device_governor_state_provider(device_index)
+        free_display = "unreported" if free_mb is None else f"{free_mb:.0f}MB"
+        self._safety_gpu_paused = True
+        self._safety_gpu_pause_owner = PauseOwner.RUNTIME_SAFETY_PLACEMENT
+        self._safety_gpu_pause_count += 1
+        detail: dict[str, str | int | float | bool | None] = {
+            "device_index": device_index,
+            "free_mb": None if free_mb is None else round(free_mb, 1),
+            "required_mb": round(required_mb, 1),
+            "governor_state": governor_state.value,
+            "waited_seconds": round(waited_seconds, 1),
+        }
+        if structural is not None:
+            detail["room_mb"] = round(structural.room_mb, 1)
+        self._action_ledger.record(
+            LedgerEventType.SAFETY_START_ESCALATED_TO_CPU,
+            process_id=pending.process_id,
+            reason=(
+                f"deferred safety start on device {device_index} made no headroom progress"
+                if structural is None
+                else f"deferred safety start on device {device_index} has a structural shortfall"
+            ),
+            detail=detail,
+        )
+        if structural is None:
+            logger.warning(
+                f"Deferred SAFETY process start on device {device_index} has waited {waited_seconds:.0f}s with no "
+                f"headroom progress ({free_display} free, governor {governor_state.value}; the start needs at least "
+                f"{required_mb:.0f}MB and a healthy governor). Starting the safety process on the CPU so finished "
+                "images can be checked; runtime safety placement returns it to a GPU once a permitted card shows "
+                "durable room.",
+            )
+        else:
+            logger.warning(
+                f"Deferred SAFETY process start on device {device_index} has a structural shortfall. It needs "
+                f"{structural.required_mb:.0f}MB free and the card can give back at most {structural.room_mb:.0f}MB "
+                f"beside its standing tenants ({free_display} free now, waited {waited_seconds:.0f}s). Starting "
+                "the safety process on the CPU so finished images can be checked; runtime safety placement "
+                "returns it to a GPU once a permitted card shows durable room.",
+            )
+        return self.start_safety_processes()
+
+    def _retire_stalled_inference_start(
+        self,
+        key: tuple[HordeProcessType, int],
+        pending: _PendingGpuStart,
+        *,
+        structural: _StructuralShortfall | None = None,
+    ) -> bool:
+        """Retire a deferred inference slot because its card has stopped draining.
+
+        An inference lane has no CPU fallback, and a card held by a tenant the reclaim ladder cannot evict never
+        reaches the start threshold, so the slot would stay pending for the life of the worker while the plan
+        still counts it. The slot comes off its card's ``target_process_count`` (the shared per-card plan the
+        scheduler reads) and off the worker-wide ceiling, so no pool start or scale-up places it there again,
+        and the worker serves on the lanes it has. Handing the slot to another card is not done: each card's
+        target is sized from that card's own config, so an extra lane there would exceed what it was planned
+        to hold. The slot is planned again on the same card once that card holds room for a start
+        (:meth:`restore_retired_inference_slots`).
+
+        The worker's last inference lane is never retired. With no other lane there is nothing left to serve
+        on, and keeping the entry keeps the start if the card drains later; the recovery backstop, which
+        :meth:`pending_gpu_starts_backing_off` releases after the same window, owns that case.
+
+        Args:
+            key: The pending-start key to remove.
+            pending: The deferred start.
+            structural: The shortfall when the card's achievable ceiling is below the requirement, so the
+                slot is retired without waiting out the no-progress window; None for a stalled drainable wait.
+
+        Returns:
+            True if the slot was retired.
+        """
+        if self._process_map.num_inference_processes() == 0:
+            return False
+        self._pending_gpu_starts.pop(key, None)
+        device_index = pending.device_index
+        waited_seconds = time.monotonic() - pending.created_at
+        free_mb = self._pending_gpu_start_last_free_mb_by_device.get(device_index)
+        required_mb = self._gpu_start_required_free_mb(device_index)
+        governor_state = self._device_governor_state_provider(device_index)
+        free_display = "unreported" if free_mb is None else f"{free_mb:.0f}MB"
+        card = self._card_runtimes.get(device_index)
+        if card is not None and card.target_process_count > 0:
+            self._card_runtimes[device_index] = replace(card, target_process_count=card.target_process_count - 1)
+            self._retired_inference_slots_by_device[device_index] = (
+                self._retired_inference_slots_by_device.get(device_index, 0) + 1
+            )
+            self._retired_slot_room_since_by_device.pop(device_index, None)
+        self.refresh_max_inference_processes()
+        card_target = self._card_runtimes[device_index].target_process_count if card is not None else 0
+        detail: dict[str, str | int | float | bool | None] = {
+            "device_index": device_index,
+            "free_mb": None if free_mb is None else round(free_mb, 1),
+            "required_mb": round(required_mb, 1),
+            "governor_state": governor_state.value,
+            "waited_seconds": round(waited_seconds, 1),
+            "card_target_process_count": card_target,
+        }
+        if structural is not None:
+            detail["room_mb"] = round(structural.room_mb, 1)
+        self._action_ledger.record(
+            LedgerEventType.INFERENCE_START_RETIRED,
+            process_id=pending.process_id,
+            reason=(
+                f"deferred inference start on device {device_index} made no headroom progress"
+                if structural is None
+                else f"deferred inference start on device {device_index} has a structural shortfall"
+            ),
+            detail=detail,
+        )
+        cause = (
+            f"has waited {waited_seconds:.0f}s with no headroom progress ({free_display} free, governor "
+            f"{governor_state.value}; the start needs at least {required_mb:.0f}MB and a healthy governor)"
+            if structural is None
+            else f"has a structural shortfall (it needs {structural.required_mb:.0f}MB free and the card can give "
+            f"back at most {structural.room_mb:.0f}MB beside its standing tenants, {free_display} free now, waited "
+            f"{waited_seconds:.0f}s)"
+        )
+        logger.warning(
+            f"Deferred INFERENCE process {pending.process_id} start on device {device_index} {cause}. Retiring the "
+            f"slot: device {device_index} now plans {card_target} inference process(es) and the worker plans "
+            f"{self._max_inference_processes}. It is planned again once the card has held room for a start for "
+            f"{RETIRED_INFERENCE_SLOT_RESTORE_DWELL_SECONDS:.0f}s.",
+        )
+        return True
+
+    def restore_retired_inference_slots(self) -> int:
+        """Plan a retired inference slot again on each card that has held room for a start through the dwell.
+
+        The reconciler behind :meth:`_retire_stalled_inference_start`, in the shape runtime safety placement
+        uses for its way back: the card's measured free has stayed at or above the GPU-start requirement under a
+        healthy governor for :data:`RETIRED_INFERENCE_SLOT_RESTORE_DWELL_SECONDS`, and the requirement is within
+        the card's achievable room. Any reading that breaks the condition restarts the clock. A structural
+        shortfall never restores, because the room it lacks is held by a standing tenant. One slot per card is
+        restored per dwell, so a card that lost two lanes proves its room again before taking the second.
+
+        The restored slot raises its card's target by one, refreshes the worker-wide ceiling and is started on
+        that card at once. Nothing is restored while image generation is not served, which includes a runtime
+        CPU-only torch build (:meth:`cap_inference_targets`).
+
+        Returns:
+            Number of slots restored on this call.
+        """
+        if not self._retired_inference_slots_by_device:
+            return 0
+        if (
+            self._state.shutting_down
+            or self._state.torch_build_cpu_only
+            or not self.process_type_wanted(HordeProcessType.INFERENCE)
+        ):
+            self._retired_slot_room_since_by_device.clear()
+            return 0
+        now = time.monotonic()
+        restored = 0
+        for device_index in sorted(self._retired_inference_slots_by_device):
+            if not self._retired_slot_card_has_room(device_index):
+                self._retired_slot_room_since_by_device.pop(device_index, None)
+                continue
+            room_since = self._retired_slot_room_since_by_device.setdefault(device_index, now)
+            if (now - room_since) < RETIRED_INFERENCE_SLOT_RESTORE_DWELL_SECONDS:
+                continue
+            self._restore_retired_inference_slot(device_index, held_seconds=now - room_since)
+            restored += 1
+        return restored
+
+    def _retired_slot_card_has_room(self, device_index: int) -> bool:
+        """Return whether a card with a retired slot has room for a GPU start right now.
+
+        Unlike :meth:`_gpu_start_has_headroom`, an unreported free reading is not room: a restore needs evidence.
+        This check also leaves the deferred-start progress samples alone.
+        """
+        if device_index not in self._card_runtimes:
+            return False
+        if any(
+            pending.process_type is HordeProcessType.INFERENCE and pending.device_index == device_index
+            for pending in self._pending_gpu_starts.values()
+        ):
+            return False
+        free_mb = self._device_free_mb_provider(device_index)
+        if free_mb is None:
+            return False
+        if self._device_governor_state_provider(device_index) != GovernorState.HEALTHY:
+            return False
+        if free_mb < self._gpu_start_required_free_mb(device_index):
+            return False
+        return self._structural_shortfall(device_index) is None
+
+    def _restore_retired_inference_slot(self, device_index: int, *, held_seconds: float) -> None:
+        """Return one retired slot to its card's plan and start it there."""
+        remaining = self._retired_inference_slots_by_device.pop(device_index, 0) - 1
+        if remaining > 0:
+            self._retired_inference_slots_by_device[device_index] = remaining
+        self._retired_slot_room_since_by_device.pop(device_index, None)
+        card = self._card_runtimes[device_index]
+        card_target = card.target_process_count + 1
+        self._card_runtimes[device_index] = replace(card, target_process_count=card_target)
+        self.refresh_max_inference_processes()
+        free_mb = self._device_free_mb_provider(device_index)
+        required_mb = self._gpu_start_required_free_mb(device_index)
+        pid = self._allocate_inference_pid()
+        self._action_ledger.record(
+            LedgerEventType.INFERENCE_SLOT_RESTORED,
+            process_id=pid,
+            reason=f"device {device_index} held room for an inference start through the restore dwell",
+            detail={
+                "device_index": device_index,
+                "free_mb": None if free_mb is None else round(free_mb, 1),
+                "required_mb": round(required_mb, 1),
+                "held_seconds": round(held_seconds, 1),
+                "card_target_process_count": card_target,
+            },
+        )
+        free_display = "unreported" if free_mb is None else f"{free_mb:.0f}MB"
+        logger.info(
+            f"Restoring a retired INFERENCE slot on device {device_index} as process {pid}: the card has held room "
+            f"for a start for {held_seconds:.0f}s ({free_display} free, the start needs {required_mb:.0f}MB). Device "
+            f"{device_index} now plans {card_target} inference process(es) and the worker plans "
+            f"{self._max_inference_processes}.",
+        )
+        self._request_inference_process_start(pid, device_index=device_index, reason="retired inference slot restored")
 
     def process_type_wanted(self, process_type: HordeProcessType) -> bool:
         """Whether a served workload needs this process type at all.
@@ -1537,12 +1915,16 @@ class ProcessLifecycleManager:
         return True
 
     def end_post_process_processes(self) -> None:
-        """End any dedicated post-processing processes."""
+        """Ask every dedicated post-processing process to end.
+
+        The child stays in the owned-PID registry until a reap confirms it dead (the replacement's
+        :meth:`_end_replaced_children`, or the shutdown reap), so one that ignores the request is still found
+        by the exit backstop.
+        """
         for process_info in self._process_map.get_stoppable_post_process_processes():
             process_info.end_intended = True
             process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
             self._process_map.on_process_ending(process_id=process_info.process_id)
-            self._forget_owned(process_info)
 
             logger.info(f"Ended post-process process {process_info.process_id}")
 
@@ -1607,6 +1989,7 @@ class ProcessLifecycleManager:
             self._process_map.num_loaded_post_process_processes() == 0
             and self._process_map.num_post_process_processes() > 0
         ):
+            self._end_replaced_children(HordeProcessType.POST_PROCESS)
             self._process_map.delete_post_process_processes()
 
         if (
@@ -1815,12 +2198,16 @@ class ProcessLifecycleManager:
         return True
 
     def end_utilities_processes(self) -> None:
-        """End any dedicated image-utilities processes."""
+        """End any dedicated image-utilities processes.
+
+        The child stays in the owned-PID registry until a reap confirms it dead (the replacement's
+        :meth:`_end_replaced_children`, or the shutdown reap), so one that ignores the request is still found
+        by the exit backstop.
+        """
         for process_info in self._process_map.get_stoppable_utilities_processes():
             process_info.end_intended = True
             process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
             self._process_map.on_process_ending(process_id=process_info.process_id)
-            self._forget_owned(process_info)
 
             logger.info(f"Ended image utilities process {process_info.process_id}")
 
@@ -1845,6 +2232,7 @@ class ProcessLifecycleManager:
             return
 
         if self._process_map.num_loaded_utilities_processes() == 0 and self._process_map.num_utilities_processes() > 0:
+            self._end_replaced_children(HordeProcessType.UTILITIES)
             self._process_map.delete_utilities_processes()
 
         if (
@@ -1982,12 +2370,16 @@ class ProcessLifecycleManager:
         return True
 
     def end_component_processes(self) -> None:
-        """End the dedicated component lane process (its publications are withdrawn as it exits)."""
+        """End the dedicated component lane process (its publications are withdrawn as it exits).
+
+        The child stays in the owned-PID registry until a reap confirms it dead (the replacement's
+        :meth:`_end_replaced_children`, or the shutdown reap), so one that ignores the request is still found
+        by the exit backstop.
+        """
         for process_info in self._process_map.get_stoppable_component_processes():
             process_info.end_intended = True
             process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
             self._process_map.on_process_ending(process_id=process_info.process_id)
-            self._forget_owned(process_info)
             logger.info(f"Ended component lane {process_info.process_id}")
 
     def _replace_all_component_process(self) -> None:
@@ -2008,6 +2400,7 @@ class ProcessLifecycleManager:
             return
 
         if self._process_map.num_loaded_component_processes() == 0 and self._process_map.num_component_processes() > 0:
+            self._end_replaced_children(HordeProcessType.COMPONENT)
             self._process_map.delete_component_processes()
 
         if (
@@ -2192,12 +2585,16 @@ class ProcessLifecycleManager:
         return True
 
     def end_vae_lane_processes(self) -> None:
-        """End any dedicated VAE lane processes."""
+        """End any dedicated VAE lane processes.
+
+        The child stays in the owned-PID registry until a reap confirms it dead (the replacement's
+        :meth:`_end_replaced_children`, or the shutdown reap), so one that ignores the request is still found
+        by the exit backstop.
+        """
         for process_info in self._process_map.get_stoppable_vae_lane_processes():
             process_info.end_intended = True
             process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
             self._process_map.on_process_ending(process_id=process_info.process_id)
-            self._forget_owned(process_info)
             logger.info(f"Ended VAE lane {process_info.process_id}")
 
     def _initiate_vae_lane_replacement(self) -> None:
@@ -2222,6 +2619,7 @@ class ProcessLifecycleManager:
             return
 
         if self._process_map.num_loaded_vae_lane_processes() == 0 and self._process_map.num_vae_lane_processes() > 0:
+            self._end_replaced_children(HordeProcessType.VAE_LANE)
             self._process_map.delete_vae_lane_processes()
 
         if (
@@ -2610,10 +3008,23 @@ class ProcessLifecycleManager:
         self._process_map.clear()
         self._horde_model_map.root.clear()
         self._download_process_info = None
-        if self._owned_registry is not None:
-            self._owned_registry.clear()
+        self._kill_owned_outside_the_map()
         self.neutralize_message_queue_feeder()
         return True
+
+    def _kill_owned_outside_the_map(self) -> None:
+        """Kill every child still in the owned-PID registry, then clear it, once the map's children are reaped.
+
+        A record left at this point belongs to a child the map no longer holds, such as a replaced child whose
+        kill failed. Clearing the registry without killing it would drop the only record of that process, and
+        a front end that drives the main loop directly never runs the atexit backstop to catch it later.
+        """
+        if self._owned_registry is None:
+            return
+        killed = self._owned_registry.kill_all_owned()
+        if killed:
+            logger.warning(f"Killed {len(killed)} owned child process(es) no longer in the process map: {killed}")
+        self._owned_registry.clear()
 
     def restart_download_process(self) -> None:
         """Stop and restart the download process (a hard reset that re-reads the current bridge data).
@@ -2832,13 +3243,40 @@ class ProcessLifecycleManager:
         return pid
 
     def refresh_max_inference_processes(self) -> None:
-        """Recompute the cached worker-wide inference-process ceiling from the current per-card targets.
+        """Recompute the worker-wide inference-process ceiling from the current per-card targets and publish it.
 
         The ceiling is summed once at construction; call this after the shared ``card_runtimes`` targets are
-        changed at runtime (an alchemist-only collapse lowers every card to one) so the worker-wide scale
-        bound and any reader of it agree with the new plan.
+        changed at runtime (a slot retired or restored, the CPU-only cap) so the worker-wide scale bound and
+        every cached copy of it agree with the new plan. The copies are updated through the one listener
+        (:meth:`set_max_inference_processes_listener`), so no reader recomputes the sum on its own.
         """
         self._max_inference_processes = sum(card.target_process_count for card in self._card_runtimes.values())
+        if self._max_inference_processes_listener is not None:
+            self._max_inference_processes_listener(self._max_inference_processes)
+
+    def set_max_inference_processes_listener(self, listener: Callable[[int], None]) -> None:
+        """Register the callback told the new worker-wide ceiling on every :meth:`refresh_max_inference_processes`."""
+        self._max_inference_processes_listener = listener
+
+    def cap_inference_targets(self, *, per_card_limit: int) -> bool:
+        """Mutate each card's inference target down to at most ``per_card_limit``, refreshing the ceiling.
+
+        Each card keeps the smaller of its current target and the limit, so a card whose slot was retired is
+        not raised back to the limit by the cap: its target already reflects that the card could not start the
+        lane. The retired-slot record is kept, and :meth:`restore_retired_inference_slots` stands down for as
+        long as the reason for the cap (a runtime CPU-only build) holds.
+
+        Returns:
+            True if any card's target was lowered.
+        """
+        lowered = False
+        for index, card in list(self._card_runtimes.items()):
+            if card.target_process_count > per_card_limit:
+                self._card_runtimes[index] = replace(card, target_process_count=per_card_limit)
+                lowered = True
+        if lowered:
+            self.refresh_max_inference_processes()
+        return lowered
 
     def scale_inference_processes(
         self,
@@ -3115,15 +3553,71 @@ class ProcessLifecycleManager:
         if not self._state.shutting_down:
             logger.info(f"Ended inference process {process_info.process_id}")
 
+    def _end_replaced_children(self, process_type: HordeProcessType) -> None:
+        """End the OS process of every child of ``process_type`` in the map, ahead of retiring their entries.
+
+        Retiring a map entry only forgets the child, so a replaced child that is not ended here outlives its
+        replacement and, since no teardown path looks outside the map, the parent as well. A child still in
+        ``PROCESS_STARTING`` has not reached its control loop and cannot read ``END_PROCESS``, so it is
+        terminated outright. One past startup was sent ``END_PROCESS`` when the replacement began and gets the
+        same end grace an inference slot does. A straggler is killed. Only a child confirmed dead leaves the
+        owned-PID registry, so one the kill could not end is still reaped by the exit backstop.
+        """
+        for process_info in [p for p in self._process_map.values() if p.process_type is process_type]:
+            self._end_replaced_child(process_info)
+
+    def _end_replaced_child(self, process_info: HordeProcessInfo) -> None:
+        """End one replaced child's OS process; see :meth:`_end_replaced_children`."""
+        process_info.end_intended = True
+        mp_process = process_info.mp_process
+        grace = INFERENCE_SHUTDOWN_END_GRACE_SECONDS if self._state.shutting_down else INFERENCE_END_GRACE_SECONDS
+        try:
+            if mp_process.is_alive():
+                if process_info.last_process_state == HordeProcessState.PROCESS_STARTING:
+                    mp_process.terminate()
+                mp_process.join(timeout=grace)
+                if mp_process.is_alive():
+                    mp_process.kill()
+                    mp_process.join(timeout=1)
+            else:
+                mp_process.join(timeout=0)
+            still_alive = mp_process.is_alive()
+        except Exception as e:  # noqa: BLE001 - a failed reap must not stop the replacement
+            logger.error(
+                f"Failed to end replaced {process_info.process_type.name} process {process_info.process_id} "
+                f"(os pid {process_info.os_pid}): {type(e).__name__} {e}",
+            )
+            return
+
+        if still_alive:
+            logger.error(
+                f"Replaced {process_info.process_type.name} process {process_info.process_id} (os pid "
+                f"{process_info.os_pid}) is still alive after a kill; it stays owned so the exit backstop reaps it.",
+            )
+            return
+
+        self._forget_owned(process_info)
+        self._action_ledger.record(
+            LedgerEventType.PROCESS_ENDED,
+            process_id=process_info.process_id,
+            os_pid=process_info.os_pid,
+            launch_identifier=process_info.process_launch_identifier,
+            detail={"process_type": process_info.process_type.name},
+        )
+
     def end_safety_processes(self) -> None:
-        """End any safety processes above the configured limit, or all of them if shutting down."""
+        """Ask every safety process to end.
+
+        The child stays in the owned-PID registry until a reap confirms it dead (the replacement's
+        :meth:`_end_replaced_children`, or the shutdown reap), so one that ignores the request is still found
+        by the exit backstop.
+        """
         for process_info in self._process_map.get_stoppable_safety_processes():
             # Mark the end as supervisor-intended before sending the command so the crash reaper does not
             # treat the child's expected exit as a safety-pool crash.
             process_info.end_intended = True
             process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
             self._process_map.on_process_ending(process_id=process_info.process_id)
-            self._forget_owned(process_info)
 
             logger.info(f"Ended safety process {process_info.process_id}")
 
@@ -3198,6 +3692,39 @@ class ProcessLifecycleManager:
             device_index: The chosen card's stable index, or None for the lowest-index default.
         """
         self._desired_safety_card = device_index
+
+    def set_standing_floor_provider(self, provider: Callable[[int], float | None]) -> None:
+        """Register the source of each card's standing foreign floor (MB) for the structural-shortfall check.
+
+        The scheduler's :meth:`InferenceScheduler.current_foreign_floor_mb`, the floor its achievable ceiling
+        subtracts: the learned foreign floor, or the managed text backend's footprint on its card when larger.
+        None while neither is known. Until registered no shortfall is structural.
+        """
+        self._standing_floor_mb_provider = provider
+
+    def set_safety_card_chooser(self, chooser: Callable[[], int | None]) -> None:
+        """Register the headroom-aware safety card choice a supervised safety rebuild re-runs.
+
+        The scheduler's placement identity, the same one it pushes through :meth:`set_desired_safety_card`
+        while safety is off-GPU. Until registered a rebuild keeps the recorded pin.
+        """
+        self._safety_card_chooser = chooser
+
+    def _place_rebuilt_safety_afresh(self) -> None:
+        """Re-run the headroom chooser for a supervised safety rebuild instead of keeping the previous pin.
+
+        A rebuild is a fresh placement. The scheduler refreshes the desired card only while safety is off-GPU,
+        so the pin recorded before safety was placed would otherwise stand, even when that card has since
+        filled with a tenant the reclaim ladder cannot evict. The chooser honours per-card ``safety_on_gpu``
+        permission, and the bring-up still applies the pause flags, so whole-card residency is unchanged. With
+        one card the chooser can only name that card, so the historical fixed pin (None) is kept and the spawn
+        stays byte-identical.
+        """
+        self._safety_rebuild_places_afresh = False
+        chooser = self._safety_card_chooser
+        if chooser is None or len(self._card_runtimes) <= 1:
+            return
+        self._desired_safety_card = chooser()
 
     def safety_gpu_card_index(self) -> int | None:
         """Return the device the on-GPU safety process occupies, or None when safety is off-GPU.
@@ -3548,6 +4075,7 @@ class ProcessLifecycleManager:
             return
 
         if self._process_map.num_loaded_safety_processes() == 0 and self._process_map.num_safety_processes() > 0:
+            self._end_replaced_children(HordeProcessType.SAFETY)
             self._process_map.delete_safety_processes()
 
         if (
@@ -3557,6 +4085,8 @@ class ProcessLifecycleManager:
         ):
             if time.time() < self._safety_next_start_allowed_at:
                 return
+            if self._safety_rebuild_places_afresh:
+                self._place_rebuilt_safety_afresh()
             self.start_safety_processes()
             self._safety_processes_ending = False
             self._safety_processes_should_be_replaced = False
@@ -4010,9 +4540,11 @@ class ProcessLifecycleManager:
 
         The start-failure streak, the intentional-window count, and the respawn backoff are cleared with it,
         for the same reason and with the same bound: a supervised rebuild is a fresh attempt, and if the pool
-        still cannot start its rebuilds re-accumulate from zero.
+        still cannot start its rebuilds re-accumulate from zero. For the same reason the respawn re-runs the
+        headroom card choice rather than keeping the previous pin (:meth:`_place_rebuilt_safety_afresh`).
         """
         logger.error(f"Soft reset: rebuilding safety pool ({reason}).")
+        self._safety_rebuild_places_afresh = True
         self._safety_recovery_history.clear()
         self._safety_consecutive_start_failures = 0
         self._safety_intentional_window_rebuilds = 0
@@ -4390,8 +4922,7 @@ class ProcessLifecycleManager:
         self._horde_model_map.root.clear()
         if all_:
             self._download_process_info = None
-        if self._owned_registry is not None:
-            self._owned_registry.clear()
+        self._kill_owned_outside_the_map()
         self.neutralize_message_queue_feeder()
 
     def neutralize_message_queue_feeder(self) -> None:
@@ -4738,6 +5269,7 @@ class ProcessLifecycleManager:
         now = time.time()
         self._observe_safety_pool_readiness()
         any_started_pending = self.drain_pending_gpu_starts() > 0
+        self.restore_retired_inference_slots()
 
         # A live inference slot that has advanced past PROCESS_STARTING has proven it can initialise,
         # so clear any consecutive crash-on-start streak it accrued. Only slots that never get past

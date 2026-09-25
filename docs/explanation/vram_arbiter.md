@@ -478,6 +478,15 @@ scheduler faults the head for reissue and places the model on a conditional, sel
 permanent wedge (see [the achievable ceiling in Performance and Backpressure](performance_and_backpressure.md#the-achievable-ceiling-a-model-that-can-never-fit-this-card)).
 The first concurrent sampling of its kind admits on an empty ledger.
 
+The worker's managed text backend is a known tenant of its card, so the ceiling does not wait for the learned
+window to find it. Once the backend is serving with a measured footprint (the card's free-VRAM drop between its
+launch and ready), that footprint is a standing floor on its card, and the floor every reader subtracts is the
+larger of it and the learned floor. The two are never added, because the learned floor is measured from device
+truth and already contains the backend once its window has covered it. A relaunch replaces the figure when the new process
+is ready, and a backend that stops serving removes it. The ceiling, the scheduling snapshot, the safety card
+choice, model serviceability and the lifecycle's GPU-start check all read the same floor. One INFO line names the
+card, the footprint and the resulting ceiling when the charge starts or changes, and another when it is released.
+
 Between a plain `DEFER` and a structural `DENY` sits one bounded escape hatch: the **measured-load attempt**. A
 candidate under the achievable ceiling is possible on this card in principle, so a static sampling-VRAM
 prediction that misses the instantaneous available reading may simply be conservative, or the foreign VRAM may
@@ -738,6 +747,12 @@ with the same forecast dwell (the memory that pause returned is part of what the
 A **whole-card residency** pause does not: it ends when its own model drains, and holding it to a memory
 forecast would leave a card that hosts one heavy resident without an on-GPU safety process for the session.
 
+A deferred safety GPU start that makes no headroom progress for the no-progress window is started on the CPU by
+the lifecycle manager (see [deferred GPU starts](process_lifecycle.md#process-replacement)) and recorded under
+this policy's own pause owner. A start whose requirement exceeds its card's achievable ceiling is escalated on the
+next drain instead, since no wait can meet it. There was no resident process to evict, so that pause bypasses the reconciler,
+but its way back does not: it earns the same forecast restore dwell as a pressure demotion.
+
 The verified reclaim ladder uses the same operator permission as whole-card safety movement: if
 `whole_card_residency_safety_off_gpu` is false, safety is not added as a reclaim rung even when it is on GPU.
 Under that permission the ladder carries two safety rungs. `DEMOTE_SAFETY_WEIGHTS` comes first: the safety
@@ -749,10 +764,13 @@ evidence the process-level restore uses; a rebuilt safety process starts residen
 **Placement is headroom-aware across cards, not a fixed device 0.** One identity
 ([`_choose_safety_gpu_card`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler])
 picks the driven card with the most verified headroom (measured device-free when reported, else card total less
-the peak that card is committed to) and is pushed to the lifecycle manager **only while a spawn could use it**,
-that is while safety is off-GPU or not yet placed. While safety is resident the desired card is the card it is
-pinned to, so a crash rebuild or a residency restore puts it back where it was rather than wherever read
-roomiest that cycle. Demotion, promotion, and the current placement card (or `None` for CPU) are surfaced in the
+the standing foreign floor and the peak that card is committed to). A card whose achievable ceiling cannot hold the
+safety footprint, such as one the managed text backend fills, is chosen only when no card can. The choice is
+pushed to the lifecycle manager **only while a spawn could use it**, that is while safety is off-GPU or not yet
+placed. While safety is resident the desired card is the card it is pinned to, so a crash rebuild or a residency
+restore puts it back where it was rather than wherever read roomiest that cycle. A supervised rebuild (the soft
+reset's `rebuild_safety_pool`) is the exception: it is a fresh placement, so on a multi-card host its respawn
+re-runs the choice. Demotion, promotion, and the current placement card (or `None` for CPU) are surfaced in the
 run metrics.
 
 Reclaim stays single-owner across three seams: preload, dispatch reconciliation, and post-processing all run a
@@ -829,7 +847,9 @@ resident weights + minimum 512x512 batch-1 activation <= device total - shared b
 
 The resident weight and minimum activation figures come from the same torch-free hordelib burden seeds used
 by the scheduler. The shared baseline is the VRAM the reconciler attributes to the OS, desktop, and foreign
-apps; if it has not been captured yet the offer filter reads it as zero rather than inventing pressure. The
+apps; if it has not been captured yet the offer filter reads it as zero rather than inventing pressure. On the
+managed text backend's card the baseline is raised to the backend's measured footprint when that is larger (the
+two are never added), so a model that cannot fit beside the backend is not offered for that card. The
 noise term is the same proportional admission buffer used by runtime admission.
 
 At pop time, a model is excluded only when every card in the current offer scope that serves it fails that

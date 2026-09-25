@@ -55,7 +55,11 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     admission_margin_mb,
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
-from horde_worker_regen.process_management.resources.foreign_vram_floor import ForeignVramFloorTracker
+from horde_worker_regen.process_management.resources.foreign_vram_floor import (
+    ForeignVramFloorTracker,
+    ManagedVramTenant,
+    floor_with_known_tenant_mb,
+)
 from horde_worker_regen.process_management.resources.model_serviceability import (
     model_serviceability_verdicts,
     serviceability_arithmetic,
@@ -708,10 +712,21 @@ class InferenceScheduler:
         # _foreign_floor_clock so tests can hand-advance the observation window.
         self._foreign_vram_floor = ForeignVramFloorTracker()
         self._foreign_floor_clock: Callable[[], float] = time.monotonic
+        # The worker's managed text backend is a known tenant of its card: its measured footprint is a standing
+        # floor there before the learned window has observed it. Wired by the manager; no tenant until then and
+        # in standalone unit tests. The charged map holds each card's charged footprint so the charge and its
+        # release are logged once, on the edge.
+        self._managed_tenant_provider: Callable[[], ManagedVramTenant | None] = lambda: None
+        self._charged_tenant_mb_by_device: dict[int, float] = {}
         # The job tracker lifts a conditional ceiling hold by re-reading the card's current achievable ceiling;
         # wire that read here (the scheduler owns the foreign-floor tracker) so the tracker's live predicate
         # need not reach back into the scheduler.
         self._job_tracker.set_achievable_ceiling_provider(self.achievable_ceiling_mb)
+        # A deferred GPU start judges whether its card could ever give back the room it waits for against the
+        # same standing floor, and a supervised safety rebuild places safety through the same chooser the
+        # placement reconciler pushes.
+        self._process_lifecycle.set_standing_floor_provider(self.current_foreign_floor_mb)
+        self._process_lifecycle.set_safety_card_chooser(self._choose_safety_gpu_card)
         # One-shot log throttle, keyed by model, for the "declined a whole-card residency" notice (a teardown
         # demand the warrant gate did not trust; see _whole_card_warranted / _log_whole_card_declined).
         self._whole_card_declined_notified: dict[str, bool] = {}
@@ -781,6 +796,28 @@ class InferenceScheduler:
         predictive gate admits.
         """
         self._admission_baseline_provider = provider
+
+    def set_managed_tenant_provider(self, provider: Callable[[], ManagedVramTenant | None]) -> None:
+        """Register the source of the worker's managed text backend as a known VRAM tenant.
+
+        Read whenever a card's floor is read. The provider returns the serving backend's card and measured
+        footprint, or None while no managed backend is serving with a measured footprint on a known card.
+        """
+        self._managed_tenant_provider = provider
+
+    def serviceability_baseline_mb(self, device_index: int | None) -> float | None:
+        """Return the unreclaimable device load (MB) model serviceability judges a card against.
+
+        The reconciler's shared-device baseline, raised to the managed text backend's footprint on the card it
+        serves from. The baseline is VRAM attributed to no worker child, so once captured beside a serving
+        backend it already contains it and the two are not added. The pop offer and the preload gate's
+        unserviceable-job fault both read this, so neither advertises nor keeps a model that cannot fit beside
+        the tenant.
+        """
+        baseline_mb = (
+            self._admission_baseline_provider(device_index) if self._admission_baseline_provider is not None else None
+        )
+        return floor_with_known_tenant_mb(baseline_mb, self._managed_tenant_footprint_mb(device_index))
 
     def set_disaggregation_hooks(
         self,
@@ -1366,15 +1403,13 @@ class InferenceScheduler:
     def _unpausable_tenancy_mb(self, device_index: int | None) -> float:
         """Device tenancy (MB) on the card that no sole-residency teardown returns.
 
-        The sustained foreign floor (VRAM the OS, desktop or other processes hold), plus the utilities lane
-        at its measured reservation and a context when policy withholds lane reclaim (with it permitted the
-        lane is a rung like the others). Safety and the post-processing lane are not here: the residency
-        conversion pauses both. The forecast's alone frame subtracts this so a whole-card claim is retired
-        only against room the dispatch will actually find.
+        The standing foreign floor (VRAM the OS, desktop, other processes or the managed text backend hold),
+        plus the utilities lane at its measured reservation and a context when policy withholds lane reclaim
+        (with it permitted the lane is a rung like the others). Safety and the post-processing lane are not
+        here: the residency conversion pauses both. The forecast's alone frame subtracts this so a whole-card
+        claim is retired only against room the dispatch will actually find.
         """
-        device_key = device_index if device_index is not None else 0
-        foreign_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
-        tenancy_mb = max(0.0, foreign_floor_mb or 0.0)
+        tenancy_mb = max(0.0, self.current_foreign_floor_mb(device_index) or 0.0)
         if self._starved_head_lane_reclaim_permitted(device_index) and self._starved_head_utilities_pause_permitted(
             device_index,
         ):
@@ -1475,18 +1510,23 @@ class InferenceScheduler:
         safety process there) and when the runtime placement policy re-promotes safety onto the GPU, so the
         two never disagree about which card safety lands on. Headroom per card is its truthful measured
         device-free VRAM when reported (that figure already nets out whatever is resident and sampling on the
-        card right now); absent a measured reading it falls back to the card total less the largest sampling
-        peak that card is committed to. The card with the greatest headroom wins, ties resolving to
-        the lowest index so the choice is stable. Only cards whose effective config permits an on-GPU safety
-        process are candidates, and the result is None when no card permits it. On a single-GPU host this is
-        the one card, and with no headroom evidence at all it is the lowest-index card, both byte-identical to
-        the historical fixed pin.
+        card right now); absent a measured reading it falls back to the card total less its standing foreign
+        floor and the largest sampling peak that card is committed to. The card with the greatest headroom
+        wins, ties resolving to the lowest index so the choice is stable. A card whose achievable ceiling
+        (total net of noise and its standing foreign floor, the managed text backend included) cannot hold the
+        safety footprint is chosen only when no card can: its room will not come back however much the worker
+        evicts. Only cards whose effective config permits an on-GPU safety process are candidates, and the
+        result is None when no card permits it. On a single-GPU host this is the one card, and with no headroom
+        evidence at all it is the lowest-index card, both byte-identical to the historical fixed pin.
         """
         permitted = self._safety_permitted_cards
         if not permitted:
             return None
+        safety_footprint_mb = self._safety_footprint_mb()
         best_index: int | None = None
         best_headroom_mb = float("-inf")
+        best_fitting_index: int | None = None
+        best_fitting_headroom_mb = float("-inf")
         for device_index in sorted(permitted):
             measured_free_mb = self._measured_free_vram_mb(device_index=device_index)
             if measured_free_mb is not None:
@@ -1495,10 +1535,21 @@ class InferenceScheduler:
                 total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
                 if total_vram_mb is None:
                     continue
-                headroom_mb = total_vram_mb - (self._largest_active_sampling_peak_mb(device_index) or 0.0)
+                headroom_mb = (
+                    total_vram_mb
+                    - (self.current_foreign_floor_mb(device_index) or 0.0)
+                    - (self._largest_active_sampling_peak_mb(device_index) or 0.0)
+                )
             if headroom_mb > best_headroom_mb:
                 best_headroom_mb = headroom_mb
                 best_index = device_index
+            room_mb = self.achievable_ceiling_mb(device_index)
+            safety_fits_card = room_mb is None or room_mb >= safety_footprint_mb
+            if safety_fits_card and headroom_mb > best_fitting_headroom_mb:
+                best_fitting_headroom_mb = headroom_mb
+                best_fitting_index = device_index
+        if best_fitting_index is not None:
+            return best_fitting_index
         return best_index if best_index is not None else min(permitted)
 
     def _safety_gpu_card(self) -> int | None:
@@ -2845,6 +2896,13 @@ class InferenceScheduler:
                 model,
             )
         self._pop_claim_tracker.disclose_edge(self.whole_card_pop_claim(), now=self._clock())
+
+    def set_max_inference_processes(self, max_inference_processes: int) -> None:
+        """Mutate the cached worker-wide inference ceiling after the per-card targets change at runtime.
+
+        Fed by :meth:`ProcessLifecycleManager.refresh_max_inference_processes` through the process manager.
+        """
+        self._max_inference_processes = max_inference_processes
 
     def _residency_restore_ceiling(self, device_index: int | None) -> int:
         """The process count to grow back to when a card's whole-card residency is restored.
@@ -4833,11 +4891,14 @@ class InferenceScheduler:
             context_constant_mb=self.resolved_context_constant_mb(),
             device_index=device_index,
         )
-        foreign_floor_mb = self._sustained_foreign_floor_mb(
-            device_index,
-            total_vram_mb=raw_total_mb,
-            device_free_mb=device_free_mb,
-            worker_footprint_mb=committed_mb,
+        foreign_floor_mb = floor_with_known_tenant_mb(
+            self._sustained_foreign_floor_mb(
+                device_index,
+                total_vram_mb=raw_total_mb,
+                device_free_mb=device_free_mb,
+                worker_footprint_mb=committed_mb,
+            ),
+            self._managed_tenant_footprint_mb(device_index),
         )
         oldest_report_age = self._process_map.oldest_committed_report_age_seconds(
             now=time.time(),
@@ -4970,19 +5031,73 @@ class InferenceScheduler:
         return self._foreign_vram_floor.update(device_key, foreign_now_mb, now=self._foreign_floor_clock())
 
     def achievable_ceiling_mb(self, device_index: int | None) -> float | None:
-        """Return a card's current achievable VRAM ceiling (MB): total net of noise and the sustained foreign floor.
+        """Return a card's current achievable VRAM ceiling (MB): total net of noise and the standing foreign floor.
 
         The most VRAM this card could offer one load right now, read live so a conditional ceiling hold can lift
         the moment the foreign floor recedes. None when the card's total is unknown (no GPU child has reported
-        yet). Reads the sustained foreign floor without recording a fresh sample, so a ceiling read never
-        perturbs the observation window.
+        yet). Reads the foreign floor through :meth:`current_foreign_floor_mb`, without recording a fresh
+        sample, so a ceiling read never perturbs the observation window.
         """
         total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         if total_vram_mb is None:
             return None
-        device_key = device_index if device_index is not None else 0
-        foreign_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
+        foreign_floor_mb = self.current_foreign_floor_mb(device_index)
         return total_vram_mb - self._admission_margin_mb(device_index, total_vram_mb) - (foreign_floor_mb or 0.0)
+
+    def current_foreign_floor_mb(self, device_index: int | None) -> float | None:
+        """Return a card's standing foreign floor (MB) without recording a sample, or None when nothing is known.
+
+        The larger of the learned sustained floor and the managed text backend's measured footprint when it
+        serves on this card. The ceiling, the scheduling snapshot, the unpausable tenancy and the safety card
+        choice read it here; the per-cycle arbiter state combines the same two figures.
+        """
+        device_key = device_index if device_index is not None else 0
+        learned_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
+        return floor_with_known_tenant_mb(learned_floor_mb, self._managed_tenant_footprint_mb(device_index))
+
+    def _managed_tenant_footprint_mb(self, device_index: int | None) -> float | None:
+        """Return the managed text backend's measured footprint (MB) when it serves on this card, else None."""
+        device_key = device_index if device_index is not None else 0
+        tenant = self._managed_tenant_provider()
+        footprint_mb = tenant.footprint_mb if tenant is not None and tenant.device_index == device_key else None
+        self._note_managed_tenant_charge(device_index, footprint_mb)
+        return footprint_mb
+
+    def _note_managed_tenant_charge(self, device_index: int | None, footprint_mb: float | None) -> None:
+        """Log a card's managed-tenant charge when it starts, changes with a relaunch, or ends.
+
+        Every floor read passes through here, several times a cycle, so only an edge logs.
+        """
+        device_key = device_index if device_index is not None else 0
+        previous_mb = self._charged_tenant_mb_by_device.get(device_key)
+        if footprint_mb == previous_mb:
+            return
+        if footprint_mb is None:
+            self._charged_tenant_mb_by_device.pop(device_key, None)
+            logger.info(
+                f"VRAM: the managed text backend no longer serves on device {device_key}; its "
+                f"{previous_mb or 0.0:.0f} MB standing floor there is released.",
+            )
+            return
+        self._charged_tenant_mb_by_device[device_key] = footprint_mb
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        if total_vram_mb is None:
+            ceiling_text = "the card's total is not reported yet"
+        else:
+            learned_floor_mb = self._foreign_vram_floor.current_floor_mb(
+                device_key,
+                now=self._foreign_floor_clock(),
+            )
+            ceiling_mb = (
+                total_vram_mb
+                - self._admission_margin_mb(device_index, total_vram_mb)
+                - max(learned_floor_mb or 0.0, footprint_mb)
+            )
+            ceiling_text = f"the most one load on device {device_key} can now be offered is {ceiling_mb:.0f} MB"
+        logger.info(
+            f"VRAM: the managed text backend holds {footprint_mb:.0f} MB on device {device_key}; it is charged "
+            f"as a standing floor there and {ceiling_text}.",
+        )
 
     def snapshot(self) -> SchedulingSnapshot:
         """Freeze the worker as this cycle's pipelines see it.
@@ -5028,10 +5143,7 @@ class InferenceScheduler:
             governor_state=self.governor_state,
             growth_held=self.is_vram_growth_held,
             arbiter_state=arbiter_state,
-            foreign_floor_mb=lambda device_index: self._foreign_vram_floor.current_floor_mb(
-                device_index if device_index is not None else 0,
-                now=self._foreign_floor_clock(),
-            ),
+            foreign_floor_mb=self.current_foreign_floor_mb,
             eligible_cards=self._eligible_card_indices,
             disaggregation_class_eligible=self._is_disaggregation_class_eligible,
             unserviceable_reason=self._unserviceable_job_reason,
@@ -8104,7 +8216,7 @@ class InferenceScheduler:
             job.model,
             card_runtimes=self._card_runtimes,
             model_metadata=self._model_metadata,
-            admission_baseline_provider=self._admission_baseline_provider,
+            admission_baseline_provider=self.serviceability_baseline_mb,
             max_pixels=None,
         )
         if not verdicts or any(verdict.serviceable for _, verdict in verdicts):

@@ -128,6 +128,36 @@ A `Runtime safety placement inputs:` line at DEBUG carries the same evidence on 
 can attribute a flip to what the policy saw; unchanged repeats drop to TRACE. For the policy itself see
 [VRAM arbiter](../explanation/vram_arbiter.md#runtime-safety-placement).
 
+A deferred safety start whose card never drains is started on the CPU once, with a warning of this shape:
+
+```text
+Deferred SAFETY process start on device 0 has waited 601s with no headroom progress (677MB free, governor
+pressure; the start needs at least 1631MB and a healthy governor). Starting the safety process on the CPU so
+finished images can be checked; runtime safety placement returns it to a GPU once a permitted card shows
+durable room.
+```
+
+The later restore is the ordinary `Runtime safety placement: restoring the safety process to the GPU.` line.
+
+A deferred inference start on such a card is retired instead, while another inference lane is serving, with
+a warning of this shape (a structural shortfall names the card's achievable room in place of the wait):
+
+```text
+Deferred INFERENCE process 1 start on device 0 has waited 601s with no headroom progress (600MB free, governor
+pressure; the start needs at least 1631MB and a healthy governor). Retiring the slot: device 0 now plans 0
+inference process(es) and the worker plans 1. It is planned again once the card has held room for a start
+for 300s.
+```
+
+Once the card has held room for the whole dwell, one info line records the restore:
+
+```text
+Restoring a retired INFERENCE slot on device 0 as process 1: the card has held room for a start for 300s
+(9000MB free, the start needs 1631MB). Device 0 now plans 1 inference process(es) and the worker plans 2.
+```
+
+Both lines have a matching action-ledger event, `inference_start_retired` and `inference_slot_restored`.
+
 The `Withholding job pops: post-inference safety backlog` warning's closing advice depends on where safety is
 running: it suggests enabling `safety_on_gpu` only while that is off, and names resource governance when the
 setting is on but the placement policy has moved safety to the CPU.

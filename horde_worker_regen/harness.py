@@ -1813,6 +1813,10 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         # force-kill backstop it armed and join its thread before returning: an embedder that runs several
         # lifecycles in one interpreter must never inherit a thread that can later os._exit the process.
         manager._cancel_timed_shutdown()
+        # The harness drives the main loop directly, so the worker's own atexit kill of owned children never
+        # exists here; a child replaced while still starting, or one that ignored its end request, would
+        # otherwise outlive the run holding the card. Identity is re-verified per pid inside the kill.
+        _kill_owned_children_after_run(manager)
         # The children are gone, so nothing reads the simulated card any more; its manager process would
         # otherwise outlive every run in the interpreter.
         sim_resources.close()
@@ -1946,6 +1950,23 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         min_observed_device_free_mb=dict(governor_trajectory.min_free_mb),
         observed_device_total_mb=dict(governor_trajectory.total_mb),
     )
+
+
+def _kill_owned_children_after_run(manager: HordeWorkerProcessManager) -> None:
+    """Kill any child the run still owns once its main loop has returned.
+
+    The worker's own exit-time kill is registered only by ``HordeWorkerProcessManager.start``, which the
+    harness bypasses to drive the loop itself, so a child replaced while still starting, or one that ignored
+    its end request, would otherwise outlive the run holding the card. Best effort: a failure here is logged
+    and never masks the run's own result.
+    """
+    try:
+        killed = manager._process_lifecycle.kill_owned_children()
+    except Exception as exc:  # noqa: BLE001 - teardown must not raise over a finished run
+        logger.warning(f"Could not kill owned children after the run: {type(exc).__name__}: {exc}")
+        return
+    if killed:
+        logger.warning(f"Killed {len(killed)} owned child process(es) still running after the run: {killed}")
 
 
 def _determine_exit_reason(
@@ -2460,6 +2481,10 @@ class WarmHarnessSession:
         # can later os._exit the process.
         if self._manager is not None:
             self._manager._cancel_timed_shutdown()
+            _kill_owned_children_after_run(self._manager)
+        if self._run_context is not None:
+            self._run_context.close()
+            self._run_context = None
 
     async def _drain_installed_scenario(
         self,

@@ -12,15 +12,45 @@ permanently lowers the ceiling and wrongly denies a servable model. A momentary 
 which can only raise the ceiling: the worst it does is defer-and-reclaim a load that then does not fit, never a
 false terminal denial. The floor is withheld (None) until a full window of observation has elapsed, so a
 cold-start transient cannot set it prematurely; None preserves the arbiter's pre-foreign behaviour exactly.
+
+A tenant the worker launched and measured itself (the managed text backend) needs no window: its footprint is
+known from the moment it is measured. :class:`ManagedVramTenant` carries it and
+:func:`floor_with_known_tenant_mb` folds it in as a standing floor on its card, the larger of the two figures
+and never their sum, because the learned floor already contains the tenant once its window has covered it.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
 FOREIGN_FLOOR_WINDOW_SECONDS = 120.0
 """Trailing window (seconds) the sustained foreign floor is the minimum over. Also the warm-up span: no floor
 is reported until observation has covered a full window, so a startup transient cannot set it early."""
+
+
+@dataclass(frozen=True)
+class ManagedVramTenant:
+    """Represents a process the worker launched on one card and measured, which holds its VRAM while it serves."""
+
+    device_index: int
+    """The card the tenant holds VRAM on."""
+    footprint_mb: float
+    """The tenant's measured device footprint (MB)."""
+
+
+def floor_with_known_tenant_mb(measured_floor_mb: float | None, tenant_footprint_mb: float | None) -> float | None:
+    """Return a card's standing floor (MB): the larger of a measured unattributed floor and a known tenant's footprint.
+
+    The measured floor (the learned foreign floor, or the reconciler's shared-device baseline) is VRAM no worker
+    child accounts for, so once it has observed a serving tenant it already contains that tenant. The two are
+    never added. None when neither is known, which keeps every reader's behaviour without a floor.
+    """
+    if tenant_footprint_mb is None:
+        return measured_floor_mb
+    if measured_floor_mb is None:
+        return max(0.0, tenant_footprint_mb)
+    return max(measured_floor_mb, tenant_footprint_mb)
 
 
 class ForeignVramFloorTracker:

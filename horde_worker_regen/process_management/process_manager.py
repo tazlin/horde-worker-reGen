@@ -198,6 +198,7 @@ from horde_worker_regen.process_management.resources.device_free_governor import
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
+from horde_worker_regen.process_management.resources.foreign_vram_floor import ManagedVramTenant
 from horde_worker_regen.process_management.resources.model_serviceability import (
     ModelServiceabilityTier,
     max_power_to_pixels,
@@ -1860,6 +1861,9 @@ class HordeWorkerProcessManager:
         # The measured-truth identity's primary input for any snapshot the scheduler self-primes outside the
         # manager-driven cycle; the per-tick cycle passes the same readings map explicitly.
         self._inference_scheduler.set_device_free_mb_provider(self._last_device_free_mb_by_device.get)
+        # The managed text backend is a known tenant of its card: its measured launch footprint is a standing
+        # floor there from the moment it serves, before the learned foreign floor has observed it.
+        self._inference_scheduler.set_managed_tenant_provider(self._managed_text_backend_tenant)
         # Share the single learned-footprint store (the dispatcher observes into it, the scheduler prices
         # admission sampling peaks from it) so every observed peak and every priced estimate reference the same
         # watermarks.
@@ -2015,7 +2019,7 @@ class HordeWorkerProcessManager:
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
             whole_card_pop_claim=self._inference_scheduler.whole_card_pop_claim,
             whole_card_pop_outcome=self._inference_scheduler.note_whole_card_pop_outcome,
-            admission_baseline_provider=self.latest_baseline_estimate_mb,
+            admission_baseline_provider=self._inference_scheduler.serviceability_baseline_mb,
             extended_controlnet_ready_provider=self._extended_controlnet_ready,
             post_processing_lane_paused_provider=lambda: self._process_lifecycle.is_post_process_gpu_paused,
             safety_off_gpu_provider=lambda: self._process_lifecycle.is_safety_gpu_paused,
@@ -2038,6 +2042,11 @@ class HordeWorkerProcessManager:
             quarantined_models_provider=self._process_lifecycle.quarantined_models,
             run_metrics=self._run_metrics,
         )
+
+        # Every cached copy of the worker-wide inference ceiling follows the lifecycle's per-card targets through
+        # this one path, so a retired or restored slot and the CPU-only cap reach the scheduler and the popper
+        # together.
+        self._process_lifecycle.set_max_inference_processes_listener(self._on_max_inference_processes_changed)
 
         # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
         # tick by _update_pop_governors so its ENTER/EXIT log lines fire regardless of whether a TUI is attached.
@@ -7743,7 +7752,7 @@ class HordeWorkerProcessManager:
                     model,
                     card_runtimes={device_index: card_runtime},
                     model_metadata=self._model_metadata,
-                    admission_baseline_provider=self.latest_baseline_estimate_mb,
+                    admission_baseline_provider=self._inference_scheduler.serviceability_baseline_mb,
                     max_pixels=max_power_to_pixels(card_runtime.config.max_power),
                 ):
                     if verdict.tier is ModelServiceabilityTier.UNSERVICEABLE:
@@ -7786,8 +7795,10 @@ class HordeWorkerProcessManager:
         because it is the process that made the report, and an install whose sentinel says ``cpu`` plans
         none at all (``resolve_card_concurrency``).
 
-        Each card's ``target_process_count`` is lowered to one (authoritative for recovery placement, the
-        VRAM/RAM budget, and any target-based scale-up), then idle contexts are reaped toward one. Run every
+        Each card's ``target_process_count`` is capped at one (authoritative for recovery placement, the
+        VRAM/RAM budget, and any target-based scale-up), then idle contexts are reaped toward one. The cap takes
+        the minimum of the card's target and one, so a card whose slot was retired stays at zero: raising it
+        would plan a lane that card already failed to start, and the collapse only ever removes lanes. Run every
         control tick while the flag is set: lowering the target happens once (idempotent thereafter), and the
         reap retries cheaply until each card is at one, so a context that was briefly mid-alchemy at detection
         is collapsed on a later tick. Busy processes are never killed.
@@ -7795,16 +7806,7 @@ class HordeWorkerProcessManager:
         if not self._state.torch_build_cpu_only:
             return
 
-        from dataclasses import replace
-
-        target_lowered = False
-        for index, card in list(self._card_runtimes.items()):
-            if card.target_process_count != 1:
-                self._card_runtimes[index] = replace(card, target_process_count=1)
-                target_lowered = True
-        if target_lowered:
-            self.max_inference_processes = sum(card.target_process_count for card in self._card_runtimes.values())
-            self._process_lifecycle.refresh_max_inference_processes()
+        if self._process_lifecycle.cap_inference_targets(per_card_limit=1):
             logger.info(
                 "CPU-only torch build detected at runtime; collapsing inference processes to one per card "
                 "(image generation disabled, alchemy continues).",
@@ -7813,6 +7815,17 @@ class HordeWorkerProcessManager:
         for index in sorted(self._card_runtimes):
             if self._process_map.num_loaded_inference_processes(device_index=index) > 1:
                 self._process_lifecycle.scale_inference_processes(1, device_index=index)
+
+    def _on_max_inference_processes_changed(self, max_inference_processes: int) -> None:
+        """Mutate every cached copy of the worker-wide inference ceiling to the lifecycle's refreshed value.
+
+        The pricing lookahead, affinity and the planned-count budget split in the scheduler and the popper read
+        these copies, so a slot retired or restored at runtime changes what they plan against. The LRU capacity
+        sized from the construction-time ceiling is left as it was.
+        """
+        self.max_inference_processes = max_inference_processes
+        self._inference_scheduler.set_max_inference_processes(max_inference_processes)
+        self._job_popper.set_max_inference_processes(max_inference_processes)
 
     def _served_workloads(self, bridge_data: reGenBridgeData) -> list[str]:
         """The workloads actually served, as sorted ``WorkloadKind`` values, for the snapshot.
@@ -7877,6 +7890,21 @@ class HordeWorkerProcessManager:
         """
         text_backend_supervisor = self._text_backend_supervisor
         return [] if text_backend_supervisor is None else [text_backend_supervisor]
+
+    def _managed_text_backend_tenant(self) -> ManagedVramTenant | None:
+        """Return the managed text backend as a known VRAM tenant, or None while it holds no measured card.
+
+        Only a serving backend with a measured footprint on a known card is a tenant. A relaunch replaces the
+        figure when the new process is ready, and a backend that stops serving is no tenant.
+        """
+        supervisor = self._text_backend_supervisor
+        if supervisor is None or not supervisor.is_serving:
+            return None
+        footprint_mb = supervisor.footprint_mb
+        device_index = supervisor.device_index
+        if footprint_mb is None or device_index is None:
+            return None
+        return ManagedVramTenant(device_index=device_index, footprint_mb=footprint_mb)
 
     def _supervised_process_row(self, source: SupervisedProcessSnapshotSource) -> ProcessSnapshot:
         """Return one supervised program's row, adding what only the worker's own flows can see.
