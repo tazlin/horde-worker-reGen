@@ -64,12 +64,12 @@ async def _wait_until_serving(supervisor: TextBackendSupervisor) -> None:
         await asyncio.sleep(0.2)
 
 
-@pytest.mark.slow
 def factory_for(spec: TextBackendLaunchSpec) -> LaunchSpecFactory:
     """Return a factory handing the supervisor the spec this row rendered for the real binary."""
     return lambda: spec
 
 
+@pytest.mark.slow
 async def test_real_koboldcpp_streams_a_generation_and_reports_it_arriving(tmp_path: Path) -> None:
     """A real streamed generation arrives in pieces and answers the same shape the blocking route does.
 
