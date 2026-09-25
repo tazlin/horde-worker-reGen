@@ -47,7 +47,10 @@ Run the tool before hand-rolling anything. `horde-log sessions` lists each launc
 into pop->dispatch / generation / finished->submit plus the sampling-concurrency histogram (which
 answers "is a multi-GPU worker actually using its cards"); `timeline` is the raw merged parent/child
 event stream; `bundle` builds a redacted zip for a maintainer. Every finding id is catalogued in
-[docs/reference/log_findings.md](docs/reference/log_findings.md).
+[docs/reference/log_findings.md](docs/reference/log_findings.md). A benchmark run (`bridge_harness.log`)
+is a session of its own kind: it is listed after the worker sessions, numbered from #0 within its kind,
+and addressed with `--benchmark N` or `--last-benchmark`; `--session` and `--last` are worker-only, so
+worker numbering never moves when a harness log is present.
 
 **When a session needs a hand-rolled script, the tool needs a finding: add it there.** The copy a finding
 shows a reader follows [docs/how-to/write-a-finding.md](docs/how-to/write-a-finding.md), enforced by
@@ -299,7 +302,21 @@ These fail as interactions, not as units, so component tests stay green through 
 - **Do not run tests or builds during a soak or live run in the same checkout.** The CPU contention ruins
   the measurement. (Tests no longer share the live run's `.abort` sentinel or `logs/`: each test has its
   own run root. A live worker launched in the checkout still watches the checkout's `.abort`, so never
-  drop one there to stop a test.)
+  drop one there to stop a test. A benchmark claims its own `.abort_benchmark` sentinel
+  (`run_root.AbortSentinelKind`), so aborting a benchmark never stops a live worker and its startup
+  cleanup never removes the worker's file.)
+- **Delegated agents run targeted test files only; the orchestrator runs the long suites.** A subagent's
+  context cache lives five minutes, so a delegate waiting on a long run pays for its whole context again
+  and a finished delegate cannot be resumed cheaply. Briefs name specific test files; whole packages, the
+  slow bands and the full suite are run by the session that owns the tree, after the reports are in.
+- **A liveness proof the failure's own bookkeeping can satisfy is not a proof.** Take an acknowledgement
+  marker after the request is sent (the send path may restamp it), and count end-to-end completions
+  (jobs reaching submit), never inference results, as progress: results parked behind a missing safety
+  process moved `total_num_completed_jobs` for hours.
+- **Every replaced child is ended, whatever its state.** A child still in `PROCESS_STARTING` cannot read
+  an end request; retiring only its map entry leaves an OS process that outlives the parent and holds
+  the card. Replacement terminates, joins and drops the owned pid; a harness run kills owned children at
+  exit itself because it bypasses `start()`.
 
 ## See also
 
