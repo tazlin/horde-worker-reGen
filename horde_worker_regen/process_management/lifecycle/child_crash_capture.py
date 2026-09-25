@@ -45,6 +45,12 @@ from horde_worker_regen.run_root import logs_dir
 # cause out of a startup-crash file. Kept here (not imported from the analysis package) so the worker's
 # recovery path stays dependency-light.
 _EXCEPTION_LINE_RE = re.compile(r"^(?P<exc>[A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt|Exit)): ?(?P<msg>.*)$")
+# The header :func:`write_startup_crash` opens each record with, for splitting the appended file per crash.
+_STARTUP_CRASH_HEADER_RE = re.compile(
+    r"^(?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) \| CRITICAL \| \S+:startup - worker child"
+    r"(?: \(os_pid=\w+, launch=(?P<launch>\w+)\))? crashed before its log was ready:",
+)
+_STARTUP_CRASH_STAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 
 _FAULTHANDLER_FILES: dict[str, TextIO] = {}
 """The open faulthandler file handle per role, kept referenced for the process lifetime.
@@ -315,6 +321,64 @@ def read_last_startup_crash(role: str, *, max_bytes: int = 8192) -> str | None:
             if match is not None:
                 message = match.group("msg").strip()
                 return f"{match.group('exc')}: {message}" if message else match.group("exc")
+        return None
+    except Exception:  # noqa: BLE001 - never let crash-cause reading disrupt the recovery path
+        return None
+
+
+def read_startup_crash_for_launch(
+    role: str,
+    *,
+    spawned_at: float,
+    launch_identifier: int | None,
+    max_bytes: int = 8192,
+) -> str | None:
+    """Return the exception summary of a startup crash written by one launch of ``role``, if it wrote one.
+
+    The startup file is appended across every launch of a slot, and a replaced child that was never reaped
+    can still write to it after its successor started. Only a record stamped at or after ``spawned_at``
+    counts, and when both the record and the caller carry a launch identifier they must agree. Every error
+    is swallowed, as in :func:`read_last_startup_crash`, because this runs on the recovery path.
+
+    Args:
+        role: Short identifier for the process (e.g. ``"safety_0"``).
+        spawned_at: Wall-clock time the launch was spawned; older records belong to earlier launches.
+        launch_identifier: The parent-assigned launch counter for the slot, if known.
+        max_bytes: How many trailing bytes of the crash file to scan.
+    """
+    try:
+        path = logs_dir() / f"bridge_{role}_startup.log"
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+        record_end = len(lines)
+        for index in range(len(lines) - 1, -1, -1):
+            header = _STARTUP_CRASH_HEADER_RE.match(lines[index])
+            if header is None:
+                continue
+            record_lines, record_end = lines[index + 1 : record_end], index
+            stamped_at = datetime.strptime(header.group("stamp"), _STARTUP_CRASH_STAMP_FORMAT).timestamp()
+            if stamped_at < spawned_at:
+                return None
+            stamped_launch = header.group("launch")
+            launch_differs = (
+                launch_identifier is not None
+                and stamped_launch is not None
+                and stamped_launch.isdigit()
+                and int(stamped_launch) != launch_identifier
+            )
+            if launch_differs:
+                continue
+            for line in reversed(record_lines):
+                match = _EXCEPTION_LINE_RE.match(line.strip())
+                if match is not None:
+                    message = match.group("msg").strip()
+                    return f"{match.group('exc')}: {message}" if message else match.group("exc")
+            return None
         return None
     except Exception:  # noqa: BLE001 - never let crash-cause reading disrupt the recovery path
         return None

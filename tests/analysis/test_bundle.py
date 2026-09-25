@@ -43,6 +43,18 @@ def test_record_accessors_cache_parsed_files(tmp_path: Path, monkeypatch: pytest
     ]
 
 
+@pytest.mark.parametrize("role", ["inference", "safety", "download", "post_process", "vae_lane", "component"])
+def test_every_child_role_startup_log_is_a_startup_path(tmp_path: Path, role: str) -> None:
+    """Each role a worker entry point arms its crash backstop under is read as that slot's startup log."""
+    startup_log = tmp_path / f"bridge_{role}_1_startup.log"
+    startup_log.write_text("", encoding="utf-8")
+    (tmp_path / "bridge.log").write_text("", encoding="utf-8")
+
+    bundle = LogBundle.from_path(tmp_path)
+
+    assert bundle.startup_paths == {1: [startup_log]}
+
+
 _STARTUP_LINE = (
     "2026-06-24 10:00:00.000 | DEBUG    | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process"
 )

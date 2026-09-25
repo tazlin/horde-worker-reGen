@@ -6564,12 +6564,18 @@ class HordeWorkerProcessManager:
         # would inherit a non-zero count and be failed for a recovery it never had.
         self._process_lifecycle.reset_recovery_counter()
 
+    def abandon_benchmark_alchemy_forms(self) -> int:
+        """Drop the canned alchemy forms a finished warm level left behind and return how many were dropped."""
+        return self._alchemy_coordinator.abandon_canned_forms()
+
     def request_benchmark_memory_cleanup(self) -> dict[int, float]:
         """Ask idle alchemy service lanes to discard transient RAM before the next warm probe.
 
-        Returns each targeted process id mapped to its last parent-receive timestamp before the request. The
+        Returns each targeted process id mapped to its last parent-receive timestamp as of the request. The
         warm harness uses that marker to wait for a newer child message, proving the asynchronous unload was
-        handled before it installs the next scenario.
+        handled before it installs the next scenario. The marker is read after the request is sent: the
+        send path restamps the same timestamp on the parent side (``ProcessMap.on_model_ram_clear``), and a
+        marker taken before it would be beaten by that bookkeeping with no child answer at all.
         """
         if self._alchemy_coordinator.num_in_flight:
             raise RuntimeError("cannot clean benchmark alchemy lanes while forms are still pending or in flight")
@@ -6580,8 +6586,8 @@ class HordeWorkerProcessManager:
                 continue
             if not process_info.is_process_alive() or not process_info.can_accept_job():
                 continue
-            requested[process_info.process_id] = process_info.last_received_timestamp
             self._inference_scheduler.unload_from_ram(process_info.process_id)
+            requested[process_info.process_id] = process_info.last_received_timestamp
         return requested
 
     def _supervisor_state_signature(self) -> tuple[object, ...]:

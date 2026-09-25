@@ -78,6 +78,7 @@ class FindingKind(enum.StrEnum):
     OOM = "oom"
     SWALLOWED_OOM = "swallowed_oom"
     FILE_DESCRIPTOR_EXHAUSTION = "file_descriptor_exhaustion"
+    PAGEFILE_EXHAUSTION = "pagefile_exhaustion"
     SCHEDULER_STARVATION_WEDGE = "scheduler_starvation_wedge"
     UNSATISFIABLE_HEAD_STARVATION = "unsatisfiable_head_starvation"
     RESIDENCY_RECONCILIATION_HOLDS = "residency_reconciliation_holds"
@@ -304,6 +305,22 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "worker reports no open-file headroom yet, so the growth cannot be traced from the log. Windows "
             "has a far higher handle ceiling, so this is a Linux concern."
         ),
+    ),
+    FindingSpec(
+        kind=FindingKind.PAGEFILE_EXHAUSTION,
+        title="Windows ran out of paging file space",
+        action=(
+            "Let Windows manage the paging file size, or set a larger fixed size, then restart the worker. "
+            "As a stopgap, run fewer processes by lowering `max_threads` or `queue_size`."
+        ),
+        detail=(
+            "Windows reserves room in RAM or the paging file for every block of memory a process may use. "
+            "That total is the commit limit. Loading a model or a GPU library fails with error 1455 once it "
+            "is reached. Every worker process holds its own libraries and models, so the total grows with the "
+            "number of processes. A process that fails this way is started again and usually fails again, so "
+            "jobs stop until memory is freed."
+        ),
+        see_also=FindingKind.CRASH_ON_START_LOOP,
     ),
     FindingSpec(
         kind=FindingKind.SCHEDULER_STARVATION_WEDGE,

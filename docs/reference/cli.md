@@ -250,6 +250,12 @@ the idle safety and post-processing processes to unload optional models from RAM
 acknowledgements. The probe's own warm-up then loads exactly the models it needs before the measured pass.
 If that warm-up cannot drain within its bounded budget, the probe is reported timed out immediately; the
 driver does not reset the source and install a measured copy over forms that may still be running.
+A probe that timed out can leave alchemy forms waiting for a process that never came up, or still running
+on one. The next probe's boundary drops them before the RAM cleanup, since the earlier probe is already
+scored, and a result that arrives for a dropped form is discarded rather than counted against the next
+probe. A process that does not acknowledge the RAM cleanup within 30 s fails that probe without running
+it. The probe is reported timed out with an `exit_reason` starting `boundary_cleanup_timeout` that lists
+the process ids that did not answer, and the run moves on to the next probe.
 
 A **capability** is a `(tier, kind, magnitude)` triple, e.g. "SD1.5 can run batch size 4". Each probe's
 verdict is `PROVEN`, `DISPROVEN`, `SKIPPED` (a prerequisite was unproven or the machine cannot host it),

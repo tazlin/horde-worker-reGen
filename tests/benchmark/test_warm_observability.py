@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+from horde_sdk.ai_horde_api import GENERATION_STATE
 from loguru import logger
 
 from horde_worker_regen.benchmark.capabilities.stats import level_stats_from_harness_result
@@ -110,6 +111,9 @@ class _StubManager:
 
     def install_benchmark_scenario(self, *, jobs: object, alchemy_forms: object = None) -> None:
         self.install_calls += 1
+
+    def abandon_benchmark_alchemy_forms(self) -> int:
+        return 0
 
     def request_benchmark_memory_cleanup(self) -> dict[int, float]:
         return {}
@@ -213,6 +217,90 @@ async def test_undrained_alchemy_warmup_is_not_reinstalled_as_measured_work() ->
 
     assert result.timed_out is True
     assert session.manager.install_calls == 1  # type: ignore[attr-defined]
+
+
+async def test_level_boundary_drops_forms_a_timed_out_level_left_behind() -> None:
+    """The next level starts even when the last one timed out with forms its lane never served.
+
+    A timed-out level leaves forms pending (their lane never came up) or in flight (a child still running
+    one). The boundary's RAM cleanup refuses to run with forms outstanding, so the boundary must drop them
+    first; a result that arrives afterwards must not be counted against the next scenario.
+    """
+    from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec, HordeAlchemyResultMessage
+    from tests.process_management.conftest import make_testable_process_manager
+
+    manager = make_testable_process_manager(alchemist=True)
+    never_dispatched = AlchemyFormSpec(form_id="pending-form", form="caption", source_image_bytes=b"x")
+    still_running = AlchemyFormSpec(form_id="running-form", form="RealESRGAN_x4plus", source_image_bytes=b"x")
+    manager.install_benchmark_scenario(jobs=[], alchemy_forms=[never_dispatched, still_running])
+    coordinator = manager._alchemy_coordinator
+    coordinator._queue_pending_form(never_dispatched)
+    coordinator._in_flight[still_running.form_id] = still_running
+    session = WarmHarnessSession(process_mode="fake", model_names=["Deliberate"], max_threads_ceiling=1)
+    session._manager = manager
+
+    await session._prepare_level_boundary()
+
+    assert coordinator.num_in_flight == 0
+    coordinator.on_alchemy_result(
+        HordeAlchemyResultMessage(
+            process_id=1,
+            process_launch_identifier=0,
+            info="",
+            form_id=still_running.form_id,
+            form=still_running.form,
+            state=GENERATION_STATE.ok,
+        ),
+    )
+    assert coordinator.num_forms_awaiting_submit == 0
+
+
+async def test_unacknowledged_boundary_cleanup_fails_the_level_and_the_next_level_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that never answers the boundary's RAM cleanup fails that level instead of raising.
+
+    The probe executor has no handler for an exception out of ``run_level``, so a raise here ended the
+    whole benchmark run. The level is scored as failed and the session goes on to the next level.
+    """
+    import horde_worker_regen.harness as harness_mod
+    from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
+
+    monkeypatch.setattr(harness_mod, "_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS", 0.3)
+    manager = make_testable_process_manager(alchemist=True)
+    manager.install_benchmark_scenario(jobs=[], alchemy_forms=[])
+    safety = make_mock_process_info(3, model_name=None, process_type=HordeProcessType.SAFETY)
+    manager._process_map[3] = safety
+
+    # The unload command is recorded rather than sent: the parent's optimistic RAM-clear bookkeeping
+    # restamps the slot's receive time, which would read as an answer the child never gave.
+    unload_requests: list[int] = []
+    monkeypatch.setattr(manager._inference_scheduler, "unload_from_ram", unload_requests.append)
+    child_answers = False
+
+    async def pump_messages() -> None:
+        if child_answers:
+            safety.last_received_timestamp = time.time() + 1.0
+
+    monkeypatch.setattr(manager, "receive_and_handle_process_messages", pump_messages)
+    session = WarmHarnessSession(process_mode="fake", model_names=["Deliberate"], max_threads_ceiling=1)
+    session._manager = manager
+
+    failed = await session.run_level(jobs=[], threads=1, timeout_seconds=5.0)
+
+    assert unload_requests == [3]
+    assert failed.timed_out is True
+    assert failed.succeeded is False
+    assert failed.exit_reason.startswith(harness_mod._BOUNDARY_CLEANUP_TIMEOUT_EXIT_REASON)
+    assert "[3]" in failed.exit_reason
+    assert failed.diagnostics
+
+    child_answers = True
+    following = await session.run_level(jobs=[], threads=1, timeout_seconds=5.0)
+
+    assert unload_requests == [3, 3]
+    assert following.timed_out is False
+    assert following.exit_reason == "completed"
 
 
 class _AllFaultedStubManager(_StubManager):

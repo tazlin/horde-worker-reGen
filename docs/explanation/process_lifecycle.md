@@ -44,6 +44,15 @@ applies none of the transition side effects). Without that, the whole cold start
 reads as one unbroken silence, and a start slower than `preload_timeout` is reaped
 as "stuck starting" and respawned into the same window.
 
+A child that dies before its log sink opens writes its traceback only to
+`logs/bridge_<role>_<id>_startup.log` (`child_crash_capture.write_startup_crash`).
+When the parent replaces a slot stuck starting, the "replacing it" line and the
+recovery diagnostics line carry that file's exception summary, if this launch wrote
+one. The record must be stamped after the launch was spawned and, when it names a
+launch identifier, name this one. The file is appended across launches, and a
+replaced child can still write to it after its successor started, so an older or
+foreign record is never attributed to the slot being replaced.
+
 Inference processes are started up to `max_inference_processes` (derived
 `queue_size + max_threads`). Safety processes are started up to
 `max_safety_processes` (typically 1).

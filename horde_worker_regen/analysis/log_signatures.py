@@ -899,6 +899,16 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_NO_FAULT,
         field_of="pop_api_error",
     ),
+    # --- Host environment faults ---
+    _signature(
+        "pagefile_exhausted",
+        r"WinError 1455\b|os error 1455\b",
+        # Windows raises the error. The worker records it in the traceback its crash backstop writes, or in
+        # the child's loguru catch once the sink is open.
+        emitter="process_management.lifecycle.child_crash_capture:write_startup_crash",
+        sample="OSError: Die Auslagerungsdatei ist zu klein, um diesen Vorgang durchzuführen. (os error 1455)",
+        dry_run_reason="commit-charge exhaustion is a Windows memory condition the dry-run harness never produces",
+    ),
     # --- Stuck/stalled slots ---
     _signature(
         "stuck_step",

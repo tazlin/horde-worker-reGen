@@ -99,6 +99,9 @@ _FD_EXHAUSTION_RE = re.compile(r"Too many open files(?! in system)")
 # The resource whose open() was refused, naming where the exhaustion bit: a /proc probe (psutil's
 # free-RAM read, or the child's own /proc/<pid>/stat control-message read) or a checkpoint/LoRA .safetensors.
 _FD_RESOURCE_RE = re.compile(r"Too many open files: '(?P<path>[^']+)'|open file <(?P<file>[^>]+)> in read-only mode")
+# Windows commit-charge exhaustion ("the paging file is too small"), raised while a process maps a checkpoint
+# or loads a DLL. It reaches the logs inside a traceback, so it is matched against a record's full text.
+_PAGEFILE_EXHAUSTED_RE = pattern_for("pagefile_exhausted")
 _NO_IMAGES_RE = pattern_for("no_images")
 # The in-progress orphan watchdog names itself in its punt line ("...(orphaned-job watchdog).") rather
 # than using the words "orphaned in-progress", so the watchdog tag is the signature that actually
@@ -833,6 +836,47 @@ def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
             evidence=([resource_clause.strip()] if resource_clause else [])
             + [_evidence(r) for r in faults[:4]]
             + ([_evidence(recovery.record)] if recovery else []),
+        ),
+    ]
+
+
+def detect_pagefile_exhaustion(context: SessionContext) -> list[Finding]:
+    """Worker processes refused memory by Windows because the commit limit was reached (error 1455).
+
+    The failure lands in whichever process allocates next: a child still starting (its startup-crash
+    backstop holds the traceback), a child whose log is open (its loguru catch), or the parent. The parent
+    sees only a child that never reports ready, so without this finding the reader is told a process was
+    stuck starting and never why. One crash can appear in both a child's loop log and its startup log, so
+    matches are counted once per process per second.
+    """
+    start, end = context.session.start_ts, context.session.end_ts
+    matches: list[tuple[int | None, LogRecord]] = [
+        (None, record) for record in context.session.records if _PAGEFILE_EXHAUSTED_RE.search(record.full_text)
+    ]
+    for process_id in sorted(context.bundle.process_ids()):
+        child_records = _records_in_window(context.bundle.child_records(process_id), start, end)
+        startup_records = _records_in_window(context.bundle.startup_records(process_id), start, end)
+        matches.extend(
+            (process_id, record)
+            for record in [*child_records, *startup_records]
+            if _PAGEFILE_EXHAUSTED_RE.search(record.full_text)
+        )
+    if not matches:
+        return []
+
+    distinct: dict[tuple[int | None, datetime | None], LogRecord] = {}
+    for process_id, record in matches:
+        second = record.timestamp.replace(microsecond=0) if record.timestamp is not None else None
+        distinct.setdefault((process_id, second), record)
+    records = sorted(distinct.values(), key=_window_key)
+    count = len(records)
+    times = "once" if count == 1 else f"{count} times"
+    return [
+        Finding(
+            kind=FindingKind.PAGEFILE_EXHAUSTION,
+            severity=Severity.CRITICAL,
+            headline=f'Worker processes failed {times} because Windows reported "the paging file is too small".',
+            evidence=[_evidence(record) for record in records[:6]],
         ),
     ]
 
@@ -3167,6 +3211,7 @@ DETECTORS: list[Detector] = [
     detect_post_processing_deferral_starvation,
     detect_oom,
     detect_file_descriptor_exhaustion,
+    detect_pagefile_exhaustion,
     detect_swallowed_oom,
     detect_orphan_wedge,
     detect_session_summary,

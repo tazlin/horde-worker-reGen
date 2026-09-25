@@ -436,6 +436,11 @@ class AlchemyCoordinator:
     """
     _pending_submits: deque[PendingAlchemySubmitJob]
     _form_time_popped: dict[str, float]
+    _abandoned_form_ids: frozenset[str] = frozenset()
+    """Canned forms dropped while a child was still running them; their late results are discarded.
+
+    Without this a result arriving after the next scenario is installed would be submitted and counted
+    against that scenario's forms."""
 
     _estimator: AlchemyHeadroomEstimator
     _free_vram_baseline_mb: dict[int | None, float]
@@ -672,6 +677,36 @@ class AlchemyCoordinator:
         self._canned_alchemy_source = source
         self.num_canned_forms_completed = 0
         self.num_canned_forms_faulted = 0
+
+    def abandon_canned_forms(self) -> int:
+        """Drop every pending, in-flight and awaiting-submit form of the installed canned scenario.
+
+        A benchmark level that times out leaves forms behind, and the lane meant to serve them may never
+        return. The level is already scored, so its leftovers are discarded rather than drained. Forms
+        popped from the horde are owed back to it and are never dropped this way.
+
+        Returns:
+            The number of forms dropped.
+
+        Raises:
+            RuntimeError: If no canned alchemy source is installed.
+        """
+        if self._canned_alchemy_source is None:
+            raise RuntimeError("only canned benchmark forms can be abandoned; horde forms are owed back to the horde")
+        pending_ids = [spec.form_id for spec in self._pending_forms]
+        submit_ids = [submit.form_id for submit in self._pending_submits]
+        in_flight_ids = list(self._in_flight)
+        self._abandoned_form_ids = self._abandoned_form_ids.union(in_flight_ids)
+        for form_id in [*pending_ids, *submit_ids, *in_flight_ids]:
+            self._form_time_popped.pop(form_id, None)
+            self._form_resolution.pop(form_id, None)
+        self._pending_forms.clear()
+        self._pending_form_deadlines.clear()
+        self._pending_submits.clear()
+        self._in_flight.clear()
+        self._in_flight_card.clear()
+        self._in_flight_owner.clear()
+        return len(pending_ids) + len(submit_ids) + len(in_flight_ids)
 
     @property
     def bridge_data(self) -> reGenBridgeData:
@@ -1339,6 +1374,10 @@ class AlchemyCoordinator:
 
     def on_alchemy_result(self, message: HordeAlchemyResultMessage) -> None:
         """Accept a form result from a child process and queue it for submission."""
+        if message.form_id in self._abandoned_form_ids:
+            self._abandoned_form_ids = self._abandoned_form_ids.difference((message.form_id,))
+            logger.debug(f"Discarding the result of abandoned canned alchemy form {message.form_id} ({message.form})")
+            return
         spec = self._in_flight.pop(message.form_id, None)
         device_index = self._in_flight_card.pop(message.form_id, None)
         self._in_flight_owner.pop(message.form_id, None)

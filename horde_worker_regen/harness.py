@@ -2213,9 +2213,18 @@ make the next level cold-load them back. The session's superset already covers e
 
 
 _WARMUP_DRAIN_TIMEOUT_SECONDS = 300.0
-_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS = 30.0
 """Bound on a level's pre-warm pass: enough for a cold heavy-model load plus one recovery-and-reload
 cycle, after which the level times out without installing a second copy of the scenario."""
+
+_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS = 30.0
+"""How long the level boundary waits for each alchemy lane to acknowledge its RAM cleanup. A lane that
+misses it fails the level it precedes (:data:`_BOUNDARY_CLEANUP_TIMEOUT_EXIT_REASON`)."""
+
+_BOUNDARY_CLEANUP_TIMEOUT_EXIT_REASON = "boundary_cleanup_timeout"
+"""``exit_reason`` prefix of a warm level failed because a child never acknowledged the boundary cleanup.
+
+The level is not run: a lane that did not answer is in an unknown memory state, so its measurement would
+not describe the level. The session carries on to the next level, whose own boundary asks again."""
 
 _WARM_PROGRESS_INTERVAL_SECONDS = 1.0
 """How often the warm session samples the live worker metrics for the progress hook. Snappier than the
@@ -2503,12 +2512,24 @@ class WarmHarnessSession:
             else:
                 dead_since = None
 
-    async def _prepare_level_boundary(self) -> None:
-        """Unload idle alchemy residents and wait for each child to acknowledge before a new level."""
+    async def _prepare_level_boundary(self) -> list[int]:
+        """Unload idle alchemy residents and wait for each child to acknowledge before a new level.
+
+        A level that timed out leaves its forms pending or in flight, and the lane meant to serve them may
+        never come back, so waiting for them could stall every later level. That level is already scored,
+        so its leftovers are dropped before the cleanup, which refuses to run with forms outstanding.
+
+        Returns:
+            The sorted process ids that did not acknowledge within
+            :data:`_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS`; empty when every child answered.
+        """
         manager = self.manager
+        abandoned = manager.abandon_benchmark_alchemy_forms()
+        if abandoned:
+            logger.warning(f"Dropped {abandoned} alchemy form(s) the previous level left unfinished.")
         requested = manager.request_benchmark_memory_cleanup()
         if not requested:
-            return
+            return []
 
         deadline = time.time() + _WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS
         while requested and time.time() < deadline:
@@ -2527,11 +2548,13 @@ class WarmHarnessSession:
             if requested:
                 await asyncio.sleep(0.1)
 
-        if requested:
-            raise RuntimeError(
+        unacknowledged = sorted(requested)
+        if unacknowledged:
+            logger.warning(
                 f"benchmark memory cleanup was not acknowledged within "
-                f"{_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS:.0f}s by process ids {sorted(requested)}",
+                f"{_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS:.0f}s by process ids {unacknowledged}",
             )
+        return unacknowledged
 
     async def _settle_level_metrics(
         self,
@@ -2627,6 +2650,10 @@ class WarmHarnessSession:
 
         ``on_progress`` is invoked roughly every :data:`_WARM_PROGRESS_INTERVAL_SECONDS` with the live run
         metrics and the seconds elapsed since this call began, so a caller can stream the level's progress.
+
+        A child that does not acknowledge the level boundary's RAM cleanup fails the level without running
+        it: the result is ``timed_out`` with an ``exit_reason`` starting
+        :data:`_BOUNDARY_CLEANUP_TIMEOUT_EXIT_REASON` and naming the silent process ids.
         """
         manager = self.manager
         scenario_jobs = jobs or []
@@ -2634,7 +2661,27 @@ class WarmHarnessSession:
         num_jobs_expected = len(scenario_jobs)
         num_forms_expected = len(alchemy_forms or [])
 
-        await self._prepare_level_boundary()
+        boundary_started = time.time()
+        unacknowledged = await self._prepare_level_boundary()
+        if unacknowledged:
+            exit_reason = (
+                f"{_BOUNDARY_CLEANUP_TIMEOUT_EXIT_REASON}: process ids {unacknowledged} did not acknowledge the "
+                f"RAM cleanup within {_WARM_BOUNDARY_CLEANUP_TIMEOUT_SECONDS:.0f}s"
+            )
+            return HarnessResult(
+                num_jobs_expected=num_jobs_expected,
+                num_jobs_completed=0,
+                num_jobs_faulted=0,
+                elapsed_seconds=time.time() - boundary_started,
+                started_at_epoch=boundary_started,
+                timed_out=True,
+                exit_reason=exit_reason,
+                diagnostics=[
+                    exit_reason,
+                    f"worker process states at boundary: {_summarize_worker_processes(manager)}",
+                ],
+                num_alchemy_forms_expected=num_forms_expected,
+            )
 
         # Before the concurrency call, which is the authority on the live cap: a config reload re-derives
         # the effective cap from the new max_threads, so applying the delta afterwards would undo it.

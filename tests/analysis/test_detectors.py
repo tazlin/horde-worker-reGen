@@ -74,6 +74,70 @@ class TestCrashOnStart:
         assert findings["crash_on_start_loop"].severity is Severity.CRITICAL
 
 
+class TestPagefileExhaustion:
+    """Windows error 1455 in a child log, which the parent only ever reports as a process stuck starting."""
+
+    _STUCK_STARTING = "seems to be stuck starting"
+
+    @staticmethod
+    def _startup_crash(ts: str) -> str:
+        return (
+            f"2026-06-24 {ts} | CRITICAL | safety_0:startup - worker child (os_pid=105816, launch=27) crashed "
+            "before its log was ready:\nTraceback (most recent call last):\n"
+            "OSError: Die Auslagerungsdatei ist zu klein, um diesen Vorgang durchzuführen. (os error 1455)\n"
+        )
+
+    @staticmethod
+    def _loop_log_catch(ts: str) -> str:
+        return (
+            f"2026-06-24 {ts} | ERROR    | horde_worker_regen.process_management.worker_entry_points:"
+            "start_post_process_process:730 - An error has been caught in function 'start_post_process_process', "
+            "process 'SpawnProcess-64' (114080), thread 'MainThread' (91652):\nTraceback (most recent call last):\n"
+            "OSError: [WinError 1455] Die Auslagerungsdatei ist zu klein, um diesen Vorgang durchzuführen. Error "
+            'loading "torch\\lib\\cufft64_12.dll" or one of its dependencies.\n'
+        )
+
+    def _bridge(self) -> str:
+        return "\n".join(
+            [
+                f"2026-06-24 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _recovery("18:40:00.000", 0, reason=self._STUCK_STARTING),
+            ],
+        )
+
+    def test_names_the_paging_file_from_a_startup_crash(self, tmp_path: Path) -> None:
+        """The startup backstop's traceback is enough; the parent side only says the child was stuck."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(),
+            {"bridge_safety_0_startup.log": self._startup_crash("18:35:00.000")},
+        )
+        assert "pagefile_exhaustion" in findings
+        finding = findings["pagefile_exhaustion"]
+        assert finding.severity is Severity.CRITICAL
+        assert "once" in finding.headline
+        assert "`max_threads`" in finding.action
+
+    def test_counts_one_crash_logged_in_both_the_loop_and_startup_logs_once(self, tmp_path: Path) -> None:
+        """A child whose sink is open writes the crash to its loop log and its backstop in the same second."""
+        startup = self._startup_crash("18:35:00.814").replace("safety_0", "post_process_1")
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(),
+            {
+                "bridge_1.log": self._loop_log_catch("18:35:00.810"),
+                "bridge_post_process_1_startup.log": startup,
+                "bridge_safety_0_startup.log": self._startup_crash("18:36:00.000"),
+            },
+        )
+        assert "2 times" in findings["pagefile_exhaustion"].headline
+
+    def test_stays_quiet_without_error_1455(self, tmp_path: Path) -> None:
+        """A startup crash for another reason is the crash-on-start finding's business, not this one."""
+        findings = _diagnose(tmp_path, self._bridge(), {"bridge_safety_0_startup.log": _TRACEBACK})
+        assert "pagefile_exhaustion" not in findings
+
+
 class TestDoomedPoolNoGiveup:
     """The recovery storm that never gave up vs. the worker that correctly abandoned ship."""
 

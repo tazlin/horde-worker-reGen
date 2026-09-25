@@ -6,6 +6,7 @@ import argparse
 import faulthandler
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
     enable_child_faulthandler,
     neutralize_inherited_argv,
     read_last_startup_crash,
+    read_startup_crash_for_launch,
     write_startup_crash,
 )
 from horde_worker_regen.tui.log_tailer import discover_bridge_logs_grouped
@@ -72,6 +74,55 @@ def test_read_last_startup_crash_missing_file_is_none(monkeypatch: pytest.Monkey
     """A slot that never wrote a startup crash yields None, not an error."""
     monkeypatch.chdir(tmp_path)
     assert read_last_startup_crash("inference_9") is None
+
+
+def _record_crash(role: str, message: str, *, launch_identifier: int | None) -> None:
+    try:
+        raise OSError(message)
+    except OSError as error:
+        write_startup_crash(role, error, os_pid=4600, launch_identifier=launch_identifier)
+
+
+def test_crash_for_launch_skips_a_later_crash_by_another_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A replaced child that was never reaped can append after its successor; its crash is not the successor's."""
+    monkeypatch.chdir(tmp_path)
+    spawned_at = time.time() - 1
+    _record_crash("safety_0", "this launch", launch_identifier=12)
+    _record_crash("safety_0", "a replaced launch", launch_identifier=11)
+
+    summary = read_startup_crash_for_launch("safety_0", spawned_at=spawned_at, launch_identifier=12)
+
+    assert summary == "OSError: this launch"
+
+
+def test_crash_for_launch_ignores_crashes_older_than_the_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The file is appended across launches, so a record from before this spawn belongs to an earlier one."""
+    monkeypatch.chdir(tmp_path)
+    _record_crash("safety_0", "an earlier session", launch_identifier=12)
+
+    summary = read_startup_crash_for_launch("safety_0", spawned_at=time.time() + 1, launch_identifier=12)
+
+    assert summary is None
+
+
+def test_crash_for_launch_accepts_an_unstamped_record_newer_than_the_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A child that could not learn its launch identifier still writes a record the time bound can place."""
+    monkeypatch.chdir(tmp_path)
+    spawned_at = time.time() - 1
+    _record_crash("post_process_1", "[WinError 1455] paging file too small", launch_identifier=None)
+
+    summary = read_startup_crash_for_launch("post_process_1", spawned_at=spawned_at, launch_identifier=65)
+
+    assert summary == "OSError: [WinError 1455] paging file too small"
 
 
 def test_write_startup_crash_is_lazy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

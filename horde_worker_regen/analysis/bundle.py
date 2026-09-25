@@ -33,6 +33,9 @@ _CHILD_LOOP_RE = re.compile(r"^bridge_(?P<pid>\d+)\.log$")
 _INFERENCE_STARTUP_RE = re.compile(r"^bridge_inference_(?P<pid>\d+)_startup\.log$")
 _SAFETY_STARTUP_RE = re.compile(r"^bridge_safety_(?P<pid>\d+)_startup\.log$")
 _DOWNLOAD_STARTUP_RE = re.compile(r"^bridge_download_(?P<pid>\d+)_startup\.log$")
+# The helper lanes write the same backstop under their own role names (see worker_entry_points). Their ids
+# share the process map's id space with inference and safety, so they key into the same per-slot table.
+_LANE_STARTUP_RE = re.compile(r"^bridge_(?:post_process|vae_lane|component)_(?P<pid>\d+)_startup\.log$")
 _STDERR_RE = re.compile(r"^stderr_(?P<pid>\d+)\.log$")
 
 # A rotated archive carries a timestamp segment before ".log", e.g. "bridge.2026-06-22_00-55-59.log".
@@ -231,6 +234,7 @@ class LogBundle:
             (_INFERENCE_STARTUP_RE, self.startup_paths),
             (_SAFETY_STARTUP_RE, self.startup_paths),
             (_DOWNLOAD_STARTUP_RE, self.startup_paths),
+            (_LANE_STARTUP_RE, self.startup_paths),
             (_STDERR_RE, self.stderr_paths),
         ):
             match = pattern.match(base)
@@ -336,6 +340,7 @@ def _looks_like_rotation(path: Path) -> bool:
             _INFERENCE_STARTUP_RE,
             _SAFETY_STARTUP_RE,
             _DOWNLOAD_STARTUP_RE,
+            _LANE_STARTUP_RE,
             _STDERR_RE,
         )
     )

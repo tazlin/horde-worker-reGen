@@ -160,6 +160,22 @@ def _fd_exhaustion(ts: str, *, slot: int = 3, model: str = "WAI-NSFW-illustrious
     )
 
 
+def _pagefile_startup_crash(ts: str, *, process_id: int = 0) -> str:
+    """child_crash_capture.write_startup_crash: a safety child refused commit charge by Windows.
+
+    Mirrors the real backstop record: the identity-stamped header, then the traceback whose last line is the
+    localized OSError that safetensors raises while mapping the CLIP checkpoint.
+    """
+    return (
+        f"2026-06-24 {ts} | CRITICAL | safety_{process_id}:startup - worker child (os_pid=105816, launch=27) "
+        "crashed before its log was ready:\n"
+        "Traceback (most recent call last):\n"
+        '  File "safetensors\\torch.py", line 359, in load_file\n'
+        '    with safe_open(filename, framework="pt", device=device, backend=backend) as f:\n'
+        "OSError: Die Auslagerungsdatei ist zu klein, um diesen Vorgang durchzuführen. (os error 1455)\n"
+    )
+
+
 def _no_images(ts: str) -> str:
     """A generic 'no images produced' fault (the swallowed-OOM classification gap)."""
     return f"2026-06-24 {ts} | WARNING | x:y:1 - Job faulted: no images were produced"
@@ -461,6 +477,11 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "detect_file_descriptor_exhaustion": Contract(
         bridge=_bridge(_fd_exhaustion("20:09:24.000")),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_pagefile_exhaustion": Contract(
+        bridge=_bridge(_recovery("18:40:00.000", 0, reason="seems to be stuck starting")),
+        child_logs={"bridge_safety_0_startup.log": _pagefile_startup_crash("18:35:00.000")},
         severity=Severity.CRITICAL,
     ),
     "detect_swallowed_oom": Contract(

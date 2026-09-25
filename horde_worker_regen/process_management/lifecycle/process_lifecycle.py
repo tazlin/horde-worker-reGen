@@ -45,7 +45,10 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
-from horde_worker_regen.process_management.lifecycle.child_crash_capture import read_last_startup_crash
+from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
+    read_last_startup_crash,
+    read_startup_crash_for_launch,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -1207,6 +1210,8 @@ class ProcessLifecycleManager:
             for event in recent
         )
         last_job = process_info.last_job_referenced
+        startup_crash = self._startup_crash_for_launch(process_info)
+        startup_crash_clause = f"; startup_crash='{startup_crash}'" if startup_crash is not None else ""
         logger.error(
             f"Recovery diagnostics for process {process_info.process_id} (os_pid={process_info.os_pid}, "
             f"launch={process_info.process_launch_identifier}): reason='{reason}'; "
@@ -1214,7 +1219,22 @@ class ProcessLifecycleManager:
             f"last_heartbeat_type={process_info.last_heartbeat_type.name}; "
             f"since_last_heartbeat={now - process_info.last_heartbeat_timestamp:.1f}s; "
             f"since_last_message={now - process_info.last_received_timestamp:.1f}s; "
-            f"last_job={last_job.id_ if last_job is not None else None}; recent_actions=[{recent_summary}]",
+            f"last_job={last_job.id_ if last_job is not None else None}; recent_actions=[{recent_summary}]"
+            f"{startup_crash_clause}",
+        )
+
+    @staticmethod
+    def _startup_crash_for_launch(process_info: HordeProcessInfo) -> str | None:
+        """Return the startup-crash summary this launch of the slot wrote, or None.
+
+        A child that dies before its loguru sink opens leaves its traceback only in the startup backstop. The
+        parent otherwise sees a child that never reported ready and cannot say why. The backstop's role name
+        is the process type's lower-cased name plus the slot id, as each worker entry point arms it.
+        """
+        return read_startup_crash_for_launch(
+            f"{process_info.process_type.name.lower()}_{process_info.process_id}",
+            spawned_at=process_info.spawned_at,
+            launch_identifier=process_info.process_launch_identifier,
         )
 
     def _forget_owned(self, process_info: HordeProcessInfo) -> None:
@@ -4416,7 +4436,11 @@ class ProcessLifecycleManager:
             time_elapsed = min(time_elapsed, now - process_info.last_heartbeat_timestamp)
 
         if time_elapsed > timeout and process_info.last_process_state == state:
-            logger.error(f"{process_info} {error_message}, replacing it")
+            startup_crash = (
+                self._startup_crash_for_launch(process_info) if state is HordeProcessState.PROCESS_STARTING else None
+            )
+            startup_crash_clause = f" (startup crash: {startup_crash})" if startup_crash is not None else ""
+            logger.error(f"{process_info} {error_message}, replacing it{startup_crash_clause}")
             self._action_ledger.record(
                 LedgerEventType.TIMEOUT_DETECTED,
                 process_id=process_info.process_id,

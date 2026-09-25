@@ -1741,6 +1741,76 @@ def test_stuck_utilities_lane_arms_its_replacement() -> None:
     assert plm.utilities_processes_should_be_replaced is True
 
 
+def test_stuck_starting_names_the_startup_crash_this_launch_wrote() -> None:
+    """A child that died before its log opened leaves its cause only in the startup backstop.
+
+    The parent sees a process that never reported ready; both the "replacing it" line and the recovery
+    diagnostics carry the exception so the reader is not left with a bare "stuck starting".
+    """
+    from loguru import logger
+
+    from horde_worker_regen.process_management.lifecycle.child_crash_capture import write_startup_crash
+
+    safety = make_mock_process_info(
+        0, model_name=None, state=HordeProcessState.PROCESS_STARTING, process_type=HordeProcessType.SAFETY
+    )
+    safety.spawned_at = time.time() - 1
+    safety.last_received_timestamp = time.time() - 1000
+    safety.last_heartbeat_timestamp = time.time() - 1000
+    plm = _make_plm(process_map=ProcessMap({0: safety}))
+    try:
+        raise OSError("The paging file is too small for this operation to complete. (os error 1455)")
+    except OSError as error:
+        write_startup_crash(
+            "safety_0",
+            error,
+            os_pid=safety.os_pid,
+            launch_identifier=safety.process_launch_identifier,
+        )
+
+    captured: list[str] = []
+    handler_id = logger.add(lambda message: captured.append(str(message)), level="ERROR")
+    try:
+        assert plm._check_and_replace_process(safety, 0.0, HordeProcessState.PROCESS_STARTING, "stuck") is True
+    finally:
+        logger.remove(handler_id)
+
+    expected = "OSError: The paging file is too small for this operation to complete. (os error 1455)"
+    replacing = [line for line in captured if "replacing it" in line]
+    diagnostics = [line for line in captured if "Recovery diagnostics for process 0" in line]
+    assert replacing and expected in replacing[0]
+    assert diagnostics and f"startup_crash='{expected}'" in diagnostics[0]
+
+
+def test_stuck_starting_ignores_a_startup_crash_from_an_earlier_launch() -> None:
+    """The backstop is appended across launches, so a crash older than this launch is not its cause."""
+    from loguru import logger
+
+    from horde_worker_regen.process_management.lifecycle.child_crash_capture import write_startup_crash
+
+    try:
+        raise OSError("an earlier launch's crash")
+    except OSError as error:
+        write_startup_crash("safety_0", error, os_pid=1, launch_identifier=0)
+    safety = make_mock_process_info(
+        0, model_name=None, state=HordeProcessState.PROCESS_STARTING, process_type=HordeProcessType.SAFETY
+    )
+    safety.spawned_at = time.time() + 1
+    safety.last_received_timestamp = time.time() - 1000
+    safety.last_heartbeat_timestamp = time.time() - 1000
+    plm = _make_plm(process_map=ProcessMap({0: safety}))
+
+    captured: list[str] = []
+    handler_id = logger.add(lambda message: captured.append(str(message)), level="ERROR")
+    try:
+        assert plm._check_and_replace_process(safety, 0.0, HordeProcessState.PROCESS_STARTING, "stuck") is True
+    finally:
+        logger.remove(handler_id)
+
+    assert not any("earlier launch" in line for line in captured)
+    assert not any("startup_crash=" in line for line in captured)
+
+
 def test_operation_timeout_uses_state_duration_not_recent_liveness() -> None:
     """Operation replacement is bounded by time in state, not by heartbeat silence.
 
