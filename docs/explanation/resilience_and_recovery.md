@@ -992,9 +992,12 @@ the horde's own pause:
   too many jobs") marks the episode server-forced; any other reason is treated as
   somebody's deliberate choice and left standing. Separately, every deliberate
   local set (the dashboard key, a supervisor command, the attach supervisor's
-  frozen-parent guard) arrives as the same `SET_SERVER_MAINTENANCE` command and
-  records `WorkerState.server_maintenance_locally_intended`, which disqualifies
-  auto-clear until the same surface unsets it.
+  frozen-parent guard) arrives as the same `SET_SERVER_MAINTENANCE` command, naming
+  the logical workers it addresses, and records each in
+  `WorkerState.server_maintenance_locally_intended_workloads`. The image worker's
+  presence there disqualifies auto-clear until the same surface removes it; the
+  auto-clear itself addresses only the image worker, whose pop latch the episode
+  is, so another role an operator holds stays held.
 - **Fitness.** An attempt only goes out while the worker can actually serve: an
   inference process free to take a job, no pop pause standing (self-throttle,
   fault-rate breaker, or operator), and no terminal fault in the last

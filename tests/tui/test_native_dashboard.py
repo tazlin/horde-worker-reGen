@@ -7,6 +7,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     TEXT_BACKEND_PROCESS_ID,
+    HordeWorkerDetailsSnapshot,
     ProcessSnapshot,
     TextBackendDetail,
     WorkerConfigSummary,
@@ -42,6 +43,7 @@ class _NativeSupervisorDouble:
         self._lifecycle_resolved = True
         self.actions: list[str] = []
         self.maintenance: list[bool] = []
+        self.maintenance_workloads: list[tuple[object, ...] | None] = []
 
     @property
     def status(self) -> SupervisorStatus:
@@ -72,8 +74,9 @@ class _NativeSupervisorDouble:
         self.actions.append("resume")
         return self.connected
 
-    def request_set_server_maintenance(self, enabled: bool) -> bool:
+    def request_set_server_maintenance(self, enabled: bool, workloads: object = None) -> bool:
         self.maintenance.append(enabled)
+        self.maintenance_workloads.append(None if workloads is None else tuple(workloads))
         return self.connected
 
 
@@ -252,6 +255,50 @@ def test_action_bridge_uses_explicit_local_and_horde_maintenance_commands() -> N
 
     assert supervisor.actions == ["start", "stop", "pause", "resume"]
     assert supervisor.maintenance == [True, False]
+    assert supervisor.maintenance_workloads == [None, None]
+
+
+def test_a_maintenance_action_can_name_one_logical_worker() -> None:
+    """A host serving two roles has two workers on the horde, and the page addresses one by its workload."""
+    supervisor = _NativeSupervisorDouble(_snapshot())
+    bridge = NativeDashboardBridge(supervisor)
+
+    result = bridge.perform(NativeDashboardAction.MAINTENANCE_ON, WorkloadKind.TEXT_GENERATION)
+
+    assert result.accepted
+    assert "Text generation" in result.message
+    assert supervisor.maintenance == [True]
+    assert supervisor.maintenance_workloads == [(WorkloadKind.TEXT_GENERATION,)]
+
+
+def test_the_state_lists_each_enabled_role_as_its_own_horde_worker() -> None:
+    """The page renders one maintenance control per logical worker, so the state carries each with its flags."""
+    snapshot = _snapshot().model_copy(
+        update={
+            "config": WorkerConfigSummary(
+                dreamer_name="Native Worker",
+                worker_version="12.0.0",
+                scribe=True,
+                scribe_name="Native Scribe",
+            ),
+            "worker_details_by_workload": {
+                WorkloadKind.IMAGE_GENERATION: HordeWorkerDetailsSnapshot(
+                    worker_name="Native Worker", registered=True
+                ),
+                WorkloadKind.TEXT_GENERATION: HordeWorkerDetailsSnapshot(
+                    worker_name="Native Scribe", registered=True, maintenance=True
+                ),
+            },
+            "worker_details_maintenance": True,
+        }
+    )
+
+    state = build_native_dashboard_state(_NativeSupervisorDouble(snapshot))
+
+    assert [(w.workload, w.worker_name, w.maintenance) for w in state.horde_workers] == [
+        ("image_generation", "Native Worker", False),
+        ("text_generation", "Native Scribe", True),
+    ]
 
 
 def test_native_page_is_dependency_free_and_links_to_the_full_dashboard() -> None:

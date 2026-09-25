@@ -44,6 +44,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import time
+from collections.abc import Callable
 
 from horde_sdk.ai_horde_api.ai_horde_clients import AIHordeAPIClientSession, AIHordeAPISimpleClient
 from horde_sdk.ai_horde_api.apimodels import (
@@ -58,6 +59,7 @@ from horde_sdk.generic_api.apimodels import RequestErrorResponse
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 
 _OWNERSHIP_CHECK_ATTEMPTS = 3
 """How many times the network ownership check is attempted before hard-failing on a transient error."""
@@ -109,39 +111,91 @@ class _RoleName:
     reserved_default: str
 
 
-def _enabled_roles(bridge_data: reGenBridgeData) -> list[tuple[str, str, str]]:
-    """Return each role that is on as (role, config key, name attribute), in the order dreamer, alchemist, scribe.
+@dataclasses.dataclass(frozen=True)
+class _Role:
+    """One role of the worker: the workload it serves, how it is named, and how its config is read.
 
-    Only an enabled role registers a worker on the horde. The scribe flag is compared against True because a
-    mocked config reads every unset attribute as truthy.
+    A role is one logical worker on the horde, so the workload is what a per-worker command or reading is
+    keyed by. The readers are plain attribute access on the typed config, one per role.
     """
-    candidates = (
-        (bool(bridge_data.dreamer), "image generation", "dreamer_name", "dreamer_worker_name"),
-        (bool(bridge_data.alchemist), "alchemy", "alchemist_name", "alchemist_name"),
-        (bridge_data.scribe is True, "text generation", "scribe_name", "scribe_name"),
-    )
-    return [(role, config_key, attribute) for enabled, role, config_key, attribute in candidates if enabled]
+
+    workload: WorkloadKind
+    prose: str
+    """The role in operator words ("image generation")."""
+    config_key: str
+    """The bridgeData key that names the role's worker."""
+    name_field: str
+    """The config model field holding that name; used to look up the reserved default it ships with."""
+    enabled: Callable[[reGenBridgeData], bool]
+    worker_name: Callable[[reGenBridgeData], str]
+
+
+_ROLES: tuple[_Role, ...] = (
+    _Role(
+        workload=WorkloadKind.IMAGE_GENERATION,
+        prose="image generation",
+        config_key="dreamer_name",
+        name_field="dreamer_worker_name",
+        enabled=lambda bridge_data: bool(bridge_data.dreamer),
+        worker_name=lambda bridge_data: bridge_data.dreamer_worker_name,
+    ),
+    _Role(
+        workload=WorkloadKind.ALCHEMY,
+        prose="alchemy",
+        config_key="alchemist_name",
+        name_field="alchemist_name",
+        enabled=lambda bridge_data: bool(bridge_data.alchemist),
+        worker_name=lambda bridge_data: bridge_data.alchemist_name,
+    ),
+    _Role(
+        workload=WorkloadKind.TEXT_GENERATION,
+        prose="text generation",
+        config_key="scribe_name",
+        name_field="scribe_name",
+        # Compared against True because a mocked config reads every unset attribute as truthy.
+        enabled=lambda bridge_data: bridge_data.scribe is True,
+        worker_name=lambda bridge_data: bridge_data.scribe_name,
+    ),
+)
+"""Every role, in the order dreamer, alchemist, scribe."""
+
+
+def _enabled_roles(bridge_data: reGenBridgeData) -> list[_Role]:
+    """Return each role that is on, in the order dreamer, alchemist, scribe.
+
+    Only an enabled role registers a worker on the horde.
+    """
+    return [role for role in _ROLES if role.enabled(bridge_data)]
+
+
+def enabled_worker_names_by_workload(bridge_data: reGenBridgeData) -> dict[WorkloadKind, str]:
+    """Return the horde worker name of every role that is on, keyed by the workload the role serves.
+
+    Each enabled role is its own worker on the horde, so anything set or read per worker (its maintenance
+    flag, its paused flag) is addressed through this map.
+    """
+    return {role.workload: role.worker_name(bridge_data) for role in _enabled_roles(bridge_data)}
 
 
 def enabled_worker_names(bridge_data: reGenBridgeData) -> list[str]:
     """Return the horde worker name of every role that is on, in the order dreamer, alchemist, scribe."""
-    return [getattr(bridge_data, attribute) for _role, _config_key, attribute in _enabled_roles(bridge_data)]
+    return list(enabled_worker_names_by_workload(bridge_data).values())
 
 
 def _enabled_role_names(bridge_data: reGenBridgeData) -> list[_RoleName]:
-    """Return every enabled role's name with the reserved default the config model ships for it.
+    """Return every enabled role's name with the reserved default the config model ships with for it.
 
     A role that is off never pops, so its name is never sent and a placeholder there harms nothing.
     """
     fields = type(bridge_data).model_fields
     return [
         _RoleName(
-            role=role,
-            config_key=config_key,
-            name=getattr(bridge_data, attribute),
-            reserved_default=fields[attribute].default,
+            role=role.prose,
+            config_key=role.config_key,
+            name=role.worker_name(bridge_data),
+            reserved_default=fields[role.name_field].default,
         )
-        for role, config_key, attribute in _enabled_roles(bridge_data)
+        for role in _enabled_roles(bridge_data)
     ]
 
 

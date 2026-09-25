@@ -20,7 +20,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerStateSnapshot,
 )
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
-from horde_worker_regen.tui.formatters import human_bytes, human_duration
+from horde_worker_regen.tui.formatters import held_workers_phrase, human_bytes, human_duration
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
 STALE_SNAPSHOT_SECONDS = 20.0
@@ -539,9 +539,11 @@ def _maintenance_detail(
 
     if snapshot.worker_details_maintenance or snapshot.worker_details_paused:
         what = "maintenance" if snapshot.worker_details_maintenance else "paused"
+        held = held_workers_phrase(snapshot)
+        subject = f"the {held} worker" if held else "this worker"
         return (
-            f"The horde has this worker set to {what} (server-side); it will not be given new jobs until "
-            "cleared. In-flight jobs finish. Press the Maintenance (horde) key to toggle it."
+            f"The horde has {subject} set to {what} (server-side); it will not be given new jobs until "
+            "cleared. In-flight jobs finish. Press the Maintenance (horde) key to change it."
             f"{note_on_maintenance}"
         )
     if snapshot.last_pop_maintenance_mode:

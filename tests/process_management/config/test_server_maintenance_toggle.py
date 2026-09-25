@@ -19,7 +19,12 @@ from unittest.mock import Mock
 import pytest
 
 from horde_worker_regen.process_management import process_manager as process_manager_module
-from horde_worker_regen.process_management.ipc.supervisor_channel import SupervisorCommand, SupervisorControlMessage
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    HordeWorkerDetailsSnapshot,
+    SupervisorCommand,
+    SupervisorControlMessage,
+)
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from tests.process_management.conftest import make_testable_process_manager
 
 
@@ -141,7 +146,9 @@ class TestSupervisorMaintenanceCommand:
         manager = make_testable_process_manager()
         _run_off_loop_inline(monkeypatch)
         recorded: list[bool] = []
-        monkeypatch.setattr(manager, "_set_server_maintenance_safe", lambda value: recorded.append(value))
+        monkeypatch.setattr(
+            manager, "_set_server_maintenance_safe", lambda value, workloads=None: recorded.append(value)
+        )
 
         manager._apply_supervisor_command(
             SupervisorControlMessage(
@@ -162,7 +169,9 @@ class TestResumeClearsMaintenanceOnlyWhenConfigured:
         manager._state.supervisor_paused = True
         _run_off_loop_inline(monkeypatch)
         recorded: list[bool] = []
-        monkeypatch.setattr(manager, "_set_server_maintenance_safe", lambda value: recorded.append(value))
+        monkeypatch.setattr(
+            manager, "_set_server_maintenance_safe", lambda value, workloads=None: recorded.append(value)
+        )
 
         manager._apply_supervisor_command(SupervisorControlMessage(command=SupervisorCommand.RESUME))
 
@@ -174,7 +183,9 @@ class TestResumeClearsMaintenanceOnlyWhenConfigured:
         manager = make_testable_process_manager(remove_maintenance_on_init=False)
         manager._state.supervisor_paused = True
         recorded: list[bool] = []
-        monkeypatch.setattr(manager, "_set_server_maintenance_safe", lambda value: recorded.append(value))
+        monkeypatch.setattr(
+            manager, "_set_server_maintenance_safe", lambda value, workloads=None: recorded.append(value)
+        )
 
         manager._apply_supervisor_command(SupervisorControlMessage(command=SupervisorCommand.RESUME))
 
@@ -266,3 +277,120 @@ class TestWorkerDetailsMaintenanceRefresh:
 
         assert manager._worker_details_maintenance is False
         assert manager._state.server_maintenance_cleared_by_job_pop is False
+
+
+class TestPerWorkerMaintenance:
+    """Each enabled role is its own worker on the horde, and the flag is set and read per worker."""
+
+    @staticmethod
+    def _client(looked_up: list[str | None], modified: list[tuple[str, bool]]) -> object:
+        class FakeClient:
+            def workers_all_details(self, worker_name: str | None = None, *, api_key: str | None = None) -> list[Mock]:
+                looked_up.append(worker_name)
+                details = Mock()
+                details.id_ = f"id-of-{worker_name}"
+                details.name = worker_name
+                return [details]
+
+            def worker_modify(self, request: object) -> None:
+                modified.append((request.worker_id, request.maintenance))  # type: ignore[attr-defined]
+
+        return FakeClient()
+
+    def test_naming_workloads_changes_only_those_workers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A dreamer plus scribe host holding only the scribe leaves the dreamer's flag alone."""
+        looked_up: list[str | None] = []
+        modified: list[tuple[str, bool]] = []
+        monkeypatch.setattr(
+            process_manager_module, "AIHordeAPISimpleClient", lambda: self._client(looked_up, modified)
+        )
+        manager = make_testable_process_manager(scribe=True, scribe_name="A Scribe")
+
+        manager.set_maintenance(True, [WorkloadKind.TEXT_GENERATION])
+
+        assert looked_up == ["A Scribe"]
+        assert modified == [("id-of-A Scribe", True)]
+
+    def test_a_workload_whose_role_is_off_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A role that is off has no worker on the horde, so naming it changes nothing."""
+        looked_up: list[str | None] = []
+        monkeypatch.setattr(process_manager_module, "AIHordeAPISimpleClient", lambda: self._client(looked_up, []))
+        manager = make_testable_process_manager()
+
+        manager.set_maintenance(True, [WorkloadKind.TEXT_GENERATION])
+
+        assert looked_up == []
+
+    def test_the_command_carries_the_workloads_to_the_setter_and_the_intent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The workloads a surface names reach the horde call and the per-worker intent the auto-clear reads."""
+        manager = make_testable_process_manager(scribe=True, scribe_name="A Scribe")
+        _run_off_loop_inline(monkeypatch)
+        recorded: list[tuple[bool, object]] = []
+        monkeypatch.setattr(
+            manager, "_set_server_maintenance_safe", lambda value, workloads=None: recorded.append((value, workloads))
+        )
+
+        manager._apply_supervisor_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_SERVER_MAINTENANCE,
+                server_maintenance_enabled=True,
+                server_maintenance_workloads=[WorkloadKind.TEXT_GENERATION],
+            ),
+        )
+
+        assert recorded == [(True, [WorkloadKind.TEXT_GENERATION])]
+        assert manager._state.server_maintenance_locally_intended_workloads == {WorkloadKind.TEXT_GENERATION}
+        assert manager._state.server_maintenance_locally_intended is False, "the image worker was not held"
+
+    def test_a_whole_worker_command_holds_every_enabled_role(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No workloads named means every enabled role, and a later OFF for one releases only that one."""
+        manager = make_testable_process_manager(scribe=True, scribe_name="A Scribe")
+        _run_off_loop_inline(monkeypatch)
+        monkeypatch.setattr(manager, "_set_server_maintenance_safe", lambda value, workloads=None: None)
+
+        manager._apply_supervisor_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_SERVER_MAINTENANCE, server_maintenance_enabled=True
+            ),
+        )
+        assert manager._state.server_maintenance_locally_intended_workloads == {
+            WorkloadKind.IMAGE_GENERATION,
+            WorkloadKind.TEXT_GENERATION,
+        }
+
+        manager._apply_supervisor_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_SERVER_MAINTENANCE,
+                server_maintenance_enabled=False,
+                server_maintenance_workloads=[WorkloadKind.IMAGE_GENERATION],
+            ),
+        )
+        assert manager._state.server_maintenance_locally_intended_workloads == {WorkloadKind.TEXT_GENERATION}
+
+    async def test_the_poll_records_each_worker_and_the_aggregates_are_any_of_them(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A held scribe beside a serving dreamer reads as held on the whole and as itself per worker."""
+        manager = make_testable_process_manager(scribe=True, scribe_name="A Scribe")
+
+        def fetch(worker_name: str) -> Mock | None:
+            if worker_name == "A Scribe":
+                return Mock(maintenance_mode=True, paused=False)
+            return Mock(maintenance_mode=False, paused=False)
+
+        monkeypatch.setattr(manager, "_fetch_worker_details", fetch)
+
+        await manager.api_get_worker_details()
+        snapshot = manager._build_worker_state_snapshot()
+
+        assert snapshot.worker_details_maintenance is True
+        assert snapshot.worker_details_by_workload == {
+            WorkloadKind.IMAGE_GENERATION: HordeWorkerDetailsSnapshot(
+                worker_name=manager.bridge_data.dreamer_worker_name, registered=True
+            ),
+            WorkloadKind.TEXT_GENERATION: HordeWorkerDetailsSnapshot(
+                worker_name="A Scribe", registered=True, maintenance=True
+            ),
+        }

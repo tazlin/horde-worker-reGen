@@ -19,7 +19,7 @@ import multiprocessing
 import os
 import sys
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.lifecycle.owned_process_registry impo
     kill_process_tree,
 )
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.job_object import WorkerJobObject
 
@@ -919,12 +920,17 @@ class WorkerSupervisor:
             ),
         )
 
-    def request_set_server_maintenance(self, enabled: bool) -> bool:
+    def request_set_server_maintenance(
+        self,
+        enabled: bool,
+        workloads: Sequence[WorkloadKind] | None = None,
+    ) -> bool:
         """Ask the worker to set its server-side (horde) maintenance flag on or off."""
         return self.send_command(
             SupervisorControlMessage(
                 command=SupervisorCommand.SET_SERVER_MAINTENANCE,
                 server_maintenance_enabled=enabled,
+                server_maintenance_workloads=None if workloads is None else list(workloads),
             ),
         )
 

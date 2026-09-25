@@ -23,6 +23,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind, capability_for_alchemy_form
 from horde_worker_regen.tui.formatters import (
+    WORKLOAD_LABELS,
     format_percent,
     human_bytes,
     human_duration,
@@ -347,14 +348,6 @@ class StatsView(Vertical):
             padding=(0, 1),
         )
 
-    _WORKLOAD_LABELS: dict[WorkloadKind, str] = {
-        WorkloadKind.IMAGE_GENERATION: "Image generation",
-        WorkloadKind.ALCHEMY: "Alchemy",
-        WorkloadKind.TEXT_GENERATION: "Text generation",
-    }
-    """How each workload is named in the split. A workload with no entry here is shown by its own value,
-    so a worker newer than this dashboard still names its rows."""
-
     @classmethod
     def _render_workload_totals(cls, totals: dict[WorkloadKind, WorkloadTotalsSnapshot]) -> Panel:
         """Render this session's completed, faulted and earned figures split by workload.
@@ -374,7 +367,7 @@ class StatsView(Vertical):
             faulted = Text(f"{row.faulted:,}", style="red" if row.faulted else "grey50")
             mean_tokens = "-" if row.mean_generated_tokens is None else f"{row.mean_generated_tokens:,.0f}"
             table.add_row(
-                cls._WORKLOAD_LABELS.get(workload, workload.value),
+                WORKLOAD_LABELS.get(workload, workload.value),
                 f"{row.completed:,}",
                 faulted,
                 f"{row.kudos:,.1f}",

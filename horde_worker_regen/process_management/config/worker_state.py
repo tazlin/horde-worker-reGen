@@ -13,6 +13,7 @@ import time
 from collections import deque
 
 from horde_worker_regen.process_management.models.aux_download_backoff import AuxDownloadBackoff
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 
 
 class PopGate(enum.StrEnum):
@@ -167,13 +168,20 @@ class WorkerState:
     num_jobs_popped: int = 0
     """Image jobs popped this session, cumulative; a batch pop counts once, as one job."""
 
-    server_maintenance_locally_intended: bool = False
-    """A local surface (dashboard key, supervisor command, attach-supervisor guard) last set maintenance on.
+    server_maintenance_locally_intended_workloads: set[WorkloadKind] = dataclasses.field(default_factory=set)
+    """The workloads whose horde worker a local surface (dashboard key, supervisor command, attach-supervisor
+    guard) last set into maintenance; a local OFF for that worker removes it.
 
     Every deliberate set arrives as the same supervisor command, so recording the intent where that command
-    is applied covers all of them. While true the worker will not auto-clear its maintenance: the flag says a
-    human or a guard wanted this worker held back, and only the same surface unsetting it releases that
-    intent."""
+    is applied covers all of them. Kept per worker because each enabled role is its own worker on the horde
+    and an operator may hold one while another keeps serving. While a worker is here the auto-clear leaves
+    it alone: a human or a guard wanted it held back, and only the same surface releases that intent."""
+
+    @property
+    def server_maintenance_locally_intended(self) -> bool:
+        """Whether the image worker's maintenance was set deliberately, the worker whose pops latch an episode."""
+        return WorkloadKind.IMAGE_GENERATION in self.server_maintenance_locally_intended_workloads
+
     last_pop_skipped_reasons: dict[str, int] = dataclasses.field(default_factory=dict)
     """Why the last 'no job available' pop skipped work, per reason (models/nsfw/max_pixels/...).
 

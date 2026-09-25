@@ -12,7 +12,7 @@ from __future__ import annotations
 import enum
 import functools
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -27,6 +27,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor
+from horde_worker_regen.tui.formatters import WORKLOAD_LABELS
 from horde_worker_regen.tui.widgets.simple import event_sentence
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
@@ -161,6 +162,8 @@ class NativeDashboardState(BaseModel):
     effective_maintenance: bool = False
     local_paused: bool = False
     horde_maintenance: bool = False
+    horde_workers: list[NativeHordeWorkerState] = Field(default_factory=list)
+    """Each enabled role's horde worker with its own flags; ``horde_maintenance`` is any of them held."""
     self_throttle_paused: bool = False
     processes_alive: int = 0
     processes_total: int = 0
@@ -170,6 +173,16 @@ class NativeDashboardState(BaseModel):
     process_states: list[NativeProcessState] = Field(default_factory=list)
     active_models: list[str] = Field(default_factory=list)
     api_messages: list[str] = Field(default_factory=list)
+
+
+class NativeHordeWorkerState(BaseModel):
+    """One of this worker's logical workers on the horde, as the native page controls it."""
+
+    workload: str
+    """The ``WorkloadKind`` value the role serves; what an action names to address this worker."""
+    worker_name: str
+    maintenance: bool = False
+    paused: bool = False
 
 
 class NativeActionResult(BaseModel):
@@ -211,7 +224,11 @@ class NativeSupervisor(Protocol):
     def request_resume(self) -> bool:
         """Request local pop resume."""
 
-    def request_set_server_maintenance(self, enabled: bool) -> bool:
+    def request_set_server_maintenance(
+        self,
+        enabled: bool,
+        workloads: Sequence[WorkloadKind] | None = None,
+    ) -> bool:
         """Request the explicit Horde-side maintenance state."""
 
 
@@ -393,6 +410,7 @@ def build_native_dashboard_state(supervisor: NativeSupervisor) -> NativeDashboar
         effective_maintenance=snapshot.maintenance_mode,
         local_paused=snapshot.supervisor_paused,
         horde_maintenance=snapshot.worker_details_maintenance,
+        horde_workers=_native_horde_workers(snapshot),
         self_throttle_paused=snapshot.self_throttle_paused,
         processes_alive=sum(process.alive for process in process_states),
         processes_total=len(process_states),
@@ -416,8 +434,12 @@ class NativeDashboardBridge:
         """Return the current browser-facing state projection."""
         return build_native_dashboard_state(self.supervisor)
 
-    def perform(self, action: NativeDashboardAction) -> NativeActionResult:
-        """Perform one explicit action without deriving a toggle from aggregate maintenance state."""
+    def perform(self, action: NativeDashboardAction, workload: WorkloadKind | None = None) -> NativeActionResult:
+        """Perform one explicit action without deriving a toggle from aggregate maintenance state.
+
+        A maintenance action names the logical worker it addresses by the workload its role serves; None
+        addresses every enabled role, which is what a page showing one worker asks for.
+        """
         if action is NativeDashboardAction.START:
             self.supervisor.start()
             return NativeActionResult(accepted=True, message="Worker start requested.")
@@ -437,15 +459,33 @@ class NativeDashboardBridge:
                 message="Local resume requested." if accepted else "Worker host is not connected.",
             )
         enable = action is NativeDashboardAction.MAINTENANCE_ON
-        accepted = self.supervisor.request_set_server_maintenance(enable)
+        workloads = None if workload is None else (workload,)
+        accepted = self.supervisor.request_set_server_maintenance(enable, workloads)
+        subject = "" if workload is None else f" for {WORKLOAD_LABELS.get(workload, workload.value)}"
         return NativeActionResult(
             accepted=accepted,
             message=(
-                f"Horde maintenance {'ON' if enable else 'OFF'} requested."
+                f"Horde maintenance {'ON' if enable else 'OFF'}{subject} requested."
                 if accepted
                 else "Worker host is not connected."
             ),
         )
+
+
+def _native_horde_workers(snapshot: WorkerStateSnapshot) -> list[NativeHordeWorkerState]:
+    """Each enabled role's horde worker with the flags the last poll reported for it."""
+    rows: list[NativeHordeWorkerState] = []
+    for workload, name in snapshot.config.enabled_roles:
+        details = snapshot.worker_details_by_workload.get(workload)
+        rows.append(
+            NativeHordeWorkerState(
+                workload=workload.value,
+                worker_name=name,
+                maintenance=details is not None and details.maintenance,
+                paused=details is not None and details.paused,
+            ),
+        )
+    return rows
 
 
 @functools.lru_cache(maxsize=1)
@@ -509,8 +549,10 @@ class NativeDashboardWeb:
         try:
             payload = await request.json()
             raw_action = payload.get("action") if isinstance(payload, dict) else None
+            raw_workload = payload.get("workload") if isinstance(payload, dict) else None
             action = NativeDashboardAction(raw_action)
+            workload = None if raw_workload is None else WorkloadKind(raw_workload)
         except (ValueError, TypeError):
             raise web.HTTPBadRequest(text="Unknown native dashboard action.") from None
-        result = self._bridge.perform(action)
+        result = self._bridge.perform(action, workload)
         return web.json_response(result.model_dump(mode="json"), status=202 if result.accepted else 503)

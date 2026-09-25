@@ -93,6 +93,7 @@ through the orphan-proof graceful path rather than a raw command.
 
 ```jsonl
 {"command": "SET_SERVER_MAINTENANCE", "server_maintenance_enabled": true}
+{"command": "SET_SERVER_MAINTENANCE", "server_maintenance_enabled": false, "server_maintenance_workloads": ["text_generation"]}
 {"command": "SET_CONCURRENCY", "target_threads": 2, "target_processes": 3}
 {"command": "SET_DOWNLOAD_RATE_LIMIT", "download_rate_limit_kbps": 5000}
 {"command": "SET_DOWNLOAD_PRIORITY_POLICY", "download_priority_policy": "parallel"}

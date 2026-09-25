@@ -73,6 +73,7 @@ class FakeSupervisor:
         """Every download queue order the app asked for, in the order it asked."""
         self.download_requests: list[RecordedDownloadRequest] = []
         self.server_maintenance: list[bool] = []
+        self.server_maintenance_workloads: list[tuple[object, ...] | None] = []
         self.stats_export: list[bool] = []
         self.set_concurrency_calls: list[tuple[int | None, int | None]] = []
         """Every ``request_set_concurrency`` call as ``(target_processes, target_threads)``."""
@@ -221,10 +222,11 @@ class FakeSupervisor:
         self.download_requests.append(RecordedDownloadRequest(model_names=list(model_names), include_aux=include_aux))
         return self._alive
 
-    def request_set_server_maintenance(self, enabled: bool) -> bool:
+    def request_set_server_maintenance(self, enabled: bool, workloads: object = None) -> bool:
         """Record a server-side maintenance toggle; True only when the worker is running."""
         self.requests.append("set_server_maintenance")
         self.server_maintenance.append(enabled)
+        self.server_maintenance_workloads.append(None if workloads is None else tuple(workloads))  # type: ignore[arg-type]
         return self._alive
 
     def request_set_stats_export(self, enabled: bool) -> bool:

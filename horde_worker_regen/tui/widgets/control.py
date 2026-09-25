@@ -12,7 +12,16 @@ from textual.message import Message
 from textual.widgets import Button, Static
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.tui.formatters import held_workers_phrase
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
+
+
+def _maintenance_label(snapshot: WorkerStateSnapshot | None) -> str:
+    """The maintenance button's label: off, on, or on for the named workers when only some are held."""
+    if snapshot is None or not snapshot.worker_details_maintenance:
+        return "Horde maintenance: off"
+    held = held_workers_phrase(snapshot)
+    return f"Horde maintenance: on ({held})" if held else "Horde maintenance: on"
 
 
 class ControlView(VerticalScroll):
@@ -90,9 +99,7 @@ class ControlView(VerticalScroll):
         self.query_one("#control-start-stop", Button).label = start_stop_label
         self.query_one("#control-pause", Button).label = "Resume worker" if self._paused else "Pause worker"
         self.query_one("#control-autostart", Button).label = f"Auto-start: {'on' if auto_start else 'off'}"
-        self.query_one("#control-maintenance", Button).label = (
-            "Horde maintenance: on" if self._server_maintenance else "Horde maintenance: off"
-        )
+        self.query_one("#control-maintenance", Button).label = _maintenance_label(snapshot)
         self.query_one("#control-summary", Static).update(
             self._render_summary(snapshot, supervisor_status, restart_attempts),
         )

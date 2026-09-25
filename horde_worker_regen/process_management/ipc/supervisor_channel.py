@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 32
+SUPERVISOR_PROTOCOL_VERSION = 33
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -143,6 +143,11 @@ v32 makes ``num_jobs_popped`` cumulative: each flow counts at its own pop site, 
 and a Session card's "Popped" reads as the session's total. Up to v31 it carried the work held at that
 instant; that figure moves to ``jobs_in_hand``, every image job from pop to submit plus the other flows'
 in-flight work, which no sum of the per-stage fields reproduces.
+v33 makes horde maintenance per logical worker. Each enabled role is its own worker on the horde with its
+own maintenance and paused flags, so the snapshot gains ``worker_details_by_workload`` (a
+:class:`HordeWorkerDetailsSnapshot` per role, keyed by the workload it serves) and
+``SET_SERVER_MAINTENANCE`` gains ``server_maintenance_workloads``, the roles it addresses, None meaning all.
+The two aggregate flags stay as "any" over the map, so a reader of the whole-worker view is unchanged.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -429,12 +434,21 @@ class WorkerConfigSummary(BaseModel):
         part of who the worker is. Empty only when every role is off, which the worker warns about at
         start-up.
         """
+        return tuple(name for _workload, name in self.enabled_roles)
+
+    @property
+    def enabled_roles(self) -> tuple[tuple[WorkloadKind, str], ...]:
+        """Return each enabled role as (the workload it serves, its horde name), dreamer, alchemist, scribe order.
+
+        A role is one logical worker on the horde, so this is the list a per-worker control (the maintenance
+        flag) offers and the key the snapshot's per-worker readings use.
+        """
         by_role = (
-            (self.dreamer, self.dreamer_name),
-            (self.alchemist, self.alchemist_name),
-            (self.scribe, self.scribe_name),
+            (WorkloadKind.IMAGE_GENERATION, self.dreamer, self.dreamer_name),
+            (WorkloadKind.ALCHEMY, self.alchemist, self.alchemist_name),
+            (WorkloadKind.TEXT_GENERATION, self.scribe, self.scribe_name),
         )
-        return tuple(name for enabled, name in by_role if enabled and name)
+        return tuple((workload, name) for workload, enabled, name in by_role if enabled and name)
 
     @property
     def worker_display_name(self) -> str:
@@ -1579,6 +1593,23 @@ class ModelPoolSnapshot(BaseModel):
     """Free-lane matches whose returned model was already resident at pop time."""
 
 
+class HordeWorkerDetailsSnapshot(BaseModel):
+    """What the horde's worker-details API last reported for one of this worker's logical workers.
+
+    Each enabled role (dreamer, alchemist, scribe) registers under its own name and carries its own
+    maintenance and paused flags, so a host serving two roles has two of these.
+    """
+
+    worker_name: str
+    """The name the role pops under."""
+    registered: bool = False
+    """Whether the horde knows the name yet; it registers a worker on its first pop."""
+    maintenance: bool = False
+    """The horde holds this worker in maintenance (polled, advisory)."""
+    paused: bool = False
+    """The horde holds this worker paused (polled, advisory)."""
+
+
 class WorkerStateSnapshot(BaseModel):
     """One frame of worker state pushed from the worker to its supervisor over the pipe.
 
@@ -1603,9 +1634,12 @@ class WorkerStateSnapshot(BaseModel):
     last_pop_maintenance_mode: bool = False
     """The most recent pop response returned a maintenance-mode error (cleared on the next successful pop)."""
     worker_details_maintenance: bool = False
-    """The horde's worker-details API reports this worker in maintenance (polled, advisory)."""
+    """The worker-details API reports one of this worker's logical workers in maintenance (polled, advisory)."""
     worker_details_paused: bool = False
-    """The horde's worker-details API reports this worker paused (polled, advisory)."""
+    """The horde's worker-details API reports any of this worker's logical workers paused (polled, advisory)."""
+    worker_details_by_workload: dict[WorkloadKind, HordeWorkerDetailsSnapshot] = Field(default_factory=dict)
+    """The same flags per logical worker, keyed by the workload its role serves, in the order dreamer,
+    alchemist, scribe. Empty until the first poll answers; the two aggregates above are "any" over it."""
     too_many_consecutive_failed_jobs: bool = False
 
     gpu_torch_incompatible: bool = False
@@ -1920,6 +1954,9 @@ class SupervisorControlMessage(BaseModel):
     """The new download queue order, for :attr:`SupervisorCommand.SET_DOWNLOAD_PRIORITY_POLICY`."""
     server_maintenance_enabled: bool | None = None
     """The desired server-side maintenance state, for :attr:`SupervisorCommand.SET_SERVER_MAINTENANCE`."""
+    server_maintenance_workloads: list[WorkloadKind] | None = None
+    """Which logical workers :attr:`SupervisorCommand.SET_SERVER_MAINTENANCE` addresses, by the workload each
+    role serves; None means every enabled role, which is what a whole-worker surface or guard asks for."""
     download_model_names: list[str] = Field(default_factory=list)
     """The image models to fetch on demand, for :attr:`SupervisorCommand.DOWNLOAD_MODELS`."""
     download_include_aux: bool = False

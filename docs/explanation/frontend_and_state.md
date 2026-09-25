@@ -68,6 +68,9 @@ defines the structured protocol over it:
   and Stats tab do not read zero while its own counters climb. Each flow contributes its delivered submits
   plus its fault reports, matching what the image job tracker's movement counter means; the same totals feed
   the stats sample and the durable `WorkerRunRecord`, which is what judges a session productive.
+  Horde maintenance is per logical worker: each enabled role registers under its own name with its own
+  flags, carried in `worker_details_by_workload`, and `SET_SERVER_MAINTENANCE` names the workers it
+  addresses through `server_maintenance_workloads` (None for all); the aggregate flags are any-of.
   `num_jobs_popped` is cumulative, counted at each flow's pop site; `jobs_in_hand` is the work held at an
   instant, every image job from pop to submit plus the other flows' in-flight work, which the per-stage
   fields split for the image part only.
@@ -90,7 +93,7 @@ defines the structured protocol over it:
   as "Image intake held for ..." ahead of the serving headline, with any work that goes on without the image
   intake named after the sentinel's line. The dashboard holds no pop-liveness bound of its own.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 32) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 33) so a frontend can detect a mismatch with a worker built from different code.
 
 ### The event ring
 

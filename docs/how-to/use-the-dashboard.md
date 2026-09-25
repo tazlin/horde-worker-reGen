@@ -496,7 +496,7 @@ shortcut by name with its key beside it. Both stay visible at 80 columns.
 | `J` | Collapse or show finished rows in the Work ledger |
 | `F7` | Pause or resume model downloads |
 | `F11` | Restart the worker process |
-| `M` | Toggle horde-side maintenance |
+| `M` | Toggle horde-side maintenance; with more than one role on, choose which worker (or all) |
 | `T` | Cycle the Overview trend window: 5m, 15m, 30m, 60m, 120m, All |
 | `R` | Reset the Overview trend buffers (view-only; session totals keep running) |
 | `Ctrl+Q` / `Ctrl+C` | Stop the worker and quit |
@@ -602,8 +602,10 @@ carries how many requests it is producing and how many are waiting for it.
 
 Its controls are deliberately few: start, graceful stop, local pause/resume, and horde maintenance.
 **Pause** stops this worker from accepting new work locally; **Horde maintenance** changes the worker's
-advertised state at the horde. They are independent. The **Full terminal dashboard** link goes to
-everything else.
+advertised state at the horde. They are independent. Each enabled role is its own worker on the horde,
+so with more than one role on there is one maintenance button per worker plus an all-workers pair, and
+the Session card names the workers held when only some are. The **Full terminal dashboard** link goes
+to everything else.
 
 **Glance view** keeps lifecycle controls, four headline metrics, the pipeline, active jobs, and all
 process states in one viewport. On a phone the page itself does not scroll: metrics form a 2×2 grid,

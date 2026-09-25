@@ -46,6 +46,7 @@ from horde_worker_regen.process_management.process_manager import (
     SERVER_MAINTENANCE_RETRIP_WINDOW_SECONDS,
     HordeWorkerProcessManager,
 )
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
@@ -117,7 +118,9 @@ class _ClearRecorder:
 
     def __init__(self, manager: HordeWorkerProcessManager, monkeypatch: pytest.MonkeyPatch) -> None:
         self.calls: list[bool] = []
-        monkeypatch.setattr(manager, "_set_server_maintenance_safe", self.calls.append)
+        monkeypatch.setattr(
+            manager, "_set_server_maintenance_safe", lambda enabled, workloads=None: self.calls.append(enabled)
+        )
         monkeypatch.setattr(process_manager_module.threading, "Thread", _InlineThread)
 
 
@@ -355,7 +358,7 @@ class TestAutoClearEligibility:
         """The same surface releasing the intent puts the worker back in charge of its own recovery."""
         manager = _make_manager()
         recorder = _ClearRecorder(manager, monkeypatch)
-        manager._state.server_maintenance_locally_intended = True
+        manager._state.server_maintenance_locally_intended_workloads.add(WorkloadKind.IMAGE_GENERATION)
         self._elapse_to_first_attempt(manager)
         manager._drive_server_maintenance_recovery()
         assert recorder.calls == []

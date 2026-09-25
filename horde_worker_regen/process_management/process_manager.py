@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from asyncio import CancelledError
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
@@ -78,7 +78,7 @@ from horde_worker_regen.process_management._internal.util import throttled_log_l
 from horde_worker_regen.process_management.config.bridge_data_reloader import BridgeDataReloader
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_identity import (
-    enabled_worker_names,
+    enabled_worker_names_by_workload,
     lookup_worker_by_name,
 )
 from horde_worker_regen.process_management.config.worker_state import PopGate, PopPauseOwner, WorkerState
@@ -109,6 +109,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     DisaggStageRow,
     FeatureInfoRow,
     FeatureReadinessSummary,
+    HordeWorkerDetailsSnapshot,
     JobFeatureSummary,
     JobQueueEntry,
     ModelPoolBenchRow,
@@ -1308,6 +1309,7 @@ class HordeWorkerProcessManager:
         """
         self.session_start_time = time.time()
         self._state = WorkerState()
+        self._worker_details_by_workload = {}
         self._main_loop_finished = threading.Event()
         """Set only after the gathered asyncio main loop returns.
 
@@ -2638,10 +2640,11 @@ class HordeWorkerProcessManager:
             f"{next_interval:.0f}s if the horde keeps rejecting pops.",
         )
         # The horde API call is blocking; run it off the control loop so a slow or unreachable horde can
-        # never stall the worker's tick.
+        # never stall the worker's tick. Only the image worker is cleared: the episode is its pop latch, and
+        # another role an operator holds deliberately must stay held.
         threading.Thread(
             target=self._set_server_maintenance_safe,
-            args=(False,),
+            args=(False, (WorkloadKind.IMAGE_GENERATION,)),
             name="auto-clear-maintenance",
             daemon=True,
         ).start()
@@ -2872,20 +2875,23 @@ class HordeWorkerProcessManager:
             "later job needs it.",
         )
 
-    def set_maintenance(self, enabled: bool) -> None:
-        """Set the named worker's *server-side* maintenance flag via the horde API (blocking).
+    def set_maintenance(self, enabled: bool, workloads: Iterable[WorkloadKind] | None = None) -> None:
+        """Set the *server-side* maintenance flag of this worker's logical workers via the horde API (blocking).
 
-        ``enabled=True`` puts the worker into maintenance on the horde (it stops being sent jobs);
+        ``enabled=True`` puts a worker into maintenance on the horde (it stops being sent jobs);
         ``enabled=False`` clears it. This is the true horde-side "maintenance mode" the job-pop response
-        signals, distinct from the local pop-pause (:attr:`WorkerState.supervisor_paused`). Runs a
-        blocking API call, so live callers from the control loop must invoke it off-loop (see
-        :meth:`_apply_supervisor_command`).
+        signals, distinct from the local pop-pause (:attr:`WorkerState.supervisor_paused`). Each enabled role
+        is its own worker on the horde, so ``workloads`` names which of them to change by the workload each
+        role serves; None means every enabled role. A workload whose role is off has no worker to change and
+        is skipped. Runs a blocking API call, so live callers from the control loop must invoke it off-loop
+        (see :meth:`_apply_supervisor_command`).
         """
         simple_client = AIHordeAPISimpleClient()
         verb = "placed into" if enabled else "removed from"
-        # Each enabled role is its own worker on the horde, and a role that is off has no worker to
-        # change, so the flag goes to every name this worker actually pops under.
-        for worker_name in enabled_worker_names(self.bridge_data):
+        names_by_workload = enabled_worker_names_by_workload(self.bridge_data)
+        chosen = names_by_workload.keys() if workloads is None else [w for w in workloads if w in names_by_workload]
+        for workload in chosen:
+            worker_name = names_by_workload[workload]
             worker_details = lookup_worker_by_name(simple_client, worker_name)
             if worker_details is None:
                 logger.debug(
@@ -2909,19 +2915,25 @@ class HordeWorkerProcessManager:
         """
         self.set_maintenance(False)
 
-    def _note_deliberate_server_maintenance(self, enabled: bool) -> None:
-        """Record that a local surface asked for this worker's maintenance state, so recovery honours it.
+    def _note_deliberate_server_maintenance(self, enabled: bool, workloads: Iterable[WorkloadKind] | None) -> None:
+        """Record which of this worker's logical workers a local surface asked to hold, so recovery honours it.
 
         Recorded where the decision is made rather than where the API call happens: the intent stands even if
         the call is slow or fails, and the worker's own maintenance recovery uses the same helper to reach
-        the horde without that being mistaken for somebody asking for the pause.
+        the horde without that being mistaken for somebody asking for the pause. None addresses every enabled
+        role, as the command does.
         """
-        self._state.server_maintenance_locally_intended = enabled
+        addressed = set(enabled_worker_names_by_workload(self.bridge_data)) if workloads is None else set(workloads)
+        intended = self._state.server_maintenance_locally_intended_workloads
+        if enabled:
+            intended |= addressed
+        else:
+            intended -= addressed
 
-    def _set_server_maintenance_safe(self, enabled: bool) -> None:
+    def _set_server_maintenance_safe(self, enabled: bool, workloads: Iterable[WorkloadKind] | None = None) -> None:
         """Best-effort off-loop ``set_maintenance`` for the supervisor toggle; never raises into the thread."""
         try:
-            self.set_maintenance(enabled)
+            self.set_maintenance(enabled, workloads)
         except Exception as e:
             logger.warning(f"Failed to set server-side maintenance={enabled}: {type(e).__name__} {e}")
 
@@ -3372,6 +3384,8 @@ class HordeWorkerProcessManager:
     """Whether the horde reports this worker in maintenance (from the worker-details API, polled)."""
     _worker_details_paused: bool = False
     """Whether the horde reports this worker paused (from the worker-details API, polled)."""
+    _worker_details_by_workload: dict[WorkloadKind, HordeWorkerDetailsSnapshot]
+    """The polled flags per logical worker, keyed by the workload its role serves; the aggregates are "any" of it."""
 
     def calculate_kudos_info(self) -> None:
         """Calculate and log information about the kudos generated in the current session."""
@@ -3508,10 +3522,11 @@ class HordeWorkerProcessManager:
         """
         if self._state.shutting_down or self.bridge_data.dry_run_skip_api:
             return
-        # Every enabled role is a worker of its own on the horde, so the flags are read for each and the
-        # dashboard shows maintenance or a pause when any of them is held.
+        # Every enabled role is a worker of its own on the horde, so the flags are read for each and kept per
+        # worker; the whole-worker view shows maintenance or a pause when any of them is held.
         found: list[WorkerDetailItem] = []
-        for worker_name in enabled_worker_names(self.bridge_data):
+        by_workload: dict[WorkloadKind, HordeWorkerDetailsSnapshot] = {}
+        for workload, worker_name in enabled_worker_names_by_workload(self.bridge_data).items():
             if not worker_name:
                 continue
             try:
@@ -3519,8 +3534,17 @@ class HordeWorkerProcessManager:
             except Exception as e:  # noqa: BLE001 - advisory poll must never disturb the worker
                 logger.trace(f"Worker-details refresh failed: {type(e).__name__} {e}")
                 return
-            if worker_details is not None:
-                found.append(worker_details)
+            if worker_details is None:
+                by_workload[workload] = HordeWorkerDetailsSnapshot(worker_name=worker_name)
+                continue
+            found.append(worker_details)
+            by_workload[workload] = HordeWorkerDetailsSnapshot(
+                worker_name=worker_name,
+                registered=True,
+                maintenance=bool(worker_details.maintenance_mode),
+                paused=bool(worker_details.paused),
+            )
+        self._worker_details_by_workload = by_workload
         if not found:
             return
         polled_maintenance = any(bool(details.maintenance_mode) for details in found)
@@ -6454,7 +6478,7 @@ class HordeWorkerProcessManager:
                 # when the operator opted into that via remove_maintenance_on_init; otherwise a local
                 # resume must never silently clear server-side maintenance (use the explicit toggle).
                 if self.bridge_data.remove_maintenance_on_init:
-                    self._note_deliberate_server_maintenance(False)
+                    self._note_deliberate_server_maintenance(False, None)
                     threading.Thread(
                         target=self._set_server_maintenance_safe,
                         args=(False,),
@@ -6532,17 +6556,20 @@ class HordeWorkerProcessManager:
                 )
             case SupervisorCommand.SET_SERVER_MAINTENANCE:
                 enabled = bool(command.server_maintenance_enabled)
+                workloads = command.server_maintenance_workloads
+                addressed = "every enabled role" if workloads is None else ", ".join(w.value for w in workloads)
                 logger.warning(
-                    f"Supervisor requested server-side maintenance {'ON' if enabled else 'OFF'} (horde API).",
+                    f"Supervisor requested server-side maintenance {'ON' if enabled else 'OFF'} for {addressed} "
+                    "(horde API).",
                 )
                 # A deliberate request, from the dashboard key or the attach supervisor's frozen-parent
                 # guard: while it stands the worker's own maintenance recovery leaves the flag alone.
-                self._note_deliberate_server_maintenance(enabled)
+                self._note_deliberate_server_maintenance(enabled, workloads)
                 # The horde API call is blocking; run it off the control loop so a slow or unreachable
                 # horde can never stall the worker's tick.
                 threading.Thread(
                     target=self._set_server_maintenance_safe,
-                    args=(enabled,),
+                    args=(enabled, workloads),
                     name="set-server-maintenance",
                     daemon=True,
                 ).start()
@@ -8258,6 +8285,7 @@ class HordeWorkerProcessManager:
             last_pop_maintenance_mode=self._state.last_pop_maintenance_mode,
             worker_details_maintenance=self._worker_details_maintenance,
             worker_details_paused=self._worker_details_paused,
+            worker_details_by_workload=dict(self._worker_details_by_workload),
             too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,
             gpu_torch_incompatible=self._state.gpu_torch_incompatible,
             gpu_torch_incompatible_reason=(self._state.gpu_torch_incompatible_reason or None),

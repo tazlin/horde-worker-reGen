@@ -20,6 +20,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     DownloadPhase,
     DownloadPlanSummary,
     DownloadStatusSnapshot,
+    HordeWorkerDetailsSnapshot,
     JobFeatureSummary,
     JobQueueEntry,
     OrchestrationIntentSnapshot,
@@ -538,6 +539,10 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
             session_start_time=session_start,
             maintenance_mode=paused,
             worker_details_maintenance=horde_maintenance,
+            worker_details_by_workload={
+                workload: HordeWorkerDetailsSnapshot(worker_name=name, registered=True, maintenance=horde_maintenance)
+                for workload, name in config.enabled_roles
+            },
             config=config,
             processes=process_snapshots,
             num_jobs_popped=jobs_popped,

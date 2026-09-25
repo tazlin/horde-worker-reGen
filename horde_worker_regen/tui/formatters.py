@@ -6,7 +6,31 @@ from collections.abc import Sequence
 
 from rich.text import Text
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
 from horde_worker_regen.process_management.lifecycle.process_temperature import ProcessTemperature
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
+
+WORKLOAD_LABELS: dict[WorkloadKind, str] = {
+    WorkloadKind.IMAGE_GENERATION: "Image generation",
+    WorkloadKind.ALCHEMY: "Alchemy",
+    WorkloadKind.TEXT_GENERATION: "Text generation",
+}
+"""How each workload is named on an operator surface. A workload with no entry is shown by its own value, so
+a worker newer than this dashboard still names its rows."""
+
+
+def held_workers_phrase(snapshot: WorkerStateSnapshot) -> str:
+    """Name the logical workers the horde holds in maintenance when only some of them are, else empty.
+
+    A host serving one role, or every role held, is the whole-worker case the aggregate flag already states,
+    so nothing is named; a partial hold is the case a reader needs the names for.
+    """
+    by_workload = snapshot.worker_details_by_workload
+    held = [details.worker_name for details in by_workload.values() if details.maintenance]
+    if not held or len(held) == len(by_workload):
+        return ""
+    return ", ".join(held)
+
 
 TEMPERATURE_COLOURS: dict[ProcessTemperature, str] = {
     ProcessTemperature.HOT: "green",

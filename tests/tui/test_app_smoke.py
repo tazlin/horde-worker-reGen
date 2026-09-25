@@ -17,9 +17,19 @@ from horde_worker_regen.app_state import (
     OverviewTrendWindow,
     OverviewViewMode,
 )
-from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    HordeWorkerDetailsSnapshot,
+    WorkerConfigSummary,
+    WorkerStateSnapshot,
+)
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.run_worker import WorkerLaunchOptions
-from horde_worker_regen.tui.app import _COMPACT_TAB_LABELS, REMOTE_EXPOSED_CLASS, HordeWorkerTUI
+from horde_worker_regen.tui.app import (
+    _COMPACT_TAB_LABELS,
+    REMOTE_EXPOSED_CLASS,
+    HordeWorkerTUI,
+    ServerMaintenanceModal,
+)
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor
 from horde_worker_regen.tui.health import WorkerPhase, derive
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
@@ -389,13 +399,15 @@ async def test_tick_clears_optimistic_maintenance_after_successful_pop(
     """A successful job pop is authoritative evidence that optimistic maintenance is no longer active."""
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
     supervisor = FakeSupervisor(alive=True)
+    requested_at = time.time() - 30.0
     supervisor.latest_snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="T", worker_version="0.0.0"),
-        num_jobs_popped=7,
+        timestamp=time.time(),
+        seconds_since_last_pop_per_workload={WorkloadKind.IMAGE_GENERATION: 5.0},
     )
     app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
-    app._intended_server_maintenance = True
-    app._server_maintenance_intent_pop_count = 6
+    app._intended_server_maintenance = {WorkloadKind.IMAGE_GENERATION: True}
+    app._server_maintenance_intent_at = {WorkloadKind.IMAGE_GENERATION: requested_at}
 
     captured: list[bool] = []
 
@@ -408,8 +420,8 @@ async def test_tick_clears_optimistic_maintenance_after_successful_pop(
     async with app.run_test(size=(120, 40)):
         app._tick()
 
-    assert app._intended_server_maintenance is None
-    assert app._server_maintenance_intent_pop_count is None
+    assert app._intended_server_maintenance == {}
+    assert app._server_maintenance_intent_at == {}
     assert captured[-1] is False
 
 
@@ -701,3 +713,42 @@ async def test_trends_panel_gets_a_wide_band_when_multicolumn(tmp_path: Path) ->
         # Trends must be far wider than the fractional core column Health sits in: it carries a ~48-char
         # sparkline and would scrunch if squeezed into a 1/3 slot.
         assert trends.size.width > health.size.width
+
+
+async def test_the_maintenance_key_opens_a_per_worker_modal_for_two_roles(tmp_path: Path) -> None:
+    """A dreamer plus scribe host has two workers on the horde; the modal offers one press per worker."""
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.set_auto_start_worker(True)
+    store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    fake = FakeSupervisor(alive=True)
+    config = WorkerConfigSummary(dreamer_name="Dreamer", worker_version="0.0.0", scribe=True, scribe_name="Scribe")
+    fake.latest_snapshot = WorkerStateSnapshot(
+        config=config,
+        timestamp=time.time(),
+        worker_details_maintenance=True,
+        worker_details_by_workload={
+            WorkloadKind.IMAGE_GENERATION: HordeWorkerDetailsSnapshot(worker_name="Dreamer", registered=True),
+            WorkloadKind.TEXT_GENERATION: HordeWorkerDetailsSnapshot(
+                worker_name="Scribe", registered=True, maintenance=True
+            ),
+        },
+    )
+    app = HordeWorkerTUI(fake, config_path=Path("bridgeData.yaml"), app_state_store=store)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+
+        app.action_toggle_server_maintenance()
+        await pilot.pause()
+
+        assert isinstance(app.screen, ServerMaintenanceModal)
+        scribe_button = app.screen.query_one("#maintenance-text_generation", Button)
+        assert str(scribe_button.label) == "Take out of maintenance"
+        scribe_button.press()
+        await pilot.pause()
+
+        assert not isinstance(app.screen, ServerMaintenanceModal)
+        assert fake.server_maintenance == [False]
+        assert fake.server_maintenance_workloads == [(WorkloadKind.TEXT_GENERATION,)]
+        assert app._intended_server_maintenance == {WorkloadKind.TEXT_GENERATION: False}

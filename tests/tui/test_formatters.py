@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    HordeWorkerDetailsSnapshot,
+    WorkerConfigSummary,
+    WorkerStateSnapshot,
+)
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.tui.formatters import (
     _JOB_ID_PALETTE,
+    held_workers_phrase,
     job_id_color,
     job_id_text,
     short_baseline,
@@ -63,3 +70,26 @@ def test_short_baseline_abbreviates_known_baselines() -> None:
 def test_short_baseline_falls_back_for_unknown_baselines() -> None:
     """An unknown baseline reads as a cleaned-up name rather than being dropped."""
     assert short_baseline("some_new_baseline") == "some new baseline"
+
+
+def _held(held: dict[WorkloadKind, bool]) -> WorkerStateSnapshot:
+    names = {WorkloadKind.IMAGE_GENERATION: "A Dreamer", WorkloadKind.TEXT_GENERATION: "A Scribe"}
+    return WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="A Dreamer", worker_version="0", scribe=True, scribe_name="A Scribe"),
+        worker_details_maintenance=any(held.values()),
+        worker_details_by_workload={
+            workload: HordeWorkerDetailsSnapshot(worker_name=names[workload], registered=True, maintenance=flag)
+            for workload, flag in held.items()
+        },
+    )
+
+
+def test_held_workers_are_named_only_for_a_partial_hold() -> None:
+    """One of two held names it; none or all held is the whole-worker case the aggregate already states."""
+    partial = _held({WorkloadKind.IMAGE_GENERATION: False, WorkloadKind.TEXT_GENERATION: True})
+    every = _held({WorkloadKind.IMAGE_GENERATION: True, WorkloadKind.TEXT_GENERATION: True})
+    none = _held({WorkloadKind.IMAGE_GENERATION: False, WorkloadKind.TEXT_GENERATION: False})
+
+    assert held_workers_phrase(partial) == "A Scribe"
+    assert held_workers_phrase(every) == ""
+    assert held_workers_phrase(none) == ""

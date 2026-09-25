@@ -18,6 +18,7 @@ import contextlib
 import dataclasses
 import socket
 import threading
+from collections.abc import Sequence
 from typing import Protocol
 
 from loguru import logger
@@ -29,6 +30,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerStateSnapshot,
 )
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.tui import socket_protocol as sp
 from horde_worker_regen.tui.worker_launcher import SupervisorStallStats, SupervisorStatus, WorkerProcessMode
 
@@ -168,7 +170,11 @@ class SupervisorLike(Protocol):
     def request_download_models(self, model_names: list[str], *, include_aux: bool) -> bool:
         """Ask the worker to fetch a chosen set of models on demand."""
 
-    def request_set_server_maintenance(self, enabled: bool) -> bool:
+    def request_set_server_maintenance(
+        self,
+        enabled: bool,
+        workloads: Sequence[WorkloadKind] | None = None,
+    ) -> bool:
         """Ask the worker to set its server-side (horde) maintenance flag on or off."""
 
     def request_set_stats_export(self, enabled: bool) -> bool:
@@ -404,12 +410,17 @@ class AttachedWorkerSupervisor:
             ),
         )
 
-    def request_set_server_maintenance(self, enabled: bool) -> bool:
+    def request_set_server_maintenance(
+        self,
+        enabled: bool,
+        workloads: Sequence[WorkloadKind] | None = None,
+    ) -> bool:
         """Ask the worker to set its server-side (horde) maintenance flag on or off."""
         return self.send_command(
             SupervisorControlMessage(
                 command=SupervisorCommand.SET_SERVER_MAINTENANCE,
                 server_maintenance_enabled=enabled,
+                server_maintenance_workloads=None if workloads is None else list(workloads),
             ),
         )
 

@@ -358,7 +358,7 @@
     <div class="controls" aria-label="Worker controls">
       <button class="primary" id="lifecycle-button" disabled>Start worker</button>
       <button id="pause-button" disabled>Pause locally</button>
-      <button class="warn" id="maintenance-button" disabled>Horde maintenance on</button>
+      <span id="maintenance-controls"><button class="warn" id="maintenance-button" disabled>Horde maintenance on</button></span>
     </div>
     <p class="notice" id="action-notice" aria-live="polite"></p>
 
@@ -445,6 +445,7 @@
       let current = null;
       let polling = false;
       let pendingAction = null;
+      let pendingWorkload = null;
       let pendingSince = 0;
 
       const setText = (id, value) => { byId(id).textContent = value; };
@@ -657,8 +658,11 @@
         if (pendingAction === "stop") return !state.worker_running || ["stopping", "stopped"].includes(state.lifecycle);
         if (pendingAction === "pause") return state.local_paused;
         if (pendingAction === "resume") return !state.local_paused;
-        if (pendingAction === "maintenance_on") return state.horde_maintenance;
-        if (pendingAction === "maintenance_off") return !state.horde_maintenance;
+        const heldFor = pendingWorkload
+          ? (state.horde_workers || []).some(w => w.workload === pendingWorkload && w.maintenance)
+          : state.horde_maintenance;
+        if (pendingAction === "maintenance_on") return heldFor;
+        if (pendingAction === "maintenance_off") return !heldFor;
         return true;
       };
 
@@ -692,7 +696,9 @@
         setText("recoveries", formatNumber(state.process_recoveries));
         setText("no-work", formatDuration(state.no_jobs_seconds));
         setText("local-pause", state.local_paused ? "On" : "Off");
-        setText("horde-maintenance", state.horde_maintenance ? "On" : "Off");
+        const heldNames = (state.horde_workers || []).filter(w => w.maintenance).map(w => w.worker_name);
+        const partialHold = heldNames.length > 0 && heldNames.length < (state.horde_workers || []).length;
+        setText("horde-maintenance", state.horde_maintenance ? (partialHold ? `On (${heldNames.join(", ")})` : "On") : "Off");
         byId("local-pause").className = state.local_paused ? "maintenance-on" : "";
         byId("horde-maintenance").className = state.horde_maintenance ? "maintenance-on" : "";
 
@@ -702,12 +708,9 @@
         const pauseButton = byId("pause-button");
         pauseButton.textContent = state.local_paused ? "Resume locally" : "Pause locally";
         pauseButton.dataset.action = state.local_paused ? "resume" : "pause";
-        const maintenanceButton = byId("maintenance-button");
-        maintenanceButton.textContent = state.horde_maintenance ? "Horde maintenance off" : "Horde maintenance on";
-        maintenanceButton.dataset.action = state.horde_maintenance ? "maintenance_off" : "maintenance_on";
+        renderMaintenanceControls(state, connected);
         lifecycleButton.disabled = !state.connected || Boolean(pendingAction) || state.lifecycle === "stopping";
         pauseButton.disabled = !connected || !state.worker_running || Boolean(pendingAction);
-        maintenanceButton.disabled = !connected || !state.worker_running || Boolean(pendingAction);
 
         state.active_jobs = state.active_jobs || [];
         state.recent_events = state.recent_events || [];
@@ -780,9 +783,41 @@
         }
       }
 
-      async function perform(action) {
+      // Each enabled role is its own worker on the horde with its own maintenance flag. One role keeps the
+      // single button; more than one gets a button per worker plus the all-workers pair, each naming the
+      // workload its role serves so the worker addresses the right one.
+      function renderMaintenanceControls(state, connected) {
+        const container = byId("maintenance-controls");
+        const workers = state.horde_workers || [];
+        const disabled = !connected || !state.worker_running || Boolean(pendingAction);
+        const button = (label, action, workload) => {
+          const element = document.createElement("button");
+          element.className = "warn";
+          element.textContent = label;
+          element.dataset.action = action;
+          if (workload) element.dataset.workload = workload;
+          element.disabled = disabled;
+          element.addEventListener("click", event => perform(event.currentTarget.dataset.action, event.currentTarget.dataset.workload));
+          return element;
+        };
+        container.replaceChildren();
+        if (workers.length <= 1) {
+          container.appendChild(button(state.horde_maintenance ? "Horde maintenance off" : "Horde maintenance on",
+            state.horde_maintenance ? "maintenance_off" : "maintenance_on", null));
+          return;
+        }
+        workers.forEach(worker => {
+          container.appendChild(button(`${worker.worker_name}: maintenance ${worker.maintenance ? "off" : "on"}`,
+            worker.maintenance ? "maintenance_off" : "maintenance_on", worker.workload));
+        });
+        container.appendChild(button("All: maintenance on", "maintenance_on", null));
+        container.appendChild(button("All: maintenance off", "maintenance_off", null));
+      }
+
+      async function perform(action, workload) {
         if (!action || pendingAction) return;
         pendingAction = action;
+        pendingWorkload = workload || null;
         pendingSince = Date.now();
         document.querySelectorAll("button").forEach(button => { button.disabled = true; });
         const notice = byId("action-notice");
@@ -792,7 +827,7 @@
           const response = await fetch("/native/api/action", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action })
+            body: JSON.stringify(pendingWorkload ? { action, workload: pendingWorkload } : { action })
           });
           const result = await response.json();
           notice.textContent = result.message || "Request sent.";
@@ -805,7 +840,7 @@
         await poll();
       }
 
-      ["lifecycle-button", "pause-button", "maintenance-button"].forEach(id => {
+      ["lifecycle-button", "pause-button"].forEach(id => {
         byId(id).addEventListener("click", event => perform(event.currentTarget.dataset.action));
       });
       byId("view-toggle").addEventListener("click", () => setGlance(!document.body.classList.contains("glance")));

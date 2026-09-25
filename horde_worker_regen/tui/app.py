@@ -10,11 +10,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import multiprocessing
 import os
 import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, override
@@ -51,6 +52,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerStateSnapshot,
 )
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.tui import socket_protocol as sp
@@ -67,7 +69,7 @@ from horde_worker_regen.tui.beta_models import apply_beta_model_env
 from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
 from horde_worker_regen.tui.design import register_horde_themes
-from horde_worker_regen.tui.formatters import configure_fidelity, format_percent
+from horde_worker_regen.tui.formatters import WORKLOAD_LABELS, configure_fidelity, format_percent
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.responsive import (
@@ -384,6 +386,133 @@ class BenchmarkActionConfirmModal(ResponsiveModalScreen[bool]):
             self.dismiss(False)
 
 
+@dataclasses.dataclass(frozen=True)
+class ServerMaintenanceRow:
+    """One logical worker as the maintenance modal shows it."""
+
+    workload: WorkloadKind
+    worker_name: str
+    in_maintenance: bool
+    """What the horde last reported for it, overlaid by a request the dashboard has sent and not yet seen confirmed."""
+    pending: bool
+    """A request for this worker is in flight, so the state shown is the requested one."""
+
+
+ServerMaintenanceChoice = tuple[tuple[WorkloadKind, ...], bool]
+"""What the modal returns: the workers to change and the state to set on them."""
+
+
+class ServerMaintenanceModal(ResponsiveModalScreen[ServerMaintenanceChoice | None]):
+    """Choose which of this worker's logical workers to put into, or take out of, horde maintenance.
+
+    Each enabled role is its own worker on the horde with its own maintenance flag, so a host serving more
+    than one role has more than one thing the key could mean. Every row is one press: it offers the one
+    change that makes sense for that worker's current state. The last row applies one state to all of them.
+    """
+
+    DEFAULT_CSS = """
+    ServerMaintenanceModal {
+        align: center middle;
+    }
+    ServerMaintenanceModal #maintenance-dialog {
+        width: 76;
+        max-width: 95%;
+        height: auto;
+        padding: 1 2;
+        border: thick $warning;
+        background: $surface;
+    }
+    ServerMaintenanceModal .maintenance-row {
+        height: auto;
+        margin-top: 1;
+    }
+    ServerMaintenanceModal .maintenance-row Static {
+        width: 1fr;
+        padding-top: 1;
+    }
+    ServerMaintenanceModal .maintenance-row Button {
+        width: 30;
+    }
+    ServerMaintenanceModal #maintenance-all {
+        height: auto;
+        margin-top: 1;
+    }
+    ServerMaintenanceModal #maintenance-all Button {
+        width: 1fr;
+    }
+    ServerMaintenanceModal #maintenance-cancel {
+        width: 100%;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, rows: Sequence[ServerMaintenanceRow]) -> None:
+        """Take the rows to offer, in the order the roles are configured."""
+        super().__init__()
+        self._rows = tuple(rows)
+
+    def compose(self) -> ComposeResult:
+        """Lay out one row per logical worker, the all-workers row, and cancel."""
+        with Vertical(id="maintenance-dialog"):
+            yield Static(
+                Text.assemble(
+                    ("Horde maintenance, per worker\n\n", "bold"),
+                    (
+                        "Each role is its own worker on the horde. A worker in maintenance is sent no new "
+                        "jobs; in-flight work finishes.",
+                        "grey70",
+                    ),
+                ),
+            )
+            for row in self._rows:
+                with Horizontal(classes="maintenance-row"):
+                    yield Static(self._describe(row))
+                    yield Button(
+                        "Take out of maintenance" if row.in_maintenance else "Put into maintenance",
+                        id=f"maintenance-{row.workload.value}",
+                        variant="primary" if row.in_maintenance else "warning",
+                    )
+            with Horizontal(id="maintenance-all"):
+                yield Button("All into maintenance", id="maintenance-all-on", variant="warning")
+                yield Button("All out of maintenance", id="maintenance-all-off", variant="primary")
+            yield Button("Cancel", id="maintenance-cancel")
+
+    @staticmethod
+    def _describe(row: ServerMaintenanceRow) -> Text:
+        state = "in maintenance" if row.in_maintenance else "receiving jobs"
+        style = "yellow" if row.in_maintenance else "green"
+        text = Text.assemble(
+            (row.worker_name, "bold"),
+            (f"  {WORKLOAD_LABELS.get(row.workload, row.workload.value)}\n", "grey62"),
+            (state, style),
+        )
+        if row.pending:
+            text.append("  (requested, awaiting the horde)", style="grey50")
+        return text
+
+    def action_cancel(self) -> None:
+        """Dismiss without a change when Escape is pressed."""
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Resolve the press into the workers to change and the state to set."""
+        button_id = event.button.id or ""
+        every = tuple(row.workload for row in self._rows)
+        if button_id == "maintenance-cancel":
+            self.dismiss(None)
+        elif button_id == "maintenance-all-on":
+            self.dismiss((every, True))
+        elif button_id == "maintenance-all-off":
+            self.dismiss((every, False))
+        else:
+            for row in self._rows:
+                if button_id == f"maintenance-{row.workload.value}":
+                    self.dismiss(((row.workload,), not row.in_maintenance))
+                    return
+
+
 class HordeWorkerTUI(App[None]):
     """A Textual dashboard that owns and visualises the reGen worker."""
 
@@ -566,11 +695,12 @@ class HordeWorkerTUI(App[None]):
         self._last_main_tab = "tab-overview"
         self._allow_tab_switch_to: str | None = None
         self._config_leave_warning_suppressed = False
-        # Optimistic intent for the "m" server-maintenance toggle: set to the desired state immediately
-        # after a command is sent, so a rapid second press toggles correctly before the 15 s poll catches up.
-        # Cleared once a snapshot confirms the advisory poll has reflected the new state.
-        self._intended_server_maintenance: bool | None = None
-        self._server_maintenance_intent_pop_count: int | None = None
+        # Optimistic intent for the "m" server-maintenance toggle, per logical worker: set to the desired
+        # state immediately after a command is sent, so a rapid second press toggles correctly before the
+        # 15 s poll catches up. An entry is dropped once a snapshot confirms the advisory poll reflects the
+        # requested state, or once that worker pops after the request, which proves it is not held.
+        self._intended_server_maintenance: dict[WorkloadKind, bool] = {}
+        self._server_maintenance_intent_at: dict[WorkloadKind, float] = {}
         # Tracks the previous-tick value of last_pop_maintenance_mode to detect False → True transitions
         # and fire a toast exactly once when the horde forces maintenance via the pop response.
         self._prev_pop_maintenance_mode: bool = False
@@ -974,17 +1104,17 @@ class HordeWorkerTUI(App[None]):
                     self._pending_download_models = None
         self._frame += 1
         snapshot = self._supervisor.latest_snapshot
-        # Clear the "m" intent once the advisory poll confirms the horde reflects the requested state,
-        # or once a real job pop proves the worker is no longer in horde maintenance.
-        if self._intended_server_maintenance is not None and snapshot is not None:
-            confirmed_by_poll = snapshot.worker_details_maintenance == self._intended_server_maintenance
-            cleared_by_successful_pop = (
-                self._intended_server_maintenance
-                and self._server_maintenance_intent_pop_count is not None
-                and snapshot.num_jobs_popped > self._server_maintenance_intent_pop_count
-            )
-            if confirmed_by_poll or cleared_by_successful_pop:
-                self._clear_server_maintenance_intent()
+        # Clear a worker's "m" intent once the advisory poll confirms the horde reflects the requested
+        # state, or once that worker pops after the request, which proves it is not held.
+        if self._intended_server_maintenance and snapshot is not None:
+            for workload, intended in list(self._intended_server_maintenance.items()):
+                polled = snapshot.worker_details_by_workload.get(workload)
+                confirmed_by_poll = polled is not None and polled.registered and polled.maintenance == intended
+                since_pop = snapshot.seconds_since_last_pop_per_workload.get(workload)
+                requested_at = self._server_maintenance_intent_at.get(workload, snapshot.timestamp)
+                cleared_by_pop = intended and since_pop is not None and snapshot.timestamp - since_pop > requested_at
+                if confirmed_by_poll or cleared_by_pop:
+                    self._clear_server_maintenance_intent(workload)
         # Toast exactly once when the pop loop first sees a maintenance-mode error from the horde.
         pop_maint = snapshot.last_pop_maintenance_mode if snapshot is not None else False
         if pop_maint and not self._prev_pop_maintenance_mode:
@@ -1009,7 +1139,7 @@ class HordeWorkerTUI(App[None]):
             self._supervisor.status,
             liveness_age,
             offline_checks=offline_checks,
-            optimistic_server_maintenance=self._intended_server_maintenance is True,
+            optimistic_server_maintenance=any(self._intended_server_maintenance.values()),
             fatal_error=self._supervisor.last_fatal_error,
         )
         try:
@@ -1321,10 +1451,10 @@ class HordeWorkerTUI(App[None]):
         else:
             self.notify("Could not request the download (worker not reachable).", severity="warning")
 
-    def _clear_server_maintenance_intent(self) -> None:
-        """Drop the optimistic server-maintenance command tracking once live state supersedes it."""
-        self._intended_server_maintenance = None
-        self._server_maintenance_intent_pop_count = None
+    def _clear_server_maintenance_intent(self, workload: WorkloadKind) -> None:
+        """Drop one worker's optimistic server-maintenance tracking once live state supersedes it."""
+        self._intended_server_maintenance.pop(workload, None)
+        self._server_maintenance_intent_at.pop(workload, None)
 
     def _paused_source(self, snapshot: WorkerStateSnapshot | None) -> str:
         """Return a short source tag for the PAUSED badge (e.g. 'server', 'local', 'auto', 'pop')."""
@@ -1978,32 +2108,81 @@ class HordeWorkerTUI(App[None]):
             self.notify("Pause requested (in-flight jobs will finish).")
 
     def action_toggle_server_maintenance(self) -> None:
-        """Toggle the worker's server-side (horde) maintenance flag via the horde API.
+        """Toggle a logical worker's server-side (horde) maintenance flag via the horde API.
 
-        Distinct from local pause: this asks the horde itself to stop (or resume) sending the worker
-        jobs, matching the maintenance the job-pop response reports. The current state is taken from the
-        polled worker-details flag.
+        Distinct from local pause: this asks the horde itself to stop (or resume) sending a worker jobs,
+        matching the maintenance the job-pop response reports. Each enabled role is its own worker on the
+        horde, so with one role on the key toggles it, and with more than one a modal asks which.
         """
+        rows = self._server_maintenance_rows()
+        if len(rows) <= 1:
+            # One role or none known yet: the whole-worker toggle, read from the pending intent before the
+            # (up-to-15-s stale) advisory poll so a rapid second press reverses the first.
+            workload = rows[0].workload if rows else None
+            currently_in_maintenance = rows[0].in_maintenance if rows else self._whole_worker_in_maintenance()
+            self._request_server_maintenance(None if workload is None else (workload,), not currently_in_maintenance)
+            return
+        self.push_screen(ServerMaintenanceModal(rows), self._on_server_maintenance_choice)
+
+    def _on_server_maintenance_choice(self, choice: ServerMaintenanceChoice | None) -> None:
+        """Apply the modal's choice, or nothing when it was cancelled."""
+        if choice is None:
+            return
+        workloads, enable = choice
+        self._request_server_maintenance(workloads, enable)
+
+    def _whole_worker_in_maintenance(self) -> bool:
+        """The whole-worker reading, for a toggle sent before any per-worker state is known."""
+        if self._intended_server_maintenance:
+            return any(self._intended_server_maintenance.values())
         snapshot = self._supervisor.latest_snapshot
-        # Prefer the pending intent over the (up-to-15-s stale) advisory poll so that a rapid second
-        # press reverses the first instead of duplicating it.
-        if self._intended_server_maintenance is not None:
-            currently_in_maintenance = self._intended_server_maintenance
-        else:
-            currently_in_maintenance = snapshot is not None and snapshot.worker_details_maintenance
-        enable = not currently_in_maintenance
-        sent = self._supervisor.request_set_server_maintenance(enable)
-        if sent:
-            self._intended_server_maintenance = enable
-            self._server_maintenance_intent_pop_count = (
-                snapshot.num_jobs_popped if enable and snapshot is not None else None
+        return snapshot is not None and snapshot.worker_details_maintenance
+
+    def _server_maintenance_rows(self) -> tuple[ServerMaintenanceRow, ...]:
+        """One row per enabled role, its horde state overlaid by any request not yet confirmed."""
+        snapshot = self._supervisor.latest_snapshot
+        if snapshot is None:
+            return ()
+        rows: list[ServerMaintenanceRow] = []
+        for workload, worker_name in snapshot.config.enabled_roles:
+            polled = snapshot.worker_details_by_workload.get(workload)
+            intended = self._intended_server_maintenance.get(workload)
+            in_maintenance = intended if intended is not None else (polled is not None and polled.maintenance)
+            rows.append(
+                ServerMaintenanceRow(
+                    workload=workload,
+                    worker_name=worker_name,
+                    in_maintenance=in_maintenance,
+                    pending=intended is not None,
+                ),
             )
+        return tuple(rows)
+
+    def _request_server_maintenance(self, workloads: tuple[WorkloadKind, ...] | None, enable: bool) -> None:
+        """Send the request, record the intent per worker, and say what was asked."""
+        sent = self._supervisor.request_set_server_maintenance(enable, workloads)
         if not sent:
             self.notify("Worker not running; maintenance change not sent.")
-        elif enable:
-            self.notify("Requested horde maintenance ON (worker stops receiving jobs).")
+            return
+        snapshot = self._supervisor.latest_snapshot
+        addressed = workloads
+        if addressed is None:
+            addressed = tuple(workload for workload, _name in snapshot.config.enabled_roles) if snapshot else ()
+        now = time.time()
+        for workload in addressed:
+            self._intended_server_maintenance[workload] = enable
+            self._server_maintenance_intent_at[workload] = now
+        names = self._worker_names_for(addressed)
+        if enable:
+            self.notify(f"Requested horde maintenance ON for {names} (stops receiving jobs).")
         else:
-            self.notify("Requested horde maintenance OFF (worker receives jobs again).")
+            self.notify(f"Requested horde maintenance OFF for {names} (receives jobs again).")
+
+    def _worker_names_for(self, workloads: tuple[WorkloadKind, ...]) -> str:
+        """The horde names of the given roles as one phrase, or the role labels when no snapshot names them."""
+        snapshot = self._supervisor.latest_snapshot
+        by_workload = dict(snapshot.config.enabled_roles) if snapshot is not None else {}
+        return ", ".join(by_workload.get(w) or WORKLOAD_LABELS.get(w, w.value) for w in workloads) or "the worker"
 
     def action_start_stop_worker(self) -> None:
         """Start the worker if stopped, or gracefully stop it (without quitting) if running."""

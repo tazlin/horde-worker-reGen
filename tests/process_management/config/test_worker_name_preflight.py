@@ -9,6 +9,7 @@ import pytest
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.config import worker_identity
 from horde_worker_regen.process_management.config.worker_identity import WorkerNameConfigError, verify_worker_identity
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 
 _DREAMER_DEFAULT = reGenBridgeData.model_fields["dreamer_worker_name"].default
 _ALCHEMIST_DEFAULT = reGenBridgeData.model_fields["alchemist_name"].default
@@ -325,3 +326,20 @@ class TestLookupRegisteredWorker:
         monkeypatch.setattr(worker_identity, "AIHordeAPIClientSession", lambda: _FakeSession(worker))
 
         assert worker_identity._lookup_registered_worker("Some Worker", "0" * 22) is worker
+
+
+def test_the_enabled_roles_map_to_their_workloads_and_names() -> None:
+    """Each role that is on is one worker on the horde, keyed by the workload it serves, in role order."""
+    bridge_data = Mock(
+        dreamer=True,
+        alchemist=False,
+        scribe=True,
+        dreamer_worker_name="A Dreamer",
+        alchemist_name="An Alchemist",
+        scribe_name="A Scribe",
+    )
+
+    by_workload = worker_identity.enabled_worker_names_by_workload(bridge_data)
+
+    assert by_workload == {WorkloadKind.IMAGE_GENERATION: "A Dreamer", WorkloadKind.TEXT_GENERATION: "A Scribe"}
+    assert worker_identity.enabled_worker_names(bridge_data) == ["A Dreamer", "A Scribe"]
