@@ -475,6 +475,24 @@ async def test_an_empty_pop_leaves_nothing_in_flight() -> None:
     assert session.submit_requests == []
 
 
+async def test_a_dry_run_never_sends_a_text_pop_to_the_horde() -> None:
+    """A dry run promises no API traffic, so the loop keeps turning over a ready backend and never pops."""
+    coordinator, _backend, session = _make_coordinator(dry_run_skip_api=True)
+    coordinator._loop_interval = 0.0
+    loop_passes = 3
+    shutdown_manager = coordinator._shutdown_manager
+    assert isinstance(shutdown_manager, Mock)
+    shutdown_manager.is_time_for_shutdown.side_effect = [False] * (loop_passes - 1) + [True]
+
+    await asyncio.wait_for(coordinator.run(), timeout=5.0)
+
+    assert shutdown_manager.is_time_for_shutdown.call_count == loop_passes, "the loop stopped turning over"
+    assert coordinator.advertisement is not None, "the gate never ran, so the pop was never reachable"
+    assert session.pop_requests == [], "a dry run sent a text pop to the horde"
+    assert session.submit_requests == []
+    assert coordinator._pop_hold_until == 0.0, "a dry run entered the pop error backoff"
+
+
 async def test_a_generated_job_is_submitted_as_ok_with_the_backend_text() -> None:
     """The happy path: the text the backend produced is what the horde is given."""
     backend = FakeTextBackend(description=_DESCRIPTION, response_text="a generated answer")

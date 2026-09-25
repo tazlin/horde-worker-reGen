@@ -360,6 +360,11 @@ Put the scribe worker into maintenance on the horde (the worker's page, or `PUT 
 owner's own API key to it, so a request that names the worker in `workers` is served by it and nobody
 else's traffic reaches it. The worker logs the hold once when it begins and once when pops resume.
 
+A dry run (`dry_run_skip_api`) never reaches the horde from the text flow. The backend is replaced by an
+in-process stand-in that describes itself as the configured backend would, so the readiness gate and the
+advertisement run as they would live, but no pop is sent. The text flow has no canned job source, so a dry
+run pops no text work at all, the same as an alchemy flow with no canned source attached.
+
 ## What a finished text job is counted in
 
 A submitted text job earns kudos the same way an image job does, and the worker treats those earnings as

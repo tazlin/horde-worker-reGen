@@ -1473,6 +1473,12 @@ class TextGenerationCoordinator:
 
     async def api_text_pop(self) -> None:
         """Pop a text job from the API when the pop policy allows it, and start work on what came back."""
+        # A dry run promises no API traffic and the text flow has no canned job source, so there is nothing to
+        # pop; the fake backend only stands in for generation. Compared against True because a mocked config
+        # reads every unset attribute as truthy.
+        if self.bridge_data.dry_run_skip_api is True:
+            return
+
         advertisement = self._advertisement
         if advertisement is None or not self._should_pop():
             return
