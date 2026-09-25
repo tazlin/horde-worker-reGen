@@ -18,6 +18,7 @@ import pytest
 
 from horde_worker_regen.analysis import support_bundle
 from horde_worker_regen.analysis.support_bundle import build_support_bundle
+from horde_worker_regen.analysis.triage_report import BENCHMARK_RUN_TAG
 
 _API_KEY = "abcdEFGH1234ijklMNOP56"
 _CIVITAI = "cd92292204eaa0759418fdebc5ae6d79"
@@ -398,3 +399,64 @@ class TestFootprintStore:
 
         with zipfile.ZipFile(out) as zf:
             assert zf.read("config/vram_footprints.json").decode() == '{"schema_version": 2}'
+
+
+_HARNESS_LOG = (
+    "2026-06-24 18:00:03.000 | DEBUG | horde_worker_regen.process_management.process_manager:__init__:1 - "
+    "Models to load: []\n"
+    "2026-06-24 18:00:30.000 | INFO | x:y:1 - benchmark level running\n"
+)
+
+
+def _read_member(zip_path: Path, name: str) -> str:
+    with zipfile.ZipFile(zip_path) as zf:
+        return zf.read(name).decode("utf-8")
+
+
+class TestBenchmarkRuns:
+    """A bundle lists worker sessions and benchmark runs apart, each numbered from #0."""
+
+    def test_both_lists_appear_worker_first(self, tmp_path: Path) -> None:
+        """``sessions.txt`` and ``diagnose.txt`` show the worker list, then the benchmark runs."""
+        logs = _worker_dir(tmp_path)
+        (logs / "bridge_harness.log").write_text(_HARNESS_LOG, encoding="utf-8")
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        sessions_text = _read_member(out, "sessions.txt")
+        assert sessions_text.index("1 worker session(s)") < sessions_text.index("1 benchmark run(s)")
+        diagnose_text = _read_member(out, "diagnose.txt")
+        worker_heading = diagnose_text.index("=== Session #0 ")
+        benchmark_heading = diagnose_text.index("=== Session #0  [benchmark run: bridge_harness.log]")
+        assert worker_heading < benchmark_heading
+        diagnose_json = json.loads(_read_member(out, "diagnose.json"))
+        assert [(entry["log_kind"], entry["session_index"]) for entry in diagnose_json] == [
+            ("worker", 0),
+            ("harness", 0),
+        ]
+        labels = [entry["session_label"] for entry in diagnose_json]
+        assert labels == ["#0", f"#0  {BENCHMARK_RUN_TAG}"]
+        assert all(f"=== Session {label}  " in diagnose_text for label in labels)
+
+    def test_the_benchmark_selector_diagnoses_only_the_benchmark_run(self, tmp_path: Path) -> None:
+        """``benchmark_index`` picks benchmark run #0, not worker session #0."""
+        logs = _worker_dir(tmp_path)
+        (logs / "bridge_harness.log").write_text(_HARNESS_LOG, encoding="utf-8")
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml", benchmark_index=0)
+
+        diagnose_json = json.loads(_read_member(out, "diagnose.json"))
+        assert [(entry["log_kind"], entry["session_index"]) for entry in diagnose_json] == [("harness", 0)]
+        assert diagnose_json[0]["session_label"] == f"#0  {BENCHMARK_RUN_TAG}"
+
+    def test_a_worker_only_bundle_labels_its_sessions(self, tmp_path: Path) -> None:
+        """Without a harness log, each ``diagnose.json`` entry still carries the label the CLI prints."""
+        logs = _worker_dir(tmp_path)
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        diagnose_json = json.loads(_read_member(out, "diagnose.json"))
+        assert [(entry["log_kind"], entry["session_index"], entry["session_label"]) for entry in diagnose_json] == [
+            ("worker", 0, "#0")
+        ]
+        assert "=== Session #0  " in _read_member(out, "diagnose.txt")

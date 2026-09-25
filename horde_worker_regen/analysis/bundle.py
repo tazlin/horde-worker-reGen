@@ -3,9 +3,12 @@
 A worker run scatters its logs across many files in one directory (see
 ``hordelib.utils.logger`` for the naming): the orchestrator ``bridge.log``, per-slot ``bridge_<N>.log``
 loop logs, ``bridge_inference_<N>_startup.log`` pre-sink crash backstops, ``stderr_<N>.log``, plus
-zipped rotations of each. This module maps those filenames back to their roles so the rest of the
-toolchain can ask "give me the orchestrator records" or "give me slot 3's startup crash" without
-re-deriving the naming convention.
+zipped rotations of each. A ``horde-benchmark`` run hosts the same orchestrator in the harness process,
+which writes its lines to ``bridge_harness.log`` instead (see ``harness._arm_harness_log_sink``); that
+file is an orchestrator log of its own kind (:class:`OrchestratorLogKind`), parsed the same way but kept
+apart, because a benchmark and a worker can run in the same logs directory at the same time. This module
+maps those filenames back to their roles so the rest of the toolchain can ask "give me the orchestrator
+records" or "give me slot 3's startup crash" without re-deriving the naming convention.
 
 Accepts a directory (the usual ``logs/``), a single file (just that log), or a ``.zip`` an operator
 sent us (extracted to a temp dir and scanned as a directory). The action ledger, if present, is located
@@ -14,6 +17,7 @@ relative to the bundle root via :mod:`ledger_ingest`.
 
 from __future__ import annotations
 
+import enum
 import re
 import tempfile
 import zipfile
@@ -29,6 +33,7 @@ from .log_ingest import LogRecord, read_records, read_time_range
 
 # Role-classifying patterns over a *base* name (rotation timestamp and .zip/.gz suffix already stripped).
 _ORCHESTRATOR_RE = re.compile(r"^bridge\.log$")
+_HARNESS_ORCHESTRATOR_RE = re.compile(r"^bridge_harness\.log$")
 _CHILD_LOOP_RE = re.compile(r"^bridge_(?P<pid>\d+)\.log$")
 _INFERENCE_STARTUP_RE = re.compile(r"^bridge_inference_(?P<pid>\d+)_startup\.log$")
 _SAFETY_STARTUP_RE = re.compile(r"^bridge_safety_(?P<pid>\d+)_startup\.log$")
@@ -47,6 +52,15 @@ ROTATION_ABUT_SECONDS = 120.0
 A size-triggered rotation hands off within a line, so the true gap is milliseconds; the allowance covers a
 slow compression or a quiet worker that logged nothing across the handover. It is deliberately far shorter
 than the gap between two worker launches, which is what the chain must not swallow."""
+
+
+class OrchestratorLogKind(enum.StrEnum):
+    """Which process wrote an orchestrator log, and so what kind of run its sessions are."""
+
+    WORKER = "worker"
+    """``bridge.log``: a worker launched by ``run_worker`` or the dashboard."""
+    HARNESS = "harness"
+    """``bridge_harness.log``: the harness parent hosting the orchestrator for a ``horde-benchmark`` run."""
 
 
 def _base_name(path: Path) -> str:
@@ -94,6 +108,8 @@ class LogBundle:
 
     root: Path
     orchestrator_paths: list[Path] = field(default_factory=list)
+    harness_paths: list[Path] = field(default_factory=list)
+    """The benchmark harness parent's orchestrator log and its rotations (:attr:`OrchestratorLogKind.HARNESS`)."""
     child_loop_paths: dict[int, list[Path]] = field(default_factory=dict)
     startup_paths: dict[int, list[Path]] = field(default_factory=dict)
     stderr_paths: dict[int, list[Path]] = field(default_factory=dict)
@@ -104,6 +120,8 @@ class LogBundle:
     watch passes an incremental reader here so re-parses touch only each file's appended tail."""
     _orchestrator_cache: list[LogRecord] | None = field(default=None, init=False, repr=False, compare=False)
     _active_orchestrator_cache: list[LogRecord] | None = field(default=None, init=False, repr=False, compare=False)
+    _harness_cache: list[LogRecord] | None = field(default=None, init=False, repr=False, compare=False)
+    _active_harness_cache: list[LogRecord] | None = field(default=None, init=False, repr=False, compare=False)
     _child_cache: dict[int, list[LogRecord]] = field(default_factory=dict, init=False, repr=False, compare=False)
     _startup_cache: dict[int, list[LogRecord]] = field(default_factory=dict, init=False, repr=False, compare=False)
     _ledger_cache: list[LedgerEvent] | None = field(default=None, init=False, repr=False, compare=False)
@@ -176,7 +194,7 @@ class LogBundle:
         A directory target reads every rotation it finds, which is the right default for forensics but
         leaves the report's span resting on files the reader never sees named. Nothing is excluded here.
         """
-        rotations = [path for path in self.orchestrator_paths if _is_rotation(path)]
+        rotations = [path for path in [*self.orchestrator_paths, *self.harness_paths] if _is_rotation(path)]
         if rotations:
             self.rotation_stitch = RotationStitch(included=_sorted_rotations(rotations))
 
@@ -229,6 +247,9 @@ class LogBundle:
         if _ORCHESTRATOR_RE.match(base):
             self.orchestrator_paths.append(path)
             return
+        if _HARNESS_ORCHESTRATOR_RE.match(base):
+            self.harness_paths.append(path)
+            return
         for pattern, target in (
             (_CHILD_LOOP_RE, self.child_loop_paths),
             (_INFERENCE_STARTUP_RE, self.startup_paths),
@@ -258,17 +279,39 @@ class LogBundle:
         A bounded "recent sessions" pass can read just this and skip decompressing the whole rotation
         history, which is the bulk of the disk I/O and parse cost on a long-running worker.
         """
-        return [
-            path
-            for path in self.orchestrator_paths
-            if path.suffix.lower() == ".log" and not _ROTATION_TS_RE.search(path.name)
-        ]
+        return _active_paths(self.orchestrator_paths)
 
     def active_orchestrator_records(self) -> list[LogRecord]:
         """Parsed records from only the live ``bridge.log`` (skips rotations); see ``active_orchestrator_paths``."""
         if self._active_orchestrator_cache is None:
             self._active_orchestrator_cache = self._read(*self.active_orchestrator_paths())
         return self._active_orchestrator_cache
+
+    def harness_records(self) -> list[LogRecord]:
+        """All parsed ``bridge_harness.log`` records, active plus rotations, in time order.
+
+        Kept out of :meth:`orchestrator_records`: a benchmark and a worker can log over the same hours, and
+        merging the two streams would splice their sessions together.
+        """
+        if self._harness_cache is None:
+            self._harness_cache = self._read(*self.harness_paths)
+        return self._harness_cache
+
+    def active_harness_paths(self) -> list[Path]:
+        """Only the live ``bridge_harness.log``, without its rotations; see ``active_orchestrator_paths``."""
+        return _active_paths(self.harness_paths)
+
+    def active_harness_records(self) -> list[LogRecord]:
+        """Parsed records from only the live ``bridge_harness.log`` (skips rotations)."""
+        if self._active_harness_cache is None:
+            self._active_harness_cache = self._read(*self.active_harness_paths())
+        return self._active_harness_cache
+
+    def active_paths_of_kind(self, kind: OrchestratorLogKind) -> list[Path]:
+        """The live orchestrator log of ``kind``, without its rotations."""
+        if kind is OrchestratorLogKind.HARNESS:
+            return self.active_harness_paths()
+        return self.active_orchestrator_paths()
 
     def child_records(self, process_id: int) -> list[LogRecord]:
         """Parsed loop-log records for one slot, in time order (empty if that slot has no loop log)."""
@@ -291,6 +334,11 @@ class LogBundle:
         if self._ledger_cache is None:
             self._ledger_cache = ledger_ingest.load_ledger_for(self.root)
         return self._ledger_cache
+
+
+def _active_paths(paths: list[Path]) -> list[Path]:
+    """The uncompressed, unrotated files among ``paths``: the logs a running process still appends to."""
+    return [path for path in paths if path.suffix.lower() == ".log" and not _ROTATION_TS_RE.search(path.name)]
 
 
 def _uncompressed_name(path: Path) -> str:
@@ -336,6 +384,7 @@ def _looks_like_rotation(path: Path) -> bool:
         pattern.match(base)
         for pattern in (
             _ORCHESTRATOR_RE,
+            _HARNESS_ORCHESTRATOR_RE,
             _CHILD_LOOP_RE,
             _INFERENCE_STARTUP_RE,
             _SAFETY_STARTUP_RE,

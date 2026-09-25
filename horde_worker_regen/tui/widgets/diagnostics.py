@@ -31,13 +31,15 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Button, Label, LoadingIndicator, Rule, Select, Static
 
+from horde_worker_regen.analysis.bundle import OrchestratorLogKind
 from horde_worker_regen.analysis.detectors import Finding, Severity
+from horde_worker_regen.analysis.triage_report import session_label
 from horde_worker_regen.tui.formatters import human_duration
 from horde_worker_regen.tui.log_tailer import default_log_dir
 from horde_worker_regen.tui.widgets.finding_card import FindingCard
 
 if TYPE_CHECKING:
-    from horde_worker_regen.analysis.diagnose import SessionDiagnosisView
+    from horde_worker_regen.analysis.diagnose import SessionDiagnosisView, SessionSummary
 
 # A displayed analysis older than this is flagged stale: the worker may have logged new incidents since
 # the parse, so the findings on screen can no longer be trusted to reflect the current logs.
@@ -61,6 +63,15 @@ _SCOPE_LABELS: dict[str, str] = {
 }
 # The default scope on first open: a quick, bounded pass that never looks hung on a long history.
 _DEFAULT_SCOPE = "recent"
+
+type _SessionKey = tuple[OrchestratorLogKind, int]
+"""A session selector value. Worker sessions and benchmark runs are each numbered from 0, so the index alone
+does not identify a session."""
+
+
+def _session_key(session: SessionSummary) -> _SessionKey:
+    """Return the selector value and cache key of a session."""
+    return (session.log_kind, session.index)
 
 
 class DiagnosticsView(Vertical):
@@ -201,12 +212,13 @@ class DiagnosticsView(Vertical):
         if event.select.id == "diag-scope":
             self._indicate_scope_pending(str(event.value))
             return
-        # The session option values are indices (ints); the isinstance guard also covers the BLANK case. The
-        # message is delivered after the setter that caused it, so one posted by repopulating the selector
-        # can arrive after the operator has already picked another session; a value the selector no longer
-        # holds is that stale message, not a choice.
-        if event.select.id == "diag-session" and isinstance(event.value, int) and event.value == event.select.value:
-            self._render_selected(event.value)
+        # The session option values are (log kind, index) keys; the isinstance guard also covers the BLANK
+        # case. The message is delivered after the setter that caused it, so one posted by repopulating the
+        # selector can arrive after the operator has already picked another session; a value the selector no
+        # longer holds is that stale message, not a choice.
+        if event.select.id == "diag-session" and isinstance(event.value, tuple) and event.value == event.select.value:
+            log_kind, index = event.value
+            self._render_selected((OrchestratorLogKind(log_kind), int(index)))
 
     def _indicate_scope_pending(self, scope: str) -> None:
         """Show that the chosen scope is not applied until Run analysis is pressed."""
@@ -315,9 +327,8 @@ class DiagnosticsView(Vertical):
                 ),
             )
             return
-        self._populate_session_select(results)
-        latest_index = results[-1].session.index
-        self._render_selected(latest_index)
+        default_key = self._populate_session_select(results)
+        self._render_selected(default_key)
 
     def _on_analysis_error(self, error: Exception) -> None:
         """UI-thread callback: report a triage failure and re-enable the controls."""
@@ -329,26 +340,39 @@ class DiagnosticsView(Vertical):
         self._set_status(f"Analysis failed: {type(error).__name__}: {error}")
         self.notify(f"Diagnostics failed: {type(error).__name__}: {error}", severity="error")
 
-    def _populate_session_select(self, results: list[SessionDiagnosisView]) -> None:
-        """Repopulate the session selector (latest last, default-selected) from the diagnosed sessions."""
+    def _populate_session_select(self, results: list[SessionDiagnosisView]) -> _SessionKey:
+        """Repopulate the session selector from the diagnosed sessions and return the default-selected key.
+
+        Worker sessions come first, oldest to latest, then benchmark runs. The latest worker session is the
+        default; with no worker session in scope, the last benchmark run is.
+        """
         select = self.query_one("#diag-session", Select)
-        last_pos = len(results) - 1
+        worker_views = [view for view in results if view.session.log_kind is not OrchestratorLogKind.HARNESS]
+        benchmark_views = [view for view in results if view.session.log_kind is OrchestratorLogKind.HARNESS]
+        latest_worker = worker_views[-1] if worker_views else None
         options = [
-            (self._session_label(diagnosis, is_latest=pos == last_pos), diagnosis.session.index)
-            for pos, diagnosis in enumerate(results)
+            (self._session_label(diagnosis, is_latest=diagnosis is latest_worker), _session_key(diagnosis.session))
+            for diagnosis in [*worker_views, *benchmark_views]
         ]
+        default_key = _session_key(latest_worker.session if latest_worker is not None else results[-1].session)
         self._updating_select = True
         try:
             select.set_options(options)
             select.disabled = False
-            select.value = results[-1].session.index
+            select.value = default_key
         finally:
             self._updating_select = False
+        return default_key
 
     def _session_label(self, diagnosis: SessionDiagnosisView, *, is_latest: bool) -> str:
-        """A one-line selector label: position, worker version, and how the session ended."""
+        """A one-line selector label: position, worker version, and how the session ended.
+
+        The position is "latest" for the latest worker session and the shared session label otherwise, so a
+        benchmark run always carries its tag.
+        """
         session = diagnosis.session
-        position = "latest" if is_latest else f"#{session.index}"
+        is_benchmark_run = session.log_kind is OrchestratorLogKind.HARNESS
+        position = "latest" if is_latest and not is_benchmark_run else session_label(session)
         version = f"v{session.version}" if session.version else "v?"
         worst = self._worst_severity(diagnosis)
         flag = f"; {worst.value}" if worst is not None else ""
@@ -359,16 +383,16 @@ class DiagnosticsView(Vertical):
         """The most-severe finding severity in a session (findings are already sorted), or None."""
         return diagnosis.findings[0].severity if diagnosis.findings else None
 
-    def _render_selected(self, session_index: int) -> None:
-        """Render the findings for the session with ``session_index`` from the cache."""
-        diagnosis = next((d for d in self._diagnoses if d.session.index == session_index), None)
+    def _render_selected(self, session_key: _SessionKey) -> None:
+        """Render the findings for the session with ``session_key`` from the cache."""
+        diagnosis = next((d for d in self._diagnoses if _session_key(d.session) == session_key), None)
         if diagnosis is None:
             self._show_results_message(Text("Session no longer available; run analysis again.", style="grey50"))
             return
         session = diagnosis.session
         scope_label = _SCOPE_LABELS.get(self._analyzed_scope or "", "")
         self._set_status(
-            f"Session #{session.index} ({session.end_reason}); {len(diagnosis.findings)} finding(s). "
+            f"Session {session_label(session)} ({session.end_reason}); {len(diagnosis.findings)} finding(s). "
             f"Scope: {scope_label}. Change scope or Run analysis to refresh.",
         )
         if not diagnosis.findings:

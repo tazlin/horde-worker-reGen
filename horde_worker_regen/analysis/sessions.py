@@ -8,6 +8,11 @@ is the session boundary, reusing the same contract :mod:`duty_log_report` alread
 Each session is then classified by *how it ended* (clean exit, gave up and aborted, operator shutdown,
 or killed/crashed mid-run), which is the first thing you want to know and the signal the detectors key
 the recovery story off of.
+
+A ``horde-benchmark`` run logs the same orchestrator lines to ``bridge_harness.log``.
+:func:`segment_bundle_sessions` segments that file on its own and lists its sessions after the worker's,
+each tagged with the :class:`~horde_worker_regen.analysis.bundle.OrchestratorLogKind` it came from and
+numbered within its own kind, so a worker session keeps the index it has without a harness log.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .bundle import LogBundle, OrchestratorLogKind
 from .duty_log_report import (
     _EPOCH_BOUNDARY_FALLBACK_RE,
     _EPOCH_BOUNDARY_RE,
@@ -83,6 +89,13 @@ class WorkerSession:
     """
     start_truncated: bool = False
     """Whether the missing launch boundary is attributable to a bundle truncation note in the capture."""
+    log_kind: OrchestratorLogKind = OrchestratorLogKind.WORKER
+    """Which orchestrator log the session was segmented from: a worker launch or a benchmark run."""
+
+    @property
+    def is_benchmark_run(self) -> bool:
+        """Whether the session is a ``horde-benchmark`` run read from ``bridge_harness.log``."""
+        return self.log_kind is OrchestratorLogKind.HARNESS
 
     @property
     def start_ts(self) -> datetime | None:
@@ -113,17 +126,45 @@ def _is_init_banner(record: LogRecord) -> bool:
     return bool(_EPOCH_BOUNDARY_RE.search(record.location) or _EPOCH_BOUNDARY_FALLBACK_RE.search(record.full_text))
 
 
-def segment_sessions(records: list[LogRecord]) -> list[WorkerSession]:
-    """Split orchestrator records into sessions, one per worker launch.
+def segment_bundle_sessions(bundle: LogBundle, *, active_only: bool = False) -> list[WorkerSession]:
+    """Segment every orchestrator log in ``bundle`` into sessions: the worker's, then the benchmark runs.
+
+    ``bridge.log`` and ``bridge_harness.log`` are segmented separately, so a benchmark run that overlaps a
+    worker launch in time stays its own session instead of absorbing or splitting the worker's. Each kind
+    is numbered from 0 on its own, so a worker session's index is the same with or without a harness log
+    and a session is addressed by its ``log_kind`` and ``index`` together.
+
+    Args:
+        bundle: The grouped log files to read.
+        active_only: Read only the live logs and skip their rotations.
+
+    Returns:
+        The worker sessions in log order, followed by the benchmark runs in log order.
+    """
+    worker_records = bundle.active_orchestrator_records() if active_only else bundle.orchestrator_records()
+    harness_records = bundle.active_harness_records() if active_only else bundle.harness_records()
+    worker_sessions = segment_sessions(worker_records)
+    harness_sessions = segment_sessions(harness_records, log_kind=OrchestratorLogKind.HARNESS)
+    return worker_sessions + harness_sessions
+
+
+def segment_sessions(
+    records: list[LogRecord],
+    *,
+    log_kind: OrchestratorLogKind = OrchestratorLogKind.WORKER,
+) -> list[WorkerSession]:
+    """Split one orchestrator log's records into sessions, one per launch.
 
     Prefers the main process's first-line logger-setup marker so a new launch's slow startup does not
     bleed onto the prior session; falls back to the process-manager init banner for captures that have
-    no logger-setup line (older logs, or a bundle that begins mid-run). A 30s burst-collapse keeps the
-    several init lines of one launch from each opening a session.
+    no logger-setup line (older logs, a bundle that begins mid-run, or ``bridge_harness.log``, which
+    does not carry the main-process marker). A 30s burst-collapse keeps the several init lines of one
+    launch from each opening a session.
 
     A session opened without a boundary record (the capture starts mid-run, e.g. a size-trimmed log)
     carries ``start_is_lower_bound``, so its start and duration are reported as bounds rather than as
-    facts the capture cannot support.
+    facts the capture cannot support. Every session is tagged with ``log_kind``; records from two
+    different orchestrator logs must not be passed together (see :func:`segment_bundle_sessions`).
     """
     use_startup_boundary = any(_is_main_startup(record) for record in records)
     is_boundary = _is_main_startup if use_startup_boundary else _is_init_banner
@@ -141,21 +182,44 @@ def segment_sessions(records: list[LogRecord]) -> list[WorkerSession]:
                 and ts is not None
                 and (ts - last_boundary_ts).total_seconds() <= _EPOCH_COLLAPSE_SECONDS
             )
-            if not within_burst:
-                current = WorkerSession(index=len(sessions))
+            if current is not None and last_boundary_ts is None and _is_harness_preamble(current, ts):
+                current.start_is_lower_bound = False
+            elif not within_burst:
+                current = WorkerSession(index=len(sessions), log_kind=log_kind)
                 sessions.append(current)
             if ts is not None:
                 last_boundary_ts = ts
         if current is None:
             # Records before the first banner (the file began mid-session): open an implicit session 0.
             # Its launch line is not in the capture, so its start is only an upper bound on the real one.
-            current = WorkerSession(index=0, start_is_lower_bound=True, start_truncated=record.follows_truncation)
+            current = WorkerSession(
+                index=0,
+                start_is_lower_bound=True,
+                start_truncated=record.follows_truncation,
+                log_kind=log_kind,
+            )
             sessions.append(current)
         current.records.append(record)
 
     for index, session in enumerate(sessions):
         _populate_session(session, is_last=index == len(sessions) - 1)
     return sessions
+
+
+def _is_harness_preamble(implicit_session: WorkerSession, boundary_ts: datetime | None) -> bool:
+    """Whether the records ahead of a harness log's first init banner are that run's own startup lines.
+
+    The harness arms its log sink at the start of each run, before it builds the process manager, so a
+    few lines (model reference and provider setup) always precede the banner. Opening them as a separate
+    mid-run session would report a benchmark run that never happened. A capture cut by truncation, or a
+    preamble longer than the burst window, is still treated as the tail of an earlier run.
+    """
+    if implicit_session.log_kind is not OrchestratorLogKind.HARNESS or implicit_session.start_truncated:
+        return False
+    start = implicit_session.start_ts
+    if start is None or boundary_ts is None:
+        return False
+    return (boundary_ts - start).total_seconds() <= _EPOCH_COLLAPSE_SECONDS
 
 
 def _populate_session(session: WorkerSession, *, is_last: bool) -> None:

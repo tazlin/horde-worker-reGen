@@ -60,7 +60,12 @@ horde-log diagnose --last
 
 `sessions` lists every launch with its span, version, end-reason (clean exit, gave-up-and-aborted,
 operator shutdown, or killed/crashed), and peak process-recovery count, so a session that thrashed
-stands out. A clean exit requires the outer `Worker has finished working` marker. The earlier
+stands out. A `horde-benchmark` run writes its own `bridge_harness.log`; its runs are listed after the
+worker sessions as a second list, tagged `[benchmark run: bridge_harness.log]`, and `diagnose` reads each
+like any other session. Worker sessions and benchmark runs are each numbered from #0, so a worker
+session's number does not change when a benchmark log is present. `--session N` and `--last` select
+worker sessions; `--benchmark N` and `--last-benchmark` select benchmark runs. A benchmark that ran
+beside a live worker stays its own session. A clean exit requires the outer `Worker has finished working` marker. The earlier
 `Shutting down process manager` line records child teardown only and is deliberately not sufficient: a
 gathered background request can still hold the main process open. `diagnose` then runs detectors over a
 session and prints ranked findings: it recognizes an

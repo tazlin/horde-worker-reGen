@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from horde_worker_regen.analysis import bundle as bundle_module
-from horde_worker_regen.analysis.bundle import LogBundle
+from horde_worker_regen.analysis.bundle import LogBundle, OrchestratorLogKind
 from horde_worker_regen.analysis.log_ingest import LogRecord
 from horde_worker_regen.analysis.sessions import segment_sessions
 
@@ -53,6 +53,55 @@ def test_every_child_role_startup_log_is_a_startup_path(tmp_path: Path, role: st
     bundle = LogBundle.from_path(tmp_path)
 
     assert bundle.startup_paths == {1: [startup_log]}
+
+
+class TestHarnessLog:
+    """``bridge_harness.log`` is an orchestrator log of its own kind, never folded into ``bridge.log``'s."""
+
+    def test_harness_log_is_classified_apart_from_the_worker_log(self, tmp_path: Path) -> None:
+        """The harness file and its rotations land in ``harness_paths``; the worker's stay in their own list."""
+        worker_log = tmp_path / "bridge.log"
+        harness_log = tmp_path / "bridge_harness.log"
+        harness_rotation = tmp_path / "bridge_harness.2026-06-24_10-00-00_000001.log.zip"
+        for path in (worker_log, harness_log):
+            path.write_text("", encoding="utf-8")
+        with zipfile.ZipFile(harness_rotation, "w") as handle:
+            handle.writestr("bridge_harness.2026-06-24_10-00-00_000001.log", "")
+
+        bundle = LogBundle.from_path(tmp_path)
+
+        assert bundle.orchestrator_paths == [worker_log]
+        assert sorted(bundle.harness_paths) == sorted([harness_log, harness_rotation])
+        assert bundle.active_harness_paths() == [harness_log]
+        assert bundle.active_paths_of_kind(OrchestratorLogKind.HARNESS) == [harness_log]
+        assert bundle.active_paths_of_kind(OrchestratorLogKind.WORKER) == [worker_log]
+        assert bundle.process_ids() == set(), "the harness file must not be read as a child slot's log"
+
+    def test_harness_records_are_not_orchestrator_records(self, tmp_path: Path) -> None:
+        """Each kind parses only its own file, so overlapping runs never share a record stream."""
+        (tmp_path / "bridge.log").write_text(_line("10:00:00.000", "worker line") + "\n", encoding="utf-8")
+        (tmp_path / "bridge_harness.log").write_text(_line("10:00:01.000", "harness line") + "\n", encoding="utf-8")
+
+        bundle = LogBundle.from_path(tmp_path)
+
+        assert [record.message for record in bundle.orchestrator_records()] == ["worker line"]
+        assert [record.message for record in bundle.harness_records()] == ["harness line"]
+        assert [record.message for record in bundle.active_harness_records()] == ["harness line"]
+
+    def test_a_single_harness_file_target_is_a_harness_bundle(self, tmp_path: Path) -> None:
+        """Naming the harness log alone reads it as the harness's orchestrator log."""
+        harness_log = tmp_path / "bridge_harness.log"
+        harness_log.write_text("", encoding="utf-8")
+
+        bundle = LogBundle.from_path(harness_log)
+
+        assert bundle.harness_paths == [harness_log]
+        assert bundle.orchestrator_paths == []
+
+    def test_a_harness_rotation_zip_is_read_in_place(self, tmp_path: Path) -> None:
+        """A zipped harness rotation is one log to read, not an operator bundle to extract."""
+        rotation = tmp_path / "bridge_harness.2026-06-24_10-00-00_000001.log.zip"
+        assert bundle_module._looks_like_rotation(rotation)
 
 
 _STARTUP_LINE = (

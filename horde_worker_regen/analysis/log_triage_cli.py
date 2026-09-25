@@ -22,7 +22,7 @@ from .bundle import LogBundle
 from .correlate import build_session_context, build_timeline
 from .diagnose import diagnose, select_sessions
 from .job_lifecycle import job_lifecycle_for
-from .sessions import WorkerSession, segment_sessions
+from .sessions import WorkerSession, segment_bundle_sessions
 from .support_bundle import build_support_bundle
 from .triage_report import (
     finding_to_dict,
@@ -40,16 +40,27 @@ _DEFAULT_PATH = Path("logs")
 
 
 def _load_sessions(path: Path) -> tuple[LogBundle, list[WorkerSession]]:
-    """Build the bundle for ``path`` and segment its orchestrator log into sessions."""
+    """Build the bundle for ``path`` and segment its orchestrator logs (worker and benchmark) into sessions."""
     bundle = LogBundle.from_path(path)
-    sessions = segment_sessions(bundle.orchestrator_records())
+    sessions = segment_bundle_sessions(bundle)
     return bundle, sessions
 
 
+def _select(sessions: list[WorkerSession], args: argparse.Namespace) -> list[WorkerSession]:
+    """Apply the worker (``--last``, ``--session``) and benchmark (``--last-benchmark``, ``--benchmark``) selectors."""
+    return select_sessions(
+        sessions,
+        last=args.last,
+        session_index=args.session,
+        last_benchmark=args.last_benchmark,
+        benchmark_index=args.benchmark,
+    )
+
+
 def _run_sessions(args: argparse.Namespace) -> int:
-    """List the worker sessions in a log path with their end-reason and peak recoveries."""
+    """List the worker sessions and benchmark runs in a log path with their end-reason and peak recoveries."""
     bundle, sessions = _load_sessions(args.path)
-    selected = select_sessions(sessions, last=args.last, session_index=args.session)
+    selected = _select(sessions, args)
     if args.json:
         print(json.dumps([session_to_dict(s) for s in selected], indent=2))
     else:
@@ -59,7 +70,13 @@ def _run_sessions(args: argparse.Namespace) -> int:
 
 def _run_diagnose(args: argparse.Namespace) -> int:
     """Run all detectors over the selected session(s) and print ranked findings with remediation."""
-    results = diagnose(args.path, last=args.last, session_index=args.session)
+    results = diagnose(
+        args.path,
+        last=args.last,
+        session_index=args.session,
+        last_benchmark=args.last_benchmark,
+        benchmark_index=args.benchmark,
+    )
     if not results:
         print("No matching sessions.")
         return 1
@@ -77,7 +94,7 @@ def _run_diagnose(args: argparse.Namespace) -> int:
 def _run_timeline(args: argparse.Namespace) -> int:
     """Print the merged parent/child/ledger event stream for the selected session(s)."""
     bundle, sessions = _load_sessions(args.path)
-    selected = select_sessions(sessions, last=args.last, session_index=args.session)
+    selected = _select(sessions, args)
     if not selected:
         print("No matching sessions.")
         return 1
@@ -107,7 +124,7 @@ def _run_jobs(args: argparse.Namespace) -> int:
     Neither has a shape that a whole-session table fits into without a mutually exclusive argument set.
     """
     bundle, sessions = _load_sessions(args.path)
-    selected = select_sessions(sessions, last=args.last, session_index=args.session)
+    selected = _select(sessions, args)
     if not selected:
         print("No matching sessions.")
         return 1
@@ -161,6 +178,8 @@ def _run_bundle(args: argparse.Namespace) -> int:
         out,
         last=args.last,
         session_index=args.session,
+        last_benchmark=args.last_benchmark,
+        benchmark_index=args.benchmark,
         full_logs=args.full_logs,
         cache_inventory=args.cache_inventory,
         probe_gpu=args.probe_gpu,
@@ -204,9 +223,20 @@ def _add_common_source_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="A logs directory, a single log file, or a .zip of logs (default: logs/).",
     )
-    parser.add_argument("--last", action="store_true", help="Only the most recent session.")
-    parser.add_argument("--session", type=int, default=None, metavar="N", help="Only session #N.")
+    _add_session_selector_args(parser, verb="Only")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text.")
+
+
+def _add_session_selector_args(parser: argparse.ArgumentParser, *, verb: str) -> None:
+    """Add the worker-session and benchmark-run selectors; each kind is numbered from #0 on its own."""
+    parser.add_argument("--last", action="store_true", help=f"{verb} the most recent worker session.")
+    parser.add_argument("--session", type=int, default=None, metavar="N", help=f"{verb} worker session #N.")
+    parser.add_argument(
+        "--last-benchmark",
+        action="store_true",
+        help=f"{verb} the most recent benchmark run (from bridge_harness.log).",
+    )
+    parser.add_argument("--benchmark", type=int, default=None, metavar="N", help=f"{verb} benchmark run #N.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,7 +247,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    sessions_parser = subparsers.add_parser("sessions", help="List worker sessions and how each ended.")
+    sessions_parser = subparsers.add_parser(
+        "sessions",
+        help="List worker sessions, then benchmark runs, and how each ended.",
+    )
     _add_common_source_args(sessions_parser)
     sessions_parser.set_defaults(func=_run_sessions)
 
@@ -281,8 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output .zip path (default: horde_support_<ts>.zip).",
     )
-    bundle_parser.add_argument("--last", action="store_true", help="Diagnose only the most recent session.")
-    bundle_parser.add_argument("--session", type=int, default=None, metavar="N", help="Diagnose only session #N.")
+    _add_session_selector_args(bundle_parser, verb="Diagnose only")
     bundle_parser.add_argument(
         "--full-logs",
         action="store_true",

@@ -15,8 +15,10 @@ import pytest
 from rich.text import Text
 from textual.widgets import Collapsible, Select, Static, TabbedContent
 
+from horde_worker_regen.analysis.bundle import OrchestratorLogKind
 from horde_worker_regen.analysis.detectors import Finding, FindingKind, Severity
 from horde_worker_regen.analysis.diagnose import SessionDiagnosisView, SessionSummary
+from horde_worker_regen.analysis.triage_report import BENCHMARK_RUN_TAG
 from horde_worker_regen.app_state import AppStateStore
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.tui.app import HordeWorkerTUI
@@ -27,7 +29,12 @@ from tests.tui._fake_supervisor import FakeSupervisor
 pytestmark = pytest.mark.slow
 
 
-def _diagnosis(index: int, *findings: Finding, version: str = "12.29.0") -> SessionDiagnosisView:
+def _diagnosis(
+    index: int,
+    *findings: Finding,
+    version: str = "12.29.0",
+    log_kind: OrchestratorLogKind = OrchestratorLogKind.WORKER,
+) -> SessionDiagnosisView:
     """A lightweight session-diagnosis view (what the off-process pass returns) with the given findings."""
     session = SessionSummary(
         index=index,
@@ -36,6 +43,7 @@ def _diagnosis(index: int, *findings: Finding, version: str = "12.29.0") -> Sess
         num_models=None,
         max_threads=None,
         peak_process_recoveries=0,
+        log_kind=log_kind,
     )
     return SessionDiagnosisView(session=session, findings=list(findings))
 
@@ -133,7 +141,7 @@ async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pyt
         assert view._diagnoses == results
         select = view.query_one("#diag-session", Select)
         assert select.disabled is False
-        assert select.value == 1
+        assert select.value == (OrchestratorLogKind.WORKER, 1)
 
         # Each finding is a card: badge and title, headline and "Do this" visible, details collapsed. The
         # cards mount through a worker, so wait until they have composed their children.
@@ -148,10 +156,86 @@ async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pyt
         assert "Evidence" in _text(details.query_one(".finding-detail", Static))
 
         # Choosing the earlier session in the selector re-renders from the cache (no re-parse) without error.
-        select.value = 0
+        select.value = (OrchestratorLogKind.WORKER, 0)
         cards = await _wait_for_cards(pilot, view, count=1)
         assert "Session #0" in _text(view.query_one("#diag-status", Static))
         assert [card.finding.id for card in cards] == ["oom"]
+
+
+async def test_a_benchmark_run_is_tagged_in_the_selector_and_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session read from the harness log carries the same tag the text reports print; a worker session does not."""
+    results = [
+        _diagnosis(
+            0,
+            _finding(FindingKind.OOM, Severity.CRITICAL),
+            _finding(FindingKind.FORCED_MAINTENANCE, Severity.CRITICAL),
+        ),
+        _diagnosis(0, _finding(FindingKind.OOM, Severity.CRITICAL), log_kind=OrchestratorLogKind.HARNESS),
+    ]
+    monkeypatch.setattr("horde_worker_regen.analysis.diagnose.diagnose_views_for", lambda *a: results)
+
+    app = _make_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        view = _activate_diagnostics(app)
+        status = await _run_and_wait(pilot, view)
+
+        # The latest worker session is the default and keeps the "latest" wording; a benchmark run never does.
+        assert BENCHMARK_RUN_TAG not in status
+        assert view._session_label(results[0], is_latest=True).startswith("latest  ")
+        assert view._session_label(results[1], is_latest=True).startswith(f"#0  {BENCHMARK_RUN_TAG}")
+        assert BENCHMARK_RUN_TAG not in view._session_label(results[0], is_latest=False)
+
+        view.query_one("#diag-session", Select).value = (OrchestratorLogKind.HARNESS, 0)
+        await _wait_for_cards(pilot, view, count=1)
+        assert f"Session #0  {BENCHMARK_RUN_TAG}" in _text(view.query_one("#diag-status", Static))
+
+
+async def test_worker_and_benchmark_sessions_of_one_number_render_their_own_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Worker #0 and benchmark #0 coexist: the selector lists workers then benchmark runs, each keyed by its kind."""
+    worker_first = _diagnosis(0, _finding(FindingKind.OOM, Severity.CRITICAL))
+    worker_latest = _diagnosis(
+        1,
+        _finding(FindingKind.SESSION_SUMMARY, Severity.INFO),
+        _finding(FindingKind.OOM, Severity.CRITICAL),
+    )
+    benchmark_run = _diagnosis(
+        0,
+        _finding(FindingKind.FORCED_MAINTENANCE, Severity.CRITICAL),
+        _finding(FindingKind.SESSION_SUMMARY, Severity.INFO),
+        _finding(FindingKind.OOM, Severity.CRITICAL),
+        log_kind=OrchestratorLogKind.HARNESS,
+    )
+    results = [worker_first, worker_latest, benchmark_run]
+    monkeypatch.setattr("horde_worker_regen.analysis.diagnose.diagnose_views_for", lambda *a: results)
+
+    app = _make_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        view = _activate_diagnostics(app)
+        await _run_and_wait(pilot, view)
+        select = view.query_one("#diag-session", Select)
+
+        option_values = [value for _, value in select._options if isinstance(value, tuple)]
+        assert option_values == [
+            (OrchestratorLogKind.WORKER, 0),
+            (OrchestratorLogKind.WORKER, 1),
+            (OrchestratorLogKind.HARNESS, 0),
+        ]
+        assert select.value == (OrchestratorLogKind.WORKER, 1)
+        await _wait_for_cards(pilot, view, count=2)
+
+        select.value = (OrchestratorLogKind.WORKER, 0)
+        cards = await _wait_for_cards(pilot, view, count=1)
+        assert [card.finding.id for card in cards] == ["oom"]
+        assert BENCHMARK_RUN_TAG not in _text(view.query_one("#diag-status", Static))
+
+        select.value = (OrchestratorLogKind.HARNESS, 0)
+        cards = await _wait_for_cards(pilot, view, count=3)
+        assert [card.finding.id for card in cards] == ["forced_maintenance", "session_summary", "oom"]
+        assert f"Session #0  {BENCHMARK_RUN_TAG}" in _text(view.query_one("#diag-status", Static))
 
 
 async def test_diagnostics_tab_empty_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

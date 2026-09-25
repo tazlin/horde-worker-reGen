@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
-from .bundle import RotationStitch
+from .bundle import OrchestratorLogKind, RotationStitch
 from .correlate import TimelineEntry
 from .detectors import Finding
 from .job_lifecycle import JobLifecycleModel, JobRecord
@@ -59,10 +60,41 @@ def _start_bound_note(session: WorkerSession) -> str:
     )
 
 
+BENCHMARK_RUN_TAG = "[benchmark run: bridge_harness.log]"
+"""Marks a session read from ``bridge_harness.log``; the text reports and the dashboard's diagnostics tab
+both print it, so the two name a benchmark run the same way."""
+
+
+class SessionIdentity(Protocol):
+    """Represents what names a session: its number within its kind and the log it was read from."""
+
+    @property
+    def index(self) -> int:
+        """The session's number within its ``log_kind``."""
+        ...
+
+    @property
+    def log_kind(self) -> OrchestratorLogKind:
+        """The orchestrator log the session was read from."""
+        ...
+
+
+def session_label(session: SessionIdentity) -> str:
+    """Return ``#N``, followed by the benchmark-run tag when the session came from the harness log.
+
+    Every surface that names a session (the text reports, ``diagnose.json`` in a support bundle, the
+    dashboard's diagnostics tab) prints this label, so the same session reads the same everywhere.
+    """
+    if session.log_kind is OrchestratorLogKind.HARNESS:
+        return f"#{session.index}  {BENCHMARK_RUN_TAG}"
+    return f"#{session.index}"
+
+
 def session_to_dict(session: WorkerSession) -> dict[str, object]:
     """A JSON-serializable summary of one session."""
     return {
         "index": session.index,
+        "log_kind": str(session.log_kind),
         "start": session.start_ts.isoformat() if session.start_ts else None,
         "start_is_lower_bound": session.start_is_lower_bound,
         "start_truncated": session.start_truncated,
@@ -82,22 +114,42 @@ def render_sessions(sessions: list[WorkerSession], *, root: Path, stitch: Rotati
     """A compact per-session listing: span, version, end-reason, and peak recoveries.
 
     ``stitch`` names the rotated predecessors folded into the parse, so a span that covers more than the
-    targeted file says which archives it came from.
+    targeted file says which archives it came from. Benchmark runs follow the worker sessions as a list
+    of their own, numbered from #0 and tagged, so a worker session's number never depends on whether a
+    benchmark ran beside it.
     """
     if not sessions:
         return f"No worker sessions found in {root}."
 
-    lines = [f"{len(sessions)} worker session(s) in {root}"]
+    worker_sessions = [session for session in sessions if not session.is_benchmark_run]
+    benchmark_runs = [session for session in sessions if session.is_benchmark_run]
+    if worker_sessions:
+        lines = [f"{len(worker_sessions)} worker session(s) in {root}"]
+    else:
+        lines = [f"No worker sessions found in {root}."]
     if stitch is not None:
         lines.append(f"Rotation: {stitch.describe()}")
     lines.append("")
+    lines.extend(_session_listing_lines(worker_sessions))
+    if benchmark_runs:
+        if worker_sessions:
+            lines.append("")
+        lines.append(f"{len(benchmark_runs)} benchmark run(s) in {root}")
+        lines.append("")
+        lines.extend(_session_listing_lines(benchmark_runs))
+    return "\n".join(lines)
+
+
+def _session_listing_lines(sessions: list[WorkerSession]) -> list[str]:
+    """The listing lines for one kind of session, in the order given."""
+    lines: list[str] = []
     for session in sessions:
         span, duration = _fmt_session_span(session)
         version = session.version or "?"
         recoveries = session.peak_process_recoveries
         flag = "  <-- recovery storm" if recoveries >= 5 else ""
         lines.append(
-            f"#{session.index}  {span}  ({duration})  v{version}  "
+            f"{session_label(session)}  {span}  ({duration})  v{version}  "
             f"{session.end_reason}  recoveries: {recoveries}{flag}",
         )
         models = session.num_models if session.num_models is not None else "?"
@@ -106,7 +158,7 @@ def render_sessions(sessions: list[WorkerSession], *, root: Path, stitch: Rotati
         note = _start_bound_note(session)
         if note:
             lines.append(note)
-    return "\n".join(lines)
+    return lines
 
 
 _SOURCE_TAG = {
@@ -166,7 +218,7 @@ def render_findings(session: WorkerSession, findings: list[Finding]) -> str:
     (the mechanism, the evidence, the cross-references) follows for whoever reads on.
     """
     span, duration = _fmt_session_span(session)
-    header = f"=== Session #{session.index}  {span}  ({duration})  {session.end_reason} ==="
+    header = f"=== Session {session_label(session)}  {span}  ({duration})  {session.end_reason} ==="
     note = _start_bound_note(session)
     if note:
         header = f"{header}\n{note.strip()}"
@@ -282,7 +334,7 @@ def render_job_lifecycle(session: WorkerSession, model: JobLifecycleModel, *, li
     scheduling problem, in ``generate`` a GPU/config one, and in ``->submit`` a pipeline-balance one.
     """
     span, duration = _fmt_session_span(session)
-    lines = [f"=== Session #{session.index}  {span}  ({duration})  {session.end_reason} ==="]
+    lines = [f"=== Session {session_label(session)}  {span}  ({duration})  {session.end_reason} ==="]
     if not model.jobs:
         return "\n".join([*lines, "  (no job lifecycle lines in this session)"])
 

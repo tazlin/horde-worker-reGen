@@ -28,16 +28,17 @@ from .bundle import ROTATION_ABUT_SECONDS, LogBundle
 from .cache_inventory import collect_cache_inventory
 from .correlate import build_session_context
 from .detectors import run_detectors
+from .diagnose import select_sessions
 from .log_ingest import _read_physical_lines, read_time_range
 from .redaction import Redactor, build_redactor
-from .sessions import WorkerSession, segment_sessions
+from .sessions import segment_bundle_sessions
 from .system_info import (
     collect_system_info,
     config_secret_values,
     config_worker_name,
     resolve_cache_home,
 )
-from .triage_report import finding_to_dict, render_findings, render_sessions
+from .triage_report import finding_to_dict, render_findings, render_sessions, session_label
 
 _DEFAULT_CONFIG_PATH = Path("bridgeData.yaml")
 # Per-file cap: keep the tail (the most recent, most relevant lines) of any oversized artifact so one
@@ -72,15 +73,6 @@ class BundleResult:
     redaction_count: int
     session_count: int
     size_bytes: int
-
-
-def _select_sessions(sessions: list[WorkerSession], *, last: bool, index: int | None) -> list[WorkerSession]:
-    """Apply last/index selection (default: all sessions)."""
-    if index is not None:
-        return [s for s in sessions if s.index == index]
-    if last and sessions:
-        return sessions[-1:]
-    return sessions
 
 
 def _is_rotation(file_path: Path) -> bool:
@@ -279,6 +271,8 @@ def build_support_bundle(
     *,
     last: bool = False,
     session_index: int | None = None,
+    last_benchmark: bool = False,
+    benchmark_index: int | None = None,
     full_logs: bool = False,
     cache_inventory: bool = True,
     probe_gpu: bool = False,
@@ -290,8 +284,11 @@ def build_support_bundle(
     Args:
         path: A logs directory (usual) or a single log file.
         out: Destination ``.zip`` path.
-        last: Restrict the diagnosis to the most recent session.
-        session_index: Restrict the diagnosis to a specific session index (default: all sessions).
+        last: Restrict the diagnosis to the most recent worker session.
+        session_index: Restrict the diagnosis to worker session #N (default: all sessions).
+        last_benchmark: Restrict the diagnosis to the most recent benchmark run.
+        benchmark_index: Restrict the diagnosis to benchmark run #N. Worker and benchmark selectors
+            combine; ``diagnose.txt`` and ``sessions.txt`` list worker sessions before benchmark runs.
         full_logs: Include rotation archives and lift the per-file tail cap (a much larger bundle).
         cache_inventory: Include the on-disk model listing.
         probe_gpu: Run the out-of-process GPU probe for the system-info block.
@@ -304,15 +301,23 @@ def build_support_bundle(
     # whole rotation history parsed the first time a detector joined child records to the session, even
     # though those archives are not shipped. --full-logs opts into the complete history on both counts.
     log_bundle = LogBundle.from_path(path, active_only=not full_logs)
-    sessions = segment_sessions(log_bundle.orchestrator_records())
-    selected = _select_sessions(sessions, last=last, index=session_index)
+    sessions = segment_bundle_sessions(log_bundle)
+    selected = select_sessions(
+        sessions,
+        last=last,
+        session_index=session_index,
+        last_benchmark=last_benchmark,
+        benchmark_index=benchmark_index,
+    )
     # A session that begins mid-run in the active log continues back through the rotations the size
     # roll-over cut it from. Ship those (bounded, uncapped) so the run's earlier hours are not lost to
     # the default bundle, and let the stats window reach back to where the shipped evidence starts.
     stitched_rotations: list[Path] = []
-    if not full_logs and any(s.start_is_lower_bound for s in selected):
-        for active_log in log_bundle.active_orchestrator_paths():
-            stitched_rotations.extend(_stitched_predecessors(active_log))
+    bounded_log_kinds = {s.log_kind for s in selected if s.start_is_lower_bound}
+    if not full_logs:
+        for log_kind in sorted(bounded_log_kinds):
+            for active_log in log_bundle.active_paths_of_kind(log_kind):
+                stitched_rotations.extend(_stitched_predecessors(active_log))
     evidence_start = min((s.start_ts for s in sessions if s.start_ts is not None), default=None)
     for rotation in stitched_rotations:
         first, _ = read_time_range(rotation)
@@ -336,7 +341,15 @@ def build_support_bundle(
         # Lead with the analysis the maintainer reads first.
         diagnosis = [(s, run_detectors(build_session_context(s, log_bundle))) for s in selected]
         _write(zf, "diagnose.txt", "\n\n".join(render_findings(s, f) for s, f in diagnosis) or "(no sessions)")
-        diagnose_json = [{"session_index": s.index, "findings": [finding_to_dict(x) for x in f]} for s, f in diagnosis]
+        diagnose_json = [
+            {
+                "session_index": s.index,
+                "log_kind": str(s.log_kind),
+                "session_label": session_label(s),
+                "findings": [finding_to_dict(x) for x in f],
+            }
+            for s, f in diagnosis
+        ]
         _write(zf, "diagnose.json", json.dumps(diagnose_json, indent=2))
         _write(zf, "sessions.txt", render_sessions(sessions, root=log_bundle.root))
 

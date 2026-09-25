@@ -550,7 +550,7 @@ an operator sent you.
 
 | Subcommand | Purpose |
 |------------|---------|
-| `sessions [PATH]` | List each worker launch in the log with its span, version, end-reason, and peak process recoveries. |
+| `sessions [PATH]` | List each worker launch in the log with its span, version, end-reason, and peak process recoveries, then each benchmark run from `bridge_harness.log` as a second list. |
 | `diagnose [PATH]` | Run the detectors and print ranked findings (root cause + remediation) per session. |
 | `timeline [PATH]` | Merged, time-ordered parent + child + ledger event stream for a session. |
 | `jobs [PATH]` | Per-job lifecycle table for a session: which lane and card ran each job, and how its wall clock split across pop->dispatch, generation, and finished->submit. |
@@ -559,7 +559,9 @@ an operator sent you.
 | `bundle [PATH]` | Build a single redacted `.zip` (logs + diagnosis + config + system/cache info) to send a maintainer. |
 
 `PATH` defaults to `logs/`. `sessions`, `diagnose`, `timeline`, and `jobs` take `--session N` or
-`--last` to select a session and `--json` for machine-readable output; `timeline` also takes
+`--last` to select a worker session, `--benchmark N` or `--last-benchmark` to select a benchmark run, and
+`--json` for machine-readable output. Worker sessions and benchmark runs are each numbered from #0, and
+selectors of both kinds combine (worker sessions first); `timeline` also takes
 `--process N`, `--grep RE`, and `--child` (include verbose child-loop records), and `jobs` takes
 `--limit N` (`0` for every row; the summary always covers every job whatever the table shows). Each detector recognizes one incident
 class (an inference pool crashing on start, a recovery storm that never gives up, GPU OOM, the swallowed
@@ -666,7 +668,8 @@ horde-log bundle
 | Flag | Meaning |
 |------|---------|
 | `--out FILE.zip` | Output path (default `horde_support_<timestamp>.zip`). |
-| `--last` / `--session N` | Diagnose only the most recent / a specific session (the logs are still included). |
+| `--last` / `--session N` | Diagnose only the most recent / a specific worker session (the logs are still included). |
+| `--last-benchmark` / `--benchmark N` | Diagnose only the most recent / a specific benchmark run from `bridge_harness.log`. Combines with the worker selectors. |
 | `--full-logs` | Include rotation archives, every retained stats file, and do not tail-cap large artifacts (a much larger bundle). By default only the active logs are bundled and analysed, stats files last written before the earliest bundled session are skipped; oversized plain logs are read from their tail and bundled already-trimmed, and the active `bridge.log` already spans many sessions. When the earliest bundled session begins mid-run (the active `bridge.log` is a size roll-over continuation), up to three of its abutting predecessor rotations are shipped uncapped and the stats window reaches back to where they start, so a long run's earlier hours are not lost. The learned VRAM footprint store (`.horde_worker_regen/vram_footprints.json`) ships as `config/vram_footprints.json`. |
 | `--no-cache-inventory` | Skip the on-disk model listing. |
 | `--probe-gpu` | Run the GPU probe for the system-info block (slower; the logs already record the GPUs). |

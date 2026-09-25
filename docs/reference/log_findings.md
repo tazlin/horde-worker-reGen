@@ -4,6 +4,15 @@ Every finding `horde-log diagnose` can emit, and every one the dashboard's Insig
 running worker, with the id it prints, the severity it carries, what makes it fire, and what to do about it. The id is the stable handle: it is what the JSON output keys on, what
 the dashboard's Diagnostics tab shows, and what a `see also:` line points at.
 
+Findings run over every session `horde-log sessions` lists. That includes each `horde-benchmark` run
+read from `bridge_harness.log`, which is tagged `[benchmark run: bridge_harness.log]` in the text output
+and carries `"log_kind": "harness"` in the JSON. A finding under that tag describes the benchmark, not the
+worker, even when the two ran over the same hours. Worker sessions and benchmark runs are numbered from #0
+within their own kind, so a session is identified by its `log_kind` and index together. In a support
+bundle, each `diagnose.json` entry carries `session_index` (that per-kind number), `log_kind`, and
+`session_label`, the heading the text output prints for the session (`#0`, or
+`#0  [benchmark run: bridge_harness.log]`).
+
 The ids are declared as `FindingKind` members in `horde_worker_regen/analysis/finding_kinds.py`, one
 per entry in the `FINDING_SPECS` table. A contract test (`tests/analysis/test_log_findings_doc.py`)
 walks that table in both directions, so a new kind cannot ship without an entry here and a row cannot
