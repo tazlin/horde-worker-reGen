@@ -4582,17 +4582,16 @@ class ProcessLifecycleManager:
         floor: the kernel reaps the largest process to relieve memory pressure, so the slot vanishes with
         no exception and no fault ``info`` for the ordinary classifier to read. The low-RAM check is what
         distinguishes this from the worker's own hang-kill (also ``-9``) on a healthy host: when RAM is fine
-        a ``-9`` stays an ordinary crash/hang. Reads the configured floor defensively (a partially-mocked or
-        older config falls back to the module defaults) and never raises; any error reads False, leaving
-        the slot on its ordinary crash path.
+        a ``-9`` stays an ordinary crash/hang. Never raises: a floor that does not read as a number, or any
+        error, reads False and leaves the slot on its ordinary crash path.
         """
         raw_exitcode = getattr(process_info.mp_process, "exitcode", None)
         if raw_exitcode != -9:
             return False
         try:
             bridge_data = self._runtime_config.bridge_data
-            pause = getattr(bridge_data, "ram_pressure_pause_percent", 85.0)
-            min_free = getattr(bridge_data, "ram_pressure_min_free_mb", 1024.0)
+            pause = bridge_data.ram_pressure_pause_percent
+            min_free = bridge_data.ram_pressure_min_free_mb
             pause_pct = float(pause) if isinstance(pause, (int, float)) and not isinstance(pause, bool) else 85.0
             min_free_mb = (
                 float(min_free) if isinstance(min_free, (int, float)) and not isinstance(min_free, bool) else 1024.0

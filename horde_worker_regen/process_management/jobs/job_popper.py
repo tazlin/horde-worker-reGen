@@ -950,17 +950,14 @@ class JobPopper:
         """Return the effective (switch_min_seconds, reentry_cooldown_seconds), resolving the -1 inherit.
 
         A negative re-entry value inherits ``whole_card_residency_cooldown_seconds`` (the lease it complements);
-        a non-numeric config (a partial mock) reads as disabled, so the limiter never crashes the pop cycle.
+        a non-numeric value reads as disabled, so the limiter never crashes the pop cycle.
         """
-        switch_min = self._coerce_seconds(getattr(bridge_data, "large_model_switch_min_seconds", 0), default=0.0)
-        reentry_raw = getattr(bridge_data, "large_model_reentry_cooldown_seconds", -1)
+        switch_min = self._coerce_seconds(bridge_data.large_model_switch_min_seconds, default=0.0)
+        reentry_raw = bridge_data.large_model_reentry_cooldown_seconds
         if isinstance(reentry_raw, bool) or not isinstance(reentry_raw, (int, float)):
             reentry = 0.0
         elif reentry_raw < 0:
-            reentry = self._coerce_seconds(
-                getattr(bridge_data, "whole_card_residency_cooldown_seconds", 0),
-                default=0.0,
-            )
+            reentry = self._coerce_seconds(bridge_data.whole_card_residency_cooldown_seconds, default=0.0)
         else:
             reentry = float(reentry_raw)
         return switch_min, reentry

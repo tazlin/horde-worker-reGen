@@ -688,7 +688,7 @@ def co_tenant_ram_reserve_bytes(bridge_data: reGenBridgeData) -> int:
     reserve = 0
     served = enabled_workloads(bridge_data)
     if WorkloadKind.ALCHEMY in served:
-        alchemy_headroom_mb = config_number(getattr(bridge_data, "alchemy_ram_headroom_mb", None)) or 0.0
+        alchemy_headroom_mb = config_number(bridge_data.alchemy_ram_headroom_mb) or 0.0
         reserve += max(_ALCHEMIST_CO_TENANT_RAM_BYTES, int(alchemy_headroom_mb * 1024 * 1024))
     if WorkloadKind.TEXT_GENERATION in served:
         reserve += _SCRIBE_CO_TENANT_RAM_BYTES
@@ -990,12 +990,12 @@ A re-trip inside this period doubles the cooldown (a condition the first pause d
 longer one); a worker that goes this long without tripping has demonstrated the condition passed, so the
 next trip starts from the base cooldown rather than inheriting an old escalation."""
 
-BUDGET_DEPENDENT_FLAGS: tuple[str, ...] = (
-    "whole_card_exclusive_residency",
-    "whole_card_residency_safety_off_gpu",
-    "overbudget_exclusive_mode",
+BUDGET_DEPENDENT_FLAGS: tuple[tuple[str, Callable[[reGenBridgeData], bool]], ...] = (
+    ("whole_card_exclusive_residency", lambda bridge_data: bridge_data.whole_card_exclusive_residency),
+    ("whole_card_residency_safety_off_gpu", lambda bridge_data: bridge_data.whole_card_residency_safety_off_gpu),
+    ("overbudget_exclusive_mode", lambda bridge_data: bridge_data.overbudget_exclusive_mode),
 )
-"""Config flags whose behaviour exists only while the measured VRAM/RAM budget is active.
+"""Config flags whose behaviour exists only while the measured VRAM/RAM budget is active, each with its reader.
 
 Each governs a placement decision the budget's arithmetic drives, so with ``enable_vram_budget`` false none of
 them is ever consulted. Listed here so the startup disclosure can name the ones an operator explicitly turned
@@ -3054,8 +3054,8 @@ class HordeWorkerProcessManager:
         """
         inert = [
             name
-            for name in BUDGET_DEPENDENT_FLAGS
-            if getattr(self.bridge_data, name, None) is True and self._is_config_field_explicit(name)
+            for name, read in BUDGET_DEPENDENT_FLAGS
+            if read(self.bridge_data) is True and self._is_config_field_explicit(name)
         ]
         if not inert:
             return
@@ -3067,10 +3067,9 @@ class HordeWorkerProcessManager:
     def _is_config_field_explicit(self, field_name: str) -> bool:
         """Whether the operator set this config field themselves rather than inheriting its default.
 
-        Read tolerantly: a partially-mocked config (used in tests) exposes no real ``model_fields_set``, and an
-        unreadable set means nothing can be shown to be explicit, so nothing is disclosed.
+        An unreadable set means nothing can be shown to be explicit, so nothing is disclosed.
         """
-        fields_set = getattr(self.bridge_data, "model_fields_set", None)
+        fields_set = self.bridge_data.model_fields_set
         if not isinstance(fields_set, (set, frozenset)):
             return False
         return field_name in fields_set
@@ -7633,7 +7632,7 @@ class HordeWorkerProcessManager:
             ),
         )
 
-        stickiness = getattr(bridge_data, "horde_model_stickiness", 0)
+        stickiness = bridge_data.horde_model_stickiness
         loaded_count = sum(1 for p in self._process_map.values() if p.loaded_horde_model_name is not None)
         stickiness_active = bool(
             isinstance(stickiness, (int, float))

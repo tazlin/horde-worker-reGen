@@ -134,8 +134,4 @@ def _known_good_from_bridge_data(bridge_data: reGenBridgeData, worker_version: s
 
 def _relevant_config_snapshot(bridge_data: reGenBridgeData) -> dict[str, object]:
     """Return the subset of bridgeData fields that define a configuration's performance profile."""
-    snapshot: dict[str, object] = {}
-    for field_name in _KNOWN_GOOD_CONFIG_FIELDS:
-        if hasattr(bridge_data, field_name):
-            snapshot[field_name] = getattr(bridge_data, field_name)
-    return snapshot
+    return bridge_data.model_dump(include=set(_KNOWN_GOOD_CONFIG_FIELDS))
