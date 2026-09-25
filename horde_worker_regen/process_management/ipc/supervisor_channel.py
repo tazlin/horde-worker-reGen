@@ -16,7 +16,7 @@ from __future__ import annotations
 import enum
 import threading
 import time
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 30
+SUPERVISOR_PROTOCOL_VERSION = 31
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -132,6 +132,13 @@ most recent process recovery happened and which lane it replaced. ``num_process_
 only ever rises, so a frontend reading it alone cannot tell a lane cycling now from one replaced once at
 startup, and reports the latter for the rest of the run. The bounded ``recent_events`` ring cannot answer
 this either: it evicts a startup recovery within the first minutes of ordinary work.
+v31 adds ``pop_gate`` and ``pop_gate_since``, the gate holding the image popper and when it engaged, and
+``seconds_since_last_pop_per_workload``. Without the gate a worker whose image intake is held reads as
+healthy for as long as another flow keeps working, and the whole-worker ``seconds_since_last_pop`` is the
+youngest flow's figure, so a text pop hides an image intake that has been silent for hours. v31 also adds
+``pop_liveness`` (:class:`PopLivenessSnapshot`), the pop-liveness sentinel's verdict on the image intake with
+the line it logs, so the dashboard's pop-intake check shows the worker's own judgement and holds no bounds or
+exemptions of its own.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -1285,6 +1292,22 @@ class PopGovernorsSnapshot(BaseModel):
     """Whether any governor is currently engaged (a quick "is the worker being held back" flag)."""
 
 
+class PopLivenessSnapshot(BaseModel):
+    """The pop-liveness sentinel's verdict on the image intake; the defaults mean no concern.
+
+    The worker judges the silence since its last pop attempt reached the horde against its own bounds and
+    exemptions, logs from this verdict, and publishes the same value here, so a frontend renders it and never
+    re-derives it.
+    """
+
+    level: Literal["warn", "error"] | None = None
+    """``warn`` past the sentinel's warn bound, ``error`` past its error bound, None while there is no concern."""
+    silent_seconds: float | None = None
+    """Seconds since a pop attempt last concluded against the horde; None while there is no concern."""
+    detail: str | None = None
+    """The line the sentinel logs for this verdict; None while there is no concern."""
+
+
 class RamGovernanceSnapshot(BaseModel):
     """The RAM governor's current posture as operator-visible state.
 
@@ -1618,6 +1641,20 @@ class WorkerStateSnapshot(BaseModel):
     """How many jobs have failed back-to-back (resets on a success)."""
     seconds_since_last_pop: float | None = None
     """Seconds since the worker last successfully popped a job (None if it never has)."""
+    seconds_since_last_pop_per_workload: dict[WorkloadKind, float] = Field(default_factory=dict)
+    """Seconds since each flow's own most recent pop; a flow that has not popped this session is absent.
+
+    :attr:`seconds_since_last_pop` is the youngest of these, which is the right headline for a single-role
+    worker and the wrong one for a worker serving several flows: each flow asks the horde for its own work,
+    so one flow popping says nothing about another's intake."""
+    pop_gate: str | None = None
+    """The ``PopGate`` name that ended the image popper's last cycle, or None when that cycle reached the horde."""
+    pop_gate_since: float | None = None
+    """Worker wall clock when :attr:`pop_gate` engaged; None while no gate holds.
+
+    On the same clock as :attr:`timestamp`, so a reader takes the hold's age by subtracting the two."""
+    pop_liveness: PopLivenessSnapshot = Field(default_factory=PopLivenessSnapshot)
+    """The pop-liveness sentinel's verdict on the image intake, which the dashboard's pop-intake check renders."""
     last_pop_no_jobs_available: bool = False
     """The most recent successful pop returned no job (a short-term 'no work right now' signal)."""
     last_pop_skipped_reasons: dict[str, int] = Field(default_factory=dict)

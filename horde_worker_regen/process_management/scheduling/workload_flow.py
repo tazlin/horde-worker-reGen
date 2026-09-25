@@ -136,8 +136,8 @@ class FlowCoordinator(Protocol):
     and tracker, so both flows are launched and observed uniformly through the process manager's registry.
     A flow may keep dispatch elsewhere (image generation's is interwoven with the VRAM budget in the
     control loop) or have no dispatch at all (text generation's generations run in a separate program
-    reached over HTTP); the protocol covers the flow's identity, live work count, and lifecycle entry
-    point.
+    reached over HTTP); the protocol covers the flow's identity, live work count, last pop time and
+    lifecycle entry point.
     """
 
     @property
@@ -148,6 +148,11 @@ class FlowCoordinator(Protocol):
     @property
     def num_in_flight(self) -> int:
         """Units of work currently popped, dispatched, or awaiting submission for this flow."""
+        ...
+
+    @property
+    def last_pop_time(self) -> float:
+        """When this flow last asked the horde for work, or 0.0 before it has asked at all."""
         ...
 
     async def run(self) -> None:

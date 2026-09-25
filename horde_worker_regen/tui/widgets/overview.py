@@ -15,6 +15,7 @@ from textual.containers import Container, Vertical, VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.app_state import OverviewTrendWindow, OverviewViewMode
+from horde_worker_regen.process_management.config.worker_state import PopGate
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_JOBS_IN_SNAPSHOT,
     CardSnapshot,
@@ -777,11 +778,7 @@ class OverviewView(Vertical):
                 ),
             )
             age = time.time() - snapshot.timestamp if snapshot.timestamp else None
-            last_pop = (
-                f"{human_duration(snapshot.seconds_since_last_pop)} ago"
-                if snapshot.seconds_since_last_pop is not None
-                else "never"
-            )
+            last_pop = self._furthest_behind_last_pop(snapshot)
             body.append(
                 Text.assemble(
                     ("Last pop ", "grey50"),
@@ -860,17 +857,13 @@ class OverviewView(Vertical):
         active alchemy is visible alongside image work rather than buried in a side panel.
         """
         age = time.time() - snapshot.timestamp if snapshot.timestamp else None
-        since_pop = (
-            human_duration(snapshot.seconds_since_last_pop) + " ago"
-            if snapshot.seconds_since_last_pop is not None
-            else "never"
-        )
+        since_pop = cls._last_pop_segments(snapshot)
         if cls._is_alchemist_only(snapshot):
             return Text.assemble(
                 ("updated ", "grey50"),
                 (f"{human_duration(age)} ago", "grey70"),
                 ("  ·  last pop ", "grey50"),
-                (since_pop, "grey70"),
+                *since_pop,
                 ("  ·  forms in flight ", "grey50"),
                 (str(snapshot.alchemy_forms_in_flight), "grey70"),
                 ("  ·  pending ", "grey50"),
@@ -880,7 +873,7 @@ class OverviewView(Vertical):
             ("updated ", "grey50"),
             (f"{human_duration(age)} ago", "grey70"),
             ("  ·  last pop ", "grey50"),
-            (since_pop, "grey70"),
+            *since_pop,
             ("  ·  in progress ", "grey50"),
             (str(snapshot.jobs_in_progress), "grey70"),
             ("  ·  queued ", "grey50"),
@@ -891,6 +884,50 @@ class OverviewView(Vertical):
             line.append("  ·  alchemy ", style="grey50")
             line.append(str(alchemy_live), style="grey70")
         return line
+
+    @staticmethod
+    def _since_text(seconds: float | None) -> str:
+        """Return an age as ``4s ago``, or ``never`` when there is none."""
+        return f"{human_duration(seconds)} ago" if seconds is not None else "never"
+
+    @staticmethod
+    def _flow_name(flow: WorkloadKind) -> str:
+        """Return a flow's short name for the last-pop figures (``image``, ``alchemy``, ``text``)."""
+        return flow.value.split("_")[0]
+
+    @classmethod
+    def _last_pop_per_flow(cls, snapshot: WorkerStateSnapshot) -> list[tuple[WorkloadKind, float | None]]:
+        """Return each served flow with the seconds since its own last pop, None for a flow that has not popped.
+
+        The whole-worker figure is the youngest flow's, so on a worker serving several flows a text pop a
+        second ago would hide an image intake that has been silent for an hour.
+        """
+        served = cls._enabled_workloads(snapshot)
+        ages = snapshot.seconds_since_last_pop_per_workload
+        return [(flow, ages.get(flow)) for flow in WorkloadKind if flow in served]
+
+    @classmethod
+    def _last_pop_segments(cls, snapshot: WorkerStateSnapshot) -> list[tuple[str, str]]:
+        """Return the styled last-pop figure: one age for a single-role worker, one per flow otherwise."""
+        flows = cls._last_pop_per_flow(snapshot)
+        if len(flows) <= 1:
+            return [(cls._since_text(snapshot.seconds_since_last_pop), "grey70")]
+        segments: list[tuple[str, str]] = []
+        for index, (flow, seconds) in enumerate(flows):
+            if index:
+                segments.append((" · ", "grey37"))
+            segments.append((f"{cls._flow_name(flow)} ", "grey50"))
+            segments.append((cls._since_text(seconds), "grey70"))
+        return segments
+
+    @classmethod
+    def _furthest_behind_last_pop(cls, snapshot: WorkerStateSnapshot) -> str:
+        """Return the last-pop figure for a row with room for one: the flow furthest behind, by name."""
+        flows = cls._last_pop_per_flow(snapshot)
+        if len(flows) <= 1:
+            return cls._since_text(snapshot.seconds_since_last_pop)
+        flow, seconds = max(flows, key=lambda pair: float("inf") if pair[1] is None else pair[1])
+        return f"{cls._flow_name(flow)} {cls._since_text(seconds)}"
 
     @staticmethod
     def _memory_line(snapshot: WorkerStateSnapshot) -> Text | None:
@@ -1979,15 +2016,32 @@ class OverviewView(Vertical):
     """Maximum block-bar width (chars) for one job-pipeline stage; bars scale to the busiest stage."""
 
     @staticmethod
-    def _stage_segment(label: str, count: int, peak: int) -> Text:
-        """Render one labelled pipeline stage: name, a count-proportional bar, and the count."""
+    def _stage_segment(label: str, count: int, peak: int, note: str | None = None) -> Text:
+        """Render one labelled pipeline stage: name, a count-proportional bar, the count, and any warning note."""
         colour = "green" if count > 0 else "grey50"
         if peak > 0 and count > 0:
             width = max(1, round(count / peak * OverviewView._PIPELINE_BAR_WIDTH))
             bar = mini_bar(count / peak, width)
         else:
             bar = "·"
-        return Text.assemble((f"{label} ", "bold"), (bar + " ", colour), (str(count), f"bold {colour}"))
+        segment = Text.assemble((f"{label} ", "bold"), (bar + " ", colour), (str(count), f"bold {colour}"))
+        if note is not None:
+            segment.append(f" {note}", style="bold yellow")
+        return segment
+
+    _SAFETY_LANE_MISSING_NOTE = "⚠ no safety process"
+    """Marks the Safety stage while the image popper is held because no safety process can take a check."""
+
+    @staticmethod
+    def _safety_lane_missing(snapshot: WorkerStateSnapshot) -> bool:
+        """Return whether the image popper is held because no safety process can accept a check.
+
+        Reads the gate the worker's popper records, which engages when no safety process is available to take
+        a job, so a dead or still-starting safety row marks the stage just as a missing one does. Shown on the
+        pipeline strip's Safety stage rather than as a Processes row: the strip is where the results waiting on
+        safety are counted, so the count and its cause read together, and it renders at every width.
+        """
+        return snapshot.pop_gate == str(PopGate.NO_SAFETY_PROCESS)
 
     def _render_pipeline_strip(self, snapshot: WorkerStateSnapshot, *, compact: bool = False) -> Panel:
         """Render the job lifecycle as a labelled flow: what is queued, in-flight, and finishing.
@@ -2008,27 +2062,29 @@ class OverviewView(Vertical):
         arrow = Text(" ▶ ", style="grey50")
         rows: list[Text] = []
 
-        def pipeline_row(stages: list[tuple[str, int]], stage_peak: int, submitted: int) -> None:
+        def pipeline_row(stages: list[tuple[str, int, str | None]], stage_peak: int, submitted: int) -> None:
             if compact:
-                rows.extend(self._stage_segment(label, count, stage_peak) for label, count in stages)
+                rows.extend(self._stage_segment(label, count, stage_peak, note) for label, count, note in stages)
                 rows.append(Text(f"✓ {submitted:,} submitted", style="grey62"))
                 return
             line = Text()
-            for index, (label, count) in enumerate(stages):
+            for index, (label, count, note) in enumerate(stages):
                 if index:
                     line.append_text(arrow)
-                line.append_text(self._stage_segment(label, count, stage_peak))
+                line.append_text(self._stage_segment(label, count, stage_peak, note))
             line.append("    ")
             line.append(f"✓ {submitted:,} submitted", style="grey62")
             rows.append(line)
 
         # An alchemist-only worker pops no image jobs, so its image lifecycle row is permanently empty;
         # the alchemy flow becomes the primary (and only) pipeline content instead.
+        safety_missing = self._safety_lane_missing(snapshot)
         if not alchemist_only:
-            stages = [("Queue", queue), ("Inference", inference)]
+            stages: list[tuple[str, int, str | None]] = [("Queue", queue, None), ("Inference", inference, None)]
             if snapshot.config.allow_post_processing or post_processing:
-                stages.append(("Post-proc", post_processing))
-            stages.extend((("Safety", safety), ("Submit", submit)))
+                stages.append(("Post-proc", post_processing, None))
+            safety_note = self._SAFETY_LANE_MISSING_NOTE if safety_missing else None
+            stages.extend((("Safety", safety, safety_note), ("Submit", submit, None)))
             pipeline_row(stages, peak, snapshot.num_jobs_submitted)
 
         alchemy_active = (
@@ -2043,9 +2099,9 @@ class OverviewView(Vertical):
             )
             pipeline_row(
                 [
-                    ("Alchemy pending", snapshot.alchemy_forms_pending),
-                    ("Active", snapshot.alchemy_forms_in_flight),
-                    ("Submit", snapshot.alchemy_forms_awaiting_submit),
+                    ("Alchemy pending", snapshot.alchemy_forms_pending, None),
+                    ("Active", snapshot.alchemy_forms_in_flight, None),
+                    ("Submit", snapshot.alchemy_forms_awaiting_submit, None),
                 ],
                 alch_peak,
                 snapshot.alchemy_total_submitted,
@@ -2060,6 +2116,8 @@ class OverviewView(Vertical):
         else:
             title = "Job pipeline"
             border = "green" if (queue or inference or post_processing or safety or submit) else "grey37"
+            if safety_missing:
+                border = "yellow"
         return Panel(Group(*rows), title=title, title_align="left", border_style=border, padding=(0, 1))
 
     @staticmethod

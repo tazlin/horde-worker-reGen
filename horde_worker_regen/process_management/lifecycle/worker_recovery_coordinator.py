@@ -822,7 +822,11 @@ class WorkerRecoveryCoordinator:
             self.pop_gate_provisioning_disclosed_since = None
             return False
 
-        held_since = self._state.last_pop_gate_since
+        held_since = self._state.pop_gate_held_since()
+        if held_since is None:
+            # A gate with no engagement stamp has no measurable age, so it cannot be shown to have outlasted
+            # the wedge window.
+            return False
         if self.pop_gate_hold_baseline is None or self.pop_gate_hold_baseline[0] != held_since:
             self.pop_gate_hold_baseline = (held_since, self._job_tracker.total_num_successful_submits)
 
@@ -846,7 +850,7 @@ class WorkerRecoveryCoordinator:
         if self.pop_gate_wedge_disclosed_since != held_since:
             self.pop_gate_wedge_disclosed_since = held_since
             logger.critical(
-                f"Job pops have been held at gate '{gate}' for {now - held_since:.0f}s with no job completed "
+                f"Job pops have been held at gate '{gate}' for {now - held_since:.0f}s with no job submitted "
                 "and no pop attempt reaching the horde in that time; the worker is serving nothing, so "
                 "recovery is escalating over the hold regardless of what is holding it.",
             )

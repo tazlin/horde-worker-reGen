@@ -14,6 +14,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 from unittest.mock import Mock
 
+from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.jobs.image_coordinator import ImageGenerationCoordinator
 from horde_worker_regen.process_management.scheduling.workload_flow import FlowCoordinator, WorkloadKind
 
@@ -23,6 +24,7 @@ _AsyncRun = Callable[[], Coroutine[Any, Any, None]]
 def _coordinator(
     *,
     num_jobs_total: int = 0,
+    last_job_pop_time: float = 0.0,
     popper_run: _AsyncRun | None = None,
     submitter_run: _AsyncRun | None = None,
     on_done: Callable[[asyncio.Task[None]], None] | None = None,
@@ -36,6 +38,7 @@ def _coordinator(
     if submitter_run is not None:
         submitter.run = submitter_run
     return ImageGenerationCoordinator(
+        state=WorkerState(last_job_pop_time=last_job_pop_time),
         job_popper=popper,
         job_submitter=submitter,
         job_tracker=tracker,
@@ -56,6 +59,12 @@ def test_kind_is_image_generation() -> None:
 def test_num_in_flight_tracks_job_tracker_total() -> None:
     """Live work count mirrors the tracker's queued-stage total (popped through pending-submit)."""
     assert _coordinator(num_jobs_total=7).num_in_flight == 7
+
+
+def test_last_pop_time_reads_the_image_poppers_stamp() -> None:
+    """The flow's last pop is the worker state's image pop stamp, 0.0 before the popper has asked."""
+    assert _coordinator().last_pop_time == 0.0
+    assert _coordinator(last_job_pop_time=1234.5).last_pop_time == 1234.5
 
 
 async def test_run_supervises_both_loops_and_fires_callback() -> None:

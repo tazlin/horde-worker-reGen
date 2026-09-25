@@ -115,6 +115,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     OrchestrationIntentSnapshot,
     PopGovernorsSnapshot,
     PopGovernorStatus,
+    PopLivenessSnapshot,
     PreloadAdmissionSnapshot,
     ProcessSnapshot,
     RamGovernanceSnapshot,
@@ -2086,6 +2087,7 @@ class HordeWorkerProcessManager:
         self._message_dispatcher.set_strip_result_handler(self._on_strip_result)
 
         self._image_coordinator = ImageGenerationCoordinator(
+            state=self._state,
             job_popper=self._job_popper,
             job_submitter=self._job_submitter,
             job_tracker=self._job_tracker,
@@ -5411,18 +5413,58 @@ class HordeWorkerProcessManager:
 
     def _pop_liveness_line(self, now: float, silent_seconds: float) -> str:
         """Compose the disclosure for a pop loop that has not reached the horde for ``silent_seconds``."""
-        gate = self._state.last_pop_gate
-        if gate is None:
+        held_since = self._state.pop_gate_held_since()
+        if held_since is None:
             return (
                 f"Pop liveness: no pop attempt has reached the horde for {silent_seconds:.0f}s, and no gate is "
                 "holding pops back, so a pop request is still outstanding or the pop loop is no longer running. "
                 "Restart the worker if this does not clear on its own."
             )
-        held_seconds = now - self._state.last_pop_gate_since
         return (
             f"Pop liveness: no pop attempt has reached the horde for {silent_seconds:.0f}s; pops are held at "
-            f"gate '{gate}' (held {held_seconds:.0f}s). The worker is serving nothing while that gate stands, "
+            f"gate '{self._state.last_pop_gate}' (held {now - held_since:.0f}s). The worker is serving nothing "
+            "while that gate stands, "
             "so check whatever it waits on (the inference pool, the local queue, or the downstream stages)."
+        )
+
+    def _reportable_pop_silence(self, now: float) -> float | None:
+        """Return the seconds since the last pop attempt concluded, or None while that silence is accounted for.
+
+        Silence under the warn bound is ordinary pop cadence. Intake held worker-wide is the operator's own
+        doing. A worker that does not serve image generation has an image intake that is silent by choice, and
+        the other flows (alchemy, text) account for their own liveness. A zero attempt stamp is the field default:
+        the popper seeds it when its loop starts, and before that there is no silence to measure.
+        """
+        if self._state.last_pop_attempt_completed_at == 0.0:
+            return None
+        silent_seconds = now - self._state.last_pop_attempt_completed_at
+        if silent_seconds < POP_LIVENESS_WARN_SECONDS:
+            return None
+        if self._state.workload_intake_paused:
+            return None
+        if self._state.last_pop_gate == str(PopGate.IMAGE_GENERATION_NOT_SERVED):
+            return None
+        return silent_seconds
+
+    def _pop_liveness_verdict(self, now: float) -> PopLivenessSnapshot:
+        """Return the pop-liveness sentinel's verdict on the image intake at ``now``.
+
+        The sentinel logs from this value and the supervisor snapshot publishes it, so the log and the
+        dashboard's pop-intake check read one judgement. Pure: the log cadence and the full-queue baseline stay
+        with :meth:`_check_pop_liveness`.
+        """
+        silent_seconds = self._reportable_pop_silence(now)
+        if silent_seconds is None:
+            return PopLivenessSnapshot()
+        # The error-backoff spell must not excuse the silence: it only stretches the pop cadence to a few
+        # seconds and it can only close when an attempt completes, so treating it as an explanation would
+        # let one failed pop followed by a latched gate mute this sentinel forever.
+        if self._pop_governor_registry.any_active(ignore=POP_LIVENESS_NON_EXPLAINING_GOVERNORS):
+            return PopLivenessSnapshot()
+        return PopLivenessSnapshot(
+            level="error" if silent_seconds >= POP_LIVENESS_ERROR_SECONDS else "warn",
+            silent_seconds=silent_seconds,
+            detail=self._pop_liveness_line(now, silent_seconds),
         )
 
     def _check_pop_liveness(self, now: float) -> None:
@@ -5441,37 +5483,29 @@ class HordeWorkerProcessManager:
             self._pop_liveness_warned_at = 0.0
             self._pop_liveness_errored_at = 0.0
 
-        silent_seconds = now - last_attempt
-        if silent_seconds < POP_LIVENESS_WARN_SECONDS:
-            return
-        if self._state.workload_intake_paused:
+        if (now - last_attempt) >= POP_LIVENESS_WARN_SECONDS and self._state.workload_intake_paused:
             self._pop_liveness_frozen_baseline = None
             self._pop_liveness_frozen_errored_at = 0.0
+        if self._reportable_pop_silence(now) is None:
             return
-        if self._state.last_pop_gate == str(PopGate.IMAGE_GENERATION_NOT_SERVED):
-            # The operator deselected image generation; the image intake path is silent by choice and the
-            # other flows (alchemy, text) account for their own liveness.
-            return
-        # Judged ahead of the governor check below: a governor explains why pops are not being attempted, but
-        # nothing explains a queue of accepted work that neither dispatches nor completes.
+        # Judged ahead of the verdict's governor exemption: a governor explains why pops are not being
+        # attempted, but nothing explains a queue of accepted work that neither dispatches nor completes.
         self._check_full_queue_liveness(now)
-        # The error-backoff spell must not excuse the silence: it only stretches the pop cadence to a few
-        # seconds and it can only close when an attempt completes, so treating it as an explanation would
-        # let one failed pop followed by a latched gate mute this sentinel forever.
-        if self._pop_governor_registry.any_active(ignore=POP_LIVENESS_NON_EXPLAINING_GOVERNORS):
-            return
 
-        if silent_seconds >= POP_LIVENESS_ERROR_SECONDS:
+        verdict = self._pop_liveness_verdict(now)
+        if verdict.level is None or verdict.detail is None:
+            return
+        if verdict.level == "error":
             if self._pop_liveness_errored_at == 0.0 or (now - self._pop_liveness_errored_at) >= (
                 POP_LIVENESS_ERROR_SECONDS
             ):
                 self._pop_liveness_errored_at = now
-                logger.error(self._pop_liveness_line(now, silent_seconds))
+                logger.error(verdict.detail)
             return
 
         if self._pop_liveness_warned_at == 0.0:
             self._pop_liveness_warned_at = now
-            logger.warning(self._pop_liveness_line(now, silent_seconds))
+            logger.warning(verdict.detail)
 
     def _full_queue_frozen_line(self, frozen_seconds: float) -> str:
         """Compose the disclosure for a local queue that has been full and motionless for ``frozen_seconds``."""
@@ -7155,6 +7189,11 @@ class HordeWorkerProcessManager:
                 why=why,
             )
 
+        # Checked ahead of the safety backlog and activity branches below: with no safety process, results
+        # back up and the backlog branch would promise a catch-up that no process can deliver.
+        if self._recovery_coordinator.intake_held_without_safety():
+            return self._no_safety_process_intent()
+
         # Safety backlog backpressure (pops withheld to let the safety stage catch up)
         safety_backlog = self._job_tracker.safety_backlog_depth
         if safety_backlog > 0 and getattr(self._job_popper, "_is_post_inference_backlogged", lambda: False)():
@@ -7219,6 +7258,36 @@ class HordeWorkerProcessManager:
 
         # Default: ready and waiting
         return OrchestrationIntentSnapshot(summary="Ready for work.", next_action="Pop the next matching job.")
+
+    def _no_safety_process_intent(self) -> OrchestrationIntentSnapshot:
+        """Return the intent for an image intake held because no safety process is running.
+
+        Next names what the lifecycle is doing about it, read from the same state its backstops act on: a
+        start deferred for card headroom moves to the CPU when the card makes no progress, and a pool that
+        keeps failing is escalated by the recovery coordinator rather than rebuilt forever.
+        """
+        waiting = self._job_tracker.safety_backlog_depth
+        summary = (
+            f"{waiting} result{'s' if waiting != 1 else ''} waiting: no safety process is running."
+            if waiting
+            else "Image intake held: no safety process is running."
+        )
+        lifecycle = self._process_lifecycle
+        if lifecycle.has_pending_safety_starts():
+            next_action = "Waiting for room on the card; safety starts on the CPU if none comes."
+        elif lifecycle.safety_pool_failing or lifecycle.safety_pool_start_failing:
+            next_action = "Safety keeps failing to start; recovery is escalating."
+        elif any(info.process_type == HordeProcessType.SAFETY for info in self._process_map.values()):
+            next_action = "Starting a safety process."
+        else:
+            next_action = "Waiting for recovery to start a safety process."
+        held_since = self._state.pop_gate_held_since()
+        why = (
+            f"No image jobs taken for {self._format_remaining_seconds(time.time() - held_since)}."
+            if held_since is not None
+            else None
+        )
+        return OrchestrationIntentSnapshot(summary=summary, next_action=next_action, why=why)
 
     def _build_pending_jobs_list(self) -> list[JobQueueEntry]:
         """Build a capped list of pending work for the overview queue display.
@@ -7980,19 +8049,22 @@ class HordeWorkerProcessManager:
         in_hand = self._alchemy_coordinator.num_in_flight
         return in_hand if text is None else in_hand + text.num_in_flight
 
+    def _seconds_since_last_pop_per_flow(self, now: float) -> dict[WorkloadKind, float]:
+        """Return each flow's time since its own most recent pop, leaving out flows that have not popped.
+
+        A flow that has never popped is absent rather than zero, which a reader would take for a pop just now.
+        """
+        last_pop_times = {kind: flow.last_pop_time for kind, flow in self._flows.items()}
+        return {kind: now - popped_at for kind, popped_at in last_pop_times.items() if popped_at}
+
     def _seconds_since_any_flows_last_pop(self, now: float) -> float | None:
         """Return the age of the most recent pop any flow made, or None when none has popped yet.
 
         Every flow asks the horde for its own work, so a worker that popped a second ago on one of them has
         popped: reading the image popper alone says "never" for the whole life of a scribe-only worker.
         """
-        text = self._text_coordinator
-        last_pop_time = max(
-            self._state.last_job_pop_time,
-            self._alchemy_coordinator.last_pop_time,
-            0.0 if text is None else text.last_pop_time,
-        )
-        return (now - last_pop_time) if last_pop_time else None
+        ages = self._seconds_since_last_pop_per_flow(now)
+        return min(ages.values()) if ages else None
 
     # endregion
 
@@ -8186,6 +8258,10 @@ class HordeWorkerProcessManager:
             in_error_backoff=self._job_popper._pop_throttler.is_in_error_backoff,
             consecutive_failed_jobs=self._state.consecutive_failed_jobs,
             seconds_since_last_pop=seconds_since_last_pop,
+            seconds_since_last_pop_per_workload=self._seconds_since_last_pop_per_flow(now),
+            pop_gate=self._state.last_pop_gate,
+            pop_gate_since=self._state.pop_gate_held_since(),
+            pop_liveness=self._pop_liveness_verdict(now),
             last_pop_no_jobs_available=self._state.last_pop_no_jobs_available,
             last_pop_skipped_reasons=dict(self._state.last_pop_skipped_reasons),
             last_reduced_pop_skipped_reasons=dict(self._state.last_reduced_pop_skipped_reasons),

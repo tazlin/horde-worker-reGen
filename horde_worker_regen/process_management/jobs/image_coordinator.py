@@ -27,6 +27,7 @@ from horde_worker_regen.process_management.scheduling.workload_flow import Workl
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from horde_worker_regen.process_management.config.worker_state import WorkerState
     from horde_worker_regen.process_management.jobs.job_popper import JobPopper
     from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
     from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -38,6 +39,7 @@ class ImageGenerationCoordinator:
     def __init__(
         self,
         *,
+        state: WorkerState,
         job_popper: JobPopper,
         job_submitter: JobSubmitter,
         job_tracker: JobTracker,
@@ -46,6 +48,7 @@ class ImageGenerationCoordinator:
         """Wrap the image-generation collaborators behind the flow interface.
 
         Args:
+            state: The shared worker state, which holds the image popper's last pop time.
             job_popper: The image job popper loop (the pop end of the flow).
             job_submitter: The image job submitter loop (the submit end of the flow).
             job_tracker: The shared image job tracker, read for the live in-flight count.
@@ -54,6 +57,7 @@ class ImageGenerationCoordinator:
                 top level. The process manager passes its main-loop supervisor here; left ``None`` the
                 loops run unsupervised (unit tests driving ``run`` directly).
         """
+        self._state = state
         self._job_popper = job_popper
         self._job_submitter = job_submitter
         self._job_tracker = job_tracker
@@ -72,6 +76,11 @@ class ImageGenerationCoordinator:
         image analogue of ``AlchemyCoordinator.num_in_flight``.
         """
         return self._job_tracker.num_jobs_total
+
+    @property
+    def last_pop_time(self) -> float:
+        """When the image popper last asked the horde for a job, or 0.0 before it has asked at all."""
+        return self._state.last_job_pop_time
 
     async def run(self) -> None:
         """Supervise the pop and submit loops for the worker's life.

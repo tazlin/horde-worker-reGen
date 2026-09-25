@@ -49,6 +49,9 @@ The session's recovery count never falls, so severity has to come from the last 
 dashboard warns for the rest of the run over a lane that came back at startup. Past the window the count
 is reported as information, which keeps the history visible without standing in for a live problem."""
 
+POP_INTAKE_CHECK_NAME = "Pop intake"
+"""Names the held-image-intake row, which the status bar shows when it is the worst check."""
+
 _DISK_FLOOR_BYTES = 20 * 1024**3
 
 _INFERENCE_STATES = frozenset(
@@ -119,6 +122,18 @@ class HealthCheck:
     name: str
     status: HealthStatus
     detail: str
+
+
+@dataclasses.dataclass(frozen=True)
+class HeldImageIntake:
+    """Represents the worker's pop-liveness verdict on its image intake while that verdict is a concern."""
+
+    status: HealthStatus
+    """WARN past the sentinel's warn bound, ERROR past its error bound."""
+    silent_seconds: float
+    """Seconds since a pop attempt last concluded against the horde, on the worker's clock."""
+    detail: str
+    """The line the worker's sentinel logs for this verdict."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -324,6 +339,10 @@ def _derive_phase(
             checks,
             False,
         )
+    held_intake = held_image_intake(snapshot)
+    if held_intake is not None:
+        return _held_image_intake_report(snapshot, held_intake, checks)
+
     # A text job runs in the external backend and moves no lane's state, so the flow's own count of jobs in
     # hand is what says a text worker is working. The backend's process state is not read for this: a backend
     # that is up is ready to serve, which is not the same as serving.
@@ -388,6 +407,73 @@ def _derive_phase(
         checks,
         False,
     )
+
+
+def held_image_intake(snapshot: WorkerStateSnapshot) -> HeldImageIntake | None:
+    """Return the worker's pop-liveness concern about its image intake, or None while it has none.
+
+    The worker applies the bounds and the exemptions, including the one for a worker that serves no image
+    work, and this renders its verdict. A worker still warming up is excluded: the gates held while its
+    processes come up are part of that start, and the warm-up headline covers them.
+    """
+    verdict = snapshot.pop_liveness
+    if verdict.level is None or verdict.silent_seconds is None or verdict.detail is None:
+        return None
+    if _is_warming_up(snapshot):
+        return None
+    status = HealthStatus.ERROR if verdict.level == "error" else HealthStatus.WARN
+    return HeldImageIntake(status=status, silent_seconds=verdict.silent_seconds, detail=verdict.detail)
+
+
+def _held_image_intake_report(
+    snapshot: WorkerStateSnapshot,
+    held: HeldImageIntake,
+    checks: list[HealthCheck],
+) -> HealthReport:
+    """Return the headline for a held image intake, naming the work that goes on without it.
+
+    Ahead of the serving headline because the flows still working can hide the one that stopped: a text job
+    in flight reads as serving while no image job has been taken for hours.
+    """
+    continuing = _work_continuing(snapshot)
+    detail = held.detail
+    if continuing:
+        verb = "continues" if len(continuing) == 1 else "continue"
+        joined = " and ".join(continuing)
+        detail += f" {joined[:1].upper()}{joined[1:]} {verb}."
+    return HealthReport(
+        WorkerPhase.DEGRADED,
+        held.status,
+        f"Image intake held for {human_duration(held.silent_seconds)}",
+        detail,
+        checks,
+        bool(continuing),
+    )
+
+
+def _work_continuing(snapshot: WorkerStateSnapshot) -> list[str]:
+    """Return the work in hand that goes on while the image intake is held, in operator words."""
+    continuing: list[str] = []
+    image_lane_busy = any(
+        process.last_process_state in _INFERENCE_STATES and not process.last_process_state.startswith("ALCHEMY")
+        for process in snapshot.processes
+        if not process.is_external
+    )
+    if image_lane_busy:
+        continuing.append("accepted image jobs")
+    if snapshot.text_jobs_in_flight > 0:
+        continuing.append("text generation")
+    if snapshot.alchemy_forms_in_flight + snapshot.alchemy_forms_pending > 0:
+        continuing.append("alchemy")
+    return continuing
+
+
+def _pop_intake_check(snapshot: WorkerStateSnapshot) -> HealthCheck | None:
+    """Render the worker's pop-liveness verdict on its image intake, or None while it has no concern."""
+    held = held_image_intake(snapshot)
+    if held is None:
+        return None
+    return HealthCheck(POP_INTAKE_CHECK_NAME, held.status, held.detail)
 
 
 def _stale_threshold(snapshot: WorkerStateSnapshot) -> float:
@@ -510,6 +596,10 @@ def _build_checks(
     checks: list[HealthCheck] = []
 
     checks.append(_api_check(snapshot, optimistic_server_maintenance=optimistic_server_maintenance))
+    # Second, so that when it ties another row for the worst status the status bar names the held intake.
+    pop_intake = _pop_intake_check(snapshot)
+    if pop_intake is not None:
+        checks.append(pop_intake)
 
     if snapshot.gpu_torch_incompatible:
         checks.append(

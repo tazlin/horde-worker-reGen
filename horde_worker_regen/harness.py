@@ -1322,11 +1322,8 @@ def _capture_harness_stage_snapshot(
     total_jobs = source.total_jobs if source is not None else None
     jobs_emitted = source.jobs_emitted if source is not None else None
     source_progress = f"{jobs_emitted}/{total_jobs}" if jobs_emitted is not None and total_jobs is not None else None
-    pop_gate_age = (
-        max(0.0, now - state.last_pop_gate_since)
-        if state.last_pop_gate is not None and state.last_pop_gate_since > 0
-        else None
-    )
+    pop_gate_since = state.pop_gate_held_since()
+    pop_gate_age = max(0.0, now - pop_gate_since) if pop_gate_since is not None else None
     last_pop_attempt_age = (
         max(0.0, now - state.last_pop_attempt_completed_at) if state.last_pop_attempt_completed_at > 0 else None
     )

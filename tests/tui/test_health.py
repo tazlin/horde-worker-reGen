@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    PopLivenessSnapshot,
     ProcessSnapshot,
     TextBackendDetail,
     WholeCardResidencyStatus,
@@ -20,6 +21,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.health import (
+    POP_INTAKE_CHECK_NAME,
     PROCESS_RECOVERY_WARN_SECONDS,
     TEXT_BACKEND_CHECK_NAME,
     TEXT_GENERATION_CHECK_NAME,
@@ -948,3 +950,131 @@ def test_a_program_that_could_not_be_obtained_is_an_error_not_a_warm_up() -> Non
     checks = _text_checks(snapshot)
     assert [check.name for check in checks] == [TEXT_BACKEND_CHECK_NAME]
     assert checks[0].status is HealthStatus.ERROR
+
+
+# --- Held image intake ---------------------------------------------------------------------------------------
+
+_HELD_FOR = 3600.0
+"""The noa3 hold: an hour past engagement, well past both pop-liveness bounds."""
+
+_SENTINEL_LINE = (
+    "Pop liveness: no pop attempt has reached the horde for 3600s; pops are held at gate 'no_safety_process' "
+    "(held 3600s). The worker is serving nothing while that gate stands, so check whatever it waits on (the "
+    "inference pool, the local queue, or the downstream stages)."
+)
+"""The line the worker's sentinel logs and publishes for the noa3 hold."""
+
+
+def _held_gate_snapshot(
+    *,
+    workloads: tuple[WorkloadKind, ...] = (WorkloadKind.IMAGE_GENERATION, WorkloadKind.TEXT_GENERATION),
+    verdict: PopLivenessSnapshot | None = None,
+    text_jobs_in_flight: int = 0,
+) -> WorkerStateSnapshot:
+    """An image worker whose lanes are ready and idle while its popper has been held for an hour.
+
+    The pop-liveness verdict defaults to the sentinel's error for that hold; pass ``verdict`` to publish another.
+    """
+    now = time.time()
+    published = (
+        verdict
+        if verdict is not None
+        else PopLivenessSnapshot(level="error", silent_seconds=_HELD_FOR, detail=_SENTINEL_LINE)
+    )
+    return _snapshot(
+        timestamp=now,
+        enabled_workloads=sorted(workload.value for workload in workloads),
+        processes=[_process("WAITING_FOR_JOB", process_id=4), _process("WAITING_FOR_JOB", process_id=5)],
+        pop_gate="no_safety_process",
+        pop_gate_since=now - _HELD_FOR,
+        pop_liveness=published,
+        jobs_pending_safety_check=9,
+        text_jobs_in_flight=text_jobs_in_flight,
+        text_backend_ready=True,
+        config=WorkerConfigSummary(dreamer_name="Test", worker_version="12.0.0", scribe=True),
+    )
+
+
+def _pop_intake(report: object) -> HealthCheck | None:
+    return next((check for check in report.checks if check.name == POP_INTAKE_CHECK_NAME), None)  # type: ignore[attr-defined]
+
+
+def test_a_held_image_intake_leads_while_a_text_job_is_in_flight() -> None:
+    """A text job in flight no longer reads as serving the horde while no image job has been taken for an hour."""
+    report = derive(_held_gate_snapshot(text_jobs_in_flight=1), SupervisorStatus.RUNNING, 1.0)
+
+    assert report.phase is WorkerPhase.DEGRADED
+    assert report.severity is HealthStatus.ERROR
+    assert report.headline.startswith("Image intake held for 1h")
+    assert report.detail == f"{_SENTINEL_LINE} Text generation continues."
+    assert report.animated is True
+    check = _pop_intake(report)
+    assert check is not None and check.status is HealthStatus.ERROR
+    assert check.detail == _SENTINEL_LINE
+
+
+def test_a_held_image_intake_leads_between_text_jobs() -> None:
+    """Between text jobs the worker read READY; the held intake is the headline and nothing is said to continue."""
+    report = derive(_held_gate_snapshot(text_jobs_in_flight=0), SupervisorStatus.RUNNING, 1.0)
+
+    assert report.phase is WorkerPhase.DEGRADED
+    assert report.headline.startswith("Image intake held for 1h")
+    assert report.detail == _SENTINEL_LINE
+    assert report.animated is False
+
+
+def test_a_held_image_intake_on_an_image_only_worker() -> None:
+    """An image-only worker gets the same headline and check; there is no other flow to mention."""
+    report = derive(
+        _held_gate_snapshot(workloads=(WorkloadKind.IMAGE_GENERATION,)),
+        SupervisorStatus.RUNNING,
+        1.0,
+    )
+
+    assert report.phase is WorkerPhase.DEGRADED
+    assert _pop_intake(report) is not None
+
+
+def test_a_worker_with_no_image_role_has_no_verdict_and_its_text_flow_leads() -> None:
+    """The worker publishes no concern for an image intake it does not serve, so the text flow's state leads."""
+    report = derive(
+        _held_gate_snapshot(
+            workloads=(WorkloadKind.TEXT_GENERATION,),
+            verdict=PopLivenessSnapshot(),
+            text_jobs_in_flight=1,
+        ),
+        SupervisorStatus.RUNNING,
+        1.0,
+    )
+
+    assert report.phase is WorkerPhase.SERVING
+    assert _pop_intake(report) is None
+
+
+def test_the_check_follows_the_published_level() -> None:
+    """WARN and ERROR follow the worker's verdict, and a long-held gate with no verdict says nothing."""
+    warned = derive(
+        _held_gate_snapshot(verdict=PopLivenessSnapshot(level="warn", silent_seconds=90.0, detail=_SENTINEL_LINE)),
+        SupervisorStatus.RUNNING,
+        1.0,
+    )
+    check = _pop_intake(warned)
+    assert check is not None and check.status is HealthStatus.WARN
+    assert warned.severity is HealthStatus.WARN
+    assert warned.headline == "Image intake held for 1m 30s"
+
+    errored = derive(_held_gate_snapshot(), SupervisorStatus.RUNNING, 1.0)
+    assert errored.severity is HealthStatus.ERROR
+
+    quiet = derive(_held_gate_snapshot(verdict=PopLivenessSnapshot()), SupervisorStatus.RUNNING, 1.0)
+    assert _pop_intake(quiet) is None
+    assert quiet.phase is not WorkerPhase.DEGRADED
+
+
+def test_a_worker_still_warming_up_does_not_report_its_start_as_a_held_intake() -> None:
+    """Gates held while the processes come up belong to the start, which the warm-up headline covers."""
+    snapshot = _held_gate_snapshot().model_copy(update={"processes": [_process("PRELOADING_MODEL")]})
+    report = derive(snapshot, SupervisorStatus.RUNNING, 1.0)
+
+    assert report.phase is WorkerPhase.WARMING_UP
+    assert _pop_intake(report) is None

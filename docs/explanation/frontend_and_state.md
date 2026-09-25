@@ -73,8 +73,21 @@ defines the structured protocol over it:
   cannot tell a lane cycling now from one replaced once at startup, and the bounded event ring below has
   evicted a startup recovery long before the session ends. The dashboard's health checklist reads the pair
   to warn while a replacement is recent and report the count as information afterwards.
+  `pop_gate` and `pop_gate_since` carry the gate that ended the image popper's last cycle and when it engaged.
+  The Now line and the overview show them, and the overview's pipeline strip marks the Safety stage while the
+  gate is `no_safety_process`, which the popper records when no safety process can take a check. The
+  whole-worker `seconds_since_last_pop` is the youngest flow's figure, so a text pop seconds ago would hide an
+  image intake silent for an hour. `seconds_since_last_pop_per_workload` carries each flow's own figure, read
+  from the `last_pop_time` every registered `FlowCoordinator` exposes. On a worker serving several flows the
+  overview's activity line names each served flow's last pop and the phone hero shows the flow furthest
+  behind. A single-role worker keeps the one figure. `pop_liveness` is the pop-liveness sentinel's verdict on
+  the image intake: a level (`warn`, `error`, or none), the seconds since a pop attempt last concluded against
+  the horde, and the line the sentinel logs. The worker applies its own bounds and exemptions, logs from this
+  value and publishes it. The health checklist's Pop intake row renders it, and a verdict leads the headline
+  as "Image intake held for ..." ahead of the serving headline, with any work that goes on without the image
+  intake named after the sentinel's line. The dashboard holds no pop-liveness bound of its own.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 30) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 31) so a frontend can detect a mismatch with a worker built from different code.
 
 ### The event ring
 

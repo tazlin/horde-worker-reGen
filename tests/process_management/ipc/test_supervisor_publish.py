@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
+from horde_worker_regen.process_management.config.worker_state import PopGate
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_EVENTS_IN_SNAPSHOT,
     ModelPoolSeatReadiness,
+    PopLivenessSnapshot,
     SupervisorCommand,
     SupervisorControlMessage,
     WorkerEventKind,
@@ -27,6 +31,7 @@ from horde_worker_regen.process_management.scheduling.model_pool import (
     PopLane,
     RankedCandidate,
 )
+from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
 
 
@@ -384,6 +389,91 @@ def test_alchemy_work_reaches_the_whole_worker_counters() -> None:
     assert snapshot.seconds_since_last_pop < 60.0
     # The per-workload split is untouched, as it is for text.
     assert (snapshot.alchemy_total_submitted, snapshot.alchemy_total_faulted) == (7, 2)
+
+
+def test_the_held_pop_gate_reaches_the_snapshot_with_when_it_engaged() -> None:
+    """The gate holding the image popper and its engagement time travel on the wire, and clear together."""
+    manager = make_testable_process_manager()
+    engaged_at = time.time() - 3600.0
+    manager._state.last_pop_gate = str(PopGate.NO_SAFETY_PROCESS)
+    manager._state.last_pop_gate_since = engaged_at
+
+    held = manager._build_worker_state_snapshot()
+    assert held.pop_gate == "no_safety_process"
+    assert held.pop_gate_since == engaged_at
+
+    manager._state.last_pop_gate = None
+    manager._state.last_pop_gate_since = time.time()
+    cleared = manager._build_worker_state_snapshot()
+    assert cleared.pop_gate is None
+    assert cleared.pop_gate_since is None
+
+
+def test_the_pop_liveness_verdict_reaches_the_snapshot_with_the_line_it_logs() -> None:
+    """The sentinel's verdict on a silent image intake travels on the wire, and clears once a pop concludes."""
+    manager = make_testable_process_manager()
+    now = time.time()
+    manager._state.last_pop_gate = str(PopGate.NO_SAFETY_PROCESS)
+    manager._state.last_pop_gate_since = now - 3600.0
+    manager._state.last_pop_attempt_completed_at = now - 3600.0
+
+    errored = manager._build_worker_state_snapshot().pop_liveness
+    assert errored.level == "error"
+    assert errored.silent_seconds is not None and errored.silent_seconds >= 3600.0
+    assert errored.detail is not None
+    assert errored.detail.startswith("Pop liveness: no pop attempt has reached the horde for 36")
+    assert "pops are held at gate 'no_safety_process' (held 36" in errored.detail
+
+    manager._state.last_pop_attempt_completed_at = time.time() - 90.0
+    assert manager._build_worker_state_snapshot().pop_liveness.level == "warn"
+
+    manager._state.last_pop_attempt_completed_at = time.time()
+    assert manager._build_worker_state_snapshot().pop_liveness == PopLivenessSnapshot()
+
+
+def test_an_image_intake_the_worker_does_not_serve_publishes_no_concern() -> None:
+    """The sentinel's exemption for a deselected image role reaches the wire, so no frontend re-applies it."""
+    manager = make_testable_process_manager()
+    manager._state.last_pop_gate = str(PopGate.IMAGE_GENERATION_NOT_SERVED)
+    manager._state.last_pop_gate_since = time.time() - 3600.0
+    manager._state.last_pop_attempt_completed_at = time.time() - 3600.0
+
+    assert manager._build_worker_state_snapshot().pop_liveness == PopLivenessSnapshot()
+
+
+def test_each_flow_reports_its_own_last_pop() -> None:
+    """A text pop a second ago leaves the image flow's own figure at an hour, and the headline at the youngest."""
+    manager = make_testable_process_manager(scribe=True)
+    text = manager._text_coordinator
+    assert text is not None
+    now = time.time()
+    manager._state.last_job_pop_time = now - 3600.0
+    text._last_pop_time = now - 1.0
+
+    snapshot = manager._build_worker_state_snapshot()
+
+    per_flow = snapshot.seconds_since_last_pop_per_workload
+    assert set(per_flow) == {WorkloadKind.IMAGE_GENERATION, WorkloadKind.TEXT_GENERATION}
+    assert per_flow[WorkloadKind.IMAGE_GENERATION] >= 3600.0
+    assert per_flow[WorkloadKind.TEXT_GENERATION] < 60.0
+    assert snapshot.seconds_since_last_pop == min(per_flow.values())
+
+
+def test_a_held_safety_gate_says_why_results_wait_instead_of_safety_checking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no safety process the Now line names the missing process, never a safety check that is not running."""
+    manager = make_testable_process_manager()
+    manager._state.last_pop_gate = str(PopGate.NO_SAFETY_PROCESS)
+    manager._state.last_pop_gate_since = time.time() - 3600.0
+    monkeypatch.setattr(type(manager._job_tracker), "safety_backlog_depth", property(lambda _tracker: 9))
+
+    intent = manager._build_orchestration_intent()
+
+    assert intent.summary == "9 results waiting: no safety process is running."
+    assert "Safety checking" not in intent.summary
+    assert intent.next_action == "Waiting for recovery to start a safety process."
+    assert intent.why is not None and intent.why.startswith("No image jobs taken for 1h")
 
 
 def test_the_run_record_counts_every_flows_delivered_work() -> None:

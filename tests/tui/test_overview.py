@@ -6,6 +6,7 @@ import time
 
 from rich.console import Console
 
+from horde_worker_regen.process_management.config.worker_state import PopGate
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     TEXT_BACKEND_PROCESS_ID,
     CardSnapshot,
@@ -1514,3 +1515,106 @@ def test_a_text_row_counting_stream_records_gets_an_indeterminate_bar() -> None:
     assert "????????" in text
     assert "12 chunks" in text
     assert "%" not in text
+
+
+def _safety_process() -> ProcessSnapshot:
+    return ProcessSnapshot(
+        process_id=3, process_type="SAFETY", last_process_state="WAITING_FOR_JOB", is_alive=True, is_busy=False
+    )
+
+
+def _inference_process() -> ProcessSnapshot:
+    return ProcessSnapshot(
+        process_id=4, process_type="INFERENCE", last_process_state="WAITING_FOR_JOB", is_alive=True, is_busy=False
+    )
+
+
+def test_pipeline_strip_marks_the_safety_stage_when_no_safety_process_exists() -> None:
+    """An image worker with results waiting and no safety process says so on the stage the results wait at."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value],
+        processes=[_inference_process()],
+        pop_gate=str(PopGate.NO_SAFETY_PROCESS),
+        jobs_pending_safety_check=9,
+    )
+
+    strip = _render(OverviewView()._render_pipeline_strip(snapshot))
+    compact = _render(OverviewView()._render_pipeline_strip(snapshot, compact=True), width=60)
+
+    assert "no safety process" in strip
+    assert "no safety process" in compact
+
+
+def test_pipeline_strip_marks_the_safety_stage_when_the_safety_row_cannot_take_a_check() -> None:
+    """A dead safety row holds the popper just as a missing one does, so the stage is marked beside it."""
+    dead_safety = _safety_process().model_copy(update={"is_alive": False, "last_process_state": "PROCESS_ENDED"})
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value],
+        processes=[_inference_process(), dead_safety],
+        pop_gate=str(PopGate.NO_SAFETY_PROCESS),
+        jobs_pending_safety_check=9,
+    )
+
+    assert "no safety process" in _render(OverviewView()._render_pipeline_strip(snapshot))
+
+
+def test_pipeline_strip_is_unmarked_with_a_safety_process_or_no_image_role() -> None:
+    """A popper not held for safety, or a worker that serves no image work, leaves the stage as it was."""
+    with_safety = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value],
+        processes=[_inference_process(), _safety_process()],
+    )
+    alchemist_only = WorkerStateSnapshot(
+        config=_alchemist_only_config(),
+        enabled_workloads=[WorkloadKind.ALCHEMY.value],
+        processes=[_inference_process()],
+    )
+
+    assert "no safety process" not in _render(OverviewView()._render_pipeline_strip(with_safety))
+    assert "no safety process" not in _render(OverviewView()._render_pipeline_strip(alchemist_only))
+
+
+def test_last_pop_is_shown_per_flow_on_a_worker_serving_several() -> None:
+    """A text pop seconds ago cannot hide an image intake that has been silent for an hour."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0", scribe=True),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value, WorkloadKind.TEXT_GENERATION.value],
+        seconds_since_last_pop=4.0,
+        seconds_since_last_pop_per_workload={
+            WorkloadKind.IMAGE_GENERATION: 4967.0,
+            WorkloadKind.TEXT_GENERATION: 4.0,
+        },
+    )
+
+    line = OverviewView._activity_line(snapshot).plain
+    assert "last pop image 1h 22m 47s ago · text 4s ago" in line
+    assert OverviewView._furthest_behind_last_pop(snapshot) == "image 1h 22m 47s ago"
+
+
+def test_a_flow_that_never_popped_reads_never_and_is_furthest_behind() -> None:
+    """A served flow with no pop this session is named as never rather than dropped."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0", scribe=True),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value, WorkloadKind.TEXT_GENERATION.value],
+        seconds_since_last_pop=4.0,
+        seconds_since_last_pop_per_workload={WorkloadKind.TEXT_GENERATION: 4.0},
+    )
+
+    assert "last pop image never · text 4s ago" in OverviewView._activity_line(snapshot).plain
+    assert OverviewView._furthest_behind_last_pop(snapshot) == "image never"
+
+
+def test_a_single_role_worker_keeps_one_last_pop_figure() -> None:
+    """With one flow served the wording is unchanged: one age, no flow name."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value],
+        seconds_since_last_pop=4.0,
+        seconds_since_last_pop_per_workload={WorkloadKind.IMAGE_GENERATION: 4.0},
+    )
+
+    assert "last pop 4s ago" in OverviewView._activity_line(snapshot).plain
+    assert OverviewView._furthest_behind_last_pop(snapshot) == "4s ago"

@@ -443,6 +443,17 @@ class WorkerState:
             or self.recovery_parked
         )
 
+    def pop_gate_held_since(self) -> float | None:
+        """Return when the gate named by :attr:`last_pop_gate` engaged, or None while no gate holds pops.
+
+        The popper writes the gate name and this stamp together, so a held gate always has an engagement time.
+        Every reading of the gate's age (the harness stage snapshot, the supervisor snapshot, the pop-liveness
+        line, the recovery coordinator's held-gate wedge) goes through this one rule.
+        """
+        if self.last_pop_gate is None:
+            return None
+        return self.last_pop_gate_since
+
     def record_safety_duration(self, seconds: float) -> None:
         """Fold one measured safety-check wall-clock into the EMA used for post-inference backpressure."""
         if seconds <= 0:
