@@ -117,11 +117,19 @@ class RetentionFit:
     static_charges_mb: float
     retained_resident_mb: float
     committed_reserve_mb: float
+    foreign_floor_mb: float
+    """The card's standing foreign floor: memory held outside the worker (the managed text backend included)."""
 
     @property
     def effective_available_mb(self) -> float:
-        """Card total net of sibling contexts, retained residents and in-flight commitments."""
-        return self.total_vram_mb - self.static_charges_mb - self.retained_resident_mb - self.committed_reserve_mb
+        """Card total net of the static charges, retained residents, in-flight commitments and the foreign floor."""
+        return (
+            self.total_vram_mb
+            - self.static_charges_mb
+            - self.retained_resident_mb
+            - self.committed_reserve_mb
+            - self.foreign_floor_mb
+        )
 
     @property
     def granted(self) -> bool:
@@ -131,10 +139,11 @@ class RetentionFit:
     def describe(self) -> str:
         """The gate figures for a log line."""
         retained = f", retained residents {self.retained_resident_mb:.0f}MB" if self.retained_resident_mb > 0 else ""
+        foreign = f", foreign floor {self.foreign_floor_mb:.0f}MB" if self.foreign_floor_mb > 0 else ""
         return (
             f"static: peak {self.predicted_mb} + noise {self.noise_mb:.0f} vs {self.effective_available_mb:.0f}MB "
             f"(total {self.total_vram_mb:.0f}MB minus sibling contexts, the job's own post-processing, and "
-            f"in-flight commitments{retained})"
+            f"in-flight commitments{retained}{foreign})"
         )
 
 

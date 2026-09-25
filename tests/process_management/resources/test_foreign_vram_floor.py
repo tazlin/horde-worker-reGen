@@ -9,6 +9,7 @@ gate withholds any floor until a full window has been observed so a cold-start t
 from __future__ import annotations
 
 from dataclasses import replace
+from unittest.mock import Mock
 
 from loguru import logger
 
@@ -20,6 +21,7 @@ from horde_worker_regen.process_management.resources.foreign_vram_floor import (
     floor_with_known_tenant_mb,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ledgers.retention import RetentionFit
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -294,3 +296,49 @@ class TestManagedTenantServiceability:
         reason = scheduler._unserviceable_job_reason(job)
         assert reason is not None
         assert "cannot fit any serving card" in reason
+
+
+class TestManagedTenantIsChargedByRetention:
+    """The retention static fit prices from the card total, so the tenant must be charged there too."""
+
+    def test_a_tenant_of_n_mb_reduces_the_retention_fit_by_n(self) -> None:
+        """A job whose peak fits beside the retained residents stops fitting once a tenant holds the card."""
+        tenant_mb = 4000.0
+        scheduler, tenant_box = _two_card_scheduler()
+        target = scheduler._process_map[1]
+        predicted_box = [0.0]
+
+        def fixed_peak(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
+            return Mock(fits=True, predicted_mb=predicted_box[0], reserve_mb=0.0)
+
+        scheduler._vram_budget.check_job = fixed_peak  # type: ignore[method-assign]
+        job = make_job_pop_response("sd15_model")
+
+        without_tenant = scheduler._retention_fit(job, target=target, device_index=0, include_target_retained=True)
+        assert isinstance(without_tenant, RetentionFit)
+        assert without_tenant.foreign_floor_mb == 0.0
+        predicted_box[0] = without_tenant.effective_available_mb - without_tenant.noise_mb - tenant_mb / 2
+        fits_alone = scheduler._retention_fit(job, target=target, device_index=0, include_target_retained=True)
+        assert isinstance(fits_alone, RetentionFit)
+        assert fits_alone.granted is True
+
+        tenant_box[0] = ManagedVramTenant(device_index=0, footprint_mb=tenant_mb)
+
+        with_tenant = scheduler._retention_fit(job, target=target, device_index=0, include_target_retained=True)
+        assert isinstance(with_tenant, RetentionFit)
+        assert with_tenant.foreign_floor_mb == tenant_mb
+        assert with_tenant.effective_available_mb == fits_alone.effective_available_mb - tenant_mb
+        assert with_tenant.granted is False
+        assert f"foreign floor {tenant_mb:.0f}MB" in with_tenant.describe()
+
+    def test_a_tenant_on_another_card_leaves_the_retention_fit_alone(self) -> None:
+        """The tenant is charged on its own card only."""
+        scheduler, tenant_box = _two_card_scheduler()
+        target = scheduler._process_map[1]
+        job = make_job_pop_response("sd15_model")
+        tenant_box[0] = ManagedVramTenant(device_index=1, footprint_mb=_TENANT_MB)
+
+        fit = scheduler._retention_fit(job, target=target, device_index=0, include_target_retained=True)
+
+        assert isinstance(fit, RetentionFit)
+        assert fit.foreign_floor_mb == 0.0

@@ -9089,6 +9089,12 @@ class InferenceScheduler:
         card's retained residents. Nothing here reads measured free VRAM: the gate must hold when the driver's free
         figure cannot be trusted (WDDM demand-paging), so it prices from the reported total, a figure the driver
         cannot misreport under pressure.
+
+        The total is charged the static tenants, the retained residents, the in-flight commitments and the card's
+        standing foreign floor (the learned floor or the managed text backend's footprint, whichever is larger).
+        Retention cannot page the floor out, and a total-based fit sees it nowhere else. It is read through
+        :meth:`current_foreign_floor_mb`, the accessor the ceiling and the other floor readers share, and kept
+        out of the static charges so the log line states it as its own figure.
         """
         model = job.model
         if model is None:
@@ -9121,10 +9127,11 @@ class InferenceScheduler:
                 "static: a retained resident holds the card but its weight footprint is unpriceable",
             )
         committed_reserve_mb = self._committed_vram_reserve_mb(device_index=device_index)
+        foreign_floor_mb = max(0.0, self.current_foreign_floor_mb(device_index) or 0.0)
         static_verdict = self._vram_budget.check_job(
             job,
             baseline,
-            total_vram_mb - static_charges_mb - retained_resident_mb,
+            total_vram_mb - static_charges_mb - retained_resident_mb - foreign_floor_mb,
             committed_reserve_mb=committed_reserve_mb,
             disaggregated=self._is_disaggregation_class_eligible(job),
         )
@@ -9135,6 +9142,7 @@ class InferenceScheduler:
             static_charges_mb=static_charges_mb,
             retained_resident_mb=retained_resident_mb,
             committed_reserve_mb=committed_reserve_mb,
+            foreign_floor_mb=foreign_floor_mb,
         )
 
     def _fits_beside_retained_residents(
@@ -9173,8 +9181,9 @@ class InferenceScheduler:
     ) -> float | None:
         """VRAM (MB) the static fit must charge on top of the job's own sampling peak, or None when unpriceable.
 
-        Four tenants share the card with retained weights yet are invisible to the peak estimate and to the
-        committed ledger at grant time: sibling CUDA contexts (charged at the measured marginal per-context cost;
+        Four of the worker's own tenants share the card with retained weights yet are invisible to the peak
+        estimate and to the committed ledger at grant time (the standing foreign floor is the fit's fifth charge,
+        taken in :meth:`_retention_fit`): sibling CUDA contexts (charged at the measured marginal per-context cost;
         unpriceable when contexts exist but none has been measured), idle lanes' held component caches, the part of
         a concurrently cleared sibling's materialisation the ledger does not yet carry, and the job's own
         post-processing chain, which runs while the weights are held and enters the ledger one dispatch too late.

@@ -319,26 +319,30 @@ class TestRetentionFit:
             static_charges_mb=3000.0,
             retained_resident_mb=4000.0,
             committed_reserve_mb=1000.0,
+            foreign_floor_mb=2000.0,
         )
 
     def test_effective_available_nets_every_charge(self) -> None:
-        """The card total less contexts, retained residents and commitments is what the peak must fit."""
-        assert self._fit(1.0).effective_available_mb == 8000.0
+        """The card total less contexts, retained residents, commitments and the foreign floor is the room."""
+        assert self._fit(1.0).effective_available_mb == 6000.0
 
     def test_granted_at_the_boundary_and_denied_past_it(self) -> None:
         """Peak plus noise at exactly the room fits; one MB more does not."""
-        assert self._fit(7500.0).granted is True
-        assert self._fit(7501.0).granted is False
+        assert self._fit(5500.0).granted is True
+        assert self._fit(5501.0).granted is False
 
     def test_an_unknown_peak_cannot_be_refused_statically(self) -> None:
         """A static gate has no figure to refuse on when the peak is unknown."""
         assert self._fit(None).granted is True
 
-    def test_describe_names_the_retained_charge_only_when_present(self) -> None:
-        """The log line carries the retained figure only when something is retained."""
-        assert "retained residents 4000MB" in self._fit(1.0).describe()
-        bare = RetentionFit(1.0, 0.0, 16000.0, 0.0, 0.0, 0.0)
+    def test_describe_names_the_retained_charge_and_floor_only_when_present(self) -> None:
+        """The log line carries the retained and foreign-floor figures only when each is nonzero."""
+        described = self._fit(1.0).describe()
+        assert "retained residents 4000MB" in described
+        assert "foreign floor 2000MB" in described
+        bare = RetentionFit(1.0, 0.0, 16000.0, 0.0, 0.0, 0.0, 0.0)
         assert "retained residents" not in bare.describe()
+        assert "foreign floor" not in bare.describe()
 
 
 class TestWddmPagingRecord:

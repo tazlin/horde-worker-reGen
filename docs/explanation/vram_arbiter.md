@@ -941,7 +941,11 @@ to the card. It is instead a governed live gate that grants only when:
   what a multi-slot lease adds: a staged sibling's weights land at *its* clearance, so at this instant the
   shared ledger carries only its encode charge and the rest of its materialisation is charged here. Priced
   without it, two grants each fit "alone" and jointly overflow the card, which is the shape every observed
-  out-of-memory on a two-slot lease took.
+  out-of-memory on a two-slot lease took. The card's standing foreign floor is charged too: the learned
+  foreign floor or the managed text backend's measured footprint, whichever is larger, read through the
+  same accessor as the achievable ceiling. Retention cannot page that memory out, and a fit priced from the
+  card's total would otherwise see none of it. The verdict's log line states the floor as its own figure
+  when it is nonzero.
 
 A grant is settled into the slot's retained-resident record only when its job **succeeds**. A fault is
 evidence about the job and none at all about the device: a job that failed part-way through may have left

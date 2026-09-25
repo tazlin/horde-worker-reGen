@@ -122,8 +122,8 @@ stops driving that card, so the two workloads never compete for its VRAM. An unn
 a single-card host the card stays shared whatever is configured. The worker measures the backend's footprint
 once, as the card's free-VRAM drop between launch and ready, and logs it. While the backend serves, that
 footprint is charged to its card as a standing floor (see the [VRAM arbiter](vram_arbiter.md#the-decision-pipeline)).
-Image admission, the models offered for that card, the safety process's card choice and the start of a GPU
-child all see the card as that much smaller, without waiting for the arbiter's learned foreign floor to observe
+Image admission, the models offered for that card, the safety process's card choice, the start of a GPU
+child and the static fit behind a VRAM retention grant all see the card as that much smaller, without waiting for the arbiter's learned foreign floor to observe
 the backend. A relaunch re-measures the footprint, and a backend that stops serving is no longer charged.
 
 With `text_threads` above 1 the worker launches koboldcpp with `--parallelrequests` set to that many, and
@@ -444,8 +444,8 @@ headline figure states.
 ## What is not supported yet
 
 - **A shared card is charged, not planned around.** When the backend shares a card with image generation,
-  the worker charges its measured footprint to that card as a standing floor; it does not yet pause, wake
-  or shrink the backend to make room for image work.
+  the worker charges its measured footprint to that card as a standing floor, in admission and in the
+  retention fit alike; it does not yet pause, wake or shrink the backend to make room for image work.
 - **The backend cannot be swapped or reconfigured while the worker runs.** Changing which model the
   backend serves means restarting the backend; the worker will notice when the generation it is waiting
   on fails and re-run its readiness gate, but nothing coordinates the two. Which *kind* of backend is
