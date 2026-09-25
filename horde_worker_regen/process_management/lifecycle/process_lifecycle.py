@@ -15,6 +15,7 @@ from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import BoundedSemaphore as BoundedSemaphore_MultiProcessing
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
+from queue import Empty as QueueEmpty
 from typing import TYPE_CHECKING, NamedTuple
 
 import psutil
@@ -268,6 +269,12 @@ ticks, so this is a final bounded reap rather than their primary drain window.
 
 ALL_PROCESS_SHUTDOWN_KILL_JOIN_SECONDS: float = 1.0
 """Final join after killing a child that outlived graceful worker teardown."""
+
+_SHUTDOWN_REAP_DRAIN_INTERVAL_SECONDS: float = 0.05
+"""How long the final reap waits on one child between drains of the status queue it is exiting into."""
+
+_SHUTDOWN_REAP_DRAIN_LIMIT: int = 10_000
+"""Reads one drain of the status queue may make: a bound on what is readable now, not a budget."""
 
 SOFT_RESET_POOL_END_GRACE_SECONDS: float = 10.0
 """Total wall-clock budget for ending every victim of a soft-reset pool rebuild. Each victim is signalled
@@ -2961,6 +2968,13 @@ class ProcessLifecycleManager:
         unbounded interpreter-exit finalizer to join. All children receive their graceful signal first, then
         share one bounded join deadline; stragglers are killed and joined once more.
 
+        The status queue is drained while the deadline runs. A child's interpreter exit joins the feeder thread
+        of every queue it has put to, and that thread cannot finish until the pipe has taken its buffered
+        bytes; the pipe holds a few kilobytes, and the control loop that normally reads it is parked in this
+        method. Left undrained, a child that has already left its main loop and reported ``PROCESS_ENDED``
+        sits in interpreter exit until the deadline kills it. What is drained is discarded: the map is cleared
+        below and nothing acts on a message from a child the worker is exiting past.
+
         Returns:
             True only when every known child was confirmed dead and its ownership record was removed.
         """
@@ -2976,7 +2990,14 @@ class ProcessLifecycleManager:
         join_deadline = time.monotonic() + ALL_PROCESS_SHUTDOWN_REAP_GRACE_SECONDS
         for process_info in process_infos:
             try:
-                process_info.mp_process.join(timeout=max(0.0, join_deadline - time.monotonic()))
+                while True:
+                    self._discard_status_queue_backlog()
+                    remaining = join_deadline - time.monotonic()
+                    process_info.mp_process.join(
+                        timeout=min(_SHUTDOWN_REAP_DRAIN_INTERVAL_SECONDS, max(0.0, remaining)),
+                    )
+                    if remaining <= 0.0 or not process_info.mp_process.is_alive():
+                        break
             except Exception as join_error:  # noqa: BLE001 - teardown must continue across every child
                 logger.debug(f"Failed to join process {process_info.process_id} during shutdown: {join_error}")
 
@@ -4924,6 +4945,23 @@ class ProcessLifecycleManager:
             self._download_process_info = None
         self._kill_owned_outside_the_map()
         self.neutralize_message_queue_feeder()
+
+    def _discard_status_queue_backlog(self) -> None:
+        """Take and drop whatever the children have put on the status queue since the control loop last read it.
+
+        Bounded by what is readable now: an ``empty()`` that reads True ends it, and so does a read that finds
+        nothing, so a queue double that answers neither can only be read a fixed number of times.
+        """
+        for _ in range(_SHUTDOWN_REAP_DRAIN_LIMIT):
+            try:
+                if self._process_message_queue.empty():
+                    return
+                self._process_message_queue.get(block=False)
+            except QueueEmpty:
+                return
+            except Exception as drain_error:  # noqa: BLE001 - teardown must continue across every child
+                logger.debug(f"Failed to drain the status queue during shutdown: {type(drain_error).__name__}")
+                return
 
     def neutralize_message_queue_feeder(self) -> None:
         """Abandon buffered puts on every parent-owned child-facing queue so interpreter exit cannot wedge.

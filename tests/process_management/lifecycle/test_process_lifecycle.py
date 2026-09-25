@@ -18,6 +18,7 @@ from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.lifecycle import process_lifecycle as process_lifecycle_module
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
@@ -175,8 +176,9 @@ class TestFinalShutdownReap:
         vae_process.mp_process.kill.assert_not_called()
         download_process.mp_process.kill.assert_not_called()
 
-    def test_reap_kills_and_joins_a_graceful_shutdown_straggler(self) -> None:
+    def test_reap_kills_and_joins_a_graceful_shutdown_straggler(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A lane that ignores END_PROCESS is killed and reaped before teardown reports success."""
+        monkeypatch.setattr(process_lifecycle_module, "ALL_PROCESS_SHUTDOWN_REAP_GRACE_SECONDS", 0.0)
         vae_process = _make_exiting_process_info(4, HordeProcessType.VAE_LANE, exits_gracefully=False)
         process_map = ProcessMap({4: vae_process})
         process_lifecycle = _make_plm(process_map=process_map)
@@ -186,6 +188,23 @@ class TestFinalShutdownReap:
         vae_process.mp_process.kill.assert_called_once()
         assert vae_process.mp_process.join.call_count == 2
         assert len(process_map) == 0
+
+    def test_reap_drains_the_status_queue_while_it_waits(self) -> None:
+        """A child cannot finish exiting while its last messages sit in a pipe nobody reads.
+
+        The child's interpreter exit joins the status queue's feeder thread, which blocks once the pipe is full,
+        so the reap must keep taking messages off the queue for as long as it waits on a child.
+        """
+        vae_process = _make_exiting_process_info(4, HordeProcessType.VAE_LANE, exits_gracefully=True)
+        process_lifecycle = _make_plm(process_map=ProcessMap({4: vae_process}))
+        status_queue = Mock()
+        status_queue.empty.side_effect = [False, False, True]
+        process_lifecycle._process_message_queue = status_queue
+
+        assert process_lifecycle.reap_all_processes_for_shutdown() is True
+
+        assert status_queue.get.call_count == 2
+        status_queue.get.assert_called_with(block=False)
 
     def test_hard_kill_includes_out_of_map_download_process(self) -> None:
         """The terminal backstop must not orphan the downloader when it force-exits the parent."""
