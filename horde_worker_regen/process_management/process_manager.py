@@ -226,7 +226,12 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     WorkerRunMetrics,
     scenario_provenance_from_env,
 )
-from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommandKind, VramArbiter
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    ActuatorCommandKind,
+    VramArbiter,
+    VramDisposition,
+    VramVerdict,
+)
 from horde_worker_regen.process_management.resources.vram_attribution import (
     _REPORT_STALENESS_SECONDS,
     DriftObservation,
@@ -921,39 +926,10 @@ _BYTES_PER_GIGABYTE = 1024**3
 """Bytes in one binary gigabyte, used to turn the pool's gigabyte-valued download budget into a byte budget."""
 
 _POST_PROCESSING_PEAK_MB = 3100.0
-"""Historically measured VRAM peak of the dedicated post-processing lane (~3.1GB for a 4x ESRGAN pass at 1024px).
+"""The single representative post-processing chain cost (MB) the pop-time offer probe prices.
 
-The proactive advertising gate and the breaker's headroom-gated auto-recovery both size their free-VRAM
-requirement from this figure."""
-
-_POST_PROCESSING_HEADROOM_MARGIN_MB = 512.0
-"""Safety margin added above the measured post-processing peak so the gate opens only with real slack.
-
-Without it the gate would open with the card balanced exactly at the peak, where the next allocation still tips
-it into driver demand-paging."""
-
-POST_PROCESSING_HEADROOM_REQUIREMENT_MB = _POST_PROCESSING_PEAK_MB + _POST_PROCESSING_HEADROOM_MARGIN_MB
-"""Free VRAM (MB) a driven card must show for admitted post-processing work to still be viable.
-
-The measured post-processing lane peak plus its safety margin. Dropping below this closes the advertising
-gate immediately."""
-
-_POST_PROCESSING_RESIDENT_SHIFT_MARGIN_MB = 5120.0
-"""Extra free VRAM required beyond the peak requirement before the advertising gate will OPEN.
-
-Advertising is a promise about the future: a post-processing job admitted while the gate is open runs its
-VRAM peak only after sampling, by which time a model swap can have consumed several GB (a single SDXL-class
-checkpoint is ~5GB). Observed live: a gate keyed to the bare requirement oscillated with the card's marginal
-state and every open window admitted a few jobs that faulted once residency shifted under them. Opening only
-with this shift margin on top means the card must have slack for the peak even after one heavy resident
-lands, so a config whose steady state is heavy-resident (e.g. value-ranked SDXL pool seats on a 16GB card)
-simply keeps post-processing withheld instead of leaking doomed jobs, while light-resident configs open and
-serve post-processing normally. Closing still uses the bare requirement, giving the gate wide hysteresis."""
-
-POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB = (
-    POST_PROCESSING_HEADROOM_REQUIREMENT_MB + _POST_PROCESSING_RESIDENT_SHIFT_MARGIN_MB
-)
-"""Free VRAM (MB) a driven card must sustain before the worker will advertise or re-enable post-processing."""
+A measured lane peak (~3.1GB for a 4x ESRGAN pass at 1024px). At pop time the job is unknown, so the offer asks
+the arbiter about this one figure. Dispatch prices each real chain through hordelib's estimate instead."""
 
 TERMINAL_FAULT_BREAKER_THRESHOLD = 3
 """Terminal generation faults within the window that trip the worker's fault-rate breaker.
@@ -1661,13 +1637,6 @@ class HordeWorkerProcessManager:
         self._governor_states_by_device: dict[int, GovernorState] = {}
         self._last_device_free_mb_by_device: dict[int, float] = {}
         self._last_device_total_mb_by_device: dict[int, float] = {}
-        # Throttle for the one-shot post-processing headroom reclaim: at most one *successful* idle-resident
-        # unload per fault window, whether triggered by a recorded over-commit fault or a proactive-gate closure.
-        self._last_post_processing_reclaim_at = 0.0
-        # Monotonic stamp of when measured free VRAM last began continuously holding the post-processing
-        # requirement; None while below it. The headroom gate opens only after the sustain window elapses,
-        # so a momentarily-empty booting card cannot admit a doomed wave of post-processing jobs.
-        self._pp_headroom_sustained_since: float | None = None
 
         # The control types each image-utilities lane process can currently annotate, keyed by its process
         # id, learned from the lane's availability snapshots. The pre-annotation scan keys on the union of
@@ -1899,6 +1868,7 @@ class HordeWorkerProcessManager:
             decision_sink=self._run_metrics.record_decision,
         )
         self._post_process_orchestrator.set_vram_arbiter(self._vram_arbiter)
+        self._post_process_orchestrator.set_idle_resident_probe(self._inference_scheduler.has_evictable_idle_resident)
 
         # Disaggregated jobs whose decode completed; drained each loop into the safety pipeline (the
         # orchestrator's completion callback is sync, but safety routing is async).
@@ -2676,18 +2646,16 @@ class HordeWorkerProcessManager:
         )
 
     def _apply_post_processing_fault_breaker(self) -> None:
-        """Trip, auto-recover, or reclaim for the reactive post-processing over-commit breaker.
+        """Trip or auto-recover the reactive post-processing over-commit breaker.
 
         A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
         over-commits) faults the job; the horde reissues it, but a worker that keeps faulting trips the horde's
         forced-maintenance, the very spiral this guards against. When such faults (the scheduler's
         unhostable-peak faults and the lifecycle's reaped post-processing stalls) exceed the configured
         threshold within the window, stop advertising post-processing so the worker is no longer handed
-        upscale/face-fix jobs it cannot host. A fresh fault first attempts one throttled idle-resident reclaim,
-        so a momentarily-idle heavy resident yields the card and the peak may fit without latching at all. Once
-        latched, the fault-count breaker auto-recovers when the parent measures the card's free VRAM back above
-        the post-processing requirement (see :meth:`_maybe_reenable_post_processing_after_breaker`); a host
-        without an NVML reading keeps the session latch until restart.
+        upscale/face-fix jobs it cannot host. Making room for a chain is the dispatch-side reclaim ladder's job,
+        so a fault here only counts. Once latched, the fault-count breaker auto-recovers on a quiet window and
+        the offer probe (see :meth:`_maybe_reenable_post_processing_after_breaker`).
         """
         if not self.bridge_data.post_processing_fault_breaker_enabled:
             return
@@ -2696,14 +2664,11 @@ class HordeWorkerProcessManager:
         recent_faults = self._job_tracker.count_recent_post_processing_faults(window, now=now)
 
         if self._state.post_processing_disabled_by_breaker:
-            self._maybe_reenable_post_processing_after_breaker(now=now, recent_faults=recent_faults)
+            self._maybe_reenable_post_processing_after_breaker(recent_faults=recent_faults)
             return
 
         if recent_faults <= 0:
             return
-
-        # A fresh over-commit fault: try to free headroom first, so the peak may fit without ever latching.
-        self._maybe_reclaim_vram_for_post_processing(now=now)
 
         threshold = self.bridge_data.post_processing_fault_threshold
         if recent_faults <= threshold:
@@ -2713,33 +2678,31 @@ class HordeWorkerProcessManager:
         self._state.post_processing_breaker_auto_recoverable = True
         self._state.post_processing_breaker_tripped_at = now
         self._state.post_processing_disabled_reason = (
-            f"{recent_faults} post-processing over-commit faults in {window:.0f}s; suppressed until the card's "
-            "free VRAM recovers above the post-processing peak, or on restart."
+            f"{recent_faults} post-processing over-commit faults in {window:.0f}s; suppressed until the fault "
+            "window passes with no further faults, or on restart."
         )
         logger.warning(
             f"Post-processing fault breaker tripped: {recent_faults} post-processing over-commit fault(s) in the "
             f"last {window:.0f}s (threshold {threshold}). Disabling post-processing advertising so the worker "
             "stops being handed upscale/face-fix jobs it cannot host (which keep faulting and risk the horde "
-            "forcing maintenance). It re-enables automatically once the card's measured free VRAM recovers above "
-            f"the ~{POST_PROCESSING_HEADROOM_REQUIREMENT_MB / 1024:.1f}GB post-processing requirement.",
+            "forcing maintenance). It re-enables automatically once the fault window passes with no further "
+            "over-commit faults and a driven card can host the post-processing peak.",
         )
 
-    def _maybe_reenable_post_processing_after_breaker(self, *, now: float, recent_faults: int) -> None:
-        """Re-enable post-processing once the fault window has passed and the card recovered its VRAM peak.
+    def _maybe_reenable_post_processing_after_breaker(self, *, recent_faults: int) -> None:
+        """Re-enable post-processing once the fault window is quiet and the offer probe finds a card for it.
 
         Only the fault-count breaker's latch auto-recovers; a structural whole-card residency disable stays
-        latched to restart. Re-enable requires BOTH no over-commit fault counted within the window (the window
-        since the last fault has passed) AND the parent's measured device-free VRAM risen above the
-        post-processing requirement on a driven card. A host without an NVML reading cannot satisfy the headroom
-        gate, so it stays session-latched exactly as before. Edge-triggered: it runs only while the latch is set
-        and clears it, so the re-enable log fires once.
+        latched to restart. Re-enable needs no over-commit fault within the window and the same probe the offer
+        gate uses (:meth:`_post_processing_offer_denial`), so the breaker never re-opens what the offer would
+        refuse. A host with no device reading has no card the probe can rule out and re-enables on the window
+        alone. Edge-triggered: it runs only while the latch is set and clears it, so the log fires once.
         """
         if not self._state.post_processing_breaker_auto_recoverable:
             return
         if recent_faults > 0:
             return
-        free_mb = self._max_driven_card_free_mb()
-        if free_mb is None or free_mb < POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB:
+        if self._post_processing_offer_denial() is not None:
             return
         self._state.post_processing_disabled_by_breaker = False
         self._state.post_processing_breaker_auto_recoverable = False
@@ -2747,85 +2710,61 @@ class HordeWorkerProcessManager:
         self._state.post_processing_disabled_reason = ""
         logger.info(
             "Post-processing fault breaker cleared: the fault window elapsed with no further over-commit faults "
-            f"and a driven card's measured free VRAM ({free_mb:.0f}MB) recovered above the "
-            f"~{POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB / 1024:.1f}GB open requirement (peak plus resident-shift "
-            "margin). Re-enabling post-processing advertising.",
+            "and a driven card can host the post-processing peak. Re-enabling post-processing advertising.",
         )
 
-    _POST_PROCESSING_HEADROOM_SUSTAIN_SECONDS = 60.0
-    """How long measured free VRAM must continuously hold the post-processing requirement before the gate opens.
+    def _post_processing_offer_denial(self) -> VramVerdict | None:
+        """Return the first card's DENY when every driven card denies the post-processing peak, else None.
 
-    An instantaneous reading races the boot load-up: right after launch the card is empty, so a spot check
-    would open the gate, admit a wave of post-processing jobs, and every one of them faults once the heavy
-    residents land (observed live: the whole first wave burned before the breaker tripped). Requiring the
-    headroom to hold across a sustain window means the gate only opens against the card's steady state, and
-    a single dip immediately restarts the proof."""
+        The offer is a derived verdict of the one VRAM arbiter, asked the same PP_JOB question dispatch asks.
+        Only DENY counts against it. DENY is the arbiter's structural ``candidate > total - noise - foreign
+        floor``, which a free-VRAM dip cannot produce, while a DEFER means the dispatch-side ladder can make
+        room. A card with no cycle state answers a relaxed FITS, and a host with no driven-card reading has no
+        card to deny on, so both keep the offer open as every gate does on missing telemetry.
+        """
+        first_denial: VramVerdict | None = None
+        for device_index in sorted(self._last_device_free_mb_by_device):
+            verdict = self._vram_arbiter.evaluate(
+                self._post_process_orchestrator.build_offer_request(
+                    device_index=device_index,
+                    candidate_delta_mb=_POST_PROCESSING_PEAK_MB,
+                ),
+            )
+            if verdict.disposition is not VramDisposition.DENY:
+                return None
+            if first_denial is None:
+                first_denial = verdict
+        return first_denial
 
     def _apply_post_processing_headroom_gate(self) -> None:
-        """Proactively withhold post-processing advertising until a driven card sustainably hosts its VRAM peak.
+        """Withhold post-processing advertising while no driven card could ever host the post-processing peak.
 
-        The parent measures device-free VRAM directly (the truthful figure under WDDM). Advertising starts
-        withheld and opens only after a card's measured free VRAM has held above the post-processing peak plus
-        margin for the sustain window, so the boot load-up race (an empty card momentarily looks spacious)
-        cannot admit a wave of jobs that fault once heavy residents land. Any reading below the requirement
-        closes the gate at once and restarts the proof; a closure also attempts one throttled idle-resident
-        reclaim so the card can re-open the gate on its own. A host without an NVML reading never gates here
-        (headroom is unmeasurable), preserving its reactive-breaker-only behaviour. Edge-triggered logs on
-        both transitions.
+        Reads :meth:`_post_processing_offer_denial` every tick with no sustain window. The DENY it closes on is
+        structural and so stable by construction, and a transient shortage is the dispatch ladder's to
+        resolve. Shares the fault breaker's master switch. Edge-triggered logs on both transitions.
         """
         if not self.bridge_data.post_processing_fault_breaker_enabled:
-            # The proactive gate shares the breaker's master switch: an operator who turned the self-protection
-            # off has opted out of the worker second-guessing its own post-processing advertising.
-            self._state.post_processing_withheld_for_headroom = False
-            return
-        free_mb = self._max_driven_card_free_mb()
-        if free_mb is None:
-            # No NVML reading: headroom is unmeasurable, so never proactively gate on it.
+            # An operator who turned the self-protection off has opted out of the worker second-guessing its
+            # own post-processing advertising.
             self._state.post_processing_withheld_for_headroom = False
             return
 
-        now = time.monotonic()
-        if free_mb < POST_PROCESSING_HEADROOM_REQUIREMENT_MB:
-            self._pp_headroom_sustained_since = None
+        denial = self._post_processing_offer_denial()
+        if denial is not None:
             if not self._state.post_processing_withheld_for_headroom:
                 self._state.post_processing_withheld_for_headroom = True
                 logger.warning(
-                    f"Withholding post-processing advertising: a driven card's measured free VRAM "
-                    f"({free_mb:.0f}MB) is below the ~{POST_PROCESSING_HEADROOM_REQUIREMENT_MB / 1024:.1f}GB "
-                    "post-processing peak requirement, so a post-processing job would only fault at the lane. "
-                    "Attempting a one-shot idle-resident reclaim to free the card.",
-                )
-                self._maybe_reclaim_vram_for_post_processing(now=time.time())
-            return
-
-        if free_mb < POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB:
-            # The hysteresis band: enough headroom for already-admitted work, not enough to promise more.
-            # An open gate stays open (the close threshold governs it); a withheld gate stops accumulating
-            # its steady-state proof, since opening from here would leak jobs into a resident shift.
-            self._pp_headroom_sustained_since = None
-            return
-
-        if self._pp_headroom_sustained_since is None:
-            self._pp_headroom_sustained_since = now
-        sustained = (now - self._pp_headroom_sustained_since) >= self._POST_PROCESSING_HEADROOM_SUSTAIN_SECONDS
-        if not sustained:
-            if not self._state.post_processing_withheld_for_headroom:
-                # Headroom looks fine but has not yet held for the sustain window (the boot race window);
-                # withhold quietly until the proof completes.
-                self._state.post_processing_withheld_for_headroom = True
-                logger.info(
-                    f"Holding post-processing advertising until free VRAM ({free_mb:.0f}MB) sustains the "
-                    f"~{POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB / 1024:.1f}GB open requirement for "
-                    f"{self._POST_PROCESSING_HEADROOM_SUSTAIN_SECONDS:.0f}s (steady-state proof).",
+                    "Withholding post-processing advertising: the VRAM arbiter rules out the post-processing "
+                    f"lane's ~{_POST_PROCESSING_PEAK_MB / 1024:.1f}GB peak on every driven card, so a "
+                    f"post-processing job could only fault. {denial.stated}.",
                 )
             return
 
         if self._state.post_processing_withheld_for_headroom:
             self._state.post_processing_withheld_for_headroom = False
             logger.info(
-                f"Re-advertising post-processing: a driven card's measured free VRAM ({free_mb:.0f}MB) held "
-                f"above the ~{POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB / 1024:.1f}GB open requirement (peak plus "
-                "resident-shift margin) for the sustain window.",
+                "Re-advertising post-processing: the VRAM arbiter no longer rules out the post-processing "
+                f"lane's ~{_POST_PROCESSING_PEAK_MB / 1024:.1f}GB peak on every driven card.",
             )
 
     def _all_governed_cards_under_vram_pressure(self) -> bool:
@@ -2840,40 +2779,6 @@ class HordeWorkerProcessManager:
         if not self._governor_states_by_device:
             return False
         return all(state is not GovernorState.HEALTHY for state in self._governor_states_by_device.values())
-
-    def _max_driven_card_free_mb(self) -> float | None:
-        """Return the highest recent NVML device-free reading across driven cards, or None when unavailable.
-
-        The proactive post-processing gate and the breaker's headroom-gated auto-recovery both ask whether at
-        least one driven card can currently host the post-processing peak; the maximum across cards answers that
-        worker-wide question. None when no card has a reading yet (a host without NVML), which both callers treat
-        as "headroom is unmeasurable" and fall back accordingly (never gate, never auto-recover).
-        """
-        if not self._last_device_free_mb_by_device:
-            return None
-        return max(self._last_device_free_mb_by_device.values())
-
-    def _maybe_reclaim_vram_for_post_processing(self, *, now: float) -> None:
-        """Unload one coldest idle resident's VRAM so a stranded post-processing peak can fit (throttled).
-
-        A momentarily-idle heavy resident that no queued or in-progress job needs is unloaded (weights to RAM,
-        the RAM copy retained) so the post-processing peak fits on the next attempt and the model re-stages from
-        RAM afterwards. Throttled to one successful reclaim per fault window so a burst of over-commit faults (or
-        a sustained headroom shortage) does not thrash the card. A no-op when every resident is busy or is a
-        queued/in-progress job's model, since evicting one of those would only force an immediate reload.
-        """
-        window = self.bridge_data.post_processing_fault_window_seconds
-        if now - self._last_post_processing_reclaim_at < window:
-            return
-        victim_model = self._inference_scheduler.reclaim_coldest_idle_resident()
-        if victim_model is None:
-            return
-        self._last_post_processing_reclaim_at = now
-        logger.info(
-            f"Post-processing headroom reclaim: unloaded idle resident model {victim_model} from VRAM (its RAM "
-            "copy is kept) so the post-processing lane's VRAM peak can fit; the model re-stages from RAM when a "
-            "later job needs it.",
-        )
 
     def set_maintenance(self, enabled: bool, workloads: Iterable[WorkloadKind] | None = None) -> None:
         """Set the *server-side* maintenance flag of this worker's logical workers via the horde API (blocking).
@@ -4432,7 +4337,6 @@ class HordeWorkerProcessManager:
             self._apply_self_maintenance_throttle()
             self._drive_server_maintenance_recovery()
             self._apply_post_processing_fault_breaker()
-            self._apply_post_processing_headroom_gate()
             if self._state.server_maintenance_cleared_by_job_pop and self._worker_details_maintenance:
                 logger.info("Clearing cached worker-details maintenance: a new job was popped successfully.")
                 self._worker_details_maintenance = False
@@ -4496,6 +4400,9 @@ class HordeWorkerProcessManager:
             # running). Placed after the housekeeping above so the governor snapshots the same process-map
             # and pause state a scheduling cycle would.
             self._begin_vram_arbiter_cycle()
+            # The offer probe prices against the cycle just frozen, so it reads the same cards and readings the
+            # governance tick below acts on.
+            self._apply_post_processing_headroom_gate()
             self._inference_scheduler.run_governance_tick()
 
             # Drive the GPU denoise clearance controllers every tick, independent of queue depth: they must be

@@ -1242,7 +1242,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     job unless the device's measured free VRAM covers the job's estimated peak plus
     `vram_reserve_mb`, and it evicts the coldest idle resident model under pressure. This is the
     proactive guard against the multi-process over-commit that OOMs a shared GPU. Set false to
-    restore the prior availability-only behavior (not recommended on a shared/consumer GPU)."""
+    restore the prior availability-only behavior (not recommended on a shared/consumer GPU).
+
+    Off means no deferral, not no housekeeping: a post-processing chain the arbiter would not admit takes the
+    cheapest reclaim rung that acts, then dispatches on the same tick."""
 
     enable_pipeline_disaggregation: bool = Field(default=False)
     """Route eligible jobs through the disaggregated stage pipeline instead of the monolithic path.

@@ -209,6 +209,8 @@ class ActuatorCommandKind(StrEnum):
     """Ask an idle lane to release its cached allocator reservation back to the device."""
     EVICT_IDLE_MODEL = "evict_idle_model"
     """Evict an idle VRAM-resident model to reclaim its weights."""
+    EVICT_COLDEST_IDLE_MODEL = "evict_coldest_idle_model"
+    """Evict the single coldest idle inference resident on the card, for a lane tenant that needs no slot."""
     REDUCE_LIVE_CONTEXTS = "reduce_live_contexts"
     """Reduce the live inference context count so a retained per-context reservation returns to the device."""
     PAUSE_VAE_LANE = "pause_vae_lane"
@@ -271,6 +273,15 @@ class VramActuator(Protocol):
         head: HeadReclaimContext | None = None,
     ) -> bool:
         """Evict an idle VRAM-resident model on the card to reclaim its weights, sparing ``head`` when given."""
+        ...
+
+    def evict_coldest_idle_model(self, device_index: int | None) -> bool:
+        """Unload the one coldest idle inference resident on the card; report whether an unload was issued.
+
+        Never a post-processing lane's models and never a busy or in-progress model. One verified step at a time
+        is the ladder's style, and a lane tenant never needs a slot, so the head-shaped sweep is the wrong tool
+        for it.
+        """
         ...
 
     def reduce_live_contexts(self, device_index: int | None, *, head: HeadReclaimContext | None = None) -> bool:
@@ -1300,7 +1311,8 @@ class VramArbiter:
 
         Only commands that could still free device memory are emitted. RELEASE_CACHE targets idle lanes (a
         busy lane is never a target, and the request's own target slot is never asked to release the cache it
-        is about to load into); EVICT_IDLE_MODEL is emitted only when an idle resident model exists to evict;
+        is about to load into); EVICT_IDLE_MODEL is emitted only when an idle resident model exists to evict,
+        and a PP_JOB takes the single-step EVICT_COLDEST_IDLE_MODEL in its place;
         REDUCE_LIVE_CONTEXTS only when a warranted context reduction is available. An empty ladder therefore
         means the arbiter's own per-cycle reclamation is structurally exhausted: nothing the caller could run
         this cycle would free memory. The commands are described for the caller to execute; the arbiter runs
@@ -1318,7 +1330,12 @@ class VramArbiter:
                 ),
             )
         if request.has_reclaimable_idle_model:
-            commands.append(ActuatorCommand(kind=ActuatorCommandKind.EVICT_IDLE_MODEL, device_index=None))
+            evict_kind = (
+                ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL
+                if request.kind is VramRequestKind.PP_JOB
+                else ActuatorCommandKind.EVICT_IDLE_MODEL
+            )
+            commands.append(ActuatorCommand(kind=evict_kind, device_index=None))
         if request.can_reduce_live_contexts:
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None))
         if state.safety_context_count > 0 and state.safety_weights_demotable:

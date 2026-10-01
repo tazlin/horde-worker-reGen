@@ -376,6 +376,14 @@ class _WholeCardDemandOutcome(enum.Enum):
 
 
 @dataclass(frozen=True)
+class IdleResidentCandidate:
+    """Represents the coldest idle inference resident a single-step eviction would unload."""
+
+    process_id: int
+    model_name: str
+
+
+@dataclass(frozen=True)
 class _MaterializationOutcome:
     """The result of pricing a job's VRAM materialisation through the MONOLITHIC_DISPATCH arbiter identity.
 
@@ -2855,10 +2863,16 @@ class InferenceScheduler:
             self._min_hold_disclosed.pop(device_index, None)
             if self._reclaim_ladder is not None:
                 self._reclaim_ladder.discharge_context_reduction(device_index)
+            # Only the structural whole-card latch keeps the lane down: it means the lane cannot coexist with
+            # the residency model at all. The fault-count latch recovers on its own and withholds the offer by
+            # itself, so a lane left paused under it would stay off the card after that latch clears.
+            structural_post_processing_latch = (
+                self._state.post_processing_disabled_by_breaker
+                and not self._state.post_processing_breaker_auto_recoverable
+            )
             post_process_restored = (
                 self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
-                if self._residency_should_pause_post_process(device_index)
-                and not self._state.post_processing_disabled_by_breaker
+                if self._residency_should_pause_post_process(device_index) and not structural_post_processing_latch
                 else False
             )
             vae_lane_restored = (
@@ -7323,14 +7337,34 @@ class InferenceScheduler:
     def reclaim_coldest_idle_resident(self, *, device_index: int | None = None) -> str | None:
         """Unload the coldest idle resident model's VRAM to make room for another tenant; return its name.
 
-        Picks the least-recently-demanded idle inference resident whose model no pending or in-progress job
-        needs, and unloads its weights to RAM (the RAM copy is retained, so a later job re-stages it cheaply).
-        Returns the unloaded model's name, or None when no such momentarily-idle resident exists (every resident
-        is busy, is already unloading, or is a queued/in-progress job's model, so yielding one would only force
-        an immediate reload). The post-processing lane's headroom reclaim and the safety process's return to
-        the GPU both buy their room here.
+        Unloads the :meth:`_coldest_idle_resident` selection's weights to RAM (the RAM copy is retained, so a
+        later job re-stages it cheaply). Returns the unloaded model's name, or None when there is no such
+        resident or the unload could not be sent. The safety process's return to the GPU and the
+        post-processing lane's ladder rung both buy their room here.
 
         ``device_index`` scopes the search to one card on a multi-GPU host; None considers every card.
+        """
+        candidate = self._coldest_idle_resident(device_index)
+        if candidate is None:
+            return None
+        if not self.unload_idle_model(candidate.process_id, device_index=device_index):
+            return None
+        return candidate.model_name
+
+    def has_evictable_idle_resident(self, device_index: int | None) -> bool:
+        """Return whether :meth:`evict_coldest_idle_model` has a resident to unload on the card right now."""
+        return self._coldest_idle_resident(device_index) is not None
+
+    def evict_coldest_idle_model(self, device_index: int | None) -> bool:
+        """Unload the one coldest idle inference resident on the card (:class:`VramActuator`)."""
+        return self.reclaim_coldest_idle_resident(device_index=device_index) is not None
+
+    def _coldest_idle_resident(self, device_index: int | None) -> IdleResidentCandidate | None:
+        """Return the least-recently-demanded idle inference resident no queued or running job needs, if any.
+
+        Skips busy slots, slots already unloading, and any model a pending or in-progress job needs, since
+        yielding one of those would only force an immediate reload. Inference slots only, so a lane's models are
+        never chosen. ``device_index`` scopes the search to one card; None considers every card.
         """
         pending_models = {job.model for job in self._job_tracker.jobs_pending_inference}
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
@@ -7358,11 +7392,9 @@ class InferenceScheduler:
                 coldest_process_id = process_info.process_id
                 coldest_model_name = model_name
 
-        if coldest_process_id is None:
+        if coldest_process_id is None or coldest_model_name is None:
             return None
-        if not self.unload_idle_model(coldest_process_id, device_index=device_index):
-            return None
-        return coldest_model_name
+        return IdleResidentCandidate(process_id=coldest_process_id, model_name=coldest_model_name)
 
     def release_idle_cache(self, process_id: int) -> bool:
         """Release an idle process's reclaimable allocator cache back to the card (reclaim-ladder actuator)."""

@@ -2098,7 +2098,7 @@ class TestPostProcessingVramStall:
         findings = _diagnose(tmp_path, self._bridge(self._stall("16:53:42.000"), self._breaker("16:55:00.000")))
         finding = findings["post_processing_vram_stall"]
         assert finding.severity is Severity.CRITICAL
-        assert "already off" in finding.action
+        assert "comes back on its own" in finding.action
 
     def test_breaker_only_still_fires(self, tmp_path: Path) -> None:
         """The detector fires on a breaker-only session (the planner-fault path leaves no stall line)."""

@@ -14,6 +14,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.resources.reclaim_ladder import verification_settle_seconds
 from horde_worker_regen.process_management.scheduling.governance.whole_card import _MIN_HOLD_SECONDS
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
@@ -194,9 +195,23 @@ async def test_post_processing_admission_applies_remaining_safety_reclaim(monkey
 
     job_info = post_process_tests._make_pp_job_info(["RealESRGAN_x4plus"])
     await process_manager._job_tracker.queue_for_post_processing(job_info)
+    clock = [1000.0]
+    process_manager._post_process_orchestrator._clock = lambda: clock[0]
     process_manager._begin_vram_arbiter_cycle()
 
     await process_manager.start_post_processing()
+
+    # A lane head climbs the plan one verified rung per settle: the idle slot's cache release comes first, so
+    # the safety rung is not reached on the first deferral tick.
+    assert job_info in process_manager._job_tracker.jobs_pending_post_processing
+    assert process_manager._process_lifecycle.is_safety_gpu_paused is False
+
+    for _ in range(3):
+        if process_manager._process_lifecycle.is_safety_gpu_paused:
+            break
+        clock[0] += verification_settle_seconds() + 1.0
+        process_manager._begin_vram_arbiter_cycle()
+        await process_manager.start_post_processing()
 
     assert job_info in process_manager._job_tracker.jobs_pending_post_processing
     assert process_manager._process_lifecycle.is_safety_gpu_paused is True

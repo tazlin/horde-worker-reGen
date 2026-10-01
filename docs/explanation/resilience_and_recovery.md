@@ -842,18 +842,23 @@ rolling-window counter
 once it exceeds `post_processing_fault_threshold` within
 `post_processing_fault_window_seconds`, the worker stops advertising
 post-processing at pop time, so the horde stops sending it upscale/face-fix jobs.
-Recovery is **headroom-gated rather than restart-only**: because the over-commit
-is a VRAM shortage the card can grow out of (a heavy resident unloads, a fixed
-pool seat rotates to a smaller model), the latch clears once the parent measures
-the card's free VRAM back above the post-processing peak plus a safety margin,
-and a fresh fault first attempts a one-shot idle-resident VRAM reclaim so the
-peak may fit without ever latching. A **proactive** gate closes the same loop
-from the front: whenever the parent measures free VRAM below that requirement it
-withholds post-processing advertising before any fault, killing the boot-window
-burst a relaunch into heavy residents would otherwise pay. Both paths need a
-truthful NVML device-free reading; a host without one keeps the reactive breaker
-alone, **session-latched** (it survives a soft reset and clears only on restart).
-The structural whole-card conflict that shares the latch never auto-recovers. It
+The fault-count latch **recovers on its own**. It clears once the window holds no
+over-commit fault and the VRAM arbiter does not rule the post-processing peak out
+on every driven card. The faults the latch itself issues while draining pending
+work do not count toward the window, so the latch cannot hold itself set. A
+**proactive** offer gate asks the arbiter the same question every control-loop
+tick and withholds post-processing at pop time only when every driven card returns
+DENY for a representative chain, meaning the peak exceeds the card's total less its
+noise buffer and the VRAM other processes hold. A transient shortage is a DEFER,
+which never closes the offer. Dispatch prices the real chain and the arbiter's
+reclaim ladder makes room for it, unloading the coldest idle model no queued or
+running job needs one step at a time. With `enable_vram_budget: false` that verdict is
+advisory. Its cheapest reclaim rung still runs and the chain dispatches on the same tick. There
+is no sustain window or margin. A host without a device reading has no card to deny
+on, so its offer stays open and its breaker recovers on the window alone.
+The structural whole-card conflict that shares the latch never auto-recovers, and
+a whole-card residency keeps the post-processing lane paused only under that
+structural latch. It
 mirrors the per-model unservable breaker and the self-maintenance throttle: a
 worker that protects its own standing on the horde rather than bleeding dropped
 jobs until the server intervenes. The dedicated post-processing lane (see

@@ -636,8 +636,8 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
     )
     if breaker_trips:
         action = (
-            "Post-processing is already off for the rest of this session and comes back on its own once free "
-            "VRAM recovers. If the card cannot get there, turn on the VRAM budget, or lower `max_threads` or "
+            "Post-processing is off for now and comes back on its own once a fault window passes without "
+            "another stall. If the stalls return, turn on the VRAM budget, or lower `max_threads` or "
             "`queue_size`."
         )
     else:

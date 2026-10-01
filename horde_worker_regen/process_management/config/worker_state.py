@@ -257,23 +257,20 @@ class WorkerState:
     post_processing_disabled_by_breaker: bool = False
     """The post-processing fault breaker (or a whole-card residency conflict) has stopped advertising post-processing.
 
-    A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
-    over-commits) faults the job and, reaped, accumulates toward this breaker. While true the job popper stops
-    advertising post-processing support (see the popper's ``pop_allow_post_processing``) so the worker is no
-    longer handed upscale/face-fix jobs it cannot host, ending the fault->forced-maintenance spiral. Whether it
-    can clear without a restart depends on ``post_processing_breaker_auto_recoverable``: the fault-count breaker
-    sets that true and re-enables once the parent measures the card's free VRAM back above the post-processing
-    peak (so a relaunch or seat rotation that frees the card restores post-processing earnings on its own),
-    while a structural whole-card conflict leaves it false and stays latched to restart. Deliberately NOT
-    cleared by a save-our-ship soft reset."""
+    Over-commit faults on accepted post-processing work feed the breaker; the faults the latch itself issues to
+    drain pending work do not. While true the job popper stops advertising post-processing and the orchestrator
+    faults pending chains without images, ending the fault->forced-maintenance spiral. Whether it clears without
+    a restart depends on ``post_processing_breaker_auto_recoverable``. Deliberately not cleared by a
+    save-our-ship soft reset."""
 
     post_processing_breaker_auto_recoverable: bool = False
-    """Whether the current ``post_processing_disabled_by_breaker`` latch may clear on measured headroom recovery.
+    """Whether the current ``post_processing_disabled_by_breaker`` latch clears on its own.
 
-    Set true only by the rolling-window fault-count breaker, whose over-commit can be undone when the card
-    later has room (a heavy resident unloads, a seat rotates to a smaller model). Left false by the structural
-    whole-card residency conflict, which cannot be undone in-session and so stays latched until restart. Read
-    only while ``post_processing_disabled_by_breaker`` is true; meaningless otherwise."""
+    True for the rolling-window fault-count breaker: it clears once the window holds no over-commit fault and
+    the offer probe finds a driven card the arbiter does not rule the post-processing peak out on, and a
+    whole-card residency restores a lane it paused under this latch. False for the structural whole-card
+    residency conflict, which holds until restart and keeps the lane paused. Read only while
+    ``post_processing_disabled_by_breaker`` is true."""
 
     post_processing_breaker_tripped_at: float = 0.0
     """Wall-clock time the post-processing breaker tripped; 0 when not tripped (for the operator advisory/TUI)."""
@@ -287,13 +284,12 @@ class WorkerState:
     """
 
     post_processing_withheld_for_headroom: bool = False
-    """Proactive gate: the parent measures a driven card's free VRAM below the post-processing peak requirement.
+    """The VRAM arbiter denies the post-processing peak on every driven card, so the offer is withheld.
 
-    Independent of the fault breaker's latch: while true the job popper withholds post-processing advertising
-    before any fault occurs, so a worker relaunched into heavy residents does not earn a boot-window burst of
-    post-processing jobs it cannot yet host. Cleared the moment a driven card's measured free VRAM recovers
-    above the requirement. Never set on a host without an NVML device-free reading (headroom is unmeasurable
-    there), so such a host keeps its fault-breaker-only behaviour."""
+    Re-evaluated every control-loop tick against the arbiter's cycle. Only a DENY (the peak exceeds the card's
+    achievable ceiling) sets it; a transient shortage is a DEFER the dispatch ladder resolves, so free-VRAM
+    swings never close the offer. Independent of the fault breaker's latch, and forced false when the breaker's
+    master switch is off."""
 
     lora_disk_exhausted: bool = False
     """The LoRA cache volume is below its free-space floor and eviction could not clear it.

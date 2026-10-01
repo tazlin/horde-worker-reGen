@@ -112,6 +112,15 @@ less than half of a promised multi-GB unload, by contrast, means the rung did no
 claimed, and the estimate feeds a calibration event."""
 
 
+def verification_settle_seconds() -> float:
+    """Return the settle an IPC rung gets before its effect can show in a reading.
+
+    For callers outside the engine that climb their own rungs one at a time, so every reclaim path waits the
+    same latency before judging a rung and taking the next.
+    """
+    return _VERIFICATION_BASE_SECONDS
+
+
 class ReclaimRungKind(enum.StrEnum):
     """The kind of pressure-relief action one ladder rung performs."""
 
@@ -974,7 +983,8 @@ class VerifiedReclaimLadder:
         two reclaim triggers; routing both through this engine keeps one execution surface so they can never
         become two mechanisms evicting the same card by different rules. This maps each described
         :class:`ActuatorCommand` onto the caller's :class:`VramActuator`, one action each, exactly as the
-        preload path did inline: RELEASE_CACHE targets an idle lane, EVICT_IDLE_MODEL frees an idle resident,
+        preload path did inline: RELEASE_CACHE targets an idle lane, EVICT_IDLE_MODEL frees an idle resident
+        (EVICT_COLDEST_IDLE_MODEL exactly one, the coldest),
         REDUCE_LIVE_CONTEXTS collapses the live context count, CYCLE_SAFETY_OFF_GPU frees the safety context.
         The arbiter guarantees RELEASE_CACHE and service-lane pause targets are idle, so live work is never
         disturbed. Returns exactly the commands whose actuator reported that it acted; callers that temporarily
@@ -987,6 +997,8 @@ class VerifiedReclaimLadder:
                 acted = actuator.release_cache(command.target_process_id)
             elif command.kind is ActuatorCommandKind.EVICT_IDLE_MODEL:
                 acted = actuator.evict_idle_model(device_index, for_head_of_queue=for_head_of_queue, head=head)
+            elif command.kind is ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL:
+                acted = actuator.evict_coldest_idle_model(device_index)
             elif command.kind is ActuatorCommandKind.REDUCE_LIVE_CONTEXTS:
                 acted = actuator.reduce_live_contexts(device_index, head=head)
             elif command.kind is ActuatorCommandKind.PAUSE_VAE_LANE:

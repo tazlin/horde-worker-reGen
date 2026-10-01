@@ -43,7 +43,10 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    PauseOwner,
+    ProcessLifecycleManager,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.resource_budget import (
@@ -555,6 +558,39 @@ class TestWholeCardPostProcessLanePolicy:
         assert lifecycle.is_post_process_gpu_paused is False
         assert lifecycle.post_process_processes_should_be_replaced is False
         assert pp_process.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+    @pytest.mark.parametrize(
+        ("auto_recoverable", "expect_restore"),
+        [
+            pytest.param(True, True, id="fault_count_latch_restores_lane"),
+            pytest.param(False, False, id="structural_latch_keeps_lane_paused"),
+        ],
+    )
+    def test_residency_release_restores_lane_unless_latch_is_structural(
+        self,
+        *,
+        auto_recoverable: bool,
+        expect_restore: bool,
+    ) -> None:
+        """Only the structural whole-card latch keeps the lane paused when the residency releases.
+
+        A lane paused while the fault-count breaker happened to be latched must come back at release: that
+        latch clears on its own, and a lane left off the card would outlive it.
+        """
+        scheduler, lifecycle, state, _pp_process = _scheduler_with_post_process_lane()
+        restore = Mock(return_value=True)
+        lifecycle.restore_post_process_off_gpu = restore  # type: ignore[method-assign]
+        lifecycle.scale_inference_processes = Mock(return_value=1)  # type: ignore[method-assign]
+        state.post_processing_disabled_by_breaker = True
+        state.post_processing_breaker_auto_recoverable = auto_recoverable
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+
+        scheduler._restore_siblings_after_whole_card()
+
+        if expect_restore:
+            restore.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
+        else:
+            restore.assert_not_called()
 
 
 class TestReservedHeadNeverWaitsIndefinitely:

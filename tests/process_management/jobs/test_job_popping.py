@@ -41,8 +41,8 @@ from horde_worker_regen.process_management.jobs.pool_lanes import PoolLaneState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
-from horde_worker_regen.process_management.process_manager import POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB
 from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
+from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
 from horde_worker_regen.process_management.scheduling.model_pool import PopLane
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedJobSource, make_empty_pop_response
@@ -719,7 +719,7 @@ class TestPostProcessingBreakerSuppression:
         assert request.allow_post_processing is True
 
     async def test_headroom_gate_withholds_post_processing(self) -> None:
-        """With the proactive headroom gate closed, the pop advertises ``allow_post_processing=False``."""
+        """With the arbiter-derived offer gate closed, the pop advertises ``allow_post_processing=False``."""
         state = WorkerState()
         state.post_processing_withheld_for_headroom = True
 
@@ -766,18 +766,20 @@ class TestPausedPostProcessingLaneSuppression:
     def test_pause_alone_withholds_with_the_headroom_gate_open(self) -> None:
         """The pause itself withholds the offer, not either self-protection latch.
 
-        Both latches are proven clear first: the headroom gate is driven open by free VRAM that holds the open
-        requirement past the sustain window, and the fault breaker never trips. The reclaim-ladder lane pause is
-        then the only remaining reason the offer can be withheld.
+        Both latches are proven clear first: the offer gate is open because the arbiter fits the post-processing
+        peak on the card, and the fault breaker never trips. The reclaim-ladder lane pause is then the only
+        remaining reason the offer can be withheld.
         """
-        manager = make_testable_process_manager(
-            post_processing_fault_breaker_enabled=True,
-            device_free_mb=POST_PROCESSING_GATE_OPEN_REQUIREMENT_MB + 5000.0,
+        manager = make_testable_process_manager(post_processing_fault_breaker_enabled=True)
+        roomy_card = DeviceVramState(
+            total_vram_mb=24000.0,
+            baseline_mb=0.0,
+            committed_vram_mb=0.0,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            device_free_mb=21000.0,
         )
-        manager._apply_post_processing_headroom_gate()
-        manager._pp_headroom_sustained_since = (
-            time.monotonic() - manager._POST_PROCESSING_HEADROOM_SUSTAIN_SECONDS - 1.0
-        )
+        manager._vram_arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: roomy_card}))
         manager._apply_post_processing_headroom_gate()
         assert manager._state.post_processing_withheld_for_headroom is False
         assert manager._state.post_processing_disabled_by_breaker is False

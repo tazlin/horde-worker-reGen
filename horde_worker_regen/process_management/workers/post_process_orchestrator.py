@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
 from loguru import logger
@@ -20,7 +20,10 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
-from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
+from horde_worker_regen.process_management.resources.reclaim_ladder import (
+    VerifiedReclaimLadder,
+    verification_settle_seconds,
+)
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     predict_job_post_processing_vram_mb,
@@ -70,6 +73,12 @@ has been actively post-processed for this window, so a stalled queue (jobs that 
 dispatching) can no longer hold a disaggregation lane hostage. Sits below the admission-patience window so the
 lane is returned well before a stranded job ages out."""
 
+POST_PROCESSING_OFFER_JOB_LABEL = "post_process:offer"
+"""The job label the pop-time offer probe prices its representative post-processing chain under."""
+
+_LANE_GONE_STATES = frozenset({HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED})
+"""Lane states that no longer hold a CUDA context the arbiter should treat as the request's own target."""
+
 
 def _round_or_none(value: float | None) -> float | None:
     """Round a measured MB figure to one decimal, passing ``None`` through for absent telemetry."""
@@ -82,14 +91,17 @@ class _DeferralRecord:
 
     ``first_deferred_at`` anchors the aging window; ``reclaim_requested`` makes the idle-VRAM reclaim a
     one-shot per starvation episode rather than one request per tick; ``last_logged_at`` throttles the
-    deferral warning.
+    deferral warning. A lane job re-asks every tick, so the episode climbs the arbiter's plan one verified rung
+    at a time and these fields remember how far it got.
     """
 
     first_deferred_at: float
     last_logged_at: float
     reclaim_requested: bool = False
-    applied_actuations: tuple[ActuatorCommand, ...] = ()
-    """Most recent arbiter plan executed for this episode; a newly available plan may run once later."""
+    applied_actuations: set[ActuatorCommand] = field(default_factory=set)
+    """Every plan command tried this episode, whether or not it acted, so no rung is taken twice."""
+    last_step_at: float | None = None
+    """When the last rung that acted was taken; the next rung waits for its settle."""
     admission_reclaim_attempted: bool = False
     """Whether a non-fitting arbiter verdict already spent the ordinary cache/model reclaim opportunity."""
 
@@ -180,10 +192,69 @@ class PostProcessOrchestrator:
         # admission question (replacing the banned free-VRAM read). None until wired (and in tests), where the
         # gate admits on missing telemetry.
         self._vram_arbiter: VramArbiter | None = None
+        # Whether the scheduler has an idle inference resident its coldest-model rung could unload on a card.
+        # None until wired (and in tests), where the ladder simply never offers that rung.
+        self._idle_resident_evictable: Callable[[int | None], bool] | None = None
 
     def set_vram_arbiter(self, arbiter: VramArbiter) -> None:
         """Inject the single VRAM arbiter: the deciding authority for the lane's memory admission question."""
         self._vram_arbiter = arbiter
+
+    def set_idle_resident_probe(self, probe: Callable[[int | None], bool]) -> None:
+        """Inject the scheduler's read-only check for an idle resident the coldest-model rung would unload."""
+        self._idle_resident_evictable = probe
+
+    def _post_processing_request(
+        self,
+        *,
+        job_label: str,
+        device_index: int | None,
+        target_process_id: int | None,
+        candidate_delta_mb: float,
+        is_head_of_queue: bool,
+        allow_idle_service_lane_reclaim: bool = False,
+    ) -> VramRequest:
+        """Create the PP_JOB request both the pop-time offer probe and dispatch admission price.
+
+        One builder keeps the two questions identical. The offer asks whether a chain could be admitted on the
+        card and dispatch asks whether this chain is admitted now, so a field one sets and the other forgets
+        would make the offer promise work dispatch then refuses.
+        """
+        probe = self._idle_resident_evictable
+        return VramRequest(
+            kind=VramRequestKind.PP_JOB,
+            job_label=job_label,
+            baseline=None,
+            device_index=device_index,
+            target_process_id=target_process_id,
+            candidate_delta_mb=candidate_delta_mb,
+            is_head_of_queue=is_head_of_queue,
+            has_reclaimable_idle_model=probe is not None and probe(device_index),
+            allow_idle_service_lane_reclaim=allow_idle_service_lane_reclaim,
+        )
+
+    def build_offer_request(self, *, device_index: int, candidate_delta_mb: float) -> VramRequest:
+        """Create the pop-time offer probe's request for a representative chain on one card.
+
+        The probe is never the head of any queue, so the arbiter's starvation diagnostic and measured-attempt
+        hatch stay quiet and a per-tick evaluation has no side effect. The live lane on the card, when there is
+        one, is the request's target so the ladder never asks the lane to release the cache it would run in.
+        """
+        return self._post_processing_request(
+            job_label=POST_PROCESSING_OFFER_JOB_LABEL,
+            device_index=device_index,
+            target_process_id=self._live_lane_process_id(device_index),
+            candidate_delta_mb=candidate_delta_mb,
+            is_head_of_queue=False,
+        )
+
+    def _live_lane_process_id(self, device_index: int) -> int | None:
+        """Return the post-processing lane process on ``device_index`` that still holds its context, if any."""
+        for process_info in self._process_map.get_post_process_processes():
+            lane_card = process_info.device_index if process_info.device_index is not None else 0
+            if lane_card == device_index and process_info.last_process_state not in _LANE_GONE_STATES:
+                return process_info.process_id
+        return None
 
     def _arbiter_admits_post_processing(
         self,
@@ -195,24 +266,21 @@ class PostProcessOrchestrator:
         """Return the lane's arbiter verdict, or None when admission is intentionally bypassed.
 
         The chain's estimated peak is charged against the frozen cycle measurement, so a FITS verdict admits
-        and a DEFER or DENY carries the reclaim plan the caller must execute. The
-        reserve bypass is preserved (a disabled VRAM budget or a zero-peak chain always admits), and a cold or
-        unwired arbiter admits, matching the every-gate-admits-on-missing-telemetry contract. The deferral
-        bookkeeping (reclaim request, throttled warning, aging) is the caller's, so this stays side-effect free
-        and can be evaluated for every candidate in a queue scan.
+        and a DEFER or DENY carries the reclaim plan the caller must execute. A zero-peak chain and a cold or
+        unwired arbiter bypass (every gate admits on missing telemetry). The verdict is evaluated whether or
+        not the VRAM budget is on, and the caller decides whether a non-FITS verdict defers or only runs its
+        reclaim. The deferral bookkeeping is the caller's, so this stays side-effect free and can be evaluated
+        for every candidate in a queue scan.
         """
-        bridge_data = self._runtime_config.bridge_data
-        if not bridge_data.enable_vram_budget or reserve_vram_mb <= 0:
+        if reserve_vram_mb <= 0:
             return None
         arbiter = self._vram_arbiter
         if arbiter is None or not arbiter.has_cycle:
             return None
         record = self._deferrals.get(str(completed_job_info.sdk_api_job_info.id_))
         return arbiter.evaluate(
-            VramRequest(
-                kind=VramRequestKind.PP_JOB,
+            self._post_processing_request(
                 job_label=f"post_process:{completed_job_info.sdk_api_job_info.id_}",
-                baseline=None,
                 device_index=post_process_process.device_index,
                 target_process_id=post_process_process.process_id,
                 candidate_delta_mb=reserve_vram_mb,
@@ -274,8 +342,47 @@ class PostProcessOrchestrator:
                 f"{lane_cap_mb:.0f}MB VRAM cap on card {post_process_process.device_index}; it cannot be "
                 "hosted on this card"
             ),
+            feeds_breaker=True,
         )
         return True
+
+    def _execute_next_actuation(
+        self,
+        *,
+        verdict: VramVerdict,
+        applied: set[ActuatorCommand],
+        post_process_process: HordeProcessInfo,
+        now: float,
+    ) -> ActuatorCommand | None:
+        """Mutate ``applied`` by running the plan's next untried rungs until one acts; return that one, or None.
+
+        A lane job re-asks every tick, so it climbs one verified rung at a time in the plan's cheapest-first
+        order, while a starved head takes the whole plan. Executing all of it at once would evict a resident
+        that the cheaper rung already made unnecessary. A rung that reports it did nothing is marked tried and
+        the next is taken on the same call. A service-lane pause it acquires is recorded as a borrow so the
+        drain can return it.
+        """
+        if self._vram_actuator is None:
+            return None
+        for command in verdict.required_actuations:
+            if command in applied:
+                continue
+            applied.add(command)
+            acted = VerifiedReclaimLadder.execute_arbiter_commands(
+                (command,),
+                self._vram_actuator,
+                device_index=post_process_process.device_index,
+                for_head_of_queue=True,
+            )
+            if not acted:
+                continue
+            if command.kind in (ActuatorCommandKind.PAUSE_VAE_LANE, ActuatorCommandKind.PAUSE_COMPONENT_LANE):
+                self._borrowed_service_lane_actuations.add(command.kind)
+                # A borrow is only taken for a job that has not yet dispatched, so the lane is idle from the
+                # instant it is acquired; anchor the idle-release window here.
+                self._borrow_idle_since = now
+            return command
+        return None
 
     def _note_deferral(
         self,
@@ -286,12 +393,13 @@ class PostProcessOrchestrator:
         verdict: VramVerdict,
         now: float,
     ) -> None:
-        """Record that a job could not be admitted this tick, requesting reclaim once and logging thriftily.
+        """Record that a job could not be admitted this tick, taking at most one reclaim rung and logging thriftily.
 
-        The first deferral of a starvation episode issues a single idle-VRAM reclaim request (a freshly
-        released slot may not exist yet). Further ticks reuse the record so reclaim is not re-issued every
-        cycle, and the warning is throttled so a long unfittable wait leaves a few diagnostic lines rather
-        than one per tick.
+        A lane job re-asks every tick, so it climbs the verdict's plan one verified rung at a time, waiting the
+        verified ladder's settle after each rung that acted. The verdict is re-priced each tick, so a job the
+        cheap rung made fit never reaches the eviction behind it. Without a plan the first deferral issues a
+        single idle-VRAM reclaim request, and the warning is throttled so a long unfittable wait leaves a few
+        diagnostic lines rather than one per tick.
         """
         key = str(job_id)
         record = self._deferrals.get(key)
@@ -302,31 +410,21 @@ class PostProcessOrchestrator:
 
         issued_reclaim = False
         reclaim_action_available = False
-        required_actuations = verdict.required_actuations
-        if (
-            required_actuations
-            and self._vram_actuator is not None
-            and required_actuations != record.applied_actuations
-        ):
-            applied_actuations = VerifiedReclaimLadder.execute_arbiter_commands(
-                required_actuations,
-                self._vram_actuator,
-                device_index=post_process_process.device_index,
-                for_head_of_queue=True,
-            )
-            record.applied_actuations = required_actuations
-            record.reclaim_requested = True
-            for actuation in applied_actuations:
-                if actuation.kind in (
-                    ActuatorCommandKind.PAUSE_VAE_LANE,
-                    ActuatorCommandKind.PAUSE_COMPONENT_LANE,
-                ):
-                    self._borrowed_service_lane_actuations.add(actuation.kind)
-                    # A borrow is only taken for a job that is deferring (not yet dispatched), so the lane is
-                    # idle from the instant it is acquired; anchor the idle-release window here.
-                    self._borrow_idle_since = now
-            reclaim_action_available = bool(applied_actuations)
-            issued_reclaim = True
+        untried_rung_exists = any(command not in record.applied_actuations for command in verdict.required_actuations)
+        if untried_rung_exists and self._vram_actuator is not None:
+            settled = record.last_step_at is None or (now - record.last_step_at) >= verification_settle_seconds()
+            if settled:
+                acted = self._execute_next_actuation(
+                    verdict=verdict,
+                    applied=record.applied_actuations,
+                    post_process_process=post_process_process,
+                    now=now,
+                )
+                if acted is not None:
+                    record.last_step_at = now
+                record.reclaim_requested = True
+                reclaim_action_available = acted is not None
+                issued_reclaim = True
         elif not record.reclaim_requested:
             reclaim_action_available = self._request_vram_reclaim(
                 post_process_process,
@@ -422,7 +520,9 @@ class PostProcessOrchestrator:
         if self._state.post_processing_disabled_by_breaker:
             reason = self._state.post_processing_disabled_reason or "post-processing disabled for this session"
             for job_info in list(pending):
-                await self._fault_without_images(job_info, reason=reason)
+                # The latch's own drain is not a fresh over-commit: counting it would re-arm the window the
+                # fault-count breaker recovers on, so the latch would keep itself set.
+                await self._fault_without_images(job_info, reason=reason, feeds_breaker=False)
             return
 
         now = self._clock()
@@ -606,7 +706,17 @@ class PostProcessOrchestrator:
                 post_process_process=post_process_process,
                 reserve_vram_mb=reserve_vram_mb,
             )
-            if verdict is None or verdict.admits:
+            budget_enforced = bool(self._runtime_config.bridge_data.enable_vram_budget)
+            if verdict is None or verdict.admits or not budget_enforced:
+                if verdict is not None and not verdict.admits:
+                    # With the budget off the verdict is advisory. Its cheapest rung that acts still runs, and
+                    # the job dispatches regardless.
+                    self._execute_next_actuation(
+                        verdict=verdict,
+                        applied=set(),
+                        post_process_process=post_process_process,
+                        now=now,
+                    )
                 self._deferrals.pop(str(completed_job_info.sdk_api_job_info.id_), None)
                 return await self._dispatch(
                     completed_job_info=completed_job_info,
@@ -643,16 +753,25 @@ class PostProcessOrchestrator:
             logger.warning(
                 f"Post-processing for job {job_id} could not be admitted within {waited:.0f}s; faulting it."
             )
-            await self._fault_without_images(job_info, reason=reason)
+            await self._fault_without_images(job_info, reason=reason, feeds_breaker=True)
             self._deferrals.pop(str(job_id), None)
 
-    async def _fault_without_images(self, job_info: HordeJobInfo, *, reason: str) -> None:
-        """Terminally fault a post-inference job without submitting raw images."""
+    async def _fault_without_images(self, job_info: HordeJobInfo, *, reason: str, feeds_breaker: bool) -> None:
+        """Terminally fault a post-inference job without submitting raw images.
+
+        Args:
+            job_info: The job to fault.
+            reason: Operator-facing reason recorded on the fault.
+            feeds_breaker: Whether the fault counts toward the post-processing fault breaker's window. True only
+                for work the worker accepted and could not host. The faults the latch itself issues must not
+                count, or the breaker could never see a quiet window to recover on.
+        """
         logger.error(
             f"Faulting job {job_info.sdk_api_job_info.id_} without images: {reason}. "
             "The horde will reissue it to another worker.",
         )
-        self._job_tracker.note_post_processing_overcommit_fault()
+        if feeds_breaker:
+            self._job_tracker.note_post_processing_overcommit_fault()
         await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
         self._deferrals.pop(str(job_info.sdk_api_job_info.id_), None)
 

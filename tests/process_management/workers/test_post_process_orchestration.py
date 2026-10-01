@@ -5,11 +5,13 @@ from __future__ import annotations
 import time
 from unittest.mock import Mock
 
+import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
 from horde_sdk.worker.chaining import CHAIN_NODE_STATE
 
 from horde_worker_regen.process_management.ipc.messages import (
+    HordeControlFlag,
     HordeImageResult,
     HordePostProcessControlMessage,
     HordePostProcessResultMessage,
@@ -17,8 +19,12 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers import post_process_orchestrator as post_process_orchestrator_module
 from tests.process_management.conftest import (
@@ -48,6 +54,73 @@ def _make_lane_process(process_id: int = 7) -> Mock:
         state=HordeProcessState.WAITING_FOR_JOB,
         process_type=HordeProcessType.POST_PROCESS,
     )
+
+
+class _TwoRungRig:
+    """A full card whose PP plan is the idle slot's cache release, then the coldest-resident eviction."""
+
+    def __init__(
+        self,
+        *,
+        process_manager: HordeWorkerProcessManager,
+        actuator: Mock,
+        lane: HordeProcessInfo,
+        job_info: HordeJobInfo,
+        clock: list[float],
+    ) -> None:
+        self.process_manager = process_manager
+        self.orchestrator = process_manager._post_process_orchestrator
+        self.actuator = actuator
+        self.lane = lane
+        self.job_info = job_info
+        self.clock = clock
+
+    @classmethod
+    async def build(
+        cls,
+        monkeypatch: object,
+        *,
+        enable_vram_budget: bool,
+        release_acts: bool = True,
+    ) -> _TwoRungRig:
+        """Seat the lane and one idle resident, price a 4000 MB chain on a full card, and queue the job."""
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            post_process_orchestrator_module,
+            "predict_job_post_processing_vram_mb",
+            lambda *_args, **_kwargs: 4000.0,
+        )
+        process_manager = make_testable_process_manager(enable_vram_budget=enable_vram_budget, vram_reserve_mb=1500)
+        actuator = Mock()
+        actuator.release_cache.return_value = release_acts
+        actuator.evict_coldest_idle_model.return_value = True
+        orchestrator = process_manager._post_process_orchestrator
+        orchestrator._vram_actuator = actuator
+        clock = [100.0]
+        orchestrator._clock = lambda: clock[0]
+        lane = _make_lane_process()
+        idle_inference = make_mock_process_info(3, model_name="cold-model", state=HordeProcessState.WAITING_FOR_JOB)
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane, 3: idle_inference})
+        job_info = _make_pp_job_info(["RealESRGAN_x4plus"])
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+        rig = cls(process_manager=process_manager, actuator=actuator, lane=lane, job_info=job_info, clock=clock)
+        rig.install_card(device_free_mb=2000.0)
+        return rig
+
+    def install_card(self, *, device_free_mb: float) -> None:
+        """Freeze a 24 GB card with ``device_free_mb`` free and the idle slot 3 into the arbiter."""
+        card = DeviceVramState(
+            total_vram_mb=24000.0,
+            baseline_mb=0.0,
+            committed_vram_mb=0.0,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            device_free_mb=device_free_mb,
+            idle_process_ids=frozenset({3}),
+        )
+        self.process_manager._vram_arbiter.begin_cycle(
+            MeasuredVramSnapshot(devices={self.lane.device_index or 0: card}),
+        )
 
 
 class TestStartPostProcessing:
@@ -438,6 +511,117 @@ class TestStartPostProcessing:
         assert job_info in process_manager._job_tracker.jobs_being_post_processed
         assert lane.pipe_connection.send.call_count == 1
 
+    async def test_non_fitting_chain_evicts_the_coldest_idle_resident_and_spares_the_lane(
+        self,
+        monkeypatch: object,
+    ) -> None:
+        """A deferred chain's ladder carries the coldest-resident rung and the scheduler unloads that one model.
+
+        The idle inference slot's model is the only reclaimable tenant on the full card, so the verdict names
+        the single-step eviction. It reaches the scheduler's ``evict_coldest_idle_model``, the idle resident is
+        unloaded, and the post-processing lane the chain is waiting for receives nothing.
+        """
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            post_process_orchestrator_module,
+            "predict_job_post_processing_vram_mb",
+            lambda *_args, **_kwargs: 4000.0,
+        )
+        process_manager = make_testable_process_manager(enable_vram_budget=True, vram_reserve_mb=1500)
+        scheduler = process_manager._inference_scheduler
+        evict_spy = Mock(wraps=scheduler.evict_coldest_idle_model)
+        scheduler.evict_coldest_idle_model = evict_spy  # type: ignore[method-assign]
+        lane = _make_lane_process()
+        idle_inference = make_mock_process_info(
+            3,
+            model_name="cold-model",
+            state=HordeProcessState.WAITING_FOR_JOB,
+        )
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane, 3: idle_inference})
+
+        full_card = DeviceVramState(
+            total_vram_mb=24000.0,
+            baseline_mb=0.0,
+            committed_vram_mb=0.0,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            device_free_mb=2000.0,
+        )
+        process_manager._vram_arbiter.begin_cycle(MeasuredVramSnapshot(devices={lane.device_index or 0: full_card}))
+
+        job_info = _make_pp_job_info(["RealESRGAN_x4plus"])
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        evict_spy.assert_called_once_with(lane.device_index)
+        assert job_info in process_manager._job_tracker.jobs_pending_post_processing
+        idle_inference.pipe_connection.send.assert_called_once()
+        unload_message = idle_inference.pipe_connection.send.call_args.args[0]
+        assert unload_message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        assert unload_message.horde_model_name == "cold-model"
+        lane.pipe_connection.send.assert_not_called()
+        assert lane.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+    async def test_budget_off_runs_one_acting_rung_and_dispatches_on_the_same_tick(self, monkeypatch: object) -> None:
+        """With the VRAM budget off a non-fitting verdict is advisory: one rung runs and the chain dispatches.
+
+        The plan is the idle slot's cache release, then the coldest-resident eviction. Only the cheaper rung runs,
+        the job dispatches in the same pass, and no deferral record (patience clock, throttled warning) is opened.
+        """
+        rig = await _TwoRungRig.build(monkeypatch, enable_vram_budget=False)
+
+        await rig.process_manager.start_post_processing()
+
+        rig.actuator.release_cache.assert_called_once_with(3)
+        rig.actuator.evict_coldest_idle_model.assert_not_called()
+        assert rig.job_info in rig.process_manager._job_tracker.jobs_being_post_processed
+        assert rig.lane.pipe_connection.send.call_count == 1
+        assert rig.orchestrator._deferrals == {}
+        assert rig.process_manager._reserve_ledger.total_vram_mb() == 4000.0
+
+    async def test_deferral_climbs_one_rung_per_settle(self, monkeypatch: object) -> None:
+        """The cache release runs first; the eviction waits out the settle and runs only if the job still misses."""
+        rig = await _TwoRungRig.build(monkeypatch, enable_vram_budget=True)
+        settle = reclaim_ladder_module.verification_settle_seconds()
+
+        await rig.process_manager.start_post_processing()
+        rig.actuator.release_cache.assert_called_once_with(3)
+        rig.actuator.evict_coldest_idle_model.assert_not_called()
+
+        rig.clock[0] += settle / 2
+        await rig.process_manager.start_post_processing()
+        rig.actuator.evict_coldest_idle_model.assert_not_called()
+
+        rig.clock[0] += settle
+        await rig.process_manager.start_post_processing()
+        rig.actuator.evict_coldest_idle_model.assert_called_once_with(rig.lane.device_index)
+        rig.actuator.release_cache.assert_called_once_with(3)
+        assert rig.job_info in rig.process_manager._job_tracker.jobs_pending_post_processing
+
+    async def test_job_the_cache_release_made_fit_never_reaches_the_eviction(self, monkeypatch: object) -> None:
+        """The verdict is re-priced each tick, so once the cheap rung frees room the job dispatches instead."""
+        rig = await _TwoRungRig.build(monkeypatch, enable_vram_budget=True)
+
+        await rig.process_manager.start_post_processing()
+        rig.actuator.release_cache.assert_called_once_with(3)
+
+        rig.install_card(device_free_mb=21000.0)
+        rig.clock[0] += reclaim_ladder_module.verification_settle_seconds() + 1.0
+        await rig.process_manager.start_post_processing()
+
+        rig.actuator.evict_coldest_idle_model.assert_not_called()
+        assert rig.job_info in rig.process_manager._job_tracker.jobs_being_post_processed
+
+    async def test_no_op_rung_falls_through_to_the_next_on_the_same_tick(self, monkeypatch: object) -> None:
+        """A cache release that frees nothing is marked tried, and the eviction runs in the same pass."""
+        rig = await _TwoRungRig.build(monkeypatch, enable_vram_budget=True, release_acts=False)
+
+        await rig.process_manager.start_post_processing()
+
+        rig.actuator.release_cache.assert_called_once_with(3)
+        rig.actuator.evict_coldest_idle_model.assert_called_once_with(rig.lane.device_index)
+
     async def test_chain_over_lane_cap_faults_clean_without_dispatch(self, monkeypatch: object) -> None:
         """A chain estimated above the lane's cap is faulted at the gate, never dispatched into an OOM.
 
@@ -514,6 +698,50 @@ class TestStartPostProcessing:
 
         assert process_manager._process_lifecycle.post_process_processes_should_be_replaced
         assert job_info in process_manager._job_tracker.jobs_pending_post_processing
+
+
+class TestColdestIdleResidentSelection:
+    """The scheduler's read-only predicate agrees with the selection its coldest-resident rung acts on."""
+
+    @staticmethod
+    async def _scheduler_with_slot(*, slot_condition: str) -> tuple[InferenceScheduler, HordeProcessInfo]:
+        """Seat one inference slot holding ``resident-model`` under ``slot_condition`` and return the scheduler."""
+        process_manager = make_testable_process_manager()
+        state = HordeProcessState.INFERENCE_PRIMED if slot_condition == "busy" else HordeProcessState.WAITING_FOR_JOB
+        slot = make_mock_process_info(3, model_name="resident-model", state=state)
+        process_manager._process_map.clear()
+        process_manager._process_map.update({3: slot, 7: _make_lane_process()})
+        tracker = process_manager._job_tracker
+        if slot_condition == "unloading":
+            slot.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        if slot_condition in ("pending_model", "in_progress_model"):
+            job = make_job_pop_response("resident-model")
+            await track_popped_job_async(tracker, job)
+            if slot_condition == "in_progress_model":
+                await tracker.mark_inference_started(job)
+        return process_manager._inference_scheduler, slot
+
+    @pytest.mark.parametrize(
+        ("slot_condition", "evictable"),
+        [
+            pytest.param("idle", True, id="idle_resident"),
+            pytest.param("busy", False, id="busy_slot"),
+            pytest.param("in_progress_model", False, id="in_progress_model"),
+            pytest.param("pending_model", False, id="pending_model"),
+            pytest.param("unloading", False, id="already_unloading"),
+        ],
+    )
+    async def test_predicate_matches_selection(self, *, slot_condition: str, evictable: bool) -> None:
+        """The predicate is True exactly when the selection names the slot, and never names the lane."""
+        scheduler, slot = await self._scheduler_with_slot(slot_condition=slot_condition)
+
+        candidate = scheduler._coldest_idle_resident(0)
+
+        assert scheduler.has_evictable_idle_resident(0) is evictable
+        assert (candidate is not None) is evictable
+        if candidate is not None:
+            assert candidate.process_id == slot.process_id
+            assert candidate.model_name == "resident-model"
 
 
 class TestPostProcessResultHandling:

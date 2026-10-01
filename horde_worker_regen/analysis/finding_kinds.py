@@ -249,7 +249,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "is the worker's job. With the VRAM budget on, the post-processing peak is priced before it starts "
             "and idle models are unloaded to fit it. The `post_processing_fault_breaker_enabled` breaker turns "
             "post-processing off after repeated stalls, so the worker stops taking jobs it cannot finish, and "
-            "turns it back on when free memory recovers."
+            "turns it back on after a stall-free fault window."
         ),
         reference_page="docs/explanation/performance_and_backpressure.md",
     ),

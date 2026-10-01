@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+from unittest.mock import Mock
 
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     _SAFETY_RUNG_COOLDOWN_SECONDS,
@@ -16,6 +17,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import (
     build_reclaim_ladder,
     execute_reclaim_rung,
 )
+from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, ActuatorCommandKind
 
 
 class _FakeActuator:
@@ -890,3 +892,39 @@ class TestStarvedHeadLanePauseObligation:
         engine = VerifiedReclaimLadder()
         engine.record_lane_pause(0, ReclaimRungKind.SAFETY_OFF_GPU, tenant_label="safety", promised_mb=3044.0)
         assert engine.episode_holds_paused_lane(0) is False
+
+
+class TestArbiterCommandExecution:
+    """The arbiter's described commands map onto the actuator method that performs each one."""
+
+    def test_coldest_eviction_maps_to_the_single_step_actuator(self) -> None:
+        """EVICT_COLDEST_IDLE_MODEL calls ``evict_coldest_idle_model`` for the card and never the sweep."""
+        actuator = Mock()
+        actuator.evict_coldest_idle_model.return_value = True
+        command = ActuatorCommand(kind=ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL, device_index=None)
+
+        applied = VerifiedReclaimLadder.execute_arbiter_commands(
+            (command,),
+            actuator,
+            device_index=1,
+            for_head_of_queue=True,
+        )
+
+        actuator.evict_coldest_idle_model.assert_called_once_with(1)
+        actuator.evict_idle_model.assert_not_called()
+        assert applied == (command,)
+
+    def test_coldest_eviction_that_unloads_nothing_is_not_applied(self) -> None:
+        """A rung whose actuator found no resident is left out of the receipt."""
+        actuator = Mock()
+        actuator.evict_coldest_idle_model.return_value = False
+        command = ActuatorCommand(kind=ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL, device_index=None)
+
+        applied = VerifiedReclaimLadder.execute_arbiter_commands(
+            (command,),
+            actuator,
+            device_index=0,
+            for_head_of_queue=True,
+        )
+
+        assert applied == ()

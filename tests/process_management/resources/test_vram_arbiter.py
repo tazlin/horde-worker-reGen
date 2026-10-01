@@ -127,6 +127,33 @@ class TestAdmissionPath:
         ]
         assert release_targets == [3, 7]
 
+    @pytest.mark.parametrize(
+        ("request_kind", "eviction_kind"),
+        [
+            pytest.param(
+                VramRequestKind.PP_JOB,
+                ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL,
+                id="post_processing_takes_one_coldest_resident",
+            ),
+            pytest.param(VramRequestKind.PRELOAD, ActuatorCommandKind.EVICT_IDLE_MODEL, id="preload_keeps_the_sweep"),
+        ],
+    )
+    def test_eviction_rung_matches_the_request_kind(
+        self,
+        request_kind: VramRequestKind,
+        eviction_kind: ActuatorCommandKind,
+    ) -> None:
+        """A lane tenant gets the single-step coldest eviction at the sweep's position; a preload keeps the sweep."""
+        arbiter = VramArbiter()
+        state = _roomy_state(device_free_mb=5000.0, idle_process_ids=frozenset({3}))
+        arbiter.begin_cycle(_snapshot(state))
+        verdict = arbiter.evaluate(
+            _preload(kind=request_kind, candidate_delta_mb=5000.0, has_reclaimable_idle_model=True),
+        )
+        assert verdict.disposition == VramDisposition.DEFER
+        kinds = [command.kind for command in verdict.required_actuations]
+        assert kinds == [ActuatorCommandKind.RELEASE_CACHE, eviction_kind]
+
     def test_ladder_omits_commands_that_could_free_nothing(self) -> None:
         """EVICT and REDUCE are emitted only when the request signals they could still free memory."""
         arbiter = VramArbiter()

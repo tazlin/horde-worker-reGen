@@ -269,7 +269,7 @@ for how it works.
 
 | Field                | Default | Effect                                                                                                                                                                  |
 | -------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enable_vram_budget` | `true`  | Gate preload and dispatch materialisation (including leased-child clearance) on measured free VRAM/RAM, and evict idle resident models under pressure. `false` restores availability-only placement while retaining readiness, co-residency, and other non-budget safety gates (not recommended on a shared/consumer GPU). It also makes every budget-dependent feature inert; see below. |
+| `enable_vram_budget` | `true`  | Gate preload and dispatch materialisation (including leased-child clearance) on measured free VRAM/RAM, and evict idle resident models under pressure. `false` restores availability-only placement while retaining readiness, co-residency, and other non-budget safety gates (not recommended on a shared/consumer GPU). It also makes every budget-dependent feature inert; see below. With the budget off, a post-processing chain the arbiter would not admit takes the cheapest reclaim rung that acts, then dispatches on the same tick. |
 | `vram_reserve_mb`    | `2048`  | Co-residency safety margin: free VRAM (MB) kept in reserve on top of a job's estimated peak while a model samples *beside* others. Covers transient spikes such as tiled VAE decode and sizes how many models co-reside and how deep a whole-card teardown goes. It is *not* a hard load-feasibility floor: whether a model's weights can load at all is governed by ComfyUI's own streaming threshold (`minimum_inference_memory`), so a large checkpoint whose weights fit the drained card (e.g. an ~11.5 GB Flux on 16 GB) still loads via whole-card residency even when this margin exceeds the leftover headroom. Larger trades co-resident throughput for safety.                |
 | `vram_admission_noise_mb` | `None` | The VRAM admission margin (MB) subtracted from the measured free reading before a load or dispatch is judged to fit. Unset derives it from the card (5 % of the total on Windows/WDDM, 2.5 % where the NVML reading is device-wide, never below 512 MB). The one margin the admission keeps, so a whole-card model on a card at its edge is refused by exactly this much; lower it (or set 0) for a model you have seen run with the card to itself. Does not move the device-free governor's pressure floors. Per-card under `gpu_overrides`. |
 | `measured_load_probe_seconds` | `10` | Seconds the head must have starved at a card with nothing left to reclaim before one real load is admitted to let measured reality decide. Reclaim rungs and the idle-context teardown run first; 0 probes as soon as the ladder is empty. A shortfall past the measured-attempt band keeps the 60 s diagnostic horizon regardless. Per-card under `gpu_overrides`. |
@@ -402,16 +402,16 @@ works two ways. Reactively, if post-processing peaks keep failing to host (more
 than `post_processing_fault_threshold` over-commit faults within
 `post_processing_fault_window_seconds`), the worker stops advertising
 post-processing so the horde stops sending it upscale/face-fix jobs it cannot
-host, ending the fault-to-forced-maintenance spiral. Proactively, where the
-parent has a truthful device-free VRAM reading (NVML), it withholds
-post-processing advertising *before* any fault whenever the card's measured free
-VRAM sits below the post-processing peak plus a safety margin, so a worker
-relaunched into heavy residents does not earn a boot-window burst of jobs it
-cannot yet host. Either suppression re-opens on its own once the card's measured
-free VRAM recovers above the requirement (a heavy resident unloads, or a fixed
-pool seat rotates to a smaller model); the worker also attempts a one-shot
-idle-resident VRAM reclaim to bring that recovery about. A host without an NVML
-reading keeps the reactive breaker alone, session-latched until restart. See
+host, ending the fault-to-forced-maintenance spiral. It re-enables on its own
+once the window passes with no further over-commit fault. Proactively, the worker
+withholds post-processing at pop time while the VRAM arbiter rules a
+representative post-processing peak out on every driven card, which happens only
+when the peak exceeds what an emptied card could offer. A card that is merely full
+defers, and the dispatch-side reclaim ladder makes room for the real chain when it
+arrives, so free-VRAM swings never close the offer. That ladder can unload the
+coldest idle model no queued or running job needs, one model per step. With
+`enable_vram_budget: false` the dispatch verdict is advisory. Its cheapest
+reclaim rung still runs, and the chain dispatches on the same tick. See
 [Resilience and recovery](resilience_and_recovery.md) for how it sits alongside
 the other self-protective throttles. A separate, session-latched suppression is
 used when a whole-card model cannot fit beside even the post-processing lane's
