@@ -533,6 +533,26 @@ class TestWholeCardPostProcessLanePolicy:
         assert lifecycle.post_process_processes_should_be_replaced is True
         assert pp_process.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
+    def test_context_incompatible_promotes_a_fault_count_latch_to_structural(self) -> None:
+        """A structural conflict arriving under the self-clearing fault-count latch must outlive that latch."""
+        scheduler, lifecycle, state, _pp_process = _scheduler_with_post_process_lane()
+        state.post_processing_disabled_by_breaker = True
+        state.post_processing_breaker_auto_recoverable = True
+        state.post_processing_disabled_reason = "fault-count latch"
+        forecast = _forecast_16gb(
+            weights_mb=_FLUX_WEIGHTS_MB,
+            reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
+            free_now_mb=_FLUX16_ESTABLISH_FREE_NOW_MB,
+            wants_whole_card=True,
+        )
+
+        scheduler._pause_post_process_for_residency_if_idle(None, model_name=_FLUX_MODEL, forecast=forecast)
+
+        assert state.post_processing_disabled_by_breaker is True
+        assert state.post_processing_breaker_auto_recoverable is False
+        assert _FLUX_MODEL in state.post_processing_disabled_reason
+        assert lifecycle.is_post_process_gpu_paused is True
+
     async def test_context_incompatible_backlog_disables_pp_but_leaves_lane_for_drain(self) -> None:
         """A queued PP job blocks stopping the lane; the orchestrator owns the bounded no-image fault."""
         tracker = JobTracker()

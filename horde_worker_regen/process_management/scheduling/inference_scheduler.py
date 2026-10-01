@@ -2113,11 +2113,20 @@ class InferenceScheduler:
         return post_process_context_fits(forecast, self._whole_card_ledger.target_process_count(forecast))
 
     def _disable_post_processing_for_whole_card(self, model_name: str | None, forecast: StreamForecast) -> None:
-        """Session-disable post-processing because a whole-card model cannot fit beside the lane context."""
-        if self._state.post_processing_disabled_by_breaker:
+        """Session-disable post-processing because a whole-card model cannot fit beside the lane context.
+
+        A latch the fault-count breaker already holds is promoted rather than left alone: that latch clears on
+        its own, and a structural conflict recorded under it would clear with it and reopen the thrash.
+        """
+        already_structural = (
+            self._state.post_processing_disabled_by_breaker
+            and not self._state.post_processing_breaker_auto_recoverable
+        )
+        if already_structural:
             return
         model = model_name or "the whole-card model"
         self._state.post_processing_disabled_by_breaker = True
+        self._state.post_processing_breaker_auto_recoverable = False
         self._state.post_processing_breaker_tripped_at = time.time()
         self._state.post_processing_disabled_reason = (
             f"Disabled: {model} needs whole-card residency and cannot fit beside the dedicated "
