@@ -122,6 +122,18 @@ class TestContents:
         assert {"diagnose.txt", "manifest.json", "README.txt", "config/bridgeData.redacted.yaml"} <= names
         assert any(n.startswith("logs/") for n in names)
 
+    def test_a_bundle_without_stats_says_the_export_is_off(self, tmp_path: Path) -> None:
+        """The manifest counts the stats files and the README says why there are none."""
+        logs = _worker_dir(tmp_path)
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+        with zipfile.ZipFile(out) as zf:
+            manifest = json.loads(zf.read("manifest.json"))
+            readme = zf.read("README.txt").decode("utf-8")
+        assert manifest["scope"]["stats_files"] == 0
+        assert manifest["scope"]["stats_export_enabled"] is False
+        assert "`stats_export_enabled` is off" in readme
+
     def test_diagnose_reports_crash_root_cause(self, tmp_path: Path) -> None:
         """The bundled diagnosis lifts the child's exception, scrubbed of the leaked key."""
         logs = _worker_dir(tmp_path)
@@ -368,6 +380,23 @@ class TestMidRunSessionStitching:
         assert "logs/bridge.2026-06-24_09-00-00_000000.log" not in names
         assert "stats/stats-v1.0.0-20260624-170000-000.jsonl" in names
         assert manifest["scope"]["stitched_rotations"] == [f"logs/{self._ROTATION}"]
+
+    def test_the_stitched_active_log_ships_whole(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An active log whose predecessors were stitched is not tail-capped, so the run has no hole."""
+        monkeypatch.setattr(support_bundle, "_MAX_FILE_BYTES", 512)
+        logs = self._mid_run_worker_dir(tmp_path)
+        active = logs / "bridge.log"
+        padding = "".join(f"2026-06-24 18:00:{i:02d}.000 | INFO | x:y:2 - filler line {i}\n" for i in range(12, 40))
+        active.write_text(padding + active.read_text(encoding="utf-8"), encoding="utf-8")
+        assert active.stat().st_size > 512
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        with zipfile.ZipFile(out) as zf:
+            text = zf.read("logs/bridge.log").decode("utf-8")
+        assert not text.startswith("[... truncated to the most recent")
+        assert "filler line 12" in text
 
     def test_a_session_with_its_launch_in_the_active_log_ships_no_rotation(self, tmp_path: Path) -> None:
         """The default bundle stays lean when the active log already holds the launch."""

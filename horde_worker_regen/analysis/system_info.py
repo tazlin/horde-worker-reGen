@@ -67,6 +67,15 @@ def config_worker_name(config_path: Path = _DEFAULT_CONFIG_PATH) -> str | None:
     return str(name) if name else None
 
 
+def config_stats_export_enabled(config_path: Path = _DEFAULT_CONFIG_PATH) -> bool:
+    """Whether the config turns on the per-session stats JSONL export (off when the key is absent).
+
+    The bundle records it so a maintainer reading an archive with no ``stats/`` member knows the stream was
+    never written rather than lost, since the stats rows are the per-second scheduling evidence.
+    """
+    return bool(_load_config_yaml(config_path).get("stats_export_enabled", False))
+
+
 def _disk_free(path: Path) -> dict[str, int] | None:
     """Free/total bytes for the volume holding ``path``, or None if it cannot be read."""
     try:

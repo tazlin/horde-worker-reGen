@@ -36,6 +36,7 @@ from .sessions import segment_bundle_sessions
 from .system_info import (
     collect_system_info,
     config_secret_values,
+    config_stats_export_enabled,
     config_worker_name,
     resolve_cache_home,
 )
@@ -46,7 +47,8 @@ _DEFAULT_CONFIG_PATH = Path("bridgeData.yaml")
 # verbose file (the console mirror is tens of MB) cannot balloon the bundle or make the interactive build
 # crawl. Logs and the JSONL artifacts (ledger, stats) are capped with the same polarity, so a capped
 # bundle does not end up with its artifacts covering different windows of the timeline.
-# 15 MB keeps a full active bridge.log intact and trims only the largest mirrors. `--full-logs` lifts it.
+# 15 MB trims the largest mirrors; a parent log near its 25 MB roll size is capped too, unless its run was
+# stitched from rotations (then it ships whole, see the stitching below). `--full-logs` lifts it.
 _MAX_FILE_BYTES = 15 * 1024 * 1024
 # A rotated archive: loguru's timestamped roll-over (``bridge.2026-06-22_00-55-59.log``) or its compressed
 # form. These are older sessions; the active bridge.log (appended across restarts) already covers history,
@@ -322,11 +324,18 @@ def build_support_bundle(
     # roll-over cut it from. Ship those (bounded, uncapped) so the run's earlier hours are not lost to
     # the default bundle, and let the stats window reach back to where the shipped evidence starts.
     stitched_rotations: list[Path] = []
+    # The active file whose predecessors were stitched ships whole as well: it is at most one roll size, and
+    # capping it would cut the hours between the last predecessor's end and the cap's tail out of the run
+    # the stitching exists to restore.
+    stitched_active_logs: set[Path] = set()
     bounded_log_kinds = {s.log_kind for s in selected if s.start_is_lower_bound}
     if not full_logs:
         for log_kind in sorted(bounded_log_kinds):
             for active_log in log_bundle.active_paths_of_kind(log_kind):
-                stitched_rotations.extend(_stitched_predecessors(active_log))
+                predecessors = _stitched_predecessors(active_log)
+                if predecessors:
+                    stitched_rotations.extend(predecessors)
+                    stitched_active_logs.add(active_log)
     evidence_start = min((s.start_ts for s in sessions if s.start_ts is not None), default=None)
     for rotation in stitched_rotations:
         first, _ = read_time_range(rotation)
@@ -334,6 +343,7 @@ def build_support_bundle(
             evidence_start = first
     redactor = _make_redactor(config_path, redact_identifiers=redact_identifiers)
     cache_home = resolve_cache_home(config_path)
+    stats_export_enabled = config_stats_export_enabled(config_path)
 
     redaction_count = 0
     members: list[str] = []
@@ -396,7 +406,8 @@ def build_support_bundle(
         # agnostic test for that, and --full-logs ships the whole retention as it does the log rotations.
         stats_since = None if full_logs else evidence_start
         used_stats_names: set[str] = set()
-        for stats_path in _find_stats_files(log_bundle.root, modified_since=stats_since):
+        stats_paths = _find_stats_files(log_bundle.root, modified_since=stats_since)
+        for stats_path in stats_paths:
             name = _stats_member_name(stats_path)
             if name in used_stats_names:
                 stem, _, ext = name.rpartition(".")
@@ -411,7 +422,7 @@ def build_support_bundle(
         # reduce to the same `.log` name) does not collide in the archive.
         logs_root, log_files = _all_log_files(path, include_rotations=full_logs)
         used_names: set[str] = set()
-        uncapped = set(stitched_rotations)
+        uncapped = set(stitched_rotations) | stitched_active_logs
         for file_path in [*stitched_rotations, *log_files]:
             name = _member_name(file_path, logs_root)
             if name in used_names:
@@ -433,6 +444,8 @@ def build_support_bundle(
                 "session_count": len(selected),
                 "full_logs": full_logs,
                 "stitched_rotations": [_member_name(p, logs_root) for p in stitched_rotations],
+                "stats_files": len(stats_paths),
+                "stats_export_enabled": stats_export_enabled,
                 "cache_inventory": cache_inventory,
                 "gpu_probed": probe_gpu,
                 "identifiers_redacted": redact_identifiers,
@@ -442,7 +455,15 @@ def build_support_bundle(
         }
         zf.writestr("manifest.json", json.dumps(manifest, indent=2))
         members.append("manifest.json")
-        zf.writestr("README.txt", _readme(redaction_count, redact_identifiers))
+        zf.writestr(
+            "README.txt",
+            _readme(
+                redaction_count,
+                redact_identifiers,
+                stats_files=len(stats_paths),
+                stats_export_enabled=stats_export_enabled,
+            ),
+        )
         members.append("README.txt")
 
     return BundleResult(
@@ -454,16 +475,35 @@ def build_support_bundle(
     )
 
 
-def _readme(redaction_count: int, redact_identifiers: bool) -> str:
+def _readme(
+    redaction_count: int,
+    redact_identifiers: bool,
+    *,
+    stats_files: int,
+    stats_export_enabled: bool,
+) -> str:
     """The human-facing note shipped at the root of the bundle."""
     scope = "API/CivitAI keys"
     if redact_identifiers:
         scope += " and personal identifiers (home path, username, worker name)"
+    if stats_files > 0:
+        stats_note = f"Stats: {stats_files} per-session stats file(s) under stats/.\n"
+    elif stats_export_enabled:
+        stats_note = (
+            "Stats: none found for the bundled sessions although `stats_export_enabled` is on, so the stats\n"
+            "directory was not under this working directory or its files predate every bundled session.\n"
+        )
+    else:
+        stats_note = (
+            "Stats: none. `stats_export_enabled` is off in the config (the default), so the worker never wrote\n"
+            "its per-second scheduling record; the parent log is the only evidence of what the scheduler did.\n"
+        )
     return (
         "horde-worker-reGen support bundle\n"
         "=================================\n\n"
         "This archive was generated by `horde-log bundle` to help a maintainer diagnose a worker issue.\n"
         "Start with diagnose.txt (the automated analysis), then sessions.txt and the logs/ directory.\n\n"
+        f"{stats_note}\n"
         f"Redaction: {redaction_count} occurrence(s) of {scope} were replaced with <REDACTED>/<HOME>/<USER>/\n"
         "<WORKER_NAME> markers before this archive was written. Redaction is best-effort: please skim the\n"
         "contents and confirm nothing sensitive remains before sending this file to anyone.\n"
