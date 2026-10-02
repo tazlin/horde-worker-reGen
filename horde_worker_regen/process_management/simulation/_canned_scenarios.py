@@ -20,6 +20,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     LorasPayloadEntry,
     TIPayloadEntry,
 )
+from horde_sdk.ai_horde_api.apimodels.generate.text.pop import ModelPayloadKobold, TextGenerateJobPopResponse
 from horde_sdk.ai_horde_api.fields import GenerationID
 from horde_sdk.generation_parameters.image.object_models import ImageGenerationFeatureFlags
 from horde_sdk.worker.dispatch.ai_horde.image.convert import image_job_pop_response_to_feature_flags
@@ -483,6 +484,71 @@ def make_alchemy_scenario(
 # ---------------------------------------------------------------------------
 # Sustained-load (soak) generation
 # ---------------------------------------------------------------------------
+
+
+class CannedTextSource:
+    """Hands out predetermined text generations in place of real API pops.
+
+    The text counterpart of :class:`CannedJobSource`; consumed by ``TextGenerationCoordinator`` when the
+    harness runs with the API faked out. Once exhausted it answers the empty pop the horde gives a worker
+    it has no text work for, so the flow's no-work path runs as it would live.
+    """
+
+    def __init__(self, jobs: list[TextGenerateJobPopResponse]) -> None:
+        """Initialise the source with the generations to hand out, in order."""
+        self._jobs = list(jobs)
+        self._next_index = 0
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether every generation has been handed out."""
+        return self._next_index >= len(self._jobs)
+
+    @property
+    def total_jobs(self) -> int:
+        """The number of generations this source will hand out."""
+        return len(self._jobs)
+
+    @property
+    def jobs_emitted(self) -> int:
+        """How many generations have been handed out so far."""
+        return self._next_index
+
+    def next_pop_response(self) -> TextGenerateJobPopResponse:
+        """Return the next canned generation, or the empty pop once exhausted."""
+        if self.exhausted:
+            return make_empty_text_pop_response()
+        job = self._jobs[self._next_index]
+        self._next_index += 1
+        return job
+
+
+def make_empty_text_pop_response() -> TextGenerateJobPopResponse:
+    """Create the answer the horde gives a worker it has no text work for."""
+    return TextGenerateJobPopResponse(payload=ModelPayloadKobold(), ids=[])
+
+
+def make_canned_text_job(
+    *,
+    prompt: str = "Write one sentence about the AI Horde.",
+    max_length: int = 80,
+    max_context_length: int = 1024,
+    model: str = "koboldcpp/a-canned-model",
+    ttl: int | None = None,
+) -> TextGenerateJobPopResponse:
+    """Create one text generation as the horde would pop it, with a fresh generation id."""
+    return TextGenerateJobPopResponse(
+        payload=ModelPayloadKobold(prompt=prompt, max_length=max_length, max_context_length=max_context_length),
+        id=str(uuid.uuid4()),
+        ids=[],
+        model=model,
+        ttl=ttl,
+    )
+
+
+def make_text_scenario(num_jobs: int = 3, **job_fields: object) -> list[TextGenerateJobPopResponse]:
+    """Create ``num_jobs`` canned text generations sharing the given job fields."""
+    return [make_canned_text_job(**job_fields) for _ in range(num_jobs)]  # type: ignore[arg-type]
 
 
 @dataclass

@@ -362,8 +362,9 @@ else's traffic reaches it. The worker logs the hold once when it begins and once
 
 A dry run (`dry_run_skip_api`) never reaches the horde from the text flow. The backend is replaced by an
 in-process stand-in that describes itself as the configured backend would, so the readiness gate and the
-advertisement run as they would live, but no pop is sent. The text flow has no canned job source, so a dry
-run pops no text work at all, the same as an alchemy flow with no canned source attached.
+advertisement run as they would live. With a canned text source attached (the harness's `text_jobs`), the
+flow pops from it and records each outcome locally, the same as the alchemy flow over its canned forms;
+without one, a dry run pops no text work at all.
 
 ## What a finished text job is counted in
 

@@ -38,6 +38,7 @@ from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.apimodels.generate.text.pop import TextGenerateJobPopResponse
 from horde_sdk.ai_horde_api.fields import GenerationID
 from horde_sdk.generation_parameters.image.consts import (
     KNOWN_IMAGE_SOURCE_PROCESSING,
@@ -77,6 +78,7 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
     CannedJobSource,
+    CannedTextSource,
     GeneratingAlchemySource,
     GeneratingJobSource,
     SoakAlchemyForm,
@@ -227,6 +229,10 @@ class HarnessConfig:
 
     alchemy_forms: list[AlchemyFormSpec] | None = None
     """Alchemy forms to run alongside the image scenario (enables `alchemist` in the bridge data)."""
+
+    text_jobs: list[TextGenerateJobPopResponse] | None = None
+    """Text generations to run alongside the image scenario (enables `scribe` in the bridge data). The fake
+    text backend answers them; there is no real-backend text mode."""
 
     arrival: ArrivalSchedule | None = None
     """When set, image jobs are released to the popper on this schedule instead of all at once."""
@@ -476,6 +482,9 @@ class HarnessResult:
     num_alchemy_forms_expected: int = 0
     num_alchemy_forms_completed: int = 0
     num_alchemy_forms_faulted: int = 0
+    num_text_jobs_expected: int = 0
+    num_text_jobs_completed: int = 0
+    num_text_jobs_faulted: int = 0
     model_availability_known: bool = False
     """Whether the background download process reported image-model availability during the run."""
     available_model_names: list[str] = field(default_factory=list)
@@ -549,6 +558,8 @@ class HarnessResult:
             and (self.num_jobs_completed >= self.num_jobs_expected)
             and self.num_alchemy_forms_faulted == 0
             and (self.num_alchemy_forms_completed >= self.num_alchemy_forms_expected)
+            and self.num_text_jobs_faulted == 0
+            and (self.num_text_jobs_completed >= self.num_text_jobs_expected)
         )
 
     def failure_summary(self) -> str:
@@ -586,6 +597,10 @@ class HarnessResult:
             parts.append(f"alchemy_faulted={self.num_alchemy_forms_faulted}")
         if self.num_alchemy_forms_completed < self.num_alchemy_forms_expected:
             parts.append(f"alchemy_completed={self.num_alchemy_forms_completed}/{self.num_alchemy_forms_expected}")
+        if self.num_text_jobs_faulted > 0:
+            parts.append(f"text_faulted={self.num_text_jobs_faulted}")
+        if self.num_text_jobs_completed < self.num_text_jobs_expected:
+            parts.append(f"text_completed={self.num_text_jobs_completed}/{self.num_text_jobs_expected}")
         if self.disaggregation_discarded_sample_reroutes > 0:
             parts.append(f"discarded_sample_reroutes={self.disaggregation_discarded_sample_reroutes}")
         if self.diagnostics:
@@ -730,6 +745,7 @@ def _workload_capability_bridge_fields(
     max_pixels_needed: int,
     max_batch_needed: int,
     needs_alchemist: bool,
+    needs_scribe: bool = False,
 ) -> dict[str, object]:
     """The bridge-data fields a workload's *union* of requirements demands.
 
@@ -767,6 +783,11 @@ def _workload_capability_bridge_fields(
         fields["allow_sdxl_controlnet"] = True
     if needs_alchemist:
         fields["alchemist"] = True
+    if needs_scribe:
+        # A scribe under a faked API runs the fake text backend, which the worker never launches, so the
+        # role is on with no managed backend: the config validator otherwise demands a model to launch.
+        fields["scribe"] = True
+        fields["text_backend_managed"] = False
     # A workload that carries LoRA/TI references needs the worker to advertise LoRA support, or the
     # simulated pop matching (which honours the request exactly as the live API does) filters every
     # auxiliary-bearing job out of the run and the harness silently measures only the control group.
@@ -885,6 +906,7 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
             max_pixels_needed=max_pixels_needed,
             max_batch_needed=max_batch_needed,
             needs_alchemist=bool(config.alchemy_forms or config.soak_alchemy_templates),
+            needs_scribe=bool(config.text_jobs),
         ),
     )
     if config.process_mode == "real":
@@ -1240,6 +1262,10 @@ def build_harness_process_manager(
     elif config.skip_api and config.alchemy_forms:
         canned_alchemy_source = CannedAlchemySource(config.alchemy_forms)
 
+    canned_text_source: CannedTextSource | None = None
+    if config.skip_api and config.text_jobs:
+        canned_text_source = CannedTextSource(config.text_jobs)
+
     # The manager writes its session_start record during construction, so the identity must be in
     # place before it is built.
     _apply_scenario_provenance_env(config)
@@ -1265,6 +1291,7 @@ def build_harness_process_manager(
         process_entry_points=entry_points,
         canned_job_source=canned_job_source,
         canned_alchemy_source=canned_alchemy_source,
+        canned_text_source=canned_text_source,
         enable_background_downloads=config.process_mode == "real"
         or (
             config.process_mode == "fake"
@@ -1403,6 +1430,7 @@ async def _watch_for_scenario_completion(
     *,
     num_jobs_expected: int,
     num_forms_expected: int = 0,
+    num_text_jobs_expected: int = 0,
     timeout_seconds: float,
     stage_deadlines: HarnessStageDeadlines | None = None,
     timeout_snapshots: list[HarnessStageSnapshot] | None = None,
@@ -1443,6 +1471,8 @@ async def _watch_for_scenario_completion(
         jobs_accounted_for = manager._job_tracker.total_num_completed_jobs
         coordinator = manager._alchemy_coordinator
         forms_accounted_for = coordinator.num_canned_forms_completed + coordinator.num_canned_forms_faulted
+        text_coordinator = manager._text_coordinator
+        text_accounted_for = text_coordinator.num_canned_jobs_completed + text_coordinator.num_canned_jobs_faulted
 
         source = manager._job_popper._canned_job_source
         has_terminal_accounting_gap = (
@@ -1475,10 +1505,15 @@ async def _watch_for_scenario_completion(
         else:
             terminal_accounting_gap_since = None
 
-        if jobs_accounted_for >= num_jobs_expected and forms_accounted_for >= num_forms_expected:
+        if (
+            jobs_accounted_for >= num_jobs_expected
+            and forms_accounted_for >= num_forms_expected
+            and text_accounted_for >= num_text_jobs_expected
+        ):
             logger.info(
                 f"Harness scenario complete ({jobs_accounted_for}/{num_jobs_expected} jobs, "
-                f"{forms_accounted_for}/{num_forms_expected} alchemy forms accounted for)",
+                f"{forms_accounted_for}/{num_forms_expected} alchemy forms, "
+                f"{text_accounted_for}/{num_text_jobs_expected} text jobs accounted for)",
             )
             manager._shutdown()
             return False
@@ -1771,6 +1806,7 @@ async def _run_harness_in_run_context(config: HarnessConfig) -> HarnessResult:
     time_started = time.time()
 
     num_forms_expected = len(config.alchemy_forms) if (config.alchemy_forms and config.skip_api) else 0
+    num_text_jobs_expected = len(config.text_jobs) if (config.text_jobs and config.skip_api) else 0
     timeout_snapshots: list[HarnessStageSnapshot] = []
 
     # Sample real GPU core utilization across the soak's *steady-state* window (the watcher
@@ -1796,6 +1832,7 @@ async def _run_harness_in_run_context(config: HarnessConfig) -> HarnessResult:
                 manager,
                 num_jobs_expected=num_jobs_expected,
                 num_forms_expected=num_forms_expected,
+                num_text_jobs_expected=num_text_jobs_expected,
                 timeout_seconds=config.timeout_seconds,
                 stage_deadlines=config.stage_deadlines,
                 timeout_snapshots=timeout_snapshots,
@@ -1915,6 +1952,9 @@ async def _run_harness_in_run_context(config: HarnessConfig) -> HarnessResult:
     num_jobs_faulted = manager._job_tracker.num_jobs_faulted
     num_jobs_completed = max(0, manager._job_tracker.total_num_completed_jobs - num_jobs_faulted)
     num_forms_completed = manager._alchemy_coordinator.num_canned_forms_completed
+    text_coordinator = manager._text_coordinator
+    num_text_jobs_completed = text_coordinator.num_canned_jobs_completed
+    num_text_jobs_faulted = text_coordinator.num_canned_jobs_faulted
 
     # A soak generates an open-ended amount of work, so "expected" is whatever it completed;
     # its pass/fail rests on faults, timeout, and (in the benchmark layer) throughput retention.
@@ -1961,6 +2001,9 @@ async def _run_harness_in_run_context(config: HarnessConfig) -> HarnessResult:
         num_alchemy_forms_expected=num_forms_expected,
         num_alchemy_forms_completed=num_forms_completed,
         num_alchemy_forms_faulted=manager._alchemy_coordinator.num_canned_forms_faulted,
+        num_text_jobs_expected=num_text_jobs_expected,
+        num_text_jobs_completed=num_text_jobs_completed,
+        num_text_jobs_faulted=num_text_jobs_faulted,
         model_availability_known=availability.is_known,
         available_model_names=sorted(availability.present or []),
         failed_download_model_names=sorted(availability.failed),

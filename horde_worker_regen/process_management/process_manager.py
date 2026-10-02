@@ -41,6 +41,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     UserDetailsResponse,
     WorkerDetailItem,
 )
+from horde_sdk.ai_horde_api.apimodels.generate.text.pop import TextGenerateJobPopResponse
 from horde_sdk.ai_horde_api.apimodels.status import (
     HordeStatusModelsAllRequest,
     HordeStatusModelsAllResponse,
@@ -276,7 +277,11 @@ from horde_worker_regen.process_management.scheduling.pop_governor_registry impo
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator
 from horde_worker_regen.process_management.scheduling.workload_flow import FlowCoordinator, WorkloadKind
-from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
+from horde_worker_regen.process_management.simulation._canned_scenarios import (
+    CannedAlchemySource,
+    CannedJobSource,
+    CannedTextSource,
+)
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.disaggregation_orchestrator import (
     DisaggregatedFault,
@@ -1246,6 +1251,7 @@ class HordeWorkerProcessManager:
         process_entry_points: ProcessEntryPoints | None = None,
         canned_job_source: CannedJobSource | None = None,
         canned_alchemy_source: CannedAlchemySource | None = None,
+        canned_text_source: CannedTextSource | None = None,
         enable_background_downloads: bool = False,
         max_threads_ceiling: int | None = None,
     ) -> None:
@@ -1273,6 +1279,8 @@ class HordeWorkerProcessManager:
                 (hordelib-backed) entry points. Test harnesses can inject fakes here.
             canned_job_source: Source of predetermined jobs used when `dry_run_skip_api` is set. \
                 If None, an endlessly-cycling default scenario is used.
+            canned_text_source: Source of predetermined text generations; when set, the text flow pops \
+                from it and records submits locally instead of reaching the horde. \
             canned_alchemy_source: Source of predetermined alchemy forms; when set, the alchemy \
                 coordinator pops from it and records submits locally instead of touching the API.
             enable_background_downloads: If True, start a background download process that reports \
@@ -2098,6 +2106,7 @@ class HordeWorkerProcessManager:
             backend_factory=self._text_backend_for,
             text_backend_kind=bridge_data.text_backend_kind,
             run_metrics=self._run_metrics,
+            canned_text_source=canned_text_source,
             # Read through a callable rather than handed the supervisor: the supervisor is built
             # once the loop is running, long after this, and the flow needs only the count. A
             # backend the operator runs has no launch the worker can count, so it gets nothing.
@@ -6517,6 +6526,7 @@ class HordeWorkerProcessManager:
         *,
         jobs: list[ImageGenerateJobPopResponse] | None,
         alchemy_forms: list[AlchemyFormSpec] | None = None,
+        text_jobs: list[TextGenerateJobPopResponse] | None = None,
         forget_terminal_faults: bool = True,
     ) -> None:
         """Swap in a fresh canned scenario and reset per-level metrics (warm benchmark worker).
@@ -6540,6 +6550,7 @@ class HordeWorkerProcessManager:
             CannedJobSource(jobs or [], terminal_fault_ledger=self._canned_terminal_fault_ids),
         )
         self._alchemy_coordinator.set_canned_alchemy_source(CannedAlchemySource(alchemy_forms or []))
+        self._text_coordinator.set_canned_text_source(CannedTextSource(text_jobs or []))
         self._run_metrics.reset()
         # The recovery counter is cumulative for the worker's lifetime; the warm benchmark reuses one
         # worker across levels, so it must be zeroed here too or each level after the first recovery

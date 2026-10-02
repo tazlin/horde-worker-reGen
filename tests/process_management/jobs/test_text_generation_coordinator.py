@@ -46,6 +46,10 @@ from horde_worker_regen.process_management.jobs.text_generation_coordinator impo
 )
 from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+from horde_worker_regen.process_management.simulation._canned_scenarios import (
+    CannedTextSource,
+    make_text_scenario,
+)
 from horde_worker_regen.text_backends import (
     FakeTextBackend,
     TextBackendBusy,
@@ -201,6 +205,7 @@ def _make_coordinator(
     launch_count_provider: Callable[[], int] | None = None,
     backend_address_provider: Callable[[], str] | None = None,
     relaunch_backend: Callable[[str], bool] | None = None,
+    canned_text_source: CannedTextSource | None = None,
     **bridge_overrides: object,
 ) -> tuple[TextGenerationCoordinator, FakeTextBackend, _FakeHordeClientSession]:
     """Create a coordinator over a fake backend and a fake horde session, with the scribe role on.
@@ -233,6 +238,7 @@ def _make_coordinator(
         launch_count_provider=launch_count_provider,
         backend_address_provider=backend_address_provider,
         relaunch_backend=relaunch_backend,
+        canned_text_source=canned_text_source,
     )
     return coordinator, resolved_backend, resolved_session
 
@@ -2096,3 +2102,34 @@ async def test_the_counters_are_read_at_the_probe_cadence_not_on_every_busy_answ
     assert backend.busy_answers >= text_generation_coordinator.BUSY_RETRY_MAX_ATTEMPTS
     assert backend.generation_progress_call_count == 1
     assert coordinator.backend_wedged is False, "one reading cannot show a count standing for a whole bound"
+
+
+async def test_a_canned_source_feeds_the_flow_and_submits_are_recorded_locally() -> None:
+    """With a canned source the flow pops from it and records outcomes itself; the horde is never reached."""
+    jobs = make_text_scenario(2)
+    coordinator, _backend, session = _make_coordinator(canned_text_source=CannedTextSource(jobs))
+    await coordinator.await_backend_ready()
+
+    # One pop per cycle, as the loop would: the pop cadence gate refuses a second pop in the same instant.
+    for _ in jobs:
+        coordinator._last_pop_time = 0.0
+        await coordinator.api_text_pop()
+        await _drain_job_tasks(coordinator)
+
+    assert session.pop_requests == [], "a canned run sent a text pop to the horde"
+    assert session.submit_requests == [], "a canned run submitted to the horde"
+    assert coordinator.num_canned_jobs_completed == 2
+    assert coordinator.num_jobs_submitted == 2
+    assert coordinator.num_jobs_popped == 2
+    assert coordinator.num_in_flight == 0
+
+
+async def test_an_exhausted_canned_source_answers_the_no_work_pop() -> None:
+    """Once every canned generation is out, the source answers as the horde does with no work."""
+    source = CannedTextSource(make_text_scenario(1))
+
+    assert source.next_pop_response().id_ is not None
+    assert source.exhausted
+    empty = source.next_pop_response()
+    assert empty.id_ is None
+    assert empty.ids == []

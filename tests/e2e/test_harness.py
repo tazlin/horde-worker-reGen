@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.scheduling.workload_flow import Workl
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_alchemy_scenario,
     make_simple_scenario,
+    make_text_scenario,
 )
 
 # Every scenario spawns real OS child processes through the harness, so the module is opt-in via -m slow.
@@ -290,3 +291,22 @@ class TestHarnessScenarioProvenance:
 
         assert SCENARIO_ID_ENV_VAR not in os.environ
         assert SCENARIO_REVISION_ENV_VAR not in os.environ
+
+
+@pytest.mark.e2e
+async def test_text_jobs_run_through_the_fake_backend_with_no_api() -> None:
+    """A scribe scenario under a faked API pops from the canned text source and records every generation."""
+    result = await run_harness_async(
+        HarnessConfig(
+            num_jobs=1,
+            text_jobs=make_text_scenario(3),
+            process_mode="fake",
+            skip_api=True,
+            timeout_seconds=90.0,
+        ),
+    )
+
+    assert not result.timed_out, f"Harness run timed out ({result.failure_summary()})"
+    assert result.num_text_jobs_completed == 3, f"Expected 3 text jobs, got {result.num_text_jobs_completed}"
+    assert result.num_text_jobs_faulted == 0, result.failure_summary()
+    assert result.succeeded, f"Harness run did not succeed ({result.failure_summary()})"

@@ -78,6 +78,7 @@ from loguru import logger
 from horde_worker_regen.bridge_data.data_model import derive_text_generation_timeout_seconds, reGenBridgeData
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+from horde_worker_regen.process_management.simulation._canned_scenarios import CannedTextSource
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.text_backends import (
     FakeTextBackend,
@@ -635,6 +636,7 @@ class TextGenerationCoordinator:
         backend_address_provider: Callable[[], str] | None = None,
         canonical_name_provider: Callable[[], str | None] | None = None,
         relaunch_backend: Callable[[str], bool] | None = None,
+        canned_text_source: CannedTextSource | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators and the backend to generate through.
 
@@ -673,6 +675,8 @@ class TextGenerationCoordinator:
             relaunch_backend: Stops a backend the worker owns so its supervisor relaunches it, handed the
                 reason, and answering whether a relaunch was scheduled. Called once per wedge. None for a
                 backend the operator runs, which the flow holds its pops for and reports instead.
+            canned_text_source: When set, generations come from this source and outcomes are recorded
+                locally; the horde is never reached. The harness attaches one under a faked API.
 
         Raises:
             ValueError: Neither `backend` nor `backend_factory` was given, leaving nothing to generate
@@ -685,6 +689,12 @@ class TextGenerationCoordinator:
         self._shutdown_manager = shutdown_manager
         self._runtime_config = runtime_config
         self._api_sessions = api_sessions
+        self._canned_text_source = canned_text_source
+        """When set, generations come from this source and submits are recorded locally; no horde traffic."""
+        self.num_canned_jobs_completed = 0
+        """Cumulative canned generations recorded as completed this session."""
+        self.num_canned_jobs_faulted = 0
+        """Cumulative canned generations recorded as faulted this session."""
         self._backend = backend
         self._backend_factory = backend_factory
         self._text_backend_kind = text_backend_kind
@@ -1473,16 +1483,28 @@ class TextGenerationCoordinator:
         else:
             logger.error(f"Failed to pop text job (API Error): {response}")
 
-    async def api_text_pop(self) -> None:
-        """Pop a text job from the API when the pop policy allows it, and start work on what came back."""
-        # A dry run promises no API traffic and the text flow has no canned job source, so there is nothing to
-        # pop; the fake backend only stands in for generation. Compared against True because a mocked config
-        # reads every unset attribute as truthy.
-        if self.bridge_data.dry_run_skip_api is True:
-            return
+    def set_canned_text_source(self, source: CannedTextSource | None) -> None:
+        """Replace the canned source (a warm benchmark installs one per level) and reset its counters."""
+        self._canned_text_source = source
+        self.num_canned_jobs_completed = 0
+        self.num_canned_jobs_faulted = 0
 
+    async def api_text_pop(self) -> None:
+        """Pop a text job from the API (or the canned source) when the pop policy allows it, and start it."""
         advertisement = self._advertisement
         if advertisement is None or not self._should_pop():
+            return
+
+        if self._canned_text_source is not None:
+            self._note_pop_resumed()
+            self._last_pop_time = time.time()
+            self._start_popped_jobs(self._canned_text_source.next_pop_response(), advertisement=advertisement)
+            return
+
+        # A dry run promises no API traffic, so with no canned source attached there is nothing to pop; the
+        # fake backend only stands in for generation. Compared against True because a mocked config reads
+        # every unset attribute as truthy.
+        if self.bridge_data.dry_run_skip_api is True:
             return
 
         self._note_pop_resumed()
@@ -1834,10 +1856,29 @@ class TextGenerationCoordinator:
         model logs an error for.
         """
         try:
-            await self._submit_with_retries(job, generation=generation, state=state)
+            if self._canned_text_source is not None:
+                self._canned_submit(job, state=state)
+            else:
+                await self._submit_with_retries(job, generation=generation, state=state)
         finally:
             self._in_flight.pop(job.job_id, None)
             self._state.text_jobs_in_flight = len(self._in_flight)
+
+    def _canned_submit(self, job: TextJobInFlight, *, state: GENERATION_STATE) -> None:
+        """Record one outcome locally instead of submitting it, the way the alchemy flow records a canned form."""
+        submit_time = time.time()
+        if state == GENERATION_STATE.faulted:
+            self.num_canned_jobs_faulted += 1
+            self.num_jobs_faulted += 1
+            logger.error(f"Canned text job {job.job_id[:8]} faulted")
+            self._record_job_metrics(job, submit_time=submit_time, faulted=True, kudos_reward=None)
+            return
+        self.num_canned_jobs_completed += 1
+        self.num_jobs_submitted += 1
+        logger.success(
+            f"Completed canned text job {job.job_id[:8]} in {round(submit_time - job.time_popped, 2)} seconds.",
+        )
+        self._record_job_metrics(job, submit_time=submit_time, faulted=False, kudos_reward=None)
 
     async def _submit_with_retries(self, job: TextJobInFlight, *, generation: str, state: GENERATION_STATE) -> None:
         """Attempt the submit a bounded number of times, logging the outcome of the last attempt."""
