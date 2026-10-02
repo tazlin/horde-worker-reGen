@@ -632,6 +632,16 @@ def _build_checks(
                 or "Disabled for this session after structural post-processing failures.",
             )
         )
+    elif snapshot.config.allow_post_processing and snapshot.post_processing_offered is False:
+        # The breaker row above already explains its own withholding; this covers the per-pop reasons that
+        # leave the configured flag True while the request on the wire says False.
+        checks.append(
+            HealthCheck(
+                "Post-processing",
+                HealthStatus.WARN,
+                f"Offer withheld: {snapshot.post_processing_offer_withheld_reason or 'reason not reported'}",
+            )
+        )
 
     if snapshot.too_many_consecutive_failed_jobs:
         checks.append(

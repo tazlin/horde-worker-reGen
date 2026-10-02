@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 33
+SUPERVISOR_PROTOCOL_VERSION = 34
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -148,6 +148,8 @@ own maintenance and paused flags, so the snapshot gains ``worker_details_by_work
 :class:`HordeWorkerDetailsSnapshot` per role, keyed by the workload it serves) and
 ``SET_SERVER_MAINTENANCE`` gains ``server_maintenance_workloads``, the roles it addresses, None meaning all.
 The two aggregate flags stay as "any" over the map, so a reader of the whole-worker view is unchanged.
+v34 adds ``post_processing_offered`` and ``post_processing_offer_withheld_reason``, the ``allow_post_processing``
+value the last image pop carried and why it was withheld, which can differ from the configured flag.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -1665,6 +1667,13 @@ class WorkerStateSnapshot(BaseModel):
     """Post-processing is session-disabled and no longer advertised to the Horde."""
     post_processing_disabled_reason: str | None = None
     """Operator-facing detail for why post-processing was disabled; None when not tripped."""
+    post_processing_offered: bool | None = None
+    """The ``allow_post_processing`` value the last image pop request carried; None before the first pop.
+
+    Can be False while ``config.allow_post_processing`` is True: self-protection, feature readiness and
+    commitment depth each withhold the offer per pop."""
+    post_processing_offer_withheld_reason: str | None = None
+    """Operator-facing reason the last image pop withheld post-processing; None when it was offered."""
 
     # Connectivity / health signals the worker already tracks (surfaced for the status monitor).
     worker_registered: bool = False

@@ -291,6 +291,15 @@ class WorkerState:
     swings never close the offer. Independent of the fault breaker's latch, and forced false when the breaker's
     master switch is off."""
 
+    post_processing_offered: bool | None = None
+    """The ``allow_post_processing`` value the last built image pop request carried; None before the first.
+
+    The wire value folds the config, per-card advertising, the self-protection latches, feature readiness and
+    commitment depth, so it can be False while the configured flag is True."""
+
+    post_processing_offer_withheld_reason: str = ""
+    """Operator-facing reason the last image pop withheld post-processing; empty when it was offered."""
+
     lora_disk_exhausted: bool = False
     """The LoRA cache volume is below its free-space floor and eviction could not clear it.
 

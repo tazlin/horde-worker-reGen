@@ -84,6 +84,9 @@ _WHOLE_CARD_NOT_EXERCISED = (
     "dry-run harness's fake models never trigger"
 )
 _MALFORMED_POP_NOT_EXERCISED = "the dry-run harness never synthesizes a malformed pop response with a blank model name"
+_OFFER_NEVER_WITHHELD = (
+    "the dry-run harness offers post-processing from its first pop and never withholds it, so neither edge occurs"
+)
 _HORDELIB_READOUT_NOT_EXERCISED = (
     "the dry-run harness's fake inference children never call hordelib's free-VRAM readout"
 )
@@ -1098,6 +1101,20 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.process_manager:_apply_post_processing_fault_breaker",
         sample="Post-processing fault breaker tripped: 5 post-processing over-commit fault(s) in the last 10 minutes.",
         dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
+        "post_processing_offer_withheld",
+        r"Post-processing offer changed: (?P<before>unset|offered|withheld) -> withheld \((?P<reason>.+)\)$",
+        emitter="process_management.jobs.job_popper:_note_post_processing_offer",
+        sample=("Post-processing offer changed: offered -> withheld (2 post-processing jobs are already in hand)"),
+        dry_run_reason=_OFFER_NEVER_WITHHELD,
+    ),
+    _signature(
+        "post_processing_offer_restored",
+        r"Post-processing offer changed: withheld -> offered$",
+        emitter="process_management.jobs.job_popper:_note_post_processing_offer",
+        sample="Post-processing offer changed: withheld -> offered",
+        dry_run_reason=_OFFER_NEVER_WITHHELD,
     ),
     _signature(
         "wddm_paging",

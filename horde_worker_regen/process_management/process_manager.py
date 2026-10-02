@@ -6337,6 +6337,8 @@ class HordeWorkerProcessManager:
             stage_age_line=self._build_stage_age_line(),
             aux_hold_line=self._aux_prefetch_coordinator.hold_summary(),
             model_pool_status=self._model_pool_status(),
+            post_processing_offered=self._state.post_processing_offered,
+            post_processing_offer_withheld_reason=self._state.post_processing_offer_withheld_reason,
         )
 
         self._last_status_message_time = reporter.last_status_message_time
@@ -8199,6 +8201,8 @@ class HordeWorkerProcessManager:
             torch_build_cpu_only_reason=(self._state.torch_build_cpu_only_reason or None),
             post_processing_disabled=self._state.post_processing_disabled_by_breaker,
             post_processing_disabled_reason=(self._state.post_processing_disabled_reason or None),
+            post_processing_offered=self._state.post_processing_offered,
+            post_processing_offer_withheld_reason=(self._state.post_processing_offer_withheld_reason or None),
             worker_registered=self.user_info is not None,
             user_info_failed=self._user_info_failed,
             user_info_failed_reason=self._user_info_failed_reason,

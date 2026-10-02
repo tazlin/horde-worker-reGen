@@ -517,6 +517,67 @@ def test_process_recovery_without_a_recorded_time_is_informational() -> None:
     assert recoveries.detail == "3 process recoveries this session"
 
 
+def _post_processing_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+    return [check for check in report.checks if check.name == "Post-processing"]
+
+
+def test_withheld_post_processing_offer_warns_with_its_reason() -> None:
+    """The config says post-processing is on but the pop carried False, so the row names why."""
+    checks = _post_processing_checks(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            post_processing_offered=False,
+            post_processing_offer_withheld_reason="post-processing models are not on disk yet",
+        ),
+    )
+
+    assert len(checks) == 1
+    assert checks[0].status is HealthStatus.WARN
+    assert checks[0].detail == "Offer withheld: post-processing models are not on disk yet"
+
+
+def test_offered_or_unbuilt_post_processing_offer_has_no_row() -> None:
+    """An offered capability, or a worker that has not built a pop yet, reports nothing."""
+    for offered in (True, None):
+        checks = _post_processing_checks(
+            _snapshot(processes=[_process("WAITING_FOR_JOB")], post_processing_offered=offered),
+        )
+        assert checks == []
+
+
+def test_withheld_offer_with_post_processing_off_in_config_has_no_row() -> None:
+    """An operator who turned post-processing off is not warned that it is not offered."""
+    checks = _post_processing_checks(
+        _snapshot(
+            config=WorkerConfigSummary(dreamer_name="Test", worker_version="12.0.0", allow_post_processing=False),
+            processes=[_process("WAITING_FOR_JOB")],
+            post_processing_offered=False,
+            post_processing_offer_withheld_reason="post-processing is off in the config",
+        ),
+    )
+
+    assert checks == []
+
+
+def test_breaker_withholding_reports_one_post_processing_row() -> None:
+    """The breaker's own row covers its withholding, so the offer row does not repeat it."""
+    checks = _post_processing_checks(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            post_processing_disabled=True,
+            post_processing_disabled_reason="Disabled after repeated over-commit faults.",
+            post_processing_offered=False,
+            post_processing_offer_withheld_reason=(
+                "the fault breaker latch: Disabled after repeated over-commit faults."
+            ),
+        ),
+    )
+
+    assert len(checks) == 1
+    assert checks[0].detail == "Disabled after repeated over-commit faults."
+
+
 def test_api_check_folds_reachability_and_registration() -> None:
     """A reachable, registered worker reports one 'API' row naming the registered dreamer name."""
     report = derive(

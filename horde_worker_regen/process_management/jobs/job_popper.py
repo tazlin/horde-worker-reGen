@@ -1615,23 +1615,52 @@ class JobPopper:
             + shared_lane_commitments
         )
 
-    def _post_processing_offer_withheld(self) -> bool:
-        """Whether the worker's post-processing self-protection withholds the capability from this pop.
+    def _post_processing_offer_withheld_reason(self) -> str | None:
+        """Return why the worker's post-processing self-protection withholds the capability, or None.
 
         Three independent reasons, any of which stops the advertising so the worker is not handed more
         upscale/face-fix work it cannot host (which would keep faulting toward the horde's forced-maintenance):
-        the reactive fault breaker (repeated unhostable peaks), the proactive headroom gate (the parent measures
-        the card's free VRAM below the post-processing peak), and the dedicated lane being held off the GPU.
+        the reactive fault breaker (repeated unhostable peaks), the proactive headroom gate (the arbiter rules
+        the post-processing peak out on every driven card), and the dedicated lane being held off the GPU. The
+        first that applies, in that order, is the operator-facing reason.
 
         The paused-lane read is derived live rather than latched. Whoever paused the lane owns its restore, so
         the offer follows the lane back up on its own; borrowing either latch would instead leave the offer
         gated on a third party clearing state it does not own.
         """
-        return (
-            self._state.post_processing_disabled_by_breaker
-            or self._state.post_processing_withheld_for_headroom
-            or self._post_processing_lane_paused_provider()
-        )
+        if self._state.post_processing_disabled_by_breaker:
+            detail = self._state.post_processing_disabled_reason or "latched for this session"
+            return f"the fault breaker latch: {detail}"
+        if self._state.post_processing_withheld_for_headroom:
+            return "the VRAM arbiter rules the post-processing peak out on every driven card"
+        if self._post_processing_lane_paused_provider():
+            return "the post-processing lane is paused off the GPU"
+        return None
+
+    def _post_processing_offer_withheld(self) -> bool:
+        """Whether the worker's post-processing self-protection withholds the capability from this pop."""
+        return self._post_processing_offer_withheld_reason() is not None
+
+    def _note_post_processing_offer(self, *, withheld_reason: str | None) -> None:
+        """Record the outgoing pop's effective post-processing offer and log it when it changes.
+
+        The wire value folds config, per-card advertising, three self-protection latches, feature readiness
+        and commitment depth, so the configured flag alone does not say what the horde was told. The state
+        pair feeds the snapshot and status line; the edge-triggered line keeps the wire value in the log
+        without repeating it every pop.
+        """
+        offered = withheld_reason is None
+        reason = withheld_reason or ""
+        previous = self._state.post_processing_offered
+        if previous == offered and self._state.post_processing_offer_withheld_reason == reason:
+            return
+        self._state.post_processing_offered = offered
+        self._state.post_processing_offer_withheld_reason = reason
+        before = "unset" if previous is None else ("offered" if previous else "withheld")
+        if offered:
+            logger.info(f"Post-processing offer changed: {before} -> offered")
+        else:
+            logger.info(f"Post-processing offer changed: {before} -> withheld ({reason})")
 
     def _should_withhold_post_processing_offer(self, bridge_data: reGenBridgeData) -> bool:
         """Return whether this pop should stop advertising post-processing until the lane catches up."""
@@ -2158,8 +2187,18 @@ class JobPopper:
         pop_allow_post_processing = (
             advertised.allow_post_processing if advertised is not None else bridge_data.allow_post_processing
         )
-        if self._post_processing_offer_withheld():
-            pop_allow_post_processing = False
+        # The first condition that forces the offer off, in the order applied below; None while offered.
+        post_processing_withheld_reason: str | None = None
+        if not pop_allow_post_processing:
+            post_processing_withheld_reason = (
+                "post-processing is off in the config"
+                if not bridge_data.allow_post_processing
+                else "this card does not offer post-processing"
+            )
+        else:
+            post_processing_withheld_reason = self._post_processing_offer_withheld_reason()
+            if post_processing_withheld_reason is not None:
+                pop_allow_post_processing = False
         pop_allow_controlnet = advertised.allow_controlnet if advertised is not None else bridge_data.allow_controlnet
         pop_allow_sdxl_controlnet = (
             advertised.allow_sdxl_controlnet if advertised is not None else bridge_data.allow_sdxl_controlnet
@@ -2240,9 +2279,14 @@ class JobPopper:
             pop_allow_controlnet = is_offered(readiness, GatedFeature.CONTROLNET)
             pop_allow_sdxl_controlnet = is_offered(readiness, GatedFeature.SDXL_CONTROLNET)
             pop_allow_post_processing = is_offered(readiness, GatedFeature.POST_PROCESSING)
+            if not pop_allow_post_processing and post_processing_withheld_reason is None:
+                post_processing_withheld_reason = "post-processing models are not on disk yet"
 
         if pop_allow_post_processing and self._should_withhold_post_processing_offer(bridge_data):
             pop_allow_post_processing = False
+            post_processing_withheld_reason = (
+                f"{_POST_PROCESSING_OFFER_COMMITMENT_LIMIT} post-processing jobs are already in hand"
+            )
 
         # Extended controlnet is a dynamic, per-pop opt-in: the operator flag AND live annotator readiness
         # AND proof that the connected server understands the field. It is additionally clamped to the
@@ -2256,6 +2300,8 @@ class JobPopper:
             and self._extended_controlnet_ready_provider()
             and server_supports_extended_controlnet()
         )
+
+        self._note_post_processing_offer(withheld_reason=post_processing_withheld_reason)
 
         # Past every gate: the offer is settled and the request is about to go out, so nothing is holding
         # pops back. Cleared before the request rather than after it, so a request that never returns leaves

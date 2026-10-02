@@ -794,6 +794,161 @@ class TestPausedPostProcessingLaneSuppression:
         assert manager._job_popper._post_processing_offer_withheld() is True
 
 
+class TestPostProcessingOfferRecording:
+    """The pop records the post-processing value it sent and the first condition that withheld it."""
+
+    @staticmethod
+    async def _popper(
+        *,
+        state: WorkerState,
+        bridge_data: Mock | None = None,
+        lane_paused: bool = False,
+        availability: ModelAvailability | None = None,
+        card_runtimes: dict[int, CardRuntime] | None = None,
+        post_processing_backlog_depth: int = 0,
+    ) -> tuple[JobPopper, Mock]:
+        """Build a popper past every pop guard, with a session that answers every pop with no jobs."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()  # clear the session warm-up gate so a pop happens
+        await _queue_n_jobs_for_post_processing(job_tracker, post_processing_backlog_depth)
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            state=state,
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=bridge_data,
+            model_availability=availability,
+            post_processing_lane_paused_provider=lambda: lane_paused,
+            card_runtimes=card_runtimes,
+        )
+        return popper, session
+
+    @classmethod
+    async def _pop_once(cls, **kwargs: object) -> tuple[WorkerState, object]:
+        """Drive one pop and return the state and the request it sent."""
+        state = WorkerState()
+        popper, session = await cls._popper(state=state, **kwargs)  # type: ignore[arg-type]
+        await popper.api_job_pop()
+        session.submit_request.assert_awaited_once()
+        return state, session.submit_request.call_args.args[0]
+
+    async def test_offered_pop_records_offered_with_no_reason(self) -> None:
+        """An offered pop records True and no reason."""
+        state, request = await self._pop_once()
+
+        assert request.allow_post_processing is True
+        assert state.post_processing_offered is True
+        assert state.post_processing_offer_withheld_reason == ""
+
+    async def test_config_off_is_the_reason(self) -> None:
+        """Post-processing turned off in the worker config is named as the reason."""
+        state, request = await self._pop_once(bridge_data=make_mock_bridge_data(allow_post_processing=False))
+
+        assert request.allow_post_processing is False
+        assert state.post_processing_offered is False
+        assert state.post_processing_offer_withheld_reason == "post-processing is off in the config"
+
+    async def test_card_that_does_not_offer_it_is_the_reason(self) -> None:
+        """The worker config enables post-processing but the only card's effective config does not."""
+        card_config = make_mock_bridge_data(allow_post_processing=False)
+        state, request = await self._pop_once(
+            bridge_data=make_mock_bridge_data(),
+            card_runtimes=make_test_card_runtimes(device_indices=(0,), config=card_config),
+        )
+
+        assert request.allow_post_processing is False
+        assert state.post_processing_offer_withheld_reason == "this card does not offer post-processing"
+
+    async def test_breaker_latch_is_the_reason_with_its_detail(self) -> None:
+        """The breaker latch is named with its own detail, ahead of the later self-protection reasons."""
+        state = WorkerState()
+        state.post_processing_disabled_by_breaker = True
+        state.post_processing_disabled_reason = "5 over-commit faults in 10 minutes"
+        # The breaker comes first, so the other two self-protection reasons are not named.
+        state.post_processing_withheld_for_headroom = True
+        popper, session = await self._popper(state=state, lane_paused=True)
+
+        await popper.api_job_pop()
+
+        assert session.submit_request.call_args.args[0].allow_post_processing is False
+        assert state.post_processing_offered is False
+        assert state.post_processing_offer_withheld_reason == (
+            "the fault breaker latch: 5 over-commit faults in 10 minutes"
+        )
+
+    async def test_headroom_gate_is_the_reason(self) -> None:
+        """The arbiter's headroom ruling is named ahead of the paused lane."""
+        state = WorkerState()
+        state.post_processing_withheld_for_headroom = True
+        popper, _session = await self._popper(state=state, lane_paused=True)
+
+        await popper.api_job_pop()
+
+        assert state.post_processing_offer_withheld_reason == (
+            "the VRAM arbiter rules the post-processing peak out on every driven card"
+        )
+
+    async def test_paused_lane_is_the_reason(self) -> None:
+        """A lane held off the GPU is named when no latch is set."""
+        state, request = await self._pop_once(lane_paused=True)
+
+        assert request.allow_post_processing is False
+        assert state.post_processing_offer_withheld_reason == "the post-processing lane is paused off the GPU"
+
+    async def test_missing_models_are_the_reason(self) -> None:
+        """Feature readiness withholding the offer is named."""
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            post_processing_present=False,
+        )
+        state, request = await self._pop_once(availability=availability)
+
+        assert request.allow_post_processing is False
+        assert state.post_processing_offer_withheld_reason == "post-processing models are not on disk yet"
+
+    async def test_commitment_depth_is_the_reason(self) -> None:
+        """Commitment-depth offer shaping is named with the commitment limit."""
+        state, request = await self._pop_once(
+            bridge_data=make_mock_bridge_data(post_processing_lane_enabled=True, queue_size=8),
+            post_processing_backlog_depth=2,
+        )
+
+        assert request.allow_post_processing is False
+        assert state.post_processing_offer_withheld_reason == "2 post-processing jobs are already in hand"
+
+    async def test_change_is_logged_once_per_edge(self) -> None:
+        """Repeated pops with an unchanged offer log nothing; each change logs one line."""
+        state = WorkerState()
+        state.post_processing_disabled_by_breaker = True
+        state.post_processing_disabled_reason = "latched"
+        popper, _session = await self._popper(state=state)
+
+        lines, sink_id = _capture_logs(level="INFO")
+        try:
+            for clear_breaker in (False, False, True, True):
+                if clear_breaker:
+                    state.post_processing_disabled_by_breaker = False
+                state.last_pop_no_jobs_available = False
+                await popper.api_job_pop(urgent=True)
+        finally:
+            logger.remove(sink_id)
+
+        offer_lines = [line for line in lines if line.startswith("Post-processing offer changed:")]
+        assert offer_lines == [
+            "Post-processing offer changed: unset -> withheld (the fault breaker latch: latched)",
+            "Post-processing offer changed: withheld -> offered",
+        ]
+        assert state.post_processing_offered is True
+        assert state.post_processing_offer_withheld_reason == ""
+
+
 class TestVramPressureModelNarrowing:
     """Under sustained VRAM pressure the whole-card models come off the offer, floored so it never empties."""
 

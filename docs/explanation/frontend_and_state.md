@@ -92,8 +92,14 @@ defines the structured protocol over it:
   value and publishes it. The health checklist's Pop intake row renders it, and a verdict leads the headline
   as "Image intake held for ..." ahead of the serving headline, with any work that goes on without the image
   intake named after the sentinel's line. The dashboard holds no pop-liveness bound of its own.
+  `post_processing_offered` is the `allow_post_processing` value the last image pop request carried, and
+  `post_processing_offer_withheld_reason` names the first condition that forced it off (config, per-card
+  advertising, the fault breaker, the arbiter's headroom ruling, the paused lane, readiness or commitment
+  depth). The configured flag alone does not say what the horde was told. The health checklist warns while
+  the config enables post-processing and the offer is withheld for a reason other than the fault breaker,
+  which has its own row, and the headless status line appends the effective offer when it differs.
   The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 33) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 34) so a frontend can detect a mismatch with a worker built from different code.
 
 ### The event ring
 

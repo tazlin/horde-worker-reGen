@@ -118,6 +118,8 @@ class StatusReporter:
         stage_age_line: str | None = None,
         aux_hold_line: str | None = None,
         model_pool_status: ModelPoolSnapshot | None = None,
+        post_processing_offered: bool | None = None,
+        post_processing_offer_withheld_reason: str = "",
     ) -> float:
         """Print the status of the worker.
 
@@ -157,6 +159,9 @@ class StatusReporter:
                 contradict.
             model_pool_status: Live fixed-pool seats, lane tallies, and download admission budget. None means the pool
                 is disabled or has not produced a snapshot yet; ``bridge_data`` distinguishes those cases.
+            post_processing_offered: The ``allow_post_processing`` value the last image pop carried, or None
+                before the first pop.
+            post_processing_offer_withheld_reason: Why that pop withheld post-processing; empty when offered.
 
         Returns:
             The updated status message frequency.
@@ -229,6 +234,8 @@ class StatusReporter:
             jobs_pending_safety_check,
             jobs_being_safety_checked,
             jobs_in_progress,
+            post_processing_offered=post_processing_offered,
+            post_processing_offer_withheld_reason=post_processing_offer_withheld_reason,
         )
 
         # Print warnings
@@ -547,9 +554,21 @@ class StatusReporter:
         jobs_pending_safety_check: int,
         jobs_being_safety_checked: int,
         jobs_in_progress: int,
+        *,
+        post_processing_offered: bool | None = None,
+        post_processing_offer_withheld_reason: str = "",
     ) -> None:
         """Print worker information."""
         logger.opt(colors=True).info("<b>Worker Info:</b>")
+
+        # The pop request can withhold post-processing per pop, so echoing the configured flag alone would
+        # tell the operator the opposite of what the horde was told.
+        post_processing_echo = f"allow_post_processing: {bridge_data.allow_post_processing}"
+        if post_processing_offered is not None and post_processing_offered != bridge_data.allow_post_processing:
+            withheld_detail = (
+                f", {post_processing_offer_withheld_reason}" if post_processing_offer_withheld_reason else ""
+            )
+            post_processing_echo += f" (offered: {post_processing_offered}{withheld_detail})"
 
         max_power_dimension = int(math.sqrt(bridge_data.max_power * 8 * 64 * 64))
         logger.info(
@@ -577,7 +596,7 @@ class StatusReporter:
                     f"allow_lora: {bridge_data.allow_lora}",
                     f"allow_controlnet: {bridge_data.allow_controlnet}",
                     f"allow_sdxl_controlnet: {bridge_data.allow_sdxl_controlnet}",
-                    f"allow_post_processing: {bridge_data.allow_post_processing}",
+                    post_processing_echo,
                     f"dedicated_post_processing: {bridge_data.dedicated_post_processing}",
                 ],
             ),
