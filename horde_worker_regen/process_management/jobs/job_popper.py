@@ -186,6 +186,16 @@ while the single post-processing lane catches up; only the capability that would
 temporarily withheld.
 """
 
+# Log contract: analysis/detectors.py (post_processing_offer_withheld). The reasons below are the text of the
+# offer's withheld edge. The detector classifies them by fragment, and a test pins each fragment to these.
+POST_PROCESSING_OFFER_REASON_CONFIG_OFF = "post-processing is off in the config"
+POST_PROCESSING_OFFER_REASON_CARD_OFF = "this card does not offer post-processing"
+POST_PROCESSING_OFFER_REASON_BREAKER_PREFIX = "the fault breaker latch: "
+POST_PROCESSING_OFFER_REASON_ARBITER = "the VRAM arbiter rules the post-processing peak out on every driven card"
+POST_PROCESSING_OFFER_REASON_LANE_PAUSED = "the post-processing lane is paused off the GPU"
+POST_PROCESSING_OFFER_REASON_MODELS_NOT_ON_DISK = "post-processing models are not on disk yet"
+POST_PROCESSING_OFFER_REASON_JOBS_IN_HAND_SUFFIX = " post-processing jobs are already in hand"
+
 _MAX_CONCURRENT_LORA_JOBS = 2
 """Maximum LoRA-bearing jobs retained in the local inference queue.
 
@@ -1630,11 +1640,11 @@ class JobPopper:
         """
         if self._state.post_processing_disabled_by_breaker:
             detail = self._state.post_processing_disabled_reason or "latched for this session"
-            return f"the fault breaker latch: {detail}"
+            return f"{POST_PROCESSING_OFFER_REASON_BREAKER_PREFIX}{detail}"
         if self._state.post_processing_withheld_for_headroom:
-            return "the VRAM arbiter rules the post-processing peak out on every driven card"
+            return POST_PROCESSING_OFFER_REASON_ARBITER
         if self._post_processing_lane_paused_provider():
-            return "the post-processing lane is paused off the GPU"
+            return POST_PROCESSING_OFFER_REASON_LANE_PAUSED
         return None
 
     def _post_processing_offer_withheld(self) -> bool:
@@ -2191,9 +2201,9 @@ class JobPopper:
         post_processing_withheld_reason: str | None = None
         if not pop_allow_post_processing:
             post_processing_withheld_reason = (
-                "post-processing is off in the config"
+                POST_PROCESSING_OFFER_REASON_CONFIG_OFF
                 if not bridge_data.allow_post_processing
-                else "this card does not offer post-processing"
+                else POST_PROCESSING_OFFER_REASON_CARD_OFF
             )
         else:
             post_processing_withheld_reason = self._post_processing_offer_withheld_reason()
@@ -2280,12 +2290,12 @@ class JobPopper:
             pop_allow_sdxl_controlnet = is_offered(readiness, GatedFeature.SDXL_CONTROLNET)
             pop_allow_post_processing = is_offered(readiness, GatedFeature.POST_PROCESSING)
             if not pop_allow_post_processing and post_processing_withheld_reason is None:
-                post_processing_withheld_reason = "post-processing models are not on disk yet"
+                post_processing_withheld_reason = POST_PROCESSING_OFFER_REASON_MODELS_NOT_ON_DISK
 
         if pop_allow_post_processing and self._should_withhold_post_processing_offer(bridge_data):
             pop_allow_post_processing = False
             post_processing_withheld_reason = (
-                f"{_POST_PROCESSING_OFFER_COMMITMENT_LIMIT} post-processing jobs are already in hand"
+                f"{_POST_PROCESSING_OFFER_COMMITMENT_LIMIT}{POST_PROCESSING_OFFER_REASON_JOBS_IN_HAND_SUFFIX}"
             )
 
         # Extended controlnet is a dynamic, per-pop opt-in: the operator flag AND live annotator readiness

@@ -27,6 +27,7 @@ import pytest
 from horde_worker_regen.analysis.detectors import DETECTORS, Detector, Severity
 from horde_worker_regen.analysis.finding_kinds import FINDING_SPECS, Finding, FindingKind
 from tests.analysis.test_detectors import (
+    _ARBITER_WITHHELD_REASON,
     _DISPATCH_BUG_REASON,
     _DISPATCH_NONHEAD_REASON,
     _DISPATCH_RECONCILE_REASON,
@@ -50,6 +51,7 @@ from tests.analysis.test_detectors import (
     _pop_api_error,
     _pop_claim_engaged,
     _pop_claim_released,
+    _post_processing_offer,
     _recovery,
     _safety_lost_result,
     _safety_requeue,
@@ -486,6 +488,14 @@ CONTRACTS: dict[str, Contract] = {
     "detect_post_processing_vram_stall": Contract(
         bridge=_bridge(_post_processing_stall("16:53:42.000")),
         severity=Severity.WARNING,
+    ),
+    "detect_post_processing_offer_withheld": Contract(
+        bridge=_bridge(
+            _post_processing_offer("16:54:00.000", "unset"),
+            _post_processing_offer("16:55:00.000", "offered", withheld_reason=_ARBITER_WITHHELD_REASON),
+            _post_processing_offer("16:59:00.000", "withheld"),
+        ),
+        severity=Severity.CRITICAL,
     ),
     "detect_oom": Contract(
         bridge=_bridge(_oom("18:00:10.000")),

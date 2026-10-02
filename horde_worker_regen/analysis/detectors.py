@@ -21,9 +21,10 @@ invariant remediation and the default cross-reference are declared once in
 from __future__ import annotations
 
 import bisect
+import enum
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
@@ -314,6 +315,25 @@ _POST_PROCESSING_BREAKER_RE = pattern_for("post_processing_breaker_tripped")
 # post-processing/inference overlap as a genuine stall rather than admitted co-residency. The phrase is the
 # inference scheduler's verbatim rising-edge line (note_wddm_paging).
 _WDDM_PAGING_RE = pattern_for("wddm_paging")
+# The pop offer's edge lines. A current worker logs every change of the wire value with the reason it went off.
+# A worker up to 18.8.1 logged only its free-VRAM headroom gate, which is the one reason it had.
+_OFFER_WITHHELD_RE = pattern_for("post_processing_offer_withheld")
+_OFFER_RESTORED_RE = pattern_for("post_processing_offer_restored")
+_OFFER_FIRST_OFFERED_RE = pattern_for("post_processing_offer_first_offered")
+_LEGACY_ADVERTISING_CLOSED_RES = (
+    pattern_for("post_processing_advertising_withheld_legacy"),
+    pattern_for("post_processing_advertising_holding_legacy"),
+)
+_LEGACY_ADVERTISING_RESTORED_RE = pattern_for("post_processing_advertising_restored_legacy")
+_OFFER_WITHHELD_WARNING_FRACTION = 0.25
+_OFFER_WITHHELD_CRITICAL_FRACTION = 0.75
+_OFFER_WITHHELD_LONGEST_SECONDS = 900.0
+_OFFER_EVIDENCE_GAP_SECONDS = 300.0
+"""A silence between consecutive parent records longer than this leaves the offer's state unknown through it.
+
+The parent prints a status block every 20 s or so, so minutes of silence mean the log was not being written: a
+capture hole or a parent-loop stall. That time counts toward neither side and shortens any stretch spanning it.
+"""
 
 # A median pop->submit latency this many times the median generation time means jobs are aging somewhere
 # other than generation. Which stage that is comes from the lifecycle split, never from this ratio alone.
@@ -653,6 +673,268 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
             action_addendum=action,
             evidence=[_evidence(r) for r in (stalls[:4] + low_vram_warnings[:4] + breaker_trips[:1])]
             + [_evidence(r.record) for r in post_processing_recoveries[:2]],
+        ),
+    ]
+
+
+class _OfferWithheldReason(enum.StrEnum):
+    """Why a pop went out with post-processing off, worded as the finding's evidence names it."""
+
+    LEGACY_HEADROOM_GATE = "the old free-VRAM headroom gate"
+    FAULT_BREAKER = "the fault breaker"
+    VRAM_ARBITER = "the VRAM arbiter ruling the peak out"
+    LANE_PAUSED = "the post-processing lane paused"
+    MODELS_NOT_ON_DISK = "the post-processing models not on disk"
+    JOBS_IN_HAND = "too many post-processing jobs in hand"
+    CONFIGURED_OFF = "post-processing off in the config"
+    OTHER = "an unrecognised reason"
+
+
+# Fragments of the reasons ``job_popper`` writes into the withheld edge. Matched by fragment because some carry
+# a measured tail (the breaker's trip reason, the commitment limit). Time under ``CONFIGURED_OFF`` is the
+# operator's choice, so it counts toward neither side of the withheld fraction.
+_OFFER_REASON_FRAGMENTS: tuple[tuple[str, _OfferWithheldReason], ...] = (
+    ("the fault breaker latch", _OfferWithheldReason.FAULT_BREAKER),
+    ("the VRAM arbiter rules", _OfferWithheldReason.VRAM_ARBITER),
+    ("lane is paused", _OfferWithheldReason.LANE_PAUSED),
+    ("not on disk", _OfferWithheldReason.MODELS_NOT_ON_DISK),
+    ("jobs are already in hand", _OfferWithheldReason.JOBS_IN_HAND),
+    ("is off in the config", _OfferWithheldReason.CONFIGURED_OFF),
+    ("does not offer post-processing", _OfferWithheldReason.CONFIGURED_OFF),
+)
+
+_OFFER_WITHHELD_ACTIONS: dict[_OfferWithheldReason, str] = {
+    _OfferWithheldReason.LEGACY_HEADROOM_GATE: (
+        "Update the worker. Versions up to 18.8.1 turned post-processing off on every free-VRAM dip."
+    ),
+    _OfferWithheldReason.FAULT_BREAKER: (
+        "Repeated post-processing faults turned it off. Fix the cause named in the post-processing finding."
+    ),
+    _OfferWithheldReason.VRAM_ARBITER: (
+        "No card had room for the post-processing peak beside the loaded models. Serve fewer models on that card."
+    ),
+    _OfferWithheldReason.LANE_PAUSED: (
+        "The reclaim ladder paused post-processing to make room for image generation. Serve fewer models on that "
+        "card if this repeats."
+    ),
+    _OfferWithheldReason.MODELS_NOT_ON_DISK: (
+        "The post-processing models were still downloading. Let the download finish, and check for download "
+        "errors if it never does."
+    ),
+    _OfferWithheldReason.JOBS_IN_HAND: "No action needed. The worker was busy with post-processing work.",
+    _OfferWithheldReason.CONFIGURED_OFF: "No action needed.",
+    _OfferWithheldReason.OTHER: "Read the reason in the evidence and follow the finding it points to.",
+}
+
+
+@dataclass(frozen=True)
+class _OfferEdge:
+    """One logged change of the pop offer's post-processing value."""
+
+    record: LogRecord
+    timestamp: datetime
+    withheld_reason: _OfferWithheldReason | None
+    """Why the offer went off at this line, or None where it came back on."""
+
+
+@dataclass(frozen=True)
+class _OfferWithheldStretch:
+    """One unbroken stretch with post-processing off for a counted reason."""
+
+    start: datetime
+    end: datetime
+    reason: _OfferWithheldReason
+    """The reason the stretch opened with; a later reason change inside it does not split it."""
+    opened_by: LogRecord
+    closed_by: LogRecord | None
+    """The edge that turned the offer back on, or None where the stretch ran to the session end."""
+    seconds: float
+    """The stretch's recorded length: its span less any log silence inside it."""
+
+
+@dataclass
+class _OfferTimeline:
+    """The offer state over a session, from its first edge to the session end."""
+
+    offered_seconds: float = 0.0
+    silent_seconds: float = 0.0
+    """Log silence after the first edge, counted toward neither side."""
+    withheld_seconds: dict[_OfferWithheldReason, float] = field(default_factory=dict)
+    closures: dict[_OfferWithheldReason, int] = field(default_factory=dict)
+    """Each transition into a counted reason, including a change of reason while already off."""
+    stretches: list[_OfferWithheldStretch] = field(default_factory=list)
+
+
+def _classify_offer_reason(reason: str) -> _OfferWithheldReason:
+    """Map the reason a withheld edge carries to its kind."""
+    for fragment, kind in _OFFER_REASON_FRAGMENTS:
+        if fragment in reason:
+            return kind
+    return _OfferWithheldReason.OTHER
+
+
+def _offer_edge(record: LogRecord) -> _OfferEdge | None:
+    """Read one record as a change of the post-processing offer, current or legacy, or None."""
+    if record.timestamp is None:
+        return None
+    withheld = _OFFER_WITHHELD_RE.search(record.message)
+    if withheld is not None:
+        return _OfferEdge(record, record.timestamp, _classify_offer_reason(withheld.group("reason")))
+    if any(pattern.search(record.message) for pattern in _LEGACY_ADVERTISING_CLOSED_RES):
+        return _OfferEdge(record, record.timestamp, _OfferWithheldReason.LEGACY_HEADROOM_GATE)
+    if (
+        _OFFER_RESTORED_RE.search(record.message)
+        or _OFFER_FIRST_OFFERED_RE.search(record.message)
+        or _LEGACY_ADVERTISING_RESTORED_RE.search(record.message)
+    ):
+        return _OfferEdge(record, record.timestamp, None)
+    return None
+
+
+def _counts_as_withheld(reason: _OfferWithheldReason | None) -> bool:
+    """Whether time in this state counts toward the withheld side of the fraction."""
+    return reason is not None and reason is not _OfferWithheldReason.CONFIGURED_OFF
+
+
+def _log_silences(records: list[LogRecord]) -> list[tuple[datetime, datetime]]:
+    """The spans between consecutive timestamped records longer than :data:`_OFFER_EVIDENCE_GAP_SECONDS`."""
+    timestamps = [record.timestamp for record in records if record.timestamp is not None]
+    return [
+        (earlier, later)
+        for earlier, later in zip(timestamps, timestamps[1:], strict=False)
+        if (later - earlier).total_seconds() > _OFFER_EVIDENCE_GAP_SECONDS
+    ]
+
+
+def _recorded_seconds(silences: list[tuple[datetime, datetime]], start: datetime, end: datetime) -> float:
+    """The length of ``[start, end]`` less the part of it the log was silent through."""
+    silent = sum(
+        max(0.0, (min(end, silence_end) - max(start, silence_start)).total_seconds())
+        for silence_start, silence_end in silences
+    )
+    return max(0.0, (end - start).total_seconds() - silent)
+
+
+def _offer_timeline(
+    edges: list[_OfferEdge],
+    session_end: datetime,
+    silences: list[tuple[datetime, datetime]],
+) -> _OfferTimeline:
+    """Walk the edges in order and total the recorded time on each side, up to ``session_end``.
+
+    Time before the first edge and log silences after it are unknown and not counted. A repeated edge for the
+    state already in force (a legacy gate's hold line while it was already closed) changes nothing.
+    """
+    timeline = _OfferTimeline()
+    offered: bool | None = None
+    reason: _OfferWithheldReason | None = None
+    since: datetime | None = None
+    stretch_open: _OfferEdge | None = None
+
+    def accrue(until: datetime) -> None:
+        if since is None or until <= since:
+            return
+        seconds = _recorded_seconds(silences, since, until)
+        timeline.silent_seconds += (until - since).total_seconds() - seconds
+        if offered:
+            timeline.offered_seconds += seconds
+        elif _counts_as_withheld(reason) and reason is not None:
+            timeline.withheld_seconds[reason] = timeline.withheld_seconds.get(reason, 0.0) + seconds
+
+    for edge in edges:
+        accrue(edge.timestamp)
+        since = edge.timestamp
+        was_withheld = _counts_as_withheld(reason) and not offered
+        now_withheld = _counts_as_withheld(edge.withheld_reason)
+        if now_withheld and edge.withheld_reason is not None and (not was_withheld or edge.withheld_reason != reason):
+            timeline.closures[edge.withheld_reason] = timeline.closures.get(edge.withheld_reason, 0) + 1
+        if now_withheld and not was_withheld:
+            stretch_open = edge
+        elif was_withheld and not now_withheld and stretch_open is not None:
+            timeline.stretches.append(_offer_stretch(stretch_open, edge.timestamp, edge.record, silences))
+            stretch_open = None
+        offered = edge.withheld_reason is None
+        reason = edge.withheld_reason
+    accrue(session_end)
+    if stretch_open is not None:
+        stretch_end = max(session_end, stretch_open.timestamp)
+        timeline.stretches.append(_offer_stretch(stretch_open, stretch_end, None, silences))
+    return timeline
+
+
+def _offer_stretch(
+    opened: _OfferEdge,
+    end: datetime,
+    closed_by: LogRecord | None,
+    silences: list[tuple[datetime, datetime]],
+) -> _OfferWithheldStretch:
+    """Build a withheld stretch from the edge that opened it, measured over its recorded time."""
+    if opened.withheld_reason is None:
+        raise ValueError("a withheld stretch opens on a withheld edge")
+    return _OfferWithheldStretch(
+        start=opened.timestamp,
+        end=end,
+        reason=opened.withheld_reason,
+        opened_by=opened.record,
+        closed_by=closed_by,
+        seconds=_recorded_seconds(silences, opened.timestamp, end),
+    )
+
+
+def detect_post_processing_offer_withheld(context: SessionContext) -> list[Finding]:
+    """Post-processing configured on but sent off on the wire for a large share of the session.
+
+    The offer's state is rebuilt from its edge lines alone: a current worker's offer-changed line, or the
+    headroom gate's advertising lines from a worker up to 18.8.1. The state is unknown until the first edge,
+    and that time is left out, so a capture that begins mid-run is not read as either side. A log silence
+    after it is left out the same way (:data:`_OFFER_EVIDENCE_GAP_SECONDS`). Fires on the
+    withheld share or on one long stretch, since a short session can hide a long outage behind a low share.
+    The advice follows the reason that held the offer off longest.
+    """
+    start, end = context.session.start_ts, context.session.end_ts
+    records = _records_in_window(context.session.records, start, end)
+    edges = [edge for edge in (_offer_edge(record) for record in records) if edge is not None]
+    if not edges:
+        return []
+    session_end = end or max(record.timestamp for record in records if record.timestamp is not None)
+    timeline = _offer_timeline(edges, session_end, _log_silences(records))
+    withheld_seconds = sum(timeline.withheld_seconds.values())
+    observed_seconds = withheld_seconds + timeline.offered_seconds
+    if withheld_seconds <= 0 or not timeline.stretches:
+        return []
+    fraction = withheld_seconds / observed_seconds
+    longest = max(timeline.stretches, key=lambda stretch: stretch.seconds)
+    if fraction < _OFFER_WITHHELD_WARNING_FRACTION and longest.seconds < _OFFER_WITHHELD_LONGEST_SECONDS:
+        return []
+
+    dominant = max(timeline.withheld_seconds, key=lambda kind: timeline.withheld_seconds[kind])
+    before_first_edge = (edges[0].timestamp - start).total_seconds() if start is not None else 0.0
+    unknown_seconds = before_first_edge + timeline.silent_seconds
+    closed_line = (
+        f"longest stretch closed: {_evidence(longest.closed_by)}"
+        if longest.closed_by is not None
+        else f"longest stretch ran to the session end at {_clock_text(longest.end)}"
+    )
+    reason_lines = [
+        f"{kind.value}: turned off {timeline.closures.get(kind, 0)} time(s), {seconds / 60:.0f} min in total"
+        for kind, seconds in sorted(timeline.withheld_seconds.items(), key=lambda item: item[1], reverse=True)
+    ]
+    return [
+        Finding(
+            kind=FindingKind.POST_PROCESSING_OFFER_WITHHELD,
+            severity=Severity.CRITICAL if fraction >= _OFFER_WITHHELD_CRITICAL_FRACTION else Severity.WARNING,
+            headline=(
+                f"Post-processing was off for {round(fraction * 100)} percent of the session, the longest stretch "
+                f"{_span_text(longest.seconds)}."
+            ),
+            action_addendum=_OFFER_WITHHELD_ACTIONS[dominant],
+            evidence=[
+                f"off {withheld_seconds / 60:.0f} min, on {timeline.offered_seconds / 60:.0f} min, "
+                f"{unknown_seconds / 60:.0f} min not counted, before the first offer change or with the log silent",
+                f"longest stretch opened ({longest.reason.value}): {_evidence(longest.opened_by)}",
+                closed_line,
+                *reason_lines,
+            ],
         ),
     ]
 
@@ -3527,6 +3809,7 @@ DETECTORS: list[Detector] = [
     detect_pop_api_error_dominance,
     detect_stuck_inference_step,
     detect_post_processing_vram_stall,
+    detect_post_processing_offer_withheld,
     detect_post_processing_deferral_starvation,
     detect_oom,
     detect_file_descriptor_exhaustion,

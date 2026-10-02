@@ -14,6 +14,7 @@ from pathlib import Path
 from horde_worker_regen.analysis.bundle import LogBundle
 from horde_worker_regen.analysis.correlate import build_session_context
 from horde_worker_regen.analysis.detectors import (
+    _OFFER_REASON_FRAGMENTS,
     Finding,
     FindingKind,
     Severity,
@@ -22,6 +23,7 @@ from horde_worker_regen.analysis.detectors import (
 )
 from horde_worker_regen.analysis.log_ingest import LogRecord
 from horde_worker_regen.analysis.sessions import segment_sessions
+from horde_worker_regen.process_management.jobs import job_popper
 
 
 def _diagnose(tmp_path: Path, bridge_log: str, child_logs: dict[str, str] | None = None) -> dict[str, Finding]:
@@ -2254,6 +2256,178 @@ class TestPostProcessingVramStall:
         """A crash-on-start recovery is not a post-processing stall, so the detector stays silent."""
         bridge = self._bridge(_recovery("16:53:31.000", 1, reason="inference process replaced (crashed or hung)"))
         assert "post_processing_vram_stall" not in _diagnose(tmp_path, bridge)
+
+
+_ARBITER_WITHHELD_REASON = job_popper.POST_PROCESSING_OFFER_REASON_ARBITER
+
+
+def _post_processing_offer(ts: str, before: str, *, withheld_reason: str | None = None) -> str:
+    """job_popper._note_post_processing_offer: the pop offer's post-processing value changing."""
+    after = "offered" if withheld_reason is None else f"withheld ({withheld_reason})"
+    return (
+        f"2026-06-28 {ts} | INFO     | horde_worker_regen.process_management.jobs.job_popper:_note_post_processing_offer:1663 - "
+        f"Post-processing offer changed: {before} -> {after}"
+    )
+
+
+def _legacy_advertising(ts: str, *, withheld: bool) -> str:
+    """process_manager._apply_post_processing_headroom_gate as worker 18.8.1 wrote it."""
+    message = (
+        "Withholding post-processing advertising: a driven card's measured free VRAM (3054MB) is below the ~3.5GB "
+        "post-processing peak requirement, so a post-processing job would only fault at the lane."
+        if withheld
+        else "Re-advertising post-processing: a driven card's measured free VRAM (21242MB) held above the ~8.5GB "
+        "open requirement (peak plus resident-shift margin) for the sustain window."
+    )
+    return (
+        f"2026-06-28 {ts} | INFO     | horde_worker_regen.process_management.process_manager:"
+        f"_apply_post_processing_headroom_gate:2769 - {message}"
+    )
+
+
+class TestPostProcessingOfferWithheld:
+    """The pop offer's post-processing value rebuilt from its edge lines, current and legacy.
+
+    Every session here starts at 16:53 and ends at 17:35, with a status line each minute as a live parent
+    writes one, so the 41 minutes from a first edge at 16:54 are the observed span unless a test silences part.
+    """
+
+    _FINDING = "post_processing_offer_withheld"
+
+    @staticmethod
+    def _bridge(*lines: str, silent_minutes: range = range(0)) -> str:
+        """The session's lines in time order, with a status line at half past each minute outside ``silent_minutes``.
+
+        Minutes count from 16:53, so ``range(7, 27)`` silences 17:00 through 17:19.
+        """
+        session_start = datetime(2026, 6, 28, 16, 53)
+        status = [
+            f"{(session_start + timedelta(minutes=minute, seconds=30)):%Y-%m-%d %H:%M:%S}.000 | INFO | x:y:1 - Status"
+            for minute in range(42)
+            if minute not in silent_minutes
+        ]
+        body = sorted([*status, *lines, "2026-06-28 17:35:00.000 | INFO | x:y:1 - Session still active"])
+        return "\n".join(
+            [f"2026-06-28 16:53:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *body]
+        )
+
+    def test_current_lines_give_the_fraction_longest_stretch_and_reason(self, tmp_path: Path) -> None:
+        """Thirty of 41 observed minutes off for the arbiter's reason is a warning naming that reason."""
+        bridge = self._bridge(
+            _post_processing_offer("16:54:00.000", "unset"),
+            _post_processing_offer("16:55:00.000", "offered", withheld_reason=_ARBITER_WITHHELD_REASON),
+            _post_processing_offer("17:25:00.000", "withheld"),
+        )
+        finding = _diagnose(tmp_path, bridge)[self._FINDING]
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "Post-processing was off for 73 percent of the session, the longest stretch 30 minutes."
+        )
+        assert "Serve fewer models" in finding.action
+        assert any(
+            line.startswith("longest stretch opened") and "16:55:00  bridge.log:" in line for line in finding.evidence
+        )
+        assert any(
+            line.startswith("longest stretch closed") and "17:25:00  bridge.log:" in line for line in finding.evidence
+        )
+        assert "the VRAM arbiter ruling the peak out: turned off 1 time(s), 30 min in total" in finding.evidence
+
+    def test_legacy_lines_name_the_old_gate_and_advise_an_update(self, tmp_path: Path) -> None:
+        """A worker up to 18.8.1 logged only its headroom gate, which reads as the same state change."""
+        bridge = self._bridge(
+            _legacy_advertising("16:54:00.000", withheld=False),
+            _legacy_advertising("16:55:00.000", withheld=True),
+            _legacy_advertising("17:25:00.000", withheld=False),
+        )
+        finding = _diagnose(tmp_path, bridge)[self._FINDING]
+        assert finding.severity is Severity.WARNING
+        assert "73 percent" in finding.headline
+        assert "30 minutes" in finding.headline
+        assert finding.action.startswith("Update the worker.")
+        assert "the old free-VRAM headroom gate: turned off 1 time(s), 30 min in total" in finding.evidence
+
+    def test_time_before_the_first_edge_is_not_counted(self, tmp_path: Path) -> None:
+        """Twenty of 21 observed minutes off is 95 percent. Counting the 21 minutes before it would change that."""
+        bridge = self._bridge(
+            _post_processing_offer("17:14:00.000", "unset", withheld_reason=_ARBITER_WITHHELD_REASON),
+            _post_processing_offer("17:34:00.000", "withheld"),
+        )
+        finding = _diagnose(tmp_path, bridge)[self._FINDING]
+        assert "off for 95 percent" in finding.headline
+        assert finding.evidence[0].endswith("21 min not counted, before the first offer change or with the log silent")
+
+    def test_a_log_silence_inside_a_stretch_is_not_counted(self, tmp_path: Path) -> None:
+        """Twenty silent minutes inside a stretch count toward neither side, so 10 of 21 recorded minutes are off.
+
+        The stretch still opens and closes on its own edge lines.
+        """
+        bridge = self._bridge(
+            _post_processing_offer("16:54:00.000", "unset"),
+            _post_processing_offer("16:55:00.000", "offered", withheld_reason=_ARBITER_WITHHELD_REASON),
+            "2026-06-28 17:00:00.000 | INFO | x:y:1 - Last line before the silence",
+            "2026-06-28 17:20:00.000 | INFO | x:y:1 - First line after the silence",
+            _post_processing_offer("17:25:00.000", "withheld"),
+            silent_minutes=range(7, 27),
+        )
+        finding = _diagnose(tmp_path, bridge)[self._FINDING]
+        assert finding.headline == (
+            "Post-processing was off for 48 percent of the session, the longest stretch 10 minutes."
+        )
+        assert finding.evidence[0].startswith("off 10 min, on 11 min, 21 min not counted")
+        assert any(
+            line.startswith("longest stretch opened") and "16:55:00  bridge.log:" in line for line in finding.evidence
+        )
+        assert any(
+            line.startswith("longest stretch closed") and "17:25:00  bridge.log:" in line for line in finding.evidence
+        )
+
+    def test_every_reason_fragment_tracks_one_popper_reason(self) -> None:
+        """The detector's fragments and the popper's reason texts cannot drift apart unnoticed."""
+        reasons = [
+            job_popper.POST_PROCESSING_OFFER_REASON_CONFIG_OFF,
+            job_popper.POST_PROCESSING_OFFER_REASON_CARD_OFF,
+            job_popper.POST_PROCESSING_OFFER_REASON_BREAKER_PREFIX,
+            job_popper.POST_PROCESSING_OFFER_REASON_ARBITER,
+            job_popper.POST_PROCESSING_OFFER_REASON_LANE_PAUSED,
+            job_popper.POST_PROCESSING_OFFER_REASON_MODELS_NOT_ON_DISK,
+            job_popper.POST_PROCESSING_OFFER_REASON_JOBS_IN_HAND_SUFFIX,
+        ]
+        fragments = [fragment for fragment, _ in _OFFER_REASON_FRAGMENTS]
+        for fragment in fragments:
+            assert sum(fragment in reason for reason in reasons) == 1, fragment
+        for reason in reasons:
+            assert any(fragment in reason for fragment in fragments), reason
+
+    def test_short_stretches_under_both_thresholds_emit_nothing(self, tmp_path: Path) -> None:
+        """Two minutes off in 41 is under the share and the stretch thresholds."""
+        bridge = self._bridge(
+            _post_processing_offer("16:54:00.000", "unset"),
+            _post_processing_offer(
+                "16:55:00.000",
+                "offered",
+                withheld_reason=f"2{job_popper.POST_PROCESSING_OFFER_REASON_JOBS_IN_HAND_SUFFIX}",
+            ),
+            _post_processing_offer("16:57:00.000", "withheld"),
+        )
+        assert self._FINDING not in _diagnose(tmp_path, bridge)
+
+    def test_a_session_with_no_edge_emits_nothing(self, tmp_path: Path) -> None:
+        """With no edge the offer's state is unknown throughout, so nothing is claimed."""
+        assert self._FINDING not in _diagnose(tmp_path, self._bridge())
+
+    def test_off_for_most_of_the_session_is_critical(self, tmp_path: Path) -> None:
+        """Forty of 41 observed minutes off, never restored, is critical and runs to the session end."""
+        bridge = self._bridge(
+            _post_processing_offer("16:54:00.000", "unset"),
+            _post_processing_offer(
+                "16:55:00.000", "offered", withheld_reason=job_popper.POST_PROCESSING_OFFER_REASON_LANE_PAUSED
+            ),
+        )
+        finding = _diagnose(tmp_path, bridge)[self._FINDING]
+        assert finding.severity is Severity.CRITICAL
+        assert "98 percent" in finding.headline
+        assert "reclaim ladder" in finding.action
+        assert "longest stretch ran to the session end at 17:35:00" in finding.evidence
 
 
 class TestPostProcessingDeferralStarvation:

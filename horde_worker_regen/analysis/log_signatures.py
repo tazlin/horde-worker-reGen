@@ -87,6 +87,9 @@ _MALFORMED_POP_NOT_EXERCISED = "the dry-run harness never synthesizes a malforme
 _OFFER_NEVER_WITHHELD = (
     "the dry-run harness offers post-processing from its first pop and never withholds it, so neither edge occurs"
 )
+_EARLIER_WORKER_VERSIONS_ONLY = (
+    "emitted only by earlier worker versions, whose free-VRAM headroom gate this codebase no longer has"
+)
 _HORDELIB_READOUT_NOT_EXERCISED = (
     "the dry-run harness's fake inference children never call hordelib's free-VRAM readout"
 )
@@ -1115,6 +1118,48 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.jobs.job_popper:_note_post_processing_offer",
         sample="Post-processing offer changed: withheld -> offered",
         dry_run_reason=_OFFER_NEVER_WITHHELD,
+    ),
+    _signature(
+        "post_processing_offer_first_offered",
+        r"Post-processing offer changed: unset -> offered$",
+        # The first pop of a session settles the offer from no prior state, so this is the edge that tells a
+        # reader the offer was on from the start rather than unknown until the first withhold.
+        emitter="process_management.jobs.job_popper:_note_post_processing_offer",
+        sample="Post-processing offer changed: unset -> offered",
+    ),
+    # Written by workers up to 18.8.1, whose headroom gate closed on any free-VRAM reading under the
+    # post-processing peak and reopened only after a sustained reading well above it. Kept so their bundles
+    # still diagnose; the current gate logs a VRAM-arbiter verdict in different words.
+    _signature(
+        "post_processing_advertising_withheld_legacy",
+        r"Withholding post-processing advertising: a driven card's measured free VRAM \((?P<free_mb>\d+)MB\)",
+        emitter="process_management.process_manager:_apply_post_processing_headroom_gate",
+        sample=(
+            "Withholding post-processing advertising: a driven card's measured free VRAM (3054MB) is below the "
+            "~3.5GB post-processing peak requirement, so a post-processing job would only fault at the lane. "
+            "Attempting a one-shot idle-resident reclaim to free the card."
+        ),
+        dry_run_reason=_EARLIER_WORKER_VERSIONS_ONLY,
+    ),
+    _signature(
+        "post_processing_advertising_holding_legacy",
+        r"Holding post-processing advertising until free VRAM \((?P<free_mb>\d+)MB\)",
+        emitter="process_management.process_manager:_apply_post_processing_headroom_gate",
+        sample=(
+            "Holding post-processing advertising until free VRAM (21396MB) sustains the ~8.5GB open requirement "
+            "for 60s (steady-state proof)."
+        ),
+        dry_run_reason=_EARLIER_WORKER_VERSIONS_ONLY,
+    ),
+    _signature(
+        "post_processing_advertising_restored_legacy",
+        r"Re-advertising post-processing: a driven card's measured free VRAM \((?P<free_mb>\d+)MB\)",
+        emitter="process_management.process_manager:_apply_post_processing_headroom_gate",
+        sample=(
+            "Re-advertising post-processing: a driven card's measured free VRAM (21242MB) held above the ~8.5GB "
+            "open requirement (peak plus resident-shift margin) for the sustain window."
+        ),
+        dry_run_reason=_EARLIER_WORKER_VERSIONS_ONLY,
     ),
     _signature(
         "wddm_paging",

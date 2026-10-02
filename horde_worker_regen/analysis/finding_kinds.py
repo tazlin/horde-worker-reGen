@@ -73,6 +73,7 @@ class FindingKind(enum.StrEnum):
     GAVE_UP_CLEAN = "gave_up_clean"
     STUCK_INFERENCE_STEP = "stuck_inference_step"
     POST_PROCESSING_VRAM_STALL = "post_processing_vram_stall"
+    POST_PROCESSING_OFFER_WITHHELD = "post_processing_offer_withheld"
     ORPHAN_WEDGE = "orphan_wedge"
     INFERENCE_SLOT_RETIRED = "inference_slot_retired"
     SAFETY_START_ESCALATED_TO_CPU = "safety_start_escalated_to_cpu"
@@ -252,6 +253,18 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "turns it back on after a stall-free fault window."
         ),
         reference_page="docs/explanation/performance_and_backpressure.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.POST_PROCESSING_OFFER_WITHHELD,
+        title="Post-processing was not offered to the horde",
+        detail=(
+            "The worker can send its job request with post-processing off while the config says on. It does so "
+            "for a reason it logs. The reasons are the fault breaker, the VRAM arbiter ruling the peak out, the "
+            "post-processing lane paused, the models not on disk, or too many post-processing jobs in hand. "
+            "While it is off, requests with an upscaler or face fixer cannot be assigned to this worker."
+        ),
+        see_also=FindingKind.POST_PROCESSING_VRAM_STALL,
+        reference_page="docs/explanation/resilience_and_recovery.md",
     ),
     FindingSpec(
         kind=FindingKind.ORPHAN_WEDGE,
