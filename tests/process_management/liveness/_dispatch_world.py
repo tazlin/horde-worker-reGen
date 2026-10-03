@@ -40,6 +40,7 @@ import multiprocessing
 import queue
 from dataclasses import dataclass
 from multiprocessing import synchronize
+from pathlib import Path
 from unittest.mock import Mock
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -114,6 +115,7 @@ from tests.process_management.conftest import (
     make_test_runtime_config,
     track_popped_job_async,
 )
+from tests.process_management.liveness._host_ram import HostRamLedger
 
 # --------------------------------------------------------------------------------------------------------
 # Hardware and model classes
@@ -125,6 +127,7 @@ _FIRST_CONTEXT_MB = 1354.0
 _MARGINAL_CONTEXT_MB = 384.0
 """Matches the seeded marginal the forecast falls back to when no probe measurement exists, so the world's
 own accounting and the scheduler's forecast charge sibling contexts identically."""
+
 
 _AMPLE_RAM_MB = 65_536.0
 """The host RAM reading every row runs against. These rows vary VRAM; a live psutil reading would make a
@@ -628,10 +631,16 @@ class _DispatchWorld:
         post_processing_chain_ticks: int = 0,
         preload_ends_dispatch: bool = False,
         extra_model_classes: tuple[_ModelClass, ...] = (),
+        host_ram: HostRamLedger | None = None,
+        ram_reserve_mb: float = 8192.0,
+        ram_pause_percent: float = 90.0,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
         Args:
+            host_ram: Opt-in conserved host RAM, including private pages and reclaimable checkpoint cache.
+            ram_reserve_mb: Single additive host headroom reserve.
+            ram_pause_percent: Hard danger-floor percentage for host-RAM rows.
             card: The device-free profile the row runs on.
             lane_count: How many inference lanes the pool holds.
             max_threads: The concurrent-sampling cap (the ``max_threads`` config axis).
@@ -775,6 +784,12 @@ class _DispatchWorld:
         self.child_evicts_granted_resident = child_evicts_granted_resident
         self.child_unload_leaks_mb = child_unload_leaks_mb
         self.preload_report_latency_seconds = preload_report_latency_seconds
+        self.host_ram = host_ram
+        self.ram_hold_ticks: list[int] = []
+        self.ram_two_way_ticks = 0
+        self.ram_busy_ticks = 0
+        self.ram_recycles: list[int] = []
+        self.ram_min_headroom_mb = float("inf")
         self.preload_latency_seconds = preload_latency_seconds
         self.disaggregated_encode_seconds = disaggregated_encode_seconds
         self.tick = 0
@@ -993,7 +1008,9 @@ class _DispatchWorld:
             # These are virtual-card scenarios, not host-platform scenarios. Pin the WDDM/conservative
             # physics the world was authored against so its holds and golden traces are identical on Linux.
             vram_admission_noise_mb=admission_noise_buffer_mb(card.total_mb),
-            ram_reserve_mb=8192.0,
+            ram_reserve_mb=ram_reserve_mb,
+            ram_pressure_pause_percent=ram_pause_percent if host_ram is not None else 85.0,
+            ram_per_process_max_mb=18432,
             vram_per_process_overhead_mb=_FIRST_CONTEXT_MB,
             whole_card_residency_cooldown_seconds=cooldown_seconds,
             whole_card_residency_max_hold_seconds=max_hold_seconds,
@@ -1071,6 +1088,12 @@ class _DispatchWorld:
         # The rows vary VRAM, never host RAM: pinning an ample reading keeps the RAM admission gates out of
         # the variation and stops a row's outcome depending on how much memory the machine running it has.
         self._scheduler.set_available_ram_mb_provider(lambda: _AMPLE_RAM_MB)
+        if host_ram is not None:
+            self._scheduler.set_available_ram_mb_provider(lambda: host_ram.available_mb)
+            self._scheduler._measured_total_ram_mb = lambda: host_ram.total_mb
+            self._scheduler._resolve_checkpoint_path = self._host_checkpoint_path
+            self._scheduler._read_component_sidecar = lambda _model: None
+            self._lifecycle._replace_inference_process = self._host_recycle
         # The learned-footprint feed, through the production observers: the children's per-tick memory reports
         # go through the real dispatcher into a store the scheduler prices from, so a row can say what the
         # parent learns from what its children report, and what that learning does to admission.
@@ -1154,6 +1177,7 @@ class _DispatchWorld:
         A pool where one card earns for both would hold any worker-wide duty floor while a card sits idle."""
         self.started_at = self.now
         self.completed_jobs = 0
+        self.submitted_jobs = 0
         self.weight_uploads = 0
         """Dispatches that had to bring their model's weights onto the card, the cost retention removes.
 
@@ -1168,6 +1192,36 @@ class _DispatchWorld:
             self._scheduler.set_reclaim_ladder(self._reclaim_ladder)
 
     # -- card model ---------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _host_model_ram(model: _ModelClass) -> tuple[float, float]:
+        """Checkpoint mmap bytes and private working set for the model's host-RAM profile."""
+        if model.baseline == KNOWN_IMAGE_GENERATION_BASELINE.flux_1:
+            return 18000.0, 8000.0
+        if model.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl:
+            return 6500.0, 8500.0
+        return 2000.0, 2500.0
+
+    def _host_checkpoint_path(self, model_name: str) -> Path | None:
+        """Supply virtual file metadata while production computes the static and learned RAM price."""
+        model = _model_by_name(model_name)
+        if model is None:
+            return None
+        checkpoint, _private = self._host_model_ram(model)
+        path = Mock(spec=Path)
+        path.stat.return_value.st_size = int(checkpoint * 1024 * 1024)
+        return path
+
+    def _host_recycle(self, process_info: HordeProcessInfo, **_kwargs: object) -> None:
+        """Record a real governance recycle and return its host pages to the ledger."""
+        process_id = process_info.process_id
+        self._scheduler.ram_reclaim.void_credit(process_id)
+        self.ram_recycles.append(process_id)
+        if self.host_ram is not None:
+            self.host_ram.evict(process_id)
+        lane = self._process_map.get(process_id)
+        if lane is not None:
+            self._release_unloaded_lane(lane)
 
     def _inference_lanes(self) -> list[HordeProcessInfo]:
         """The pool's inference lanes, which is what the row's residency and teardown bookkeeping is about."""
@@ -1468,6 +1522,19 @@ class _DispatchWorld:
         re-price of a staged job is made against.
         """
         for lane in self._process_map.values():
+            if self.host_ram is not None:
+                ledger = self.host_ram
+                ledger.private_mb.setdefault(lane.process_id, 1100.0)
+                ledger.transients_mb[lane.process_id] = 600.0 if lane.is_process_busy() else 0.0
+                ledger.trim_cache()
+                lane.ram_usage_bytes = int(ledger.rss_mb(lane.process_id) * 1024 * 1024)
+                lane.ram_private_bytes = int(ledger.private_mb[lane.process_id] * 1024 * 1024)
+                lane.report_sampled_at = self.now
+                occupancy = next((row for row in self._occupancy.values() if row.lane_id == lane.process_id), None)
+                if occupancy is not None:
+                    duration = occupancy.sample_until - occupancy.sample_from
+                    progress = (self.now - occupancy.sample_from) / max(0.001, duration)
+                    lane.last_heartbeat_percent_complete = max(0.0, min(100.0, 100.0 * progress))
             total_mb = self._card_totals[lane.device_index]
             lane.total_vram_mb = int(total_mb)
             lane.vram_usage_mb = int(total_mb - self.card_free_mb(lane.device_index))
@@ -1507,7 +1574,8 @@ class _DispatchWorld:
                     process_id=lane.process_id,
                     process_launch_identifier=lane.process_launch_identifier,
                     info="Memory report",
-                    ram_usage_bytes=0,
+                    ram_usage_bytes=lane.ram_usage_bytes,
+                    ram_private_bytes=lane.ram_private_bytes,
                     vram_usage_mb=lane.vram_usage_mb,
                     vram_total_mb=lane.total_vram_mb,
                     process_reserved_mb=reserved_mb,
@@ -1523,6 +1591,9 @@ class _DispatchWorld:
     def seed_resident(self, lane_id: int, model: _ModelClass, *, in_vram: bool) -> None:
         """Place ``model`` on ``lane_id`` as a resident (VRAM) or staged (RAM) copy."""
         lane = self._process_map[lane_id]
+        if self.host_ram is not None:
+            checkpoint, private = self._host_model_ram(model)
+            self.host_ram.stage(lane_id, model.name, checkpoint, private)
         lane.loaded_horde_model_name = model.name
         lane.last_process_state = HordeProcessState.PRELOADED_MODEL
         self._model_map.update_entry(
@@ -1586,6 +1657,8 @@ class _DispatchWorld:
         Stands in for the horde answering a pop with a job: work the worker did not advertise never arrives,
         so a job for an unadvertised model is refused and the queue never sees it.
         """
+        if self.host_ram is not None and self._scheduler._state.ram_pressure_pop_hold:
+            return False
         if job.model not in self.advertised_models():
             return False
         await self.pop(job)
@@ -1607,6 +1680,10 @@ class _DispatchWorld:
         parent's own record of the command stands until the child reports the model's new state.
         """
         for lane in self._process_map.values():
+            if self.host_ram is not None and lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
+                self.host_ram.evict(lane.process_id)
+                self._release_unloaded_lane(lane)
+                continue
             if lane.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
                 self._unload_leaked.discard(lane.process_id)
             if (
@@ -1719,12 +1796,16 @@ class _DispatchWorld:
                 self.preloads_commanded.append((self.tick, info.process_id, name))
             if info.process_id in self._loading or info.process_id in self._staged_mb:
                 continue
+            cache_delay = 0.0
+            if self.host_ram is not None:
+                checkpoint, private = self._host_model_ram(model)
+                cache_delay = self.host_ram.stage(info.process_id, name, checkpoint, private)
             report_at = self.now + self.preload_report_latency_seconds
             self._loading[info.process_id] = _PendingPreload(
                 model=name,
                 weights_mb=self._actual_charge_mb(model.weights_mb),
                 report_at=report_at,
-                ready_at=report_at + self.preload_latency_seconds,
+                ready_at=report_at + self.preload_latency_seconds + cache_delay,
             )
         self._preload_commands_standing = commanded
         self._advance_preloads()
@@ -1825,6 +1906,7 @@ class _DispatchWorld:
             await self._job_tracker.begin_safety_check(job_info)
             await self._job_tracker.queue_for_submit(job_info)
             await self._job_tracker.finalize_submitted(job_info)
+            self.submitted_jobs += 1
 
     async def _drain_post_processing(self) -> None:
         """Complete pending post-processing on the hand-driven lane and pass its result to safety.
@@ -2328,6 +2410,9 @@ class _DispatchWorld:
 
     def _retire_lane(self, lane_id: int) -> None:
         """Remove a lane from the pool, releasing its context, its resident weights, and its map entry."""
+        if self.host_ram is not None:
+            self.host_ram.evict(lane_id)
+            self.host_ram.private_mb.pop(lane_id, None)
         lane = self._process_map.get(lane_id)
         if lane is not None:
             self._record_committed_slot_retirement(lane)
@@ -2581,6 +2666,20 @@ class _DispatchWorld:
             # before the pass that would grow the card acts on it.
             self._evaluate_device_free_governor()
         self._scheduler.run_governance_tick()
+        if self.host_ram is not None:
+            ledger = self.host_ram
+            self.ram_min_headroom_mb = min(
+                self.ram_min_headroom_mb,
+                ledger.total_mb
+                - ledger.foreign_mb
+                - sum(ledger.private_mb.values())
+                - sum(ledger.transients_mb.values()),
+            )
+            if self._scheduler._state.ram_pressure_pop_hold:
+                self.ram_hold_ticks.append(self.tick)
+            busy = len(self._job_tracker.jobs_in_progress)
+            self.ram_busy_ticks += int(busy > 0)
+            self.ram_two_way_ticks += int(busy >= 2)
         # The parent drives the clearance controllers every control-loop iteration, independent of queue
         # depth, so a staged child is cleared as a slot frees whether or not new work is pending.
         self._advance_clearance()

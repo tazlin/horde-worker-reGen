@@ -178,6 +178,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 )
 from horde_worker_regen.process_management.scheduling.admission import clearance as clearance_mod
 from horde_worker_regen.process_management.scheduling.admission import preload as preload_mod
+from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
 )
@@ -192,6 +193,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     NextJobAndProcess,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import HEAD_PROTECTION_MAX_STARVE_SECONDS
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import ReuseCreditDiscrepancy
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     SAFETY_BACKLOG_PRIORITY_DEPTH,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
@@ -4506,3 +4508,140 @@ async def test_x_defect_reinjection_a_head_bound_selector_stalls_the_whole_fleet
         _assert_the_fleet_kept_its_cards_busy(world, run, context="head-bound selector")
     with pytest.raises(AssertionError, match="the median job waited"):
         _assert_no_job_waited_on_the_fleet(world, run, context="head-bound selector")
+
+
+@pytest.mark.closed_loop
+async def test_host_ram_starvation_keeps_two_lanes_serving() -> None:
+    """A 63.4 GB host with 30 GB foreign occupancy does not serialize jobs or recycle healthy fp8 RSS."""
+    from tests.process_management.liveness._host_ram import HostRamLedger
+
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        whole_card_enabled=False,
+        closed_loop=True,
+        disaggregated=True,
+        learned_footprints=True,
+        high_performance_mode=True,
+        host_ram=HostRamLedger(63434.0, 30000.0),
+        ram_reserve_mb=8192,
+        ram_pause_percent=90,
+        tick_seconds=0.5,
+    )
+    offered = 0
+    sdxl_defers = 0
+    sdxl_attempts = 0
+    apply_ram = world.scheduler._apply_ram_verdict
+    settle_ram = world.scheduler.ram_reclaim.settle_credits
+    late_discrepancies: list[ReuseCreditDiscrepancy] = []
+
+    def record_settlements(process_map: Mapping[int, HordeProcessInfo]) -> list[ReuseCreditDiscrepancy]:
+        discrepancies = settle_ram(process_map)
+        for discrepancy in discrepancies:
+            loads = sum(model == discrepancy.record.model for _tick, _lane, model in world.preloads_commanded)
+            if loads > 2:
+                late_discrepancies.append(discrepancy)
+        return discrepancies
+
+    world.scheduler.ram_reclaim.settle_credits = record_settlements
+
+    def record_ram_attempt(
+        job: ImageGenerateJobPopResponse,
+        target: HordeProcessInfo,
+        *,
+        is_head_blocker: bool,
+        no_live_resource_consumer: bool,
+        snapshot: SchedulingSnapshot | None = None,
+    ) -> bool:
+        nonlocal sdxl_attempts, sdxl_defers
+        admitted = apply_ram(
+            job,
+            target,
+            is_head_blocker=is_head_blocker,
+            no_live_resource_consumer=no_live_resource_consumer,
+            snapshot=snapshot,
+        )
+        if job.model in {_SDXL.name, _SDXL_OTHER.name}:
+            sdxl_attempts += 1
+            sdxl_defers += int(not admitted)
+        return admitted
+
+    world.scheduler._apply_ram_verdict = record_ram_attempt
+    for _ in range(12000):
+        while offered < 200 and len(world.job_tracker.jobs_pending_inference) < 4:
+            model = (_SDXL if offered % 2 else _SDXL_OTHER) if offered % 20 else _FLUX
+            job = make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=60)
+            if not await world.offer_job(job):
+                break
+            offered += 1
+        await world.step()
+        if world.submitted_jobs >= 200:
+            break
+    assert world.submitted_jobs == 200
+    assert world.ram_hold_ticks == [], "RAM hold came from the reserve instead of transient risk"
+    assert world.ram_two_way_ticks / max(1, world.ram_busy_ticks) >= 0.4
+    assert world.ram_recycles == []
+    assert sdxl_attempts > 0
+    assert sdxl_defers / sdxl_attempts < 0.1
+    assert late_discrepancies == [], "Settled growth must stay within 2 GB of the charge after the first two loads"
+    for model in (_SDXL, _SDXL_OTHER):
+        job = make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=60)
+        charge = world.scheduler._checkpoint_staging_charge_mb(job)
+        assert charge is not None and abs(charge - 6500) / 6500 <= 0.25
+    assert world.host_ram is not None
+    assert world.host_ram.free_mb >= 0
+    assert world.ram_min_headroom_mb >= 0
+
+
+@pytest.mark.closed_loop
+async def test_host_ram_reserve_band_reinjection_holds_healthy_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The incident oracle fails when the old reserve-width pop hold is reinstated."""
+    from horde_worker_regen.process_management.scheduling.governance import SetPopHold, ram_governor
+
+    def legacy_hold(snapshot):  # noqa: ANN001, ANN202
+        verdict = snapshot.verdict
+        approaching = verdict.available_mb is not None and verdict.available_mb - verdict.floor_mb < 8192
+        return SetPopHold(active=verdict.under_pressure or approaching and snapshot.in_flight_job_count > 0)
+
+    monkeypatch.setattr(ram_governor, "decide_pop_hold", legacy_hold)
+    with pytest.raises(AssertionError, match="RAM hold came from the reserve"):
+        await test_host_ram_starvation_keeps_two_lanes_serving()
+
+
+@pytest.mark.closed_loop
+async def test_fp8_private_working_set_survives_a_floor_dip() -> None:
+    """A default ceiling must shed idle contexts before treating healthy fp8 checkpoint mappings as growth."""
+    from tests.process_management.liveness._host_ram import HostRamLedger
+
+    ledger = HostRamLedger(65536, 30000)
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=3,
+        max_threads=2,
+        queue_depth=2,
+        host_ram=ledger,
+        ram_reserve_mb=4096,
+        ram_pause_percent=85,
+        closed_loop=True,
+        whole_card_enabled=False,
+        tick_seconds=0.5,
+    )
+    world.seed_resident(0, _FLUX, in_vram=True)
+    await world.pop(make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=100))
+    await world.step()
+    assert len(world.job_tracker.jobs_in_progress) == 1
+    ledger.foreign_mb = 50000
+    await world.step()
+    assert world.ram_recycles == []
+    assert not world.scheduler._processes_draining_for_ram
+    assert len(world._inference_lanes()) < 3
+    assert ledger.private_mb[0] < 18432
+    assert world.scheduler._ram_per_process_ceiling_mb() >= 27500
+    for _ in range(200):
+        await world.step()
+        if world.submitted_jobs == 1:
+            break
+    assert world.submitted_jobs == 1, "The protected fp8 job must reach submit through the floor dip"
+    assert world.ram_recycles == []

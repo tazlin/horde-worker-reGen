@@ -817,20 +817,10 @@ class TestGatesWithNoTestSeamYet:
             "directly; driving it needs either a progress-injection seam on the process map or a full "
             "sampling-progress fixture"
         ),
-        (GateSurface.POP_GATE, "ram_pressure"): (
-            "InferenceScheduler.set_available_ram_mb_provider now pins the reading the hold is derived from, "
-            "so the seam exists; what remains is driving a scripted sequence of readings across governance "
-            "ticks and observing governance_healthy_but_held arm and disarm around the hold"
-        ),
         (GateSurface.PRELOAD_ADMISSION, "defer_budget"): (
             "covered as a property at the arbiter surface in "
             "tests/process_management/resources/test_admission_liveness_matrix.py; a per-gate drive here "
             "would duplicate it rather than add coverage"
-        ),
-        (GateSurface.PRELOAD_ADMISSION, "defer_ram_pressure"): (
-            "the reclamation ladder's terminal rung is its declared backstop and is exercised through the "
-            "ram-governor suites; a per-gate drive needs the RAM reclaim sequence wired to a host-RAM "
-            "sequence fed through InferenceScheduler.set_available_ram_mb_provider"
         ),
     }
 
@@ -841,3 +831,51 @@ class TestGatesWithNoTestSeamYet:
             assert entry is not None, f"{surface.value}.{key} is listed as uncovered but is not registered"
             assert entry.kind is GateKind.HOLD
             assert seam, f"{surface.value}.{key} does not say what seam would cover it"
+
+
+class TestHostRamGates:
+    """Scripted pressure crosses both RAM gates and proves release without waiting for a job to finish."""
+
+    async def test_risk_hold_reclaims_and_releases_while_work_is_in_flight(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POP_GATE.ram_pressure: reclaim is paired with the soft hold and fresh room reopens intake."""
+        from horde_worker_regen.process_management.scheduling.governance import (
+            EvictIdleModels,
+            decide_pressure_governance,
+        )
+        from tests.process_management.conftest import make_mock_bridge_data
+        from tests.process_management.scheduling.test_admission_preload import _slot, _worker
+
+        scheduler, _jobs = await _worker(
+            slots={0: _slot(0, model=None)},
+            pending=[],
+            in_progress=["sd"],
+            bridge_data=make_mock_bridge_data(enable_vram_budget=True, vram_reserve_mb=0, ram_reserve_mb=8192),
+        )
+        monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 64000.0)
+        floor = scheduler._ram_danger_floor_mb()
+        for available, held in [(floor + 100, True), (floor + 8000, False), (floor + 50, True), (floor + 4000, False)]:
+            scheduler.set_available_ram_mb_provider(lambda reading=available: reading)
+            snapshot = scheduler._build_host_memory_snapshot(scheduler._ram_pressure_verdict())
+            actions = decide_pressure_governance(snapshot)
+            assert actions[0].active is held
+            assert any(isinstance(action, EvictIdleModels) for action in actions) is held
+        assert len(scheduler._job_tracker.jobs_in_progress) == 1
+
+    async def test_floor_defer_releases_on_the_scripted_reading(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PRELOAD_ADMISSION.defer_ram_pressure: the same queued job becomes eligible after floor recovery."""
+        from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
+        from tests.process_management.conftest import make_mock_bridge_data
+        from tests.process_management.scheduling.test_admission_preload import _decide, _slot, _worker
+
+        scheduler, jobs = await _worker(
+            slots={0: _slot(0, model=None)},
+            pending=["sd"],
+            bridge_data=make_mock_bridge_data(enable_vram_budget=True, vram_reserve_mb=0, ram_reserve_mb=4096),
+        )
+        monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 64000.0)
+        for reading, deferred in [(500, True), (65536, False), (900, True), (65536, False)]:
+            scheduler.set_available_ram_mb_provider(lambda available=reading: available)
+            assert (_decide(scheduler, jobs[0]).decision is AdmissionDecision.DEFER_RAM_PRESSURE) is deferred
+        assert jobs[0] in scheduler._job_tracker.jobs_pending_inference
