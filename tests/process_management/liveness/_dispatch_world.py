@@ -836,6 +836,9 @@ class _DispatchWorld:
         self._loading: dict[int, _PendingPreload] = {}
         """Per-lane preloads the parent has commanded and the child has not finished, keyed by lane."""
         self.preloads_commanded: list[tuple[int, int, str]] = []
+        self.preloads_onto_capped_cards: list[tuple[int, int, str]] = []
+        """Preloads commanded onto a card already running as many jobs as its sampling cap while another card
+        could start one. With every card busy a preload onto a capped card is staging ahead, not waste."""
         """Every preload the parent has sent over the run, as ``(tick, lane id, model)``.
 
         A weight upload the run paid for. A row that asserts a placement rule spreads copies rather than
@@ -1893,6 +1896,8 @@ class _DispatchWorld:
             commanded.add(command)
             if command not in self._preload_commands_standing:
                 self.preloads_commanded.append((self.tick, info.process_id, name))
+                if self._card_at_sampling_cap(info.process_id) and self._another_card_could_start(info.process_id):
+                    self.preloads_onto_capped_cards.append((self.tick, info.process_id, name))
             if info.process_id in self._loading:
                 continue
             if info.process_id in self._staged_mb:
@@ -1912,6 +1917,36 @@ class _DispatchWorld:
             )
         self._preload_commands_standing = commanded
         self._advance_preloads()
+
+    def _card_running_jobs(self, device_index: int) -> int:
+        """How many jobs the card's lanes are running."""
+        return sum(
+            1
+            for occupancy in self._occupancy.values()
+            if (holder := self._process_map.get(occupancy.lane_id)) is not None and holder.device_index == device_index
+        )
+
+    def _card_at_cap(self, device_index: int) -> bool:
+        card = self._scheduler._card_runtimes.get(device_index)
+        return card is not None and self._card_running_jobs(device_index) >= card.max_concurrent_inference
+
+    def _card_at_sampling_cap(self, lane_id: int) -> bool:
+        """Whether the lane's card already runs as many jobs as it may sample at once."""
+        lane = self._process_map.get(lane_id)
+        return lane is not None and self._card_at_cap(lane.device_index)
+
+    def _another_card_could_start(self, lane_id: int) -> bool:
+        """Whether some other card is under its sampling cap with an inference lane free to take work."""
+        lane = self._process_map.get(lane_id)
+        if lane is None:
+            return False
+        return any(
+            other.process_type is HordeProcessType.INFERENCE
+            and other.device_index != lane.device_index
+            and other.can_accept_job()
+            and not self._card_at_cap(other.device_index)
+            for other in self._process_map.values()
+        )
 
     def _advance_preloads(self) -> None:
         """Move each booked preload through its report and its materialisation as the clock passes them."""

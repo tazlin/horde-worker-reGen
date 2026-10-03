@@ -3765,6 +3765,15 @@ def _assert_no_copy_sits_where_it_cannot_run(world: _DispatchWorld, *, context: 
         )
 
 
+def _assert_no_load_went_where_it_cannot_run(world: _DispatchWorld, *, context: str) -> None:
+    """Assert no preload went to a card at its sampling cap while another card could have started the job."""
+    assert not world.preloads_onto_capped_cards, (
+        f"{context}: {len(world.preloads_onto_capped_cards)} preload(s) landed on a card at its sampling cap "
+        f"while another card could start the job, weights that sat until the card's own job ended "
+        f"({world.preloads_onto_capped_cards[:5]}). {world.state_dump()}"
+    )
+
+
 async def test_v_a_second_copy_goes_to_a_card_that_can_run_it() -> None:
     """A burst of one class reaches the idle cards instead of stacking on the card already running it.
 
@@ -3786,6 +3795,7 @@ async def test_v_a_second_copy_goes_to_a_card_that_can_run_it() -> None:
 
     _assert_the_burst_reached_the_free_cards(world, concurrency, context="burst placement")
     _assert_no_copy_sits_where_it_cannot_run(world, context="burst placement")
+    _assert_no_load_went_where_it_cannot_run(world, context="burst placement")
 
 
 async def test_v_the_copies_a_burst_earns_are_bounded() -> None:
@@ -3818,11 +3828,12 @@ async def test_v_the_copies_a_burst_earns_are_bounded() -> None:
 async def test_v_defect_reinjection_sticky_placement_stacks_copies_on_the_busy_card(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With the serving card preferred again, the burst stacks on card 0 and the idle cards stay idle.
+    """With the serving card preferred again, the burst's first copy is loaded onto card 0, already at its cap.
 
     Reinjected at the placement ranking alone: the duplicate escape, the copy bounds, the affinity guard and
     every gate below are production's, and the only thing taken away is that a card at its sampling cap loses
-    its sticky preference.
+    its sticky preference. The duplicate rule now counts only copies that can start a job, so later copies
+    still reach the idle cards; what sticky placement costs is a load onto a card that cannot run it.
     """
 
     def _sticky_first_regardless_of_capacity(
@@ -3845,8 +3856,9 @@ async def test_v_defect_reinjection_sticky_placement_stacks_copies_on_the_busy_c
 
     concurrency = await _drive_burst_traffic(world)
 
-    with pytest.raises(AssertionError, match="the pool ran at most|under the"):
-        _assert_the_burst_reached_the_free_cards(world, concurrency, context="sticky placement")
+    del concurrency
+    with pytest.raises(AssertionError, match="landed on a card at its sampling cap"):
+        _assert_no_load_went_where_it_cannot_run(world, context="sticky placement")
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -4240,27 +4252,27 @@ Eight slots at one dispatch per tick need eight ticks at best, and the classes r
 checkpoint load on top. This is past both and inside the first jobs' completions, so what follows it is a
 fleet at work rather than a fleet starting up."""
 
-_BUNDLE_JOB_FLOOR = 150
+_BUNDLE_JOB_FLOOR = 160
 """Completed jobs the run must put behind it, so its medians and duty figures are made of a real sample."""
 
-_BUNDLE_CONCURRENCY_FLOOR = 6.0
-"""Cards the fleet must average, of eight, once it is warm. Measured here: 7.1.
+_BUNDLE_CONCURRENCY_FLOOR = 7.0
+"""Cards the fleet must average, of eight, once it is warm. Measured here: 7.7, and 7.7 to 7.9 across seeds.
 
 A time-weighted mean rather than a peak: a pool that touches eight cards once and then serializes is the
 failure every multi-card row above is about, and only a mean can tell it from a pool that stays wide. The
-reinjection below averages 3.7 on the same traffic."""
+reinjection below averages 5.4 on the same traffic."""
 
-_BUNDLE_CARD_DUTY_FLOOR = 0.50
-"""Fraction of its own post-warm-up time each card must spend sampling. Measured here: 0.52 to 0.74.
+_BUNDLE_CARD_DUTY_FLOOR = 0.60
+"""Fraction of its own post-warm-up time each card must spend sampling. Measured here: 0.69 to 0.76.
 
 One slot per card, so this is the card's own lane sampling for half the clock. A job's window is sixteen
 seconds against a decode tail of one or two and a three-second checkpoint load whenever its class changes,
 so a card given work as it frees sits well above this; half is the line under which the card is waiting on
 the scheduler rather than on the workload. The weakest card is the one seeded with a large-class model,
-which pays the longer load and the longer decode. The reinjection takes its weakest card to 0.11."""
+which pays the longer load and the longer decode. The reinjection takes its weakest card to 0.29."""
 
 _BUNDLE_UPLOAD_RATIO_CEILING = 1.10
-"""Weight uploads the run may pay per completed job. Measured here: 0.97.
+"""Weight uploads the run may pay per completed job. Measured here: 0.99.
 
 With the measured budget off, retention is inactive by design: no grant is made, so every dispatch commits
 its own weights and one upload per job is what this posture costs. What the ceiling excludes is a job paying
@@ -4269,23 +4281,23 @@ the dispatches still in flight when the run ends, which are uploads no completio
 retained-copy claim belongs to the rows that run with the budget on."""
 
 _BUNDLE_PRELOAD_RATIO_CEILING = 0.90
-"""Preload commands the run may send per completed job. Measured here: 0.65.
+"""Preload commands the run may send per completed job. Measured here: 0.58.
 
 The load the rotation actually costs, as against the per-dispatch commit above: a dozen classes over sixteen
 lanes converges, so most jobs find their class already on a lane and only a model change sends a command. A
 fleet trading copies would send one for most of its dispatches."""
 
 _BUNDLE_WAIT_MEDIAN_GENERATIONS = 2.0
-"""Generations a job may typically wait between being popped and reaching a lane. Measured here: 1.4.
+"""Generations a job may typically wait between being popped and reaching a lane. Measured here: 1.3.
 
 The bundle's own median was five and a half, which is a queue draining through one or two cards while the
 rest of the fleet idles. Holding sixteen jobs over eight sampling slots is itself about one generation of
 queue (the worker's held count includes the jobs already sampling), so a fleet running wide cannot seat the
 median job inside one generation however well it dispatches; twice that is what separates a queue that is
-merely deep from one draining through part of the fleet. The reinjection sits at 4.0."""
+merely deep from one draining through part of the fleet. The reinjection sits at 2.1."""
 
 _BUNDLE_WAIT_CEILING_GENERATIONS = 5.0
-"""Generations the worst-placed job may wait. Measured here: 3.7.
+"""Generations the worst-placed job may wait. Measured here: 3.2.
 
 A job arriving behind a full queue is owed its round of it, and behind a model change it is owed that load
 as well. This is that with margin, which the maximum of a run needs more than its median does: one job
@@ -4472,9 +4484,9 @@ async def test_x_a_bundle_shaped_fleet_keeps_its_cards_busy() -> None:
     Read as one statement: a fleet given work is a fleet at work. Its consequences are that the warm run
     averages most of its cards rather than peaking at them once, that each card earns its own duty, that the
     queue's wait is a round of the queue rather than a backlog, that residency converges on the rotation
-    instead of trading copies, and that no cycle spends a ready lane on a load. Measured on this shape: 160
-    jobs, 7.1 of 8 cards averaged once warm, every card between 52% and 74% duty, a median wait of 1.4
-    generations against a worst of 3.7, 0.97 weight uploads and 0.65 preloads per completed job, and no cycle
+    instead of trading copies, and that no cycle spends a ready lane on a load. Measured on this shape: 172
+    jobs, 7.7 of 8 cards averaged once warm, every card between 69% and 76% duty, a median wait of 1.3
+    generations against a worst of 3.2, 0.99 weight uploads and 0.58 preloads per completed job, and no cycle
     that staged a model while a ready lane went unseated.
 
     The row is composite by design: a regression in any of the rules the rows above isolate shows here as
