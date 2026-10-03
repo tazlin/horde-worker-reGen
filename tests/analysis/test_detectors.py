@@ -8,6 +8,7 @@ exception across the process boundary and distinguish "never gave up" (the bug) 
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -1941,6 +1942,21 @@ class TestHeadDispatchStall:
         assert "head_dispatch_stall" in findings
         assert findings["head_dispatch_stall"].severity is Severity.WARNING
 
+    def test_ram_pressure_is_named_inside_the_stall_window(self, tmp_path: Path) -> None:
+        """RAM-backed waits point at host memory instead of suggesting a wider concurrency cap."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | x:y:1 - {_STARTUP}",
+                _dispatch_stall("13:01:00.000", reason=_DISPATCH_GATE_REASON),
+                "2026-06-25 13:01:20.000 | INFO | x:y:1 - Host RAM pop hold engaged: available 8000 MB "
+                "above danger floor 6343 MB, soft hold 8500 MB, preload 14500 MB, restore 32500 MB",
+                _dispatch_stall("13:01:40.000", reason=_DISPATCH_GATE_REASON),
+            ],
+        )
+        finding = _diagnose(tmp_path, bridge)["head_dispatch_stall"]
+        assert "System RAM pressure" in finding.action
+        assert "`max_threads`" not in finding.action
+
     def test_silent_without_stall(self, tmp_path: Path) -> None:
         """No dispatch-stall line means no finding."""
         bridge = "\n".join(
@@ -3001,3 +3017,49 @@ class TestUtilitiesLaneBringupTimeout:
             ),
         )
         assert "never came up" in findings["utilities_lane_bringup_timeout"].headline
+
+
+class TestHostRamStarvation:
+    """A host-RAM finding relates repeated holds and loads to one threshold model."""
+
+    def test_bundle_metadata_and_reclaim_counts_are_reported(self, tmp_path: Path) -> None:
+        """The captured host/config thresholds accompany rates and both expensive reclaim paths."""
+        config = tmp_path / "config"
+        config.mkdir()
+        (config / "bridgeData.redacted.yaml").write_text(
+            "ram_reserve_mb: 8192\nram_pressure_pause_percent: 90\n", encoding="utf-8"
+        )
+        (tmp_path / "system_info.json").write_text(
+            json.dumps({"ram": {"total_bytes": 63434 * 1024 * 1024, "available_bytes": 14649 * 1024 * 1024}}),
+            encoding="utf-8",
+        )
+        lines = [f"2026-06-25 13:00:00.000 | DEBUG | x:y:1 - {_STARTUP}"]
+        for hour in (13, 14):
+            lines.append(
+                f"2026-06-25 {hour}:01:00.000 | INFO | x:y:1 - Host RAM pop hold engaged: available 8000 MB "
+                "above danger floor 6343 MB, hold margin 8192 MB above the floor while work is in flight"
+            )
+            lines.append(
+                f"2026-06-25 {hour}:01:01.000 | INFO | x:y:1 - RAM budget deferring preload of SDXL: "
+                "job needs ~6500 MB + 8192 MB reserve vs 14000 MB available"
+            )
+        lines.append(
+            "2026-06-25 15:00:00.000 | INFO | x:y:1 - Inference process 3 holds 20000 MB RAM "
+            "(>= the 18432 MB per-process ceiling); recycling it to return the retained RAM to the OS."
+        )
+        finding = _diagnose(tmp_path, "\n".join(lines))["host_ram_starvation"]
+        evidence = " ".join(finding.evidence)
+        assert "hard floor 6343 MB" in evidence
+        assert "preload 14692 MB" in evidence
+        assert "engage rate 1.0/hour (2 edges)" in evidence
+        assert "recycle count 1" in evidence
+        assert "capture available 14649 MB" in evidence
+
+    def test_one_refused_load_is_not_host_starvation(self, tmp_path: Path) -> None:
+        """An isolated admission refusal gives no evidence of a throughput-shaping RAM problem."""
+        lines = [
+            f"2026-06-25 13:00:00.000 | DEBUG | x:y:1 - {_STARTUP}",
+            "2026-06-25 13:01:00.000 | INFO | x:y:1 - RAM budget deferring preload of SDXL: "
+            "job needs ~6500 MB + 8192 MB reserve vs 14000 MB available",
+        ]
+        assert "host_ram_starvation" not in _diagnose(tmp_path, "\n".join(lines))

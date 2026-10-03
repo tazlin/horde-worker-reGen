@@ -91,6 +91,7 @@ class FindingKind(enum.StrEnum):
     WHOLE_CARD_POP_CLAIM_EPISODES = "whole_card_pop_claim_episodes"
     WHOLE_CARD_POP_CLAIM_MONOPOLY = "whole_card_pop_claim_monopoly"
     MODEL_CHURN = "model_churn"
+    HOST_RAM_STARVATION = "host_ram_starvation"
 
     MULTI_CARD_DISPATCH_SERIALIZATION = "multi_card_dispatch_serialization"
     HEAD_DISPATCH_STALL = "head_dispatch_stall"
@@ -168,6 +169,20 @@ def _spec_table(*specs: FindingSpec) -> Mapping[FindingKind, FindingSpec]:
 
 
 FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
+    FindingSpec(
+        kind=FindingKind.HOST_RAM_STARVATION,
+        title="System RAM pressure is holding back jobs",
+        action=(
+            "Update the worker, then check which other programs are using system RAM. "
+            "Run `horde-log bundle` and report continued holds or repeated process restarts."
+        ),
+        detail=(
+            "The worker held new jobs or postponed model loads because system RAM was short. "
+            "The evidence names the measured memory, the ordered requirements, and process restarts. "
+            "Older workers used the RAM reserve as a soft hold and charged checkpoint swaps as whole processes."
+        ),
+        reference_page="docs/explanation/resource_governance.md",
+    ),
     # --- Startup and process lifecycle ---
     FindingSpec(
         kind=FindingKind.CRASH_ON_START_LOOP,
@@ -483,8 +498,8 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         kind=FindingKind.MODEL_CHURN,
         title="Models were loaded and unloaded far more often than jobs ran",
         action=(
-            "Turn off `unload_models_from_vram_often`. Serve fewer models, or use the model pool, so the "
-            "offered set fits the card. Raise `queue_size` so jobs for one model can run back to back."
+            "Turn off `unload_models_from_vram_often` and serve fewer models, or use the model pool. "
+            "Check system RAM pressure before changing `queue_size`."
         ),
         detail=(
             "A process that keeps its model runs the next job for it at no cost. Every swap costs a load from "

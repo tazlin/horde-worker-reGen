@@ -103,9 +103,48 @@ _DEFERRED_GPU_START_NOT_EXERCISED = (
     "start is ever deferred"
 )
 
+_RAM_NOT_EXERCISED = "the dry-run harness never drives the host below its RAM requirements"
+
 _ABORT_SENTINEL_NAMES_PATTERN = "|".join(re.escape(abort_sentinel_name(kind)) for kind in AbortSentinelKind)
 
 _SIGNATURE_LIST: list[LogSignature] = [
+    _signature(
+        "host_ram_pop_hold",
+        r"Host RAM pop hold (?P<edge>engaged|released): available (?P<available>[\d.]+) MB "
+        r"(?:above|below) danger floor (?P<floor>[\d.]+) MB, "
+        r"(?:(?:hold margin (?P<legacy_margin>[\d.]+) MB above the floor while work is in flight)|"
+        r"(?:soft hold (?P<soft>[\d.]+) MB, preload (?P<preload>[\d.]+) MB, restore (?P<restore>[\d.]+) MB))",
+        emitter="process_management.scheduling.admission.executor:execute_governance_actions",
+        sample="Host RAM pop hold engaged: available 8000 MB above danger floor 6343 MB, "
+        "soft hold 8500 MB, preload 14500 MB, restore 32500 MB; in-flight jobs continue.",
+        dry_run_reason=_RAM_NOT_EXERCISED,
+    ),
+    _signature(
+        "ram_preload_defer",
+        r"RAM budget deferring preload of (?P<model>.+?): job needs ~(?P<charge>[\d.]+) MB "
+        r"\+ (?P<reserve>[\d.]+) MB reserve vs (?P<available>[\d.]+) MB available",
+        emitter="process_management.scheduling.inference_scheduler:_apply_ram_verdict",
+        sample="RAM budget deferring preload of AlbedoBase XL: job needs ~12600 MB + 8192 MB reserve "
+        "vs 14410 MB available: does NOT fit. Reclaiming idle RAM.",
+        dry_run_reason=_RAM_NOT_EXERCISED,
+    ),
+    _signature(
+        "ram_ceiling_reclaim",
+        r"Inference process (?P<process>\d+) holds (?P<resident>[\d.]+) MB RAM "
+        r"\(>= the (?P<ceiling>[\d.]+) MB per-process ceiling\).*?; (?P<action>draining|recycling) it",
+        emitter="process_management.scheduling.admission.executor:execute_governance_actions",
+        sample="Inference process 3 holds 18662 MB RAM (>= the 18432 MB per-process ceiling); "
+        "recycling it to return the retained RAM to the OS.",
+        dry_run_reason=_RAM_NOT_EXERCISED,
+    ),
+    _signature(
+        "ram_creep_cycle",
+        r"Idle process (?P<process>\d+) holds \d+ bytes \(above the creep-containment ceiling\); cycling it",
+        emitter="process_management.scheduling.inference_scheduler:_replace_stale_ram_unload_process",
+        sample="Idle process 3 holds 19568697344 bytes (above the creep-containment ceiling); "
+        "cycling it to return the crept RAM to the OS.",
+        dry_run_reason=_RAM_NOT_EXERCISED,
+    ),
     # --- Per-job lifecycle ---
     _signature(
         "popped_job",

@@ -67,6 +67,7 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 | `whole_card_residency_churn` | warning | The whole card was reserved and released over and over in one session. | Thrash: each round trip costs a model reload and a safety restart. Usually a model that does not need the whole card is being given it. |
 | `whole_card_pop_claim_episodes` | info | The worker asked the horde for one model only while it held the card. Recorded so the claim windows are visible. | Nothing if that is the heavy work this worker is for. Otherwise trim the model list or lower `whole_card_residency_max_hold_seconds`. |
 | `whole_card_pop_claim_monopoly` | warning | Claims kept running to the hold cap while other models' jobs sat waiting. | Decide whether this worker should specialise. If it should serve a mix, lower `whole_card_residency_max_hold_seconds` or drop the whole-card model. |
+| `host_ram_starvation` | warning | System RAM holds new jobs, repeatedly defers model loads, or forces process reclaim. Reports thresholds, holds per hour, drain/recycle counts and queued-work concurrency. | Update the worker, check other programs' RAM usage, and bundle continued holds or repeated restarts. |
 | `model_churn` | varies | Models were loaded and unloaded far more often than jobs ran, or loads were cleared before they ran. | Turn off `unload_models_from_vram_often`. Serve fewer models, or use the model pool, and raise `queue_size` so same-model jobs run back to back. |
 
 ## Dispatch and throughput

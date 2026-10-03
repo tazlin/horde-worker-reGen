@@ -261,6 +261,14 @@ _REPLACED = "inference process replaced (crashed or hung)"
 # One contract per detector, keyed by the detector's function name. The no-orphan test asserts this
 # mapping covers every entry in DETECTORS, so a new detector forces a fixture to be added here.
 CONTRACTS: dict[str, Contract] = {
+    "detect_host_ram_starvation": Contract(
+        bridge=_bridge(
+            "2026-06-24 18:29:31.000 | INFO | executor:execute_governance_actions:175 - "
+            "Host RAM pop hold engaged: available 8000 MB above danger floor 6343 MB, "
+            "soft hold 8500 MB, preload 14500 MB, restore 32500 MB; in-flight jobs continue.",
+        ),
+        severity=Severity.WARNING,
+    ),
     "detect_crash_on_start_loop": Contract(
         bridge=_bridge(
             _recovery("18:29:31.000", 1, reason=_REPLACED),

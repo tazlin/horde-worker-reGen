@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import bisect
 import enum
+import json
 import re
+import statistics
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+
+import yaml
 
 from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
 
@@ -382,6 +386,11 @@ _SOFT_RESET_FLAP_THRESHOLD = 2
 # A recovery count at or above this is a storm worth surfacing on its own.
 _RECOVERY_STORM_THRESHOLD = 5
 
+
+_RAM_HOLD_RE = pattern_for("host_ram_pop_hold")
+_RAM_DEFER_RE = pattern_for("ram_preload_defer")
+_RAM_CEILING_RE = pattern_for("ram_ceiling_reclaim")
+_RAM_CREEP_RE = pattern_for("ram_creep_cycle")
 
 Detector = Callable[[SessionContext], "list[Finding]"]
 
@@ -2615,6 +2624,7 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
                 see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
             ),
         ]
+    ram = _ram_pressure_in_window(context, stalls)
     return [
         Finding(
             kind=FindingKind.HEAD_DISPATCH_STALL,
@@ -2626,7 +2636,9 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
             action_addendum=(
                 "If throughput is low, the rule named in the evidence is the lever: `max_threads`, `max_batch`, "
                 "or the VRAM budget."
-            ),
+            )
+            if not ram
+            else "System RAM pressure held jobs or model loads during this wait. Check the RAM finding.",
             evidence=[_evidence(r) for r in stalls[:3]],
         ),
     ]
@@ -3437,6 +3449,124 @@ def detect_multi_card_dispatch_serialization(context: SessionContext) -> list[Fi
     ]
 
 
+def _ram_pressure_in_window(context: SessionContext, records: list[LogRecord]) -> list[LogRecord]:
+    """RAM holds and deferred loads in the interval covered by these records."""
+    if not records:
+        return []
+    start, end = _window_key(records[0]), _window_key(records[-1])
+    return [
+        record
+        for record in context.session.records
+        if start <= _window_key(record) <= end
+        and (
+            _RAM_DEFER_RE.search(record.message)
+            or (match := _RAM_HOLD_RE.search(record.message)) is not None
+            and match.group("edge") == "engaged"
+        )
+    ]
+
+
+def _bundle_ram_requirements(context: SessionContext, charge_mb: float) -> str:
+    """Describe requirements from bundle config and host inventory, without exposing config contents."""
+    from horde_worker_regen.process_management.resources.resource_budget import ram_headroom
+
+    root = context.bundle.root
+    # A directory bundle may have its files under logs/, with metadata beside that directory.
+    if not (root / "system_info.json").is_file() and (root.parent / "system_info.json").is_file():
+        root = root.parent
+    try:
+        inventory = json.loads((root / "system_info.json").read_text(encoding="utf-8"))
+        config_path = root / "config" / "bridgeData.redacted.yaml"
+        if not config_path.is_file():
+            config_path = root / "bridgeData.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or not isinstance(inventory, dict):
+            return "RAM requirements unavailable: bundle metadata is not a mapping"
+        memory = inventory.get("ram", {})
+        total = float(memory["total_bytes"]) / (1024 * 1024)
+        available = float(memory["available_bytes"]) / (1024 * 1024)
+        thresholds = ram_headroom(
+            total,
+            pause_percent=float(config.get("ram_pressure_pause_percent", 85)),
+            min_free_mb=float(config.get("ram_pressure_min_free_mb", 1024)),
+            reserve_mb=float(config.get("ram_reserve_mb", 4096)),
+            staging_charge_mb=charge_mb,
+            context_cost_mb=charge_mb,
+        )
+    except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as error:
+        return f"RAM requirements unavailable: {type(error).__name__}"
+    return (
+        f"Shared RAM requirements: hard floor {thresholds.hard_floor_mb:.0f} MB, "
+        f"soft hold {thresholds.soft_hold_mb:.0f} MB before outstanding job transients, "
+        f"preload {thresholds.preload_requirement_mb:.0f} MB, restore at least "
+        f"{thresholds.restore_requirement_mb:.0f} MB at a {charge_mb:.0f} MB observed load charge; "
+        f"capture available {available:.0f} MB"
+    )
+
+
+def detect_host_ram_starvation(context: SessionContext) -> list[Finding]:
+    """Correlate host holds, marginal RAM refusals and expensive process reclaim in one finding."""
+    records = context.session.records
+    holds = [
+        (record, match)
+        for record in records
+        if (match := _RAM_HOLD_RE.search(record.message)) is not None and match.group("edge") == "engaged"
+    ]
+    defers = [(record, match) for record in records if (match := _RAM_DEFER_RE.search(record.message)) is not None]
+    reclaims = [(record, match) for record in records if (match := _RAM_CEILING_RE.search(record.message)) is not None]
+    creep = _matching(records, _RAM_CREEP_RE)
+    if not holds and len(defers) < 3 and not reclaims and not creep:
+        return []
+    stamps = [record.timestamp for record in records if record.timestamp is not None]
+    hours = (max(stamps) - min(stamps)).total_seconds() / 3600 if len(stamps) > 1 else 0.0
+    engage_rate = len(holds) / hours if hours > 0 else 0.0
+    drains = sum(match.group("action") == "draining" for _record, match in reclaims)
+    recycles = sum(match.group("action") == "recycling" for _record, match in reclaims) + len(creep)
+    readings = [float(match.group("available")) for _record, match in [*holds, *defers]]
+    charge = statistics.median(float(match.group("charge")) for _record, match in defers) if defers else 0.0
+    evidence = [
+        _bundle_ram_requirements(context, charge),
+        f"pop-hold engage rate {engage_rate:.1f}/hour ({len(holds)} edges); RAM-defer count {len(defers)}; "
+        f"ceiling drain count {drains}; recycle count {recycles}",
+    ]
+    if readings:
+        evidence.append(f"available RAM at hold/defer edges: median {statistics.median(readings):.0f} MB")
+    if holds:
+        evidence.append("Recorded hold requirements: " + holds[0][0].message)
+    # Sweep jobs rather than distinct cards: one card may run several inference processes.
+    lifecycle = job_lifecycle_for(context)
+    events: list[tuple[datetime, int, int]] = []
+    for job in lifecycle.jobs.values():
+        if job.popped_at is not None and job.dispatched_at is not None and job.inference_finished_at is not None:
+            events.extend([(job.popped_at, 0, 1), (job.dispatched_at, 1, -1), (job.inference_finished_at, -1, 0)])
+    running = queued = 0
+    one = busy_queued = 0.0
+    previous = None
+    for stamp, run_delta, queue_delta in sorted(events):
+        if previous is not None and queued > 0 and running > 0:
+            elapsed = (stamp - previous).total_seconds()
+            busy_queued += elapsed
+            if running == 1:
+                one += elapsed
+        running += run_delta
+        queued += queue_delta
+        previous = stamp
+    if busy_queued > 0:
+        evidence.append(f"one in-flight job while work was queued: {one / busy_queued:.1%} of {busy_queued:.0f}s")
+    evidence.extend(_evidence(record) for record, _match in defers[:2])
+    return [
+        Finding(
+            kind=FindingKind.HOST_RAM_STARVATION,
+            severity=Severity.WARNING,
+            headline=(
+                f"System RAM held new jobs {len(holds)} times and postponed model loads {len(defers)} times, "
+                f"with {recycles} process restarts."
+            ),
+            evidence=evidence,
+        )
+    ]
+
+
 def detect_model_churn(context: SessionContext) -> list[Finding]:
     """Model weights moving in and out of the lanes faster than the work justifies.
 
@@ -3461,11 +3591,13 @@ def detect_model_churn(context: SessionContext) -> list[Finding]:
     if preload_ratio < _MODEL_CHURN_PRELOAD_RATIO and cleared_ratio < _MODEL_CHURN_CLEARED_RATIO:
         return []
 
+    ram = _ram_pressure_in_window(context, context.session.records)
     severity = Severity.CRITICAL if movement.preloads >= dispatches else Severity.WARNING
     return [
         Finding(
             kind=FindingKind.MODEL_CHURN,
             severity=severity,
+            action_addendum="System RAM pressure also held jobs or model loads during these swaps." if ram else None,
             headline=(
                 f"Over {dispatches} jobs the worker loaded {movement.preloads} models and unloaded "
                 f"{movement.unloads}, and {movement.cleared_preloads} of those loads were thrown away before "
@@ -3787,6 +3919,7 @@ DETECTORS: list[Detector] = [
     detect_multi_card_dispatch_serialization,
     detect_parent_loop_stall,
     detect_model_churn,
+    detect_host_ram_starvation,
     detect_lane_placement,
     detect_utilities_lane_bringup_timeout,
     detect_inference_slot_retired,

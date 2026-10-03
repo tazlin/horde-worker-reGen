@@ -398,6 +398,26 @@ class TestMidRunSessionStitching:
         assert not text.startswith("[... truncated to the most recent")
         assert "filler line 12" in text
 
+    def test_diagnosis_includes_ram_hold_before_the_rotation(self, tmp_path: Path) -> None:
+        """Bundled analysis reads the predecessor evidence as well as shipping its bytes."""
+        logs = self._mid_run_worker_dir(tmp_path)
+        rotation = logs / self._ROTATION
+        rotation.write_text(
+            rotation.read_text(encoding="utf-8")
+            + "2026-06-24 17:59:31.000 | INFO | x:y:3 - Host RAM pop hold engaged: available 8000 MB "
+            "above danger floor 6343 MB, soft hold 8500 MB, preload 14500 MB, restore 32500 MB; "
+            "in-flight jobs continue.\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml", last=True)
+        with zipfile.ZipFile(out) as zf:
+            diagnosis = json.loads(zf.read("diagnose.json"))
+            findings = {finding["id"]: finding for finding in diagnosis[0]["findings"]}
+            sessions = zf.read("sessions.txt").decode("utf-8")
+        assert "host_ram_starvation" in findings
+        assert "17:00:00" in sessions
+
     def test_a_session_with_its_launch_in_the_active_log_ships_no_rotation(self, tmp_path: Path) -> None:
         """The default bundle stays lean when the active log already holds the launch."""
         logs = _worker_dir(tmp_path)

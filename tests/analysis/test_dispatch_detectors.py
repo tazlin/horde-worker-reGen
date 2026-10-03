@@ -269,6 +269,17 @@ class TestModelChurn:
         """A handful of jobs is a warm-up; every model load in it looks like churn."""
         assert "model_churn" not in diagnose(tmp_path, self._session(dispatches=5, preloads=5, cleared=3))
 
+    def test_ram_hold_attributes_churn_without_recommending_a_deeper_queue(self, tmp_path: Path) -> None:
+        """A RAM-starved session must not be advised to add more waiting work."""
+        session = self._session(dispatches=40, preloads=20, cleared=5)
+        session += (
+            "\n2026-09-09 01:02:00.000 | INFO | x:y:1 - Host RAM pop hold engaged: available 8000 MB "
+            "above danger floor 6343 MB, soft hold 8500 MB, preload 14500 MB, restore 32500 MB\n"
+        )
+        finding = diagnose(tmp_path, session)["model_churn"]
+        assert "RAM pressure" in finding.action
+        assert "deeper" not in finding.action
+
 
 class TestLanePlacement:
     """Auxiliary lanes that moved cards mid-session, or that stacked onto the safety lane's card."""

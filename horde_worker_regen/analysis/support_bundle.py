@@ -312,6 +312,20 @@ def build_support_bundle(
     # whole rotation history parsed the first time a detector joined child records to the session, even
     # though those archives are not shipped. --full-logs opts into the complete history on both counts.
     log_bundle = LogBundle.from_path(path, active_only=not full_logs)
+    active_sessions = segment_bundle_sessions(log_bundle, active_only=True)
+    bounded_kinds = {session.log_kind for session in active_sessions if session.start_is_lower_bound}
+    stitched_rotations: list[Path] = []
+    stitched_active_logs: set[Path] = set()
+    if not full_logs:
+        for kind in sorted(bounded_kinds):
+            for active_log in log_bundle.active_paths_of_kind(kind):
+                predecessors = _stitched_predecessors(active_log)
+                if predecessors:
+                    stitched_rotations.extend(predecessors)
+                    stitched_active_logs.add(active_log)
+                    for predecessor in predecessors:
+                        log_bundle._classify(predecessor)
+        log_bundle._note_orchestrator_rotations()
     sessions = segment_bundle_sessions(log_bundle)
     selected = select_sessions(
         sessions,
@@ -323,19 +337,6 @@ def build_support_bundle(
     # A session that begins mid-run in the active log continues back through the rotations the size
     # roll-over cut it from. Ship those (bounded, uncapped) so the run's earlier hours are not lost to
     # the default bundle, and let the stats window reach back to where the shipped evidence starts.
-    stitched_rotations: list[Path] = []
-    # The active file whose predecessors were stitched ships whole as well: it is at most one roll size, and
-    # capping it would cut the hours between the last predecessor's end and the cap's tail out of the run
-    # the stitching exists to restore.
-    stitched_active_logs: set[Path] = set()
-    bounded_log_kinds = {s.log_kind for s in selected if s.start_is_lower_bound}
-    if not full_logs:
-        for log_kind in sorted(bounded_log_kinds):
-            for active_log in log_bundle.active_paths_of_kind(log_kind):
-                predecessors = _stitched_predecessors(active_log)
-                if predecessors:
-                    stitched_rotations.extend(predecessors)
-                    stitched_active_logs.add(active_log)
     evidence_start = min((s.start_ts for s in sessions if s.start_ts is not None), default=None)
     for rotation in stitched_rotations:
         first, _ = read_time_range(rotation)

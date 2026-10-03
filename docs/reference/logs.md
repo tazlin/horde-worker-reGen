@@ -206,3 +206,7 @@ once the budget is spent), which appears only when there is something to report.
 
 Do **not** post `.log` files in public channels. Send them to a maintainer directly: we cannot
 guarantee your API key is not present in a log. See [Troubleshooting](../how-to/troubleshoot.md).
+
+Host-RAM hold edges name available RAM, the hard floor, and the shared soft/preload/restore requirements.
+`host_ram_starvation` correlates those edges with RAM load refusals, ceiling drains, creep cycles and
+queued-work concurrency. The parser accepts the older reserve-margin hold wording for historical bundles.
