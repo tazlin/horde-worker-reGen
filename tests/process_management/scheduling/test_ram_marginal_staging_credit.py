@@ -290,6 +290,17 @@ def test_learned_checkpoint_price_keeps_each_jobs_feature_ram() -> None:
     assert scheduler._checkpoint_part_of_charge_mb(heavy, verdict) == pytest.approx(6500)
 
 
+def test_an_unseen_checkpoint_is_priced_from_its_baselines_loads() -> None:
+    """Cold loads of three SDXL checkpoints price a fourth before it has loaded once."""
+    scheduler = _sdxl_pricing_scheduler()
+    for model in ("sdxl_a", "sdxl_b", "sdxl_c", "sdxl_a", "sdxl_b"):
+        scheduler.ram_reclaim.learned_ram.observe(
+            model, ReuseCreditKind.WHOLE, 8000, baseline="stable_diffusion_xl", size_mb=6500
+        )
+    job = make_job_pop_response("sdxl_d", width=1024, height=1024)
+    assert scheduler._checkpoint_staging_charge_mb(job) == pytest.approx(8000 * 1.1)
+
+
 def test_without_a_lane_post_processing_ram_lands_on_inference() -> None:
     """With no dedicated lane the inference process allocates the post-processors' RAM too."""
     scheduler = _sdxl_pricing_scheduler()

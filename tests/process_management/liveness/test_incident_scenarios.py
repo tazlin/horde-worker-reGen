@@ -4554,9 +4554,17 @@ async def test_host_ram_starvation_keeps_two_lanes_serving() -> None:
     observed: list[tuple[str, str, float, float | None]] = []
     observe = world.scheduler.ram_reclaim.learned_ram.observe
 
-    def record_observation(model: str, kind: str, settled_mb: float, peak_mb: float | None = None) -> None:
+    def record_observation(
+        model: str,
+        kind: str,
+        settled_mb: float,
+        peak_mb: float | None = None,
+        *,
+        baseline: str | None = None,
+        size_mb: float | None = None,
+    ) -> None:
         observed.append((model, kind, settled_mb, peak_mb))
-        observe(model, kind, settled_mb, peak_mb)
+        observe(model, kind, settled_mb, peak_mb, baseline=baseline, size_mb=size_mb)
 
     world.scheduler.ram_reclaim.learned_ram.observe = record_observation
 
@@ -4609,10 +4617,16 @@ async def test_host_ram_starvation_keeps_two_lanes_serving() -> None:
         assert peak_mb == pytest.approx(private_mb + _SIM_LOAD_PEAK_OVER_SETTLED_MB), "learning must read the peak"
     learned = world.scheduler.ram_reclaim.learned_ram
     for model in (_SDXL, _SDXL_OTHER):
-        estimate = learned.measured_estimate_mb(model.name, ReuseCreditKind.WHOLE)
+        checkpoint_mb, private_mb = world._host_model_ram(model)
+        estimate = learned.measured_estimate_mb(
+            model.name, ReuseCreditKind.WHOLE, baseline=str(model.baseline), size_mb=checkpoint_mb
+        )
         job = make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=60)
-        expected = 6500.0 if estimate is None else max(estimate, 3500.0)
-        assert world.scheduler._checkpoint_staging_charge_mb(job) == pytest.approx(expected)
+        if estimate is None:
+            assert world.scheduler._checkpoint_staging_charge_mb(job) == pytest.approx(checkpoint_mb)
+            continue
+        assert estimate >= private_mb + _SIM_LOAD_PEAK_OVER_SETTLED_MB, "the learned price must cover the load peak"
+        assert world.scheduler._checkpoint_staging_charge_mb(job) == pytest.approx(estimate)
     assert world.host_ram is not None
     assert world.host_ram.free_mb >= 0
     assert world.ram_min_headroom_mb >= 0

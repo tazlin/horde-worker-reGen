@@ -225,6 +225,31 @@ def test_learned_price_follows_the_load_peak() -> None:
     assert store.measured_estimate_mb("flux", "whole") == pytest.approx(9900)
 
 
+def test_baseline_evidence_prices_a_sibling_checkpoint_by_its_size() -> None:
+    """Five loads across a baseline's checkpoints price a sixth checkpoint from growth per staged megabyte."""
+    store = LearnedRamStore()
+    for model in ("sdxl_a", "sdxl_b", "sdxl_c", "sdxl_a", "sdxl_b"):
+        store.observe(model, "whole", 6500, 7150, baseline="stable_diffusion_xl", size_mb=6500)
+    assert store.measured_estimate_mb("sdxl_c", "whole") is None, "one model's own evidence is not yet trusted"
+    priced = store.measured_estimate_mb("sdxl_d", "whole", baseline="stable_diffusion_xl", size_mb=3250)
+    assert priced == pytest.approx(3250 * 1.1 * 1.1)
+    assert store.measured_estimate_mb("flux_a", "whole", baseline="flux_1", size_mb=11500) is None
+    assert store.measured_estimate_mb("sdxl_d", "component", baseline="stable_diffusion_xl", size_mb=3250) is None
+    assert store.measured_estimate_mb("sdxl_d", "whole", baseline="stable_diffusion_xl") is None
+
+
+def test_a_checkpoints_own_evidence_outranks_its_baseline() -> None:
+    """A trusted per-model price is used even when the baseline's ratio would price it differently."""
+    store = LearnedRamStore()
+    for _ in range(5):
+        store.observe("sdxl_a", "whole", 4000, baseline="stable_diffusion_xl", size_mb=6500)
+    for _ in range(5):
+        store.observe("sdxl_b", "whole", 9000, baseline="stable_diffusion_xl", size_mb=6500)
+    assert store.measured_estimate_mb(
+        "sdxl_a", "whole", baseline="stable_diffusion_xl", size_mb=6500
+    ) == pytest.approx(4400)
+
+
 def test_linux_private_reading_excludes_clean_checkpoint_mappings() -> None:
     """A 26 GB RSS/USS report with 8 GB anonymous pages cannot masquerade as 26 GB of allocator growth."""
     from horde_worker_regen.utils.private_memory import linux_private_ram_bytes

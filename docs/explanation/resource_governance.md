@@ -208,9 +208,15 @@ store keeps the larger of the peak and the settled growth.
 
 Whole, component and retained-page loads have separate identities so a cheap reused load cannot lower
 a cold-load price. Five observations unlock a bidirectional estimate: the recent maximum of twenty
-measurements plus ten percent. The store is scoped to the current launch. A worker whose models stay
-resident completes few cold loads of each checkpoint, so on resident-heavy traffic the file-size price
-is what admission usually uses.
+measurements plus ten percent. The store is scoped to the current launch.
+
+Each load also counts toward its baseline, as peak growth per megabyte of the staged file (the
+checkpoint for whole and retained-page loads, the UNet residual for component loads). A checkpoint
+without five loads of its own is priced from its baseline's trusted ratio times its own file size, so
+one baseline's checkpoints share evidence across fp16 and fp8 sizes. A checkpoint's own trusted
+evidence takes precedence. Cold loads remain rare on resident-heavy traffic, since most loads after
+warm-up are swaps onto slots that kept their pages, so the file-size price is still what admission
+usually uses for a cold load there.
 
 Children report RSS for the dashboard and private bytes for reclaim and restore. On Linux, the
 anonymous/private-dirty reading excludes reclaimable clean checkpoint mappings; USS alone would

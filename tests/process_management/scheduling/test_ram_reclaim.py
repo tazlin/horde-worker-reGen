@@ -410,6 +410,29 @@ class TestLoadCompletionThroughTheMemoryReport:
             assert ledger.pending_reuse_credits == {}
         assert ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE) == pytest.approx(7700)
 
+    def test_a_completed_load_counts_toward_its_baseline(self) -> None:
+        """Five completed loads of different checkpoints trust the baseline's growth per staged megabyte."""
+        process_map, ledger, target, clock = self._admitted()
+        for load in range(5):
+            if load:
+                process_map.on_memory_report(process_id=0, ram_usage_bytes=1100 * _MB, ram_private_bytes=1100 * _MB)
+            ledger.pending_reuse_credits.clear()
+            model = f"sdxl_{load}"
+            ledger.record_credit(
+                target,
+                model=model,
+                effective_charge_mb=6500.0,
+                kind=ReuseCreditKind.WHOLE,
+                baseline="stable_diffusion_xl",
+                size_mb=6500.0,
+            )
+            target.loaded_horde_model_name = model
+            self._report(process_map, clock, private_mb=1100 + 6500, peak_mb=1100 + 7150)
+            assert ledger.settle_credits(process_map) == []
+        assert ledger.learned_ram.measured_estimate_mb(
+            "sdxl_new", ReuseCreditKind.WHOLE, baseline="stable_diffusion_xl", size_mb=6500.0
+        ) == pytest.approx(7150 * 1.1)
+
     def test_a_report_without_a_peak_never_completes_a_load(self) -> None:
         """Periodic reports, and reports from a child that does not sample a peak, leave the record pending."""
         process_map, ledger, target, clock = self._admitted()

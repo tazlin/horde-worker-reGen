@@ -111,6 +111,10 @@ class ReuseCreditRecord:
     """When the admission was recorded, on the scheduler clock children stamp their reports with."""
     kind: ReuseCreditKind = ReuseCreditKind.PAGE_REUSE
     process_launch_identifier: int | None = None
+    baseline: str | None = None
+    """The model's baseline, under which the load also counts as evidence for its siblings."""
+    size_mb: float | None = None
+    """The staged file's size (MB), which scales baseline evidence to another checkpoint."""
 
 
 @dataclass(frozen=True)
@@ -264,6 +268,8 @@ class RamReclaimLedger:
         model: str,
         effective_charge_mb: float,
         kind: ReuseCreditKind,
+        baseline: str | None = None,
+        size_mb: float | None = None,
     ) -> None:
         """Record a credited admission onto ``target`` for the measured-truth check once its load settles."""
         self.pending_reuse_credits[target.process_id] = ReuseCreditRecord(
@@ -273,6 +279,8 @@ class RamReclaimLedger:
             admitted_at=self._clock(),
             kind=kind,
             process_launch_identifier=target.process_launch_identifier,
+            baseline=baseline,
+            size_mb=size_mb,
         )
 
     def void_credit(self, process_id: int) -> None:
@@ -307,7 +315,14 @@ class RamReclaimLedger:
             settled_mb = sample.private_bytes / (1024 * 1024) - record.private_at_admit_mb
             peak_mb = sample.peak_private_bytes / (1024 * 1024) - record.private_at_admit_mb
             if record.effective_charge_mb > 0:
-                self.learned_ram.observe(record.model, record.kind, settled_mb, peak_mb)
+                self.learned_ram.observe(
+                    record.model,
+                    record.kind,
+                    settled_mb,
+                    peak_mb,
+                    baseline=record.baseline,
+                    size_mb=record.size_mb,
+                )
             if peak_mb > record.effective_charge_mb + REUSE_CREDIT_RECONCILE_SLACK_MB:
                 discrepancies.append(ReuseCreditDiscrepancy(process_id, record, peak_mb))
         return discrepancies

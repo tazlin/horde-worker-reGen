@@ -6187,12 +6187,7 @@ class InferenceScheduler:
                 job.model,
             )
         if job.model is not None:
-            self._ram_reclaim.record_credit(
-                target,
-                model=job.model,
-                effective_charge_mb=self._checkpoint_part_of_charge_mb(job, verdict),
-                kind=ReuseCreditKind.PAGE_REUSE,
-            )
+            self._record_load_for_learning(job, target, verdict, ReuseCreditKind.PAGE_REUSE)
 
     def _note_component_admission(
         self,
@@ -6218,12 +6213,7 @@ class InferenceScheduler:
                 job.model,
             )
         if job.model is not None:
-            self._ram_reclaim.record_credit(
-                target,
-                model=job.model,
-                effective_charge_mb=self._checkpoint_part_of_charge_mb(job, verdict),
-                kind=ReuseCreditKind.COMPONENT,
-            )
+            self._record_load_for_learning(job, target, verdict, ReuseCreditKind.COMPONENT)
 
     def _reconcile_reuse_credit(self) -> None:
         """Log each settled credited admission whose real RSS growth exceeded its charge (the measured-truth check).
@@ -6271,17 +6261,56 @@ class InferenceScheduler:
         if job.model is None:
             return None
         baseline = self._model_metadata.get_baseline(job.model)
-        learned = self._ram_reclaim.learned_ram.measured_estimate_mb(job.model, ReuseCreditKind.WHOLE)
+        size_mb = self._checkpoint_file_mb(job.model)
+        learned = self._ram_reclaim.learned_ram.measured_estimate_mb(
+            job.model,
+            ReuseCreditKind.WHOLE,
+            baseline=None if baseline is None else str(baseline),
+            size_mb=size_mb,
+        )
         if learned is not None:
             return max(predict_checkpoint_staging_ram_mb(baseline, job.model, 0) or 0.0, learned)
-        path = self._resolve_checkpoint_path(job.model)
-        size = None
-        if path is not None:
-            try:
-                size = path.stat().st_size
-            except OSError as error:
-                self._log_component_charge_fallback_once(job.model, str(error))
-        return predict_checkpoint_staging_ram_mb(baseline, job.model, size)
+        return predict_checkpoint_staging_ram_mb(
+            baseline,
+            job.model,
+            None if size_mb is None else int(size_mb * 1024 * 1024),
+        )
+
+    def _checkpoint_file_mb(self, model: str) -> float | None:
+        """Return the model's checkpoint file size (MB), or None when it cannot be resolved or statted."""
+        path = self._resolve_checkpoint_path(model)
+        if path is None:
+            return None
+        try:
+            return path.stat().st_size / (1024 * 1024)
+        except OSError as error:
+            self._log_component_charge_fallback_once(model, str(error))
+            return None
+
+    def _record_load_for_learning(
+        self,
+        job: ImageGenerateJobPopResponse,
+        target: HordeProcessInfo,
+        verdict: BudgetVerdict,
+        kind: ReuseCreditKind,
+    ) -> None:
+        """Record an admitted load so its completion report prices this checkpoint and its baseline."""
+        if job.model is None:
+            return
+        baseline = self._model_metadata.get_baseline(job.model)
+        if kind is ReuseCreditKind.COMPONENT:
+            sidecar = self._read_component_sidecar(job.model)
+            size_mb = None if sidecar is None else sidecar.residual_tensor_bytes / (1024 * 1024)
+        else:
+            size_mb = self._checkpoint_file_mb(job.model)
+        self._ram_reclaim.record_credit(
+            target,
+            model=job.model,
+            effective_charge_mb=self._checkpoint_part_of_charge_mb(job, verdict),
+            kind=kind,
+            baseline=None if baseline is None else str(baseline),
+            size_mb=size_mb,
+        )
 
     def _checkpoint_part_of_charge_mb(self, job: ImageGenerateJobPopResponse, verdict: BudgetVerdict) -> float:
         """Return the checkpoint share of an admitted charge, the figure load-completion growth is checked against."""
@@ -6305,7 +6334,13 @@ class InferenceScheduler:
         sidecar = self._read_component_sidecar(job.model)
         if sidecar is None:
             return None
-        learned = self._ram_reclaim.learned_ram.measured_estimate_mb(job.model, ReuseCreditKind.COMPONENT)
+        baseline = self._model_metadata.get_baseline(job.model)
+        learned = self._ram_reclaim.learned_ram.measured_estimate_mb(
+            job.model,
+            ReuseCreditKind.COMPONENT,
+            baseline=None if baseline is None else str(baseline),
+            size_mb=sidecar.residual_tensor_bytes / (1024 * 1024),
+        )
         if learned is not None:
             return max(predict_job_unet_only_ram_mb(0), learned)
         return predict_job_unet_only_ram_mb(sidecar.residual_tensor_bytes)
@@ -6434,12 +6469,7 @@ class InferenceScheduler:
             elif admission.kind is RamChargeKind.PAGE_REUSE:
                 self._note_credited_admission(job, available_process, ram_verdict)
             elif job.model is not None and ram_verdict.predicted_mb is not None:
-                self._ram_reclaim.record_credit(
-                    available_process,
-                    model=job.model,
-                    effective_charge_mb=self._checkpoint_part_of_charge_mb(job, ram_verdict),
-                    kind=ReuseCreditKind.WHOLE,
-                )
+                self._record_load_for_learning(job, available_process, ram_verdict, ReuseCreditKind.WHOLE)
             self._resolve_head_ram_defer(job, reason="admitted")
             return True
 
