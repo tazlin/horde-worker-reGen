@@ -158,12 +158,6 @@
           "verdict": "admit"
         }
       ],
-      "dispatches": [
-        {
-          "lane": 0,
-          "model": "sd15-checkpoint-b"
-        }
-      ],
       "messages": [
         {
           "control_flag": "PRELOAD_MODEL",
@@ -171,7 +165,18 @@
           "keep_model_resident_after": null,
           "model": "sd15-checkpoint-b",
           "process_id": 0
-        },
+        }
+      ],
+      "tick": 6
+    },
+    {
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sd15-checkpoint-b"
+        }
+      ],
+      "messages": [
         {
           "control_flag": "START_INFERENCE",
           "job": "job-3",
@@ -183,7 +188,7 @@
       "sampling_started": [
         "job-3"
       ],
-      "tick": 6
+      "tick": 7
     },
     {
       "decisions": [
@@ -199,7 +204,7 @@
           "verdict": "no_op"
         }
       ],
-      "tick": 7
+      "tick": 8
     }
   ],
   "ticks_driven": 24

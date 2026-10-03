@@ -156,9 +156,11 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import (
+    HordeControlFlag,
     HordeImageResult,
     HordeInferenceControlMessage,
     HordeProcessState,
+    ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
@@ -172,6 +174,11 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
+from horde_worker_regen.process_management.resources.resource_budget import (
+    predict_job_decode_spike_mb,
+    predict_job_sampler_only_vram_mb,
+    predict_job_sampling_vram_mb,
+)
 from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     plausible_activation_ceiling_mb,
@@ -4541,13 +4548,21 @@ async def test_host_ram_starvation_keeps_two_lanes_serving() -> None:
     apply_ram = world.scheduler._apply_ram_verdict
     settle_ram = world.scheduler.ram_reclaim.settle_credits
     late_discrepancies: list[ReuseCreditDiscrepancy] = []
+    settled_by_identity: dict[tuple[str | None, str], int] = {}
 
     def record_settlements(process_map: Mapping[int, HordeProcessInfo]) -> list[ReuseCreditDiscrepancy]:
+        # A load can only be underpriced "late" once its baseline and kind had five settled loads to learn
+        # from; before that the file-size price stands and learning has nothing trusted to correct it with.
+        pending = dict(world.scheduler.ram_reclaim.pending_reuse_credits)
         discrepancies = settle_ram(process_map)
         for discrepancy in discrepancies:
-            loads = sum(model == discrepancy.record.model for _tick, _lane, model in world.preloads_commanded)
-            if loads > 2:
+            record = discrepancy.record
+            if settled_by_identity.get((record.baseline, record.kind), 0) >= 5:
                 late_discrepancies.append(discrepancy)
+        for process_id, record in pending.items():
+            if process_id not in world.scheduler.ram_reclaim.pending_reuse_credits:
+                identity = (record.baseline, record.kind)
+                settled_by_identity[identity] = settled_by_identity.get(identity, 0) + 1
         return discrepancies
 
     world.scheduler.ram_reclaim.settle_credits = record_settlements
@@ -4606,9 +4621,9 @@ async def test_host_ram_starvation_keeps_two_lanes_serving() -> None:
     assert world.ram_recycles == []
     assert sdxl_attempts > 0
     assert sdxl_defers / sdxl_attempts < 0.1
-    assert late_discrepancies == [], "Load peaks must stay within 2 GB of the charge after the first two loads"
+    assert late_discrepancies == [], "Load peaks must stay within 2 GB of the charge once learning is trusted"
+    assert {model for model, *_ in observed} >= {_SDXL.name, _SDXL_OTHER.name}, "an SDXL load went unmeasured"
     cold_loads = [row for row in observed if row[1] == ReuseCreditKind.WHOLE]
-    assert {model for model, *_ in cold_loads} >= {_SDXL.name, _SDXL_OTHER.name}, "a cold SDXL load went unmeasured"
     for model_name, _kind, settled_mb, peak_mb in cold_loads:
         model = _model_by_name(model_name)
         assert model is not None
@@ -4698,6 +4713,215 @@ async def test_host_ram_overlapping_loads_reinjection_without_planned_ram(monkey
     monkeypatch.setattr(InferenceScheduler, "_outstanding_planned_ram_mb", lambda _self: 0.0)
     world = await _run_overlapping_loads_row()
     assert world.ram_floor_breach_ticks, "without planned RAM both stages land before the reading shows either"
+
+
+def _build_mixed_traffic_cycle() -> tuple[_ModelClass, ...]:
+    """Lay out one hundred-job cycle: 18 Flux and 3 SD1.5 slots spread evenly, the other 79 rotating SDXL.
+
+    Spreading the minority classes is what live traffic does; a contiguous block of eighteen Flux jobs would fill
+    the queue with work only one lane can serve and measure the block rather than the scheduler.
+    """
+    flux_slots = {int((index + 0.5) * 100 / 18) for index in range(18)}
+    sd15_slots = {index * 100 // 3 for index in range(3)}
+    sdxl_rotation = (_SDXL, _SDXL_OTHER, _SDXL_C)
+    cycle: list[_ModelClass] = []
+    sdxl_seen = 0
+    for slot in range(100):
+        if slot in sd15_slots:
+            cycle.append(_SD15)
+        elif slot in flux_slots:
+            cycle.append(_FLUX)
+        else:
+            cycle.append(sdxl_rotation[sdxl_seen % len(sdxl_rotation)])
+            sdxl_seen += 1
+    return tuple(cycle)
+
+
+_MIXED_TRAFFIC_CYCLE = _build_mixed_traffic_cycle()
+"""The mixed row's hundred-job cycle, in arrival order."""
+
+
+def _mixed_traffic_model(index: int) -> _ModelClass:
+    """One job in a hundred-job cycle of a mostly-SDXL pool with a Flux fp8 share and a little SD1.5.
+
+    The shares follow a resident-heavy production mix: 79 SDXL across three checkpoints, 18 large fp8 models
+    (Flux stands in for the other fp8 families) and 3 SD1.5, interleaved as live traffic arrives.
+    """
+    return _MIXED_TRAFFIC_CYCLE[index % len(_MIXED_TRAFFIC_CYCLE)]
+
+
+async def _run_mixed_monolithic_row(jobs: int = 200) -> tuple[_DispatchWorld, dict[str, float]]:
+    """Run the mixed pool monolithically with whole-card residency, returning the world and its attribution.
+
+    Components are resident per phase, as ComfyUI loads them: a Flux sampler beside an SDXL sampler is a
+    UNet-plus-activation pairing, not two whole checkpoints, which is what the priced co-residency rule admits.
+
+    The attribution is the share of busy, queued ticks with one job in flight, by the stall bucket the
+    scheduler names for its head, so a shortfall can be traced to the gate that held the second lane.
+    """
+    from tests.process_management.liveness._host_ram import HostRamLedger
+
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        whole_card_enabled=True,
+        closed_loop=True,
+        disaggregated=False,
+        learned_footprints=True,
+        high_performance_mode=True,
+        host_ram=HostRamLedger(63434.0, 30000.0),
+        ram_reserve_mb=8192,
+        ram_pause_percent=90,
+        tick_seconds=0.5,
+        extra_model_classes=(_SDXL_C,),
+        phase_resident_components=True,
+    )
+    offered = 0
+    cursor = 0
+    for _ in range(20000):
+        while offered < jobs and len(world.job_tracker.jobs_pending_inference) < 4:
+            # The horde answers a pop only with work for an advertised model, so a model the worker is not
+            # asking for is skipped rather than retried, which keeps the mix moving under whole-card claims.
+            advertised = world.advertised_models()
+            skipped = next(
+                (step for step in range(100) if _mixed_traffic_model(cursor + step).name in advertised), None
+            )
+            if skipped is None:
+                break
+            cursor += skipped
+            model = _mixed_traffic_model(cursor)
+            job = make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=60)
+            if not await world.offer_job(job):
+                break
+            cursor += 1
+            offered += 1
+        await world.step()
+        if world.submitted_jobs >= jobs:
+            break
+    single = [
+        observation
+        for observation in world.tick_observations
+        if observation.jobs_in_progress == 1 and observation.head_job_id is not None
+    ]
+    attribution: dict[str, float] = {}
+    for observation in single:
+        bucket = observation.head_stall_bucket or "unattributed"
+        attribution[bucket] = attribution.get(bucket, 0.0) + 1.0 / max(1, world.ram_busy_ticks)
+    attribution["two_way_busy_fraction"] = world.ram_two_way_ticks / max(1, world.ram_busy_ticks)
+    return world, attribution
+
+
+@pytest.mark.closed_loop
+async def test_host_ram_mixed_monolithic_traffic_keeps_two_lanes_serving() -> None:
+    """The resident-heavy mix on a monolithic, whole-card worker under host-RAM pressure keeps both lanes busy."""
+    shares = {model.label: _MIXED_TRAFFIC_CYCLE.count(model) for model in (_SDXL, _SDXL_OTHER, _SDXL_C, _FLUX, _SD15)}
+    assert shares["flux"] == 18 and shares["sd15"] == 3, shares
+    assert sum(shares.values()) == len(_MIXED_TRAFFIC_CYCLE) == 100, shares
+    world, attribution = await _run_mixed_monolithic_row()
+    assert world.submitted_jobs == 200
+    assert world.ram_hold_ticks == [], "RAM held intake on the mixed monolithic workload"
+    assert world.ram_recycles == []
+    assert world.ram_floor_breach_ticks == []
+    assert world.child_overcommits == [], "a priced pairing beside Flux committed the card past what it has"
+    assert attribution["two_way_busy_fraction"] >= 0.4, f"single-job busy time by head stall bucket: {attribution}"
+
+
+@pytest.mark.closed_loop
+async def test_world_freezes_every_ticks_measurement_into_the_arbiter() -> None:
+    """Every tick re-freezes the arbiter's cycle, as the control loop does before governance.
+
+    The overlap memory verdict, the safety load verdict and the scheduling snapshot read the arbiter's cycle
+    directly; a cycle primed only by an admission call goes stale on every tick that makes none.
+    """
+    world = _DispatchWorld(card=_CARD_24GB, lane_count=2, max_threads=2, queue_depth=2, closed_loop=True)
+    for model in (_SDXL, _SDXL_OTHER, _SDXL, _SDXL_OTHER):
+        await world.offer_job(make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=20))
+    await world.step()
+    arbiter = world.scheduler._vram_arbiter
+    assert arbiter is not None
+    frozen_on: list[int] = []
+    begin_cycle = arbiter.begin_cycle
+
+    def record_freeze(snapshot: object) -> None:
+        frozen_on.append(world.tick)
+        begin_cycle(snapshot)  # type: ignore[arg-type]
+
+    arbiter.begin_cycle = record_freeze  # type: ignore[method-assign]
+    first_tick = world.tick + 1
+    for _ in range(60):
+        await world.step()
+    assert set(range(first_tick, world.tick + 1)) <= set(frozen_on)
+
+
+@pytest.mark.closed_loop
+async def test_device_unload_keeps_the_model_in_ram_where_host_pages_are_conserved() -> None:
+    """A device unload leaves the child holding the model in RAM, as the child reports ``LOADED_IN_RAM``.
+
+    The host ledger keeps the model's pages after a device unload, so a lane that forgot its model would strand
+    pages no RAM reclaim can name. Without the host ledger the lane's earlier semantics stand.
+    """
+    from tests.process_management.liveness._host_ram import HostRamLedger
+
+    for host_ram in (HostRamLedger(63434.0, 30000.0), None):
+        world = _DispatchWorld(
+            card=_CARD_24GB, lane_count=2, max_threads=2, queue_depth=2, closed_loop=True, host_ram=host_ram
+        )
+        world.seed_resident(0, _SDXL, in_vram=True)
+        free_before_mb = world.card_free_mb(0)
+        lane = world.scheduler._process_map[0]
+        lane.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        world._apply_control_flags()
+        assert world.card_free_mb(0) == free_before_mb + _SDXL.weights_mb
+        if host_ram is None:
+            assert lane.loaded_horde_model_name is None
+            continue
+        assert lane.loaded_horde_model_name == _SDXL.name
+        assert world.ram_staged_lanes(_SDXL.name) == [0]
+        assert world.scheduler._horde_model_map.root[_SDXL.name].horde_model_load_state is ModelLoadState.LOADED_IN_RAM
+        assert host_ram.checkpoints[0][0] == _SDXL.name
+
+
+@pytest.mark.closed_loop
+async def test_phase_resident_components_charge_each_phase_its_own_components() -> None:
+    """With per-phase residency a job holds its sampler-only figure while sampling and its decode spike after.
+
+    Off, the same job holds its whole-job sampling peak and decodes on its weights alone.
+    """
+    job = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=20)
+    baseline = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value
+    sampler_only_mb = predict_job_sampler_only_vram_mb(job, baseline)
+    whole_job_mb = predict_job_sampling_vram_mb(job, baseline)
+    decode_spike_mb = predict_job_decode_spike_mb(job, baseline)
+    assert sampler_only_mb is not None and whole_job_mb is not None and decode_spike_mb is not None
+    for phased in (True, False):
+        world = _DispatchWorld(
+            card=_CARD_24GB,
+            lane_count=1,
+            max_threads=1,
+            queue_depth=1,
+            closed_loop=True,
+            phase_resident_components=phased,
+            tick_seconds=0.5,
+        )
+        await world.offer_job(make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=20))
+        sampling_charges: set[float] = set()
+        decode_charges: set[float] = set()
+        for _ in range(200):
+            await world.step()
+            occupancy = next(iter(world._occupancy.values()), None)
+            if occupancy is None:
+                if world.submitted_jobs:
+                    break
+                continue
+            charge_mb = world._lane_charge_mb(occupancy.lane_id)
+            if occupancy.sample_from <= world.now < occupancy.sample_until:
+                sampling_charges.add(charge_mb)
+            elif occupancy.sample_until <= world.now < occupancy.decode_until:
+                decode_charges.add(charge_mb)
+        assert sampling_charges == {sampler_only_mb if phased else whole_job_mb}
+        assert decode_charges == {_SDXL.weights_mb + (decode_spike_mb if phased else 0.0)}
 
 
 @pytest.mark.closed_loop
