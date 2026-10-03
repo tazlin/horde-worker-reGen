@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
@@ -32,6 +33,7 @@ from horde_worker_regen.process_management.scheduling.governance.preload_admissi
     select_follower_room_process_id,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import ReuseCreditKind
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -518,6 +520,33 @@ class TestRamAdmission:
 
         assert admission.kind is RamChargeKind.PAGE_REUSE
         assert admission.verdict.reusable_credit_mb > 0.0
+
+    async def test_a_trusted_swap_price_replaces_the_page_credit(self) -> None:
+        """Learned swap evidence prices a swap onto a retaining slot, below the heuristic's floor when it says so."""
+        retaining = _slot(0, model=None)
+        retaining.ram_usage_bytes = 8000 * 1024 * 1024
+        scheduler, jobs = await _worker(slots={0: retaining}, pending=["sd"])
+        for _ in range(5):
+            scheduler.ram_reclaim.learned_ram.observe("sd", ReuseCreditKind.PAGE_REUSE, 0.0, 600.0)
+        job_id = str(jobs[0].id_)
+
+        snapshot = scheduler.snapshot()
+        admission = decide_ram_admission(snapshot, job_id, 0)
+
+        job = snapshot.queue.jobs[job_id]
+        assert admission.kind is RamChargeKind.PAGE_REUSE
+        assert admission.verdict.predicted_mb == pytest.approx(600.0 * 1.1 + job.feature_ram_mb)
+        assert admission.verdict.predicted_mb < 3500.0, "evidence, not the heuristic's floor, sets a swap's price"
+
+    async def test_cold_load_evidence_does_not_price_a_swap(self) -> None:
+        """Only swap evidence prices a swap; trusted cold-load evidence leaves the page credit in charge."""
+        retaining = _slot(0, model=None)
+        retaining.ram_usage_bytes = 8000 * 1024 * 1024
+        scheduler, jobs = await _worker(slots={0: retaining}, pending=["sd"])
+        for _ in range(5):
+            scheduler.ram_reclaim.learned_ram.observe("sd", ReuseCreditKind.WHOLE, 6000.0)
+        snapshot = scheduler.snapshot()
+        assert snapshot.queue.jobs[str(jobs[0].id_)].swap_charge_mb is None
 
     async def test_a_disaggregation_class_job_with_a_sidecar_is_charged_its_component(self) -> None:
         """The UNet-only residual supersedes the page credit, and a checkpoint already staged charges nothing."""

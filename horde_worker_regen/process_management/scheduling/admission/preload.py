@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
@@ -974,12 +974,34 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
     is gated on the danger floor inside the budget so it never admits into a floor breach). The two are
     alternative marginal accountings of the same load, so the component charge supersedes the credit.
     Either checkpoint charge carries the job's feature RAM, so admission prices the whole job's demand.
+
+    A swap onto a slot that kept its pages is priced at the checkpoint's learned swap growth once that
+    evidence is trusted, in place of the credit heuristic; swaps are most loads on a worker whose models
+    stay resident, so this is where learning has evidence.
     """
     job = snapshot.queue.jobs[job_id]
     slot = snapshot.slots[process_id]
     component = component_charge_mb(snapshot, job_id, process_id)
     is_component = component is not None
     features = job.feature_ram_mb
+    if not is_component and slot.reuse_credit_mb > 0.0 and job.swap_charge_mb is not None:
+        whole = None if job.staging_charge_mb is None else job.staging_charge_mb + features
+        learned = snapshot.services.ram_budget.check_job(
+            snapshot.queue.payloads[job_id],
+            job.baseline,
+            snapshot.host_ram.available_mb,
+            committed_reserve_mb=snapshot.services.reserve_ledger.total_ram_mb(),
+            danger_floor_mb=snapshot.host_ram.danger_floor_mb,
+            staging_charge_mb=job.swap_charge_mb + features,
+            outstanding_planned_mb=snapshot.host_ram.outstanding_planned_mb,
+        )
+        if whole is not None and learned.predicted_mb is not None and learned.predicted_mb < whole:
+            learned = replace(
+                learned,
+                uncredited_predicted_mb=whole,
+                reusable_credit_mb=whole - learned.predicted_mb,
+            )
+        return RamAdmission(verdict=learned, kind=RamChargeKind.PAGE_REUSE)
     verdict = snapshot.services.ram_budget.check_job(
         snapshot.queue.payloads[job_id],
         job.baseline,

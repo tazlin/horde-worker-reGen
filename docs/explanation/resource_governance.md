@@ -218,6 +218,12 @@ evidence takes precedence. Cold loads remain rare on resident-heavy traffic, sin
 warm-up are swaps onto slots that kept their pages, so the file-size price is still what admission
 usually uses for a cold load there.
 
+Swaps are where evidence accumulates. A swap onto a slot that kept its pages is priced at the
+checkpoint's trusted retained-page growth (its own, else its baseline's ratio times its file size) plus
+the job's features, in place of the retained-page credit and its 3,500 MB floor. Until that evidence is
+trusted the credit applies. Only swap evidence prices a swap: a cold load's growth says nothing about
+how much of the retained pages a swap reuses.
+
 Children report RSS for the dashboard and private bytes for reclaim and restore. On Linux, the
 anonymous/private-dirty reading excludes reclaimable clean checkpoint mappings; USS alone would
 still charge those mappings if no other process shares them. Other platforms use USS. Platforms

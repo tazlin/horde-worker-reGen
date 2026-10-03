@@ -5241,6 +5241,7 @@ class InferenceScheduler:
             component_charge_mb=self._unet_component_charge_mb,
             staging_charge_mb=self._checkpoint_staging_charge_mb,
             feature_ram_mb=lambda job: self._job_feature_ram(job).total_mb,
+            swap_charge_mb=self._learned_swap_charge_mb,
             checkpoint_models_held=self._checkpoint_models_held_on,
             host_ram=HostRamSnapshot(
                 available_mb=self._measured_available_ram_mb(),
@@ -6274,6 +6275,18 @@ class InferenceScheduler:
             baseline,
             job.model,
             None if size_mb is None else int(size_mb * 1024 * 1024),
+        )
+
+    def _learned_swap_charge_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
+        """Return the trusted learned growth of swapping the job's checkpoint onto a retaining slot, else None."""
+        if job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        return self._ram_reclaim.learned_ram.measured_estimate_mb(
+            job.model,
+            ReuseCreditKind.PAGE_REUSE,
+            baseline=None if baseline is None else str(baseline),
+            size_mb=self._checkpoint_file_mb(job.model),
         )
 
     def _checkpoint_file_mb(self, model: str) -> float | None:

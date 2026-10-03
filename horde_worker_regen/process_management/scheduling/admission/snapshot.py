@@ -174,6 +174,9 @@ class JobSnapshot:
     context seed. Excludes feature RAM."""
     feature_ram_mb: float = 0.0
     """RAM (MB) the job's features allocate in every process, added to whichever checkpoint charge applies."""
+    swap_charge_mb: float | None = None
+    """The trusted learned RAM growth (MB) of swapping this checkpoint onto a slot that kept its pages, else
+    None. Excludes feature RAM."""
 
 
 @dataclass(frozen=True)
@@ -506,6 +509,7 @@ def build_scheduling_snapshot(
     component_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
     staging_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
     feature_ram_mb: Callable[[ImageGenerateJobPopResponse], float],
+    swap_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
     checkpoint_models_held: Callable[[int], frozenset[str]],
     host_ram: HostRamSnapshot,
     budget_active: bool,
@@ -606,6 +610,7 @@ def build_scheduling_snapshot(
             component_charge_mb=component_charge_mb(job),
             staging_charge_mb=staging_charge_mb(job),
             feature_ram_mb=feature_ram_mb(job),
+            swap_charge_mb=swap_charge_mb(job),
         )
         (in_progress_ids if is_in_progress else pending_ids).append(key)
 
