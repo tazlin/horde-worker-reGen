@@ -493,6 +493,81 @@ class TestWholeCardResidencyProtectsFromVramEviction:
         )
 
 
+class TestWholeCardHolderUnderHostRamPressure:
+    """Host-RAM pressure may evict an idle whole-card holder no queued job wants; VRAM protection is unchanged."""
+
+    def _lone_holder_in_ram(self) -> tuple[InferenceScheduler, ProcessMap, JobTracker, list[object]]:
+        """One inference process holding the residency's model in system RAM, nothing else resident."""
+        holder = make_mock_process_info(1, model_name=_FLUX_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
+        holder.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+        holder.vram_usage_mb = _PER_PROCESS_OVERHEAD_MB
+        process_map = ProcessMap({1: holder})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(
+            horde_model_name=_FLUX_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=1
+        )
+        job_tracker = JobTracker()
+        scheduler = _wire_scheduler_with_real_plm(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            horde_model_map=horde_model_map,
+            bridge_data=_deadlock_bridge_data(),
+        )
+        scheduler._whole_card_ledger.state_for(None).model = _FLUX_MODEL
+        sent: list[object] = []
+        original_send = holder.safe_send_message
+
+        def _record(message: object) -> bool:
+            sent.append(message)
+            return original_send(message)
+
+        holder.safe_send_message = _record  # type: ignore[assignment]
+        return scheduler, process_map, job_tracker, sent
+
+    @staticmethod
+    def _ram_unloads(sent: list[object]) -> list[object]:
+        from horde_worker_regen.process_management.ipc.messages import (
+            HordeControlFlag,
+            HordeControlMessage,
+            HordeControlModelMessage,
+        )
+
+        return [
+            message
+            for message in sent
+            if isinstance(message, HordeControlMessage | HordeControlModelMessage)
+            and message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+        ]
+
+    def test_an_idle_unqueued_holder_is_evicted_from_ram_under_pressure(self) -> None:
+        """With the host under its floor and nothing queued, the holder's RAM copy is what reclaim takes."""
+        scheduler, _process_map, _job_tracker, sent = self._lone_holder_in_ram()
+
+        assert (
+            scheduler._residency_protects_from_unload(_FLUX_MODEL, {_FLUX_MODEL}, vram=False, under_pressure=True)
+            is False
+        )
+        assert scheduler.unload_models(under_pressure=True) is True
+        assert self._ram_unloads(sent), "the idle holder must be asked to unload its model from RAM"
+
+    async def test_a_holder_with_a_queued_job_is_spared(self) -> None:
+        """A holder whose model has a job waiting keeps its RAM copy; that job is what releases the hold."""
+        scheduler, _process_map, job_tracker, sent = self._lone_holder_in_ram()
+        await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX_MODEL, width=1216, height=1216))
+
+        assert scheduler.unload_models(under_pressure=True) is False
+        assert not self._ram_unloads(sent)
+
+    def test_the_holder_stays_protected_from_vram_eviction(self) -> None:
+        """The VRAM side of the contract is untouched."""
+        scheduler, _process_map, _job_tracker, _sent = self._lone_holder_in_ram()
+
+        assert (
+            scheduler._residency_protects_from_unload(_FLUX_MODEL, {_FLUX_MODEL}, vram=True, under_pressure=True)
+            is True
+        )
+
+
 class TestInitialEstablishUsesWholeCardAwareShrink:
     """Initial whole-card establishment must use the same narrowed scale-down as convergence.
 

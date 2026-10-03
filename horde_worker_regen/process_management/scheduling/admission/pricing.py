@@ -207,7 +207,11 @@ def learned_sampling_peak_mb(
     static_seed_mb: float,
     stage: FootprintStage,
 ) -> float:
-    """The static sampling-peak seed raised by the learned watermark, lowered only by a trusted measurement."""
+    """The static sampling-peak seed raised by the learned watermark, lowered by the key's trusted measurement.
+
+    Never lowered below the job's own core weights, which is what stops a light sibling's measurements in the
+    same band from underpricing a heavy checkpoint.
+    """
     store = snapshot.services.footprint_store
     if store is None:
         return static_seed_mb
@@ -216,7 +220,7 @@ def learned_sampling_peak_mb(
         return static_seed_mb
     raised_mb = store.estimate_mb(key, static_seed_mb=static_seed_mb)
     measured_mb: float | None = None
-    if job.model is not None and job.model in snapshot.models_with_results:
+    if job.model is not None:
         raw_mb = store.measured_estimate_mb(key)
         if raw_mb is not None:
             measured_mb = max(0.0, raw_mb - snapshot.context_constant_mb)

@@ -555,8 +555,8 @@ class TestMeasuredLoweringPricing:
         assert priced == pytest.approx(expected)
         assert priced is not None and priced < 17000.0
 
-    def test_model_without_a_result_keeps_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The sampling keys are baseline-wide, so an unproven model never borrows a sibling's measurement."""
+    def test_model_without_a_result_is_priced_from_its_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A model's first job after a start is priced from its key's measurements, not held to the seed."""
         self._pin_inflated_seed(monkeypatch, seed_mb=17000.0, weight_mb=12600.0)
         pm = _make_manager()
         scheduler = pm._inference_scheduler
@@ -564,10 +564,21 @@ class TestMeasuredLoweringPricing:
         baseline = scheduler._model_metadata.get_baseline(_MODEL)
         self._observe_sample_peaks(pm, 13000.0)
 
-        assert (
-            scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
-            == 17000.0
-        )
+        priced = scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
+        assert priced is not None and 12600.0 <= priced < 17000.0
+
+    def test_a_light_siblings_peaks_never_price_below_core_weights(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Key-wide authority is floored at the job's own weights, so a light sibling cannot underprice it."""
+        self._pin_inflated_seed(monkeypatch, seed_mb=17000.0, weight_mb=12600.0)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+        self._observe_sample_peaks(pm, 3000.0)
+
+        assert scheduler._measured_admission_candidate_delta_mb(
+            job, baseline, process_id=None, disaggregated=False
+        ) == pytest.approx(12600.0)
 
     def test_an_underobserved_key_keeps_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Below the measured-estimate observation minimum the conservative seed stays in charge."""

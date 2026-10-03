@@ -69,7 +69,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
-    plausible_activation_ceiling_mb,
+    plausible_sampling_peak_mb,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW, WorkloadKind
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
@@ -1121,13 +1121,15 @@ class MessageDispatcher:
             stage=FootprintStage.SAMPLE,
         )
         # The reading is the process's allocator high-water, not the job's. A process that cached another
-        # checkpoint, or overflowed on WDDM, reports a figure the size of the card against this job's key, and
-        # the watermark only rises, so the reading is capped at what the card can give one process.
+        # checkpoint, or overflowed, reports a figure near the size of the card against this job's key, and the
+        # watermark only rises, so the reading is bounded by what a job in this key's band can plausibly need.
         store.observe_peak(
             key,
             float(peak_mb),
-            plausible_max_mb=plausible_activation_ceiling_mb(
+            plausible_max_mb=plausible_sampling_peak_mb(
+                key,
                 self._process_map.get_reported_total_vram_mb(device_index=process_info.device_index),
+                batch=job.payload.n_iter or 1,
             ),
         )
 

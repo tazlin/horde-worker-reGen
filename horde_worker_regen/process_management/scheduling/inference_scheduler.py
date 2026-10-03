@@ -129,7 +129,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
-    plausible_activation_ceiling_mb,
+    plausible_sampling_peak_mb,
     sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission import pricing
@@ -4726,8 +4726,19 @@ class InferenceScheduler:
         Admission pricing of a job's sampling peak consults it so a measured activation high-water raises the
         static per-model seed; one instance is shared across the parent so every observed peak and every priced
         estimate reference the same watermarks.
+
+        Stored sampling statistics above their key's plausible bound are clamped on receipt: they predate the
+        feeders' bound and would otherwise price their key for as long as the file persists.
         """
         self._footprint_store = store
+        max_batch = config_number(self._runtime_config.bridge_data.max_batch)
+        batch = int(max_batch) if max_batch is not None and max_batch >= 1 else 1
+        clamped = store.sanitize_sampling_observations(lambda key: plausible_sampling_peak_mb(key, None, batch=batch))
+        if clamped:
+            logger.info(
+                f"Learned VRAM footprints: clamped {len(clamped)} sampling key(s) above their plausible bound "
+                f"({', '.join(f'{key.model_baseline}/{key.resolution_bucket}' for key in clamped[:6])}).",
+            )
 
     def _learned_resident_footprint_mb(
         self,
@@ -4832,10 +4843,9 @@ class InferenceScheduler:
         several GB above any peak the card has seen, hold the job at clearance for a deficit that does not
         exist, and (past the achievable ceiling) price the model off a card that provably serves it. The
         margined recent-window measurement (:meth:`LearnedFootprintStore.measured_estimate_mb`) governs when
-        it sits below the raise-only figure, but only once this job's model has produced a result here and
-        never below the checkpoint's core weight figure: the population is fed from reserved-peak reports
-        that over-read (allocator cache), so a low reading is trustworthy evidence while the floor guards the
-        one direction it cannot be.
+        it sits below the raise-only figure, never below the checkpoint's core weight figure: the population is
+        fed from reserved-peak reports that over-read (allocator cache), so a low reading is trustworthy
+        evidence while the floor guards the one direction it cannot be.
         """
         store = self._footprint_store
         if store is None:
@@ -4853,16 +4863,15 @@ class InferenceScheduler:
     def _measured_sampling_peak_mb(self, job: ImageGenerateJobPopResponse, key: FootprintKey) -> float | None:
         """The margined measured sampling peak (MB) for ``key``, or None while it lacks downward authority.
 
-        Offered only once the job's model has produced a result on this worker, mirroring the resident
-        measurement's trust gate: the sampling keys are baseline-and-resolution wide, so without the
-        per-model gate a light sibling checkpoint's measurements could vouch for a heavy one that has never
-        demonstrated anything here. The platform context constant is netted out because the store keeps
-        whole-device charges while sampling prices are job-level (contexts are charged separately).
+        Authority is the key's own: once its baseline-and-resolution population is sufficiently observed it
+        prices every model in the band, so a model's first job after a start is not held to an all-time
+        watermark. A light sibling's measurements cannot underprice a heavy checkpoint's weights, because the
+        caller floors the price at the job's own core weights. The platform context constant is netted out
+        because the store keeps whole-device charges while sampling prices are job-level (contexts are charged
+        separately).
         """
         store = self._footprint_store
         if store is None or job.model is None:
-            return None
-        if not self._job_tracker.has_model_produced_result(job.model):
             return None
         measured_mb = store.measured_estimate_mb(key)
         if measured_mb is None:
@@ -4900,7 +4909,11 @@ class InferenceScheduler:
         store.observe_peak(
             key,
             peak_reserved_mb,
-            plausible_max_mb=plausible_activation_ceiling_mb(self._process_map.get_reported_total_vram_mb()),
+            plausible_max_mb=plausible_sampling_peak_mb(
+                key,
+                self._process_map.get_reported_total_vram_mb(),
+                batch=job.payload.n_iter or 1,
+            ),
         )
 
     def _tenant_lane_by_process_id(self, device_index: int | None) -> dict[int, TenantLane]:
@@ -11606,8 +11619,11 @@ class InferenceScheduler:
             # budget pressure: evicting it undermines the residency convergence (the pre-staged head
             # cannot reach sole residency and dispatch is permanently blocked until save-our-ship
             # soft-resets the pools). Only the residency holder is spared; other models are still
-            # reclaimable.
-            return any(state.model == model_name for _, state in self._whole_card_ledger.held())
+            # reclaimable. Host-RAM pressure is different: an idle holder no queued job wants, held in
+            # system RAM by the only process left, is the footprint the floor needs back, and sparing
+            # it left pops paused with nothing able to arrive and release it. The caller still spares
+            # a holder whose model is running or queued.
+            return vram and any(state.model == model_name for _, state in self._whole_card_ledger.held())
 
         if affinity_active(len(wanted_models), self._max_inference_processes) and model_name in wanted_models:
             return True

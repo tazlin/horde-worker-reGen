@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     LearnedFootprintStore,
     ResolutionBucket,
     plausible_activation_ceiling_mb,
+    plausible_sampling_peak_mb,
 )
 
 
@@ -529,3 +530,72 @@ class TestPlausibilityBounds:
         assert plausible_activation_ceiling_mb(None) is None
         assert plausible_activation_ceiling_mb(0.0) is None
         assert plausible_activation_ceiling_mb(24576.0) == pytest.approx(24576.0 - 1228.8)
+
+
+class TestSamplingPlausibilityBound:
+    """A sampling reading is bounded by what the heaviest job in its band could plausibly need."""
+
+    def test_card_sized_readings_fall_outside_their_band(self) -> None:
+        """Allocator readings near the card's size cannot describe an SDXL or SD1.5 job's peak."""
+        sdxl = plausible_sampling_peak_mb(_key(), 24576.0)
+        sd15 = plausible_sampling_peak_mb(_key(baseline="stable_diffusion_1", bucket=ResolutionBucket.LE_512), 24576.0)
+        assert sdxl is not None and 9256.0 < sdxl < 20584.0
+        assert sd15 is not None and 6386.0 < sd15 < 19980.0
+
+    def test_large_models_are_capped_at_the_card(self) -> None:
+        """A band whose plausible peak exceeds the card keeps the card's own bound."""
+        bound = plausible_sampling_peak_mb(_key(baseline="qwen_image", bucket=ResolutionBucket.GT_1024), 24576.0)
+        assert bound == pytest.approx(plausible_activation_ceiling_mb(24576.0))
+
+    def test_keys_without_a_band_or_a_known_baseline_keep_the_card_bound(self) -> None:
+        """Resident keys and baselines the burden model does not know are bounded by the card alone."""
+        card = plausible_activation_ceiling_mb(24576.0)
+        assert plausible_sampling_peak_mb(_resident_key(), 24576.0) == card
+        assert plausible_sampling_peak_mb(_key(baseline="no_such_baseline"), 24576.0) == card
+        assert plausible_sampling_peak_mb(_key(baseline="no_such_baseline"), None) is None
+
+    def test_a_card_sized_sdxl_reading_is_refused_at_the_seam(self) -> None:
+        """The feeder's bound keeps a 20 GB SDXL reading out of the raise-only watermark."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_key(), 20584.0, plausible_max_mb=plausible_sampling_peak_mb(_key(), 24576.0))
+        assert store.get_observation(_key()) is None
+
+
+class TestSanitizeSamplingObservations:
+    """Stored sampling statistics above their bound are clamped; everything else is left as it was."""
+
+    def test_implausible_sampling_statistics_are_clamped_and_kept(self, tmp_path: Path) -> None:
+        """The watermark, recent window and EWMA are cut back; the count and genuine readings survive."""
+        path = tmp_path / "footprints.json"
+        store = LearnedFootprintStore(path=path)
+        for reading in (6874.0, 9256.0, 20584.0):
+            store.observe_peak(_key(), reading)
+        store.observe_peak(_resident_key(), 21000.0)
+        store.observe_peak(_key(bucket=ResolutionBucket.LE_512), 7000.0)
+
+        changed = store.sanitize_sampling_observations(lambda key: plausible_sampling_peak_mb(key, None))
+
+        bound = plausible_sampling_peak_mb(_key(), None)
+        assert bound is not None
+        assert changed == [_key()]
+        clamped = store.get_observation(_key())
+        assert clamped is not None
+        assert clamped.watermark_mb == pytest.approx(bound)
+        assert max(clamped.recent_mb) == pytest.approx(bound)
+        assert 6874.0 in clamped.recent_mb and 9256.0 in clamped.recent_mb
+        assert clamped.ewma_mb <= bound
+        assert clamped.observation_count == 3
+        resident = store.get_observation(_resident_key())
+        assert resident is not None and resident.watermark_mb == 21000.0
+        plausible = store.get_observation(_key(bucket=ResolutionBucket.LE_512))
+        assert plausible is not None and plausible.watermark_mb == 7000.0
+        reloaded = LearnedFootprintStore(path=path)
+        reloaded_observation = reloaded.get_observation(_key())
+        assert reloaded_observation is not None
+        assert reloaded_observation.watermark_mb == pytest.approx(bound)
+
+    def test_a_clean_store_is_untouched(self) -> None:
+        """Nothing above its bound means nothing changes and nothing is reported."""
+        store = LearnedFootprintStore()
+        store.observe_peak(_key(), 9256.0)
+        assert store.sanitize_sampling_observations(lambda key: plausible_sampling_peak_mb(key, None)) == []

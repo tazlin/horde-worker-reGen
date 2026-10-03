@@ -41,10 +41,12 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import functools
 import json
 import os
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -67,6 +69,71 @@ def plausible_activation_ceiling_mb(total_vram_mb: float | None) -> float | None
     if total_vram_mb is None or total_vram_mb <= 0:
         return None
     return total_vram_mb - admission_noise_buffer_mb(total_vram_mb)
+
+
+_PLAUSIBLE_SAMPLE_SEED_FACTOR = 1.25
+"""How far above the heaviest static seed for its band a sampling reading may sit and still describe its key.
+
+The static whole-job seed already prices every component co-resident and runs above measured peaks, and the
+band's heaviest seed carries every sampling-phase feature at the band's largest dimension, so a quarter more is
+room for a genuine outlier while a card-sized allocator reading (another checkpoint cached, an overflow) is
+well above it."""
+
+_BUCKET_UPPER_DIMENSION: dict[str, int] = {
+    "le_512": 512,
+    "le_768": 768,
+    "le_1024": 1024,
+    "gt_1024": 2048,
+}
+"""The square edge (px) a band's heaviest job is priced at: each band's upper bound, and 2048 above 1024."""
+
+
+@functools.lru_cache(maxsize=256)
+def _heaviest_sampling_seed_mb(baseline: str, bucket: str, *, isolated: bool, batch: int) -> float | None:
+    """The static sampling seed (MB) of the heaviest job a band can hold, or None for an unknown baseline."""
+    from hordelib.feature_impact import FEATURE_PHASE, estimate_job_burden, get_feature_impact_registry
+
+    dimension = _BUCKET_UPPER_DIMENSION.get(bucket)
+    if dimension is None:
+        return None
+    sampling_features = [
+        kind
+        for kind, impact in get_feature_impact_registry().features.items()
+        if impact.phase == FEATURE_PHASE.sampling
+    ]
+    burden = estimate_job_burden(
+        baseline=baseline,
+        width=dimension,
+        height=dimension,
+        batch=max(1, batch),
+        features=sampling_features,
+    )
+    if not burden.baseline_known:
+        return None
+    return float(burden.vram_sampler_only_mb if isolated else burden.vram_sampling_mb)
+
+
+def plausible_sampling_peak_mb(key: FootprintKey, total_vram_mb: float | None, *, batch: int = 1) -> float | None:
+    """Return the largest reading (MB) that can describe a sampling key, or None to apply no bound.
+
+    The band's heaviest static seed times :data:`_PLAUSIBLE_SAMPLE_SEED_FACTOR`, plus the platform context
+    charge, capped at what the card can give one process. A process's allocator high-water can hold another
+    cached checkpoint or an overflow; bounded only by the card, such readings priced SD 1.5 at 20 GB. A
+    non-sampling key, or one whose baseline the burden model does not know, gets the card bound alone.
+    """
+    card_mb = plausible_activation_ceiling_mb(total_vram_mb)
+    if key.stage not in (FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED) or key.resolution_bucket is None:
+        return card_mb
+    seed_mb = _heaviest_sampling_seed_mb(
+        key.model_baseline,
+        str(key.resolution_bucket),
+        isolated=key.stage is FootprintStage.SAMPLE_ISOLATED,
+        batch=batch,
+    )
+    if seed_mb is None:
+        return card_mb
+    bound_mb = seed_mb * _PLAUSIBLE_SAMPLE_SEED_FACTOR + platform_context_constant_mb()
+    return bound_mb if card_mb is None else min(bound_mb, card_mb)
 
 
 class MeasuredJobFootprint(Protocol):
@@ -510,6 +577,34 @@ class LearnedFootprintStore:
                 written.append(resident_key)
 
         return written
+
+    def sanitize_sampling_observations(
+        self,
+        bound_for_key: Callable[[FootprintKey], float | None],
+    ) -> list[FootprintKey]:
+        """Clamp stored sampling statistics to their key's plausible bound, returning the keys changed.
+
+        Watermarks only rise and are persisted, so a reading that predates a feeder's bound keeps mispricing
+        its key until it is cut back. Counts and keys are kept; only the watermark, the recent window and the
+        EWMA are clamped, so the key keeps its authority and its genuine evidence.
+        """
+        changed: list[FootprintKey] = []
+        for key, observation in list(self._observations.items()):
+            if key.stage not in (FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED):
+                continue
+            bound_mb = bound_for_key(key)
+            if bound_mb is None or observation.watermark_mb <= bound_mb:
+                continue
+            self._observations[key] = _FootprintObservation(
+                ewma_mb=min(observation.ewma_mb, bound_mb),
+                watermark_mb=bound_mb,
+                observation_count=observation.observation_count,
+                recent_mb=[min(reading, bound_mb) for reading in observation.recent_mb],
+            )
+            changed.append(key)
+        if changed:
+            self.save()
+        return changed
 
     def estimate_mb(self, key: FootprintKey, *, static_seed_mb: float) -> float:
         """Return the footprint estimate for ``key``: the static seed raised by any learned watermark.
