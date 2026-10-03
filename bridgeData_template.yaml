@@ -725,7 +725,7 @@ enable_vram_budget: true
 # throughput for safety. Only used when enable_vram_budget is true.
 vram_reserve_mb: 2048
 
-# Single additive host-RAM headroom reserve (MB), above a marginal checkpoint load or a new context.
+# Host RAM (MB) kept available after every modeled allocation, admitted or incoming, has landed.
 # The reserve overlaps the absolute danger floor, so their maximum is protected once. It never sets
 # the soft pop-hold band or estimates a context's size. Only used when enable_vram_budget is true.
 ram_reserve_mb: 4096

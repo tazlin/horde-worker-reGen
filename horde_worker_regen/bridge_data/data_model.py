@@ -1341,7 +1341,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     when `enable_vram_budget` is true."""
 
     ram_reserve_mb: int = Field(default=4096, ge=0)
-    """Single additive host-RAM headroom reserve (MB), above a marginal checkpoint load or new context.
+    """Host RAM (MB) kept available after every modeled allocation, admitted or incoming, has landed.
 
     The reserve overlaps the absolute danger floor, so their maximum is protected once. It never sets
     the soft pop-hold band or estimates the size of a context. Only used when `enable_vram_budget` is true."""

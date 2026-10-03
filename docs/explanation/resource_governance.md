@@ -67,12 +67,33 @@ queue drains, and the only thing that clears the hold (the tick) would never run
 All host gates use `resources.resource_budget.ram_headroom`, which returns a frozen `RamHeadroom`.
 Its absolute requirements obey `hard_floor <= soft_hold <= preload <= restore`. The single additive
 `ram_reserve_mb` protects the same free pages as the danger floor, so the retained headroom is their
-maximum, not their sum. Outstanding commitments are subtracted from available RAM once. The soft
-hold line is the hard floor plus in-flight feature RAM, never the reserve. A soft hold also evicts
-idle models in that tick, so reclaim does not depend on another job being popped or preloaded.
-There is no RAM dwell or extra release margin: when transient risk clears, intake opens immediately.
-The threshold comparison uses the shared `HysteresisLatch`, also used for safety backlog and foreign
-VRAM ceiling holds.
+maximum, not their sum.
+
+Every requirement counts outstanding RAM: work already admitted whose allocation the available
+reading does not yet show. Preload requires `max(floor, reserve) + outstanding + incoming`, and
+restore the same with a context in place of the incoming load. An accepted admission therefore keeps
+`max(floor, reserve)` even if every modeled allocation lands before the next reading. The soft hold
+line is the hard floor plus outstanding RAM, never the reserve. A soft hold also evicts idle models in
+that tick, so reclaim does not depend on another job being popped or preloaded. There is no RAM dwell
+or extra release margin: when the outstanding risk clears, intake opens immediately. The threshold
+comparison uses the shared `HysteresisLatch`, also used for safety backlog and foreign VRAM ceiling
+holds.
+
+Outstanding RAM lives in the `CommittedReserveLedger`, beside the planned VRAM it resembles. Each
+allocation is held in exactly one place:
+
+| Allocation | Booked | Released |
+|---|---|---|
+| A preload's checkpoint stage | When the preload is sent, against the target process | When the process leaves the loading set |
+| A job's inference-process feature RAM | At dispatch, against the inference process | When the job leaves inference |
+| A job's post-processing feature RAM | When post-processing starts, as a flat entry | When post-processing ends |
+| An alchemy form's RAM | Each alchemy reconcile, as a flat entry | When the form leaves the reconcile |
+
+A planned entry decays as its target's private working set grows past its admit-time reading, and the
+decay only rises, so pages a load later releases cannot resurrect its charge. Re-booking a dispatch at
+clearance keeps the entry's progress. Without a dedicated post-processing lane, post-processing RAM is
+booked on the inference process with the rest of the job's features. The post-processing entry stays
+flat while it runs, so its RAM is counted twice once the lane's reading shows it.
 
 One tick measures the RAM danger-floor verdict and one
 [`HostMemorySnapshot`][horde_worker_regen.process_management.scheduling.governance.snapshots.HostMemorySnapshot],
@@ -167,18 +188,29 @@ worker-driven RAM unload.
 
 ### Honest RAM accounting and per-process residency
 
-Checkpoint staging and context restoration have different charges. Staging a whole checkpoint costs
-its on-disk bytes plus the burden model's per-feature RAM deltas, with a marginal charge floor. If the
-file cannot be resolved or statted, the burden seed remains the fallback. The charge is captured beside
-the component charge on the scheduling snapshot; admission never resolves files itself. A restored
-context costs the measured private working set, falling back to the largest offered context seed
-before measurements exist. The reserve is never a context estimate.
+Checkpoint staging and context restoration have different charges. A whole checkpoint's staging
+price is its measured load peak once trusted, else its on-disk bytes, else the context seed when the
+file cannot be resolved or statted, never below a marginal charge floor. The price excludes feature
+RAM. Admission adds the job's own feature RAM, split by the process that allocates it (hordelib's
+`ram_sampling_mb` and `ram_post_processing_mb`), so one checkpoint price serves every feature mix. The
+checkpoint and feature figures are captured on the scheduling snapshot; admission never resolves files
+itself. A restored context costs the measured private working set, falling back to the largest offered
+context seed before measurements exist. The reserve is never a context estimate.
 
-Settled load growth feeds `LearnedRamStore`. Whole, component and retained-page loads have separate
-identities so a cheap reused load cannot lower a cold-load price. Five observations unlock a
-bidirectional estimate: the recent maximum of twenty measurements plus ten percent. Evidence can
-raise or lower a stale seed. The store is scoped to the current launch, and the existing settle window
-and model/idle checks prevent a mid-load report from becoming a settled observation.
+Load measurements feed `LearnedRamStore`. During a preload the child samples its private RAM every
+100 ms and sends the highest reading with the memory report that follows the loaded state. The parent
+records that report as the process's `LoadCompletionSample`. An admission learns only from the sample
+that completed its own load: same launch, same model, sampled after the admission. Until that report
+arrives the admission stays pending, so a delayed report is still used. One that never arrives is
+dropped unlearned after `LOAD_COMPLETION_REPORT_TIMEOUT_SECONDS`. Periodic reports never train the
+store, and the observation is taken before any job runs on the slot, so it holds no feature RAM. The
+store keeps the larger of the peak and the settled growth.
+
+Whole, component and retained-page loads have separate identities so a cheap reused load cannot lower
+a cold-load price. Five observations unlock a bidirectional estimate: the recent maximum of twenty
+measurements plus ten percent. The store is scoped to the current launch. A worker whose models stay
+resident completes few cold loads of each checkpoint, so on resident-heavy traffic the file-size price
+is what admission usually uses.
 
 Children report RSS for the dashboard and private bytes for reclaim and restore. On Linux, the
 anonymous/private-dirty reading excludes reclaimable clean checkpoint mappings; USS alone would

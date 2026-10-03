@@ -138,8 +138,8 @@ whether an older worker used the reserve as its soft band. Support-bundle summar
 parent rotations that continue the selected run.
 
 Update the worker and check other programs' system RAM use if the finding persists. `ram_reserve_mb`
-is one additive reserve above a checkpoint load or a new context, overlapping the hard floor.
-The soft hold instead protects outstanding job transients and reclaims idle models immediately.
+is the RAM kept available after every admitted and incoming allocation lands, overlapping the hard floor.
+The soft hold instead protects outstanding allocations and reclaims idle models immediately.
 A healthy fp8 process is protected by its model-sized reclaim ceiling. Increasing `queue_size`
 while RAM holds are active does not recover memory. See [Resource governance](../explanation/resource_governance.md)
 for the charge model, private-memory reports and ordered thresholds.
