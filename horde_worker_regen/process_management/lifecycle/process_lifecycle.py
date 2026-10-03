@@ -5,10 +5,11 @@ from __future__ import annotations
 import contextlib
 import enum
 import math
+import multiprocessing.queues
 import os
 import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
@@ -52,7 +53,7 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import ChildProcessHandle, HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
@@ -252,7 +253,7 @@ warmed its model cache without being dominated by a single slow start."""
 INFERENCE_END_GRACE_SECONDS: float = 5.0
 """How long a single inference-slot end waits for the child to exit cleanly before killing it, when not
 shutting down. A busy child mid-sampling holds the GPU and cannot answer END_PROCESS until its current
-operation yields, so a curt grace kills it mid-put and risks tearing a frame on the shared status queue.
+operation yields, so a curt grace kills a child whose last results and reports have not yet left it.
 A few seconds lets the common case exit on its own; a genuinely stuck child is still killed and reaped.
 Shutdown keeps the shorter grace: there the whole tree is coming down promptly regardless."""
 
@@ -281,6 +282,19 @@ SOFT_RESET_POOL_END_GRACE_SECONDS: float = 10.0
 to end first (a parallel head start), then reaped against this one shared deadline, so a busy child gets
 several seconds to exit cleanly while the whole batch stays prompt rather than paying a serial grace per
 slot. Stragglers past the deadline are killed."""
+
+_END_PATH_DRAIN_INTERVAL_SECONDS: float = 0.05
+"""How long a live end path waits on one child between requests that the reader drain the status queue."""
+
+STATUS_QUEUE_WRITER_LOCK_TIMEOUT_SECONDS: float = 2.0
+"""How long a kill waits to take the status queue's writer lock before signalling without it.
+
+A writer holds the lock for one frame, and with the reader draining the pipe that frame lands in
+milliseconds. A lock still held after this long belongs to a writer that will not release it (one that died
+holding it), so waiting longer protects nothing and only holds the control loop."""
+
+KILL_CONFIRM_JOIN_SECONDS: float = 1.0
+"""How long an end path joins a child it has just signalled before giving up on reaping it there."""
 
 UTILITIES_PROCESS_EXPECTED_VRAM_MB: float = 1024.0
 """Provisional expected device footprint (MB) charged when admitting the image-utilities lane.
@@ -501,6 +515,19 @@ so the horde is told what the worker concluded about the payload, and is worded 
 """
 
 
+def _status_queue_writer_lock(status_queue: object) -> Lock_MultiProcessing | None:
+    """Return the cross-process lock a status-queue writer holds while it writes one frame, or None.
+
+    CPython's ``multiprocessing.Queue`` guards every frame a feeder thread writes with one lock shared by all
+    writers on POSIX, and uses none on Windows, where each write is its own pipe message. A queue double has
+    none either. A writer that dies holding the lock leaves it held, and every other writer then blocks
+    before its next frame.
+    """
+    if not isinstance(status_queue, multiprocessing.queues.Queue):
+        return None
+    return status_queue._wlock  # pyrefly: ignore[missing-attribute] - the stdlib keeps the writer lock private
+
+
 class ProcessLifecycleManager:
     """Owns process start/stop/replace logic and related state."""
 
@@ -639,6 +666,9 @@ class ProcessLifecycleManager:
         # Environment-fatal crash causes already surfaced to the operator, so a crash loop repeats its
         # cause as one CRITICAL line rather than once per respawn.
         self._reported_environment_fatal_markers: set[str] = set()
+        # Asks the status queue's reader to drain while an end path holds the control loop; registered by the
+        # parent once its dispatcher exists. None (standalone tests) leaves end paths joining without a drain.
+        self._channel_drain_requester: Callable[[], None] | None = None
         # Returns the fresh WDDM paging-victim map (os_pid -> shared MB) from the scheduler, or an empty
         # map when the parent has no current paging attribution. Injected lazily (the scheduler is built
         # after this manager), so a bare default here keeps the manager usable standalone in tests.
@@ -920,6 +950,14 @@ class ProcessLifecycleManager:
     def set_event_sink(self, sink: WorkerEventSink) -> None:
         """Register the sink a recovered process is recorded on (the worker event ring)."""
         self._event_sink = sink
+
+    def set_channel_drain_requester(self, requester: Callable[[], None]) -> None:
+        """Register the callable that asks the status queue's reader to drain without waiting.
+
+        The live end paths call it while they wait on a child, since the control loop that would otherwise
+        drain the queue is held by the wait (see :meth:`_join_while_draining`).
+        """
+        self._channel_drain_requester = requester
 
     def _count_process_recovery(
         self,
@@ -2945,10 +2983,9 @@ class ProcessLifecycleManager:
                 HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS),
             )
         try:
-            self._download_process_info.mp_process.join(timeout=1)
+            self._join_while_draining(self._download_process_info.mp_process, timeout=1.0)
             if self._download_process_info.mp_process.is_alive():
-                self._download_process_info.mp_process.kill()
-                self._download_process_info.mp_process.join(timeout=ALL_PROCESS_SHUTDOWN_KILL_JOIN_SECONDS)
+                self._signal_child_between_frames(self._download_process_info.mp_process)
         except Exception as e:
             logger.debug(f"Failed to stop download process: {e}")
         if self._download_process_info.mp_process.is_alive():
@@ -3499,8 +3536,8 @@ class ProcessLifecycleManager:
 
         Signals the child to end, then reaps it: joins against a grace, killing and reaping a straggler that
         does not exit in time. The grace is longer when not shutting down (a busy child mid-sampling deserves a
-        few seconds to yield the GPU and exit cleanly rather than being killed mid-put, which risks tearing a
-        frame on the shared status queue). When ``join_deadline`` is a monotonic timestamp, the reap joins
+        few seconds to yield the GPU and exit cleanly, delivering what it has queued, rather than being killed).
+        When ``join_deadline`` is a monotonic timestamp, the reap joins
         against that shared batch deadline instead, so a pool rebuild can end its victims in parallel under one
         bounded budget rather than a serial per-slot grace.
         """
@@ -3556,10 +3593,9 @@ class ProcessLifecycleManager:
             grace = INFERENCE_END_GRACE_SECONDS
 
         try:
-            process_info.mp_process.join(timeout=grace)
+            self._join_while_draining(process_info.mp_process, grace)
             if process_info.mp_process.is_alive():
-                process_info.mp_process.kill()
-                process_info.mp_process.join(timeout=1)
+                self._signal_child_between_frames(process_info.mp_process)
         except Exception as e:
             logger.error(f"Failed to kill process {process_info.process_id}: {e}")
 
@@ -3573,6 +3609,82 @@ class ProcessLifecycleManager:
 
         if not self._state.shutting_down:
             logger.info(f"Ended inference process {process_info.process_id}")
+
+    def _request_channel_drain(self) -> None:
+        """Ask the status queue's reader to drain now, when the parent has registered one."""
+        if self._channel_drain_requester is not None:
+            self._channel_drain_requester()
+
+    def _join_while_draining(self, mp_process: ChildProcessHandle, timeout: float) -> None:
+        """Wait up to ``timeout`` seconds for a signalled child to exit, keeping the status queue drained.
+
+        A child's interpreter exit joins its status-queue feeder thread, which cannot finish while its frames
+        wait behind a full pipe, and the control loop that normally drains that pipe is held by this wait.
+        Undrained, a child that has left its main loop sits in exit until the grace runs out, and the kill
+        that follows lands on a feeder stalled mid-frame with the queue's shared writer lock held. So the wait
+        is cut into short joins, each preceded by a drain request; the next tick handles what the reader took.
+        """
+        bounded_timeout = max(0.0, timeout)
+        slices = max(1, math.ceil(bounded_timeout / _END_PATH_DRAIN_INTERVAL_SECONDS))
+        for _ in range(slices):
+            self._request_channel_drain()
+            mp_process.join(timeout=bounded_timeout / slices)
+            if not mp_process.is_alive():
+                return
+
+    def _signal_child_between_frames(self, mp_process: ChildProcessHandle, *, terminate: bool = False) -> None:
+        """Kill (or terminate) a child and join it briefly, holding the status queue's writer lock throughout.
+
+        On POSIX every multiprocessing child writes its frames under that one lock. A child killed while its
+        feeder thread holds it leaves it held for good: every other writer, including each child spawned
+        afterwards, blocks before its next frame while the parent reads an empty queue. With the lock held by
+        the parent the child is between frames when the signal lands, and the join keeps it held until the
+        child is gone. The image-utilities lane's handle stops a process that never writes to the queue, so it
+        is signalled without the lock.
+        """
+        signal_child = mp_process.terminate if terminate else mp_process.kill
+        writes_held = (
+            self._status_queue_writes_held() if isinstance(mp_process, BaseProcess) else contextlib.nullcontext()
+        )
+        with writes_held:
+            signal_child()
+            mp_process.join(timeout=KILL_CONFIRM_JOIN_SECONDS)
+
+    @contextlib.contextmanager
+    def _status_queue_writes_held(self) -> Iterator[None]:
+        """Context manager that holds the status queue's writer lock, when the queue has one.
+
+        A writer holding the lock is finishing one frame, which needs room in the pipe, so the reader is asked
+        to drain between attempts. Past :data:`STATUS_QUEUE_WRITER_LOCK_TIMEOUT_SECONDS` the body runs without
+        the lock: a lock held that long is not going to be released, so the channel is already lost and its
+        silence rule escalates.
+        """
+        writer_lock = _status_queue_writer_lock(self._process_message_queue)
+        if writer_lock is None:
+            yield
+            return
+        acquired = self._acquire_status_queue_writer_lock(writer_lock)
+        try:
+            yield
+        finally:
+            if acquired:
+                writer_lock.release()
+
+    def _acquire_status_queue_writer_lock(self, writer_lock: Lock_MultiProcessing) -> bool:
+        """Return whether the writer lock was taken within its bound, requesting a drain before each attempt."""
+        deadline = time.monotonic() + STATUS_QUEUE_WRITER_LOCK_TIMEOUT_SECONDS
+        while True:
+            self._request_channel_drain()
+            remaining = deadline - time.monotonic()
+            if writer_lock.acquire(timeout=max(0.0, min(_END_PATH_DRAIN_INTERVAL_SECONDS, remaining))):
+                return True
+            if remaining <= 0.0:
+                logger.warning(
+                    "The status queue's writer lock was not released within "
+                    f"{STATUS_QUEUE_WRITER_LOCK_TIMEOUT_SECONDS:.0f}s although the queue was being drained, so its "
+                    "holder will not release it (most likely a writer died holding it). Ending the child without it.",
+                )
+                return False
 
     def _end_replaced_children(self, process_type: HordeProcessType) -> None:
         """End the OS process of every child of ``process_type`` in the map, ahead of retiring their entries.
@@ -3595,11 +3707,10 @@ class ProcessLifecycleManager:
         try:
             if mp_process.is_alive():
                 if process_info.last_process_state == HordeProcessState.PROCESS_STARTING:
-                    mp_process.terminate()
-                mp_process.join(timeout=grace)
+                    self._signal_child_between_frames(mp_process, terminate=True)
+                self._join_while_draining(mp_process, grace)
                 if mp_process.is_alive():
-                    mp_process.kill()
-                    mp_process.join(timeout=1)
+                    self._signal_child_between_frames(mp_process)
             else:
                 mp_process.join(timeout=0)
             still_alive = mp_process.is_alive()

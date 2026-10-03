@@ -674,6 +674,9 @@ The escalation, in order:
    The same bounded-reap shape is used when horde maintenance triggers an operational
    inference-pool reload: every slot is signalled first, then all are joined against
    one shared deadline instead of paying a full shutdown grace serially per slot.
+   The status queue is drained while the reap waits, and stragglers are killed
+   under its writer lock, so the rebuild cannot strand the channel by killing a
+   child partway through a frame (see [IPC and messaging](ipc_and_messaging.md)).
 3. **Give up cleanly** (`give_up_on_wedged_jobs`): once resets clearly are not
    helping (e.g. a deterministic crash-on-start), stop fighting: fault the jobs
    that cannot be served so the horde reissues them, rather than wedging forever.

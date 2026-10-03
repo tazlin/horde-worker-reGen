@@ -38,6 +38,12 @@ dispatcher-seam liveness tests in ``ipc/test_dispatcher_drain_liveness.py``. The
 the end is deterministic: it writes a length header with no body straight into the shared pipe, so its
 wedge does not depend on catching a kill at the right instant.
 
+The campaigns kill writers directly, as a crash or an outside kill would. The end-path test drives the
+lifecycle's own end paths instead: a child ended with its last reports queued cannot finish exiting until the
+parent reads the pipe, so an end path that waits without draining kills it with its feeder thread mid-frame.
+The blocked exit does not depend on the writer lock, so that test fails on every platform when the end path
+does not drain.
+
 Every drain tick is bounded by a daemon-thread deadline and abandoned safely on a wedge, so a reproduced
 freeze can never stall pytest teardown; children are always killed and joined in teardown.
 """
@@ -53,6 +59,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.process import BaseProcess
+from multiprocessing.synchronize import Event
 
 import pytest
 
@@ -61,8 +68,9 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     HordeProcessStateChangeMessage,
 )
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from tests.process_management.conftest import make_mock_process_info
+from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
 from tests.process_management.ipc.test_dispatcher_drain_liveness import (
     _make_dispatcher,
     _run_async_with_deadline,
@@ -347,6 +355,105 @@ class TestTerminateSweepBusyWriterSharesQueue:
             f"{campaign.survivor_unreached_cycles}/{campaign.cycles} cycles never drained the surviving "
             "writer's message after the shutdown terminate sweep on a busy writer"
         )
+
+
+_ENDED_CHILD_ID = 3
+"""Slot id of the child the end path retires in the end-path scenarios."""
+
+_FINAL_REPORT_INFO = "final report queued before exit"
+"""The ``info`` of the last message the ended child queues, so the parent can find it among the drained frames."""
+
+
+def _exiting_writer(shared_queue: mp.Queue, process_id: int, queued: Event) -> None:  # type: ignore[type-arg]
+    """Queue more than the pipe holds and then a final report, and return, so interpreter exit must flush both.
+
+    Stands in for a child that has left its main loop on END_PROCESS with its last reports still queued: its
+    exit joins its feeder thread, which cannot finish writing until the parent reads the pipe.
+    """
+    shared_queue.put(
+        HordeProcessStateChangeMessage(
+            process_id=process_id,
+            process_launch_identifier=0,
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="A" * _FLOOD_PAD_BYTES,
+        ),
+    )
+    shared_queue.put(
+        HordeProcessStateChangeMessage(
+            process_id=process_id,
+            process_launch_identifier=0,
+            process_state=HordeProcessState.PROCESS_ENDED,
+            info=_FINAL_REPORT_INFO,
+        ),
+    )
+    queued.set()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "process_type",
+    [HordeProcessType.INFERENCE, HordeProcessType.SAFETY],
+    ids=["inference-slot-end", "service-lane-replacement"],
+)
+def test_an_ended_child_exits_on_its_own_and_leaves_the_queue_writable(process_type: HordeProcessType) -> None:
+    """A real child ended with its last reports still queued finishes exiting, and the queue keeps delivering.
+
+    Drives the lifecycle's own end paths (the inference slot end every soft-reset victim takes, and the service
+    lane replacement the safety rebuild takes) over a real shared queue and the real dispatcher reader. If the
+    end path waits without draining, the child's exit blocks on a pipe nobody reads until its grace kills it,
+    on POSIX with its feeder thread mid-frame holding the queue's writer lock, and a writer started afterwards
+    is never heard. Draining while it waits, the child exits by itself, its final report reaches the parent,
+    and the next writer's message is delivered.
+    """
+    context = mp.get_context("spawn")
+    shared_queue: mp.Queue = context.Queue()  # type: ignore[type-arg]
+    queued = context.Event()
+    child = context.Process(target=_exiting_writer, args=(shared_queue, _ENDED_CHILD_ID, queued))
+    survivor: BaseProcess | None = None
+    child.start()
+    try:
+        assert queued.wait(timeout=_SURVIVOR_DEADLINE_SECONDS), "the child never queued its reports"
+        state = WorkerState()
+        survivor_pid = 0
+        dispatcher = _make_dispatcher(
+            process_message_queue=shared_queue,
+            process_map=ProcessMap({survivor_pid: make_mock_process_info(survivor_pid)}),
+            state=state,
+        )
+        lifecycle = make_testable_process_manager()._process_lifecycle
+        lifecycle._process_message_queue = shared_queue
+        lifecycle.set_channel_drain_requester(dispatcher.request_channel_drain)
+        child_info = make_mock_process_info(_ENDED_CHILD_ID, model_name=None, process_type=process_type)
+        child_info.mp_process = child
+        lifecycle._process_map[_ENDED_CHILD_ID] = child_info
+
+        if process_type is HordeProcessType.INFERENCE:
+            lifecycle._end_inference_process(child_info)
+        else:
+            lifecycle._end_replaced_child(child_info)
+
+        assert child.exitcode == 0, f"the child could not finish exiting and was ended with code {child.exitcode}"
+        dispatcher._request_reader_drain_and_wait()
+        drained_infos = [message.info for message in dispatcher._take_buffered_messages()]
+        assert _FINAL_REPORT_INFO in drained_infos, "the child's final report never reached the parent"
+
+        survivor = context.Process(target=_survivor_writer, args=(shared_queue, survivor_pid))
+        survivor.start()
+        deadline = time.monotonic() + _SURVIVOR_DEADLINE_SECONDS
+        while time.monotonic() < deadline and not state.torch_build_cpu_only:
+            result = _run_async_with_deadline(
+                dispatcher.receive_and_handle_process_messages,
+                deadline_seconds=_TICK_DEADLINE_SECONDS,
+            )
+            assert result.finished, "a drain tick did not return after the end"
+            time.sleep(0.05)
+        assert state.torch_build_cpu_only, "a writer started after the end was never heard"
+    finally:
+        _kill_and_join(child)
+        if survivor is not None:
+            _kill_and_join(survivor)
+        with contextlib.suppress(Exception):
+            shared_queue.close()
 
 
 @pytest.mark.skipif(

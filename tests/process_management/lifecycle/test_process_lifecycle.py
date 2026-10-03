@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+import threading
 import time
+from collections.abc import Iterator
+from multiprocessing.process import BaseProcess
+from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from unittest.mock import Mock
 
 import pytest
@@ -45,6 +49,7 @@ from tests.process_management.conftest import (
     make_mock_process_info,
     make_test_card_runtimes,
     make_test_runtime_config,
+    make_testable_process_manager,
     track_popped_job_async,
 )
 from tests.process_management.regressions.test_inference_start_retirement_repro import (
@@ -238,6 +243,280 @@ class TestFinalShutdownReap:
         assert process_lifecycle._reap_if_crashed(safety) is False
         process_lifecycle._replace_inference_process.assert_not_called()
         process_lifecycle._replace_all_safety_process.assert_not_called()
+
+
+class _ExitFlushingChild:
+    """A child handle that can finish exiting only once the parent has drained the status queue.
+
+    Stands in for a child whose interpreter exit joins its status-queue feeder thread: the feeder cannot write
+    the child's last frames until the parent takes what the pipe already holds, so every join leaves the child
+    alive until a drain has been requested.
+    """
+
+    def __init__(self, drain_requests: list[float]) -> None:
+        self._drain_requests = drain_requests
+        self.alive = True
+        self.pid = 4242
+        self.exitcode: int | None = None
+        self.terminate = Mock()
+        self.kill = Mock(side_effect=self._killed)
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, timeout: float | None = None) -> None:
+        if self.alive and self._drain_requests:
+            self.alive = False
+            self.exitcode = 0
+
+    def _killed(self) -> None:
+        self.alive = False
+        self.exitcode = -9
+
+
+def _draining_plm(process_map: ProcessMap | None = None) -> tuple[ProcessLifecycleManager, list[float]]:
+    """Build a lifecycle whose drain requests are recorded, as the parent's dispatcher would receive them."""
+    drain_requests: list[float] = []
+    process_lifecycle = _make_plm(process_map=process_map)
+    process_lifecycle.set_channel_drain_requester(lambda: drain_requests.append(time.monotonic()))
+    return process_lifecycle, drain_requests
+
+
+class TestEndPathsDrainTheStatusQueueWhileTheyWait:
+    """A live end path keeps the status queue drained while it holds the control loop waiting on a child.
+
+    A child that has left its main loop cannot finish exiting until its last frames are written, and the
+    control loop that drains the pipe is the one waiting. Left undrained, the child is killed when its grace
+    runs out, with its feeder thread stalled mid-frame holding the queue's shared writer lock; on POSIX every
+    writer after it, including every replacement child, then blocks before its first frame.
+    """
+
+    @pytest.mark.parametrize("shared_deadline", [False, True], ids=["single-end-grace", "pool-rebuild-deadline"])
+    def test_an_ended_inference_child_exits_on_its_own(self, shared_deadline: bool) -> None:
+        """Both the single slot end and a pool rebuild's shared deadline drain while they join."""
+        child_info = make_mock_process_info(3, model_name=None)
+        process_lifecycle, drain_requests = _draining_plm(ProcessMap({3: child_info}))
+        child = _ExitFlushingChild(drain_requests)
+        child_info.mp_process = child  # pyrefly: ignore[bad-assignment] - a handle double for the child
+        join_deadline = (
+            time.monotonic() + process_lifecycle_module.SOFT_RESET_POOL_END_GRACE_SECONDS if shared_deadline else None
+        )
+
+        process_lifecycle._end_inference_process(child_info, join_deadline=join_deadline)
+
+        child.kill.assert_not_called()
+        assert child.exitcode == 0, "the child could not finish exiting and was killed"
+
+    def test_a_replaced_service_lane_child_exits_on_its_own(self) -> None:
+        """A safety child past startup, ended by its lane's replacement, is joined with the queue drained."""
+        child_info = make_mock_process_info(0, model_name=None, process_type=HordeProcessType.SAFETY)
+        process_lifecycle, drain_requests = _draining_plm(ProcessMap({0: child_info}))
+        child = _ExitFlushingChild(drain_requests)
+        child_info.mp_process = child  # pyrefly: ignore[bad-assignment] - a handle double for the child
+
+        process_lifecycle._end_replaced_child(child_info)
+
+        child.kill.assert_not_called()
+        assert child.exitcode == 0, "the child could not finish exiting and was killed"
+
+    def test_a_restarted_download_process_exits_on_its_own(self) -> None:
+        """The download child writes availability reports to the same queue, so its end drains too."""
+        download_info = make_mock_process_info(5, model_name=None, process_type=HordeProcessType.DOWNLOAD)
+        process_lifecycle, drain_requests = _draining_plm()
+        child = _ExitFlushingChild(drain_requests)
+        download_info.mp_process = child  # pyrefly: ignore[bad-assignment] - a handle double for the child
+        process_lifecycle._download_process_info = download_info
+
+        process_lifecycle.end_download_process()
+
+        child.kill.assert_not_called()
+        assert child.exitcode == 0, "the child could not finish exiting and was killed"
+        assert process_lifecycle.download_process_info is None
+
+    def test_the_manager_routes_end_path_drains_to_its_dispatcher(self) -> None:
+        """The parent registers its dispatcher's non-blocking drain request with the lifecycle."""
+        manager = make_testable_process_manager()
+
+        assert manager._process_lifecycle._channel_drain_requester == manager._message_dispatcher.request_channel_drain
+
+
+@pytest.fixture
+def posix_shaped_status_queue() -> Iterator[tuple[object, Lock_MultiProcessing]]:
+    """A real status queue carrying a cross-process writer lock, as CPython builds it on POSIX.
+
+    Windows builds the queue without one, so the lock is attached here to give every platform the shape the
+    guarded kill exists for.
+    """
+    context = multiprocessing.get_context("spawn")
+    status_queue = context.Queue()
+    writer_lock = context.Lock()
+    status_queue._wlock = writer_lock  # pyrefly: ignore[missing-attribute] - the stdlib keeps the lock private
+    yield status_queue, writer_lock
+    status_queue.close()
+
+
+def _lock_observing_child(writer_lock: Lock_MultiProcessing) -> tuple[Mock, list[bool]]:
+    """A multiprocessing child double that dies on kill or terminate, recording whether the parent held the lock.
+
+    The parent is the test's own thread, so "held by the parent" is the lock's own record of its holder being
+    the calling thread. A lock held by another writer, or by nobody, reads False.
+    """
+    held_by_parent: list[bool] = []
+    alive = [True]
+
+    def observe_and_die() -> None:
+        held_by_parent.append(writer_lock._semlock._is_mine())  # pyrefly: ignore[missing-attribute]
+        alive[0] = False
+
+    child = Mock(spec=BaseProcess)
+    child.is_alive.side_effect = lambda: alive[0]
+    child.kill.side_effect = observe_and_die
+    child.terminate.side_effect = observe_and_die
+    child.pid = 4243
+    child.exitcode = None
+    return child, held_by_parent
+
+
+class TestEndPathSignalsHoldTheStatusQueueWriterLock:
+    """A kill or terminate on a live end path lands while the parent holds the status queue's writer lock.
+
+    On POSIX every writer takes that one lock around each frame. A process killed while its feeder thread holds
+    it leaves it held, and every other child's next frame, and every replacement's first, then blocks for good.
+    With the parent holding the lock the victim cannot be inside a frame when it dies.
+    """
+
+    def test_an_inference_straggler_is_killed_under_the_lock(
+        self,
+        posix_shaped_status_queue: tuple[object, Lock_MultiProcessing],
+    ) -> None:
+        """The soft-reset path: a victim still alive at the shared deadline is killed with the lock held."""
+        status_queue, writer_lock = posix_shaped_status_queue
+        child_info = make_mock_process_info(3, model_name=None)
+        process_lifecycle = _make_plm(process_map=ProcessMap({3: child_info}))
+        process_lifecycle._process_message_queue = status_queue  # pyrefly: ignore[bad-assignment]
+        child, held_by_parent = _lock_observing_child(writer_lock)
+        child_info.mp_process = child  # pyrefly: ignore[bad-assignment] - a handle double for the child
+
+        process_lifecycle._end_inference_process(child_info, join_deadline=time.monotonic())
+
+        assert held_by_parent == [True], "the straggler was killed without the parent holding the writer lock"
+        assert writer_lock.acquire(block=False), "the end path kept the writer lock after the child was gone"
+        writer_lock.release()
+
+    @pytest.mark.parametrize(
+        ("state", "signal_name"),
+        [(HordeProcessState.PROCESS_STARTING, "terminate"), (HordeProcessState.WAITING_FOR_JOB, "kill")],
+        ids=["starting-child-terminated", "straggler-killed"],
+    )
+    def test_a_replaced_service_lane_child_is_signalled_under_the_lock(
+        self,
+        posix_shaped_status_queue: tuple[object, Lock_MultiProcessing],
+        monkeypatch: pytest.MonkeyPatch,
+        state: HordeProcessState,
+        signal_name: str,
+    ) -> None:
+        """The safety rebuild's end: a starting child's terminate and a straggler's kill both hold the lock."""
+        monkeypatch.setattr(process_lifecycle_module, "INFERENCE_END_GRACE_SECONDS", 0.0)
+        status_queue, writer_lock = posix_shaped_status_queue
+        child_info = make_mock_process_info(0, model_name=None, state=state, process_type=HordeProcessType.SAFETY)
+        process_lifecycle = _make_plm(process_map=ProcessMap({0: child_info}))
+        process_lifecycle._process_message_queue = status_queue  # pyrefly: ignore[bad-assignment]
+        child, held_by_parent = _lock_observing_child(writer_lock)
+        child_info.mp_process = child  # pyrefly: ignore[bad-assignment] - a handle double for the child
+
+        process_lifecycle._end_replaced_child(child_info)
+
+        getattr(child, signal_name).assert_called_once()
+        assert held_by_parent == [True], f"the {signal_name} landed without the parent holding the writer lock"
+
+    def test_a_kill_waits_for_a_writer_to_finish_its_frame(
+        self,
+        posix_shaped_status_queue: tuple[object, Lock_MultiProcessing],
+    ) -> None:
+        """A writer mid-frame keeps the lock until the drained pipe takes the frame; the kill comes after that.
+
+        The writer here releases only once a drain has been requested, as a feeder blocked on a full pipe does.
+        """
+        status_queue, writer_lock = posix_shaped_status_queue
+        drain_requested = threading.Event()
+        writer_holds_the_lock = threading.Event()
+
+        def writer_mid_frame() -> None:
+            with writer_lock:
+                writer_holds_the_lock.set()
+                drain_requested.wait(timeout=10.0)
+
+        writer = threading.Thread(target=writer_mid_frame, daemon=True)
+        writer.start()
+        assert writer_holds_the_lock.wait(timeout=5.0)
+        child_info = make_mock_process_info(3, model_name=None)
+        process_lifecycle = _make_plm(process_map=ProcessMap({3: child_info}))
+        process_lifecycle._process_message_queue = status_queue  # pyrefly: ignore[bad-assignment]
+        process_lifecycle.set_channel_drain_requester(drain_requested.set)
+        child, held_by_parent = _lock_observing_child(writer_lock)
+        child_info.mp_process = child  # pyrefly: ignore[bad-assignment] - a handle double for the child
+
+        process_lifecycle._end_inference_process(child_info, join_deadline=time.monotonic())
+        writer.join(timeout=5.0)
+
+        assert not writer.is_alive(), "the writer never finished its frame"
+        assert held_by_parent == [True], (
+            "the kill landed while another writer was mid-frame, or with nobody holding the writer lock"
+        )
+
+    def test_a_lock_that_is_never_released_does_not_keep_the_child_alive(
+        self,
+        posix_shaped_status_queue: tuple[object, Lock_MultiProcessing],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A lock orphaned by a writer that died holding it bounds the wait; the child is still killed."""
+        monkeypatch.setattr(process_lifecycle_module, "STATUS_QUEUE_WRITER_LOCK_TIMEOUT_SECONDS", 0.2)
+        status_queue, writer_lock = posix_shaped_status_queue
+        child_info = make_mock_process_info(3, model_name=None)
+        process_lifecycle = _make_plm(process_map=ProcessMap({3: child_info}))
+        process_lifecycle._process_message_queue = status_queue  # pyrefly: ignore[bad-assignment]
+        child, _held_by_parent = _lock_observing_child(writer_lock)
+        child_info.mp_process = child  # pyrefly: ignore[bad-assignment] - a handle double for the child
+
+        assert writer_lock.acquire(block=False)
+        try:
+            started = time.monotonic()
+            process_lifecycle._end_inference_process(child_info, join_deadline=time.monotonic())
+            elapsed = time.monotonic() - started
+        finally:
+            writer_lock.release()
+
+        child.kill.assert_called_once()
+        assert elapsed < 5.0, f"ending the child waited {elapsed:.1f}s on a lock that was never going to be released"
+
+    def test_a_handle_that_is_not_a_multiprocessing_child_is_signalled_without_waiting(
+        self,
+        posix_shaped_status_queue: tuple[object, Lock_MultiProcessing],
+    ) -> None:
+        """The image-utilities lane's handle stops a process that never writes to the queue, so no lock wait."""
+        status_queue, writer_lock = posix_shaped_status_queue
+        child_info = make_mock_process_info(
+            8,
+            model_name=None,
+            state=HordeProcessState.PROCESS_STARTING,
+            process_type=HordeProcessType.UTILITIES,
+        )
+        process_lifecycle = _make_plm(process_map=ProcessMap({8: child_info}))
+        process_lifecycle._process_message_queue = status_queue  # pyrefly: ignore[bad-assignment]
+        handle = Mock()
+        handle.is_alive.side_effect = lambda: not handle.terminate.called
+        child_info.mp_process = handle  # pyrefly: ignore[bad-assignment] - a handle double for the lane
+
+        assert writer_lock.acquire(block=False)
+        try:
+            started = time.monotonic()
+            process_lifecycle._end_replaced_child(child_info)
+            elapsed = time.monotonic() - started
+        finally:
+            writer_lock.release()
+
+        handle.terminate.assert_called_once()
+        assert elapsed < process_lifecycle_module.STATUS_QUEUE_WRITER_LOCK_TIMEOUT_SECONDS
 
 
 class TestRecoveryParkLifecycleQuiescence:

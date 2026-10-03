@@ -346,7 +346,10 @@ ended would outlive both its replacement and the parent. A child still in
 `PROCESS_STARTING` has not reached its control loop and cannot read `END_PROCESS`,
 so it is terminated. A child past startup was sent `END_PROCESS` when the
 replacement began and gets the same end grace an inference slot does. A straggler
-is killed. Asking a lane to end does not drop its child from the owned-PID
+is killed. While the end path waits it keeps the status queue drained, and each
+terminate or kill is sent under the queue's writer lock (see
+[IPC and messaging](ipc_and_messaging.md)), so a replaced child is never killed
+partway through writing a frame. Asking a lane to end does not drop its child from the owned-PID
 registry. A child confirmed dead leaves the registry and records
 `PROCESS_ENDED`; one the kill could not end stays in the registry. The shutdown
 reap and the hard kill both kill whatever the registry still holds outside the map

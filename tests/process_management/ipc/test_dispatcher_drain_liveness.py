@@ -392,3 +392,39 @@ class TestDrainTickControls:
         assert result.finished, "drain did not complete across a retired-launch tombstone"
         assert backlog.empty()
         assert state.torch_build_cpu_only is True, "the live writer's frame was not applied after the retired frame"
+
+
+class TestDrainRequestedOutsideATick:
+    """An end path holding the control loop can have the reader drain the queue without running a tick."""
+
+    def test_a_requested_drain_takes_the_backlog_and_the_next_tick_applies_it_in_order(self) -> None:
+        """The reader empties the queue on request; handling still happens on the loop thread, at the next tick.
+
+        Taking the frames off the queue is what lets a child blocked writing into a full pipe finish and exit.
+        Handling them anywhere but the control loop would break the single-threaded mutation contract.
+        """
+        state = WorkerState()
+        writer = make_mock_process_info(0)
+        writer.process_launch_identifier = 0
+        writer.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        backlog = _ListQueue([_cpu_only_state_change(0, 0), _gpu_incompatible_state_change(0, 0)])
+        dispatcher = _make_dispatcher(
+            process_message_queue=backlog,
+            process_map=ProcessMap({0: writer}),
+            state=state,
+        )
+
+        dispatcher.request_channel_drain()
+
+        assert dispatcher._reader_quiescent.wait(timeout=_CONTROL_DEADLINE_SECONDS), "the reader never drained"
+        assert backlog.empty(), "the requested drain left frames on the queue"
+        assert state.torch_build_cpu_only is False, "a requested drain handled a frame off the control loop"
+
+        result = _run_async_with_deadline(
+            dispatcher.receive_and_handle_process_messages,
+            deadline_seconds=_CONTROL_DEADLINE_SECONDS,
+        )
+
+        assert result.finished, "the tick after a requested drain did not return"
+        assert state.torch_build_cpu_only is True
+        assert state.gpu_torch_incompatible is True

@@ -1606,6 +1606,9 @@ class HordeWorkerProcessManager:
         # lock) is unrecoverable in place because every child inherits the same queue; the only correct
         # terminal is a loud abort and restart onto a fresh channel.
         self._message_dispatcher.set_channel_corruption_handler(self._restart_after_message_channel_corruption)
+        # An end path holds the control loop while it waits on a child, so it asks the reader to keep draining
+        # the channel: a child that cannot write what it queued cannot exit, and is then killed mid-frame.
+        self._process_lifecycle.set_channel_drain_requester(self._message_dispatcher.request_channel_drain)
         # The dispatcher decodes each memory report's component-residency snapshot into this shared map.
         self._message_dispatcher.set_component_residency_map(self._component_residency_map)
 

@@ -279,6 +279,21 @@ reaps them in parallel under one shared budget. A child also stops its side-thre
 status writer the instant it sees an end request, closing the window in which a
 report could be caught mid-put by a kill.
 
+An end path holds the control loop while it waits on a child, and the control loop
+is what normally asks the reader to drain. A child cannot finish exiting until its
+feeder thread has written everything it queued, so an undrained pipe kept children
+in exit until their grace ran out, and the kill then landed on a feeder stalled
+mid-frame. On POSIX every writer shares one queue writer lock, and a child killed
+while holding it leaves it held: every later writer, including each replacement
+child, blocks before its next frame and the parent reads an empty queue. Live end
+paths therefore join in short slices and request a drain before each one
+(`MessageDispatcher.request_channel_drain`). Every kill or terminate they send is
+sent, and briefly joined, while the parent holds the writer lock, so the child is
+between frames when the signal lands. If the lock is not released within two
+seconds its holder has died with it, the child is signalled anyway, and the
+silence rule above escalates. A child that crashes on its own mid-write can still
+orphan the lock; that case is left to the silence rule and the terminal restart.
+
 ## See also
 
 - [Process Lifecycle](process_lifecycle.md): how process replacement bumps the

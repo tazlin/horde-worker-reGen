@@ -171,8 +171,12 @@ The arbiter keeps four concerns deliberately separate:
     and needs no inference: its resident figure feeds the `RESIDENT` key for its checkpoint. Its device-wide
     high-water is deliberately not folded into `SAMPLE` or `SAMPLE_ISOLATED`: it carries every sibling's
     resident weights, and an activation key priced from it makes an ordinary preload look like it needs the
-    whole card. The activation keys keep the memory-report path as their only source, and admission prices
-    them raise-only from the seed; the margined measured estimate is used for the resident footprint alone.
+    whole card. The activation keys keep the memory-report path as their only source. Admission prices them
+    from the seed raised by the watermark, lowered to the margined measured estimate once the key is
+    observed enough, and never below the job's own core weights. That measured authority is key-wide: a
+    model's first job after a start is priced from its baseline-and-resolution population rather than held
+    to the all-time watermark, and the weight floor keeps a light sibling's readings from underpricing a
+    heavy checkpoint.
     A backend that reports no footprint (an older one, or a dry run) leaves the memory-report path as the
     only source for every key. The store persists to `.horde_worker_regen/vram_footprints.json` (schema-versioned,
     atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration
@@ -184,8 +188,15 @@ The arbiter keeps four concerns deliberately separate:
     card total minus the admission noise buffer (`plausible_activation_ceiling_mb`) is dropped: a process only
     gets there by overflowing on WDDM or by caching other checkpoints, and one such reading in a watermark
     that only rises prices every later job of that key at the whole card and defers preloads against room
-    that exists. A resident reading below the checkpoint's weight bytes (`predict_model_weight_mb`) is
-    dropped: a file cannot be resident in less than its size, and a run that block-swapped most of it
+    that exists. A sampling reading is also bounded by its own key (`plausible_sampling_peak_mb`): the
+    static price of the heaviest job its band admits (the bucket's largest square, every sampling-phase
+    feature, the configured batch) times 1.25, plus the context charge, capped at the card bound. The card
+    bound alone let a 20 GB reading into an SDXL or SD1.5 key, where it held every later job of the band at
+    clearance. The same bound is applied to the stored file when the store is attached
+    (`LearnedFootprintStore.sanitize_sampling_observations`): watermark, recent window and EWMA are clamped
+    to it while the observation counts and the plausible readings are kept, so a store poisoned before the
+    bound existed recovers without discarding its calibration. A resident reading below the checkpoint's
+    weight bytes (`predict_model_weight_mb`) is dropped: a file cannot be resident in less than its size, and a run that block-swapped most of it
     measured only the part that fit. The schema version was bumped with the bounds so files written without
     them are discarded rather than trusted.
 

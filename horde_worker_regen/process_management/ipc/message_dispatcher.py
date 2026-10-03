@@ -786,6 +786,17 @@ class MessageDispatcher:
         self._reader_drain_request.set()
         self._reader_quiescent.wait(timeout=self._READER_TICK_DRAIN_BUDGET_SECONDS)
 
+    def request_channel_drain(self) -> None:
+        """Ask the reader to drain the shared queue now, without waiting for it or handling what it reads.
+
+        For a caller that holds the control loop while it waits on a child, such as an end path joining a
+        process. A child cannot finish exiting until its feeder thread has written every message it queued, and
+        a write into a full pipe stalls while holding the queue's shared writer lock. The drained messages wait
+        in the buffer and the next tick handles them in arrival order, as if that tick had read them itself.
+        """
+        self._ensure_message_reader_running()
+        self._reader_drain_request.set()
+
     def _take_buffered_messages(self) -> list[HordeProcessMessage]:
         """Remove and return everything buffered so far, in arrival order."""
         with self._reader_lock:
