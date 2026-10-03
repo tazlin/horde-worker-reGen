@@ -397,8 +397,9 @@ whole pool, summed across every card, because a model's home is a lane anywhere 
 On a multi-GPU host the guard has a bound: a pool holding a distinct model on every lane protects
 every lane, and a job whose own model is resident only where it is busy then finds no preload target
 at all. The queue head escapes through its own room fallback; a follower has none. Copies therefore
-follow demand. When such a job is owed a copy (`duplicate_copy_may_serve`, so every eligible copy is
-busy and the copy bound is not yet met),
+follow demand. When such a job is owed a copy (`duplicate_copy_may_serve`, so no eligible copy can
+start it now and the copy bound is not yet met; an idle copy beside a sibling running a job on a card
+capped at one waits out that job, so it does not count),
 [`select_follower_room_target`][horde_worker_regen.process_management.scheduling.admission.preload]
 may displace one protected idle lane, choosing among lanes whose resident model has *strictly* fewer
 outstanding jobs than the loading one: the least demanded, then the one whose model has gone longest

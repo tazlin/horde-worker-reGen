@@ -314,6 +314,10 @@ see:
 1. **Target exclusion**: which slots this preload may not displace (the queued-model guard, model to
    process affinity, slots draining for RAM reclaim), composed by
    [`compute_preload_disallowed_processes`][horde_worker_regen.process_management.scheduling.governance.preload_admission.compute_preload_disallowed_processes].
+   On a multi-GPU host every ready seat is excluded as well
+   ([`ready_seat_process_ids`][horde_worker_regen.process_management.scheduling.admission.preload.ready_seat_process_ids]):
+   an idle lane holding a pending job's model on a card running fewer jobs than its cap. Dispatch follows the
+   preload pass in the same cycle and starts that job with no load, so a preload there would replace a start.
    The guards are exclusions only, never a wedge: the starved-head fallback
    ([`select_head_room_process_id`][horde_worker_regen.process_management.scheduling.governance.preload_admission.select_head_room_process_id])
    deliberately overrides them while still never displacing live work.

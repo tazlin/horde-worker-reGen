@@ -336,6 +336,62 @@ class TestTargetSelectionAgreesWithTheScheduler:
         assert preload.head_is_starving(snapshot, head) is scheduler._head_aged_past_anti_starvation(jobs[0])
 
 
+class TestReadySeats:
+    """A preload never takes the lane another pending job is about to start on."""
+
+    @staticmethod
+    async def _two_card_pool(*, pending: list[str]) -> tuple[InferenceScheduler, list[ImageGenerateJobPopResponse]]:
+        """Card 1 samples model ``c`` beside an idle copy of ``a``; card 0 is idle, holding ``a`` and ``b``.
+
+        Every resident model's lowest copy is affinity-protected, so the one unprotected lane is card 0's surplus
+        copy of ``a``: the lane the queue's ``a`` job can start on now, since card 1 is at its cap of one.
+        """
+        config = make_mock_bridge_data(image_models_to_load=["a", "b", "c", "d"])
+        sampler = make_mock_process_info(1, model_name="c", device_index=1, state=HordeProcessState.INFERENCE_STARTING)
+        slots: dict[int, object] = {
+            0: make_mock_process_info(0, model_name="a", device_index=1),
+            1: sampler,
+            2: make_mock_process_info(2, model_name="a", device_index=0),
+            3: make_mock_process_info(3, model_name="b", device_index=0),
+        }
+        scheduler, jobs = await _worker(
+            slots=slots,
+            pending=pending,
+            in_progress=["c"],
+            bridge_data=config,
+            max_inference=4,
+        )
+        scheduler._card_runtimes = make_test_card_runtimes(device_indices=(0, 1), config=config)
+        sampler.record_inference_ownership(jobs[-1], attempt_ordinal=0)
+        return scheduler, jobs
+
+    async def test_only_a_lane_on_a_card_that_can_start_is_a_ready_seat(self) -> None:
+        """Card 0's copy of ``a`` is a ready seat; card 1's waits out the job beside it and is not."""
+        scheduler, _ = await self._two_card_pool(pending=["d", "a"])
+
+        assert preload.ready_seat_process_ids(scheduler.snapshot()) == frozenset({2})
+
+    async def test_the_head_loads_past_a_lane_a_pending_job_can_start_on(self) -> None:
+        """The head's load goes to the lane nothing queued wants, so the ``a`` job still starts this cycle.
+
+        The pass runs before dispatch in the same cycle: loading over the ready seat would turn that start into
+        a load and leave the card idle for it.
+        """
+        scheduler, jobs = await self._two_card_pool(pending=["d", "a"])
+
+        plan = _decide(scheduler, jobs[0])
+
+        assert plan.admits and plan.target_process_id == 3
+
+    async def test_with_no_job_to_start_the_surplus_copy_is_the_target(self) -> None:
+        """The control: with no ``a`` job queued the same lane is an ordinary surplus copy and is taken."""
+        scheduler, jobs = await self._two_card_pool(pending=["d"])
+        snapshot = scheduler.snapshot()
+
+        assert preload.ready_seat_process_ids(snapshot) == frozenset()
+        assert _decide(scheduler, jobs[0]).target_process_id == 2
+
+
 class TestFollowerRoomSelection:
     """A follower whose only copies are busy may displace an idle lane the queue wants less."""
 
@@ -383,15 +439,26 @@ class TestFollowerRoomSelection:
         assert preload.select_follower_room_target(snapshot, str(jobs[0].id_), head_job_id=None) is None
 
     async def test_the_least_wanted_idle_copy_makes_room(self) -> None:
-        """Three jobs against one busy copy displace the idle lane whose class has one job outstanding."""
+        """Three jobs against one busy copy displace the idle lane whose class no pending job wants."""
         scheduler, jobs = await self._pool(
-            pending=["hot", "hot", "hot", "cold"],
+            pending=["hot", "hot", "hot"],
             residents={0: ("hot", 0, True), 1: ("cold", 1, False)},
         )
         snapshot = scheduler.snapshot()
 
         assert preload.duplicate_copy_may_serve(snapshot, str(jobs[0].id_)) is True
         assert preload.select_follower_room_target(snapshot, str(jobs[1].id_), head_job_id=None) == 1
+
+    async def test_a_ready_seat_is_never_taken_for_a_follower(self) -> None:
+        """An idle lane a pending job could start on this cycle is not displaced, however little it is wanted."""
+        scheduler, jobs = await self._pool(
+            pending=["hot", "hot", "hot", "cold"],
+            residents={0: ("hot", 0, True), 1: ("cold", 1, False)},
+        )
+        snapshot = scheduler.snapshot()
+
+        assert 1 in preload.ready_seat_process_ids(snapshot)
+        assert preload.select_follower_room_target(snapshot, str(jobs[1].id_), head_job_id=None) is None
 
     async def test_an_equally_wanted_idle_copy_is_left_alone(self) -> None:
         """With as many jobs queued for the resident class as for the loading one, the follower waits."""

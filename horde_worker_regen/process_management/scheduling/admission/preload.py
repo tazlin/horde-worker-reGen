@@ -286,13 +286,15 @@ def duplicate_copies_permitted(snapshot: SchedulingSnapshot, model: str) -> int:
 def duplicate_copy_may_serve(snapshot: SchedulingSnapshot, job_id: str) -> bool:
     """Whether a second copy of the job's already-resident model may be preloaded onto another card.
 
-    On one card a duplicate is pure waste. Across cards the single-copy rule inverts when every eligible copy
-    is busy running other work: the queued job would otherwise wait a whole sampling window for weights an idle
-    card could be given. A duplicate is considered only when the worker routes across cards, at least one
-    eligible copy exists, every such copy is busy, no copy is still loading (a load in flight is about to
-    provide a serving copy), and the copies already held are inside the bound
-    (:func:`duplicate_copies_permitted`) that keeps a burst of one model from taking the whole pool. Whether
-    it lands stays the rest of the ladder's decision.
+    On one card a duplicate is pure waste. Across cards the single-copy rule inverts when no eligible copy can
+    start the job now: the queued job would otherwise wait a whole sampling window for weights an idle card
+    could be given. A copy can start the job only when its lane accepts work and its card can start a job
+    (:func:`cards_able_to_start_job`): an idle lane beside a sibling sampling on a card capped at one runs
+    nothing until that sibling ends. A duplicate is considered only when the worker routes across cards, at
+    least one eligible copy exists, none of them can start the job, no copy is still loading (a load in flight
+    is about to provide a serving copy), and the copies already held are inside the bound
+    (:func:`duplicate_copies_permitted`) that keeps a burst of one model from taking the whole pool. Whether it
+    lands stays the rest of the ladder's decision.
     """
     job = snapshot.queue.jobs[job_id]
     if not snapshot.multi_gpu_routing_active or job.model is None:
@@ -306,7 +308,8 @@ def duplicate_copy_may_serve(snapshot: SchedulingSnapshot, job_id: str) -> bool:
     copies = [slot for slot in snapshot.slots.values() if slot.model == job.model and slot.device_index in allowed]
     if not copies:
         return False
-    if not all(not copy.can_accept_job for copy in copies):
+    startable_cards = cards_able_to_start_job(snapshot)
+    if any(copy.can_accept_job and copy.device_index in startable_cards for copy in copies):
         return False
     return model_copy_count(snapshot, job.model) < duplicate_copies_permitted(snapshot, job.model)
 
@@ -492,6 +495,61 @@ def cards_under_sampling_cap(snapshot: SchedulingSnapshot) -> frozenset[int]:
     )
 
 
+def card_running_job_count(snapshot: SchedulingSnapshot, device_index: int) -> int:
+    """How many in-progress jobs the card's inference lanes are running: the count dispatch holds to its cap."""
+    in_progress = frozenset(snapshot.queue.in_progress)
+    return sum(
+        1
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE
+        and slot.device_index == device_index
+        and slot.current_job_id in in_progress
+    )
+
+
+def cards_able_to_start_job(snapshot: SchedulingSnapshot) -> frozenset[int]:
+    """The cards running fewer jobs than their sampling cap, so an idle lane there can start one this cycle.
+
+    Differs from :func:`cards_under_sampling_cap`, which counts busy lanes. A lane loading or holding a
+    freshly loaded model counts as busy while running nothing, so it keeps placement from stacking copies on
+    its card, but it does not stop dispatch seating a job on the card's other lane.
+    """
+    return frozenset(
+        device_index
+        for device_index in snapshot.cards
+        if device_index is not None
+        and card_running_job_count(snapshot, device_index) < card_concurrency_cap(snapshot, device_index)
+    )
+
+
+def ready_seat_process_ids(snapshot: SchedulingSnapshot) -> frozenset[int]:
+    """The idle lanes a pending job could be dispatched onto this cycle with no load, by process id.
+
+    A ready seat holds the model a pending job names, can take work, is not a pinned disaggregation sampler,
+    and sits on a card eligible for that job that can start one now (:func:`cards_able_to_start_job`). Dispatch
+    runs after the preload pass in the same cycle and seats that job at once, so a preload landing on the lane
+    turns an immediate start into a load. Jobs awaiting auxiliary preparation are invisible to dispatch and
+    claim no seat.
+    """
+    startable_cards = cards_able_to_start_job(snapshot)
+    in_progress = frozenset(snapshot.queue.in_progress)
+    seat_cards_by_model: dict[str, set[int]] = {}
+    for job_id in snapshot.queue.pending_in_placement_order:
+        job = snapshot.queue.jobs[job_id]
+        if job_id in in_progress or job.model is None or job.requires_aux_preparation:
+            continue
+        seat_cards_by_model.setdefault(job.model, set()).update(job.eligible_cards & startable_cards)
+    return frozenset(
+        slot.process_id
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE
+        and slot.model is not None
+        and slot.can_accept_job
+        and not slot.reserved_for_disaggregation
+        and slot.device_index in seat_cards_by_model.get(slot.model, ())
+    )
+
+
 def models_spared_from_displacement(snapshot: SchedulingSnapshot, head_job_id: str | None) -> frozenset[str]:
     """The models a follower's copy may never displace: the queue's head and the pass's own head.
 
@@ -519,8 +577,10 @@ def select_follower_room_target(
     Multi-GPU only, and only for a job whose model is resident but busy everywhere it may run
     (:func:`duplicate_copy_may_serve`), whose bound on copies has already been applied. Candidate lanes are
     idle, on a card eligible for this job and still under its sampling cap, hold no model an in-progress job
-    is using, are not being drained for RAM reclaim, are not a pinned disaggregation sampler, and do not carry
-    a head's copy. :func:`select_follower_room_process_id` ranks what is left by outstanding demand.
+    is using, are not being drained for RAM reclaim, are not a pinned disaggregation sampler, do not carry
+    a head's copy, and are not a ready seat (:func:`ready_seat_process_ids`): dispatch runs after this pass
+    and would start a job there at once. :func:`select_follower_room_process_id` ranks what is left by
+    outstanding demand.
     """
     job = snapshot.queue.jobs[job_id]
     if not snapshot.multi_gpu_routing_active or job.model is None:
@@ -530,6 +590,7 @@ def select_follower_room_target(
         return None
     spared = models_spared_from_displacement(snapshot, head_job_id)
     live = pricing.in_progress_models(snapshot)
+    ready_seats = ready_seat_process_ids(snapshot)
     candidates = tuple(
         PreloadSlotSnapshot(
             process_id=slot.process_id,
@@ -545,6 +606,7 @@ def select_follower_room_target(
         and slot.process_id not in snapshot.draining_process_ids
         and slot.model not in live
         and slot.model not in spared
+        and slot.process_id not in ready_seats
     )
     if not candidates:
         return None
@@ -564,8 +626,10 @@ def preload_disallowed_processes(snapshot: SchedulingSnapshot, job: JobSnapshot)
 
     The queued-model guard, model-process affinity and the RAM-draining marks compose in
     :func:`compute_preload_disallowed_processes`; a job that is not the admitted exclusive one may also not
-    take a slot whose card an exclusive job holds. The guards are target exclusions only, never a wedge: the
-    head-room fallback deliberately overrides them.
+    take a slot whose card an exclusive job holds. On a multi-GPU host no preload takes a lane another pending
+    job is about to start on (:func:`ready_seat_process_ids`), whichever regime the queued-model guard is in:
+    the pass runs before dispatch in the same cycle, so the load would replace a start, not an idle lane. The
+    guards are target exclusions only, never a wedge: the head-room fallback deliberately overrides them.
     """
     inference_slots = [slot for slot in snapshot.slots.values() if slot.process_type is HordeProcessType.INFERENCE]
     disallowed = compute_preload_disallowed_processes(
@@ -578,6 +642,8 @@ def preload_disallowed_processes(snapshot: SchedulingSnapshot, job: JobSnapshot)
         max_inference_processes=snapshot.max_inference_processes,
         draining_process_ids=snapshot.draining_process_ids,
     )
+    if snapshot.multi_gpu_routing_active:
+        disallowed.update(ready_seat_process_ids(snapshot))
     if not job.admitted_exclusive:
         disallowed.update(
             slot.process_id

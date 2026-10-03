@@ -205,6 +205,45 @@ class TestStickyLeastLoaded:
         assert chosen is not None
         assert chosen.device_index == 1
 
+    async def test_prefers_a_free_copy_on_a_card_that_can_start_it(self) -> None:
+        """Two free copies, each beside one busy lane: the copy whose card is not sampling wins.
+
+        A lane loading another model is busy without running a job, so busy lanes alone tie the two cards. Only
+        the card whose busy lane is a load can start the job now; the other copy waits out its sibling's job.
+        """
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name="stable_diffusion", device_index=0),
+                2: make_mock_process_info(
+                    2,
+                    model_name="other_model",
+                    device_index=0,
+                    state=HordeProcessState.INFERENCE_STARTING,
+                ),
+                1: make_mock_process_info(1, model_name="stable_diffusion", device_index=1),
+                3: make_mock_process_info(
+                    3,
+                    model_name="other_model",
+                    device_index=1,
+                    state=HordeProcessState.PRELOADING_MODEL,
+                ),
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000, max_threads=1),
+        )
+        running = make_job_pop_response(model="other_model", width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, running)
+        await _seat(scheduler, running, process_map[2])
+        assert process_map.card_inference_load(0) == process_map.card_inference_load(1), "busy lanes tie"
+
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        chosen = scheduler.resident_process_for_job(job)
+
+        assert chosen is not None
+        assert chosen.process_id == 1
+
 
 class TestSingleGpuNoop:
     """A single-GPU host keeps the original first-resident lookup, untouched by routing."""
@@ -615,6 +654,51 @@ class TestDuplicateCopyEscape:
             },
         )
         scheduler = self._scheduler(process_map)
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert await _duplicate_may_serve(scheduler, job) is False
+
+    async def test_a_free_copy_beside_a_sampling_sibling_allows_a_duplicate(self) -> None:
+        """A free copy on a card at its sampling cap cannot start the job, so an idle card may earn a copy.
+
+        Under a cap of one the free lane waits out its sibling's whole job. Counting it as able to serve kept a
+        hot model on the one card holding it while the worker's other cards idled.
+        """
+        process_map = ProcessMap(
+            {
+                0: _lane(0, device_index=0, model="stable_diffusion"),
+                2: _lane(2, device_index=0, model="model_a"),
+                1: _lane(1, device_index=1, model=None),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2))
+        running = make_job_pop_response(model="model_a", width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, running)
+        await _seat(scheduler, running, process_map[2])
+        await _queue(scheduler, "stable_diffusion")
+
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        assert await _duplicate_may_serve(scheduler, job) is True
+
+    async def test_a_freshly_loaded_copy_alone_on_its_card_forbids_a_duplicate(self) -> None:
+        """A copy sitting on its completed preload reads busy but runs nothing: its card can start the job.
+
+        What decides is the card's running jobs against its cap, not its busy lanes; a preloaded lane is busy
+        until its dispatch arrives, and a second copy elsewhere would pay a load the first already paid.
+        """
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(
+                    0,
+                    model_name="stable_diffusion",
+                    device_index=0,
+                    state=HordeProcessState.PRELOADED_MODEL,
+                ),
+                1: _lane(1, device_index=1, model=None),
+            },
+        )
+        scheduler = _make_scheduler(process_map=process_map, card_runtimes=_uniform_cards(2))
+        await _queue(scheduler, "stable_diffusion")
+
         job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
         assert await _duplicate_may_serve(scheduler, job) is False
 

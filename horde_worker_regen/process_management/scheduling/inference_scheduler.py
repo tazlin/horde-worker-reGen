@@ -8513,10 +8513,23 @@ class InferenceScheduler:
         The "sticky, then least-loaded" policy at the process level: every candidate already holds the model
         (sticky), so among them a process that can take work immediately is preferred, and ties break to the
         card running the fewest inference jobs so a hot model spreads across cards instead of queueing on one.
+
+        A free lane is only ready now when its card is also under its sampling cap. Busy lanes alone cannot
+        tell the two apart: a lane loading the next job's model counts as busy without running a job, so a
+        free copy on a card whose only busy lane is loading ties with a free copy beside a sampling sibling,
+        and the one beside the sampler cannot start until that job ends.
         """
         ready = [p for p in candidates if p.can_accept_job()]
-        pool = ready or candidates
+        startable = [p for p in ready if self._card_under_sampling_cap(p.device_index)]
+        pool = startable or ready or candidates
         return min(pool, key=lambda p: self._process_map.card_inference_load(p.device_index))
+
+    def _card_under_sampling_cap(self, device_index: int) -> bool:
+        """Whether the card runs fewer in-progress jobs than its concurrent-sampling ceiling."""
+        card = self._card_runtimes.get(device_index)
+        if card is None:
+            return False
+        return len(self._jobs_in_progress_on_card(device_index)) < card.max_concurrent_inference
 
     def resident_process_for_job(
         self,
