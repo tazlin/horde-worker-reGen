@@ -127,3 +127,19 @@ many things it redacted. Redaction is best-effort, so skim the archive before yo
   [README](https://github.com/Haidra-Org/horde-worker-reGen#readme).
 - For AMD or Windows-without-NVIDIA setups, see [Run on AMD ROCm](run-on-amd-rocm.md).
 - For PyTorch or CUDA version mismatches, see [Choose a PyTorch build](choose-a-pytorch-build.md).
+
+
+## Jobs held by system RAM
+
+Run `horde-log diagnose --last` or point it at a support bundle. The `host_ram_starvation` finding
+reports RAM hold edges per hour, deferred model loads, ceiling drains and process recycles. Its
+requirements come from the same headroom model as the worker; a historical hold line also shows
+whether an older worker used the reserve as its soft band. Support-bundle summaries include the
+parent rotations that continue the selected run.
+
+Update the worker and check other programs' system RAM use if the finding persists. `ram_reserve_mb`
+is one additive reserve above a checkpoint load or a new context, overlapping the hard floor.
+The soft hold instead protects outstanding job transients and reclaims idle models immediately.
+A healthy fp8 process is protected by its model-sized reclaim ceiling. Increasing `queue_size`
+while RAM holds are active does not recover memory. See [Resource governance](../explanation/resource_governance.md)
+for the charge model, private-memory reports and ordered thresholds.

@@ -276,10 +276,10 @@ for how it works.
 | `starved_head_lane_reclaim` | `true` | Whether a head starved past the teardown grace, with every cheaper reclaim exhausted, may stop an idle service lane (post-processing, safety off-GPU, the image-utilities lane) to make its room, cheapest first and one at a time; the lanes return through the reclaim ladder once the card is healthy. Per-card under `gpu_overrides`. |
 | `starved_head_utilities_pause` | `true` | Whether the image-utilities lane is among those lanes. It is the last rung and costs the service a restart. Per-card under `gpu_overrides`. |
 | `whole_card_models` | `[]` | Models (by reference name or baseline id) the worker must treat as needing the card to itself regardless of what its footprint store measured; keeps the whole-card claim the measured rule would otherwise retire. Per-card under `gpu_overrides`. |
-| `ram_reserve_mb`     | `4096`  | Available system RAM (MB) kept in reserve so resident-in-RAM models do not force the OS to page to disk.                                                               |
+| `ram_reserve_mb`     | `4096`  | One additive headroom reserve above marginal checkpoint staging or context restoration; overlaps the hard floor and never sets the soft hold.                                                               |
 | `ram_pressure_pause_percent` | `85.0` | Absolute whole-host RAM danger floor, evaluated every scheduling tick. At/above this usage percentage the worker degrades (refuses new model loads, sheds idle resident processes, recycles an over-ceiling process, pauses pops) until RAM recovers, rather than loading weights through an out-of-RAM host and being OS OOM-killed. The default leaves ~15% free because a resident process can allocate several GB in a single step. |
 | `ram_pressure_min_free_mb`   | `1024` | Free-RAM (MB) companion floor: the worker also degrades below this many MB free. The effective floor is `max((100 - ram_pressure_pause_percent)% of total RAM, this)`, so the percentage protects large-RAM hosts and the absolute floor protects small ones. |
-| `ram_per_process_max_mb`     | `18432` | Resident RAM (MB) one inference process may hold before it is a reclaim candidate *while the host is under the danger floor*. Over it, an idle process is recycled immediately and a busy one is drained (fed no new work) then recycled once its job finishes, so a single process's balloon cannot drive the summed footprint into an OS OOM kill. Consulted only under the floor, so a roomy host never recycles. `0` disables. |
+| `ram_per_process_max_mb`     | `18432` | Private RAM (MB), falling back to RSS, one inference process may hold before it is a reclaim candidate; the effective ceiling is raised to fit the largest offered context seed with slack *while the host is under the danger floor*. Over it, an idle process is recycled immediately and a busy one is drained (fed no new work) then recycled once its job finishes, so a single process's balloon cannot drive the summed footprint into an OS OOM kill. Consulted only under the floor, so a roomy host never recycles. `0` disables. |
 | `component_cache_budget_mb`  | `None`  | Host-RAM budget (MB) for each GPU child's in-process model-component cache. Unset (the default) keeps the legacy single-slot cache (one component resident at a time); a positive value keeps as many loaded checkpoints/components warm in RAM as fit within it, so a swapped-away model reloads from RAM instead of disk. The value validated in testing on a 16 GB card is `12288`; size it against the host RAM left beside `ram_per_process_max_mb` and any co-tenants rather than copying that number blindly. `0` is equivalent to legacy. |
 | `post_processing_fault_breaker_enabled` | `true` | Disable post-processing on this worker after repeated post-processing over-commit faults, so it stops feeding the horde's forced-maintenance spiral (see below). |
 | `post_processing_fault_threshold` | `4` | The breaker trips when *more than* this many post-processing over-commit faults occur within the window (tolerates 4, trips on the 5th). |
@@ -294,21 +294,20 @@ notice. The worker therefore names any of them the operator set explicitly in a
 startup warning, so the dependency is visible rather than inferred; the remedy is to
 enable the budget.
 
-The `ram_pressure_*` floor is distinct from `ram_reserve_mb`: the reserve is a
-*marginal* per-job admission check, while the pressure floor is the *absolute*
-whole-host guard that drives the degrade response (shed footprint, recycle an
-over-ceiling process, throttle pops) the moment available RAM crosses it,
-independent of any one job's cost. Raising `ram_reserve_mb` alone does **not**
-prevent a system-RAM OOM kill: it gates only a *new* preload's marginal cost, not
-the resident set that a generous residency policy accumulates across processes.
-The `ram_per_process_max_mb` ceiling and the danger floor are the levers for that.
-A softer, pre-floor pop hold (reusing `ram_reserve_mb` as its approach margin)
-stops the popper starting a new job's time-to-live clock once available RAM is
-within that margin of the floor, so a job does not age past its ttl on a degraded
-worker and get aborted as too slow. A SIGKill (`exitcode -9`) reaped while RAM is
-below this floor is classified as an OS OOM kill rather than a slot crash, so it
-is not mislabelled "crashed or hung" and does not quarantine an otherwise-healthy
-slot.
+The host-RAM gates share one headroom model. `ram_reserve_mb` has one meaning: an additive
+reserve above marginal work. It overlaps the absolute `ram_pressure_*` floor, so the larger of
+reserve and floor is protected once. A checkpoint swap is charged from checkpoint bytes plus
+feature RAM; a restored context uses private working-set bytes or the context seed before a
+measurement exists. Requirements are ordered from hard floor through soft hold and preload to restore.
+
+The soft hold tracks the sum of in-flight feature allocations that could push available RAM below
+the hard floor. It evicts idle models in the same governance tick and releases when that risk clears.
+Raising the reserve does not widen this band or estimate a context's size. Below the hard floor,
+idle models and contexts are shed, with drain/recycle reserved for processes above the effective
+model-aware ceiling. `ram_per_process_max_mb` is compared to private bytes when reported, otherwise
+RSS, and is protected by the largest offered context seed plus slack. Config load warns about an
+undersized ceiling. A SIGKill below the floor remains classified as an OS OOM kill, rather than a
+slot crash.
 
 On a host running several worker roles together (a dreamer plus an alchemist
 and/or a scribe), the plan-time process-count sizing additionally reserves RAM for

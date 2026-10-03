@@ -157,3 +157,7 @@ module paths directly.
 
 The full auto-generated API reference lives under
 [Horde Worker Regen Code Reference](../horde_worker_regen/).
+
+The host-RAM charge and threshold model lives in `resources/resource_budget.py` (`RamHeadroom`).
+`resources/ram_footprints.py` stores launch-scoped marginal load observations; `resources/hysteresis.py`
+provides the pure hold comparator shared by RAM, safety backlog and foreign VRAM ceiling gates.

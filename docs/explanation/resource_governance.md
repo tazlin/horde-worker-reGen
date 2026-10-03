@@ -64,6 +64,16 @@ whose queue a pop hold has drained to empty, is governed exactly as often as one
 Gating the tick on a non-empty queue would let the soft pop hold self-latch: the hold blocks pops, the
 queue drains, and the only thing that clears the hold (the tick) would never run again.
 
+All host gates use `resources.resource_budget.ram_headroom`, which returns a frozen `RamHeadroom`.
+Its absolute requirements obey `hard_floor <= soft_hold <= preload <= restore`. The single additive
+`ram_reserve_mb` protects the same free pages as the danger floor, so the retained headroom is their
+maximum, not their sum. Outstanding commitments are subtracted from available RAM once. The soft
+hold line is the hard floor plus in-flight feature RAM, never the reserve. A soft hold also evicts
+idle models in that tick, so reclaim does not depend on another job being popped or preloaded.
+There is no RAM dwell or extra release margin: when transient risk clears, intake opens immediately.
+The threshold comparison uses the shared `HysteresisLatch`, also used for safety backlog and foreign
+VRAM ceiling holds.
+
 One tick measures the RAM danger-floor verdict and one
 [`HostMemorySnapshot`][horde_worker_regen.process_management.scheduling.governance.snapshots.HostMemorySnapshot],
 then decides and executes both regimes:
@@ -157,6 +167,28 @@ worker-driven RAM unload.
 
 ### Honest RAM accounting and per-process residency
 
+Checkpoint staging and context restoration have different charges. Staging a whole checkpoint costs
+its on-disk bytes plus the burden model's per-feature RAM deltas, with a marginal charge floor. If the
+file cannot be resolved or statted, the burden seed remains the fallback. The charge is captured beside
+the component charge on the scheduling snapshot; admission never resolves files itself. A restored
+context costs the measured private working set, falling back to the largest offered context seed
+before measurements exist. The reserve is never a context estimate.
+
+Settled load growth feeds `LearnedRamStore`. Whole, component and retained-page loads have separate
+identities so a cheap reused load cannot lower a cold-load price. Five observations unlock a
+bidirectional estimate: the recent maximum of twenty measurements plus ten percent. Evidence can
+raise or lower a stale seed. The store is scoped to the current launch, and the existing settle window
+and model/idle checks prevent a mid-load report from becoming a settled observation.
+
+Children report RSS for the dashboard and private bytes for reclaim and restore. On Linux, the
+anonymous/private-dirty reading excludes reclaimable clean checkpoint mappings; USS alone would
+still charge those mappings if no other process shares them. Other platforms use USS. Platforms
+without a private reading fall back to RSS. The effective process ceiling is the larger of the
+configured ceiling and the largest offered context seed plus ten percent and a cold-child allowance.
+Config load warns about a configured ceiling below an offered seed. The same model-aware ceiling
+protects the idle creep path. Below the hard floor, idle models and contexts are shed before a busy
+process is drained for exceptional growth; healthy fp8 working sets are not mistaken for leaks.
+
 The RAM figures the containment logic reacts to are also what the operator sees, and both must be honest.
 The per-role RAM breakdown (the console status block's *Worker* line and the Live tab's *Worker RAM by
 role* panel) sums every worker process's resident-set size into its role. Every child on the process map
@@ -187,7 +219,8 @@ governance to a clean slate.
 
 A standalone watchdog in the recovery coordinator (`maybe_reset_stuck_governance_hold`) is the last-resort
 guard against a pop hold that stays engaged after the host is healthy. It fires only when the pop hold is
-set, the most recent danger-floor verdict is healthy, nothing is draining, none of the deliberate
+set, the most recent danger-floor verdict is healthy, outstanding job transients also fit above it,
+nothing is draining, none of the deliberate
 held-queue graces (whole-card establishment, heavy-head load, RAM-reclaim cycle) are active, no inference
 is in progress, and the queue is empty, sustained past a grace window. The pop-hold-set term is what
 distinguishes a genuine latch from a merely idle worker with no matching jobs. It escalates in tiers: first
@@ -484,6 +517,10 @@ models co-resident and streams them, which is very hard to attribute after the f
 an operator decision and says nothing.
 The pure sizing rule for how many live contexts a rejected peak can co-reside with is
 [`max_coresident_for_peak`][horde_worker_regen.process_management.scheduling.governance.whole_card.max_coresident_for_peak].
+
+RAM-pressure shedding owns the process-count shortfall until the RAM governor grants each restore.
+Whole-card release and the VRAM reclaim ladder respect that shortfall: a healthy GPU cannot regrow
+contexts while the host still lacks the shared restore requirement.
 
 ## Extending governance
 
