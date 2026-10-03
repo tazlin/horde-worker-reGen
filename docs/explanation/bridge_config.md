@@ -216,7 +216,8 @@ every card (single-GPU included) to the inference contexts its VRAM physically
 holds: each planned context's idle CUDA/runtime baseline plus one copy of a single
 typical (SDXL-class) working set, within the card total net of the proportional
 admission noise buffer. A very large model (Flux, Cascade, Qwen, Z-Image) does not
-raise this bound: it never co-samples, and its footprint is paid just-in-time by the
+raise this bound: it never co-samples with another very large model, shares the card with a
+smaller job only when the arbiter confirms room, and is otherwise paid just-in-time by the
 whole-card residency machinery when one actually dispatches, not reserved at spawn,
 so the spare contexts stay free to preload the next model. Second, a **shared-RAM
 cap** (`cap_card_process_counts`) applies to every host, single-GPU included, and

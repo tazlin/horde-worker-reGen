@@ -556,8 +556,8 @@ full fit-or-evict runs at clearance; without the lease the preload is the VRAM m
 job's full marginal sampling charge. Pricing a lease-staged preload at the full peak parked the next model's
 disk read behind the running sample on every model switch, which is the work the stage exists to overlap.
 
-**Overlap.** The scheduler's overlap adapter runs its non-memory guards first (the whole-card tier's
-no-co-sampling contract, and the size-scaled sampling headway that keeps a newcomer off a running job's
+**Overlap.** The scheduler's overlap adapter runs its non-memory guards first (two extra-large jobs never
+share a card, and the size-scaled sampling headway that keeps a newcomer off a running job's
 startup beat), then lets the arbiter decide the memory question through a `MONOLITHIC_DISPATCH` verdict: a
 `FITS` admits the overlap, a `DEFER` or `DENY` withholds it for the cycle. The headway relaxation
 fires only on positive confirmation of room (a cycle that admits), so a cold start keeps the strict headway

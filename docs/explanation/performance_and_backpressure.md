@@ -543,8 +543,12 @@ a new job may join work that is already sampling only when the in-flight work ca
 missing reference does not starve dispatch. The rules, scaled by tier:
 
 - The first job (nothing in flight) always starts.
-- An extra-large candidate never joins a busy card, and an extra-large job already in flight never lets
-  anything share the card: the whole-card tier's contract holds whatever the headroom.
+- Two extra-large jobs never share a card, whether two copies of one model or two different ones. A
+  pairing with exactly one extra-large side needs the arbiter to confirm room, an unpriced verdict refusing,
+  and then waits for the strictest (both-heavy) headway. Both sides of such a pairing are priced at their
+  sampler-only footprint: ComfyUI loads a job's text encoders, UNet and VAE separately and frees its own idle
+  components when short, so beside an extra-large co-tenant a job's peak is its UNet and activation while it
+  samples, not the whole-job figure.
 - A batched candidate or a batched in-flight job blocks overlap on a tight card; with ample measured
   headroom (below) the batch instead imposes the strictest (both-heavy) headway.
 - Otherwise the running job must have made size-appropriate **headway** before a candidate joins: none for
@@ -1173,9 +1177,10 @@ admission keeps. It closes the single-GPU over-configuration gap where one card 
 asked to spawn more contexts than it can hold.
 
 Crucially, a very large model (Cascade, Flux, Qwen, Z-Image) does **not** raise this
-bound. Such models never co-sample: the scheduler runs them through whole-card
-residency that tears down or pauses sibling contexts just-in-time when one dispatches,
-so their footprint is paid at *their* dispatch, not reserved at all times. Charging
+bound. Two such models never co-sample, and one shares the card with a smaller job only when
+the arbiter confirms room at sampler-only prices; otherwise whole-card residency tears down
+or pauses sibling contexts just-in-time when one dispatches, so their footprint is paid at
+*their* dispatch, not reserved at all times. Charging
 the largest offered model here instead would pay flux's cost continuously and delete
 the spare contexts a worker needs to preload the next model ahead of the dominant
 typical-model traffic, starving the card between model switches. Sizing to one typical

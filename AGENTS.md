@@ -260,7 +260,7 @@ These fail as interactions, not as units, so component tests stay green through 
   multi-card row states each card's own total, tenants and measured free (one entry on a single card). Changes to
   admission, retention, leases, governor thresholds or recovery rungs ship with a closed-loop test
   asserting an outcome (a duty floor, no safety teardown while serving, no free-VRAM crater). A live
-  run confirms; it is not where you find out. Three fidelities are opt-in per row: `clearance_lease=True`
+  run confirms; it is not where you find out. Five fidelities are opt-in per row: `clearance_lease=True`
   makes dispatch a staging step (the lane sits `INFERENCE_PRIMED` holding its encode working set alone,
   a real `ClearanceController` is stepped over the scheduler's own `build_clearance_inputs` with
   `clearance_admit_process` as its `admit_fn`, and the weights land at clearance), and a lane held for
@@ -271,6 +271,10 @@ These fail as interactions, not as units, so component tests stay green through 
   true peaks stops over-committing within a few jobs, which would dissolve the premise of every row about
   over-commit under a fixed misprice. `child_reports_card_sized_peaks=True` makes a sampling lane report the
   whole card as its high-water, the reading an overflowed or checkpoint-caching child sends.
+  `host_ram=HostRamLedger(...)` conserves host RAM (private pages, transients, reclaimable checkpoint cache):
+  a load allocates when it completes and reports its peak, and a device unload keeps the model in RAM.
+  `phase_resident_components=True` charges a sampling job its sampler-only footprint and a decode tail its
+  weights plus the decode spike, as ComfyUI loads components separately; the encode phase is not modelled.
 - **Every production incident becomes a permanent scenario** in `test_incident_scenarios.py`, written
   so that undoing its fix makes it fail. If the simulator cannot express an incident, extend the
   simulator.
