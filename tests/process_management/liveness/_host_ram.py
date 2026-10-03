@@ -49,6 +49,10 @@ class HostRamLedger:
         checkpoint = self.checkpoints.get(process_id)
         return self.private_mb.get(process_id, 0.0) + (self.cache_mb.get(checkpoint[0], 0.0) if checkpoint else 0.0)
 
+    def load_delay(self, model: str, checkpoint_mb: float) -> float:
+        """Return the disk-read delay a load of ``model`` would pay now, without staging it."""
+        return max(0.0, checkpoint_mb - self.cache_mb.get(model, 0.0)) / 2000.0
+
     def stage(self, process_id: int, model: str, checkpoint_mb: float, private_mb: float) -> float:
         """Book a checkpoint swap and return its page-cache-dependent load delay."""
         missing_mb = max(0.0, checkpoint_mb - self.cache_mb.get(model, 0.0))

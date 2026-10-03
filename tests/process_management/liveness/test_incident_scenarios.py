@@ -193,7 +193,10 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     NextJobAndProcess,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import HEAD_PROTECTION_MAX_STARVE_SECONDS
-from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import ReuseCreditDiscrepancy
+from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
+    ReuseCreditDiscrepancy,
+    ReuseCreditKind,
+)
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     SAFETY_BACKLOG_PRIORITY_DEPTH,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
@@ -219,8 +222,10 @@ from tests.process_management.liveness._dispatch_world import (
     _SDXL,
     _SDXL_C,
     _SDXL_OTHER,
+    _SIM_LOAD_PEAK_OVER_SETTLED_MB,
     _CardClass,
     _DispatchWorld,
+    _model_by_name,
     _ModelClass,
 )
 from tests.process_management.liveness._world_assertions import (
@@ -4546,6 +4551,14 @@ async def test_host_ram_starvation_keeps_two_lanes_serving() -> None:
         return discrepancies
 
     world.scheduler.ram_reclaim.settle_credits = record_settlements
+    observed: list[tuple[str, str, float, float | None]] = []
+    observe = world.scheduler.ram_reclaim.learned_ram.observe
+
+    def record_observation(model: str, kind: str, settled_mb: float, peak_mb: float | None = None) -> None:
+        observed.append((model, kind, settled_mb, peak_mb))
+        observe(model, kind, settled_mb, peak_mb)
+
+    world.scheduler.ram_reclaim.learned_ram.observe = record_observation
 
     def record_ram_attempt(
         job: ImageGenerateJobPopResponse,
@@ -4585,11 +4598,21 @@ async def test_host_ram_starvation_keeps_two_lanes_serving() -> None:
     assert world.ram_recycles == []
     assert sdxl_attempts > 0
     assert sdxl_defers / sdxl_attempts < 0.1
-    assert late_discrepancies == [], "Settled growth must stay within 2 GB of the charge after the first two loads"
+    assert late_discrepancies == [], "Load peaks must stay within 2 GB of the charge after the first two loads"
+    cold_loads = [row for row in observed if row[1] == ReuseCreditKind.WHOLE]
+    assert {model for model, *_ in cold_loads} >= {_SDXL.name, _SDXL_OTHER.name}, "a cold SDXL load went unmeasured"
+    for model_name, _kind, settled_mb, peak_mb in cold_loads:
+        model = _model_by_name(model_name)
+        assert model is not None
+        _checkpoint_mb, private_mb = world._host_model_ram(model)
+        assert settled_mb == pytest.approx(private_mb), "learning must read the load's own growth"
+        assert peak_mb == pytest.approx(private_mb + _SIM_LOAD_PEAK_OVER_SETTLED_MB), "learning must read the peak"
+    learned = world.scheduler.ram_reclaim.learned_ram
     for model in (_SDXL, _SDXL_OTHER):
+        estimate = learned.measured_estimate_mb(model.name, ReuseCreditKind.WHOLE)
         job = make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=60)
-        charge = world.scheduler._checkpoint_staging_charge_mb(job)
-        assert charge is not None and abs(charge - 6500) / 6500 <= 0.25
+        expected = 6500.0 if estimate is None else max(estimate, 3500.0)
+        assert world.scheduler._checkpoint_staging_charge_mb(job) == pytest.approx(expected)
     assert world.host_ram is not None
     assert world.host_ram.free_mb >= 0
     assert world.ram_min_headroom_mb >= 0
@@ -4608,6 +4631,59 @@ async def test_host_ram_reserve_band_reinjection_holds_healthy_jobs(monkeypatch:
     monkeypatch.setattr(ram_governor, "decide_pop_hold", legacy_hold)
     with pytest.raises(AssertionError, match="RAM hold came from the reserve"):
         await test_host_ram_starvation_keeps_two_lanes_serving()
+
+
+async def _run_overlapping_loads_row() -> _DispatchWorld:
+    """Two cold lanes loading SDXL in parallel, each load allocating only when its 5 s read completes.
+
+    Steady state leaves room for one SDXL stage above the 8 GB reserve but not two. Parallel loads onto one
+    card are what ``very_fast_disk_mode`` permits, and neither allocation shows in the available reading
+    until its load completes, so the second admission cannot see the first in the measurement.
+    """
+    from tests.process_management.liveness._host_ram import HostRamLedger
+
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        whole_card_enabled=False,
+        closed_loop=True,
+        host_ram=HostRamLedger(65536.0, 65536.0 - 2 * 1100.0 - 18000.0),
+        ram_reserve_mb=8192,
+        ram_pause_percent=90,
+        ram_report_interval_seconds=30.0,
+        preload_latency_seconds=5.0,
+        tick_seconds=0.5,
+    )
+    world.scheduler._runtime_config.bridge_data.very_fast_disk_mode = True
+    offered = 0
+    for _ in range(4000):
+        while offered < 6 and len(world.job_tracker.jobs_pending_inference) < 2:
+            model = _SDXL if offered % 2 else _SDXL_OTHER
+            if not await world.offer_job(make_job_pop_response(model.name, width=1024, height=1024)):
+                break
+            offered += 1
+        await world.step()
+        if world.submitted_jobs >= 6:
+            break
+    return world
+
+
+@pytest.mark.closed_loop
+async def test_host_ram_overlapping_loads_cannot_spend_one_headroom_twice() -> None:
+    """Admissions made before the reading shows each other's allocations must not take the host under its floor."""
+    world = await _run_overlapping_loads_row()
+    assert world.ram_floor_breach_ticks == [], "admissions spent the same headroom before the reading showed either"
+    assert world.submitted_jobs == 6
+
+
+@pytest.mark.closed_loop
+async def test_host_ram_overlapping_loads_reinjection_without_planned_ram(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The conservation oracle fails when admitted stages are not held until the reading reflects them."""
+    monkeypatch.setattr(InferenceScheduler, "_outstanding_planned_ram_mb", lambda _self: 0.0)
+    world = await _run_overlapping_loads_row()
+    assert world.ram_floor_breach_ticks, "without planned RAM both stages land before the reading shows either"
 
 
 @pytest.mark.closed_loop

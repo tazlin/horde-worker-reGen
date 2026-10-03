@@ -130,6 +130,9 @@ own accounting and the scheduler's forecast charge sibling contexts identically.
 
 
 _AMPLE_RAM_MB = 65_536.0
+
+_SIM_LOAD_PEAK_OVER_SETTLED_MB = 512.0
+"""How much private RAM a simulated load touches above what it keeps, reported as the load's peak."""
 """The host RAM reading every row runs against. These rows vary VRAM; a live psutil reading would make a
 heavy row's outcome depend on the machine running it."""
 
@@ -634,6 +637,7 @@ class _DispatchWorld:
         host_ram: HostRamLedger | None = None,
         ram_reserve_mb: float = 8192.0,
         ram_pause_percent: float = 90.0,
+        ram_report_interval_seconds: float = 0.0,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -641,6 +645,8 @@ class _DispatchWorld:
             host_ram: Opt-in conserved host RAM, including private pages and reclaimable checkpoint cache.
             ram_reserve_mb: Single additive host headroom reserve.
             ram_pause_percent: Hard danger-floor percentage for host-RAM rows.
+            ram_report_interval_seconds: How stale children's per-process RAM readings may be. Zero
+                publishes every tick. The parent's host-available reading is always live, as psutil is.
             card: The device-free profile the row runs on.
             lane_count: How many inference lanes the pool holds.
             max_threads: The concurrent-sampling cap (the ``max_threads`` config axis).
@@ -790,6 +796,9 @@ class _DispatchWorld:
         self.ram_busy_ticks = 0
         self.ram_recycles: list[int] = []
         self.ram_min_headroom_mb = float("inf")
+        self.ram_floor_breach_ticks: list[int] = []
+        self.ram_report_interval_seconds = ram_report_interval_seconds
+        self._ram_reported_at: float | None = None
         self.preload_latency_seconds = preload_latency_seconds
         self.disaggregated_encode_seconds = disaggregated_encode_seconds
         self.tick = 0
@@ -1521,12 +1530,17 @@ class _DispatchWorld:
         overlay decay against a growth the parent cannot yet see, which is precisely the reading the clearance
         re-price of a staged job is made against.
         """
+        publish_ram = self.host_ram is not None and (
+            self._ram_reported_at is None or self.now - self._ram_reported_at >= self.ram_report_interval_seconds
+        )
         for lane in self._process_map.values():
             if self.host_ram is not None:
                 ledger = self.host_ram
                 ledger.private_mb.setdefault(lane.process_id, 1100.0)
                 ledger.transients_mb[lane.process_id] = 600.0 if lane.is_process_busy() else 0.0
                 ledger.trim_cache()
+            if self.host_ram is not None and publish_ram:
+                ledger = self.host_ram
                 lane.ram_usage_bytes = int(ledger.rss_mb(lane.process_id) * 1024 * 1024)
                 lane.ram_private_bytes = int(ledger.private_mb[lane.process_id] * 1024 * 1024)
                 lane.report_sampled_at = self.now
@@ -1541,6 +1555,28 @@ class _DispatchWorld:
             reported_mb = self._lane_charge_mb(lane.process_id) - self._encode_staging_mb.get(lane.process_id, 0.0)
             lane.process_reserved_mb = int(max(0.0, reported_mb))
             self._lane_peak_mb[lane.process_id] = max(self._lane_peak_mb.get(lane.process_id, 0.0), reported_mb)
+        if self.host_ram is not None and publish_ram:
+            self._ram_reported_at = self.now
+
+    def _report_load_completion(self, lane: HordeProcessInfo) -> None:
+        """Send the memory report a child sends as a preload completes, carrying the load's private peak."""
+        if self.host_ram is None:
+            return
+        private_mb = self.host_ram.private_mb.get(lane.process_id, 1100.0)
+        self._process_map.on_memory_report(
+            process_id=lane.process_id,
+            ram_usage_bytes=int(self.host_ram.rss_mb(lane.process_id) * 1024 * 1024),
+            ram_private_bytes=int(private_mb * 1024 * 1024),
+            ram_private_peak_bytes=int((private_mb + _SIM_LOAD_PEAK_OVER_SETTLED_MB) * 1024 * 1024),
+            vram_usage_mb=lane.vram_usage_mb,
+            total_vram_mb=lane.total_vram_mb,
+            process_reserved_mb=lane.process_reserved_mb,
+            process_allocated_mb=lane.process_allocated_mb,
+            process_peak_reserved_mb=lane.process_peak_reserved_mb,
+            process_aimdo_mb=lane.process_aimdo_mb,
+            report_sampled_at=self.now,
+            held_components=lane.held_components,
+        )
 
     def _publish_memory_reports(self) -> None:
         """Send each inference lane's memory report through the dispatcher, once per tick.
@@ -1798,8 +1834,8 @@ class _DispatchWorld:
                 continue
             cache_delay = 0.0
             if self.host_ram is not None:
-                checkpoint, private = self._host_model_ram(model)
-                cache_delay = self.host_ram.stage(info.process_id, name, checkpoint, private)
+                checkpoint, _private = self._host_model_ram(model)
+                cache_delay = self.host_ram.load_delay(name, checkpoint)
             report_at = self.now + self.preload_report_latency_seconds
             self._loading[info.process_id] = _PendingPreload(
                 model=name,
@@ -1812,6 +1848,7 @@ class _DispatchWorld:
 
     def _advance_preloads(self) -> None:
         """Move each booked preload through its report and its materialisation as the clock passes them."""
+        completed: list[HordeProcessInfo] = []
         for lane_id, pending in list(self._loading.items()):
             lane = self._process_map.get(lane_id)
             if lane is None:
@@ -1832,7 +1869,16 @@ class _DispatchWorld:
             lane.last_process_state = HordeProcessState.PRELOADED_MODEL
             lane.last_control_flag = None
             self._model_map.update_entry(pending.model, load_state=ModelLoadState.LOADED_IN_RAM, process_id=lane_id)
+            loaded = _model_by_name(pending.model)
+            if self.host_ram is not None and loaded is not None:
+                # A load allocates as it reads the checkpoint, so its pages appear when it completes; the
+                # admission that preceded it is what has to hold that room in the meantime.
+                checkpoint, private = self._host_model_ram(loaded)
+                self.host_ram.stage(lane_id, pending.model, checkpoint, private)
+            completed.append(lane)
         self._sync_reported_vram()
+        for lane in completed:
+            self._report_load_completion(lane)
 
     def _materialise_preloads(self) -> None:
         """Complete the loads whose latency has run out, staging their weights on the lane."""
@@ -2675,6 +2721,8 @@ class _DispatchWorld:
                 - sum(ledger.private_mb.values())
                 - sum(ledger.transients_mb.values()),
             )
+            if ledger.available_mb < self._scheduler._ram_danger_floor_mb():
+                self.ram_floor_breach_ticks.append(self.tick)
             if self._scheduler._state.ram_pressure_pop_hold:
                 self.ram_hold_ticks.append(self.tick)
             busy = len(self._job_tracker.jobs_in_progress)
