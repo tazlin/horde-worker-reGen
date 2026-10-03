@@ -622,7 +622,7 @@ def test_residency_scenario_matrix_preserves_lifecycle_invariants(case: Residenc
 
 
 @pytest.mark.slow
-def test_db0_twenty_minute_rotation_sim_drains_every_admitted_head() -> None:
+def test_twenty_minute_rotation_sim_drains_every_admitted_head() -> None:
     """A virtual 20-minute card-0 rotation remains rate-bounded and drains after each handoff."""
     case = ResidencyScenarioCase(
         profile="flux-knife-edge",

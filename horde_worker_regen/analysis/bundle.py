@@ -176,8 +176,8 @@ class LogBundle:
         record_reader: Callable[..., list[LogRecord]] | None = None,
     ) -> LogBundle:
         bundle = cls(root=ledger_root, record_reader=record_reader)
-        # Offline forensics recurse one level so a capture that preserved the ``logs/`` subdir (as the db0
-        # captures do) is still found, without scanning an entire unrelated tree. A live watch stays at the
+        # Offline forensics recurse one level so a capture that preserved the ``logs/`` subdir is still
+        # found, without scanning an entire unrelated tree. A live watch stays at the
         # top level: the running worker writes only there, and a nested capture directory would drag its own
         # full-size logs (and duplicate role paths, forcing a per-pass merge sort) into every pass.
         candidates = directory.glob("*") if active_only else [*directory.glob("*"), *directory.glob("*/*")]

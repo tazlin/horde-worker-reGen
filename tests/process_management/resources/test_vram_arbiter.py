@@ -341,8 +341,8 @@ class TestReservationsReduceAvailable:
 class TestHeadProtection:
     """A fitting non-head request is withheld when admitting it would leave the head unable to fit.
 
-    On the db0 4090 wedge a non-head job took physical room the head-of-queue job needed, starving the head
-    while line-skippers consumed the card. The room the truthful device-free reading shows belongs to the head:
+    A non-head job that takes physical room the head-of-queue job needs starves the head while
+    line-skippers consume the card. The room the truthful device-free reading shows belongs to the head:
     a non-head request that would leave less than the head's priced demand defers, holding the room for the head.
     """
 
@@ -463,8 +463,8 @@ class TestStarvationContextTeardown:
     """A head starved past the grace whose deficit is held by idle sibling contexts escalates to teardown.
 
     Idle sibling inference contexts hold a bare CUDA baseline that weight eviction cannot reclaim (a context is
-    freed only when its process exits). On the db0 flux wedge the built ladder had no rung that could free that
-    baseline, so an exclusive head starved indefinitely. Past the grace the arbiter escalates to a
+    freed only when its process exits). A ladder with no rung that frees that baseline
+    leaves an exclusive head starved indefinitely. Past the grace the arbiter escalates to a
     REDUCE_LIVE_CONTEXTS actuation that tears the idle contexts down, then admits once the room verifies.
     """
 

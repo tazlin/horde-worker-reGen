@@ -178,7 +178,7 @@ class TestEffectiveFloorInvalidation:
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(4266)
         model.set_marginal_overhead_mb(650.0)
-        # Latch a transient spike: 4 idle contexts momentarily read ~16.6 GB used (the db0 phantom).
+        # Latch a transient spike: 4 idle contexts momentarily read ~16.6 GB used.
         model.observe_idle_residency(context_total_mb=16642.0, context_count=4)
         assert model.marginal_breakdown(config_override_mb=None).source == "idle_floor"
         # The device later runs at only ~9 GB used with the same contexts live: the spike was reclaimable.
