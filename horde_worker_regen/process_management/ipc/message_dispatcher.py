@@ -1055,6 +1055,7 @@ class MessageDispatcher:
             process_id=message.process_id,
             ram_usage_bytes=message.ram_usage_bytes,
             ram_private_bytes=message.ram_private_bytes,
+            ram_private_peak_bytes=message.ram_private_peak_bytes,
             vram_usage_mb=message.vram_usage_mb,
             total_vram_mb=message.vram_total_mb,
             open_fds=message.open_fds,

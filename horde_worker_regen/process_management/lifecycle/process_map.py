@@ -27,7 +27,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo, LoadCompletionSample
 
 MEMORY_REPORT_LOG_INTERVAL_SECONDS = 30.0
 """Seconds between DEBUG-level memory-report lines per process; reports in between are logged at TRACE.
@@ -394,6 +394,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         report_sampled_at: float | None = None,
         held_components: list[HeldComponentSnapshot] | None = None,
         ram_private_bytes: int | None = None,
+        ram_private_peak_bytes: int | None = None,
     ) -> None:
         """Update the memory usage for the given process ID.
 
@@ -401,6 +402,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             process_id (int): The ID of the process to update.
             ram_usage_bytes (int): The amount of RAM used by this process.
             ram_private_bytes (int | None): Unique/private working-set bytes, or None when unavailable.
+            ram_private_peak_bytes (int | None): The private peak of a model load this report completes; it \
+                records the report as the process's load-completion sample.
             vram_usage_mb (int): The amount of VRAM used by this process.
             total_vram_mb (int): The total amount of VRAM available to this process.
             open_fds (int | None): Open descriptors/handles the process reported, or None if unavailable.
@@ -422,6 +425,15 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         process_info = self[process_id]
         process_info.ram_usage_bytes = ram_usage_bytes
         process_info.ram_private_bytes = ram_private_bytes
+        if ram_private_peak_bytes is not None:
+            settled_bytes = ram_private_bytes if ram_private_bytes is not None else ram_usage_bytes
+            process_info.load_completion_sample = LoadCompletionSample(
+                process_launch_identifier=process_info.process_launch_identifier,
+                model=process_info.loaded_horde_model_name,
+                sampled_at=report_sampled_at,
+                private_bytes=settled_bytes,
+                peak_private_bytes=max(ram_private_peak_bytes, settled_bytes),
+            )
         if held_components is not None:
             process_info.held_components = held_components
         process_info.vram_usage_mb = vram_usage_mb or 0

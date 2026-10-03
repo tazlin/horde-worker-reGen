@@ -52,6 +52,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
 from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
+from horde_worker_regen.utils.private_memory import PrivateRamPeakSampler
 
 
 def inject_premade_control_map(
@@ -207,6 +208,8 @@ class HordeInferenceProcess(HordeProcess):
     """The SharedModelManager instance used by this process. It is not shared between processes (despite the name)."""
 
     _active_model_name: str | None = None
+    _pending_load_peak_bytes: int | None = None
+    """Private-RAM peak of the load just completed, sent with the next memory report and then cleared."""
     """The name of the currently active model. Note that other models may be loaded in RAM or VRAM."""
 
     def __init__(
@@ -506,16 +509,29 @@ class HordeInferenceProcess(HordeProcess):
         return super().get_vram_total_mb()
 
     @override
-    def send_memory_report_message(self, include_vram: bool = False) -> bool:
+    def send_memory_report_message(
+        self,
+        include_vram: bool = False,
+        ram_private_peak_bytes: int | None = None,
+    ) -> bool:
         """Send a memory report message to the main process.
+
+        The first report after a preload carries that load's private-RAM peak; the parent learns a
+        checkpoint's staging price only from such a report.
 
         Args:
             include_vram (bool, optional): Whether or not to include VRAM usage in the report. Defaults to False.
+            ram_private_peak_bytes (int | None, optional): A load peak to report instead of the pending one.
 
         Returns:
             bool: Whether or not the message was sent successfully.
         """
-        if not super().send_memory_report_message(include_vram=include_vram):
+        if ram_private_peak_bytes is None:
+            ram_private_peak_bytes, self._pending_load_peak_bytes = self._pending_load_peak_bytes, None
+        if not super().send_memory_report_message(
+            include_vram=include_vram,
+            ram_private_peak_bytes=ram_private_peak_bytes,
+        ):
             self._end_process = True
 
         return not self._end_process
@@ -746,24 +762,26 @@ class HordeInferenceProcess(HordeProcess):
         )
 
         time_start = time.time()
+        peak_sampler = PrivateRamPeakSampler()
 
         if not self._dry_run_skip_inference:
             with contextlib.nullcontext():  # self.disk_lock:
                 try:
-                    try:
-                        self._horde.preload_model(
-                            horde_model_name,
-                            will_load_loras=will_load_loras,
-                            seamless_tiling_enabled=seamless_tiling_enabled,
-                            diffusion_model_only=diffusion_model_only,
-                        )
-                    except TypeError:
-                        # An older horde-engine predates the component-only preload; load the full checkpoint.
-                        self._horde.preload_model(
-                            horde_model_name,
-                            will_load_loras=will_load_loras,
-                            seamless_tiling_enabled=seamless_tiling_enabled,
-                        )
+                    with peak_sampler:
+                        try:
+                            self._horde.preload_model(
+                                horde_model_name,
+                                will_load_loras=will_load_loras,
+                                seamless_tiling_enabled=seamless_tiling_enabled,
+                                diffusion_model_only=diffusion_model_only,
+                            )
+                        except TypeError:
+                            # An older horde-engine predates the component-only preload; load the full checkpoint.
+                            self._horde.preload_model(
+                                horde_model_name,
+                                will_load_loras=will_load_loras,
+                                seamless_tiling_enabled=seamless_tiling_enabled,
+                            )
                 except Exception as preload_error:
                     # A load failure is a property of the *model* (an unsupported/corrupt checkpoint the
                     # backend cannot load), not of this process, but the backend may have left torch/ComfyUI
@@ -789,6 +807,7 @@ class HordeInferenceProcess(HordeProcess):
 
         logger.info(f"Preloaded model {horde_model_name}")
         self._active_model_name = horde_model_name
+        self._pending_load_peak_bytes = peak_sampler.peak_bytes
         self.on_horde_model_state_change(
             process_state=HordeProcessState.PRELOADED_MODEL,
             horde_model_name=horde_model_name,

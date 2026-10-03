@@ -68,6 +68,21 @@ class ChildProcessHandle(Protocol):
 
 
 @dataclass(frozen=True)
+class LoadCompletionSample:
+    """A process's private RAM reported with the completion of a model load.
+
+    Taken before any job runs on the slot, so the growth it shows belongs to the checkpoint alone.
+    """
+
+    process_launch_identifier: int
+    model: str | None
+    sampled_at: float | None
+    """Wall-clock time the child sampled the report, or None from a child that does not stamp reports."""
+    private_bytes: int
+    peak_private_bytes: int
+
+
+@dataclass(frozen=True)
 class PreloadJobIntent:
     """A job that selected this launch for model preparation, without execution ownership."""
 
@@ -253,6 +268,8 @@ class HordeProcessInfo:
     """The process's resident-set size, including mapped checkpoint pages."""
     ram_private_bytes: int | None = None
     """Non-reclaimable private working-set bytes, or None before measurement."""
+    load_completion_sample: LoadCompletionSample | None = None
+    """The report that completed this launch's latest model load, or None before one arrives."""
     vram_usage_mb: int
     """The amount of VRAM (MB) used by this process."""
     total_vram_mb: int
@@ -433,6 +450,7 @@ class HordeProcessInfo:
 
         self.ram_usage_bytes = 0
         self.ram_private_bytes = None
+        self.load_completion_sample = None
         self.vram_usage_mb = 0
         self.total_vram_mb = 0
         self.process_reserved_mb = None

@@ -1,7 +1,9 @@
 """Measure process RAM without treating reclaimable Linux checkpoint mappings as allocator growth."""
 
 import sys
+import threading
 from pathlib import Path
+from types import TracebackType
 
 import psutil
 from loguru import logger
@@ -32,6 +34,54 @@ def linux_private_ram_bytes(smaps_rollup: str) -> int | None:
         if len(fields) >= 2 and fields[0] in {"Anonymous:", "Private_Dirty:"}:
             readings[fields[0]] = int(fields[1]) * 1024
     return max(readings.values()) if readings else None
+
+
+PEAK_SAMPLE_INTERVAL_SECONDS = 0.1
+"""How often the load-peak sampler reads private RAM; a load's transient lasts seconds, so 100 ms resolves it."""
+
+
+class PrivateRamPeakSampler:
+    """Track the highest private RAM reading of this process while a block runs.
+
+    Used around a model load: the settled reading after the load can sit below the transient the load
+    touched, and a staging price learned from the settled figure alone would under-reserve the next load.
+    """
+
+    def __init__(self, interval_seconds: float = PEAK_SAMPLE_INTERVAL_SECONDS) -> None:
+        """Prepare a sampler for the current process."""
+        self._process = psutil.Process()
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.peak_bytes: int | None = None
+
+    def _sample(self) -> None:
+        reading = private_ram_usage_bytes(self._process)
+        if reading is not None and (self.peak_bytes is None or reading > self.peak_bytes):
+            self.peak_bytes = reading
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            self._sample()
+
+    def __enter__(self) -> "PrivateRamPeakSampler":
+        """Take a first reading and start polling on a daemon thread."""
+        self._sample()
+        self._thread = threading.Thread(target=self._run, name="private-ram-peak", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Stop polling and take a last reading."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._sample()
 
 
 def private_ram_usage_bytes(process: psutil.Process) -> int | None:
