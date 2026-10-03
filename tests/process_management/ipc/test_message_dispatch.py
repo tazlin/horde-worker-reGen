@@ -139,6 +139,7 @@ class TestReceiveAndHandleProcessMessages:
         msg.process_id = 0
         msg.process_launch_identifier = 0
         msg.ram_usage_bytes = 1024
+        msg.ram_private_bytes = 512
         msg.vram_usage_mb = 2048
         msg.vram_total_mb = 4096
         msg.open_fds = None
@@ -157,6 +158,7 @@ class TestReceiveAndHandleProcessMessages:
         process_map.on_memory_report.assert_called_once_with(
             process_id=0,
             ram_usage_bytes=1024,
+            ram_private_bytes=512,
             vram_usage_mb=2048,
             total_vram_mb=4096,
             open_fds=None,

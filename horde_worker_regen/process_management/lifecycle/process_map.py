@@ -361,6 +361,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         # over-state headroom. Zeroing total_vram_mb also drops the slot from get_free_vram_mb()'s
         # reporting set until its replacement re-reports real numbers.
         self[process_id].ram_usage_bytes = 0
+        self[process_id].ram_private_bytes = None
         self[process_id].vram_usage_mb = 0
         self[process_id].total_vram_mb = 0
         # A dead process's context and allocator reservation are reclaimed by the OS, so drop its last
@@ -392,12 +393,14 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         process_aimdo_mb: int | None = None,
         report_sampled_at: float | None = None,
         held_components: list[HeldComponentSnapshot] | None = None,
+        ram_private_bytes: int | None = None,
     ) -> None:
         """Update the memory usage for the given process ID.
 
         Args:
             process_id (int): The ID of the process to update.
             ram_usage_bytes (int): The amount of RAM used by this process.
+            ram_private_bytes (int | None): Unique/private working-set bytes, or None when unavailable.
             vram_usage_mb (int): The amount of VRAM used by this process.
             total_vram_mb (int): The total amount of VRAM available to this process.
             open_fds (int | None): Open descriptors/handles the process reported, or None if unavailable.
@@ -418,6 +421,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """
         process_info = self[process_id]
         process_info.ram_usage_bytes = ram_usage_bytes
+        process_info.ram_private_bytes = ram_private_bytes
         if held_components is not None:
             process_info.held_components = held_components
         process_info.vram_usage_mb = vram_usage_mb or 0

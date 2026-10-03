@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     PipelineStageTag,
     UnsupportedControlMessageError,
 )
+from horde_worker_regen.utils.private_memory import private_ram_usage_bytes
 
 MEMORY_REPORT_INTERVAL_SECONDS = 5.0
 """The cadence (seconds) at which a child's reporter thread samples and sends its memory report.
@@ -557,13 +558,16 @@ class HordeProcess(abc.ABC):
         Args:
             include_vram (bool, optional): Whether to include VRAM usage in the message. Defaults to False.
         """
+        process = psutil.Process()
+        private_bytes = private_ram_usage_bytes(process)
         message = HordeProcessMemoryMessage(
             process_id=self.process_id,
             process_launch_identifier=self.process_launch_identifier,
             reported_os_pid=os.getpid(),
             info="Memory report",
             time_elapsed=None,
-            ram_usage_bytes=psutil.Process().memory_info().rss,
+            ram_usage_bytes=process.memory_info().rss,
+            ram_private_bytes=private_bytes,
             open_fds=open_descriptor_count(),
             fd_soft_limit=descriptor_soft_limit(),
             device_index=self.device_index,

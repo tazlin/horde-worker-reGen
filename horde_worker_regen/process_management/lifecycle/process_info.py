@@ -250,7 +250,9 @@ class HordeProcessInfo:
     so the distinction has to survive the job boundary alongside the model name."""
 
     ram_usage_bytes: int
-    """The amount of RAM used by this process."""
+    """The process's resident-set size, including mapped checkpoint pages."""
+    ram_private_bytes: int | None = None
+    """Non-reclaimable private working-set bytes, or None before measurement."""
     vram_usage_mb: int
     """The amount of VRAM (MB) used by this process."""
     total_vram_mb: int
@@ -430,6 +432,7 @@ class HordeProcessInfo:
         self.vram_unload_refused = False
 
         self.ram_usage_bytes = 0
+        self.ram_private_bytes = None
         self.vram_usage_mb = 0
         self.total_vram_mb = 0
         self.process_reserved_mb = None
@@ -462,6 +465,11 @@ class HordeProcessInfo:
 
         self.process_launch_identifier = process_launch_identifier
         self.end_intended = False
+
+    @property
+    def ram_working_set_bytes(self) -> int:
+        """Return private working-set bytes when measured, otherwise the reported RSS."""
+        return self.ram_private_bytes if self.ram_private_bytes is not None else self.ram_usage_bytes
 
     @property
     def last_job_referenced(self) -> ImageGenerateJobPopResponse | None:

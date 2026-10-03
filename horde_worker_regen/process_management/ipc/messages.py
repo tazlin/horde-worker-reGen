@@ -229,6 +229,8 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
 
     ram_usage_bytes: int
     """The number of bytes of RAM used by the process."""
+    ram_private_bytes: int | None = None
+    """Unique/private working-set bytes, excluding shared pages; None when the platform cannot report them."""
     open_fds: int | None = None
     """Open file descriptors/handles held by the process, or None if the platform metric is unavailable.
 
