@@ -10,10 +10,16 @@ from __future__ import annotations
 import sys
 from unittest.mock import Mock
 
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.resource_budget import (
+    predict_job_sampler_only_vram_mb,
+    predict_job_sampling_vram_mb,
+)
 from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
@@ -23,7 +29,9 @@ from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_model_metadata,
     mark_job_in_progress_async,
     track_popped_job_async,
 )
@@ -122,6 +130,47 @@ class TestForecastAndDeltas:
                     process_id=process_id,
                     disaggregated=disaggregated,
                 )
+
+    async def test_a_job_beside_an_extra_large_sampler_is_priced_sampler_only(self) -> None:
+        """Beside a running extra-large job both forms price the candidate at its sampler-only footprint."""
+        reference = {
+            "sdxl_model": make_mock_model_reference_record(
+                "sdxl_model",
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+            "flux_model": make_mock_model_reference_record(
+                "flux_model",
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
+            ),
+        }
+        tracker = JobTracker()
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: _slot(0, model="flux_model"), 1: _slot(1, model=None)}),  # type: ignore[arg-type]
+            job_tracker=tracker,
+            model_metadata=make_test_model_metadata(reference),
+            max_inference=2,
+        )
+        candidate = make_job_pop_response(model="sdxl_model", width=1024, height=1024)
+        running = make_job_pop_response(model="flux_model", width=1024, height=1024)
+        await track_popped_job_async(tracker, candidate)
+        await track_popped_job_async(tracker, running)
+        await mark_job_in_progress_async(tracker, running)
+        snapshot = scheduler.snapshot()
+        baseline = scheduler._model_metadata.get_baseline("sdxl_model")  # type: ignore[attr-defined]
+        for process_id in (0, 1, None):
+            scheduler_mb = scheduler._measured_admission_candidate_delta_mb(  # type: ignore[attr-defined]
+                candidate,
+                baseline,
+                process_id=process_id,
+                disaggregated=False,
+            )
+            assert (
+                pricing.candidate_delta_mb(snapshot, candidate, baseline, process_id=process_id, disaggregated=False)
+                == scheduler_mb
+            )
+            assert scheduler_mb == predict_job_sampler_only_vram_mb(candidate, baseline)
+        whole_job_mb = predict_job_sampling_vram_mb(candidate, baseline)
+        assert whole_job_mb is not None and scheduler_mb is not None and scheduler_mb < whole_job_mb
 
     async def test_max_coresident_sizes_from_the_card_total_and_overheads(self) -> None:
         """The structural depth is the loader's context plus the marginal contexts the remaining total seats."""

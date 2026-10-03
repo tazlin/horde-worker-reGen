@@ -33,6 +33,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot, SlotSnapshot
+from horde_worker_regen.process_management.scheduling.concurrent_overlap import prices_sampler_only_beside
 from horde_worker_regen.process_management.scheduling.governance.whole_card import max_coresident_for_peak
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
@@ -233,6 +234,39 @@ def candidate_weights_resident(snapshot: SchedulingSnapshot, model: str | None, 
     return slot is not None and model in slot.resident_weight_models
 
 
+def active_jobs_on_card(snapshot: SchedulingSnapshot, device_index: int | None) -> tuple[str, ...]:
+    """The in-progress jobs whose running slot sits on the card, or every in-progress job when card-agnostic."""
+    if not snapshot.multi_gpu_routing_active or device_index is None:
+        return snapshot.queue.in_progress
+    running = {
+        slot.current_job_id
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE and slot.device_index == device_index
+    }
+    return tuple(job_id for job_id in snapshot.queue.in_progress if job_id in running)
+
+
+def prices_sampler_only_on_card(
+    snapshot: SchedulingSnapshot,
+    job: ImageGenerateJobPopResponse,
+    device_index: int | None,
+) -> bool:
+    """Whether the job shares the card with a co-tenant that makes one side of the pairing extra-large.
+
+    Such a job is priced at its sampler-only footprint (:func:`prices_sampler_only_beside`). On a multi-card
+    worker with no card named there is no co-tenant to judge, so the whole-job price stands.
+    """
+    if snapshot.multi_gpu_routing_active and device_index is None:
+        return False
+    job_id = str(job.id_)
+    co_tenant_tiers = [
+        size_tier(snapshot, snapshot.queue.jobs[running_id].model)
+        for running_id in active_jobs_on_card(snapshot, device_index)
+        if running_id != job_id and running_id in snapshot.queue.jobs
+    ]
+    return prices_sampler_only_beside(size_tier(snapshot, job.model), co_tenant_tiers)
+
+
 def candidate_delta_mb(
     snapshot: SchedulingSnapshot,
     job: ImageGenerateJobPopResponse,
@@ -241,10 +275,17 @@ def candidate_delta_mb(
     process_id: int | None,
     disaggregated: bool,
 ) -> float | None:
-    """The job's marginal predicted VRAM (MB) for the measured overlay, net of resident-weight credit."""
+    """The job's marginal predicted VRAM (MB) for the measured overlay, net of resident-weight credit.
+
+    Sampler-only for a disaggregation-class job, and for a job sharing its card with an extra-large co-tenant
+    (:func:`prices_sampler_only_on_card`); the whole-job sampling peak otherwise.
+    """
+    slot = snapshot.slots.get(process_id) if process_id is not None else None
+    device_index = snapshot.routing_device_index(slot) if slot is not None else None
+    sampler_only = disaggregated or prices_sampler_only_on_card(snapshot, job, device_index)
     static_gross_mb = (
         predict_job_sampler_only_vram_mb(job, baseline)
-        if disaggregated
+        if sampler_only
         else predict_job_sampling_vram_mb(job, baseline)
     )
     if static_gross_mb is None:
@@ -254,7 +295,7 @@ def candidate_delta_mb(
         job,
         baseline,
         static_seed_mb=static_gross_mb,
-        stage=FootprintStage.SAMPLE_ISOLATED if disaggregated else FootprintStage.SAMPLE,
+        stage=FootprintStage.SAMPLE_ISOLATED if sampler_only else FootprintStage.SAMPLE,
     )
     resident_credit_mb = 0.0
     if candidate_weights_resident(snapshot, job.model, process_id):

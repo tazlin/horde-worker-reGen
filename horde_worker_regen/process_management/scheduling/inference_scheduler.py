@@ -175,6 +175,7 @@ from horde_worker_regen.process_management.scheduling.concurrent_overlap import 
     RunningSampler,
     concurrent_overlap_permitted,
     performance_mode_headway_scale,
+    prices_sampler_only_beside,
 )
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
 from horde_worker_regen.process_management.scheduling.diagnostic_throttle import (
@@ -4629,10 +4630,15 @@ class InferenceScheduler:
         (the same resident-credit reasoning the retention gate applies) to avoid re-charging them. None (no
         estimate) propagates so the overlay treats the candidate as a zero marginal, never denying on an
         unpriceable cost.
+
+        A job sharing its card with an extra-large co-tenant is priced sampler-only too
+        (:meth:`_prices_sampler_only_on_card`), at the SAMPLE_ISOLATED stage: a whole-job watermark learned
+        while the job had the card to itself measures components ComfyUI kept only because there was room.
         """
+        sampler_only = disaggregated or self._prices_sampler_only_on_card(job, process_id)
         static_gross_mb = (
             predict_job_sampler_only_vram_mb(job, baseline)
-            if disaggregated
+            if sampler_only
             else predict_job_sampling_vram_mb(job, baseline)
         )
         if static_gross_mb is None:
@@ -4641,12 +4647,29 @@ class InferenceScheduler:
             job,
             baseline,
             static_seed_mb=static_gross_mb,
-            stage=FootprintStage.SAMPLE_ISOLATED if disaggregated else FootprintStage.SAMPLE,
+            stage=FootprintStage.SAMPLE_ISOLATED if sampler_only else FootprintStage.SAMPLE,
         )
         resident_credit_mb = 0.0
         if self._candidate_weights_resident_on_process(job.model, process_id):
             resident_credit_mb = predict_job_weight_mb(job, baseline) or 0.0
         return max(0.0, gross_mb - resident_credit_mb)
+
+    def _prices_sampler_only_on_card(self, job: ImageGenerateJobPopResponse, process_id: int | None) -> bool:
+        """Whether ``job`` shares its card with a co-tenant that makes one side of the pairing extra-large.
+
+        The scheduler form of
+        :func:`~horde_worker_regen.process_management.scheduling.admission.pricing.prices_sampler_only_on_card`.
+        On a multi-card worker with no target process there is no card to judge, so the whole-job price stands.
+        """
+        if self._multi_gpu_routing_active:
+            process_info = self._process_map.get(process_id) if process_id is not None else None
+            if process_info is None:
+                return False
+            running = self._jobs_in_progress_on_card(process_info.device_index)
+        else:
+            running = list(self._job_tracker.jobs_in_progress)
+        co_tenant_tiers = [self._model_size_tier(other.model) for other in running if other.id_ != job.id_]
+        return prices_sampler_only_beside(self._model_size_tier(job.model), co_tenant_tiers)
 
     def _candidate_weights_resident_on_process(self, model_name: str | None, process_id: int | None) -> bool:
         """Whether ``model_name``'s weights already occupy VRAM on ``process_id`` (dispatch materialises nothing).
@@ -5343,6 +5366,10 @@ class InferenceScheduler:
         its sampler-only delta (``disaggregated``), so the concurrent decode spike the sampling gate already
         reserves is never double-counted here. No actuations run: the arbiter verdict's actuations are ignored
         because reclaim stays single-owner (the preload path drives it).
+
+        The candidate's own staging charge is netted out, as the materialisation request nets it. A staged
+        candidate's preload keeps its planned charge until its dispatch lands, and the candidate delta already
+        is that load, so charging both prices the job twice and vetoes every overlap a staged job asks for.
         """
         if not self._budget_active():
             return None
@@ -5352,6 +5379,15 @@ class InferenceScheduler:
         baseline = self._model_metadata.get_baseline(candidate_job.model)
         resident_model_info = self._horde_model_map.root.get(candidate_job.model)
         resident_pid = resident_model_info.process_id if resident_model_info is not None else None
+        own_planned_mb = (
+            0.0
+            if resident_pid is None
+            else self._reserve_ledger.planned_charge_for_unit(
+                PRELOAD_ADMISSION_FLOW,
+                str(resident_pid),
+                self._process_map.reserved_by_pid(target_device_index),
+            )
+        )
         request = VramRequest(
             kind=VramRequestKind.MONOLITHIC_DISPATCH,
             job_label=str(candidate_job.model),
@@ -5364,6 +5400,7 @@ class InferenceScheduler:
                 process_id=resident_pid,
                 disaggregated=self._is_disaggregation_class_eligible(candidate_job),
             ),
+            own_planned_unmaterialized_mb=own_planned_mb,
         )
         return arbiter.evaluate(request).admits
 

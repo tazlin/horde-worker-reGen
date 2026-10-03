@@ -215,7 +215,7 @@ class TestConcurrentOverlapHeadway:
         assert await _overlap_admitted(scheduler, candidate_job) is True
 
     async def test_extra_large_running_never_overlaps_even_near_completion(self) -> None:
-        """An extra-large (Flux) job in flight never shares the card, regardless of its progress."""
+        """An extra-large (Flux) job in flight shares the card with no one the arbiter has not confirmed room for."""
         scheduler, candidate_job = await _make_overlap_scenario(
             running_baseline=_FLUX,
             candidate_baseline=_SD15,
@@ -224,7 +224,7 @@ class TestConcurrentOverlapHeadway:
         assert await _overlap_admitted(scheduler, candidate_job) is False
 
     async def test_extra_large_candidate_never_joins_a_busy_card(self) -> None:
-        """An extra-large candidate never threads onto a card that is already sampling another job."""
+        """An extra-large candidate does not thread onto a busy card without the arbiter confirming the room."""
         scheduler, candidate_job = await _make_overlap_scenario(
             running_baseline=_SD15,
             candidate_baseline=_FLUX,

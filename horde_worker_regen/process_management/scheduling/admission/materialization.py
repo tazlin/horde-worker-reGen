@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.resources.resource_budget import (
     StreamForecast,
     effective_inference_reserve_mb,
@@ -56,18 +55,6 @@ def head_starved_seconds(snapshot: SchedulingSnapshot, job_id: str) -> float:
     if view.starvation_job_id != job_id or view.starvation_since == 0.0:
         return 0.0
     return snapshot.now - view.starvation_since
-
-
-def active_jobs_on_card(snapshot: SchedulingSnapshot, device_index: int | None) -> tuple[str, ...]:
-    """The in-progress jobs whose running slot sits on the card, or every in-progress job when card-agnostic."""
-    if not snapshot.multi_gpu_routing_active or device_index is None:
-        return snapshot.queue.in_progress
-    running = {
-        slot.current_job_id
-        for slot in snapshot.slots.values()
-        if slot.process_type is HordeProcessType.INFERENCE and slot.device_index == device_index
-    }
-    return tuple(job_id for job_id in snapshot.queue.in_progress if job_id in running)
 
 
 def build_materialization_request(
@@ -156,7 +143,7 @@ def build_materialization_request(
     reprices_activation = (
         prepared_head_reprices_activation
         and job.aux_models_prepared
-        and bool(active_jobs_on_card(snapshot, device_index))
+        and bool(pricing.active_jobs_on_card(snapshot, device_index))
     )
     config = snapshot.config_for(device_index)
     request = VramRequest(

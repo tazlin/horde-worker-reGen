@@ -832,14 +832,20 @@ def preload_candidate_delta_mb(snapshot: SchedulingSnapshot, job_id: str, proces
 
 
 def predictive_vram_verdict(snapshot: SchedulingSnapshot, job_id: str, device_index: int | None) -> BudgetVerdict:
-    """The static VRAM budget's verdict for the job against the card's measured free and the committed reserve."""
+    """The static VRAM budget's verdict for the job against the card's measured free and the committed reserve.
+
+    Priced sampler-only on the same terms as the measured candidate (:func:`pricing.candidate_delta_mb`), so
+    the two verdicts agree about a job joining an extra-large co-tenant.
+    """
     job = snapshot.queue.jobs[job_id]
+    payload = snapshot.queue.payloads[job_id]
     return snapshot.services.vram_budget.check_job(
-        snapshot.queue.payloads[job_id],
+        payload,
         job.baseline,
         snapshot.card(device_index).measured_free_mb,
         committed_reserve_mb=snapshot.committed_vram_reserve_mb,
-        disaggregated=job.disaggregation_class_eligible,
+        disaggregated=job.disaggregation_class_eligible
+        or pricing.prices_sampler_only_on_card(snapshot, payload, device_index),
     )
 
 

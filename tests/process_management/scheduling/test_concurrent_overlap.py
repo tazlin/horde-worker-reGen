@@ -9,6 +9,7 @@ from horde_worker_regen.process_management.scheduling.concurrent_overlap import 
     OVERLAP_HEADWAY_MIXED_HEAVY,
     RunningSampler,
     concurrent_overlap_permitted,
+    prices_sampler_only_beside,
 )
 
 
@@ -54,17 +55,48 @@ class TestHardBlocks:
         assert _permitted(verdict=verdict) is True
         assert verdict.calls == 0
 
-    def test_extra_large_candidate_never_joins(self) -> None:
-        """An extra-large candidate neither joins a busy card nor asks about memory."""
+    def test_two_extra_large_jobs_never_share_without_consulting_memory(self) -> None:
+        """An extra-large candidate never joins an extra-large sampler, whatever the memory answer."""
         verdict = _Verdict(True)
-        running = (_running(ModelSizeTier.LIGHT, 1.0),)
+        running = (_running(ModelSizeTier.EXTRA_LARGE, 1.0),)
         assert _permitted(candidate_tier=ModelSizeTier.EXTRA_LARGE, running=running, verdict=verdict) is False
         assert verdict.calls == 0
 
-    def test_extra_large_running_job_is_never_joined(self) -> None:
-        """A running extra-large job is never shared, whatever the memory answer."""
+    def test_extra_large_candidate_joins_only_on_confirmed_room(self) -> None:
+        """An extra-large candidate joins a smaller sampler only when the arbiter confirms the priced pairing."""
+        running = (_running(ModelSizeTier.HEAVY, 1.0),)
+        assert _permitted(candidate_tier=ModelSizeTier.EXTRA_LARGE, running=running, verdict=_Verdict(True)) is True
+        assert _permitted(candidate_tier=ModelSizeTier.EXTRA_LARGE, running=running, verdict=_Verdict(None)) is False
+        assert _permitted(candidate_tier=ModelSizeTier.EXTRA_LARGE, running=running, verdict=_Verdict(False)) is False
+
+    def test_running_extra_large_job_is_joined_only_on_confirmed_room(self) -> None:
+        """A running extra-large job is shared only when the arbiter confirms the priced pairing."""
         running = (_running(ModelSizeTier.EXTRA_LARGE, 1.0),)
-        assert _permitted(candidate_tier=ModelSizeTier.LIGHT, running=running, verdict=_Verdict(True)) is False
+        assert _permitted(candidate_tier=ModelSizeTier.LIGHT, running=running, verdict=_Verdict(True)) is True
+        assert _permitted(candidate_tier=ModelSizeTier.LIGHT, running=running, verdict=_Verdict(None)) is False
+        assert _permitted(candidate_tier=ModelSizeTier.LIGHT, running=running, verdict=_Verdict(False)) is False
+
+    def test_extra_large_pairing_waits_for_the_strictest_headway(self) -> None:
+        """Confirmed room does not relax an extra-large pairing below the strictest headway."""
+        running_early = (_running(ModelSizeTier.EXTRA_LARGE, OVERLAP_HEADWAY_BOTH_HEAVY - 0.01),)
+        running_late = (_running(ModelSizeTier.EXTRA_LARGE, OVERLAP_HEADWAY_BOTH_HEAVY),)
+        assert _permitted(candidate_tier=ModelSizeTier.HEAVY, running=running_early, verdict=_Verdict(True)) is False
+        assert _permitted(candidate_tier=ModelSizeTier.HEAVY, running=running_late, verdict=_Verdict(True)) is True
+
+
+class TestSamplerOnlyPricing:
+    """Which pairings the admission seams price at the sampler-only footprint."""
+
+    def test_exactly_one_extra_large_side_prices_sampler_only(self) -> None:
+        """A smaller job beside an extra-large one, and the reverse, are priced by their sampling phase."""
+        assert prices_sampler_only_beside(ModelSizeTier.HEAVY, [ModelSizeTier.EXTRA_LARGE]) is True
+        assert prices_sampler_only_beside(ModelSizeTier.EXTRA_LARGE, [ModelSizeTier.LIGHT]) is True
+
+    def test_other_pairings_keep_the_whole_job_price(self) -> None:
+        """Alone, two smaller jobs, and two extra-large jobs keep the whole-job price."""
+        assert prices_sampler_only_beside(ModelSizeTier.HEAVY, []) is False
+        assert prices_sampler_only_beside(ModelSizeTier.HEAVY, [ModelSizeTier.HEAVY]) is False
+        assert prices_sampler_only_beside(ModelSizeTier.EXTRA_LARGE, [ModelSizeTier.EXTRA_LARGE]) is False
 
 
 class TestHeadway:

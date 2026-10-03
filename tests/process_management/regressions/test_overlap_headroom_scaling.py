@@ -2,10 +2,11 @@
 
 The overlap gate exists to stop stacked weight loads and activation peaks from thrashing a sampler
 into a step-timeout teardown. It runs two guards. A temporal/structural guard keeps a newcomer off a
-running job's memory-hungry startup beat: an extra-large (whole-card tier) model neither joins a busy
-card nor shares one, and a heavy pairing (or a batch) must let the running job make size-appropriate
-headway first. The memory guard is the VRAM arbiter's: it prices the candidate's marginal device cost
-against the cycle-frozen admission floor and answers whether the card can hold the overlap at all.
+running job's memory-hungry startup beat: two extra-large (whole-card tier) models never share a card, a
+pairing with one extra-large side needs confirmed room and the strictest headway, and a heavy pairing (or a
+batch) must let the running job make size-appropriate headway first. The memory guard is the VRAM arbiter's:
+it prices the candidate's marginal device cost against the cycle-frozen admission floor and answers whether
+the card can hold the overlap at all.
 
 When the arbiter admits, a heavy pairing's headway relaxes to a small startup-beat constant, since the
 over-subscription the strict fractions guard against cannot occur on a card judged able to hold the
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import pytest
 
+from horde_worker_regen.process_management.ipc.messages import ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier
@@ -26,6 +28,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     MeasuredVramSnapshot,
     VramArbiter,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import PRELOAD_ADMISSION_FLOW
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -36,6 +39,7 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 _HEAVY_A = "sdxl_alpha"
 _HEAVY_B = "sdxl_beta"
 _EXTRA_LARGE = "flux_like"
+_EXTRA_LARGE_OTHER = "qwen_like"
 
 
 def _fitting_state() -> DeviceVramState:
@@ -252,30 +256,64 @@ class TestBatchBlockIsBoundedByHeadroom:
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B, n_iter=4)) is False
 
 
-class TestExtraLargeContractNeverRelaxes:
-    """The whole-card tier's no-co-sampling contract is independent of measured headroom."""
+class TestExtraLargePairingIsPriced:
+    """A pairing with one extra-large side is admitted on the arbiter's priced verdict, never on headroom alone."""
 
-    async def test_running_extra_large_blocks_despite_headroom(
+    async def test_running_extra_large_is_joined_on_confirmed_room(
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An extra-large in-flight job shares with no one, at any progress, on any card."""
+        """A smaller job joins an extra-large sampler past the strictest headway once the arbiter admits it."""
         tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _HEAVY_B: ModelSizeTier.HEAVY}
         scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
         await _running(job_tracker, _EXTRA_LARGE)
         _pin_progress(monkeypatch, scheduler, 0.95)
 
-        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is False
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is True
 
-    async def test_extra_large_candidate_blocked_despite_headroom(
+    async def test_running_extra_large_is_not_joined_under_over_commit(
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An extra-large candidate never joins a busy card, whatever the headroom."""
+        """Without room an extra-large sampler shares with no one, at any progress."""
+        tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _HEAVY_B: ModelSizeTier.HEAVY}
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=False)
+        await _running(job_tracker, _EXTRA_LARGE)
+        _pin_progress(monkeypatch, scheduler, 0.95)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is False
+
+    async def test_extra_large_pairing_keeps_the_strictest_headway(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Confirmed room relaxes a heavy pairing's headway but never an extra-large one's."""
+        tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _HEAVY_B: ModelSizeTier.HEAVY}
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
+        await _running(job_tracker, _EXTRA_LARGE)
+        _pin_progress(monkeypatch, scheduler, 0.5)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is False
+
+    async def test_extra_large_candidate_joins_on_confirmed_room(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An extra-large candidate joins a smaller sampler past the strictest headway once the arbiter admits."""
         tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _HEAVY_A: ModelSizeTier.HEAVY}
         scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
         await _running(job_tracker, _HEAVY_A)
         _pin_progress(monkeypatch, scheduler, 0.95)
 
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE)) is True
+
+    async def test_second_extra_large_job_never_joins_despite_headroom(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two extra-large jobs never share a card, whether two copies of one model or two different ones."""
+        tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _EXTRA_LARGE_OTHER: ModelSizeTier.EXTRA_LARGE}
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
+        await _running(job_tracker, _EXTRA_LARGE)
+        _pin_progress(monkeypatch, scheduler, 0.95)
+
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE)) is False
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE_OTHER)) is False
 
 
 class TestMemoryQuestionIsTheArbiter:
@@ -300,6 +338,39 @@ class TestMemoryQuestionIsTheArbiter:
         _pin_progress(monkeypatch, scheduler, 0.95)
 
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is True
+
+    async def test_staged_candidate_is_not_charged_its_own_preload_twice(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A staged candidate's own preload charge is netted from the overlay, as the materialisation request nets it.
+
+        The card has room for the candidate exactly once; counting its staged preload beside its own delta would
+        veto every overlap a staged job asks for.
+        """
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
+        _install_cycle(
+            scheduler,
+            DeviceVramState(
+                total_vram_mb=16000.0,
+                baseline_mb=0.0,
+                committed_vram_mb=0.0,
+                planned_unmaterialized_mb=6000.0,
+                committed_is_stale=False,
+                device_free_mb=8000.0,
+                noise_buffer_mb=512.0,
+            ),
+        )
+        scheduler._horde_model_map.update_entry(_HEAVY_B, load_state=ModelLoadState.LOADED_IN_RAM, process_id=2)
+        scheduler._reserve_ledger.set_planned(
+            PRELOAD_ADMISSION_FLOW, "2", vram_mb=6000.0, target_process_id=2, reserved_at_admit_mb=0.0
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_measured_admission_candidate_delta_mb",
+            lambda job, baseline, *, process_id, disaggregated: 6000.0,
+        )
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=None)
 
     async def test_cold_start_relaxes_memory_to_admit(
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
