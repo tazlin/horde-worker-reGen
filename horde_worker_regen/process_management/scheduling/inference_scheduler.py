@@ -78,6 +78,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
     BudgetVerdict,
     CommittedReserveLedger,
+    JobFeatureRam,
     RamBudget,
     RamHeadroom,
     RamPressureVerdict,
@@ -91,11 +92,11 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_checkpoint_staging_ram_mb,
     predict_context_ram_mb,
     predict_job_decode_spike_mb,
+    predict_job_feature_ram_mb,
     predict_job_footprint_mb,
     predict_job_post_processing_vram_mb,
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
-    predict_job_transient_ram_mb,
     predict_job_unet_only_ram_mb,
     predict_job_weight_mb,
     ram_headroom,
@@ -154,6 +155,7 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     pass_control_for,
     preload_candidate_delta_mb,
     preload_head,
+    preload_ram_stage_mb,
     price_preload,
 )
 from horde_worker_regen.process_management.scheduling.admission.pricing import STAGING_ENCODE_VRAM_MB
@@ -3411,7 +3413,7 @@ class InferenceScheduler:
         available_ram_mb = self._measured_available_ram_mb()
         weights_mb = forecast.weights_mb
         committed_ram_mb = self._reserve_ledger.total_ram_mb()
-        staging = self._checkpoint_staging_charge_mb(job)
+        staging = self._whole_job_ram_charge_mb(job)
         return self._ram_budget.check_job(
             job,
             baseline,
@@ -3419,7 +3421,7 @@ class InferenceScheduler:
             committed_reserve_mb=committed_ram_mb,
             staging_charge_mb=staging if staging is not None else weights_mb,
             danger_floor_mb=self._ram_danger_floor_mb(),
-            in_flight_transient_mb=self._in_flight_transient_ram_mb(),
+            outstanding_planned_mb=self._outstanding_planned_ram_mb(),
         ).fits
 
     def _resident_safety_charge_mb(self, device_index: int | None) -> float:
@@ -4257,14 +4259,13 @@ class InferenceScheduler:
         crashes the scheduling cycle.
         """
         self._last_ram_verdict = verdict
-        transient_mb = self._in_flight_transient_ram_mb()
         thresholds = ram_headroom(
             None,
             min_free_mb=verdict.floor_mb,
             reserve_mb=self._ram_budget.reserve_mb,
-            in_flight_transient_mb=transient_mb,
+            outstanding_mb=self._reserve_ledger.total_ram_mb() + self._outstanding_planned_ram_mb(),
             staging_charge_mb=max(
-                (self._checkpoint_staging_charge_mb(job) or 0.0 for job in self._job_tracker.jobs_pending_inference),
+                (self._whole_job_ram_charge_mb(job) or 0.0 for job in self._job_tracker.jobs_pending_inference),
                 default=0.0,
             ),
             context_cost_mb=self._estimated_resident_context_ram_mb(),
@@ -4309,7 +4310,6 @@ class InferenceScheduler:
             shed_card_indices=frozenset(self._ram_governor_state.shed_cards),
             restore_headroom_mb=(
                 (verdict.available_mb or 0.0)
-                - self._reserve_ledger.total_ram_mb()
                 - thresholds.restore_requirement_mb
                 + self._estimated_resident_context_ram_mb()
             ),
@@ -4461,14 +4461,36 @@ class InferenceScheduler:
         snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
         self._executor.execute_governance_actions(decide_process_reduction(snapshot))
 
-    def _in_flight_transient_ram_mb(self) -> float:
-        """Return outstanding feature allocations, without charging resident checkpoint pages again."""
-        return sum(
-            predict_job_transient_ram_mb(
-                job, self._model_metadata.get_baseline(job.model) if job.model is not None else None
-            )
-            for job in self._job_tracker.jobs_in_progress
+    def _outstanding_planned_ram_mb(self) -> float:
+        """Return admitted RAM the available reading does not yet reflect, net of each entry's measured growth.
+
+        A checkpoint stage lives while its process is loading and a job's feature RAM while the job is in
+        inference; anything else is dropped by omission, so a lost result cannot pin a stale charge.
+        """
+        self._reserve_ledger.reconcile_planned_ram(PRELOAD_ADMISSION_FLOW, self._in_flight_admitted_planned_units())
+        self._reserve_ledger.reconcile_planned_ram(
+            DISPATCH_ADMISSION_FLOW,
+            {str(job.id_) for job in self._job_tracker.jobs_in_progress if job.id_ is not None},
         )
+        return self._reserve_ledger.effective_planned_ram_mb(
+            {
+                process_id: process_info.ram_working_set_bytes / (1024 * 1024)
+                for process_id, process_info in self._process_map.items()
+            },
+        )
+
+    def _job_feature_ram(self, job: ImageGenerateJobPopResponse) -> JobFeatureRam:
+        """Return the job's feature RAM by landing process; without the lane, post-processing runs in inference."""
+        baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
+        features = predict_job_feature_ram_mb(job, baseline)
+        if self._process_lifecycle.post_process_lane_enabled():
+            return features
+        return JobFeatureRam(sampling_mb=features.total_mb, post_processing_mb=0.0)
+
+    def _whole_job_ram_charge_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
+        """Return the job's whole RAM demand on a cold load: its checkpoint charge plus every feature."""
+        checkpoint = self._checkpoint_staging_charge_mb(job)
+        return None if checkpoint is None else checkpoint + self._job_feature_ram(job).total_mb
 
     def _estimated_resident_context_ram_mb(self) -> float:
         """Return private context bytes when measured, otherwise the largest offered context seed."""
@@ -5218,12 +5240,13 @@ class InferenceScheduler:
             unserviceable_reason=self._unserviceable_job_reason,
             component_charge_mb=self._unet_component_charge_mb,
             staging_charge_mb=self._checkpoint_staging_charge_mb,
+            feature_ram_mb=lambda job: self._job_feature_ram(job).total_mb,
             checkpoint_models_held=self._checkpoint_models_held_on,
             host_ram=HostRamSnapshot(
                 available_mb=self._measured_available_ram_mb(),
                 total_mb=self._measured_total_ram_mb(),
                 reserve_mb=self._ram_budget.reserve_mb,
-                in_flight_transient_mb=self._in_flight_transient_ram_mb(),
+                outstanding_planned_mb=self._outstanding_planned_ram_mb(),
                 danger_floor_mb=self._ram_danger_floor_mb(),
                 pressure=ram_verdict if ram_verdict is not None else self._ram_pressure_verdict(),
             ),
@@ -5986,13 +6009,15 @@ class InferenceScheduler:
         available_process: HordeProcessInfo,
         *,
         planned_charge_mb: float | None,
+        planned_ram_mb: float = 0.0,
     ) -> bool:
         """Send the preload command for ``job``'s model to ``available_process`` and record the load.
 
         Resets the preload-delay and head-starvation trackers, sends the PRELOAD_MODEL message inside a
         telemetry span, and on a successful send records the churn/ledger entry and advances the model map
         and process map into the LOADING state. ``planned_charge_mb`` is the candidate delta the admission was
-        priced at, recorded on the reserve ledger as the load's planned charge. Returns whether the send
+        priced at, recorded on the reserve ledger as the load's planned charge; ``planned_ram_mb`` is the
+        checkpoint RAM it stages, booked the same way against the process's private growth. Returns whether the send
         succeeded: a failed send leaves the model map and the reserve ledger untouched, so the caller records
         it as a stopped pass rather than an admitted load.
         """
@@ -6088,6 +6113,13 @@ class InferenceScheduler:
                 target_process_id=available_process.process_id,
                 reserved_at_admit_mb=float(available_process.process_reserved_mb or 0),
             )
+            self._reserve_ledger.set_planned_ram(
+                PRELOAD_ADMISSION_FLOW,
+                str(available_process.process_id),
+                ram_mb=planned_ram_mb,
+                target_process_id=available_process.process_id,
+                private_at_admit_mb=available_process.ram_working_set_bytes / (1024 * 1024),
+            )
 
         return preload_sent
 
@@ -6110,9 +6142,9 @@ class InferenceScheduler:
             baseline,
             self._measured_available_ram_mb(),
             committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
-            staging_charge_mb=self._checkpoint_staging_charge_mb(job),
+            staging_charge_mb=self._whole_job_ram_charge_mb(job),
             danger_floor_mb=self._ram_danger_floor_mb(),
-            in_flight_transient_mb=self._in_flight_transient_ram_mb(),
+            outstanding_planned_mb=self._outstanding_planned_ram_mb(),
         )
         if ram_verdict.fits:
             return
@@ -6158,7 +6190,7 @@ class InferenceScheduler:
             self._ram_reclaim.record_credit(
                 target,
                 model=job.model,
-                effective_charge_mb=verdict.predicted_mb if verdict.predicted_mb is not None else 0.0,
+                effective_charge_mb=self._checkpoint_part_of_charge_mb(job, verdict),
                 kind=ReuseCreditKind.PAGE_REUSE,
             )
 
@@ -6189,7 +6221,7 @@ class InferenceScheduler:
             self._ram_reclaim.record_credit(
                 target,
                 model=job.model,
-                effective_charge_mb=verdict.predicted_mb if verdict.predicted_mb is not None else 0.0,
+                effective_charge_mb=self._checkpoint_part_of_charge_mb(job, verdict),
                 kind=ReuseCreditKind.COMPONENT,
             )
 
@@ -6206,46 +6238,56 @@ class InferenceScheduler:
                 logger.opt(colors=True).warning(
                     "<fg #f0beff>UNet-only component charge for {} "
                     f"on process {discrepancy.process_id} "
-                    f"under-priced the stage: measured RSS grew ~{discrepancy.growth_mb:.0f} MB against a component "
-                    f"charge of ~{record.effective_charge_mb:.0f} MB; the reload shared fewer pages than the "
-                    "residual implied.</>",
+                    f"under-priced the stage: private RAM peaked ~{discrepancy.growth_mb:.0f} MB above its admit "
+                    f"reading against a component charge of ~{record.effective_charge_mb:.0f} MB; the reload shared "
+                    "fewer pages than the residual implied.</>",
                     record.model,
                 )
             elif record.kind is ReuseCreditKind.WHOLE:
                 logger.opt(colors=True).warning(
                     "<fg #f0beff>RAM checkpoint charge for {} "
                     f"on process {discrepancy.process_id} under-priced the stage: "
-                    f"measured RSS grew ~{discrepancy.growth_mb:.0f} MB against a charge of "
-                    f"~{record.effective_charge_mb:.0f} MB; settled growth feeds the model's RAM estimate.</>",
+                    f"private RAM peaked ~{discrepancy.growth_mb:.0f} MB above its admit reading against a "
+                    f"charge of ~{record.effective_charge_mb:.0f} MB; the load's peak feeds the model's RAM "
+                    "estimate.</>",
                     record.model,
                 )
             else:
                 logger.opt(colors=True).warning(
                     "<fg #f0beff>RAM reuse credit for {} "
                     f"on process {discrepancy.process_id} was too generous: "
-                    f"measured RSS grew ~{discrepancy.growth_mb:.0f} MB against an effective charge of "
-                    f"~{record.effective_charge_mb:.0f} MB; the retained pages were less reusable than priced.</>",
+                    f"private RAM peaked ~{discrepancy.growth_mb:.0f} MB above its admit reading against an "
+                    f"effective charge of ~{record.effective_charge_mb:.0f} MB; the retained pages were less "
+                    "reusable than priced.</>",
                     record.model,
                 )
 
     def _checkpoint_staging_charge_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
-        """Return file-sized marginal staging RAM, with a measured per-model overlay when trusted."""
-        baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
-        path = self._resolve_checkpoint_path(job.model) if job.model is not None else None
+        """Return the whole checkpoint's staging RAM without feature RAM: measured peak when trusted, else file bytes.
+
+        Learned observations are taken at load completion, before any job runs on the slot, so they price the
+        checkpoint alone and the caller adds each job's own features.
+        """
+        if job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        learned = self._ram_reclaim.learned_ram.measured_estimate_mb(job.model, ReuseCreditKind.WHOLE)
+        if learned is not None:
+            return max(predict_checkpoint_staging_ram_mb(baseline, job.model, 0) or 0.0, learned)
+        path = self._resolve_checkpoint_path(job.model)
         size = None
         if path is not None:
             try:
                 size = path.stat().st_size
             except OSError as error:
-                if job.model is not None:
-                    self._log_component_charge_fallback_once(job.model, str(error))
-        static = predict_checkpoint_staging_ram_mb(job, baseline, size)
-        learned = (
-            self._ram_reclaim.learned_ram.measured_estimate_mb(job.model, ReuseCreditKind.WHOLE) if job.model else None
-        )
-        if learned is None:
-            return static
-        return max(predict_checkpoint_staging_ram_mb(job, baseline, 0) or 0.0, learned)
+                self._log_component_charge_fallback_once(job.model, str(error))
+        return predict_checkpoint_staging_ram_mb(baseline, job.model, size)
+
+    def _checkpoint_part_of_charge_mb(self, job: ImageGenerateJobPopResponse, verdict: BudgetVerdict) -> float:
+        """Return the checkpoint share of an admitted charge, the figure load-completion growth is checked against."""
+        if verdict.predicted_mb is None:
+            return 0.0
+        return max(0.0, verdict.predicted_mb - self._job_feature_ram(job).total_mb)
 
     def _unet_component_charge_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
         """The UNet-only RAM staging charge (MB) for a disaggregation-class ``job`` with a readable sidecar, else None.
@@ -6395,7 +6437,7 @@ class InferenceScheduler:
                 self._ram_reclaim.record_credit(
                     available_process,
                     model=job.model,
-                    effective_charge_mb=ram_verdict.predicted_mb,
+                    effective_charge_mb=self._checkpoint_part_of_charge_mb(job, ram_verdict),
                     kind=ReuseCreditKind.WHOLE,
                 )
             self._resolve_head_ram_defer(job, reason="admitted")
@@ -6747,6 +6789,14 @@ class InferenceScheduler:
             vram_mb=charge_mb if charge_mb is not None else 0.0,
             target_process_id=process_info.process_id,
             reserved_at_admit_mb=float(process_info.process_reserved_mb or 0),
+        )
+        self._reserve_ledger.set_planned_ram(
+            DISPATCH_ADMISSION_FLOW,
+            str(job.id_),
+            ram_mb=self._job_feature_ram(job).sampling_mb,
+            target_process_id=process_info.process_id,
+            private_at_admit_mb=process_info.ram_working_set_bytes / (1024 * 1024),
+            keep_progress=True,
         )
 
     def _upgrade_dispatch_reservation_to_full(
@@ -7780,8 +7830,15 @@ class InferenceScheduler:
                     "the preload target was retired during admission and no other slot is free",
                 )
             process = reselected
-        planned_charge_mb = preload_candidate_delta_mb(self.snapshot(), plan.job_id, process.process_id)
-        if self._send_preload(job, process, planned_charge_mb=planned_charge_mb):
+        send_snapshot = self.snapshot()
+        planned_charge_mb = preload_candidate_delta_mb(send_snapshot, plan.job_id, process.process_id)
+        planned_ram_mb = preload_ram_stage_mb(send_snapshot, plan.job_id, process.process_id)
+        if self._send_preload(
+            job,
+            process,
+            planned_charge_mb=planned_charge_mb,
+            planned_ram_mb=planned_ram_mb,
+        ):
             return AdmissionDecision.ADMIT, process, "preload sent"
         return AdmissionDecision.STOP_PASS, process, "preload send failed"
 

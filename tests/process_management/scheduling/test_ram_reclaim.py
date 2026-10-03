@@ -6,19 +6,21 @@ selection rules and the ledger's clocks directly, so a change to either is caugh
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo, LoadCompletionSample
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     CREEP_CONTAINMENT_RSS_BYTES,
     FRESH_INFERENCE_CHILD_BASELINE_MB,
     LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS,
     LANE_RAM_CONTAINMENT_RSS_BYTES,
+    LOAD_COMPLETION_REPORT_TIMEOUT_SECONDS,
     RAM_RECLAIM_CYCLE_GRACE_SECONDS,
-    REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
     REUSE_CREDIT_RECONCILE_SLACK_MB,
     STALE_RAM_UNLOAD_CYCLE_MIN_INTERVAL_SECONDS,
     RamCycleReason,
@@ -190,51 +192,86 @@ class TestIdleLanesOverCeiling:
 class TestRamReclaimLedger:
     """Reuse credits settle against measured growth, and the cycle grace is bounded by the clock."""
 
-    def _credited(self, ledger: RamReclaimLedger, *, rss_mb: float, charge_mb: float) -> HordeProcessInfo:
+    def _credited(
+        self,
+        ledger: RamReclaimLedger,
+        *,
+        rss_mb: float,
+        charge_mb: float,
+        kind: ReuseCreditKind = ReuseCreditKind.PAGE_REUSE,
+    ) -> HordeProcessInfo:
         target = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         target.ram_usage_bytes = int(rss_mb * _MB)
-        ledger.record_credit(target, model="m", effective_charge_mb=charge_mb, kind=ReuseCreditKind.PAGE_REUSE)
+        ledger.record_credit(target, model="m", effective_charge_mb=charge_mb, kind=kind)
         return target
 
+    @staticmethod
+    def _complete_load(
+        target: HordeProcessInfo,
+        *,
+        private_mb: float,
+        peak_mb: float | None = None,
+        model: str = "m",
+        sampled_at: float | None = None,
+    ) -> None:
+        """Seat the report that completed a load, as the process map records it from the child."""
+        target.loaded_horde_model_name = model
+        target.load_completion_sample = LoadCompletionSample(
+            process_launch_identifier=target.process_launch_identifier,
+            model=model,
+            sampled_at=time.time() + 1.0 if sampled_at is None else sampled_at,
+            private_bytes=int(private_mb * _MB),
+            peak_private_bytes=int((private_mb if peak_mb is None else peak_mb) * _MB),
+        )
+
     def test_record_captures_the_admit_baseline(self) -> None:
-        """The record holds the target's RSS at admit time and the clock's admission stamp."""
+        """The record holds the target's working set at admit time and the clock's admission stamp."""
         clock = _Clock()
         ledger = RamReclaimLedger(clock)
         self._credited(ledger, rss_mb=4000.0, charge_mb=1000.0)
         record = ledger.pending_reuse_credits[0]
-        assert record.rss_at_admit_mb == pytest.approx(4000.0)
+        assert record.private_at_admit_mb == pytest.approx(4000.0)
         assert record.admitted_at == clock.now
         assert record.kind is ReuseCreditKind.PAGE_REUSE
 
-    def test_a_credit_does_not_settle_before_the_grace(self) -> None:
-        """Inside the settle grace the record stays pending and nothing is reported."""
+    def test_a_record_waits_for_its_load_completion_report(self) -> None:
+        """Without the completing report the record stays pending, then is dropped unlearned at the timeout."""
         clock = _Clock()
         ledger = RamReclaimLedger(clock)
-        target = self._credited(ledger, rss_mb=4000.0, charge_mb=1000.0)
+        target = self._credited(ledger, rss_mb=4000.0, charge_mb=1000.0, kind=ReuseCreditKind.WHOLE)
         target.loaded_horde_model_name = "m"
-        clock.now += REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0
+        clock.now += LOAD_COMPLETION_REPORT_TIMEOUT_SECONDS - 1.0
         assert ledger.settle_credits(ProcessMap({0: target})) == []
         assert 0 in ledger.pending_reuse_credits
+        clock.now += 1.0
+        assert ledger.settle_credits(ProcessMap({0: target})) == []
+        assert ledger.pending_reuse_credits == {}
+        assert ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE) is None
 
-    def test_growth_within_slack_settles_silently(self) -> None:
-        """Growth at the charge plus slack retires the record without a discrepancy."""
+    def test_a_delayed_report_is_still_learned(self) -> None:
+        """A report that arrives after earlier settle passes still completes the record."""
         clock = _Clock()
         ledger = RamReclaimLedger(clock)
         target = self._credited(ledger, rss_mb=4000.0, charge_mb=1000.0)
-        target.loaded_horde_model_name = "m"
-        target.ram_usage_bytes = int((4000.0 + 1000.0 + REUSE_CREDIT_RECONCILE_SLACK_MB) * _MB)
-        clock.now += REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
+        assert ledger.settle_credits(ProcessMap({0: target})) == []
+        assert 0 in ledger.pending_reuse_credits
+        self._complete_load(target, private_mb=4500.0)
+        assert ledger.settle_credits(ProcessMap({0: target})) == []
+        assert ledger.pending_reuse_credits == {}
+
+    def test_growth_within_slack_settles_silently(self) -> None:
+        """Peak growth at the charge plus slack retires the record without a discrepancy."""
+        ledger = RamReclaimLedger(_Clock())
+        target = self._credited(ledger, rss_mb=4000.0, charge_mb=1000.0)
+        self._complete_load(target, private_mb=4000.0 + 1000.0 + REUSE_CREDIT_RECONCILE_SLACK_MB)
         assert ledger.settle_credits(ProcessMap({0: target})) == []
         assert 0 not in ledger.pending_reuse_credits
 
-    def test_growth_past_slack_is_reported_once(self) -> None:
-        """A too-generous credit comes back as one discrepancy carrying the measured growth."""
-        clock = _Clock()
-        ledger = RamReclaimLedger(clock)
+    def test_peak_past_slack_is_reported_once(self) -> None:
+        """A load that peaked past its charge plus slack comes back as one discrepancy carrying the peak growth."""
+        ledger = RamReclaimLedger(_Clock())
         target = self._credited(ledger, rss_mb=4000.0, charge_mb=1000.0)
-        target.loaded_horde_model_name = "m"
-        target.ram_usage_bytes = int((4000.0 + 1000.0 + REUSE_CREDIT_RECONCILE_SLACK_MB + 1.0) * _MB)
-        clock.now += REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
+        self._complete_load(target, private_mb=4500.0, peak_mb=4000.0 + 1000.0 + REUSE_CREDIT_RECONCILE_SLACK_MB + 1.0)
         discrepancies = ledger.settle_credits(ProcessMap({0: target}))
         assert len(discrepancies) == 1
         assert discrepancies[0].process_id == 0
@@ -256,31 +293,60 @@ class TestRamReclaimLedger:
         ledger.void_credit(7)
         assert ledger.pending_reuse_credits == {}
 
-    @pytest.mark.parametrize("fresh_report", [False, True])
-    def test_whole_load_learning_requires_a_report_after_admission(self, fresh_report: bool) -> None:
-        """Stale reports cannot make a cold load look free and depress its learned price."""
+    def test_learned_price_is_the_load_peak_from_completing_reports(self) -> None:
+        """Five completed loads train the peak growth; the margin applies to it."""
+        ledger = RamReclaimLedger(_Clock())
+        for _ in range(5):
+            target = self._credited(ledger, rss_mb=1100.0, charge_mb=7100.0, kind=ReuseCreditKind.WHOLE)
+            self._complete_load(target, private_mb=1100.0 + 6500.0, peak_mb=1100.0 + 8000.0)
+            assert ledger.settle_credits(ProcessMap({0: target})) == []
+        assert ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE) == pytest.approx(8800)
+
+    def test_periodic_reports_after_admission_never_train(self) -> None:
+        """Fresh periodic reports with the model loaded and the slot idle are not a completed load."""
         clock = _Clock()
         ledger = RamReclaimLedger(clock)
         target = make_mock_process_info(0, model_name="m", state=HordeProcessState.WAITING_FOR_JOB)
         target.ram_usage_bytes = 1100 * _MB
         for _ in range(5):
             ledger.record_credit(target, model="m", effective_charge_mb=7100, kind=ReuseCreditKind.WHOLE)
-            target.report_sampled_at = clock.now + (1 if fresh_report else -1)
-            target.ram_usage_bytes += 6500 * _MB
-            clock.now += REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
+            target.report_sampled_at = time.time() + 1.0
+            clock.now += 60.0
             assert ledger.settle_credits(ProcessMap({0: target})) == []
-        estimate = ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE)
-        assert estimate == (pytest.approx(7150) if fresh_report else None)
+        assert ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE) is None
+        assert 0 in ledger.pending_reuse_credits
+
+    @pytest.mark.parametrize("mismatch", ["sampled_before_admission", "other_model", "other_launch"])
+    def test_only_the_report_that_completed_this_load_counts(self, mismatch: str) -> None:
+        """A sample from before the admission, for another model, or from another launch leaves the record pending."""
+        ledger = RamReclaimLedger(_Clock())
+        target = self._credited(ledger, rss_mb=1100.0, charge_mb=7100.0, kind=ReuseCreditKind.WHOLE)
+        record = ledger.pending_reuse_credits[0]
+        self._complete_load(
+            target,
+            private_mb=1100.0,
+            model="other" if mismatch == "other_model" else "m",
+            sampled_at=record.admitted_at - 1.0 if mismatch == "sampled_before_admission" else None,
+        )
+        if mismatch == "other_launch":
+            sample = target.load_completion_sample
+            assert sample is not None
+            target.load_completion_sample = LoadCompletionSample(
+                process_launch_identifier=sample.process_launch_identifier + 1,
+                model=sample.model,
+                sampled_at=sample.sampled_at,
+                private_bytes=sample.private_bytes,
+                peak_private_bytes=sample.peak_private_bytes,
+            )
+        assert ledger.settle_credits(ProcessMap({0: target})) == []
+        assert 0 in ledger.pending_reuse_credits
 
     def test_replaced_launch_does_not_train_the_old_load(self) -> None:
         """A successor at the same process id cannot settle its predecessor's admission."""
-        clock = _Clock()
-        ledger = RamReclaimLedger(clock)
+        ledger = RamReclaimLedger(_Clock())
         target = self._credited(ledger, rss_mb=1100, charge_mb=7100)
         target.process_launch_identifier += 1
-        target.loaded_horde_model_name = "m"
-        target.ram_usage_bytes = 50000 * _MB
-        clock.now += REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
+        self._complete_load(target, private_mb=50000.0)
         assert ledger.settle_credits(ProcessMap({0: target})) == []
         assert ledger.pending_reuse_credits == {}
 
@@ -302,3 +368,75 @@ class TestRamReclaimLedger:
         assert ledger.cycle_grace_active() is True
         clock.now += 1.0
         assert ledger.cycle_grace_active() is False
+
+
+class TestLoadCompletionThroughTheMemoryReport:
+    """The report the dispatcher hands to the process map decides what the reclaim ledger may learn."""
+
+    @staticmethod
+    def _admitted(model: str = "m") -> tuple[ProcessMap, RamReclaimLedger, HordeProcessInfo, _Clock]:
+        target = make_mock_process_info(0, model_name=None, state=HordeProcessState.PRELOADING_MODEL)
+        process_map = ProcessMap({0: target})
+        process_map.on_memory_report(process_id=0, ram_usage_bytes=1100 * _MB, ram_private_bytes=1100 * _MB)
+        clock = _Clock()
+        ledger = RamReclaimLedger(clock)
+        ledger.record_credit(target, model=model, effective_charge_mb=6500.0, kind=ReuseCreditKind.WHOLE)
+        return process_map, ledger, target, clock
+
+    @staticmethod
+    def _report(process_map: ProcessMap, clock: _Clock, *, private_mb: float, peak_mb: float | None) -> None:
+        """Deliver a report sampled after the pending admission; time then moves past it, as it does live."""
+        clock.now += 1.0
+        process_map.on_memory_report(
+            process_id=0,
+            ram_usage_bytes=int((private_mb + 9000) * _MB),
+            ram_private_bytes=int(private_mb * _MB),
+            ram_private_peak_bytes=None if peak_mb is None else int(peak_mb * _MB),
+            report_sampled_at=clock.now,
+        )
+        clock.now += 1.0
+
+    def test_the_report_after_the_loaded_state_trains_the_peak(self) -> None:
+        """State change, then the completing report: five loads train the peak, not the larger RSS."""
+        process_map, ledger, target, clock = self._admitted()
+        for load in range(5):
+            if load:
+                # The slot unloaded and was admitted again; its private reading is back at the cold baseline.
+                process_map.on_memory_report(process_id=0, ram_usage_bytes=1100 * _MB, ram_private_bytes=1100 * _MB)
+                ledger.record_credit(target, model="m", effective_charge_mb=6500.0, kind=ReuseCreditKind.WHOLE)
+            target.loaded_horde_model_name = "m"
+            self._report(process_map, clock, private_mb=1100 + 6500, peak_mb=1100 + 7000)
+            assert ledger.settle_credits(process_map) == []
+            assert ledger.pending_reuse_credits == {}
+        assert ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE) == pytest.approx(7700)
+
+    def test_a_report_without_a_peak_never_completes_a_load(self) -> None:
+        """Periodic reports, and reports from a child that does not sample a peak, leave the record pending."""
+        process_map, ledger, target, clock = self._admitted()
+        target.loaded_horde_model_name = "m"
+        self._report(process_map, clock, private_mb=1100 + 6500, peak_mb=None)
+        assert ledger.settle_credits(process_map) == []
+        assert 0 in ledger.pending_reuse_credits
+        assert ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE) is None
+
+    def test_a_report_before_the_loaded_state_names_the_old_model_and_waits(self) -> None:
+        """A completing report seen before the model is recorded cannot be credited to the new load."""
+        process_map, ledger, target, clock = self._admitted()
+        target.loaded_horde_model_name = "previous"
+        self._report(process_map, clock, private_mb=1100 + 6500, peak_mb=1100 + 7000)
+        assert ledger.settle_credits(process_map) == []
+        assert 0 in ledger.pending_reuse_credits
+        target.loaded_horde_model_name = "m"
+        self._report(process_map, clock, private_mb=1100 + 6500, peak_mb=1100 + 7000)
+        assert ledger.settle_credits(process_map) == []
+        assert ledger.pending_reuse_credits == {}
+
+    def test_a_replaced_launch_drops_the_record_unlearned(self) -> None:
+        """A successor's completing report at the same process id cannot train its predecessor's admission."""
+        process_map, ledger, target, clock = self._admitted()
+        target.process_launch_identifier += 1
+        target.loaded_horde_model_name = "m"
+        self._report(process_map, clock, private_mb=1100 + 6500, peak_mb=1100 + 7000)
+        assert ledger.settle_credits(process_map) == []
+        assert ledger.pending_reuse_credits == {}
+        assert ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE) is None

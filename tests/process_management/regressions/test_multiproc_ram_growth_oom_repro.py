@@ -217,14 +217,16 @@ class TestPopHeldBeforeTheFloorToAvoidStaleJobs:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With available RAM just above the floor and a job in flight, the soft pop hold engages."""
+        """With available RAM just above the floor and a job's feature RAM still to land, the soft pop hold engages."""
         process_map = ProcessMap({1: _resident_idle_proc(1, "AlbedoBase XL (SDXL)")})
-        # A small feature transient can cross the 9.6 GB hard floor from this 9.65 GB reading.
-        # The reserve does not set a second floor at 13.6 GB.
+        # The dispatched job's outstanding feature RAM can cross the 9.6 GB hard floor from this 9.65 GB
+        # reading. The reserve does not set a second floor at 13.6 GB.
         scheduler = _ram_pressured_scheduler(process_map, available_ram_mb=9650.0)
         job = make_job_pop_response("AlbedoBase XL (SDXL)")
         await track_popped_job_async(scheduler._job_tracker, job)
         await scheduler._job_tracker.mark_inference_started(job)
+        scheduler._record_dispatch_reservation(job, process_map[1], baseline=None)
+        assert scheduler._outstanding_planned_ram_mb() > 50.0
 
         scheduler._govern_ram_pressure_if_pressured()
 

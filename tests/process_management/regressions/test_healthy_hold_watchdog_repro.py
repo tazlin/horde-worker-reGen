@@ -68,7 +68,7 @@ class TestGovernanceHealthyButHeldPredicate:
         """The healthy-hold watchdog respects an intentional transient-risk hold."""
         scheduler = self._scheduler_with_verdict(monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
         scheduler._state.ram_pressure_pop_hold = True
-        scheduler._last_ram_headroom = ram_headroom(_TOTAL_RAM_MB, in_flight_transient_mb=30000)
+        scheduler._last_ram_headroom = ram_headroom(_TOTAL_RAM_MB, outstanding_mb=30000)
         scheduler._job_tracker = Mock(spec=JobTracker, jobs_in_progress=[Mock()])
         assert scheduler.governance_healthy_but_held() is False
 

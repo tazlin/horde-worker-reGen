@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo, LoadCompletionSample
 from horde_worker_regen.process_management.resources.ram_footprints import LearnedRamStore
 
 FRESH_INFERENCE_CHILD_BASELINE_MB = 1100.0
@@ -65,12 +65,14 @@ LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS = 180.0
 """Minimum time between two RAM-unload requests to the same idle service lane, so the reload cost stays
 negligible against the RAM returned."""
 
-REUSE_CREDIT_RECONCILE_SETTLE_SECONDS = 30.0
-"""How long after a credited admission the target's RSS must settle before the credit is reconciled, so the
-measured-truth check reads steady-state RSS rather than a mid-load spike."""
+LOAD_COMPLETION_REPORT_TIMEOUT_SECONDS = 600.0
+"""How long an admitted load may go without its load-completion report before its record is dropped unlearned.
+
+Longer than a cold load of the largest checkpoint from a slow disk; a load still unreported by then failed or
+was abandoned, and its record would otherwise wait forever."""
 
 REUSE_CREDIT_RECONCILE_SLACK_MB = 2048.0
-"""How far a credited admission's measured RSS growth may exceed its charge before it is flagged too generous.
+"""How far a credited admission's measured peak growth may exceed its charge before it is flagged too generous.
 
 Absorbs ordinary per-job creep and measurement noise so only a materially over-generous credit is reported."""
 
@@ -101,19 +103,19 @@ class ReuseCreditRecord:
 
     model: str
     """The model the credited preload was staging onto the target."""
-    rss_at_admit_mb: float
-    """The target's resident RSS (MB) at admit time, the baseline the settled growth is measured against."""
+    private_at_admit_mb: float
+    """The target's private working set (MB, RSS fallback) at admit time, the baseline growth is measured from."""
     effective_charge_mb: float
-    """The charge (MB) the admission priced the load at; the growth is reconciled against this."""
+    """The checkpoint charge (MB) the admission priced the load at; the growth is reconciled against this."""
     admitted_at: float
-    """When the admission was credited, gating the settle grace before reconciliation."""
+    """When the admission was recorded, on the scheduler clock children stamp their reports with."""
     kind: ReuseCreditKind = ReuseCreditKind.PAGE_REUSE
     process_launch_identifier: int | None = None
 
 
 @dataclass(frozen=True)
 class ReuseCreditDiscrepancy:
-    """A settled credited admission whose measured RSS growth exceeded its charge by more than the slack."""
+    """A settled admission whose measured peak growth exceeded its charge by more than the slack."""
 
     process_id: int
     record: ReuseCreditRecord
@@ -266,7 +268,7 @@ class RamReclaimLedger:
         """Record a credited admission onto ``target`` for the measured-truth check once its load settles."""
         self.pending_reuse_credits[target.process_id] = ReuseCreditRecord(
             model=model,
-            rss_at_admit_mb=max(0, target.ram_usage_bytes) / (1024 * 1024),
+            private_at_admit_mb=max(0, target.ram_working_set_bytes) / (1024 * 1024),
             effective_charge_mb=effective_charge_mb,
             admitted_at=self._clock(),
             kind=kind,
@@ -278,11 +280,13 @@ class RamReclaimLedger:
         self.pending_reuse_credits.pop(process_id, None)
 
     def settle_credits(self, process_map: Mapping[int, HordeProcessInfo]) -> list[ReuseCreditDiscrepancy]:
-        """Retire every settled credit, returning the ones whose measured growth exceeded the charge plus slack.
+        """Retire every admission whose load-completion report arrived, returning those that outgrew their charge.
 
-        A credit settles once its target has held the staged model idle past the settle grace. Growth below the
-        charge is the intended outcome of marginal load accounting and is not reported. Records for vanished slots are
-        dropped so the map does not accumulate.
+        Only the report that completed this admission's load counts: same launch, same model, sampled after
+        the admission. Until it arrives the record stays pending, so a delayed report is still learned from.
+        A record whose launch was replaced, or whose report never arrives within
+        :data:`LOAD_COMPLETION_REPORT_TIMEOUT_SECONDS`, is dropped without learning. Growth below the charge is
+        the intended outcome of marginal load accounting and is not reported.
         """
         now = self._clock()
         discrepancies: list[ReuseCreditDiscrepancy] = []
@@ -294,24 +298,32 @@ class RamReclaimLedger:
             ):
                 del self.pending_reuse_credits[process_id]
                 continue
-            settled = (
-                now - record.admitted_at >= REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
-                and process_info.loaded_horde_model_name == record.model
-                and not process_info.is_process_busy()
-            )
-            if not settled:
+            sample = process_info.load_completion_sample
+            if sample is None or not self._completes(record, sample):
+                if now - record.admitted_at >= LOAD_COMPLETION_REPORT_TIMEOUT_SECONDS:
+                    del self.pending_reuse_credits[process_id]
                 continue
             del self.pending_reuse_credits[process_id]
-            growth_mb = max(0, process_info.ram_usage_bytes) / (1024 * 1024) - record.rss_at_admit_mb
-            if (
-                record.effective_charge_mb > 0
-                and process_info.report_sampled_at is not None
-                and process_info.report_sampled_at > record.admitted_at
-            ):
-                self.learned_ram.observe(record.model, record.kind, growth_mb)
-            if growth_mb > record.effective_charge_mb + REUSE_CREDIT_RECONCILE_SLACK_MB:
-                discrepancies.append(ReuseCreditDiscrepancy(process_id, record, growth_mb))
+            settled_mb = sample.private_bytes / (1024 * 1024) - record.private_at_admit_mb
+            peak_mb = sample.peak_private_bytes / (1024 * 1024) - record.private_at_admit_mb
+            if record.effective_charge_mb > 0:
+                self.learned_ram.observe(record.model, record.kind, settled_mb, peak_mb)
+            if peak_mb > record.effective_charge_mb + REUSE_CREDIT_RECONCILE_SLACK_MB:
+                discrepancies.append(ReuseCreditDiscrepancy(process_id, record, peak_mb))
         return discrepancies
+
+    @staticmethod
+    def _completes(record: ReuseCreditRecord, sample: LoadCompletionSample) -> bool:
+        """Whether ``sample`` is the report that completed ``record``'s load."""
+        return (
+            sample.model == record.model
+            and (
+                record.process_launch_identifier is None
+                or sample.process_launch_identifier == record.process_launch_identifier
+            )
+            and sample.sampled_at is not None
+            and sample.sampled_at > record.admitted_at
+        )
 
     def note_cycle(self) -> None:
         """Open the reclaim-cycle grace: a slot is respawning and the next head must preload onto it."""

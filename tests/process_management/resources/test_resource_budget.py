@@ -250,6 +250,59 @@ class TestCommittedReserveLedger:
         assert ledger.effective_planned_vram_mb({3: 6158.0}) == 6158.0
 
 
+class TestPlannedRamLedger:
+    """Planned RAM decays by its target's private growth and is pruned by omission, apart from planned VRAM."""
+
+    def test_planned_ram_decays_with_private_growth_and_never_resurrects(self) -> None:
+        """Growth past admit consumes the charge; a later drop in the reading cannot bring it back."""
+        ledger = CommittedReserveLedger()
+        ledger.set_planned_ram("preload", "3", ram_mb=6500.0, target_process_id=3, private_at_admit_mb=1100.0)
+        assert ledger.effective_planned_ram_mb({3: 1100.0}) == 6500.0
+        assert ledger.effective_planned_ram_mb({3: 4100.0}) == 3500.0
+        assert ledger.effective_planned_ram_mb({3: 1100.0}) == 3500.0
+        assert ledger.effective_planned_ram_mb({3: 9000.0}) == 0.0
+
+    def test_absent_target_keeps_the_full_charge(self) -> None:
+        """A target with no reading has shown no growth."""
+        ledger = CommittedReserveLedger()
+        ledger.set_planned_ram("dispatch", "job", ram_mb=2000.0, target_process_id=4, private_at_admit_mb=9000.0)
+        assert ledger.effective_planned_ram_mb({}) == 2000.0
+
+    def test_refresh_with_progress_keeps_what_materialised(self) -> None:
+        """Re-booking a dispatch at clearance cannot count its materialised features a second time."""
+        ledger = CommittedReserveLedger()
+        ledger.set_planned_ram("dispatch", "job", ram_mb=3000.0, target_process_id=2, private_at_admit_mb=0.0)
+        assert ledger.effective_planned_ram_mb({2: 1000.0}) == 2000.0
+        ledger.set_planned_ram(
+            "dispatch", "job", ram_mb=3000.0, target_process_id=2, private_at_admit_mb=1000.0, keep_progress=True
+        )
+        assert ledger.effective_planned_ram_mb({2: 1000.0}) == 2000.0
+
+    def test_new_admission_on_the_same_unit_starts_in_full(self) -> None:
+        """A second preload onto a process is a new load whose charge is not credited by the last one's growth."""
+        ledger = CommittedReserveLedger()
+        ledger.set_planned_ram("preload", "3", ram_mb=6500.0, target_process_id=3, private_at_admit_mb=0.0)
+        assert ledger.effective_planned_ram_mb({3: 6500.0}) == 0.0
+        ledger.set_planned_ram("preload", "3", ram_mb=6500.0, target_process_id=3, private_at_admit_mb=6500.0)
+        assert ledger.effective_planned_ram_mb({3: 6500.0}) == 6500.0
+
+    def test_reconcile_and_release_prune_only_ram_entries_of_that_unit(self) -> None:
+        """Omission drops a unit's RAM; release drops it with the unit's other charges; planned VRAM is separate."""
+        ledger = CommittedReserveLedger()
+        ledger.set_planned("preload", "0", vram_mb=5000.0, target_process_id=0, reserved_at_admit_mb=0.0)
+        ledger.set_planned_ram("preload", "0", ram_mb=6500.0, target_process_id=0, private_at_admit_mb=0.0)
+        ledger.set_planned_ram("preload", "1", ram_mb=4000.0, target_process_id=1, private_at_admit_mb=0.0)
+        ledger.set_planned_ram("dispatch", "job", ram_mb=600.0, target_process_id=0, private_at_admit_mb=0.0)
+        ledger.reconcile_planned_ram("preload", ["0"])
+        assert ledger.effective_planned_ram_mb({}) == 7100.0
+        assert ledger.effective_planned_vram_mb({}) == 5000.0
+        ledger.release("dispatch", "job")
+        assert ledger.effective_planned_ram_mb({}) == 6500.0
+        ledger.reconcile_planned("preload", [])
+        assert ledger.effective_planned_ram_mb({}) == 6500.0
+        assert ledger.total_ram_mb() == 0.0
+
+
 class TestAdmissionNoiseBuffer:
     """The proportional noise buffer: the greater of a fixed floor and a fraction of the device total."""
 

@@ -532,9 +532,13 @@ class TestRamAdmission:
         scheduler._read_component_sidecar = lambda _model: _Sidecar()  # type: ignore[assignment, method-assign, return-value]
         job_id = str(jobs[0].id_)
 
-        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+        snapshot = scheduler.snapshot()
+        admission = decide_ram_admission(snapshot, job_id, 0)
         assert admission.kind is RamChargeKind.COMPONENT
-        assert admission.verdict.predicted_mb == 6000.0, "the residual, not the whole checkpoint net of pages"
+        features_mb = snapshot.queue.jobs[job_id].feature_ram_mb
+        assert admission.verdict.predicted_mb == 6000.0 + features_mb, (
+            "the residual plus the job's features, not the whole checkpoint net of pages"
+        )
 
         scheduler._checkpoint_models_held_on = lambda _pid: frozenset({"sd"})  # type: ignore[method-assign]
         assert preload.component_charge_mb(scheduler.snapshot(), job_id, 0) == 0.0

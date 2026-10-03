@@ -27,7 +27,7 @@ import pytest
 from loguru import logger
 
 from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot, HordeProcessState
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo, LoadCompletionSample
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.resources import resource_budget
@@ -35,7 +35,6 @@ from horde_worker_regen.process_management.resources.resource_budget import _COM
 from horde_worker_regen.process_management.scheduling.admission import preload
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
-    REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
     ReuseCreditKind,
     ReuseCreditRecord,
 )
@@ -205,12 +204,14 @@ class TestMissingSidecarParity:
         mono_admitted, mono_record = await _run(disaggregation_class=False)
 
         # The reuse credit admits both (retained 6900 MB -> credit 4830 MB -> effective 11170 MB fits 17946).
+        # The record keeps the checkpoint share of that charge, the part load-completion growth is checked against.
         assert disagg_admitted is True
         assert mono_admitted is True
         assert disagg_record is not None
         assert mono_record is not None
         assert disagg_record.effective_charge_mb == pytest.approx(mono_record.effective_charge_mb)
-        assert disagg_record.effective_charge_mb == pytest.approx(11170.0)
+        features_mb = resource_budget.predict_job_feature_ram_mb(make_job_pop_response("no_sidecar_model"), None)
+        assert disagg_record.effective_charge_mb == pytest.approx(11170.0 - features_mb.total_mb)
         assert disagg_record.kind == mono_record.kind == ReuseCreditKind.PAGE_REUSE
 
 
@@ -263,12 +264,19 @@ class TestComponentChargeReconciliation:
         """Seat a settled component-kind credited target on ``scheduler`` whose RSS grew since admit time."""
         proc = make_mock_process_info(0, model_name="disagg_model", state=HordeProcessState.WAITING_FOR_JOB)
         proc.ram_usage_bytes = int(now_rss_mb * _MB)
+        proc.load_completion_sample = LoadCompletionSample(
+            process_launch_identifier=proc.process_launch_identifier,
+            model=proc.loaded_horde_model_name,
+            sampled_at=time.time(),
+            private_bytes=proc.ram_usage_bytes,
+            peak_private_bytes=proc.ram_usage_bytes,
+        )
         scheduler._process_map = ProcessMap({0: proc})
         scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord(
             model="disagg_model",
-            rss_at_admit_mb=admit_rss_mb,
+            private_at_admit_mb=admit_rss_mb,
             effective_charge_mb=charge_mb,
-            admitted_at=time.time() - REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
+            admitted_at=time.time() - 1.0,
             kind=ReuseCreditKind.COMPONENT,
         )
 
@@ -306,7 +314,7 @@ class TestComponentChargeReconciliation:
         scheduler = _make_inference_scheduler(process_map=ProcessMap({}))
         scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord(
             model="disagg_model",
-            rss_at_admit_mb=2000.0,
+            private_at_admit_mb=2000.0,
             effective_charge_mb=6000.0,
             admitted_at=time.time(),
             kind=ReuseCreditKind.COMPONENT,
@@ -319,12 +327,19 @@ class TestComponentChargeReconciliation:
         scheduler = _make_inference_scheduler()
         proc = make_mock_process_info(0, model_name="m", state=HordeProcessState.WAITING_FOR_JOB)
         proc.ram_usage_bytes = int(9000.0 * _MB)
+        proc.load_completion_sample = LoadCompletionSample(
+            process_launch_identifier=proc.process_launch_identifier,
+            model=proc.loaded_horde_model_name,
+            sampled_at=time.time(),
+            private_bytes=proc.ram_usage_bytes,
+            peak_private_bytes=proc.ram_usage_bytes,
+        )
         scheduler._process_map = ProcessMap({0: proc})
         scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord(
             model="m",
-            rss_at_admit_mb=2000.0,
+            private_at_admit_mb=2000.0,
             effective_charge_mb=1000.0,
-            admitted_at=time.time() - REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
+            admitted_at=time.time() - 1.0,
             kind=ReuseCreditKind.PAGE_REUSE,
         )
         messages: list[object] = []

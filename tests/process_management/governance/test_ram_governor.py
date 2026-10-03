@@ -70,7 +70,7 @@ def _snapshot(
         thresholds=ram_headroom(
             None,
             min_free_mb=assess_ram_pressure(None, _TOTAL_RAM_MB).floor_mb,
-            in_flight_transient_mb=pop_hold_margin_mb if in_flight_job_count else 0.0,
+            outstanding_mb=pop_hold_margin_mb if in_flight_job_count else 0.0,
         ),
         per_process_ceiling_mb=per_process_ceiling_mb,
         multi_gpu_routing_active=multi_gpu_routing_active,

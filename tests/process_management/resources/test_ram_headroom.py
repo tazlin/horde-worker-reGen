@@ -1,17 +1,24 @@
-"""RAM threshold ordering, physical feasibility and marginal load pricing."""
+"""RAM threshold ordering, conservation of admitted allocations and marginal load pricing."""
 
 import pytest
+from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.generation_parameters import KNOWN_FACEFIXERS, KNOWN_UPSCALERS
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from horde_worker_regen.process_management.resources.ram_footprints import LearnedRamStore
 from horde_worker_regen.process_management.resources.resource_budget import (
+    RamBudget,
     predict_checkpoint_staging_ram_mb,
     predict_context_ram_mb,
-    predict_job_transient_ram_mb,
+    predict_job_feature_ram_mb,
     ram_headroom,
 )
 from tests.process_management.conftest import make_job_pop_response
+
+_MB = 1024 * 1024
+_SEEDED_BASELINES = [baseline for baseline in KNOWN_IMAGE_GENERATION_BASELINE if predict_context_ram_mb(baseline)]
+_POST_PROCESSORS = [KNOWN_UPSCALERS.RealESRGAN_x4plus.value, KNOWN_FACEFIXERS.CodeFormers.value]
 
 
 @given(
@@ -20,62 +27,138 @@ from tests.process_management.conftest import make_job_pop_response
     pause=st.floats(min_value=50, max_value=100),
     charge=st.floats(min_value=0, max_value=32000),
     context=st.floats(min_value=1100, max_value=32000),
-    risk=st.floats(min_value=0, max_value=8000),
+    outstanding=st.floats(min_value=0, max_value=16000),
 )
-def test_requirements_are_ordered_and_reserve_is_paid_once(
+def test_requirements_are_ordered_and_count_outstanding_work_once(
     total: float,
     reserve: float,
     pause: float,
     charge: float,
     context: float,
-    risk: float,
+    outstanding: float,
 ) -> None:
-    """All gates read one reserve and ordered absolute thresholds, even for unfit work."""
+    """Every requirement keeps max(floor, reserve) after outstanding work and the new allocation both land."""
     model = ram_headroom(
         total,
         reserve_mb=reserve,
         pause_percent=pause,
         staging_charge_mb=charge,
         context_cost_mb=context,
-        in_flight_transient_mb=risk,
+        outstanding_mb=outstanding,
     )
+    kept = max(reserve, model.hard_floor_mb)
     assert model.hard_floor_mb <= model.soft_hold_mb <= model.preload_requirement_mb <= model.restore_requirement_mb
-    assert model.preload_requirement_mb == max(model.soft_hold_mb, max(reserve, model.hard_floor_mb) + charge)
-    assert model.restore_requirement_mb == max(
-        model.preload_requirement_mb, max(reserve, model.hard_floor_mb) + context
-    )
+    assert model.soft_hold_mb == pytest.approx(model.hard_floor_mb + outstanding)
+    assert model.preload_requirement_mb == pytest.approx(kept + outstanding + charge)
+    assert model.restore_requirement_mb >= kept + outstanding + context
 
 
 @given(
-    total=st.integers(16384, 131072),
-    context=st.integers(1100, 28000),
-    count=st.integers(1, 4),
+    available=st.floats(min_value=0, max_value=80000),
+    committed=st.floats(min_value=0, max_value=8000),
+    outstanding=st.floats(min_value=0, max_value=12000),
+    charge=st.floats(min_value=0, max_value=30000),
+    credit=st.floats(min_value=0, max_value=20000),
+    component=st.one_of(st.none(), st.floats(min_value=0, max_value=12000)),
+    floor=st.floats(min_value=0, max_value=12000),
+    reserve=st.floats(min_value=0, max_value=16384),
+)
+def test_every_accepted_admission_conserves_the_reserve(
+    available: float,
+    committed: float,
+    outstanding: float,
+    charge: float,
+    credit: float,
+    component: float | None,
+    floor: float,
+    reserve: float,
+) -> None:
+    """Whole, credited and component admissions all leave max(floor, reserve) once everything lands."""
+    verdict = RamBudget(reserve_mb=reserve).check_job(
+        make_job_pop_response("m"),
+        None,
+        available,
+        committed_reserve_mb=committed,
+        reusable_credit_mb=credit,
+        danger_floor_mb=floor,
+        disaggregated=component is not None,
+        component_charge_mb=component,
+        staging_charge_mb=charge,
+        outstanding_planned_mb=outstanding,
+    )
+    assume(verdict.fits and verdict.predicted_mb is not None)
+    assert verdict.predicted_mb is not None
+    assert available - committed - outstanding - verdict.predicted_mb >= max(floor, reserve) - 1e-6
+
+
+def test_outstanding_and_incoming_allocations_cannot_spend_the_same_headroom() -> None:
+    """Outstanding feature RAM and an incoming stage that land together would leave 4.5 GB under a 6.3 GB floor."""
+    verdict = RamBudget(reserve_mb=8192).check_job(
+        make_job_pop_response("m"),
+        None,
+        15000,
+        danger_floor_mb=6300,
+        staging_charge_mb=6500,
+        outstanding_planned_mb=4000,
+    )
+    assert not verdict.fits
+    assert verdict.available_mb == 11000
+    assert verdict.reserve_mb == 8192
+
+
+@given(
+    total=st.integers(32768, 131072),
     reserve=st.integers(0, 8192),
     pause=st.integers(80, 95),
+    baseline=st.sampled_from(_SEEDED_BASELINES),
+    resident=st.integers(1, 3),
+    post_processing=st.lists(st.sampled_from(_POST_PROCESSORS), unique=True, max_size=2),
+    file_mb=st.integers(2000, 24000),
 )
-def test_feasible_planned_contexts_do_not_starve_themselves(
+def test_physically_feasible_plans_are_admitted_at_real_prices(
     total: int,
-    context: int,
-    count: int,
     reserve: int,
     pause: int,
+    baseline: str,
+    resident: int,
+    post_processing: list[str],
+    file_mb: int,
 ) -> None:
-    """No foreign occupancy: resident work pays only new transients, never its context cost again."""
+    """With no foreign occupancy, a plan that fits beside the reserve is admitted, so the worker cannot starve itself.
+
+    Feasibility is conservation alone: resident contexts at their seed, the features of a job running on each,
+    the incoming checkpoint with its features, and max(floor, reserve) fit the host together.
+    """
+    job = make_job_pop_response("m", width=1024, height=1024, post_processing=post_processing or None)
+    context = predict_context_ram_mb(baseline)
+    checkpoint = predict_checkpoint_staging_ram_mb(baseline, None, file_mb * _MB)
+    assert context is not None and checkpoint is not None
+    features = predict_job_feature_ram_mb(job, baseline).total_mb
+    floor = ram_headroom(total, pause_percent=pause).hard_floor_mb
+    available = total - context * resident
+    outstanding = features * resident
+    kept = max(floor, reserve)
+    assume(available - outstanding - checkpoint - features >= kept)
+
+    verdict = RamBudget(reserve_mb=reserve).check_job(
+        job,
+        baseline,
+        available,
+        danger_floor_mb=floor,
+        staging_charge_mb=checkpoint + features,
+        outstanding_planned_mb=outstanding,
+    )
+    assert verdict.fits
     thresholds = ram_headroom(
         total,
         reserve_mb=reserve,
         pause_percent=pause,
-        staging_charge_mb=600,
+        outstanding_mb=outstanding,
+        staging_charge_mb=checkpoint + features,
         context_cost_mb=context,
-        in_flight_transient_mb=600 * count,
     )
-    planned_free = total - context * count
-    # Physical feasibility includes the floor, operator reserve, and outstanding transient risk.
-    assume(planned_free >= max(thresholds.hard_floor_mb, reserve) + 600 * count)
-    assert planned_free >= thresholds.soft_hold_mb
-    assert planned_free >= thresholds.preload_requirement_mb
-    before_restore = total - context * (count - 1)
-    assert before_restore >= thresholds.restore_requirement_mb
+    if available - outstanding - context >= kept:
+        assert available >= thresholds.restore_requirement_mb
 
 
 @pytest.mark.parametrize(("total", "reserve", "pause"), [(63434, 8192, 90), (65536, 4096, 85)])
@@ -87,20 +170,32 @@ def test_two_fp8_contexts_on_a_64gb_host(total: int, reserve: int, pause: int) -
         pause_percent=pause,
         staging_charge_mb=600,
         context_cost_mb=24000,
-        in_flight_transient_mb=1200,
+        outstanding_mb=1200,
     )
     assert total - 48000 >= model.preload_requirement_mb
     assert total - 24000 >= model.restore_requirement_mb
 
 
-def test_sdxl_checkpoint_swap_uses_file_bytes_and_feature_deltas() -> None:
-    """A checkpoint swap is around 7 GB even though a cold SDXL context is seeded at 12 GB."""
-    job = make_job_pop_response("sdxl", width=1024, height=1024)
+def test_checkpoint_price_excludes_features() -> None:
+    """A checkpoint swap is priced at file bytes, the 12 GB seed only without a file, and never with features."""
     baseline = "stable_diffusion_xl"
-    delta = predict_job_transient_ram_mb(job, baseline)
-    assert predict_checkpoint_staging_ram_mb(job, baseline, 6500 * 1024 * 1024) == 6500 + delta
+    assert predict_checkpoint_staging_ram_mb(baseline, None, 6500 * _MB) == 6500
     assert predict_context_ram_mb(baseline) == 12000
-    assert predict_checkpoint_staging_ram_mb(job, baseline, None) == 12000 + delta
+    assert predict_checkpoint_staging_ram_mb(baseline, None, None) == 12000
+
+
+def test_feature_ram_is_split_by_the_process_that_allocates_it() -> None:
+    """Post-processors add RAM to the post-processing process only; sampling features stay on inference."""
+    baseline = "stable_diffusion_xl"
+    plain = predict_job_feature_ram_mb(make_job_pop_response("m", width=1024, height=1024), baseline)
+    heavy = predict_job_feature_ram_mb(
+        make_job_pop_response("m", width=1024, height=1024, post_processing=_POST_PROCESSORS),
+        baseline,
+    )
+    assert plain.post_processing_mb == 0
+    assert heavy.sampling_mb == plain.sampling_mb
+    assert heavy.post_processing_mb > 0
+    assert heavy.total_mb == heavy.sampling_mb + heavy.post_processing_mb
 
 
 def test_learned_growth_is_trusted_bidirectionally_and_separated_by_load_kind() -> None:
@@ -112,11 +207,22 @@ def test_learned_growth_is_trusted_bidirectionally_and_separated_by_load_kind() 
     store.observe("sdxl", "whole", 6500)
     assert store.measured_estimate_mb("sdxl", "whole") == pytest.approx(7150)
     store.observe("sdxl", "whole", 10000)
-    assert store.measured_estimate_mb("sdxl", "whole") == 11000
+    assert store.measured_estimate_mb("sdxl", "whole") == pytest.approx(11000)
     assert store.measured_estimate_mb("sdxl", "component") is None
     for _ in range(20):
         store.observe("sdxl", "whole", 6000)
     assert store.measured_estimate_mb("sdxl", "whole") == pytest.approx(6600)
+
+
+def test_learned_price_follows_the_load_peak() -> None:
+    """A load that touched more than it kept is priced at what it touched."""
+    store = LearnedRamStore()
+    for _ in range(5):
+        store.observe("sdxl", "whole", 6500, 8000)
+    assert store.measured_estimate_mb("sdxl", "whole") == pytest.approx(8800)
+    for _ in range(5):
+        store.observe("flux", "whole", 9000, 5000)
+    assert store.measured_estimate_mb("flux", "whole") == pytest.approx(9900)
 
 
 def test_linux_private_reading_excludes_clean_checkpoint_mappings() -> None:
@@ -130,6 +236,18 @@ def test_linux_private_reading_excludes_clean_checkpoint_mappings() -> None:
         == 8200000 * 1024
     )
     assert linux_private_ram_bytes("Rss: 100 kB\n") is None
+
+
+def test_peak_sampler_keeps_the_highest_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The peak survives a load whose settled reading is lower than what it touched."""
+    from horde_worker_regen.utils import private_memory
+
+    readings = iter([1000, 9000, 4000])
+    monkeypatch.setattr(private_memory, "private_ram_usage_bytes", lambda _process: next(readings, 4000))
+    sampler = private_memory.PrivateRamPeakSampler(interval_seconds=3600)
+    with sampler:
+        sampler._sample()
+    assert sampler.peak_bytes == 9000
 
 
 def test_host_cache_eviction_conserves_physical_ram_and_delays_the_next_load() -> None:

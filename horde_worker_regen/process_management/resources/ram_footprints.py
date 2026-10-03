@@ -16,19 +16,21 @@ class _RamObservation:
 
 
 class LearnedRamStore:
-    """Record settled load growth, trusting bidirectional estimates after five observations.
+    """Record a checkpoint load's peak growth, trusting bidirectional estimates after five observations.
 
-    Whole, reused-page and component loads never share evidence: growth for a reused slot cannot
-    demonstrate that a cold checkpoint load is cheap. The recent maximum and ten-percent margin mirror
-    the trust policy of the bidirectional VRAM estimate. This store is scoped to one worker launch.
+    Observations come from load completion, before a job runs, so they hold no feature RAM and one price
+    serves every feature mix. Whole, reused-page and component loads never share evidence: growth for a
+    reused slot cannot demonstrate that a cold checkpoint load is cheap. The recent maximum and ten-percent
+    margin mirror the trust policy of the bidirectional VRAM estimate. This store is scoped to one launch.
     """
 
     def __init__(self) -> None:
         """Initialize an empty observation store."""
         self._observations: dict[tuple[str, str], _RamObservation] = {}
 
-    def observe(self, model: str, kind: str, growth_mb: float) -> None:
-        """Record nonnegative, finite settled growth for this staging identity."""
+    def observe(self, model: str, kind: str, settled_mb: float, peak_mb: float | None = None) -> None:
+        """Record a load's growth; the peak counts when reported, never below the settled growth."""
+        growth_mb = settled_mb if peak_mb is None else max(settled_mb, peak_mb)
         if not isfinite(growth_mb) or growth_mb < 0:
             return
         observation = self._observations.setdefault((model, kind), _RamObservation())

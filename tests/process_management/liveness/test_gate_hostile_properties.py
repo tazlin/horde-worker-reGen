@@ -854,6 +854,10 @@ class TestHostRamGates:
             bridge_data=make_mock_bridge_data(enable_vram_budget=True, vram_reserve_mb=0, ram_reserve_mb=8192),
         )
         monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 64000.0)
+        # The dispatch books the job's feature RAM, which is what the soft hold protects until it lands.
+        scheduler._record_dispatch_reservation(
+            scheduler._job_tracker.jobs_in_progress[0], scheduler._process_map[0], baseline=None
+        )
         floor = scheduler._ram_danger_floor_mb()
         for available, held in [(floor + 100, True), (floor + 8000, False), (floor + 50, True), (floor + 4000, False)]:
             scheduler.set_available_ram_mb_provider(lambda reading=available: reading)

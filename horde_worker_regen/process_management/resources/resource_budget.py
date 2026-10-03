@@ -31,7 +31,7 @@ from loguru import logger
 from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
     from hordelib.feature_impact import FEATURE_KIND, BaselineBurden, BurdenEstimate
 
@@ -1393,27 +1393,51 @@ def predict_context_ram_mb(baseline: str | None, model: str | None = None) -> fl
     return None if burden is None else float(burden.ram_base_mb)
 
 
-def predict_job_transient_ram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float:
-    """Return feature RAM that in-flight work may still allocate, excluding resident checkpoint pages."""
-    whole = predict_job_ram_mb(job, baseline)
+@dataclass(frozen=True)
+class JobFeatureRam:
+    """Feature RAM (MB) a job allocates beyond its checkpoint, split by the process that allocates it."""
+
+    sampling_mb: float
+    """Allocated by the inference process while the job samples."""
+    post_processing_mb: float
+    """Allocated by the post-processing process; zero for a job without post-processing features."""
+
+    @property
+    def total_mb(self) -> float:
+        """Every feature allocation the job makes."""
+        return self.sampling_mb + self.post_processing_mb
+
+
+def predict_job_feature_ram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> JobFeatureRam:
+    """Return a job's feature RAM by phase, or the transient headroom charged to sampling without an estimate."""
+    burden = _estimate_job_burden(job, baseline)
     context = predict_context_ram_mb(baseline, job.model)
-    if whole is None or context is None:
-        return _MARGINAL_STAGING_TRANSIENT_HEADROOM_MB
-    return max(0.0, whole - context)
+    if burden is None or context is None:
+        return JobFeatureRam(_MARGINAL_STAGING_TRANSIENT_HEADROOM_MB, 0.0)
+    try:
+        # pyrefly: ignore[missing-attribute] - the pinned hordelib may predate the RAM phase split; handled below
+        sampling_mb = float(burden.ram_sampling_mb)
+        # pyrefly: ignore[missing-attribute] - as above
+        post_processing_mb = float(burden.ram_post_processing_mb)
+    except AttributeError:
+        # An older pinned hordelib predates the RAM phase split; every feature is charged to sampling.
+        return JobFeatureRam(max(0.0, burden.ram_mb - context), 0.0)
+    return JobFeatureRam(max(0.0, sampling_mb - context), max(0.0, post_processing_mb))
 
 
 def predict_checkpoint_staging_ram_mb(
-    job: ImageGenerateJobPopResponse,
     baseline: str | None,
+    model: str | None,
     checkpoint_bytes: int | None,
 ) -> float | None:
-    """Return checkpoint bytes plus feature deltas, falling back to the context seed only without a file."""
+    """Return a checkpoint's staging RAM from its file size, else its context seed, never below the swap floor.
+
+    Feature RAM is excluded; callers add the job's own features, so one price serves every feature mix.
+    """
     if checkpoint_bytes is None:
-        return predict_job_ram_mb(job, baseline)
-    return max(
-        _MARGINAL_STAGING_CHARGE_FLOOR_MB,
-        max(0, checkpoint_bytes) / (1024 * 1024) + predict_job_transient_ram_mb(job, baseline),
-    )
+        seed = predict_context_ram_mb(baseline, model)
+        return None if seed is None else max(_MARGINAL_STAGING_CHARGE_FLOOR_MB, seed)
+    return max(_MARGINAL_STAGING_CHARGE_FLOOR_MB, max(0, checkpoint_bytes) / (1024 * 1024))
 
 
 _COMPONENT_STAGING_CHARGE_FLOOR_MB = 1700.0
@@ -1537,6 +1561,19 @@ class _PlannedReserve:
     """The greatest reserved-growth (MB) past admit ever observed for this entry; ratchets up, never down."""
 
 
+@dataclass
+class _PlannedRamReserve:
+    """A planned RAM charge that decays as its target process's private working set grows.
+
+    The watermark only rises, so pages a load released after materialising cannot resurrect its charge.
+    """
+
+    ram_mb: float
+    target_process_id: int
+    private_at_admit_mb: float
+    materialized_watermark_mb: float = 0.0
+
+
 class CommittedReserveLedger:
     """A single accounting of VRAM/RAM committed by in-flight work across every workload flow.
 
@@ -1563,6 +1600,7 @@ class CommittedReserveLedger:
         self._vram_mb: dict[tuple[str, str], float] = {}
         self._ram_mb: dict[tuple[str, str], float] = {}
         self._planned: dict[tuple[str, str], _PlannedReserve] = {}
+        self._planned_ram: dict[tuple[str, str], _PlannedRamReserve] = {}
 
     def set(self, flow: str, unit: str, *, vram_mb: float = 0.0, ram_mb: float = 0.0) -> None:
         """Register (or refresh) the committed VRAM/RAM for one unit of work.
@@ -1686,6 +1724,56 @@ class CommittedReserveLedger:
             total += max(0.0, entry.vram_mb - materialised)
         return total
 
+    def set_planned_ram(
+        self,
+        flow: str,
+        unit: str,
+        *,
+        ram_mb: float,
+        target_process_id: int,
+        private_at_admit_mb: float,
+        keep_progress: bool = False,
+    ) -> None:
+        """Register a planned RAM charge that decays as ``target_process_id``'s private working set grows.
+
+        With ``keep_progress`` a unit already planned on the same target keeps its admit baseline and
+        watermark and only takes the new charge, so re-booking a dispatch at clearance cannot count the
+        allocations it already made a second time. Otherwise the entry is a new admission and starts in full.
+        """
+        key = (flow, unit)
+        existing = self._planned_ram.get(key)
+        if keep_progress and existing is not None and existing.target_process_id == target_process_id:
+            existing.ram_mb = max(0.0, ram_mb)
+            return
+        self._planned_ram[key] = _PlannedRamReserve(
+            ram_mb=max(0.0, ram_mb),
+            target_process_id=target_process_id,
+            private_at_admit_mb=max(0.0, private_at_admit_mb),
+        )
+
+    def effective_planned_ram_mb(self, private_by_pid: Mapping[int, float]) -> float:
+        """Return planned RAM still outstanding, each entry net of its target's growth since admission.
+
+        A target absent from ``private_by_pid`` has shown no growth, so its entry keeps its full charge until
+        a reconcile drops it.
+        """
+        total = 0.0
+        for entry in self._planned_ram.values():
+            current = private_by_pid.get(entry.target_process_id, entry.private_at_admit_mb)
+            entry.materialized_watermark_mb = max(
+                entry.materialized_watermark_mb,
+                current - entry.private_at_admit_mb,
+            )
+            total += max(0.0, entry.ram_mb - entry.materialized_watermark_mb)
+        return total
+
+    def reconcile_planned_ram(self, flow: str, live_units: Iterable[str]) -> None:
+        """Drop ``flow``'s planned RAM entries whose unit is no longer live, keeping the rest unchanged."""
+        live = set(live_units)
+        self._planned_ram = {
+            key: entry for key, entry in self._planned_ram.items() if key[0] != flow or key[1] in live
+        }
+
     def reconcile_planned(self, flow: str, live_units: Iterable[str]) -> None:
         """Prune ``flow``'s planned charges to only the units whose admission is still in flight (self-healing).
 
@@ -1710,6 +1798,7 @@ class CommittedReserveLedger:
         self._vram_mb.pop((flow, unit), None)
         self._ram_mb.pop((flow, unit), None)
         self._planned.pop((flow, unit), None)
+        self._planned_ram.pop((flow, unit), None)
 
     def replace_flow(
         self,
@@ -1893,13 +1982,15 @@ class RamBudget:
         disaggregated: bool = False,
         component_charge_mb: float | None = None,
         staging_charge_mb: float | None = None,
-        in_flight_transient_mb: float = 0.0,
+        outstanding_planned_mb: float = 0.0,
     ) -> BudgetVerdict:
         """Return the budget verdict for admitting ``job`` given the measured available system RAM.
 
         Admits (fits=True) when no measurement or estimate is available, so the budget never wedges a
-        worker; otherwise requires ``available - committed_reserve`` to clear the shared headroom model's
-        preload requirement. The reserve overlaps the danger floor and is counted once above marginal work.
+        worker; otherwise the measured reading must clear the shared headroom model's preload requirement,
+        so ``available - committed_reserve - outstanding_planned - charge`` keeps ``max(floor, reserve)``.
+        ``outstanding_planned_mb`` is admitted work the reading does not yet reflect, net of what it has
+        materialised; ``staging_charge_mb`` is the job's whole incoming demand.
 
         ``committed_reserve_mb`` is RAM already spoken for by in-flight work whose cost is not yet
         reflected in the measured available figure (the RAM analogue of the VRAM committed reserve;
@@ -1935,17 +2026,18 @@ class RamBudget:
         if available_ram_mb is None:
             return BudgetVerdict(fits=True, predicted_mb=None, available_mb=None, reserve_mb=self._reserve_mb)
 
-        effective_available_mb = available_ram_mb - committed_reserve_mb
+        effective_available_mb = available_ram_mb - committed_reserve_mb - outstanding_planned_mb
+        outstanding_mb = committed_reserve_mb + outstanding_planned_mb
 
         if disaggregated and component_charge_mb is not None:
             return self._check_component_charge(
                 job,
                 baseline,
-                effective_available_mb,
+                available_ram_mb,
                 component_charge_mb=component_charge_mb,
                 danger_floor_mb=danger_floor_mb,
                 staging_charge_mb=staging_charge_mb,
-                in_flight_transient_mb=in_flight_transient_mb,
+                outstanding_mb=outstanding_mb,
             )
 
         predicted = staging_charge_mb if staging_charge_mb is not None else predict_job_ram_mb(job, baseline)
@@ -1976,14 +2068,14 @@ class RamBudget:
             min_free_mb=danger_floor_mb or 0.0,
             reserve_mb=self._reserve_mb,
             staging_charge_mb=effective_predicted,
-            in_flight_transient_mb=in_flight_transient_mb,
+            outstanding_mb=outstanding_mb,
         )
-        fits = effective_available_mb >= thresholds.preload_requirement_mb
+        fits = available_ram_mb >= thresholds.preload_requirement_mb
         return BudgetVerdict(
             fits=fits,
             predicted_mb=effective_predicted,
             available_mb=effective_available_mb,
-            reserve_mb=thresholds.preload_requirement_mb - effective_predicted,
+            reserve_mb=thresholds.reserve_mb,
             uncredited_predicted_mb=predicted if applied_credit_mb > 0.0 else None,
             reusable_credit_mb=applied_credit_mb,
         )
@@ -1992,12 +2084,12 @@ class RamBudget:
         self,
         job: ImageGenerateJobPopResponse,
         baseline: str | None,
-        effective_available_mb: float,
+        available_ram_mb: float,
         *,
         component_charge_mb: float,
         danger_floor_mb: float | None,
         staging_charge_mb: float | None,
-        in_flight_transient_mb: float,
+        outstanding_mb: float,
     ) -> BudgetVerdict:
         """Price a disaggregation-class preload at its UNet-only component charge instead of the whole checkpoint.
 
@@ -2011,6 +2103,7 @@ class RamBudget:
         breach. When no whole-checkpoint estimate exists the job is admitted unpriced, matching the ordinary
         path's never-wedge-on-unknown behavior.
         """
+        effective_available_mb = available_ram_mb - outstanding_mb
         whole_predicted = staging_charge_mb if staging_charge_mb is not None else predict_job_ram_mb(job, baseline)
         if whole_predicted is None:
             return BudgetVerdict(
@@ -2033,14 +2126,14 @@ class RamBudget:
             min_free_mb=danger_floor_mb or 0.0,
             reserve_mb=self._reserve_mb,
             staging_charge_mb=candidate_charge,
-            in_flight_transient_mb=in_flight_transient_mb,
+            outstanding_mb=outstanding_mb,
         )
-        fits = effective_available_mb >= thresholds.preload_requirement_mb
+        fits = available_ram_mb >= thresholds.preload_requirement_mb
         return BudgetVerdict(
             fits=fits,
             predicted_mb=candidate_charge,
             available_mb=effective_available_mb,
-            reserve_mb=thresholds.preload_requirement_mb - candidate_charge,
+            reserve_mb=thresholds.reserve_mb,
             uncredited_predicted_mb=whole_predicted if applied_credit_mb > 0.0 else None,
             reusable_credit_mb=applied_credit_mb,
         )
@@ -2048,10 +2141,10 @@ class RamBudget:
 
 @dataclass(frozen=True)
 class RamHeadroom:
-    """Represents ordered host-RAM requirements, with one additive reserve above marginal work.
+    """Represents ordered host-RAM requirements, with one additive reserve above all modeled work.
 
     The reserve and hard floor protect the same available pages, so their maximum is kept once.
-    The soft line protects outstanding job transients and never uses the configured reserve as risk.
+    The soft line protects outstanding allocations and never uses the configured reserve as risk.
     """
 
     hard_floor_mb: float
@@ -2068,23 +2161,25 @@ def ram_headroom(
     pause_percent: float = 85.0,
     min_free_mb: float = 1024.0,
     reserve_mb: float = 4096.0,
-    in_flight_transient_mb: float = 0.0,
+    outstanding_mb: float = 0.0,
     staging_charge_mb: float = 0.0,
     context_cost_mb: float = 0.0,
     per_process_max_mb: float | None = None,
 ) -> RamHeadroom:
     """Return the single RAM threshold model used by admission, governance, restore and diagnostics.
 
-    Requirements are absolute available-RAM readings, before subtracting outstanding commitments.
-    A reserve overlaps the danger floor rather than adding a second floor. Restore pays for a complete
-    context and is never cheaper than staging the offered checkpoint. Impossible configurations remain
-    refused; this function cannot make work larger than the host fit.
+    Requirements are absolute available-RAM readings. ``outstanding_mb`` is admitted work the reading
+    does not yet reflect; it and the incoming charge are both subtracted before the reserve is kept, so
+    an accepted admission leaves ``max(floor, reserve)`` even when every modeled allocation lands before
+    the next memory report. A reserve overlaps the danger floor rather than adding a second floor.
+    Restore pays for a complete context and is never cheaper than staging the offered checkpoint.
     """
     floor = ram_pressure_floor_mb(total_ram_mb, pause_percent=pause_percent, min_free_mb=min_free_mb)
     reserve = max(floor, max(0.0, reserve_mb))
-    soft = floor + max(0.0, in_flight_transient_mb)
-    preload = max(soft, reserve + max(0.0, staging_charge_mb))
-    restore = max(preload, reserve + max(0.0, context_cost_mb))
+    outstanding = max(0.0, outstanding_mb)
+    soft = floor + outstanding
+    preload = reserve + outstanding + max(0.0, staging_charge_mb)
+    restore = max(preload, reserve + outstanding + max(0.0, context_cost_mb))
     ceiling = None
     if per_process_max_mb is not None and per_process_max_mb > 0:
         ceiling = max(per_process_max_mb, max(0.0, context_cost_mb) * 1.1 + 1100.0)

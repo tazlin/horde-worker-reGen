@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import (
 )
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
+    predict_job_feature_ram_mb,
     predict_job_post_processing_vram_mb,
 )
 from horde_worker_regen.process_management.resources.run_metrics import (
@@ -303,6 +304,12 @@ class PostProcessOrchestrator:
         if estimate is None:
             return 0.0
         return max(0.0, estimate)
+
+    def _estimate_post_processing_ram_mb(self, completed_job_info: HordeJobInfo) -> float:
+        """Return the RAM (MB) this unit's post-processing features allocate in the lane process."""
+        sdk_job = completed_job_info.sdk_api_job_info
+        baseline = self._model_metadata.get_baseline(sdk_job.model) if sdk_job.model is not None else None
+        return predict_job_feature_ram_mb(sdk_job, baseline).post_processing_mb
 
     def _effective_lane_cap_mb(self, post_process_process: HordeProcessInfo) -> float | None:
         """Return the lane's allocator-guard cap (MB) for its card, or None when the card total is unknown.
@@ -857,6 +864,7 @@ class PostProcessOrchestrator:
             POST_PROCESS_RESERVE_FLOW,
             str(completed_job_info.sdk_api_job_info.id_),
             vram_mb=reserve_vram_mb,
+            ram_mb=self._estimate_post_processing_ram_mb(completed_job_info),
         )
         await self._job_tracker.begin_post_processing(
             completed_job_info,

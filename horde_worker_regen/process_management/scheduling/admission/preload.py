@@ -973,11 +973,13 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
     checkpoint is charged net of the reusable pages an idle target retained from its unloaded model (the credit
     is gated on the danger floor inside the budget so it never admits into a floor breach). The two are
     alternative marginal accountings of the same load, so the component charge supersedes the credit.
+    Either checkpoint charge carries the job's feature RAM, so admission prices the whole job's demand.
     """
     job = snapshot.queue.jobs[job_id]
     slot = snapshot.slots[process_id]
     component = component_charge_mb(snapshot, job_id, process_id)
     is_component = component is not None
+    features = job.feature_ram_mb
     verdict = snapshot.services.ram_budget.check_job(
         snapshot.queue.payloads[job_id],
         job.baseline,
@@ -986,9 +988,9 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
         reusable_credit_mb=0.0 if is_component else slot.reuse_credit_mb,
         danger_floor_mb=snapshot.host_ram.danger_floor_mb,
         disaggregated=is_component,
-        component_charge_mb=component,
-        staging_charge_mb=job.staging_charge_mb,
-        in_flight_transient_mb=snapshot.host_ram.in_flight_transient_mb,
+        component_charge_mb=None if component is None else component + features,
+        staging_charge_mb=None if job.staging_charge_mb is None else job.staging_charge_mb + features,
+        outstanding_planned_mb=snapshot.host_ram.outstanding_planned_mb,
     )
     if is_component:
         kind = RamChargeKind.COMPONENT
@@ -997,3 +999,15 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
     else:
         kind = RamChargeKind.WHOLE
     return RamAdmission(verdict=verdict, kind=kind)
+
+
+def preload_ram_stage_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float:
+    """The checkpoint RAM (MB) a preload stages onto the slot at its admitted accounting, without feature RAM.
+
+    This is the planned RAM the scheduler books when it sends the preload. Feature RAM is booked at dispatch,
+    against the process that allocates it, so a stage and its job's features are never one entry.
+    """
+    predicted = decide_ram_admission(snapshot, job_id, process_id).verdict.predicted_mb
+    if predicted is None:
+        return 0.0
+    return max(0.0, predicted - snapshot.queue.jobs[job_id].feature_ram_mb)

@@ -168,9 +168,12 @@ class JobSnapshot:
     """Why no serving card can ever host the job's model minimum, or None when some card can."""
     component_charge_mb: float | None
     """The UNet-only RAM staging charge (MB) for a disaggregation-class job whose checkpoint carries a
-    component-identity sidecar, else None: the whole checkpoint is priced."""
+    component-identity sidecar, else None: the whole checkpoint is priced. Excludes feature RAM."""
     staging_charge_mb: float | None = None
-    """Marginal whole-checkpoint RAM charge: file bytes plus feature deltas, with trusted measured growth."""
+    """The whole checkpoint's RAM staging charge (MB): trusted measured peak, else file bytes, else the
+    context seed. Excludes feature RAM."""
+    feature_ram_mb: float = 0.0
+    """RAM (MB) the job's features allocate in every process, added to whichever checkpoint charge applies."""
 
 
 @dataclass(frozen=True)
@@ -226,8 +229,8 @@ class HostRamSnapshot:
     danger_floor_mb: float
     pressure: RamPressureVerdict
     """The governor's verdict for this tick, or a live reading before the first tick."""
-    in_flight_transient_mb: float = 0.0
-    """Outstanding feature allocations that could push the host below its hard floor."""
+    outstanding_planned_mb: float = 0.0
+    """Admitted RAM (MB) the available reading does not yet reflect, net of what has materialised."""
 
 
 @dataclass(frozen=True)
@@ -502,6 +505,7 @@ def build_scheduling_snapshot(
     unserviceable_reason: Callable[[ImageGenerateJobPopResponse], str | None],
     component_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
     staging_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
+    feature_ram_mb: Callable[[ImageGenerateJobPopResponse], float],
     checkpoint_models_held: Callable[[int], frozenset[str]],
     host_ram: HostRamSnapshot,
     budget_active: bool,
@@ -601,6 +605,7 @@ def build_scheduling_snapshot(
             unserviceable_reason=unserviceable_reason(job),
             component_charge_mb=component_charge_mb(job),
             staging_charge_mb=staging_charge_mb(job),
+            feature_ram_mb=feature_ram_mb(job),
         )
         (in_progress_ids if is_in_progress else pending_ids).append(key)
 

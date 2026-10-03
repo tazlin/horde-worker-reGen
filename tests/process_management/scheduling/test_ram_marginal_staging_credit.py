@@ -29,17 +29,18 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from horde_sdk.generation_parameters import KNOWN_FACEFIXERS, KNOWN_UPSCALERS
 from loguru import logger
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo, LoadCompletionSample
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.resources.resource_budget import BudgetVerdict
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     CREEP_CONTAINMENT_RSS_BYTES,
     FRESH_INFERENCE_CHILD_BASELINE_MB,
-    REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
     ReuseCreditKind,
     ReuseCreditRecord,
     staging_reuse_credit_mb,
@@ -213,12 +214,19 @@ class TestCreditReconciliation:
         """Seat a settled credited target on ``scheduler`` whose RSS has grown since admit time."""
         proc = make_mock_process_info(0, model_name="m", state=HordeProcessState.WAITING_FOR_JOB)
         proc.ram_usage_bytes = int(now_rss_mb * _MB)
+        proc.load_completion_sample = LoadCompletionSample(
+            process_launch_identifier=proc.process_launch_identifier,
+            model=proc.loaded_horde_model_name,
+            sampled_at=time.time(),
+            private_bytes=proc.ram_usage_bytes,
+            peak_private_bytes=proc.ram_usage_bytes,
+        )
         scheduler._process_map = ProcessMap({0: proc})
         scheduler.ram_reclaim.pending_reuse_credits[0] = ReuseCreditRecord(
             model="m",
-            rss_at_admit_mb=admit_rss_mb,
+            private_at_admit_mb=admit_rss_mb,
             effective_charge_mb=charge_mb,
-            admitted_at=time.time() - REUSE_CREDIT_RECONCILE_SETTLE_SECONDS - 1.0,
+            admitted_at=time.time() - 1.0,
         )
 
     def test_over_generous_credit_is_flagged_once_and_cleared(self) -> None:
@@ -250,17 +258,54 @@ class TestCreditReconciliation:
         assert 0 not in scheduler.ram_reclaim.pending_reuse_credits
 
 
-def test_checkpoint_charge_uses_file_metadata_and_trusted_growth_in_both_directions() -> None:
-    """Cold-context seeds do not set swap prices; settled measurements can lower and raise them."""
+def _sdxl_pricing_scheduler() -> InferenceScheduler:
+    """A scheduler pricing an SDXL checkpoint of 6500 MB with a dedicated post-processing lane."""
     scheduler = _make_inference_scheduler()
     scheduler._model_metadata.get_baseline = Mock(return_value="stable_diffusion_xl")
     checkpoint = Mock()
     checkpoint.stat.return_value.st_size = 6500 * _MB
     scheduler._resolve_checkpoint_path = Mock(return_value=checkpoint)
+    scheduler._process_lifecycle.post_process_lane_enabled = Mock(return_value=True)
+    return scheduler
+
+
+_HEAVY_POST_PROCESSING = [KNOWN_UPSCALERS.RealESRGAN_x4plus.value, KNOWN_FACEFIXERS.CodeFormers.value]
+
+
+def test_learned_checkpoint_price_keeps_each_jobs_feature_ram() -> None:
+    """A price learned from plain loads still charges a feature-heavy job its own features, and the reverse."""
+    scheduler = _sdxl_pricing_scheduler()
+    for _ in range(5):
+        scheduler.ram_reclaim.learned_ram.observe("sdxl", ReuseCreditKind.WHOLE, 6500)
+    plain = make_job_pop_response("sdxl", width=1024, height=1024)
+    heavy = make_job_pop_response("sdxl", width=1024, height=1024, post_processing=_HEAVY_POST_PROCESSING)
+    plain_features = scheduler._job_feature_ram(plain)
+    heavy_features = scheduler._job_feature_ram(heavy)
+    assert heavy_features.post_processing_mb > 0
+    assert scheduler._whole_job_ram_charge_mb(plain) == pytest.approx(7150 + plain_features.total_mb)
+    assert scheduler._whole_job_ram_charge_mb(heavy) == pytest.approx(7150 + heavy_features.total_mb)
+    # The admitted charge's checkpoint share is what load-completion growth is checked against and learned
+    # beside, so feature-heavy admissions cannot raise a plain job's price.
+    verdict = BudgetVerdict(fits=True, predicted_mb=6500 + heavy_features.total_mb, available_mb=0.0, reserve_mb=0.0)
+    assert scheduler._checkpoint_part_of_charge_mb(heavy, verdict) == pytest.approx(6500)
+
+
+def test_without_a_lane_post_processing_ram_lands_on_inference() -> None:
+    """With no dedicated lane the inference process allocates the post-processors' RAM too."""
+    scheduler = _sdxl_pricing_scheduler()
+    scheduler._process_lifecycle.post_process_lane_enabled = Mock(return_value=False)
+    heavy = make_job_pop_response("sdxl", width=1024, height=1024, post_processing=_HEAVY_POST_PROCESSING)
+    features = scheduler._job_feature_ram(heavy)
+    assert features.post_processing_mb == 0
+    assert features.sampling_mb > 0
+
+
+def test_checkpoint_charge_uses_file_metadata_and_trusted_growth_in_both_directions() -> None:
+    """Cold-context seeds do not set swap prices; measured load peaks can lower and raise them."""
+    scheduler = _sdxl_pricing_scheduler()
     job = make_job_pop_response("sdxl", width=1024, height=1024)
     static = scheduler._checkpoint_staging_charge_mb(job)
-    assert static is not None
-    assert 6500 <= static <= 6500 * 1.25
+    assert static == pytest.approx(6500)
     for _ in range(5):
         scheduler.ram_reclaim.learned_ram.observe("sdxl", ReuseCreditKind.WHOLE, 5000)
     lower = scheduler._checkpoint_staging_charge_mb(job)
