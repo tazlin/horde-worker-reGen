@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.resources.ram_footprints import LearnedRamStore
 
 FRESH_INFERENCE_CHILD_BASELINE_MB = 1100.0
 """Resident RSS (MB) a just-spawned inference child holds before it loads any model weights.
@@ -30,13 +31,10 @@ onto that slot reuses rather than allocates; the excess is what the reuse credit
 the measured range keeps the credit conservative, so the budget under-credits rather than over-admits."""
 
 CREEP_CONTAINMENT_RSS_BYTES = 18432 * 1024 * 1024
-"""Idle-slot RSS above which a process is cycled for creep containment regardless of its unload state.
+"""Compatibility ceiling for callers without offered-model or private-memory telemetry.
 
-An inference child creeps about 400 MB per job with the model unchanged and cycling is the only containment.
-Mirrors the ``ram_per_process_max_mb`` default so the two reclaim paths agree on what too big means, but runs
-whenever a reclaim is attempted rather than only under the danger floor. Above this the retained RSS is leak, not
-reusable pages, so creep containment overrides the reuse protection that otherwise spares the head's staging
-target: reusing a crept slot would only perpetuate the leak."""
+The scheduler passes its model-aware ceiling and compares private working-set bytes when measured,
+falling back to RSS. Clean checkpoint mappings alone are not evidence of allocator creep."""
 
 STALE_RAM_UNLOAD_MARGIN_PERCENT = 2.0
 """Share of total host RAM added to the cold-child baseline to set the stale-unload reclaim threshold.
@@ -87,6 +85,7 @@ more, so a cycle that never recovers still trips the supervisor."""
 class ReuseCreditKind(enum.StrEnum):
     """Which marginal accounting priced a credited RAM admission."""
 
+    WHOLE = "whole"
     PAGE_REUSE = "page_reuse"
     """The charge was reduced by the staging target's retained resident pages."""
     COMPONENT = "component"
@@ -109,6 +108,7 @@ class ReuseCreditRecord:
     admitted_at: float
     """When the admission was credited, gating the settle grace before reconciliation."""
     kind: ReuseCreditKind = ReuseCreditKind.PAGE_REUSE
+    process_launch_identifier: int | None = None
 
 
 @dataclass(frozen=True)
@@ -124,7 +124,7 @@ class RamCycleReason(enum.Enum):
     """Why an idle inference slot is being cycled to return RAM to the OS."""
 
     CREEP = enum.auto()
-    """Its RSS is above the creep-containment ceiling: leak, not reusable pages."""
+    """Its private working set (RSS fallback) exceeds the model-aware creep ceiling."""
     STALE_UNLOAD = enum.auto()
     """It did not release RAM after an unload request; the allocator retains the freed model's pages."""
 
@@ -158,6 +158,7 @@ def select_ram_cycle_victim(
     protect_process_id: int | None,
     cycled_at: Mapping[int, float],
     stale_replace_bytes: float,
+    creep_ceiling_bytes: float = CREEP_CONTAINMENT_RSS_BYTES,
 ) -> tuple[HordeProcessInfo, RamCycleReason] | None:
     """Choose the idle inference slot to cycle for RAM, creep victims ahead of stale-unload victims.
 
@@ -177,7 +178,7 @@ def select_ram_cycle_victim(
             continue
         if process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL:
             continue
-        if creep_victim is None and process_info.ram_usage_bytes >= CREEP_CONTAINMENT_RSS_BYTES:
+        if creep_victim is None and process_info.ram_working_set_bytes >= creep_ceiling_bytes:
             creep_victim = process_info
             continue
         if stale_victim is not None:
@@ -239,6 +240,7 @@ class RamReclaimLedger:
         replaced process object). Creep containment is deliberately not throttled by it."""
         self.lane_contained_at: dict[int, float] = {}
         """When each service lane was last asked to unload its models from RAM, keyed by process id."""
+        self.learned_ram = LearnedRamStore()
         self.cycle_at: float = 0.0
         """When an idle slot was last deliberately cycled to reclaim RAM; 0.0 when no cycle is in flight."""
         self._last_announced_admission: tuple[int, str | None, int] | None = None
@@ -268,6 +270,7 @@ class RamReclaimLedger:
             effective_charge_mb=effective_charge_mb,
             admitted_at=self._clock(),
             kind=kind,
+            process_launch_identifier=target.process_launch_identifier,
         )
 
     def void_credit(self, process_id: int) -> None:
@@ -278,14 +281,17 @@ class RamReclaimLedger:
         """Retire every settled credit, returning the ones whose measured growth exceeded the charge plus slack.
 
         A credit settles once its target has held the staged model idle past the settle grace. Growth below the
-        charge is the intended outcome of both credit kinds and is not reported. Records for vanished slots are
+        charge is the intended outcome of marginal load accounting and is not reported. Records for vanished slots are
         dropped so the map does not accumulate.
         """
         now = self._clock()
         discrepancies: list[ReuseCreditDiscrepancy] = []
         for process_id, record in list(self.pending_reuse_credits.items()):
             process_info = process_map.get(process_id)
-            if process_info is None:
+            if process_info is None or (
+                record.process_launch_identifier is not None
+                and record.process_launch_identifier != process_info.process_launch_identifier
+            ):
                 del self.pending_reuse_credits[process_id]
                 continue
             settled = (
@@ -297,6 +303,12 @@ class RamReclaimLedger:
                 continue
             del self.pending_reuse_credits[process_id]
             growth_mb = max(0, process_info.ram_usage_bytes) / (1024 * 1024) - record.rss_at_admit_mb
+            if (
+                record.effective_charge_mb > 0
+                and process_info.report_sampled_at is not None
+                and process_info.report_sampled_at > record.admitted_at
+            ):
+                self.learned_ram.observe(record.model, record.kind, growth_mb)
             if growth_mb > record.effective_charge_mb + REUSE_CREDIT_RECONCILE_SLACK_MB:
                 discrepancies.append(ReuseCreditDiscrepancy(process_id, record, growth_mb))
         return discrepancies

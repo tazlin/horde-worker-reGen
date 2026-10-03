@@ -987,6 +987,8 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
         danger_floor_mb=snapshot.host_ram.danger_floor_mb,
         disaggregated=is_component,
         component_charge_mb=component,
+        staging_charge_mb=job.staging_charge_mb,
+        in_flight_transient_mb=snapshot.host_ram.in_flight_transient_mb,
     )
     if is_component:
         kind = RamChargeKind.COMPONENT

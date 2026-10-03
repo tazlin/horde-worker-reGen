@@ -79,6 +79,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     BudgetVerdict,
     CommittedReserveLedger,
     RamBudget,
+    RamHeadroom,
     RamPressureVerdict,
     StreamForecast,
     VramBudget,
@@ -87,13 +88,17 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     forecast_weight_streaming,
     is_model_locally_unservable_for,
     platform_context_constant_mb,
+    predict_checkpoint_staging_ram_mb,
+    predict_context_ram_mb,
     predict_job_decode_spike_mb,
     predict_job_footprint_mb,
     predict_job_post_processing_vram_mb,
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
+    predict_job_transient_ram_mb,
     predict_job_unet_only_ram_mb,
     predict_job_weight_mb,
+    ram_headroom,
     ram_pressure_floor_mb,
 )
 from horde_worker_regen.process_management.resources.run_metrics import (
@@ -231,6 +236,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.head_admission imp
     StagingDeferReason,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
+    FRESH_INFERENCE_CHILD_BASELINE_MB,
     RamCycleReason,
     RamReclaimLedger,
     ReuseCreditKind,
@@ -687,6 +693,7 @@ class InferenceScheduler:
         self._safety_placement = SafetyPlacementLedger(ledger_clock)
         # The most recent host-RAM verdict, kept so a pop-hold edge can be logged with the reading behind it.
         self._last_ram_verdict: RamPressureVerdict | None = None
+        self._last_ram_headroom: RamHeadroom | None = None
 
         self._preload_delay_notified = False
         self._pending_line_skip = None
@@ -2931,8 +2938,15 @@ class InferenceScheduler:
         """The process count to grow back to when a card's whole-card residency is restored.
 
         That card's own ``target_process_count`` on a multi-GPU host; the worker-wide launched-process
-        ceiling for the single-GPU / worker-wide (``None``) case.
+        ceiling for the single-GPU / worker-wide (``None``) case. RAM shedding owns its restore until
+        the RAM governor grants headroom; a healthy card cannot undo a host-memory reduction.
         """
+        ram_state = self._ram_governor_state
+        ram_shed = ram_state.worker_shed is not None or (
+            bool(ram_state.shed_cards) if device_index is None else device_index in ram_state.shed_cards
+        )
+        if ram_shed:
+            return self._process_map.num_loaded_inference_processes(device_index=device_index)
         if device_index is not None and device_index in self._card_runtimes:
             return self._card_runtimes[device_index].target_process_count
         return self._max_inference_processes
@@ -3397,14 +3411,16 @@ class InferenceScheduler:
         available_ram_mb = self._measured_available_ram_mb()
         weights_mb = forecast.weights_mb
         committed_ram_mb = self._reserve_ledger.total_ram_mb()
-        if weights_mb is None:
-            return self._ram_budget.check_job(
-                job,
-                baseline,
-                available_ram_mb,
-                committed_reserve_mb=committed_ram_mb,
-            ).fits
-        return (available_ram_mb - committed_ram_mb) >= float(weights_mb) + self._ram_budget.reserve_mb
+        staging = self._checkpoint_staging_charge_mb(job)
+        return self._ram_budget.check_job(
+            job,
+            baseline,
+            available_ram_mb,
+            committed_reserve_mb=committed_ram_mb,
+            staging_charge_mb=staging if staging is not None else weights_mb,
+            danger_floor_mb=self._ram_danger_floor_mb(),
+            in_flight_transient_mb=self._in_flight_transient_ram_mb(),
+        ).fits
 
     def _resident_safety_charge_mb(self, device_index: int | None) -> float:
         """The device charge of a safety context this card's residency is leaving where it is.
@@ -4241,14 +4257,25 @@ class InferenceScheduler:
         crashes the scheduling cycle.
         """
         self._last_ram_verdict = verdict
-        margin_mb = config_number(self._runtime_config.bridge_data.ram_reserve_mb)
-        if margin_mb is None:
-            margin_mb = 4096.0
+        transient_mb = self._in_flight_transient_ram_mb()
+        thresholds = ram_headroom(
+            None,
+            min_free_mb=verdict.floor_mb,
+            reserve_mb=self._ram_budget.reserve_mb,
+            in_flight_transient_mb=transient_mb,
+            staging_charge_mb=max(
+                (self._checkpoint_staging_charge_mb(job) or 0.0 for job in self._job_tracker.jobs_pending_inference),
+                default=0.0,
+            ),
+            context_cost_mb=self._estimated_resident_context_ram_mb(),
+            per_process_max_mb=self._ram_per_process_ceiling_mb(),
+        )
+        self._last_ram_headroom = thresholds
         inference_slots = tuple(
             InferenceSlotSnapshot(
                 process_id=process_info.process_id,
                 device_index=process_info.device_index,
-                resident_ram_mb=process_info.ram_usage_bytes / (1024 * 1024),
+                resident_ram_mb=process_info.ram_working_set_bytes / (1024 * 1024),
                 is_busy=process_info.is_process_busy(),
             )
             for process_info in self._process_map.values()
@@ -4270,7 +4297,7 @@ class InferenceScheduler:
             now=time.time(),
             pop_pause_active=self._state.self_throttle_paused,
             pop_pause_until=self._state.self_throttle_paused_until,
-            pop_hold_margin_mb=margin_mb,
+            thresholds=thresholds,
             per_process_ceiling_mb=self._ram_per_process_ceiling_mb(),
             multi_gpu_routing_active=self._multi_gpu_routing_active,
             in_flight_job_count=len(self._job_tracker.jobs_in_progress),
@@ -4280,7 +4307,12 @@ class InferenceScheduler:
             cards=cards,
             draining_process_ids=frozenset(self._ram_governor_state.draining_process_ids),
             shed_card_indices=frozenset(self._ram_governor_state.shed_cards),
-            restore_headroom_mb=self._ram_headroom_for_additional_context_mb(),
+            restore_headroom_mb=(
+                (verdict.available_mb or 0.0)
+                - self._reserve_ledger.total_ram_mb()
+                - thresholds.restore_requirement_mb
+                + self._estimated_resident_context_ram_mb()
+            ),
             per_context_ram_estimate_mb=self._estimated_resident_context_ram_mb(),
             worker_shed_planned_process_count=(
                 self._ram_governor_state.worker_shed.planned_process_count
@@ -4372,7 +4404,8 @@ class InferenceScheduler:
         """Whether the soft RAM pop hold is engaged while the host is measurably healthy.
 
         The signature of a governance latch: pops are held for RAM pressure, yet the most recent
-        danger-floor verdict is healthy and nothing is draining, so the hold should already have cleared.
+        danger-floor verdict is healthy, outstanding transients fit above it, and nothing is draining,
+        so the hold should already have cleared.
         Distinct from a merely idle worker (which never sets the hold) and from the deliberate held-queue
         windows (whole-card establishment, heavy-head load, RAM-reclaim cycle), which own their own
         resolution. Returns False before the first tick has measured a verdict (treated as not-yet-healthy).
@@ -4384,6 +4417,14 @@ class InferenceScheduler:
         if verdict is None or verdict.under_pressure:
             return False
         if self._ram_governor_state.draining_process_ids:
+            return False
+        thresholds = self._last_ram_headroom
+        if (
+            thresholds is not None
+            and verdict.available_mb is not None
+            and verdict.available_mb < thresholds.soft_hold_mb
+            and self._job_tracker.jobs_in_progress
+        ):
             return False
         return not (
             self.whole_card_residency_grace_active()
@@ -4400,7 +4441,12 @@ class InferenceScheduler:
         ceiling = config_number(self._runtime_config.bridge_data.ram_per_process_max_mb)
         if ceiling is None or ceiling <= 0:
             return None
-        return ceiling
+        seeds = [
+            predict_context_ram_mb(self._model_metadata.get_baseline(model), model)
+            for model in self._runtime_config.bridge_data.image_models_to_load
+        ]
+        largest_seed = max((seed for seed in seeds if seed is not None), default=0.0)
+        return ram_headroom(None, context_cost_mb=largest_seed, per_process_max_mb=ceiling).per_process_ceiling_mb
 
     def _reduce_processes_under_ram_pressure(self) -> None:
         """Shed idle resident inference processes to return their resident-weight RAM to the OS.
@@ -4415,29 +4461,29 @@ class InferenceScheduler:
         snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
         self._executor.execute_governance_actions(decide_process_reduction(snapshot))
 
+    def _in_flight_transient_ram_mb(self) -> float:
+        """Return outstanding feature allocations, without charging resident checkpoint pages again."""
+        return sum(
+            predict_job_transient_ram_mb(
+                job, self._model_metadata.get_baseline(job.model) if job.model is not None else None
+            )
+            for job in self._job_tracker.jobs_in_progress
+        )
+
     def _estimated_resident_context_ram_mb(self) -> float:
-        """Conservative system-RAM cost (MB) of one more resident inference context.
-
-        Taken as the largest live inference process's measured resident RAM, which captures the model
-        working set the allocator retains and will not free without a respawn. Falls back to the configured
-        RAM reserve when no process has reported usage yet (only before any model has loaded; a card is only
-        ever restored after a reduction that itself implies loaded, RAM-holding processes, so the measured
-        value is the normal case).
-        """
-        live_context_ram_mb = [
-            process_info.ram_usage_bytes / (1024 * 1024)
-            for process_info in self._process_map.values()
-            if process_info.process_type == HordeProcessType.INFERENCE and process_info.ram_usage_bytes > 0
+        """Return private context bytes when measured, otherwise the largest offered context seed."""
+        measured = [
+            info.ram_private_bytes / (1024 * 1024)
+            for info in self._process_map.values()
+            if info.process_type == HordeProcessType.INFERENCE and info.ram_private_bytes is not None
         ]
-        if live_context_ram_mb:
-            return max(live_context_ram_mb)
-        return self._ram_budget.reserve_mb
-
-    def _ram_headroom_for_additional_context_mb(self) -> float:
-        """Measured system-RAM headroom (MB) above the reserve and committed reserves for one more context."""
-        available_ram_mb = self._measured_available_ram_mb()
-        committed_ram_mb = self._reserve_ledger.total_ram_mb()
-        return available_ram_mb - committed_ram_mb - self._ram_budget.reserve_mb
+        if measured:
+            return max(measured)
+        seeds = [
+            predict_context_ram_mb(self._model_metadata.get_baseline(model), model)
+            for model in self._runtime_config.bridge_data.image_models_to_load
+        ]
+        return max((seed for seed in seeds if seed is not None), default=FRESH_INFERENCE_CHILD_BASELINE_MB)
 
     def _restore_processes_after_ram_pressure(self) -> None:
         """Grow RAM-pressure-shed inference contexts back toward plan as system RAM proves headroom.
@@ -5171,11 +5217,13 @@ class InferenceScheduler:
             disaggregation_class_eligible=self._is_disaggregation_class_eligible,
             unserviceable_reason=self._unserviceable_job_reason,
             component_charge_mb=self._unet_component_charge_mb,
+            staging_charge_mb=self._checkpoint_staging_charge_mb,
             checkpoint_models_held=self._checkpoint_models_held_on,
             host_ram=HostRamSnapshot(
                 available_mb=self._measured_available_ram_mb(),
                 total_mb=self._measured_total_ram_mb(),
                 reserve_mb=self._ram_budget.reserve_mb,
+                in_flight_transient_mb=self._in_flight_transient_ram_mb(),
                 danger_floor_mb=self._ram_danger_floor_mb(),
                 pressure=ram_verdict if ram_verdict is not None else self._ram_pressure_verdict(),
             ),
@@ -5876,6 +5924,13 @@ class InferenceScheduler:
             now=now,
             protect_process_id=protect_process_id,
             cycled_at=ledger.stale_cycled_at,
+            creep_ceiling_bytes=(
+                (self._ram_per_process_ceiling_mb() or float("inf"))
+                if config_number(self._runtime_config.bridge_data.ram_per_process_max_mb) is not None
+                else 18432.0
+            )
+            * 1024
+            * 1024,
             stale_replace_bytes=stale_ram_unload_replace_bytes(self._measured_total_ram_mb()),
         )
         if selected is None:
@@ -6055,6 +6110,9 @@ class InferenceScheduler:
             baseline,
             self._measured_available_ram_mb(),
             committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
+            staging_charge_mb=self._checkpoint_staging_charge_mb(job),
+            danger_floor_mb=self._ram_danger_floor_mb(),
+            in_flight_transient_mb=self._in_flight_transient_ram_mb(),
         )
         if ram_verdict.fits:
             return
@@ -6153,6 +6211,14 @@ class InferenceScheduler:
                     "residual implied.</>",
                     record.model,
                 )
+            elif record.kind is ReuseCreditKind.WHOLE:
+                logger.opt(colors=True).warning(
+                    "<fg #f0beff>RAM checkpoint charge for {} "
+                    f"on process {discrepancy.process_id} under-priced the stage: "
+                    f"measured RSS grew ~{discrepancy.growth_mb:.0f} MB against a charge of "
+                    f"~{record.effective_charge_mb:.0f} MB; settled growth feeds the model's RAM estimate.</>",
+                    record.model,
+                )
             else:
                 logger.opt(colors=True).warning(
                     "<fg #f0beff>RAM reuse credit for {} "
@@ -6161,6 +6227,25 @@ class InferenceScheduler:
                     f"~{record.effective_charge_mb:.0f} MB; the retained pages were less reusable than priced.</>",
                     record.model,
                 )
+
+    def _checkpoint_staging_charge_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
+        """Return file-sized marginal staging RAM, with a measured per-model overlay when trusted."""
+        baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
+        path = self._resolve_checkpoint_path(job.model) if job.model is not None else None
+        size = None
+        if path is not None:
+            try:
+                size = path.stat().st_size
+            except OSError as error:
+                if job.model is not None:
+                    self._log_component_charge_fallback_once(job.model, str(error))
+        static = predict_checkpoint_staging_ram_mb(job, baseline, size)
+        learned = (
+            self._ram_reclaim.learned_ram.measured_estimate_mb(job.model, ReuseCreditKind.WHOLE) if job.model else None
+        )
+        if learned is None:
+            return static
+        return max(predict_checkpoint_staging_ram_mb(job, baseline, 0) or 0.0, learned)
 
     def _unet_component_charge_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
         """The UNet-only RAM staging charge (MB) for a disaggregation-class ``job`` with a readable sidecar, else None.
@@ -6178,6 +6263,9 @@ class InferenceScheduler:
         sidecar = self._read_component_sidecar(job.model)
         if sidecar is None:
             return None
+        learned = self._ram_reclaim.learned_ram.measured_estimate_mb(job.model, ReuseCreditKind.COMPONENT)
+        if learned is not None:
+            return max(predict_job_unet_only_ram_mb(0), learned)
         return predict_job_unet_only_ram_mb(sidecar.residual_tensor_bytes)
 
     def _checkpoint_models_held_on(self, process_id: int) -> frozenset[str]:
@@ -6303,6 +6391,13 @@ class InferenceScheduler:
                 self._note_component_admission(job, available_process, ram_verdict)
             elif admission.kind is RamChargeKind.PAGE_REUSE:
                 self._note_credited_admission(job, available_process, ram_verdict)
+            elif job.model is not None and ram_verdict.predicted_mb is not None:
+                self._ram_reclaim.record_credit(
+                    available_process,
+                    model=job.model,
+                    effective_charge_mb=ram_verdict.predicted_mb,
+                    kind=ReuseCreditKind.WHOLE,
+                )
             self._resolve_head_ram_defer(job, reason="admitted")
             return True
 

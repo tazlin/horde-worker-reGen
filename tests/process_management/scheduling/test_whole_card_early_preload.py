@@ -394,10 +394,10 @@ class TestLiveLogRamGateRegression:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """At 25GB free a full-burden gate (24+4=28GB) would reject and kill all siblings; weights alone fit.
+        """At 25GB free a full-burden gate (24+4=28GB) would reject and kill all siblings; checkpoint bytes fit.
 
         The head's weights (~11.5GB) plus the reserve (4GB) fit comfortably in the 25GB available, so the
-        weights-based gate must pre-stage; the worker must not fall back to the teardown path.
+        file-sized staging gate must pre-stage; the worker must not fall back to the teardown path.
         """
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 14000.0)
@@ -405,6 +405,9 @@ class TestLiveLogRamGateRegression:
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 24000.0)
 
         scheduler, job_tracker, idle = _live_log_overlap_scheduler(available_ram_mb=25000.0)
+        checkpoint = Mock()
+        checkpoint.stat.return_value.st_size = int(_FLUX_WEIGHTS_MB * 1024 * 1024)
+        monkeypatch.setattr(scheduler, "_resolve_checkpoint_path", lambda _model: checkpoint)
         sdxl_in_progress = make_job_pop_response(_RESIDENT_SDXL)
         await track_popped_job_async(job_tracker, sdxl_in_progress)
         await mark_job_in_progress_async(job_tracker, sdxl_in_progress)

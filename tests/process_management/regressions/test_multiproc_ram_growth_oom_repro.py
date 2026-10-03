@@ -213,15 +213,15 @@ class TestPopHeldBeforeTheFloorToAvoidStaleJobs:
     idle host frees RAM on its own, so a hold there would starve the worker permanently).
     """
 
-    async def test_pop_hold_engages_in_the_approaching_band_with_work_in_flight(
+    async def test_pop_hold_engages_when_in_flight_transient_risk_crosses_the_floor(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """With available RAM just above the floor and a job in flight, the soft pop hold engages."""
         process_map = ProcessMap({1: _resident_idle_proc(1, "AlbedoBase XL (SDXL)")})
-        # Floor on 64 GB at 85% is ~9.6 GB; with a 4 GB reserve margin the band is [9.6, 13.6) GB. 11 GB sits
-        # in it: above the hard floor (no self-throttle) but approaching it (soft hold).
-        scheduler = _ram_pressured_scheduler(process_map, available_ram_mb=11000.0)
+        # A small feature transient can cross the 9.6 GB hard floor from this 9.65 GB reading.
+        # The reserve does not set a second floor at 13.6 GB.
+        scheduler = _ram_pressured_scheduler(process_map, available_ram_mb=9650.0)
         job = make_job_pop_response("AlbedoBase XL (SDXL)")
         await track_popped_job_async(scheduler._job_tracker, job)
         await scheduler._job_tracker.mark_inference_started(job)

@@ -40,6 +40,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import
     CREEP_CONTAINMENT_RSS_BYTES,
     FRESH_INFERENCE_CHILD_BASELINE_MB,
     REUSE_CREDIT_RECONCILE_SETTLE_SECONDS,
+    ReuseCreditKind,
     ReuseCreditRecord,
     staging_reuse_credit_mb,
 )
@@ -247,3 +248,23 @@ class TestCreditReconciliation:
             logger.remove(sink_id)
         assert not any("too generous" in str(record) for record in messages)
         assert 0 not in scheduler.ram_reclaim.pending_reuse_credits
+
+
+def test_checkpoint_charge_uses_file_metadata_and_trusted_growth_in_both_directions() -> None:
+    """Cold-context seeds do not set swap prices; settled measurements can lower and raise them."""
+    scheduler = _make_inference_scheduler()
+    scheduler._model_metadata.get_baseline = Mock(return_value="stable_diffusion_xl")
+    checkpoint = Mock()
+    checkpoint.stat.return_value.st_size = 6500 * _MB
+    scheduler._resolve_checkpoint_path = Mock(return_value=checkpoint)
+    job = make_job_pop_response("sdxl", width=1024, height=1024)
+    static = scheduler._checkpoint_staging_charge_mb(job)
+    assert static is not None
+    assert 6500 <= static <= 6500 * 1.25
+    for _ in range(5):
+        scheduler.ram_reclaim.learned_ram.observe("sdxl", ReuseCreditKind.WHOLE, 5000)
+    lower = scheduler._checkpoint_staging_charge_mb(job)
+    assert lower == pytest.approx(5500)
+    assert lower < static
+    scheduler.ram_reclaim.learned_ram.observe("sdxl", ReuseCreditKind.WHOLE, 10000)
+    assert scheduler._checkpoint_staging_charge_mb(job) == 11000

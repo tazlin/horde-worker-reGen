@@ -1383,6 +1383,39 @@ def predict_job_ram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -
     return None if burden is None else float(burden.ram_mb)
 
 
+def predict_context_ram_mb(baseline: str | None, model: str | None = None) -> float | None:
+    """Return the whole-context seed, separately from a checkpoint's marginal staging cost."""
+    if baseline is None:
+        return None
+    from hordelib.feature_impact import get_baseline_burden
+
+    burden = get_baseline_burden(baseline, model)
+    return None if burden is None else float(burden.ram_base_mb)
+
+
+def predict_job_transient_ram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float:
+    """Return feature RAM that in-flight work may still allocate, excluding resident checkpoint pages."""
+    whole = predict_job_ram_mb(job, baseline)
+    context = predict_context_ram_mb(baseline, job.model)
+    if whole is None or context is None:
+        return _MARGINAL_STAGING_TRANSIENT_HEADROOM_MB
+    return max(0.0, whole - context)
+
+
+def predict_checkpoint_staging_ram_mb(
+    job: ImageGenerateJobPopResponse,
+    baseline: str | None,
+    checkpoint_bytes: int | None,
+) -> float | None:
+    """Return checkpoint bytes plus feature deltas, falling back to the context seed only without a file."""
+    if checkpoint_bytes is None:
+        return predict_job_ram_mb(job, baseline)
+    return max(
+        _MARGINAL_STAGING_CHARGE_FLOOR_MB,
+        max(0, checkpoint_bytes) / (1024 * 1024) + predict_job_transient_ram_mb(job, baseline),
+    )
+
+
 _COMPONENT_STAGING_CHARGE_FLOOR_MB = 1700.0
 """Lower bound (MB) on the UNet-only RAM staging charge for a disaggregation-class job, whatever the sidecar
 residual computes.
@@ -1859,11 +1892,14 @@ class RamBudget:
         danger_floor_mb: float | None = None,
         disaggregated: bool = False,
         component_charge_mb: float | None = None,
+        staging_charge_mb: float | None = None,
+        in_flight_transient_mb: float = 0.0,
     ) -> BudgetVerdict:
         """Return the budget verdict for admitting ``job`` given the measured available system RAM.
 
         Admits (fits=True) when no measurement or estimate is available, so the budget never wedges a
-        worker; otherwise requires ``available - committed_reserve >= effective_predicted + reserve``.
+        worker; otherwise requires ``available - committed_reserve`` to clear the shared headroom model's
+        preload requirement. The reserve overlaps the danger floor and is counted once above marginal work.
 
         ``committed_reserve_mb`` is RAM already spoken for by in-flight work whose cost is not yet
         reflected in the measured available figure (the RAM analogue of the VRAM committed reserve;
@@ -1908,9 +1944,11 @@ class RamBudget:
                 effective_available_mb,
                 component_charge_mb=component_charge_mb,
                 danger_floor_mb=danger_floor_mb,
+                staging_charge_mb=staging_charge_mb,
+                in_flight_transient_mb=in_flight_transient_mb,
             )
 
-        predicted = predict_job_ram_mb(job, baseline)
+        predicted = staging_charge_mb if staging_charge_mb is not None else predict_job_ram_mb(job, baseline)
         if predicted is None:
             return BudgetVerdict(
                 fits=True,
@@ -1933,12 +1971,19 @@ class RamBudget:
                 applied_credit_mb = predicted - candidate_charge
                 effective_predicted = candidate_charge
 
-        fits = effective_available_mb >= effective_predicted + self._reserve_mb
+        thresholds = ram_headroom(
+            None,
+            min_free_mb=danger_floor_mb or 0.0,
+            reserve_mb=self._reserve_mb,
+            staging_charge_mb=effective_predicted,
+            in_flight_transient_mb=in_flight_transient_mb,
+        )
+        fits = effective_available_mb >= thresholds.preload_requirement_mb
         return BudgetVerdict(
             fits=fits,
             predicted_mb=effective_predicted,
             available_mb=effective_available_mb,
-            reserve_mb=self._reserve_mb,
+            reserve_mb=thresholds.preload_requirement_mb - effective_predicted,
             uncredited_predicted_mb=predicted if applied_credit_mb > 0.0 else None,
             reusable_credit_mb=applied_credit_mb,
         )
@@ -1951,6 +1996,8 @@ class RamBudget:
         *,
         component_charge_mb: float,
         danger_floor_mb: float | None,
+        staging_charge_mb: float | None,
+        in_flight_transient_mb: float,
     ) -> BudgetVerdict:
         """Price a disaggregation-class preload at its UNet-only component charge instead of the whole checkpoint.
 
@@ -1964,7 +2011,7 @@ class RamBudget:
         breach. When no whole-checkpoint estimate exists the job is admitted unpriced, matching the ordinary
         path's never-wedge-on-unknown behavior.
         """
-        whole_predicted = predict_job_ram_mb(job, baseline)
+        whole_predicted = staging_charge_mb if staging_charge_mb is not None else predict_job_ram_mb(job, baseline)
         if whole_predicted is None:
             return BudgetVerdict(
                 fits=True,
@@ -1981,15 +2028,67 @@ class RamBudget:
             candidate_charge = whole_predicted
         applied_credit_mb = whole_predicted - candidate_charge
 
-        fits = effective_available_mb >= candidate_charge + self._reserve_mb
+        thresholds = ram_headroom(
+            None,
+            min_free_mb=danger_floor_mb or 0.0,
+            reserve_mb=self._reserve_mb,
+            staging_charge_mb=candidate_charge,
+            in_flight_transient_mb=in_flight_transient_mb,
+        )
+        fits = effective_available_mb >= thresholds.preload_requirement_mb
         return BudgetVerdict(
             fits=fits,
             predicted_mb=candidate_charge,
             available_mb=effective_available_mb,
-            reserve_mb=self._reserve_mb,
+            reserve_mb=thresholds.preload_requirement_mb - candidate_charge,
             uncredited_predicted_mb=whole_predicted if applied_credit_mb > 0.0 else None,
             reusable_credit_mb=applied_credit_mb,
         )
+
+
+@dataclass(frozen=True)
+class RamHeadroom:
+    """Represents ordered host-RAM requirements, with one additive reserve above marginal work.
+
+    The reserve and hard floor protect the same available pages, so their maximum is kept once.
+    The soft line protects outstanding job transients and never uses the configured reserve as risk.
+    """
+
+    hard_floor_mb: float
+    soft_hold_mb: float
+    preload_requirement_mb: float
+    restore_requirement_mb: float
+    reserve_mb: float
+    per_process_ceiling_mb: float | None
+
+
+def ram_headroom(
+    total_ram_mb: float | None,
+    *,
+    pause_percent: float = 85.0,
+    min_free_mb: float = 1024.0,
+    reserve_mb: float = 4096.0,
+    in_flight_transient_mb: float = 0.0,
+    staging_charge_mb: float = 0.0,
+    context_cost_mb: float = 0.0,
+    per_process_max_mb: float | None = None,
+) -> RamHeadroom:
+    """Return the single RAM threshold model used by admission, governance, restore and diagnostics.
+
+    Requirements are absolute available-RAM readings, before subtracting outstanding commitments.
+    A reserve overlaps the danger floor rather than adding a second floor. Restore pays for a complete
+    context and is never cheaper than staging the offered checkpoint. Impossible configurations remain
+    refused; this function cannot make work larger than the host fit.
+    """
+    floor = ram_pressure_floor_mb(total_ram_mb, pause_percent=pause_percent, min_free_mb=min_free_mb)
+    reserve = max(floor, max(0.0, reserve_mb))
+    soft = floor + max(0.0, in_flight_transient_mb)
+    preload = max(soft, reserve + max(0.0, staging_charge_mb))
+    restore = max(preload, reserve + max(0.0, context_cost_mb))
+    ceiling = None
+    if per_process_max_mb is not None and per_process_max_mb > 0:
+        ceiling = max(per_process_max_mb, max(0.0, context_cost_mb) * 1.1 + 1100.0)
+    return RamHeadroom(floor, soft, preload, restore, reserve, ceiling)
 
 
 # The defaults a partially-mocked or older config falls back to, so the pressure check never crashes the
@@ -2011,8 +2110,8 @@ def ram_pressure_floor_mb(
     The floor is the *more conservative* (higher) of two readings, so each protects the regime the other
     misses: ``(100 - pause_percent)%`` of total RAM guards a large-RAM host (where a fixed MB floor would be
     a negligible sliver), and ``min_free_mb`` guards a small-RAM host (where the percentage can resolve to
-    too few megabytes to load a model's weights safely). With the defaults (90%, 1024 MB) a 32 GB host
-    degrades below ~3.2 GB free and an 8 GB host below 1 GB free. ``min_free_mb`` alone applies when total
+    too few megabytes to load a model's weights safely). With the defaults (85%, 1024 MB) a 32 GB host
+    degrades below ~4.8 GB free and an 8 GB host below ~1.2 GB free. ``min_free_mb`` alone applies when total
     RAM is unknown.
     """
     if total_ram_mb is None or total_ram_mb <= 0:

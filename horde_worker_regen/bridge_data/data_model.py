@@ -1341,8 +1341,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     when `enable_vram_budget` is true."""
 
     ram_reserve_mb: int = Field(default=4096, ge=0)
-    """Available system RAM (MB) the budget keeps in reserve so resident-in-RAM models do not force
-    the OS to page to disk. Only used when `enable_vram_budget` is true."""
+    """Single additive host-RAM headroom reserve (MB), above a marginal checkpoint load or new context.
+
+    The reserve overlaps the absolute danger floor, so their maximum is protected once. It never sets
+    the soft pop-hold band or estimates the size of a context. Only used when `enable_vram_budget` is true."""
 
     ram_pressure_pause_percent: float = Field(default=85.0, ge=0, le=100)
     """System-RAM usage percentage at or above which the worker degrades to protect against an OS OOM kill.
@@ -1367,14 +1369,19 @@ class reGenBridgeData(CombinedHordeBridgeData):
     ram_pressure_pause_percent)% of total RAM, this)`. Only used when `enable_vram_budget` is true."""
 
     ram_per_process_max_mb: int = Field(default=18432, ge=0)
-    """Resident system RAM (MB) one inference process may hold before it is a reclaim candidate under pressure.
+    """Private working-set RAM ceiling (MB) for an inference process, protected by the offered model's context seed.
 
     A worker that keeps model weights resident for fast reload accumulates them in each process's address
     space, and the allocator does not return those pages to the OS without a respawn. On a multi-process /
     multi-GPU host a single process's footprint can balloon past what the shared RAM pool can hold beside its
     siblings and any co-tenants (an alchemist, a scribe), which is the shape that drives an OS OOM kill.
 
-    When the host is below its RAM danger floor, a process whose resident RAM is at or above this ceiling is
+    The effective ceiling is at least the largest offered context seed plus ten percent and a cold-child
+    allowance. Config load warns when the configured ceiling is below that seed. Unique/private bytes are
+    used when reported, with RSS as a fallback on platforms without that reading. The same ceiling gates
+    idle creep reclaim, so a healthy fp8 checkpoint does not trigger cold reloads merely for its mapped pages.
+
+    When the host is below its RAM danger floor, a process whose private RAM is at or above this ceiling is
     reclaimed: if idle it is recycled immediately (returning its retained pages), and if busy it is drained
     (fed no new work) and recycled once its in-flight job finishes. This bounds the per-process balloon so the
     summed resident set stays within RAM, rather than relying only on shedding idle siblings (which cannot help

@@ -298,6 +298,7 @@ class BridgeDataLoader:
         )
 
         reGenBridgeData.load_custom_models()
+        BridgeDataLoader._warn_ram_ceiling(bridge_data, horde_model_reference_manager)
 
         return bridge_data
 
@@ -363,9 +364,40 @@ class BridgeDataLoader:
                 horde_model_reference_manager,
             )
 
+        if horde_model_reference_manager is not None:
+            BridgeDataLoader._warn_ram_ceiling(bridge_data, horde_model_reference_manager)
         bridge_data.load_env_vars()
         bridge_data._loaded_from_env_vars = True
         return bridge_data
+
+    @staticmethod
+    def _warn_ram_ceiling(bridge_data: reGenBridgeData, reference_manager: ModelReferenceManager) -> None:
+        """Warn once per ceiling/model combination when a healthy offered model exceeds the configured ceiling."""
+        from horde_worker_regen.process_management.resources.resource_budget import predict_context_ram_mb
+
+        ceiling = bridge_data.ram_per_process_max_mb
+        if ceiling <= 0:
+            return
+        records = reference_manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+        for model in bridge_data.image_models_to_load:
+            record = records.get(model)
+            seed = (
+                predict_context_ram_mb(str(record.baseline), model)
+                if isinstance(record, ImageGenerationModelRecord)
+                else None
+            )
+            if seed is None or seed <= ceiling:
+                continue
+            key = (ceiling, model)
+            if key in BridgeDataLoader._ram_ceiling_warnings:
+                continue
+            BridgeDataLoader._ram_ceiling_warnings.add(key)
+            logger.warning(
+                f"ram_per_process_max_mb={ceiling} is below the {seed:.0f} MB context seed for {model!r}; "
+                "RAM reclaim uses a model-sized ceiling with slack to avoid recycling a healthy model.",
+            )
+
+    _ram_ceiling_warnings: set[tuple[int, str]] = set()
 
     @staticmethod
     def write_bridge_data_as_dot_env_file(bridge_data: reGenBridgeData, file_path: str | Path) -> None:

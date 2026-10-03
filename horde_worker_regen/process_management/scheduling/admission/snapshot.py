@@ -169,6 +169,8 @@ class JobSnapshot:
     component_charge_mb: float | None
     """The UNet-only RAM staging charge (MB) for a disaggregation-class job whose checkpoint carries a
     component-identity sidecar, else None: the whole checkpoint is priced."""
+    staging_charge_mb: float | None = None
+    """Marginal whole-checkpoint RAM charge: file bytes plus feature deltas, with trusted measured growth."""
 
 
 @dataclass(frozen=True)
@@ -224,6 +226,8 @@ class HostRamSnapshot:
     danger_floor_mb: float
     pressure: RamPressureVerdict
     """The governor's verdict for this tick, or a live reading before the first tick."""
+    in_flight_transient_mb: float = 0.0
+    """Outstanding feature allocations that could push the host below its hard floor."""
 
 
 @dataclass(frozen=True)
@@ -497,6 +501,7 @@ def build_scheduling_snapshot(
     disaggregation_class_eligible: Callable[[ImageGenerateJobPopResponse], bool],
     unserviceable_reason: Callable[[ImageGenerateJobPopResponse], str | None],
     component_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
+    staging_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
     checkpoint_models_held: Callable[[int], frozenset[str]],
     host_ram: HostRamSnapshot,
     budget_active: bool,
@@ -595,6 +600,7 @@ def build_scheduling_snapshot(
             ttl=float(job.ttl) if job.ttl is not None else None,
             unserviceable_reason=unserviceable_reason(job),
             component_charge_mb=component_charge_mb(job),
+            staging_charge_mb=staging_charge_mb(job),
         )
         (in_progress_ids if is_in_progress else pending_ids).append(key)
 

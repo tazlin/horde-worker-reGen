@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from horde_worker_regen.process_management.resources.hysteresis import HysteresisLatch
 from horde_worker_regen.process_management.scheduling.governance.actions import (
     ClearProcessDraining,
     EvictIdleModels,
@@ -122,25 +123,25 @@ class RamGovernorState:
 
 
 def decide_pop_hold(snapshot: HostMemorySnapshot) -> SetPopHold:
-    """Return the soft, pre-floor pop hold setting for this tick.
+    """Return the hold when outstanding transient allocations could breach the hard floor.
 
-    The hard floor pauses pops outright; this softer band stops the popper starting a new job's ttl clock
-    *before* the host is critical, so a job does not age past its ttl waiting on a degraded worker and get
-    aborted by the horde as too slow. The hold engages while the host is under the floor, while any process
-    is being drained for reclaim, or while measured available RAM is within the margin of the floor *and*
-    work is in flight whose completion will change the reading. An idle worker whose steady-state resident
-    footprint simply sits inside the margin is not held: nothing on an idle host frees RAM on its own, so
-    holding there starves the worker permanently, and a popped job is served immediately (no ttl-aging
-    risk) with the hard floor still guarding actual overgrowth.
+    The operator's reserve is never a proxy for job risk. A zero-hysteresis latch releases as soon as
+    the risk clears, so a host's steady-state resident footprint cannot serialize intake. Governance
+    pairs a soft hold with idle-model eviction in the same tick, independently of preload attempts.
     """
     verdict = snapshot.verdict
+    soft_line = snapshot.thresholds.soft_hold_mb
     approaching = (
         verdict.available_mb is not None
-        and (verdict.available_mb - verdict.floor_mb) < snapshot.pop_hold_margin_mb
         and snapshot.in_flight_job_count > 0
+        and HysteresisLatch().update(
+            soft_line - verdict.available_mb,
+            engage_at=0.0,
+            release_at=0.0,
+            inclusive=False,
+        )
     )
-    active = bool(verdict.under_pressure or approaching) or bool(snapshot.draining_process_ids)
-    return SetPopHold(active=active)
+    return SetPopHold(active=verdict.under_pressure or approaching or bool(snapshot.draining_process_ids))
 
 
 def decide_process_reduction(snapshot: HostMemorySnapshot) -> list[GovernanceAction]:
@@ -304,10 +305,13 @@ def decide_pressure_governance(snapshot: HostMemorySnapshot) -> list[GovernanceA
     under pressure still resolves after the floor clears). The restore of shed cards is decided separately
     by :func:`decide_shed_card_restore`, because it applies on a *healthy* host.
     """
-    actions: list[GovernanceAction] = [decide_pop_hold(snapshot)]
+    hold = decide_pop_hold(snapshot)
+    actions: list[GovernanceAction] = [hold]
     if snapshot.verdict.under_pressure:
         actions.extend(decide_degrade_response(snapshot))
     else:
+        if hold.active:
+            actions.append(EvictIdleModels())
         actions.extend(decide_draining_followthrough(snapshot))
     return actions
 

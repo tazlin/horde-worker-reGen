@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from horde_worker_regen.process_management.resources.resource_budget import RamPressureVerdict
+from horde_worker_regen.process_management.resources.resource_budget import RamHeadroom, RamPressureVerdict
 
 __all__ = [
     "CardProcessSnapshot",
@@ -77,8 +77,8 @@ class HostMemorySnapshot:
     """Whether the hard self-throttle pop pause is currently armed."""
     pop_pause_until: float
     """Wall-clock time the armed pop pause lapses (meaningless when not armed)."""
-    pop_hold_margin_mb: float
-    """How close (MB) available RAM may approach the danger floor before the soft pop hold engages."""
+    thresholds: RamHeadroom
+    """Absolute requirements computed once from this tick's charge and transient risk."""
     per_process_ceiling_mb: float | None
     """The per-process resident-RAM ceiling (MB), or None when the ceiling is disabled."""
     multi_gpu_routing_active: bool

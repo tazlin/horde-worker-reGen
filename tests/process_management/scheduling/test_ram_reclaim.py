@@ -256,6 +256,34 @@ class TestRamReclaimLedger:
         ledger.void_credit(7)
         assert ledger.pending_reuse_credits == {}
 
+    @pytest.mark.parametrize("fresh_report", [False, True])
+    def test_whole_load_learning_requires_a_report_after_admission(self, fresh_report: bool) -> None:
+        """Stale reports cannot make a cold load look free and depress its learned price."""
+        clock = _Clock()
+        ledger = RamReclaimLedger(clock)
+        target = make_mock_process_info(0, model_name="m", state=HordeProcessState.WAITING_FOR_JOB)
+        target.ram_usage_bytes = 1100 * _MB
+        for _ in range(5):
+            ledger.record_credit(target, model="m", effective_charge_mb=7100, kind=ReuseCreditKind.WHOLE)
+            target.report_sampled_at = clock.now + (1 if fresh_report else -1)
+            target.ram_usage_bytes += 6500 * _MB
+            clock.now += REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
+            assert ledger.settle_credits(ProcessMap({0: target})) == []
+        estimate = ledger.learned_ram.measured_estimate_mb("m", ReuseCreditKind.WHOLE)
+        assert estimate == (pytest.approx(7150) if fresh_report else None)
+
+    def test_replaced_launch_does_not_train_the_old_load(self) -> None:
+        """A successor at the same process id cannot settle its predecessor's admission."""
+        clock = _Clock()
+        ledger = RamReclaimLedger(clock)
+        target = self._credited(ledger, rss_mb=1100, charge_mb=7100)
+        target.process_launch_identifier += 1
+        target.loaded_horde_model_name = "m"
+        target.ram_usage_bytes = 50000 * _MB
+        clock.now += REUSE_CREDIT_RECONCILE_SETTLE_SECONDS
+        assert ledger.settle_credits(ProcessMap({0: target})) == []
+        assert ledger.pending_reuse_credits == {}
+
     def test_announce_admission_is_edge_triggered(self) -> None:
         """The same (target, model, charge) key announces once; a changed key announces again."""
         ledger = RamReclaimLedger(_Clock())

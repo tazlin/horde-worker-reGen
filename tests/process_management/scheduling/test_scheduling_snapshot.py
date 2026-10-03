@@ -158,6 +158,18 @@ class TestSchedulingSnapshot:
         assert snapshot.now == 1_000.0
         assert snapshot.services.model_metadata is scheduler._model_metadata  # type: ignore[attr-defined]
 
+    async def test_ram_load_charge_and_transient_risk_are_frozen(self) -> None:
+        """A RAM decision reads the captured charge and risk even when live providers later change."""
+        _initial, scheduler = await self._scheduler()
+        scheduler._checkpoint_staging_charge_mb = lambda _job: 7100.0
+        scheduler._in_flight_transient_ram_mb = lambda: 1200.0
+        snapshot = scheduler.snapshot()
+        scheduler._checkpoint_staging_charge_mb = lambda _job: 12600.0
+        scheduler._in_flight_transient_ram_mb = lambda: 5000.0
+        assert all(job.staging_charge_mb == 7100 for job in snapshot.queue.jobs.values())
+        assert snapshot.host_ram.in_flight_transient_mb == 1200
+        assert scheduler.snapshot().host_ram.in_flight_transient_mb == 5000
+
     async def test_building_twice_is_pure(self) -> None:
         """Two snapshots of an unchanged worker are equal, and no child received a message."""
         snapshot, scheduler = await self._scheduler()

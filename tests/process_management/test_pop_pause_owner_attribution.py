@@ -19,7 +19,7 @@ from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import PopPauseOwner
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
-from horde_worker_regen.process_management.resources.resource_budget import assess_ram_pressure
+from horde_worker_regen.process_management.resources.resource_budget import assess_ram_pressure, ram_headroom
 from horde_worker_regen.process_management.scheduling.governance import (
     HostMemorySnapshot,
     PausePops,
@@ -46,7 +46,7 @@ def _pressure_snapshot(
         now=now,
         pop_pause_active=pop_pause_active,
         pop_pause_until=pop_pause_until,
-        pop_hold_margin_mb=4096.0,
+        thresholds=ram_headroom(None, min_free_mb=assess_ram_pressure(None, _TOTAL_RAM_MB).floor_mb),
         per_process_ceiling_mb=None,
         multi_gpu_routing_active=False,
         in_flight_job_count=0,

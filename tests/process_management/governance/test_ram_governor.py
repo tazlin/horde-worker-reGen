@@ -7,7 +7,7 @@ against live processes) is covered by the regression suites under ``tests/proces
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.resources.resource_budget import assess_ram_pressure
+from horde_worker_regen.process_management.resources.resource_budget import assess_ram_pressure, ram_headroom
 from horde_worker_regen.process_management.scheduling.governance import (
     CardProcessSnapshot,
     ClearProcessDraining,
@@ -67,7 +67,11 @@ def _snapshot(
         now=_NOW,
         pop_pause_active=pop_pause_active,
         pop_pause_until=pop_pause_until,
-        pop_hold_margin_mb=pop_hold_margin_mb,
+        thresholds=ram_headroom(
+            None,
+            min_free_mb=assess_ram_pressure(None, _TOTAL_RAM_MB).floor_mb,
+            in_flight_transient_mb=pop_hold_margin_mb if in_flight_job_count else 0.0,
+        ),
         per_process_ceiling_mb=per_process_ceiling_mb,
         multi_gpu_routing_active=multi_gpu_routing_active,
         in_flight_job_count=in_flight_job_count,

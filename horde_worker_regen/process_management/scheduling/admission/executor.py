@@ -20,7 +20,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
-from horde_worker_regen.process_management.resources.resource_budget import RamPressureVerdict
+from horde_worker_regen.process_management.resources.resource_budget import RamHeadroom, RamPressureVerdict
 from horde_worker_regen.process_management.resources.run_metrics import ChurnKind
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
@@ -51,7 +51,6 @@ from horde_worker_regen.process_management.scheduling.governance import (
     WorkerProcessShedState,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import RamReclaimLedger
-from horde_worker_regen.utils.config_coercion import config_number
 
 
 class ExecutionHost(VramActuator, Protocol):
@@ -69,6 +68,7 @@ class ExecutionHost(VramActuator, Protocol):
     _runtime_config: RuntimeConfig
     _max_inference_processes: int
     _last_ram_verdict: RamPressureVerdict | None
+    _last_ram_headroom: RamHeadroom | None
 
     @property
     def _ram_governor_state(self) -> RamGovernorState:
@@ -172,10 +172,17 @@ class PlanExecutor:
                             if self._host._last_ram_verdict is not None
                             else "no reading"
                         )
-                        margin = config_number(self._host._runtime_config.bridge_data.ram_reserve_mb)
+                        thresholds = self._host._last_ram_headroom
+                        detail = (
+                            f"soft hold {thresholds.soft_hold_mb:.0f} MB, "
+                            f"preload {thresholds.preload_requirement_mb:.0f} MB, "
+                            f"restore {thresholds.restore_requirement_mb:.0f} MB"
+                            if thresholds is not None
+                            else "thresholds unavailable"
+                        )
                         logger.info(
-                            f"Host RAM pop hold {'engaged' if hold_active else 'released'}: {reading}, hold margin "
-                            f"{margin:.0f} MB above the floor while work is in flight; in-flight jobs continue.",
+                            f"Host RAM pop hold {'engaged' if hold_active else 'released'}: {reading}, {detail}; "
+                            "in-flight jobs continue.",
                         )
                     self._host._state.ram_pressure_pop_hold = hold_active
                 case PausePops(

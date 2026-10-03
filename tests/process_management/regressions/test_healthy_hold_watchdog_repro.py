@@ -22,6 +22,7 @@ import pytest
 
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.resources.resource_budget import ram_headroom
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import make_testable_process_manager
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -61,6 +62,14 @@ class TestGovernanceHealthyButHeldPredicate:
         scheduler = self._scheduler_with_verdict(monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
         scheduler._state.ram_pressure_pop_hold = False
 
+        assert scheduler.governance_healthy_but_held() is False
+
+    def test_in_flight_risk_above_a_healthy_floor_is_not_a_stuck_hold(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The healthy-hold watchdog respects an intentional transient-risk hold."""
+        scheduler = self._scheduler_with_verdict(monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
+        scheduler._state.ram_pressure_pop_hold = True
+        scheduler._last_ram_headroom = ram_headroom(_TOTAL_RAM_MB, in_flight_transient_mb=30000)
+        scheduler._job_tracker = Mock(spec=JobTracker, jobs_in_progress=[Mock()])
         assert scheduler.governance_healthy_but_held() is False
 
     def test_false_before_first_verdict_measured(self, monkeypatch: pytest.MonkeyPatch) -> None:
