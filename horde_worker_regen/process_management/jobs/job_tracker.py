@@ -51,6 +51,7 @@ from loguru import logger
 from horde_worker_regen.process_management.ipc.messages import AuxModelKind, AuxModelRef, HordeImageResult
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.resources.hysteresis import HysteresisLatch
 from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
 
 
@@ -738,7 +739,11 @@ class JobTracker:
             if current_ceiling_mb is None:
                 held = True
                 continue
-            if candidate_mb > current_ceiling_mb - self._CEILING_HOLD_LIFT_MARGIN_MB:
+            if HysteresisLatch(active=True).update(
+                candidate_mb - current_ceiling_mb,
+                engage_at=0.0,
+                release_at=-self._CEILING_HOLD_LIFT_MARGIN_MB,
+            ):
                 held = True
             else:
                 del self._ceiling_held_models[key]

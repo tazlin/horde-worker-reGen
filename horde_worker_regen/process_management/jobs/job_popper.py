@@ -68,6 +68,7 @@ from horde_worker_regen.process_management.models.model_sizing import (
     is_extra_large_model,
     model_size_tier,
 )
+from horde_worker_regen.process_management.resources.hysteresis import HysteresisLatch
 from horde_worker_regen.process_management.resources.model_serviceability import (
     _CONSTRAINED_LANE_FULL_CYCLES,
     ConstrainedLaneState,
@@ -1594,12 +1595,9 @@ class JobPopper:
 
         backlog = self._job_tracker.safety_backlog_depth
         cap = self._max_safe_safety_backlog()
-        if self._safety_backpressure_engaged:
-            if backlog <= cap * _SAFETY_BACKLOG_RELEASE_FRACTION:
-                self._safety_backpressure_engaged = False
-            return self._safety_backpressure_engaged
-        if backlog > 0 and backlog >= cap:
-            self._safety_backpressure_engaged = True
+        self._safety_backpressure_engaged = backlog > 0 and HysteresisLatch(
+            self._safety_backpressure_engaged,
+        ).update(backlog, engage_at=cap, release_at=cap * _SAFETY_BACKLOG_RELEASE_FRACTION)
         return self._safety_backpressure_engaged
 
     def _post_processing_commitment_depth(self) -> int:
