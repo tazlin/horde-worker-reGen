@@ -1,21 +1,19 @@
-"""RAM-pressure shed accounting must stay consistent when the whole-card residency path regrows the pool.
+"""A RAM-pressure shed owns its restore, whatever the whole-card residency path does meanwhile.
 
 Two independent mechanisms move the single-GPU inference-process count. The RAM governor sheds an idle
 context when the host crosses its absolute RAM danger floor, recording the shed in ``worker_shed`` so its
 own restore path can grow the pool back once RAM proves headroom. Whole-card residency independently
-collapses the pool to the residency holder and, when the residency drains, grows the pool back to the
-launched ceiling through the lifecycle directly.
+collapses the pool to the residency holder and, when the residency drains, grows the pool back toward the
+launched ceiling through the lifecycle.
 
 The contract these tests pin:
 
-* When the whole-card restore returns the pool to its planned process count, the RAM governor's
-  ``worker_shed`` record is resolved, because the pool it described as short is no longer short.
+* While a RAM shed stands, a whole-card release does not regrow the pool past the shed count. Regrowing it
+  onto a host still under its floor would only be shed again on the next governor tick, a cold reload each
+  time.
+* The RAM governor restores the shed contexts once the host proves headroom, and resolves its record.
 * Under sustained RAM pressure with repeated residency reserve/restore cycles, the recorded shed count
-  reflects the contexts actually outstanding and does not accumulate one entry per cycle without bound.
-
-Without that reconciliation the RAM governor's shed bookkeeping and the whole-card restore are disconnected:
-each governor tick that still reads under the floor re-sheds the pool the residency just regrew, and the
-recorded shed count climbs every cycle while the worker never returns to steady state.
+  reflects the contexts actually outstanding and does not accumulate one entry per cycle.
 """
 
 from __future__ import annotations
@@ -31,6 +29,7 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 _MAX_INFERENCE = 2
 _TOTAL_RAM_MB = 64000.0
 _CRITICAL_AVAILABLE_RAM_MB = 500.0
+_HEALTHY_AVAILABLE_RAM_MB = 60000.0
 
 
 def _pin_available_ram(scheduler: InferenceScheduler, monkeypatch: pytest.MonkeyPatch, available_mb: float) -> None:
@@ -93,14 +92,14 @@ def _arm_drained_residency(scheduler: InferenceScheduler, model: str) -> None:
     state.forecast = None
 
 
-class TestWholeCardRestoreReconcilesWorkerShed:
-    """A whole-card restore that returns the pool to plan resolves the RAM governor's shed record."""
+class TestRamShedOwnsItsRestore:
+    """A whole-card release leaves a RAM shed standing; the RAM governor restores it on proven headroom."""
 
-    def test_whole_card_restore_clears_worker_shed_once_pool_is_back_at_plan(
+    def test_whole_card_release_does_not_regrow_a_pool_the_ram_governor_shed(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """After the pool is regrown to its planned count, no shed record remains claiming it is short."""
+        """Under the floor, the residency's release keeps the shed count and the shed record."""
         scheduler, process_map = _single_gpu_scheduler_with_scaling(monkeypatch)
         _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
@@ -111,16 +110,36 @@ class TestWholeCardRestoreReconcilesWorkerShed:
         _arm_drained_residency(scheduler, "CyberRealistic Pony")
         scheduler._restore_siblings_after_whole_card()
 
+        assert process_map.num_loaded_inference_processes() == 1, (
+            "a whole-card release regrew a pool the RAM governor shed while the host is still under its floor"
+        )
+        assert scheduler._ram_governor_state.worker_shed is not None
+
+    def test_ram_governor_restores_the_shed_once_headroom_is_proven(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Healthy RAM after the residency's release returns the pool to plan and resolves the shed record."""
+        scheduler, process_map = _single_gpu_scheduler_with_scaling(monkeypatch)
+        _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
+        scheduler._reduce_processes_under_ram_pressure()
+        _arm_drained_residency(scheduler, "CyberRealistic Pony")
+        scheduler._restore_siblings_after_whole_card()
+
+        _pin_available_ram(scheduler, monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
+        for _ in range(_MAX_INFERENCE):
+            scheduler._restore_processes_after_ram_pressure()
+
         assert process_map.num_loaded_inference_processes() == _MAX_INFERENCE
         assert scheduler._ram_governor_state.worker_shed is None, (
-            "the whole-card restore returned the pool to plan, so the RAM governor's shed record is stale"
+            "the RAM governor returned the pool to plan, so its shed record is resolved"
         )
 
     def test_shed_count_does_not_accumulate_across_reserve_restore_cycles(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Repeat reduce/whole-card-restore cycles under pressure do not grow the recorded shed count without bound."""
+        """Repeat reduce/whole-card-release cycles under pressure keep one shed entry, not one per cycle."""
         scheduler, process_map = _single_gpu_scheduler_with_scaling(monkeypatch)
         _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
@@ -130,11 +149,11 @@ class TestWholeCardRestoreReconcilesWorkerShed:
 
             _arm_drained_residency(scheduler, f"model-{cycle}")
             scheduler._restore_siblings_after_whole_card()
-            assert process_map.num_loaded_inference_processes() == _MAX_INFERENCE
+            assert process_map.num_loaded_inference_processes() == 1
 
         worker_shed = scheduler._ram_governor_state.worker_shed
         recorded_shed = worker_shed.shed_process_count if worker_shed is not None else 0
         assert recorded_shed <= 1, (
-            f"the recorded shed count grew to {recorded_shed} across cycles even though the pool is back at plan; "
-            "the shed bookkeeping accumulates one entry per cycle instead of reconciling with the restore"
+            f"the recorded shed count grew to {recorded_shed} across cycles with one context outstanding; "
+            "the shed bookkeeping accumulates one entry per cycle"
         )
