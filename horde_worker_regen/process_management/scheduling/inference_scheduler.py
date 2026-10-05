@@ -135,6 +135,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
     ClearanceDecision,
+    StagedWaiterClock,
     decide_clearance_admit,
 )
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob
@@ -618,6 +619,10 @@ class InferenceScheduler:
         # The holds the dispatch, post-processing defer and clearance gates place on jobs that fit the queue
         # but not yet the card, with their session counters.
         self._dispatch_holds = DispatchHoldLedger(ledger_clock)
+        # The clearance clock per staged job: when clearance began holding it while waiting could not help (no
+        # other grant on its card, no reclaim in flight). Absent while either holds. It times the waiter's
+        # measured-load probe, which must come before the child's lease-acquire timeout samples it unpriced.
+        self._clearance_starved_since: dict[str, float] = {}
 
         # When the exclusive-admit dispatch hold last disclosed itself, per card scope. The hold is re-evaluated
         # every dispatch selection, so the notice is throttled to keep a sustained hold from repeating a line
@@ -3571,6 +3576,19 @@ class InferenceScheduler:
             return False
         return self._horde_model_map.is_model_loading(head.model) or self._missing_model_recovery_latched()
 
+    def _release_head_starvation_of_dispatched_job(self) -> None:
+        """Stop the head-starvation clock once the job it times is in progress.
+
+        The clock times a job's wait for dispatch; a dispatched job's wait for clearance is clearance's own
+        clock. The preload pass that would retime the head returns early once every pending model is accounted
+        for, so without this a dispatched job whose model needed no preload keeps the clock it started at pop.
+        """
+        timed_job_id = self._head_admission.starvation_job_id
+        if timed_job_id is None:
+            return
+        if any(str(job.id_) == timed_job_id for job in self._job_tracker.jobs_in_progress):
+            self._clear_head_starvation_timer()
+
     def _clear_head_starvation_timer(self) -> None:
         """Reset the head-starvation clock once a job is dispatched (the wedge, if any, is broken)."""
         self._head_admission.clear_head_starvation()
@@ -5781,7 +5799,11 @@ class InferenceScheduler:
         seconds and the card carries the measured median weight-upload cost, the two quantities the handoff
         window is sized from. Waiter priority is dispatch order (earlier-dispatched first), so queue position
         decides who samples next; the process id breaks ties deterministically.
+
+        It also stops the clearance clock of every waiter on the card that waiting can now help, every tick,
+        because a waiter behind another grant is not offered to :meth:`clearance_admit_process` at all.
         """
+        self._settle_staged_waiter_clocks(device_index)
         waiters: list[ClearanceWaiter] = []
         samplers: list[ActiveSampler] = []
         for process_info in self._process_map.values():
@@ -5838,6 +5860,10 @@ class InferenceScheduler:
         non-fit runs the described eviction through the single reclaim owner and records the hold, so the child
         stays staged until room frees (or samples via hordelib's lease-acquire timeout, liveness over pricing).
         The co-residency mutex is read here too, since clearance is the VRAM moment for a leased job.
+
+        The waiter's clearance clock runs from the first hold at which waiting could not help and stops at any
+        pass where it could: a grant, a post-processing hold, reclaim run or still in flight, or another lane's
+        work on the card.
         """
         process_info = self._process_map.get(process_id)
         job = process_info.current_inference_job() if process_info is not None else None
@@ -5852,18 +5878,23 @@ class InferenceScheduler:
             process_id,
             arbiter=self._ensure_preload_arbiter(),
             post_processing_deferred=deferred,
+            waiter_clock=self._staged_waiter_clock(process_info, job),
         )
         if process_info is None or job is None or plan.decision is ClearanceDecision.UNPRICED:
+            self._stop_staged_waiter_clock(job)
             return plan.grants
         if plan.decision is ClearanceDecision.HOLD_POST_PROCESSING:
+            self._stop_staged_waiter_clock(job)
             self._note_clearance_hold(job, reclaim_applied=False)
             self._log_clearance_hold(process_id, job, reason=plan.reason, verdict=None)
             return False
         if plan.decision is ClearanceDecision.BUDGET_INACTIVE:
+            self._stop_staged_waiter_clock(job)
             self._resolve_clearance_hold(job)
             return True
         assert plan.priced is not None and plan.verdict is not None and job.model is not None
         if plan.decision is ClearanceDecision.ADMIT:
+            self._stop_staged_waiter_clock(job)
             if plan.verdict.measured_attempt:
                 self._mark_measured_attempt(job, plan.priced.request, device_index=plan.priced.device_index)
             self._resolve_clearance_hold(job)
@@ -5877,6 +5908,10 @@ class InferenceScheduler:
             plan.verdict,
             is_head_of_queue=True,
         )
+        if applied or self._waiting_can_help_staged_waiter(process_info):
+            self._stop_staged_waiter_clock(job)
+        elif job.id_ is not None:
+            self._clearance_starved_since.setdefault(str(job.id_), self._clock())
         self._note_clearance_hold(job, reclaim_applied=bool(applied))
         self._log_clearance_hold(
             process_id,
@@ -5887,6 +5922,61 @@ class InferenceScheduler:
             actuations=applied,
         )
         return False
+
+    def _staged_waiter_clock(
+        self,
+        process_info: HordeProcessInfo | None,
+        job: ImageGenerateJobPopResponse | None,
+    ) -> StagedWaiterClock:
+        """Return the staged job's clearance clock and its card's measured load seconds."""
+        since = self._clearance_starved_since.get(str(job.id_)) if job is not None and job.id_ is not None else None
+        return StagedWaiterClock(
+            starved_seconds=0.0 if since is None else max(0.0, self._clock() - since),
+            load_seconds=(
+                self._process_map.recent_vram_load_seconds(process_info.device_index)
+                if process_info is not None
+                else None
+            ),
+        )
+
+    def _stop_staged_waiter_clock(self, job: ImageGenerateJobPopResponse | None) -> None:
+        """Stop the staged job's clearance clock; the next hold where waiting cannot help restarts it."""
+        if job is not None and job.id_ is not None:
+            self._clearance_starved_since.pop(str(job.id_), None)
+
+    def _waiting_can_help_staged_waiter(self, process_info: HordeProcessInfo) -> bool:
+        """Whether something on the waiter's card may still change its fit without a load of its own.
+
+        Another inference lane past its own clearance (sampling, loading, decoding) frees or takes room as it
+        runs, and an eviction issued but not yet evidenced at the device frees room when it lands. A lane still
+        primed is another waiter, which changes nothing while it waits.
+        """
+        pending_evictions = self._retention.pending_eviction_process_ids()
+        for other in self._process_map.values():
+            if other.process_id == process_info.process_id or other.device_index != process_info.device_index:
+                continue
+            if other.process_id in pending_evictions:
+                return True
+            if other.process_type != HordeProcessType.INFERENCE:
+                continue
+            if other.current_inference_job() is not None and (
+                other.last_process_state != HordeProcessState.INFERENCE_PRIMED
+            ):
+                return True
+        return False
+
+    def _settle_staged_waiter_clocks(self, device_index: int) -> None:
+        """Stop the clocks of the card's waiters that waiting can help, and drop those of jobs no longer staged."""
+        in_progress_ids = {str(job.id_) for job in self._job_tracker.jobs_in_progress if job.id_ is not None}
+        for job_id in [job_id for job_id in self._clearance_starved_since if job_id not in in_progress_ids]:
+            del self._clearance_starved_since[job_id]
+        for process_info in self._process_map.values():
+            if process_info.device_index != device_index:
+                continue
+            if process_info.last_process_state != HordeProcessState.INFERENCE_PRIMED:
+                continue
+            if self._waiting_can_help_staged_waiter(process_info):
+                self._stop_staged_waiter_clock(process_info.current_inference_job())
 
     def _log_clearance_hold(
         self,
@@ -7896,6 +7986,7 @@ class InferenceScheduler:
                     new_state=HordeProcessState.WAITING_FOR_JOB,
                 )
 
+        self._release_head_starvation_of_dispatched_job()
         snapshot = self.snapshot()
         loaded_models = loaded_or_loading_models(snapshot)
         if every_pending_model_accounted_for(snapshot, loaded_models):

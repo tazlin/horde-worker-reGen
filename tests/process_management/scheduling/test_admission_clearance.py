@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
@@ -17,9 +19,14 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
     ClearanceDecision,
+    StagedWaiterClock,
     decide_clearance_admit,
+    staged_attempt_deadline_seconds,
+    staged_held_mb,
     staged_materialization_delta_mb,
 )
+from horde_worker_regen.process_management.scheduling.admission.materialization import head_starved_seconds
+from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import DISPATCH_ADMISSION_FLOW
 from tests.process_management.conftest import (
@@ -32,7 +39,6 @@ from tests.process_management.conftest import (
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
-
 
 _JOB_MODEL = "stable_diffusion"
 _JOB_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
@@ -240,3 +246,98 @@ async def test_a_cleared_job_books_what_clearance_priced_and_spends_it_at_its_pe
     ledger = scheduler._reserve_ledger  # type: ignore[attr-defined]
     assert ledger.planned_charge_for_unit(DISPATCH_ADMISSION_FLOW, job_id, {0: 900.0}) == remaining
     assert ledger.planned_charge_for_unit(DISPATCH_ADMISSION_FLOW, job_id, {0: gross}) == 0.0
+
+
+async def test_clearance_presents_what_the_staged_job_already_holds() -> None:
+    """The request carries the netted holdings, so the outstanding charge plus them is the job's whole peak.
+
+    Without it the ceiling test reads the netted charge alone, and a job whose whole need exceeds the emptied
+    card reads as possible on it.
+    """
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=100.0)
+    job_id = str(job.id_)
+    snapshot = scheduler.snapshot()
+    gross = pricing.candidate_delta_mb(
+        snapshot, job, snapshot.queue.jobs[job_id].baseline, process_id=0, disaggregated=False
+    )
+    plan = _decide(scheduler, 0)
+    assert plan.priced is not None and gross is not None
+    request = plan.priced.request
+    assert request.candidate_held_mb == staged_held_mb(snapshot, job_id, 0) == 900.0
+    assert request.candidate_delta_mb is not None
+    assert request.candidate_delta_mb + request.candidate_held_mb == gross
+
+
+async def test_the_waiter_clock_times_the_probe_and_its_deadline_precedes_the_lease_timeout() -> None:
+    """Clearance prices a staged waiter on its own clock, with a probe deadline inside the acquire timeout.
+
+    The deadline is the timeout less the longer of the card's probe delay and its measured load seconds.
+    """
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=100.0)
+    probe_seconds = float(scheduler.snapshot().config_for(None).measured_load_probe_seconds)
+    arbiter = scheduler._ensure_preload_arbiter()  # type: ignore[attr-defined]
+
+    def priced_with(clock: StagedWaiterClock):  # noqa: ANN202
+        plan = decide_clearance_admit(
+            scheduler.snapshot(), 0, arbiter=arbiter, post_processing_deferred=False, waiter_clock=clock
+        )
+        assert plan.priced is not None
+        return plan.priced.request
+
+    quick_load = priced_with(StagedWaiterClock(starved_seconds=12.0, load_seconds=probe_seconds / 2))
+    assert quick_load.starved_seconds == 12.0
+    assert quick_load.attempt_deadline_seconds == CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS - probe_seconds
+    slow_load = priced_with(StagedWaiterClock(starved_seconds=12.0, load_seconds=probe_seconds + 5.0))
+    assert slow_load.attempt_deadline_seconds == CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS - probe_seconds - 5.0
+    assert staged_attempt_deadline_seconds(probe_after_seconds=0.0, load_seconds=None) == (
+        CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
+    )
+    assert _decide(scheduler, 0).priced.request.starved_seconds == 0.0  # type: ignore[union-attr]
+
+
+async def test_a_held_lone_waiter_is_timed_until_another_lanes_work_can_help() -> None:
+    """Clearance times a lone held waiter and stops the clock while another lane on the card is sampling.
+
+    The stop happens every tick the inputs are built, since a waiter behind another grant is not offered to
+    the admission at all.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=100.0)
+    now = [1000.0]
+    scheduler._clock = lambda: now[0]  # type: ignore[method-assign]
+
+    assert scheduler.clearance_admit_process(0) is False
+    now[0] += 7.0
+    assert scheduler._staged_waiter_clock(waiter, job).starved_seconds == 7.0  # type: ignore[attr-defined]
+
+    sibling = make_mock_process_info(1, model_name=_OTHER_MODEL, state=HordeProcessState.INFERENCE_STARTING)
+    sibling.last_job_referenced = make_job_pop_response(_OTHER_MODEL)
+    scheduler._process_map = ProcessMap({0: waiter, 1: sibling})
+    scheduler.build_clearance_inputs(device_index=0)
+    assert scheduler._staged_waiter_clock(waiter, job).starved_seconds == 0.0  # type: ignore[attr-defined]
+
+    assert scheduler.clearance_admit_process(0) is False
+    now[0] += 7.0
+    assert scheduler._staged_waiter_clock(waiter, job).starved_seconds == 0.0  # type: ignore[attr-defined]
+
+
+async def test_a_dispatched_job_is_never_timed_by_the_head_clock() -> None:
+    """The head-starvation clock answers nothing for a job in progress, and is released once it is dispatched.
+
+    The preload pass that retimes the head returns early once every pending model is accounted for, so a job
+    whose model needed no preload kept the clock it started at pop through dispatch and staging.
+    """
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=100.0)
+    job_id = str(job.id_)
+    head_admission = scheduler.head_admission
+    head_admission.track_head_starvation(job_id, work_in_progress=False)
+    snapshot = scheduler.snapshot()
+    later = replace(snapshot, now=head_admission.starvation_since + 30.0)
+    assert head_starved_seconds(later, job_id) == 0.0
+    still_pending = replace(
+        later,
+        queue=replace(later.queue, jobs={job_id: replace(later.queue.jobs[job_id], in_progress=False)}),
+    )
+    assert head_starved_seconds(still_pending, job_id) == 30.0
+
+    scheduler._release_head_starvation_of_dispatched_job()  # type: ignore[attr-defined]
+    assert head_admission.starvation_job_id is None

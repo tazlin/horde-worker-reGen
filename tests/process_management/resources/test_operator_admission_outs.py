@@ -1,8 +1,9 @@
 """The operator's outs over the measured admission: the margin, the probe delay, the lane rungs, the pin.
 
 Each is a field on the worker config with a per-card twin under ``gpu_overrides``; these tests pin the
-platform-aware margin default and its override, the probe delay's two regimes, the whole-card pin by name or
-baseline id, and the re-armed probe after a process cycle.
+platform-aware margin default and its override, the probe delay's two regimes and a staged waiter's deadline
+on them, the whole-card pin by name or baseline id, and the re-armed probe after a process cycle. The ceiling a
+staged job is judged against is pinned beside the probe, since the two decide its one real load together.
 """
 
 from __future__ import annotations
@@ -25,8 +26,10 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     DeviceVramState,
     MeasuredVramSnapshot,
     VramArbiter,
+    VramDisposition,
     VramRequest,
     VramRequestKind,
+    VramVerdict,
 )
 from tests.process_management.conftest import make_job_pop_response, track_popped_job_async
 
@@ -157,6 +160,77 @@ class TestProbeDelay:
         short_by_gigabytes = 20157.0 - 2 * _MEASURED_ATTEMPT_BAND_MB
         assert self._probes_at(short_by_gigabytes, _FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0, None) is False
         assert self._probes_at(short_by_gigabytes, _STARVATION_DIAGNOSTIC_SECONDS + 1.0, None) is True
+
+    def test_a_staged_waiters_delay_ends_at_its_deadline(self) -> None:
+        """A staged waiter probes by its deadline, past the band or inside it, so before its lease times out.
+
+        Uncapped, the long horizon past the band equals the lease-acquire timeout, and the child loads unpriced
+        before the probe can fire.
+        """
+        short_by_gigabytes = 20157.0 - 2 * _MEASURED_ATTEMPT_BAND_MB
+        deadline_seconds = _STARVATION_DIAGNOSTIC_SECONDS - _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
+
+        def probes(device_free_mb: float, starved_seconds: float, probe_after_seconds: float) -> bool:
+            arbiter = VramArbiter()
+            arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: self._state(device_free_mb)}))
+            request = replace(
+                self._head(starved_seconds, probe_after_seconds),
+                attempt_deadline_seconds=deadline_seconds,
+            )
+            return arbiter.evaluate(request).measured_attempt
+
+        assert probes(short_by_gigabytes, deadline_seconds - 1.0, _FIRST_PARTY_TEARDOWN_GRACE_SECONDS) is False
+        assert probes(short_by_gigabytes, deadline_seconds + 1.0, _FIRST_PARTY_TEARDOWN_GRACE_SECONDS) is True
+        assert probes(20157.0, deadline_seconds + 1.0, _STARVATION_DIAGNOSTIC_SECONDS + 10.0) is True
+
+
+class TestWholeNeedCeiling:
+    """The ceiling test prices a staged job's whole need: what it still has to load plus what it already holds."""
+
+    @staticmethod
+    def _verdict(*, held_mb: float, accepted_work: bool, device_free_mb: float = 4382.0) -> VramVerdict:
+        state = DeviceVramState(
+            total_vram_mb=7784.0,
+            baseline_mb=0.0,
+            committed_vram_mb=0.0,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            device_free_mb=device_free_mb,
+            noise_buffer_mb=512.0,
+        )
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: state}))
+        return arbiter.evaluate(
+            VramRequest(
+                kind=VramRequestKind.MONOLITHIC_DISPATCH,
+                job_label="sdxl-checkpoint",
+                baseline="stable_diffusion_xl",
+                device_index=0,
+                target_process_id=0,
+                candidate_delta_mb=6210.0,
+                candidate_held_mb=held_mb,
+                candidate_weights_mb=4900.0,
+                accepted_work=accepted_work,
+                is_head_of_queue=True,
+                head_job_id="staged",
+            ),
+        )
+
+    def test_what_the_job_holds_counts_against_the_emptied_card(self) -> None:
+        """6210 MB still to load and 2048 MB held is 8258 MB against a 7272 MB ceiling, which is over it.
+
+        The accepted job takes the ceiling attempt and an unaccepted request is denied; with nothing held the same
+        outstanding charge reads as possible and only defers.
+        """
+        assert self._verdict(held_mb=2048.0, accepted_work=True).measured_attempt is True
+        assert self._verdict(held_mb=2048.0, accepted_work=False).disposition is VramDisposition.DENY
+        unheld = self._verdict(held_mb=0.0, accepted_work=True)
+        assert unheld.disposition is VramDisposition.DEFER
+        assert unheld.measured_attempt is False
+
+    def test_the_fit_still_reads_the_outstanding_charge(self) -> None:
+        """Room for the outstanding charge admits whatever the job holds; the held figure feeds the ceiling only."""
+        assert self._verdict(held_mb=2048.0, accepted_work=False, device_free_mb=7000.0).admits is True
 
 
 async def test_a_process_cycle_rearms_a_spent_probe() -> None:

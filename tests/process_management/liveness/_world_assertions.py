@@ -206,6 +206,8 @@ class CheckpointReadSplit:
     """Read seconds a staged prefetch paid before clearance, while the lane waited."""
     cleared_seconds: float
     """Read seconds paid after clearance, inside the job's device load."""
+    booked_holding: bool
+    """Whether the parent dispatched the job to a lane it booked as holding the model."""
 
 
 def checkpoint_read_splits(world: _DispatchWorld) -> list[CheckpointReadSplit]:
@@ -217,10 +219,57 @@ def checkpoint_read_splits(world: _DispatchWorld) -> list[CheckpointReadSplit]:
             model=window.model,
             staged_seconds=window.staged_read_seconds,
             cleared_seconds=window.cleared_read_seconds,
+            booked_holding=window.booked_holding,
         )
         for window in world.job_windows.values()
         if window.loaded_now
     ]
+
+
+@dataclass(frozen=True)
+class ChildLoadDecision:
+    """Represents one child's judgement of its weight load against the free VRAM it believed the card had."""
+
+    job_id: str
+    lane_id: int
+    model: str
+    charge_mb: float
+    """The weight load the child judged."""
+    believed_free_mb: float
+    """The free VRAM the child believed the card had, from its clamped view."""
+    card_free_mb: float
+    """The free VRAM the card really had at the same instant."""
+    offloaded_mb: float
+    """The weights the child left in host RAM rather than load; zero when it loaded them all."""
+    cleared_by_grant: bool
+    """Whether the job's lease acquire obtained a clearance grant, rather than timing out or running unleased."""
+
+    @property
+    def offloaded(self) -> bool:
+        """Whether the child left any of its weights in host RAM at this load."""
+        return self.offloaded_mb > 0.0
+
+
+def child_load_decisions(world: _DispatchWorld) -> list[ChildLoadDecision]:
+    """Return, per job whose child judged a weight load, what it believed was free, what was, and what it offloaded."""
+    granted = {job_id for _tick, _lane, job_id in world.clearance_grants}
+    decisions: list[ChildLoadDecision] = []
+    for window in world.job_windows.values():
+        if window.load_charge_mb is None or window.load_believed_free_mb is None or window.load_card_free_mb is None:
+            continue
+        decisions.append(
+            ChildLoadDecision(
+                job_id=window.job_id,
+                lane_id=window.lane_id,
+                model=window.model,
+                charge_mb=window.load_charge_mb,
+                believed_free_mb=window.load_believed_free_mb,
+                card_free_mb=window.load_card_free_mb,
+                offloaded_mb=window.load_offloaded_mb,
+                cleared_by_grant=window.job_id in granted,
+            ),
+        )
+    return decisions
 
 
 def dispatch_to_first_step_seconds(world: _DispatchWorld) -> list[float]:
@@ -229,19 +278,6 @@ def dispatch_to_first_step_seconds(world: _DispatchWorld) -> list[float]:
         window.sample_from - window.dispatched_at
         for window in world.job_windows.values()
         if window.sample_from is not None
-    ]
-
-
-def booked_holding_disk_loads(world: _DispatchWorld) -> list[_JobWindow]:
-    """Return the device loads that read checkpoint pages from disk on a lane booked as holding the model.
-
-    The parent dispatched each of these believing the lane held the model, and the load still waited on the
-    disk, which is a cost nothing the parent records can see.
-    """
-    return [
-        window
-        for window in world.job_windows.values()
-        if window.loaded_now and window.booked_holding and window.disk_read_seconds > 0.0
     ]
 
 

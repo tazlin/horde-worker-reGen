@@ -141,10 +141,18 @@ multi-card rules together over the workload shape they were diagnosed from, eigh
 a dozen classes with a deep queue and a post-processing lane, and states what that fleet's throughput has to
 be. A regression in any one of the rules above shows there as cards left idle and jobs left queued, which is
 what an operator sees, rather than only in the row that isolates it.
+
+The ``same-baseline handoff`` rows state the dynamics of one card serving one baseline across more checkpoints
+than it has lanes, under the clearance lease, with host RAM used by other programs as the axis. Each lane holds
+a checkpoint in RAM between jobs and idles long enough for the host to reclaim its pages. What they pin: the
+device load stays out of the gap between one sample and the next, the next job is staged while the current one
+samples, a lane the parent books as holding its model never waits on the disk, and a retention fit does not
+charge the card for checkpoints idle lanes hold in RAM.
 """
 
 from __future__ import annotations
 
+import itertools
 import random
 import statistics
 from collections.abc import Mapping
@@ -254,7 +262,11 @@ from tests.process_management.liveness._world_assertions import (
     assert_no_committed_slot_retired,
     assert_no_duplicate_vram_copy,
     assert_no_unservable_dispatch_hold,
+    checkpoint_read_splits,
+    dispatch_to_first_step_seconds,
     duty_fraction,
+    handoff_gaps_by_card,
+    staging_overlap_share,
 )
 
 pytestmark = pytest.mark.closed_loop
@@ -2962,12 +2974,12 @@ _CLEARANCE_JOB_SHAPE = (1024, 1024)
 the fit at clearance turns on real terms rather than on rounding."""
 
 _CLEARANCE_CARD = _CardClass("clearance_fit", 7784.0)
-"""A card sized so the clearance fit is decided by exactly one term: the waiter's own staging charge.
+"""A card on which the staged job's whole need sits just over what the emptied card offers.
 
-Its total covers the lane's CUDA context (1354 MB), the encode working set a staged job holds (2048 MB), the
-activation the clearance re-price actually asks for on top of the staged weights (3358 MB), the admission
-noise buffer (512 MB), and 512 MB of margin. The job therefore fits at clearance with room to spare, and
-would not fit if a second copy of its own 2048 MB encode charge were counted against it."""
+Its total less the admission noise buffer (512 MB) is a 7272 MB ceiling. The job's whole peak is 8258 MB: the
+2048 MB encode working set it holds once staged, and 6210 MB still to load. Beside the lane's CUDA context
+(1354 MB) the measured reading leaves 3870 MB available, so the outstanding charge alone never fits and never
+reads as impossible either; only the whole need against the ceiling settles the job, by its one real load."""
 
 _CLEARANCE_TICK_CEILING = 5
 """Ticks the staged job may take to reach sampling. A preload is commanded on one pass, reported on the next
@@ -3013,19 +3025,23 @@ async def _drive_lone_staged_waiter(world: _DispatchWorld) -> ImageGenerateJobPo
 
 
 async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has() -> None:
-    """A lone staged job is cleared as soon as its full peak fits, not once its lease has run out.
+    """A lone staged job is settled by clearance within a few ticks, not once its lease has run out.
 
-    The failure this encodes: dispatch under the lease books the job an encode-only staging reservation, and
-    the clearance re-price then charges the job's full peak against measured free net of every outstanding
-    reservation. The job's own staging entry was left in that overlay, so the waiter was priced at its peak
-    *plus* its own encode charge and a card with room for the peak read as short by the whole 2 GB. Nothing on
-    the card changes while a lone waiter waits, so no eviction and no completion could release it: the hold
-    stood until the child sampled through its bounded lease-acquire timeout, and every job of that shape paid
-    a full minute of dead card time for room the card had all along.
+    The failure this encodes: dispatch under the lease books the job an encode-only staging reservation, and the
+    clearance re-price charged the job's full peak against measured free net of every outstanding reservation,
+    its own staging entry included, so the waiter read as short by its own encode charge. Nothing on the card
+    changes while a lone waiter waits, so no eviction and no completion could release it: the hold stood until
+    the child sampled through its bounded lease-acquire timeout, and every job of that shape paid a full minute
+    of dead card time.
 
-    Read as one statement: a job's own staging reservation is not an obstacle to its own clearance. Its
-    consequences are that the waiter is cleared within a few ticks of being staged, and that no lane in the run
-    reaches its lease-acquire timeout, which is the only other way a staged job ever samples.
+    Clearance now prices the job net of what it holds, and on this card that outstanding charge neither fits the
+    reading nor exceeds the ceiling, so alone it would defer against a figure that never moves. Clearance also
+    presents what the job holds, so the ceiling test reads the whole need, finds it just over what the emptied
+    card offers, and the accepted job takes its one real load at once.
+
+    Read as one statement: a lone waiter is settled by clearance, never by its lease timeout. Its consequences
+    are that the waiter is cleared within a few ticks of being staged, and that no lane in the run reaches its
+    lease-acquire timeout, which is the only other way a staged job ever samples.
     """
     world = _clearance_world()
 
@@ -3039,7 +3055,7 @@ async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has()
     )
     assert dispatch_tick <= _CLEARANCE_TICK_CEILING, (
         f"{context}: the job took {dispatch_tick} ticks to reach sampling, past the "
-        f"{_CLEARANCE_TICK_CEILING}-tick ceiling a clearance onto a card that already fits it comes in under. "
+        f"{_CLEARANCE_TICK_CEILING}-tick ceiling a lone waiter's clearance comes in under. "
         f"{world.state_dump()}"
     )
     assert not world.clearance_timeouts, (
@@ -3054,41 +3070,120 @@ async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has()
     )
 
 
-async def test_r_defect_reinjection_a_waiter_charged_its_own_staging_waits_out_its_lease(
+async def test_r_defect_reinjection_a_waiter_whose_holdings_are_not_presented_waits_for_its_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With the job's own staging entry charged against it again, the lone waiter samples only on the timeout.
+    """With clearance presenting none of what the staged job holds, the lone waiter is priced only at its deadline.
 
-    Reinjected at the netting alone: the same card, the same dispatch and the same staging reservation, and the
-    only difference is that the clearance re-price counts the job's own encode charge as room somebody else is
-    owed. What comes back is the pre-fix signature: no grant is ever issued, the card sits with a staged lane
-    and its memory largely free, and the job reaches its denoise loop only because hordelib's lease-acquire
-    timeout puts it there unpriced.
+    Reinjected at the ceiling test alone: the same card, the same dispatch and the same staging reservation, and
+    the only difference is that the job's whole need is read as its outstanding charge, under the card's
+    achievable ceiling, so the card is never judged impossible and the ceiling attempt that clears the job
+    inside a few ticks never fires. What is left is the clearance clock: the measured attempt comes only at
+    the deadline it sets below the lease-acquire timeout, after most of a minute of dead card time.
     """
-    original = clearance_mod.build_materialization_request
-
-    def unnetted(*args: object, **kwargs: object) -> object:
-        kwargs["nets_own_dispatch_reservation"] = False
-        return original(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(clearance_mod, "build_materialization_request", unnetted)
+    monkeypatch.setattr(clearance_mod, "staged_held_mb", lambda *_args: 0.0)
     world = _clearance_world()
+    deadline_ticks = int(
+        clearance_mod.staged_attempt_deadline_seconds(
+            probe_after_seconds=float(world._scheduler._runtime_config.bridge_data.measured_load_probe_seconds),
+            load_seconds=None,
+        )
+        / _TICK_SECONDS,
+    )
 
     job = await _drive_lone_staged_waiter(world)
 
-    assert not world.clearance_grants, (
-        "an unnetted re-price must withhold the grant for as long as the waiter holds its own staging charge, "
-        f"which is the whole of this defect; the gate cleared it anyway ({world.clearance_grants}). "
-        f"{world.state_dump()}"
-    )
-    assert [job_id for _tick, _lane, job_id in world.clearance_timeouts] == [str(job.id_)], (
-        "the job must reach its denoise loop through the lease-acquire timeout rather than through a grant; "
-        f"the run recorded {world.clearance_timeouts}. {world.state_dump()}"
+    assert not world.clearance_timeouts, (
+        "the clearance clock must price the waiter before the lease-acquire timeout even with the ceiling "
+        f"blind to its holdings; the run recorded {world.clearance_timeouts}. {world.state_dump()}"
     )
     dispatch_tick = world.dispatch_tick(job)
-    assert dispatch_tick is not None and dispatch_tick >= _CLEARANCE_TIMEOUT_TICKS, (
-        f"the wedge costs a full {CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f}s of dead card time per job; "
-        f"this run reached sampling on tick {dispatch_tick}, inside the timeout. {world.state_dump()}"
+    assert dispatch_tick is not None and dispatch_tick >= deadline_ticks, (
+        "a ceiling blind to the job's holdings cannot fire the ceiling attempt, so the job waits for the clock's "
+        f"deadline ({deadline_ticks} ticks); this run reached sampling on tick {dispatch_tick}. "
+        f"{world.state_dump()}"
+    )
+    assert dispatch_tick < _CLEARANCE_TIMEOUT_TICKS, (
+        f"the deadline attempt must land inside the {CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f}s timeout; "
+        f"this run reached sampling on tick {dispatch_tick}. {world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Lone staged waiter: a card that fits the job in principle but not at the reading is settled by a priced load
+# --------------------------------------------------------------------------------------------------------
+
+_LONE_WAITER_CARDS = {
+    "inside_band": _CardClass("lone_waiter_inside_band", 9412.0),
+    "outside_band": _CardClass("lone_waiter_outside_band", 8970.0),
+}
+"""Cards on which the staged job's whole need sits under the achievable ceiling while its outstanding charge
+misses the measured available room.
+
+The lane's context (1354 MB) is on the card and outside the ceiling's account, so the miss is the job's whole
+need less what the emptied card offers after that context: about 700 MB on the first card, inside the measured
+attempt band, and about 1150 MB on the second, past it. Nothing else is on either card, so no reclaim and no
+completion can close the miss."""
+
+
+def _lone_waiter_world(card: _CardClass, *, model_already_staged: bool) -> _DispatchWorld:
+    """One lane under the clearance lease on ``card``, its job's model either preloaded or already in host RAM."""
+    world = _DispatchWorld(
+        card=card,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        tick_seconds=_TICK_SECONDS,
+    )
+    if model_already_staged:
+        world.seed_resident(0, _SDXL, in_vram=False)
+    return world
+
+
+@pytest.mark.parametrize("model_already_staged", [False, True], ids=["preloaded", "already_in_ram"])
+@pytest.mark.parametrize("shortfall", sorted(_LONE_WAITER_CARDS))
+async def test_z_a_lone_staged_waiter_is_priced_before_its_lease_runs_out(
+    shortfall: str,
+    model_already_staged: bool,
+) -> None:
+    """A staged job nothing else on the card can help earns its one measured load before its lease times out.
+
+    The failure this encodes: a staged waiter's measured-load probe was timed by the head-starvation clock,
+    which a preload send cleared and which only the preload pass restarted. A job whose model was preloaded had
+    no clock once staged and never earned the probe, so it waited out its lease-acquire timeout and loaded
+    unpriced; a job whose model needed no preload kept the clock it started at pop and earned it. Past the
+    measured-attempt band the probe also waited the full diagnostic horizon, which equals that timeout.
+
+    Read as one statement: a lone staged waiter's wait is clearance's to time, and its probe comes before the
+    timeout. Its consequences are that the job reaches sampling through a grant that the measured-load probe
+    issued, inside the timeout, whether or not its model was preloaded and whether the miss is inside the band
+    or past it, and that no lane reaches the timeout.
+    """
+    world = _lone_waiter_world(_LONE_WAITER_CARDS[shortfall], model_already_staged=model_already_staged)
+
+    job = await _drive_lone_staged_waiter(world)
+
+    context = f"lone staged waiter ({shortfall}, {'already in RAM' if model_already_staged else 'preloaded'})"
+    dispatch_tick = world.dispatch_tick(job)
+    assert dispatch_tick is not None and dispatch_tick < _CLEARANCE_TIMEOUT_TICKS, (
+        f"{context}: the job reached sampling on tick {dispatch_tick}, not inside the "
+        f"{_CLEARANCE_TIMEOUT_TICKS}-tick lease-acquire timeout. {world.state_dump()}"
+    )
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, so the load "
+        f"ran unpriced. {world.state_dump()}"
+    )
+    assert [job_id for _tick, _lane, job_id in world.clearance_grants] == [str(job.id_)], (
+        f"{context}: the job entered its load-and-sample window without a grant ({world.clearance_grants}). "
+        f"{world.state_dump()}"
+    )
+    assert world.scheduler._ensure_preload_arbiter().measured_attempts == 1, (
+        f"{context}: the grant was not the measured-load probe "
+        f"({world.scheduler._ensure_preload_arbiter().measured_attempts} attempts), so the card's reading was "
+        f"not what this row says it is. {world.state_dump()}"
     )
 
 
@@ -3245,6 +3340,28 @@ async def test_t_a_checkpoint_staged_in_host_ram_is_not_measured_as_resident() -
     assert forecast.needs_exclusive_residency is True, f"{context}: the whole-card claim was retired. {forecast}"
 
 
+def _staged_heavy_world_beside_its_sibling() -> _DispatchWorld:
+    """The staged-heavy card with whole-card residency off, so the sibling lane and its SDXL weights stay.
+
+    Whole-card residency stops the sibling process outright to seat the extra-large head, which no unload leak
+    can survive; with it off, the sibling's weights are on the card for as long as its unload returns nothing.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        tick_seconds=_TICK_SECONDS,
+        closed_loop=True,
+        clearance_lease=True,
+        learned_footprints=True,
+    )
+    world.seed_resident(0, _FLUX, in_vram=False)
+    world.seed_resident(1, _SDXL, in_vram=True)
+    return world
+
+
 _CREDIT_TICKS = 10
 """Ticks the staged head is watched for: well inside the lease-acquire timeout, so a grant within them is a
 clearance the price admitted, never the timeout's unpriced sampling."""
@@ -3263,7 +3380,7 @@ async def test_u_a_staged_job_is_not_credited_with_weights_it_has_not_loaded() -
     Its consequence is that the staged head is not granted clearance while the sibling's weights still occupy
     the room its full peak needs, whatever the map says about the model being in use.
     """
-    world = _staged_heavy_world()
+    world = _staged_heavy_world_beside_its_sibling()
     # The sibling's unload returns nothing, so no eviction can make the room; a grant would have to come from
     # the price.
     world.child_unload_leaks_mb = _SDXL.weights_mb
@@ -5026,6 +5143,26 @@ _SAME_BASELINE_DECODE_SECONDS = (
     * _SAME_BASELINE_MEGAPIXELS
 )
 
+_HANDOFF_GAP_MEDIAN_CEILING_SECONDS = _SAME_BASELINE_DECODE_SECONDS + _SAME_BASELINE_TICK_SECONDS
+"""The longest a typical handoff may take: the outgoing job's decode tail and one tick of observation.
+
+The incoming job's device load belongs before the outgoing sample ends, so what is left between two samples
+is at most the decode the outgoing lane still runs."""
+
+_HANDOFF_GAP_UPPER_QUARTILE_CEILING_SECONDS = _SAME_BASELINE_DECODE_SECONDS + 2 * _SAME_BASELINE_TICK_SECONDS
+"""The longest the slower quarter of handoffs may take, one tick past the median ceiling."""
+
+_STAGED_WHILE_SAMPLING_FLOOR = (_SAME_BASELINE_SAMPLE_SECONDS - _SAME_BASELINE_TICK_SECONDS) / (
+    _SAME_BASELINE_SAMPLE_SECONDS
+)
+"""Share of sampling ticks on which another lane must hold the next job staged.
+
+With work always pending, the next job can be staged within a tick of a sample starting and stay staged
+until the sample ends."""
+
+_STAGED_LANE_STATES = frozenset({HordeProcessState.INFERENCE_PRIMED})
+"""A lane staged for clearance or loading after it: the state a lane holds the next job in."""
+
 
 @dataclass(frozen=True)
 class _HostHeadroom:
@@ -5069,8 +5206,9 @@ _SAME_BASELINE_ARRIVALS = _same_baseline_arrivals()
 def _same_baseline_world(headroom: _HostHeadroom) -> _DispatchWorld:
     """A 24 GB card, four lanes each holding an SDXL checkpoint in RAM, two sampling slots, and the lease.
 
-    Foreign RAM is set after seeding, from the worker's settled private pages, so ``headroom`` is exactly the
-    page cache left for checkpoints.
+    The lease runs with production's default tail overlap. The staged lane's prefetch stays off, since its
+    production side is not in place. Foreign RAM is set after seeding, from the worker's settled private pages,
+    so ``headroom`` is exactly the page cache left for checkpoints.
     """
     ledger = HostRamLedger(
         _SAME_BASELINE_HOST_TOTAL_MB,
@@ -5084,6 +5222,7 @@ def _same_baseline_world(headroom: _HostHeadroom) -> _DispatchWorld:
         queue_depth=_SAME_BASELINE_QUEUE_DEPTH,
         closed_loop=True,
         clearance_lease=True,
+        tail_overlap=True,
         service_contexts=True,
         tick_seconds=_SAME_BASELINE_TICK_SECONDS,
         host_ram=ledger,
@@ -5095,6 +5234,127 @@ def _same_baseline_world(headroom: _HostHeadroom) -> _DispatchWorld:
     settled_private_mb = sum(ledger.private_mb.values())
     ledger.foreign_mb = ledger.total_mb - settled_private_mb - headroom.cached_checkpoints * checkpoint_mb
     return world
+
+
+_SAME_BASELINE_RUNS: dict[str, _DispatchWorld] = {}
+"""Completed runs by headroom label: every row at one level reads the same run, which is read-only after it."""
+
+
+async def _same_baseline_run(headroom: _HostHeadroom) -> _DispatchWorld:
+    """Run the pinned script to completion at ``headroom`` once, and return the finished world."""
+    finished = _SAME_BASELINE_RUNS.get(headroom.label)
+    if finished is not None:
+        return finished
+    world = _same_baseline_world(headroom)
+    started_at = world.now
+    cursor = 0
+    for _ in range(_SAME_BASELINE_MAX_TICKS):
+        while cursor < len(_SAME_BASELINE_ARRIVALS) and _SAME_BASELINE_ARRIVALS[cursor][0] <= world.now - started_at:
+            model = _SAME_BASELINE_ARRIVALS[cursor][1]
+            job = make_job_pop_response(
+                model.name,
+                width=_SAME_BASELINE_WIDTH,
+                height=_SAME_BASELINE_HEIGHT,
+                ddim_steps=_SAME_BASELINE_STEPS,
+            )
+            if not await world.offer_job(job):
+                break
+            cursor += 1
+        await world.step()
+        if cursor == len(_SAME_BASELINE_ARRIVALS) and world.submitted_jobs >= len(_SAME_BASELINE_ARRIVALS):
+            break
+    assert world.submitted_jobs == len(_SAME_BASELINE_ARRIVALS), (
+        f"{headroom.label} headroom: {world.submitted_jobs} of {len(_SAME_BASELINE_ARRIVALS)} jobs reached submit "
+        f"in {world.tick} ticks. {world.state_dump()}"
+    )
+    _SAME_BASELINE_RUNS[headroom.label] = world
+    return world
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the device load is paid after clearance: the next lane's warm step (hordelib prefetch at job "
+        "start on a cache hit) and the retention dispatch hold under the lease are not landed"
+    ),
+)
+@pytest.mark.parametrize("headroom", _HEADROOM_LEVELS, ids=[level.label for level in _HEADROOM_LEVELS])
+async def test_y_the_handoff_gap_carries_no_device_load(headroom: _HostHeadroom) -> None:
+    """The gap between one sample ending and the next starting, while work is pending, holds no device load.
+
+    The next job's weights belong on the card before the outgoing sample ends: staged, cleared and loaded in
+    its tail, and read back from disk ahead of time where the host reclaimed their pages. What remains of the
+    gap is the outgoing decode.
+    """
+    world = await _same_baseline_run(headroom)
+    gaps = [gap for card_gaps in handoff_gaps_by_card(world).values() for gap in card_gaps]
+    assert len(gaps) > 1, f"{headroom.label} headroom: too few handoffs to measure. {world.state_dump()}"
+    _lower, median, upper = statistics.quantiles(gaps, n=4, method="inclusive")
+    first_steps = dispatch_to_first_step_seconds(world)
+    context = (
+        f"{headroom.label} headroom: {len(gaps)} handoffs, gap median {median:.2f}s and upper quartile {upper:.2f}s; "
+        f"dispatch to first step median {statistics.median(first_steps):.2f}s, worst {max(first_steps):.2f}s"
+    )
+    assert median <= _HANDOFF_GAP_MEDIAN_CEILING_SECONDS, (
+        f"{context}, over the {_HANDOFF_GAP_MEDIAN_CEILING_SECONDS:.2f}s median ceiling. {world.state_dump()}"
+    )
+    assert upper <= _HANDOFF_GAP_UPPER_QUARTILE_CEILING_SECONDS, (
+        f"{context}, over the {_HANDOFF_GAP_UPPER_QUARTILE_CEILING_SECONDS:.2f}s upper-quartile ceiling. "
+        f"{world.state_dump()}"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "a lane booked as holding its model reads reclaimed pages after clearance: the warm step "
+        "(hordelib prefetch at job start on a cache hit, covering the text encoder) is not landed"
+    ),
+)
+@pytest.mark.parametrize("headroom", _HEADROOM_LEVELS, ids=[level.label for level in _HEADROOM_LEVELS])
+async def test_y_a_lane_booked_as_holding_its_model_never_waits_on_the_disk(headroom: _HostHeadroom) -> None:
+    """No device load reads reclaimed checkpoint pages on a lane the parent booked as holding the model.
+
+    The parent dispatches to a lane because it records the model there. If the host reclaimed that
+    checkpoint's pages while the lane idled, the parent has either to know it and warm the lane ahead of the
+    dispatch, or to pay the read inside the job's own window without any record of why. The parent's residency
+    bookkeeping for a seated lane decides which.
+    """
+    world = await _same_baseline_run(headroom)
+    # A read finished while the job waited staged costs the handoff nothing, so only the read paid after
+    # clearance counts against the bookkeeping.
+    booked = [split for split in checkpoint_read_splits(world) if split.booked_holding]
+    cold = [split for split in booked if split.cleared_seconds > 0.0]
+    assert not cold, (
+        f"{headroom.label} headroom: {len(cold)} device load(s) on a lane booked as holding the model read "
+        f"{sum(split.cleared_seconds for split in cold):.1f}s of reclaimed pages from disk after clearance, inside "
+        f"the job's window, first on lane {cold[0].lane_id} for {cold[0].model}; booked-holding loads read "
+        f"{sum(split.staged_seconds for split in booked):.1f}s more while staged. {world.state_dump()}"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "`_retained_resident_dispatch_holds` prices a full load at dispatch under the lease and an "
+        "unknown live rate keeps `_overlap_memory_verdict` at the full price"
+    ),
+)
+@pytest.mark.parametrize("headroom", _HEADROOM_LEVELS, ids=[level.label for level in _HEADROOM_LEVELS])
+async def test_y_the_next_job_is_staged_while_one_samples(headroom: _HostHeadroom) -> None:
+    """While one lane samples with work pending, another lane holds the next job staged for clearance.
+
+    Staging costs the card the encode working set alone, so a card running one SDXL sampler has room for it,
+    and the overlap verdict that admits a staging dispatch is what decides whether it gets it.
+    """
+    world = await _same_baseline_run(headroom)
+    staged = staging_overlap_share(world, states=_STAGED_LANE_STATES)
+    preparing = staging_overlap_share(world)
+    assert staged >= _STAGED_WHILE_SAMPLING_FLOOR, (
+        f"{headroom.label} headroom: another lane held the next job staged on {staged:.0%} of sampling ticks, "
+        f"under the {_STAGED_WHILE_SAMPLING_FLOOR:.0%} floor (any preparing state, preloads included: "
+        f"{preparing:.0%}). {world.state_dump()}"
+    )
 
 
 _RAM_HELD_STREAK_JOBS = 12
@@ -5217,6 +5477,55 @@ def _assert_staging_left_the_card_whole(world: _DispatchWorld, *, context: str) 
     )
     assert_governor_never_reached(world, GovernorState.SATURATED, context=context)
     assert_free_floor(world, _CHILD_FREE_MARGIN_MB, context=context)
+
+
+async def _drive_staging_traffic(world: _DispatchWorld) -> None:
+    """Alternate the two checkpoints with two jobs always pending, and run until every job completes."""
+    rotation = (_SDXL, _SDXL_OTHER)
+    popped = 0
+    for _ in range(_STAGING_MAX_TICKS):
+        while popped < _STAGING_JOBS and len(world.job_tracker.jobs_pending_inference) < _STAGING_LANES:
+            await world.pop(_staging_job(rotation[popped % len(rotation)]))
+            popped += 1
+        await world.step()
+        if world.completed_jobs >= _STAGING_JOBS:
+            break
+    assert world.completed_jobs == _STAGING_JOBS, world.state_dump()
+
+
+@pytest.mark.xfail(
+    strict=True, reason="`_retained_resident_dispatch_holds` prices a full load at dispatch under the lease"
+)
+async def test_y_the_next_job_stages_beside_a_sample_on_a_small_card() -> None:
+    """On a 16 GB card the next SDXL job stages while the other lane samples, and the card stays whole.
+
+    A staging dispatch puts only the encode working set on the card; the weights land at clearance, which
+    prices the full job. Two full SDXL jobs do not fit this card, so the second lane may stage beside the
+    first lane's sample but must not load beside it, and a staged lane's wait must end at clearance rather
+    than at the lease-acquire timeout.
+    """
+    world = _staging_world()
+    _assert_two_full_jobs_overcommit_the_card(world)
+
+    await _drive_staging_traffic(world)
+
+    context = "staging beside a sample on a 16 GB card"
+    _assert_staging_left_the_card_whole(world, context=context)
+    windows = sorted(
+        (window for window in world.job_windows.values() if window.sample_from is not None),
+        key=lambda window: window.sample_from or 0.0,
+    )
+    assert len(windows) == _STAGING_JOBS, world.state_dump()
+    unstaged = [
+        later.job_id[:8]
+        for earlier, later in itertools.pairwise(windows[_STAGING_UNMEASURED_JOBS - 1 :])
+        if earlier.sample_until is None or later.dispatched_at >= earlier.sample_until
+    ]
+    assert not unstaged, (
+        f"{context}: job(s) {unstaged} were dispatched only after the previous sample ended, so their staging "
+        f"ran in the gap between samples (staged share of sampling ticks "
+        f"{staging_overlap_share(world, states=_STAGED_LANE_STATES):.0%}). {world.state_dump()}"
+    )
 
 
 async def _drive_long_sample_then_candidate(world: _DispatchWorld) -> tuple[ImageGenerateJobPopResponse, ...]:

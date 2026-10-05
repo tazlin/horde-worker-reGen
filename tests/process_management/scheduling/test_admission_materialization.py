@@ -97,7 +97,8 @@ async def test_request_carries_the_snapshot_pricing(
     assert request.accepted_work is True
     assert request.head_job_id == job_id
     assert request.is_head_of_queue is is_head_of_queue
-    assert request.starved_seconds == pytest.approx(30.0)
+    # A job in progress is never the timed head: a staged waiter's wait is clearance's clock, passed separately.
+    assert request.starved_seconds == pytest.approx(0.0 if nets_own else 30.0)
     assert request.candidate_weights_mb == predict_job_weight_mb(head, job.baseline)
     assert request.can_reduce_live_contexts is False
     expected_delta = (

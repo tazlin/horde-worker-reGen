@@ -628,7 +628,9 @@ a timed-out job never brings the previous admission's figure into the next. A cl
 attributed to the `clearance_hold`
 slot-duty bucket (see [GPU duty cycle](duty-cycle.md)). Liveness always wins over pricing: a child whose
 clearance is starved past hordelib's bounded lease-acquire timeout samples anyway, and the parent logs that
-unpriced window once rather than ever wedging the pool. The lease brackets a disaggregated sample stage
+unpriced window once rather than ever wedging the pool. A lone waiter that nothing else on its card can help
+earns its one measured load before that timeout, on a clearance clock of its own (see the staged-waiter bullet
+in [VRAM arbiter](vram_arbiter.md)). The lease brackets a disaggregated sample stage
 exactly as it brackets a whole job: the sampler resets its per-job grant when a sample control message
 arrives, so each stage waits for its own clearance and a multi-slice batch consumes one grant between them.
 Without that reset a pinned sampler blocks once, for its first stage, and passes straight through

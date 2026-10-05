@@ -338,6 +338,13 @@ class VramRequest:
     device_index: int | None
     target_process_id: int | None = None
     candidate_delta_mb: float | None = None
+    candidate_held_mb: float = 0.0
+    """What the candidate's own job already holds on the target process (MB), netted out of
+    ``candidate_delta_mb``: a staged child's encode set and any partial copy of its weights at clearance.
+
+    Only the achievable-ceiling test reads it. An emptied card releases those holdings too, so the job's whole
+    need against that ceiling is the outstanding charge plus this figure, while every test against the card as
+    it stands keeps the outstanding charge alone. Zero for every request that is not netted that way."""
     candidate_weights_mb: float | None = None
     accepted_work: bool = False
     """Whether the worker already accepted this job from the service and tracks it locally.
@@ -399,13 +406,19 @@ class VramRequest:
     this seam), degrading to admitting the non-head."""
     first_of_kind: bool = False
     starved_seconds: float = 0.0
-    """Seconds this head has been the undispatched head of an idle device, used only to time the
-    starvation diagnostic and the first-party context teardown grace; zero when a live job holds the card (the
-    head is then queued behind live work, not starved)."""
+    """Seconds this head has waited where waiting could not help, timing the starvation diagnostic, the
+    first-party context teardown grace and the measured-load probe; zero when a live job holds the card (the
+    head is then queued behind live work, not starved).
+
+    For an undispatched head it is the head-starvation clock. For a staged waiter at clearance it is the
+    clearance clock: seconds held with no other grant on its card and no reclaim in flight."""
     probe_after_seconds: float = _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
     """How long the head must have starved before the measured-load probe may fire at a converged-empty card.
     The teardown grace by default (once the ladder is empty, waiting longer buys nothing); the scheduler sets
     it from the card's ``measured_load_probe_seconds``."""
+    attempt_deadline_seconds: float | None = None
+    """For a staged waiter, the starved reading by which its measured-load probe must be eligible, so it comes
+    before the child's lease-acquire timeout makes the same load unpriced. None leaves the delay uncapped."""
     sampling_peak_mb: float | None = None
     active_sampling_peaks_total_mb: float | None = None
     """The live sum (MB) of the in-flight disaggregated sampling peaks at the moment of this request, for
@@ -655,6 +668,12 @@ class VramVerdict:
     def stated(self) -> str:
         """Return the verdict as a person should read it: the block, then the arithmetic behind it."""
         return self.reason if not self.detail else f"{self.reason} ({self.detail})"
+
+
+def _whole_need_mb(request: VramRequest) -> float:
+    """Return the job's whole device need (MB): its outstanding charge plus what it already holds on the card."""
+    candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
+    return candidate_delta_mb + max(0.0, request.candidate_held_mb)
 
 
 def _relaxed_verdict(request: VramRequest, device_index: int | None) -> VramVerdict:
@@ -1036,10 +1055,11 @@ class VramArbiter:
         self.measured_attempts += 1
         if impossible:
             ceiling_mb = state.achievable_ceiling_mb() or 0.0
+            whole_need_mb = _whole_need_mb(request)
             logger.warning(
                 f"VRAM: attempting a measured load of head-of-queue {request.job_label}: predicted candidate "
-                f"{measured.candidate_outstanding_mb:.0f} MB is above this card's achievable ceiling "
-                f"{ceiling_mb:.0f} MB by {measured.candidate_outstanding_mb - ceiling_mb:.0f} MB, within the "
+                f"{whole_need_mb:.0f} MB is above this card's achievable ceiling "
+                f"{ceiling_mb:.0f} MB by {whole_need_mb - ceiling_mb:.0f} MB, within the "
                 f"{self._ceiling_attempt_allowance_mb(ceiling_mb):.0f} MB allowance; the card is empty with "
                 "nothing left to reclaim, so one real load decides whether the prediction or the card is wrong. "
                 f"measured: {measured.reason()}",
@@ -1091,7 +1111,7 @@ class VramArbiter:
         ceiling_mb = state.achievable_ceiling_mb()
         if ceiling_mb is None:
             return False
-        if not self._ceiling_attempt_candidate_eligible(request, measured, ceiling_mb):
+        if not self._ceiling_attempt_candidate_eligible(request, ceiling_mb):
             return False
         if not self._card_converged_empty(request, measured):
             return False
@@ -1124,18 +1144,13 @@ class VramArbiter:
         ceiling_mb = state.achievable_ceiling_mb()
         if ceiling_mb is None:
             return False
-        if not self._ceiling_attempt_candidate_eligible(request, measured, ceiling_mb):
+        if not self._ceiling_attempt_candidate_eligible(request, ceiling_mb):
             return False
         if self._card_converged_empty(request, measured):
             return False
         return not self.any_other_device_can_seat(request, exclude_device_index=request.device_index)
 
-    def _ceiling_attempt_candidate_eligible(
-        self,
-        request: VramRequest,
-        measured: AdmissionVerdict,
-        ceiling_mb: float,
-    ) -> bool:
+    def _ceiling_attempt_candidate_eligible(self, request: VramRequest, ceiling_mb: float) -> bool:
         """Whether an over-ceiling candidate is bounded enough to earn convergence and one real attempt.
 
         Planning probes and work not yet owned by the worker retain the prediction-error allowance. Once the
@@ -1144,7 +1159,7 @@ class VramArbiter:
         immutable downstream refusal for work intake already promised. The remaining measured-attempt guards
         still require a true head, a converged empty card, no better card, and a job/card one-shot.
         """
-        overshoot_mb = measured.candidate_outstanding_mb - ceiling_mb
+        overshoot_mb = _whole_need_mb(request) - ceiling_mb
         if overshoot_mb <= 0.0:
             return False
         if overshoot_mb <= self._ceiling_attempt_allowance_mb(ceiling_mb):
@@ -1198,12 +1213,19 @@ class VramArbiter:
         tenant the ledger cannot see (a child whose unload returned nothing, a foreign process), and admitting
         a load into it is the one way this path can produce an out-of-memory; that keeps the long diagnostic
         horizon, the same wait as before, so the reclaim and attribution machinery has its window first.
+
+        A staged waiter's delay never passes its :attr:`VramRequest.attempt_deadline_seconds`, because at its
+        lease-acquire timeout the child makes the same load anyway, unpriced and with no reclaim to wait for.
         """
         headroom = measured.headroom_mb
         shortfall_mb = -headroom if headroom is not None else float("inf")
         if shortfall_mb <= _MEASURED_ATTEMPT_BAND_MB:
-            return request.probe_after_seconds
-        return max(request.probe_after_seconds, _STARVATION_DIAGNOSTIC_SECONDS)
+            delay_seconds = request.probe_after_seconds
+        else:
+            delay_seconds = max(request.probe_after_seconds, _STARVATION_DIAGNOSTIC_SECONDS)
+        if request.attempt_deadline_seconds is None:
+            return delay_seconds
+        return min(delay_seconds, max(0.0, request.attempt_deadline_seconds))
 
     @staticmethod
     def _card_converged_empty(request: VramRequest, measured: AdmissionVerdict) -> bool:
@@ -1491,13 +1513,13 @@ class VramArbiter:
         floor) are not the worker's to reclaim. A candidate larger than that can never fit on this card however
         much the worker reclaims, so it DENIES rather than deferring forever. An unknown total cannot prove
         impossibility (returns False); an unknown foreign floor contributes zero, so the boundary collapses to
-        the pre-foreign ``total - noise_buffer``.
+        the pre-foreign ``total - noise_buffer``. The candidate is its whole need (:func:`_whole_need_mb`), since
+        an emptied card has released what the job already holds as well.
         """
         ceiling_mb = state.achievable_ceiling_mb()
         if ceiling_mb is None:
             return False
-        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
-        return candidate_delta_mb > ceiling_mb
+        return _whole_need_mb(request) > ceiling_mb
 
     @staticmethod
     def _impossibility_detail(
@@ -1506,12 +1528,11 @@ class VramArbiter:
         measured: AdmissionVerdict,
     ) -> str:
         """Spell out the achievable-ceiling arithmetic behind a structural-impossibility DENY."""
-        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
         ceiling_mb = state.achievable_ceiling_mb() or 0.0
         total_mb = state.total_vram_mb or 0.0
         foreign_mb = state.foreign_floor_mb or 0.0
         return (
-            f"candidate {candidate_delta_mb:.0f} MB against an achievable ceiling of {ceiling_mb:.0f} MB "
+            f"candidate {_whole_need_mb(request):.0f} MB against an achievable ceiling of {ceiling_mb:.0f} MB "
             f"(total {total_mb:.0f} - noise {state.noise_buffer_mb:.0f} - foreign floor {foreign_mb:.0f}); "
             f"{measured.reason()}"
         )

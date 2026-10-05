@@ -20,9 +20,11 @@ from horde_worker_regen.process_management.resources.vram_arbiter import Actuato
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.materialization import (
     MaterializationRequest,
+    StagedWaiterTerms,
     build_materialization_request,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot
+from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 
 
 class ClearanceDecision(StrEnum):
@@ -83,19 +85,42 @@ class ClearancePlan:
         return self.priced.candidate_delta_mb if self.priced is not None else None
 
 
-def staged_materialization_delta_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
-    """The staged child's remaining materialisation (MB): its priced peak net of what it already holds on the card.
+@dataclass(frozen=True)
+class StagedWaiterClock:
+    """Represents the caller's clearance clock for one staged waiter and the load it would pay once cleared."""
 
-    By the clearance moment the child's text encoder, VAE and leftover allocator cache are on the device and
-    already missing from the measured device-free reading, while the priced peak is the whole sampling-time
-    reservation including them; charged gross, a child reads as further from fitting the more of its own job
-    it has staged. Clearance prices this figure and the cleared job's dispatch reservation is booked at it
-    against the same report, so the booking has decayed to nothing once the job reaches its peak.
+    starved_seconds: float
+    """Seconds clearance has held the waiter while waiting could not help: no other grant on its card and no
+    reclaim in flight. Zero while either holds."""
+    load_seconds: float | None
+    """The card's measured RAM-to-VRAM load seconds, or None when none is measured yet."""
 
-    The report is the job's own only net of weights another model keeps on the slot, which stay beside the
-    job. Weights of the job's own model, whole or partial, are in the report too, so they are netted from the
-    peak before any resident-weight credit rather than credited whole. An unpriceable job (None) passes
-    through, and a slot with no report yet is charged its priced peak.
+
+_UNTIMED_WAITER = StagedWaiterClock(starved_seconds=0.0, load_seconds=None)
+"""The clock of a waiter the caller does not time: no starved seconds, so no measured-load probe."""
+
+
+def staged_attempt_deadline_seconds(*, probe_after_seconds: float, load_seconds: float | None) -> float:
+    """Return the clock reading by which a staged waiter's measured-load probe must be eligible.
+
+    The acquire timeout less the longer of the card's probe delay and its measured load: the grant then reaches
+    the child while it still waits, with at least a probe delay or a load's worth of the timeout to spare for
+    the gap between the child starting its wait and clearance first holding it.
+    """
+    margin_seconds = max(probe_after_seconds, load_seconds or 0.0)
+    return max(0.0, CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS - margin_seconds)
+
+
+def _staged_peak_and_holdings_mb(
+    snapshot: SchedulingSnapshot,
+    job_id: str,
+    process_id: int,
+) -> tuple[float, float] | None:
+    """The staged job's whole peak and what of it its slot reports holding (MB), or None when unpriceable.
+
+    The report is the job's own only net of weights another model keeps on the slot, which stay beside the job.
+    Weights of the job's own model, whole or partial, are in the report too, so the peak carries them before
+    any resident-weight credit rather than having them credited whole. A slot with no report holds nothing.
     """
     job = snapshot.queue.jobs[job_id]
     if job.model is None:
@@ -112,12 +137,39 @@ def staged_materialization_delta_mb(snapshot: SchedulingSnapshot, job_id: str, p
         return None
     reported_mb = snapshot.slots[process_id].reserved_mb
     if reported_mb is None:
-        return priced_mb
+        return priced_mb, 0.0
     peak_mb = priced_mb
     if pricing.candidate_weights_resident(snapshot, job.model, process_id):
         peak_mb += predict_job_weight_mb(payload, job.baseline) or 0.0
     own_holdings_mb = max(0.0, float(reported_mb) - _other_models_weights_mb(snapshot, process_id, job.model))
-    return max(0.0, peak_mb - own_holdings_mb)
+    return peak_mb, min(peak_mb, own_holdings_mb)
+
+
+def staged_materialization_delta_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
+    """The staged child's remaining materialisation (MB): its priced peak net of what it already holds on the card.
+
+    By the clearance moment the child's text encoder, VAE and leftover allocator cache are on the device and
+    already missing from the measured device-free reading, while the priced peak is the whole sampling-time
+    reservation including them; charged gross, a child reads as further from fitting the more of its own job
+    it has staged. Clearance prices this figure and the cleared job's dispatch reservation is booked at it
+    against the same report, so the booking has decayed to nothing once the job reaches its peak.
+
+    An unpriceable job (None) passes through, and a slot with no report yet is charged its priced peak.
+    """
+    peak_and_holdings = _staged_peak_and_holdings_mb(snapshot, job_id, process_id)
+    if peak_and_holdings is None:
+        return None
+    peak_mb, held_mb = peak_and_holdings
+    return peak_mb - held_mb
+
+
+def staged_held_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float:
+    """What the staged job already holds on the card (MB): the part of its peak its outstanding charge nets out.
+
+    The outstanding charge plus this figure is the job's whole need, which is what an emptied card must seat.
+    """
+    peak_and_holdings = _staged_peak_and_holdings_mb(snapshot, job_id, process_id)
+    return peak_and_holdings[1] if peak_and_holdings is not None else 0.0
 
 
 def _other_models_weights_mb(snapshot: SchedulingSnapshot, process_id: int, model: str) -> float:
@@ -136,13 +188,16 @@ def decide_clearance_admit(
     *,
     arbiter: VramArbiter,
     post_processing_deferred: bool,
+    waiter_clock: StagedWaiterClock = _UNTIMED_WAITER,
 ) -> ClearancePlan:
     """Decide whether the staged child on ``process_id`` may be cleared into its load-and-sample window.
 
     ``post_processing_deferred`` is the co-residency mutex's answer for the child's job, read by the caller
     because that predicate still logs and latches on the scheduler; it is consulted only for a priceable job.
-    A priced decision nets the job's own outstanding staging reservation out of the overlay, since the full
-    peak priced here already covers it, and evaluates against the one frozen measurement the snapshot saw.
+    ``waiter_clock`` is the caller's clearance clock for the child, which times its measured-load probe in
+    place of the head-starvation clock. A priced decision nets the job's own outstanding staging reservation
+    out of the overlay, since the full peak priced here already covers it, presents what the job already holds
+    so the ceiling test sees its whole need, and evaluates against the one frozen measurement the snapshot saw.
     """
     slot = snapshot.slots.get(process_id)
     if slot is None:
@@ -155,6 +210,7 @@ def decide_clearance_admit(
         return ClearancePlan(ClearanceDecision.HOLD_POST_PROCESSING, process_id, job_id, job.model, None, None)
     if not snapshot.budget_active:
         return ClearancePlan(ClearanceDecision.BUDGET_INACTIVE, process_id, job_id, job.model, None, None)
+    config = snapshot.config_for(snapshot.routing_device_index(slot))
     priced = build_materialization_request(
         snapshot,
         job_id,
@@ -163,6 +219,14 @@ def decide_clearance_admit(
         is_head_of_queue=True,
         head_outstanding_mb=None,
         candidate_delta_override_mb=staged_materialization_delta_mb(snapshot, job_id, process_id),
+        staged_waiter=StagedWaiterTerms(
+            held_mb=staged_held_mb(snapshot, job_id, process_id),
+            starved_seconds=waiter_clock.starved_seconds,
+            attempt_deadline_seconds=staged_attempt_deadline_seconds(
+                probe_after_seconds=float(config.measured_load_probe_seconds),
+                load_seconds=waiter_clock.load_seconds,
+            ),
+        ),
         nets_own_dispatch_reservation=True,
     )
     verdict = arbiter.evaluate(priced.request)

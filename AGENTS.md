@@ -260,18 +260,26 @@ These fail as interactions, not as units, so component tests stay green through 
   multi-card row states each card's own total, tenants and measured free (one entry on a single card). Changes to
   admission, retention, leases, governor thresholds or recovery rungs ship with a closed-loop test
   asserting an outcome (a duty floor, no safety teardown while serving, no free-VRAM crater). A live
-  run confirms; it is not where you find out. Five fidelities are opt-in per row: `clearance_lease=True`
-  makes dispatch a staging step (the lane sits `INFERENCE_PRIMED` holding its encode working set alone,
-  a real `ClearanceController` is stepped over the scheduler's own `build_clearance_inputs` with
+  run confirms; it is not where you find out. Every lane reports what the card charges it, and every
+  `UNLOAD_MODELS_FROM_VRAM` the scheduler sends frees the lane's device weights, including one sent down the
+  pipe alone with no control flag (the eviction ahead of a cross-model dispatch). Reports arrive every tick,
+  where a child reports every `MEMORY_REPORT_INTERVAL_SECONDS`. Five fidelities are opt-in per row:
+  `clearance_lease=True` makes dispatch a staging step (the lane sits `INFERENCE_PRIMED` holding its encode
+  working set alone and reporting it, a real `ClearanceController` is stepped over the scheduler's own `build_clearance_inputs` with
   `clearance_admit_process` as its `admit_fn`, the weights land at clearance, and the lane stays
   `INFERENCE_PRIMED` through their load until its first step, as a production child does), and a lane held for
   `CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS` samples unpriced and is recorded in `world.clearance_timeouts`.
+  The child acquires through a real `ClearanceLeaseProxy` built with a shared device-free figure, so a granted
+  child rebases its free-VRAM view on the figure its grant carries and ages it from the grant, as hordelib's
+  clamp does; a lane that times out keeps its dispatch figure.
   Under the lease, `staged_lane_prefetch=True` starts a staged lane's read of its reclaimed checkpoint pages at
   dispatch and touches them each staged tick, so clearance pays only the unfinished read, as hordelib's
   prefetch-and-touch does; `tail_overlap=True` turns on the controller's handoff window and feeds it what
   production does, each sampler's step position through `ProcessMap.on_heartbeat` and each paid load as a
   `ram_to_vram` phase through `ProcessMap.on_job_metrics`; `gpu_sampling_lease_slots` sets the controller's cap
-  apart from `max_threads`. All three default to the off or `max_threads` value;
+  apart from `max_threads`. All three default to the off or `max_threads` value. `performance_model=True` gives
+  the scheduler an in-memory, unseeded `PerformanceModel` fed each finished job's sampling rate and its
+  finalization, so a dispatched slot carries an expected sampling time once a signature has enough samples;
   `learned_footprints=True` sends each lane's per-tick memory report through a real `MessageDispatcher` into
   a `LearnedFootprintStore` the scheduler prices from (`world.footprint_store`), so a row can state what the
   parent learns from what its children report. It is opt-in because a parent that learns the children's
@@ -289,8 +297,9 @@ These fail as interactions, not as units, so component tests stay green through 
   pages with nothing of it on the device, the report of a pooled monolithic lane. Every run keeps
   `world.job_windows` (each job's dispatch, clearance, load and sampling instants, and what its load paid) and
   each lane's state on `tick_observations`, from which `_world_assertions.py` reads handoff gaps, the staging
-  overlap share, the two-sampler share, dispatch-to-first-step seconds, each load's read split at clearance and
-  disk reads on lanes booked as holding their model.
+  overlap share, the two-sampler share, dispatch-to-first-step seconds, each load's read split at clearance,
+  disk reads on lanes booked as holding their model, and each child's weight-load decision (believed free
+  against true free, and what it left in host RAM) through `child_load_decisions`.
 - **Every production incident becomes a permanent scenario** in `test_incident_scenarios.py`, written
   so that undoing its fix makes it fail. If the simulator cannot express an incident, extend the
   simulator.

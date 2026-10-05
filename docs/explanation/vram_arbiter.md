@@ -313,7 +313,18 @@ timeout for room the card had all along. The candidate itself gets the same trea
 has already put on the card (its text encoder and VAE, any allocator cache left by its previous job, read as
 the process's measured reservation) is missing from the device-free reading and inside the full peak, so the
 clearance re-price charges the peak net of that reservation. Charged gross, a child reads as further from
-fitting the more of its own job it has staged; a multi-GB encoder alone costs it the timeout. Second,
+fitting the more of its own job it has staged; a multi-GB encoder alone costs it the timeout. The reservation
+is the job's own only net of weights another model keeps on the slot, which stay beside the job. Weights of
+the job's own model in it, whole or partial, are netted from the peak before any resident-weight credit, so a
+partial copy is not priced as a whole one. A grant books the job's dispatch reservation at this same figure,
+decaying by growth past the same reading (`staged_materialization_delta_mb`). Booked at the gross peak, the
+staged holdings would stay outstanding through the whole sample and be charged against the next waiter.
+The request also carries the figure it netted (`candidate_held_mb`, from `staged_held_mb`). An emptied card
+releases those holdings too, so the achievable-ceiling test compares the outstanding charge plus them, the
+job's whole need, with what the emptied card offers. Every test against the card as it stands reads the
+outstanding charge alone. Without the held figure a job whose whole need exceeds the emptied card reads as
+possible on it, defers against a reading that never moves, and samples unpriced at its lease-acquire timeout.
+Second,
 a candidate whose weights already occupy VRAM on the target process is admitted directly as a no-op: dispatching
 (or preloading) onto an already-resident idle model materialises nothing, its weights are already in the
 committed floor, and its next activation is the monolithic status quo the card has already served. The ledger
@@ -847,6 +858,15 @@ The room is also what the other frames read, so they cannot disagree with the ve
   reads as empty is likelier a tenant the ledger cannot see (a child whose unload returned nothing, a foreign
   process) than arithmetic, and a load into it is the one way this path can produce an out-of-memory. A spent
   probe is re-armed when the process that carried it goes away.
+- **A staged waiter is timed by clearance.** The head-starvation clock times a job's wait for dispatch and
+  never answers for a job in progress. At clearance the probe reads the scheduler's clearance clock instead:
+  seconds the waiter has been held while waiting could not help. A sampler or any other lane past its own
+  clearance on the card, an eviction issued and not yet evidenced, a hold that ran reclaim, a grant and a
+  post-processing hold each stop it, and the next hold where nothing helps starts it again. The waiter's delay,
+  the longer horizon past the band included, ends by the lease-acquire timeout less the longer of
+  `measured_load_probe_seconds` and the card's measured load seconds, because at the timeout the child makes
+  the same load anyway, unpriced. Reclaim keeps its turn: the probe still needs a converged card with no rung
+  left that could close the deficit.
 - **Recovery defers to a standing hold** inside its liveness bound (the probe clock, the teardown grace and
   the heavy head's load window end to end), logging the deferral once on each edge; past the bound the hold
   is a wedge like any other.

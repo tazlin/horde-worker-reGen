@@ -36,6 +36,7 @@ Assertion helpers over a completed run live in ``_world_assertions.py``.
 
 from __future__ import annotations
 
+import math
 import multiprocessing
 import queue
 from dataclasses import dataclass
@@ -48,7 +49,7 @@ from horde_model_reference.model_reference_records import ImageGenerationModelRe
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from hordelib.feature_impact import get_baseline_burden
-from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent
+from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent, SamplingStats
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
@@ -57,9 +58,11 @@ from horde_worker_regen.process_management.ipc.message_dispatcher import Message
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
     HordeControlFlag,
+    HordeControlMessage,
     HordeHeartbeatType,
     HordeImageResult,
     HordeInferenceControlMessage,
+    HordeJobMetricsMessage,
     HordeProcessMemoryMessage,
     HordeProcessState,
     ModelLoadState,
@@ -111,6 +114,7 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
 from horde_worker_regen.process_management.scheduling.governance.whole_card import offer_under_pop_claim
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
+from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
     make_mock_bridge_data,
@@ -439,6 +443,14 @@ class _JobWindow:
     """The part of ``disk_read_seconds`` a staged prefetch paid before clearance, outside ``load_seconds``."""
     cleared_read_seconds: float = 0.0
     """The part of ``disk_read_seconds`` paid after clearance, inside ``load_seconds``."""
+    load_charge_mb: float | None = None
+    """The weight load the child judged at its load decision; None when the job loaded nothing."""
+    load_believed_free_mb: float | None = None
+    """The free VRAM the child believed the card had at its load decision."""
+    load_card_free_mb: float | None = None
+    """The free VRAM the card really had at the child's load decision."""
+    load_offloaded_mb: float = 0.0
+    """The weights the child left in host RAM at its load decision to relieve a believed shortfall."""
     retention_granted: bool | None = None
     """Whether the job ended under a retention grant for its model; None until it completes."""
 
@@ -715,6 +727,7 @@ class _DispatchWorld:
         staged_lane_prefetch: bool = False,
         tail_overlap: bool = False,
         gpu_sampling_lease_slots: int | None = None,
+        performance_model: bool = False,
         legacy_comfy_vram_unload: bool = False,
         child_free_view_lie_mb: float = 0.0,
         footprint_undershoot: float = 1.0,
@@ -805,6 +818,10 @@ class _DispatchWorld:
             gpu_sampling_lease_slots: The clearance controller's steady-state grant cap, the
                 ``gpu_sampling_lease_slots`` config axis. None takes ``max_threads``, which is what every row that
                 does not vary this runs against.
+            performance_model: Whether the scheduler has an in-memory, unseeded :class:`PerformanceModel`, fed as
+                the manager feeds it: each finished closed-loop job's sampling rate as job metrics, and each
+                finalized job through the tracker's finalize observer. With it the scheduler stamps a dispatched
+                slot's expected sampling seconds once a signature has enough samples; off, that figure is None.
             legacy_comfy_vram_unload: Whether the escape hatch that restores the old flag-based child regime
                 is configured. Under it the child's executor returns the card at the end of every prompt below
                 anything a grant can suppress, so a closed-loop run evicts on every completion whatever the
@@ -1001,6 +1018,13 @@ class _DispatchWorld:
         The whole of what a dispatched job costs the device until the parent clears it: its diffusion weights
         are still in the child's RAM cache and land at clearance. Subsumed by the job's full peak the moment
         the weights are committed, so it comes off the card in the same step that charges them."""
+        self._pipe_messages_read: dict[int, int] = {}
+        """Per process, how many of the messages sent down its pipe the world's child has already received."""
+        self.pipe_unload_releases: list[tuple[int, int, str | None, float]] = []
+        """Every device release an unload carried only on the pipe caused, as (tick, lane, model, MB freed).
+
+        Such an unload sets no control flag on the slot, so it reaches the child, and the card, only through
+        the message itself."""
         self._offloaded_mb: dict[int, float] = {}
         """Per-lane weights the child kept in host RAM rather than commit, to relieve its own shortfall."""
         self._ram_held_checkpoint_lanes: set[int] = set()
@@ -1052,10 +1076,12 @@ class _DispatchWorld:
         self._dispatch_device_truth_mb: dict[str, float | None] = {}
         """Per dispatched job, the device-free figure its own control message carried, or None when it carried
         none. Read off the message the scheduler actually sent, so a run with that field neutered is a faithful
-        reinjection of a worker whose children are never told the truth."""
+        reinjection of a worker whose children are never told the truth. Replaced by the figure a clearance grant
+        carries when the child acquires its lease, as hordelib rebases its clamp there."""
         self._lane_charge_at_dispatch: dict[str, float] = {}
-        """Per dispatched job, what its lane already held when the dispatch was sent, so the dispatch-time
-        device figure can be aged by the lane's own growth since rather than read as still current."""
+        """Per dispatched job, what its lane already held when the device figure was taken (the dispatch, or the
+        clearance grant that rebased it), so the figure can be aged by the lane's own growth since rather than
+        read as still current."""
         self.child_shortfall_frees: list[str] = []
         """Every time a child's own shortfall freeing returned weights to make room for a charge."""
         self.child_overcommits: list[str] = []
@@ -1227,6 +1253,17 @@ class _DispatchWorld:
         worker_state = WorkerState()
         runtime_config = make_test_runtime_config(bridge_data=bridge_data)
         model_metadata = make_test_model_metadata(reference)
+
+        def resolve_baseline(model_name: str) -> str | None:
+            baseline = model_metadata.get_baseline(model_name)
+            return str(baseline) if baseline is not None else None
+
+        self.performance_model: PerformanceModel | None = (
+            PerformanceModel(baseline_resolver=resolve_baseline) if performance_model else None
+        )
+        """The scheduler's expected-sampling-time model, in memory with no benchmark seed, as under test."""
+        if self.performance_model is not None:
+            self._job_tracker.set_finalize_observer(self.performance_model.on_job_finalized)
         self._scheduler = InferenceScheduler(
             state=worker_state,
             process_map=self._process_map,
@@ -1243,6 +1280,7 @@ class _DispatchWorld:
             decision_sink=self._record_decision,
             resource_state_sink=self._record_resource_state,
             clock=lambda: self.now,
+            performance_model=self.performance_model,
         )
         if disaggregated:
             # Class-eligibility is the scheduler's own seam for "this job will run as a UNet-only sampler".
@@ -1293,6 +1331,11 @@ class _DispatchWorld:
         """Per lane, the clearance permit the parent grants and the world's child model consumes.
 
         Held empty (its single permit taken at creation), exactly as the parent holds a child's."""
+        self._clearance_proxies: dict[int, ClearanceLeaseProxy] = {}
+        """Per lane, the lease object the world's child acquires through, the one the controller grants through.
+
+        Built with a shared device-free figure as the spawn site builds it, so a grant carries the device free
+        the parent admitted the child against and the child rebases its free-VRAM view on it."""
         self.clearance_timeouts: list[tuple[int, int, str]] = []
         """Every lane that sampled unpriced because its clearance never came, as (tick, lane, job).
 
@@ -1315,10 +1358,13 @@ class _DispatchWorld:
                 clearance.acquire()
                 done = mp_context.Semaphore(0)
                 self._clearance_semaphores[lane_id] = clearance
-                self._clearance_controllers[self._lane_cards[lane_id]].register(
-                    lane_id,
-                    ClearanceLeaseProxy(clearance=clearance, done=done),
+                proxy = ClearanceLeaseProxy(
+                    clearance=clearance,
+                    done=done,
+                    cleared_device_free=mp_context.Value("d", math.nan),
                 )
+                self._clearance_proxies[lane_id] = proxy
+                self._clearance_controllers[self._lane_cards[lane_id]].register(lane_id, proxy)
 
         self.first_dispatch: dict[str, int] = {}
         self._dispatched_at: dict[str, int] = {}
@@ -1544,7 +1590,8 @@ class _DispatchWorld:
         Its own view is the truth plus whatever the process-local reading overstates. When its dispatch
         carried the parent's device reading, that reading caps the view: the child ages it by its own growth
         since the dispatch (the only allocations it can account for) and takes the lower of the two, which is
-        what keeps a shortfall computed against the device rather than against the process.
+        what keeps a shortfall computed against the device rather than against the process. Under the lease a
+        grant's figure replaces the dispatch reading and the growth is counted from the grant.
         """
         believed = self.card_free_mb(self._card_of(lane_id)) + self.child_free_view_lie_mb
         dispatch_truth = self._dispatch_device_truth_mb.get(job_id)
@@ -1604,7 +1651,13 @@ class _DispatchWorld:
         weight_load: bool,
     ) -> float:
         """Run the child's shortfall relief for one charge and return what it commits after relieving."""
-        shortfall_mb = (charge_mb + _CHILD_FREE_MARGIN_MB) - self._child_believed_free_mb(lane_id, job_id)
+        believed_free_mb = self._child_believed_free_mb(lane_id, job_id)
+        load_window = self.job_windows.get(job_id) if weight_load else None
+        if load_window is not None:
+            load_window.load_charge_mb = charge_mb
+            load_window.load_believed_free_mb = believed_free_mb
+            load_window.load_card_free_mb = self.card_free_mb(self._card_of(lane_id))
+        shortfall_mb = (charge_mb + _CHILD_FREE_MARGIN_MB) - believed_free_mb
         if shortfall_mb <= 0.0:
             return charge_mb
 
@@ -1630,6 +1683,8 @@ class _DispatchWorld:
         if weight_load:
             offloaded_mb = min(shortfall_mb, charge_mb)
             self._offloaded_mb[lane_id] = self._offloaded_mb.get(lane_id, 0.0) + offloaded_mb
+            if load_window is not None:
+                load_window.load_offloaded_mb = offloaded_mb
             self.child_shortfall_frees.append(
                 f"tick {self.tick}: lane {lane_id} left {offloaded_mb:.0f}MB of {model} in host RAM rather than "
                 f"charge a {shortfall_mb:.0f}MB shortfall to the card",
@@ -1679,12 +1734,12 @@ class _DispatchWorld:
     def _sync_reported_vram(self) -> None:
         """Publish the derived card state through the children's VRAM reports, as a live worker would.
 
-        The device figure is the parent's own reading and is immediate. The per-process allocator reservation
-        is not: it reaches the parent through the child's next VRAM report, and a staged job's encode working
-        set is allocated and consumed inside the staging window itself, so a lane still waiting for clearance
-        has not published that charge. Reporting it the instant the card carries it would make the planned
-        overlay decay against a growth the parent cannot yet see, which is precisely the reading the clearance
-        re-price of a staged job is made against.
+        Each lane's allocator reservation is everything the world charges it, a staged job's encode working
+        set included: a child keeps its text encoder on the device through the wait for clearance and reports
+        that reservation like any other, and clearance nets it from the staged job's price on that premise.
+        The world reports every tick, where a child reports every ``MEMORY_REPORT_INTERVAL_SECONDS``, so a
+        lane staged for less than one interval is read here at a reservation production would still show
+        at its pre-staging figure.
         """
         publish_ram = self.host_ram is not None and (
             self._ram_reported_at is None or self.now - self._ram_reported_at >= self.ram_report_interval_seconds
@@ -1710,7 +1765,7 @@ class _DispatchWorld:
             total_mb = self._card_totals[lane.device_index]
             lane.total_vram_mb = int(total_mb)
             lane.vram_usage_mb = int(total_mb - self.card_free_mb(lane.device_index))
-            reported_mb = self._lane_charge_mb(lane.process_id) - self._encode_staging_mb.get(lane.process_id, 0.0)
+            reported_mb = self._lane_charge_mb(lane.process_id)
             lane.process_reserved_mb = int(max(0.0, reported_mb))
             self._lane_peak_mb[lane.process_id] = max(self._lane_peak_mb.get(lane.process_id, 0.0), reported_mb)
         if self.host_ram is not None and publish_ram:
@@ -1895,6 +1950,7 @@ class _DispatchWorld:
         parent's own record of the command stands until the child reports the model's new state.
         """
         for lane in self._process_map.values():
+            self._receive_pipe_only_unloads(lane)
             if self.host_ram is not None and lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
                 self.host_ram.evict(lane.process_id)
                 self._release_unloaded_lane(lane)
@@ -1913,6 +1969,62 @@ class _DispatchWorld:
             # a later flag the parent stamps on the slot does not recall the memory the driver is returning.
             if due_at is not None and self.now >= due_at:
                 self._release_unloaded_lane(lane, keeps_host_copy=self.host_ram is not None)
+        self._sync_reported_vram()
+
+    def _receive_pipe_only_unloads(self, lane: HordeProcessInfo) -> None:
+        """Deliver to ``lane``'s child every VRAM unload sent down its pipe since it last read, unless flagged.
+
+        Some unloads go out on the pipe alone, ahead of START_INFERENCE, and set no control flag. The child acts
+        on the message whatever the slot's flag says, so the card gives back the device weights before the next
+        message is read. While the slot's flag carries an unload, the flag's path releases the whole lane and
+        owns the release.
+        """
+        pipe: object = lane.pipe_connection
+        assert isinstance(pipe, Mock), "the world's lanes send through a recording pipe"
+        sends = pipe.send.call_args_list
+        first_unread = self._pipe_messages_read.get(lane.process_id, 0)
+        self._pipe_messages_read[lane.process_id] = len(sends)
+        if lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+            return
+        for call in sends[first_unread:]:
+            message = call.args[0] if call.args else None
+            if isinstance(message, HordeControlMessage) and (
+                message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+            ):
+                self._free_device_weights(lane)
+
+    def _free_device_weights(self, lane: HordeProcessInfo) -> None:
+        """Return every weight ``lane`` holds on the card, as the child's whole-device free does, keeping its job.
+
+        The child frees whatever it has on the device, named model or not, and keeps its host copies. A freed
+        copy of the model the slot is seated with stays in the RAM cache for the next load, and a freed copy
+        of any other model leaves the parent's map, since the slot no longer holds it on the device.
+        """
+        lane_id = lane.process_id
+        freed_model = self._resident_model.pop(lane_id, None)
+        freed_mb = self._resident_mb.pop(lane_id, 0.0) + self._held_component_mb.pop(lane_id, 0.0)
+        lane.held_components = None
+        self._granted_resident_evicted.discard(lane_id)
+        if freed_mb <= 0.0:
+            return
+        seated_model = _model_by_name(freed_model or "")
+        if freed_model == lane.loaded_horde_model_name and lane_id not in self._staged_mb and seated_model is not None:
+            self._staged_mb[lane_id] = self._actual_charge_mb(seated_model.weights_mb)
+            self._staged_model[lane_id] = seated_model.name
+            entry = self._model_map.root.get(seated_model.name)
+            if (
+                entry is not None
+                and entry.process_id == lane_id
+                and entry.horde_model_load_state == ModelLoadState.LOADED_IN_VRAM
+            ):
+                self._model_map.update_entry(
+                    seated_model.name, load_state=ModelLoadState.LOADED_IN_RAM, process_id=lane_id
+                )
+        elif freed_model is not None:
+            entry = self._model_map.root.get(freed_model)
+            if entry is not None and entry.process_id == lane_id:
+                self._model_map.root.pop(freed_model, None)
+        self.pipe_unload_releases.append((self.tick, lane_id, freed_model, freed_mb))
         self._sync_reported_vram()
 
     def _release_unloaded_lane(self, lane: HordeProcessInfo, *, keeps_host_copy: bool = False) -> None:
@@ -2328,6 +2440,9 @@ class _DispatchWorld:
                 "an admitted job's lane must have been told to start inference"
             )
             self._lane_of[job_id] = lanes[0]
+            # An unload the dispatch sent ahead of START_INFERENCE reaches the child first, so the card gives the
+            # slot's previous weights back before this job stages or loads anything.
+            self._receive_pipe_only_unloads(self._process_map[lanes[0]])
             booked = self._model_map.root.get(admitted.model or "")
             self.job_windows[job_id] = _JobWindow(
                 job_id=job_id,
@@ -2381,6 +2496,9 @@ class _DispatchWorld:
                 # state production stamped on it at dispatch, which is what makes it a clearance waiter.
                 self._encode_staging_mb[lanes[0]] = STAGING_ENCODE_VRAM_MB
                 self._clearance_waiting_since[job_id] = self.now
+                proxy = self._clearance_proxies.get(lanes[0])
+                if proxy is not None:
+                    proxy.begin_job()
                 self._begin_staged_prefetch(admitted, lane_id=lanes[0])
                 self._sync_reported_vram()
                 continue
@@ -2512,6 +2630,10 @@ class _DispatchWorld:
         (hordelib's degraded path) and the window is unpriced. The world records that, because a lease that
         holds a waiter for room the card already had costs every such job the whole timeout in dead card time,
         and nothing else in a run distinguishes that from a merely slow schedule.
+
+        The acquire goes through the lane's real lease proxy. A granted child rebases its free-VRAM view on the
+        device free the grant carries and counts its own growth from that instant, as hordelib's clamp does at
+        lease acquire; a child that waited out the timeout keeps its dispatch figure.
         """
         for lane in list(self._process_map.values()):
             if lane.last_process_state != HordeProcessState.INFERENCE_PRIMED:
@@ -2524,13 +2646,24 @@ class _DispatchWorld:
                 # Cleared and still loading its weights: the window is already open.
                 continue
             semaphore = self._clearance_semaphores.get(lane.process_id)
-            if semaphore is None:
+            proxy = self._clearance_proxies.get(lane.process_id)
+            if semaphore is None or proxy is None:
                 continue
             waiting_since = self._clearance_waiting_since.get(job_id, self.now)
+            # The child's acquire blocks until the permit arrives or its timeout ends, and the proxy counts
+            # any completed acquire as the job's one wait. A tick is not the end of that wait, so the permit is
+            # looked for without being taken, and the proxy acquires only once the wait is over.
             if semaphore.acquire(False):
-                self.clearance_grants.append((self.tick, lane.process_id, job_id))
+                semaphore.release()
             elif (self.now - waiting_since) < CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS - _CLOCK_EPSILON:
                 continue
+            if proxy.acquire(False):
+                self.clearance_grants.append((self.tick, lane.process_id, job_id))
+                cleared_free_mb = proxy.take_cleared_device_free_mb()
+                # A dispatch that carried no reading entered no clamp, so there is nothing to rebase.
+                if cleared_free_mb is not None and self._dispatch_device_truth_mb.get(job_id) is not None:
+                    self._dispatch_device_truth_mb[job_id] = cleared_free_mb
+                    self._lane_charge_at_dispatch[job_id] = self._lane_charge_mb(lane.process_id)
             else:
                 self.clearance_timeouts.append((self.tick, lane.process_id, job_id))
             self._clearance_waiting_since.pop(job_id, None)
@@ -2732,6 +2865,34 @@ class _DispatchWorld:
             ),
         )
 
+    def _report_sampling_rate(self, lane: HordeProcessInfo, occupancy: _SlotOccupancy) -> None:
+        """Hand the performance model a finished job's sampling rate, as the job metrics sent with its result do.
+
+        The rate is the steps over the window the job actually sampled for, so an offloaded job teaches the
+        model its slower rate, as hordelib's collector reports it.
+        """
+        if self.performance_model is None or occupancy.total_steps <= 0:
+            return
+        duration_seconds = occupancy.sample_until - occupancy.sample_from
+        if duration_seconds <= 0.0:
+            return
+        self.performance_model.on_job_metrics(
+            HordeJobMetricsMessage(
+                process_id=lane.process_id,
+                process_launch_identifier=lane.process_launch_identifier,
+                info="Job metrics",
+                job_id=occupancy.job_id,
+                phase_metrics=JobPhaseMetrics(
+                    sampling=SamplingStats(
+                        steps_completed=occupancy.total_steps,
+                        total_steps=occupancy.total_steps,
+                        duration_seconds=duration_seconds,
+                        iterations_per_second=occupancy.total_steps / duration_seconds,
+                    ),
+                ),
+            ),
+        )
+
     def _release_transient(self, occupancy: _SlotOccupancy) -> None:
         """Give the card back the activation a finished sampling window was holding."""
         if not occupancy.transient_charged:
@@ -2822,6 +2983,7 @@ class _DispatchWorld:
         lane.current_first_step_at = None
         lane.current_job_expected_sampling_seconds = None
         lane.retire_inference_ownership(job)
+        self._report_sampling_rate(lane, occupancy)
         if self.tail_overlap:
             # The child's job metrics arrive with its result, and its return to WAITING_FOR_JOB clears the
             # job-scoped step position, so a stale final step never reads as the next job's progress.
