@@ -150,7 +150,10 @@ The arbiter keeps four concerns deliberately separate:
   and are kept under distinct stages (`SAMPLE` vs `SAMPLE_ISOLATED`), so a single monolithic peak never
   over-prices the isolated sampler and forfeits the second concurrent sampler (mixed operation is designed:
   a stage fault re-routes a disaggregated job monolithic). Monolithic peaks are observed from child memory
-  reports; isolated-sampler peaks from the disaggregation orchestrator at sample completion. A cold key
+  reports once the lane has reached its first step. A lane still `INFERENCE_PRIMED` holds its encode working
+  set alone under the clearance lease, or a partial load otherwise, and enough of those readings would make a
+  trusted measurement that lowers the job's price toward them. Isolated-sampler peaks come from the
+  disaggregation orchestrator at sample completion. A cold key
   prices at the static seed unchanged, so a first-of-kind job and small-resolution buckets keep their
   smaller peaks and their concurrency.
 

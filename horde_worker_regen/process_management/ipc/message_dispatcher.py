@@ -1091,8 +1091,9 @@ class MessageDispatcher:
         whose peak reading is positive. The disaggregated case is observed by the orchestrator, not here.
         Such a report's peak is attributed to the SAMPLE stage (the dominant activation term of a whole
         monolithic job). Reports from the disaggregated lanes (VAE/text-encode/post-process), from idle or
-        between-job inference slots, or with an unknown baseline are left unattributed rather than guessed:
-        the parent cannot reliably bind those peaks to one stage/job at this seam.
+        between-job inference slots, from a slot still primed ahead of its first step, or with an unknown
+        baseline are left unattributed rather than guessed: the parent cannot reliably bind those peaks to one
+        stage/job at this seam.
         """
         store = self._footprint_store
         if store is None:
@@ -1114,6 +1115,11 @@ class MessageDispatcher:
         # Bind the peak to a genuinely-running job: the slot's referenced job must be in progress, which
         # ties the peak-since-last-report to that job's sampling rather than to a merely-preloaded slot.
         if job not in self._job_tracker.jobs_in_progress:
+            return
+        # A primed lane has taken the job but not reached its first step: under the clearance lease it holds its
+        # encode working set alone, otherwise it is still loading. Either peak is well under the sampling peak,
+        # and once trusted the store's measurement lowers the job's price toward it.
+        if process_info.last_process_state is HordeProcessState.INFERENCE_PRIMED:
             return
 
         baseline = self._model_metadata.get_baseline(model_name)

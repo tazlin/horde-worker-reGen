@@ -168,6 +168,39 @@ async def test_running_inference_peak_is_recorded_with_the_right_key() -> None:
     assert len(store) == 1
 
 
+async def test_a_primed_lanes_peak_is_not_attributed_until_its_first_step() -> None:
+    """A lane primed ahead of its first step holds its encode set or a partial load, never the sampling peak.
+
+    Recorded, enough of those readings make a trusted measurement that lowers the job's price toward them.
+    """
+    process_info = make_mock_process_info(1, model_name=_MODEL, state=HordeProcessState.INFERENCE_PRIMED)
+    job = make_job_pop_response(model=_MODEL, width=512, height=512)
+    process_info.record_inference_ownership(job, attempt_ordinal=1)
+    process_map = ProcessMap({1: process_info})
+    job_tracker = JobTracker()
+    await mark_job_in_progress_async(job_tracker, job)
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=job_tracker, store=store)
+
+    dispatcher._handle_memory_report(_memory_message(1, peak_mb=2048))
+
+    assert len(store) == 0
+
+    process_info.last_process_state = HordeProcessState.INFERENCE_STARTING
+    dispatcher._handle_memory_report(_memory_message(1, peak_mb=11000))
+
+    key = FootprintKey(
+        model_baseline=str(_BASELINE),
+        resolution_bucket=ResolutionBucket.LE_512,
+        platform=sys.platform,
+        stage=FootprintStage.SAMPLE,
+    )
+    observation = store.get_observation(key)
+    assert observation is not None
+    assert observation.observation_count == 1
+    assert observation.watermark_mb == 11000.0
+
+
 async def test_idle_slot_without_a_running_job_is_not_attributed() -> None:
     """A report whose referenced job is not in progress is left unattributed (no guess)."""
     process_info = make_mock_process_info(1, model_name=_MODEL)
