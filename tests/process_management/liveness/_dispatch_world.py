@@ -47,6 +47,8 @@ from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from hordelib.feature_impact import get_baseline_burden
+from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
@@ -55,6 +57,7 @@ from horde_worker_regen.process_management.ipc.message_dispatcher import Message
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
     HordeControlFlag,
+    HordeHeartbeatType,
     HordeImageResult,
     HordeInferenceControlMessage,
     HordeProcessMemoryMessage,
@@ -71,6 +74,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     ProcessLifecycleManager,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.component_residency_map import _CHECKPOINT_KIND
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
@@ -221,7 +225,23 @@ A fleet holds a rotation of a dozen or so classes across its cards at any moment
 group above supplies, and the second weight class in here keeps such a rotation from being uniform: a card's
 residency decisions are only interesting where what it holds costs different amounts."""
 
-_KNOWN_MODEL_CLASSES = (*_MODEL_CLASSES, *_FILLER_MODEL_CLASSES, *_ROTATION_MODEL_CLASSES)
+_SDXL_D = _ModelClass("sdxl_d", "sdxl-checkpoint-d", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
+_SDXL_E = _ModelClass("sdxl_e", "sdxl-checkpoint-e", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
+_SDXL_F = _ModelClass("sdxl_f", "sdxl-checkpoint-f", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
+_SDXL_G = _ModelClass("sdxl_g", "sdxl-checkpoint-g", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
+
+_SAME_BASELINE_MODEL_CLASSES = (_SDXL_D, _SDXL_E, _SDXL_F, _SDXL_G)
+"""Further SDXL classes, for a row whose traffic is one baseline across more checkpoints than lanes.
+
+Same weight class throughout, so what separates one job's cost from another's is only whether its checkpoint
+is still on a lane, in its pages, or on disk."""
+
+_KNOWN_MODEL_CLASSES = (
+    *_MODEL_CLASSES,
+    *_FILLER_MODEL_CLASSES,
+    *_ROTATION_MODEL_CLASSES,
+    *_SAME_BASELINE_MODEL_CLASSES,
+)
 """Every class the world can resolve weights and timings for, whatever pool a given row serves."""
 
 _SAFETY_PROCESS_ID = 100
@@ -272,6 +292,16 @@ _LOAD_SECONDS_PER_GB = 0.96
 Calibrated so an SDXL checkpoint (4900 MB) takes roughly the 4.6 s a host-to-device weight upload costs over
 a consumer PCIe link, which is the cost retention exists to remove: it is paid once per job for weights that
 were still on the card when the previous job ended."""
+
+
+def _support_component_mb(model: _ModelClass) -> float:
+    """Text-encoder and VAE weights (MB) a monolithic job of ``model`` brings onto the card beside its core.
+
+    Read from hordelib's per-baseline seed, the figure the scheduler's residency verdicts also charge.
+    """
+    burden = get_baseline_burden(str(model.baseline))
+    return float(burden.vram_support_weights_mb) if burden is not None else 0.0
+
 
 _SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL: dict[str, float] = {
     KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1.value: 0.06,
@@ -361,6 +391,56 @@ class _SlotOccupancy:
     """VAE decode activation (MB) the decode tail adds beside the weights; zero unless the row models phases."""
     decode_charged_mb: float = 0.0
     """What the child actually committed for the decode spike, held until the job completes."""
+    step_seconds: float = 0.0
+    """Seconds one sampling step takes, so the lane's step position can be reported as the window advances."""
+    total_steps: int = 0
+
+
+@dataclass
+class _StagedPrefetch:
+    """A staged lane's read of its checkpoint's reclaimed pages, begun at dispatch and overlapping the wait.
+
+    hordelib starts its prefetch-and-touch as the job starts on the lane, so the read runs while the lane waits
+    for clearance and the commit pays only what has not finished.
+    """
+
+    model: str
+    checkpoint_mb: float
+    started_at: float
+    read_seconds: float
+    """The disk read the checkpoint needed when the prefetch began."""
+
+
+@dataclass
+class _JobWindow:
+    """One dispatched job's instants on the world clock, kept after the job leaves its lane.
+
+    The occupancy is dropped at completion, so this is what a row reads a handoff gap, a dispatch-to-first-step
+    delay or a paid device load back from.
+    """
+
+    job_id: str
+    lane_id: int
+    model: str
+    dispatched_at: float
+    booked_holding: bool
+    """Whether the parent's model map recorded the lane as holding the job's model when it dispatched."""
+    cleared_at: float | None = None
+    """When the job's window opened: its clearance under the lease, its dispatch otherwise."""
+    load_from: float | None = None
+    sample_from: float | None = None
+    sample_until: float | None = None
+    loaded_now: bool = False
+    """Whether the job paid a host-to-device load of its weights."""
+    load_seconds: float = 0.0
+    disk_read_seconds: float = 0.0
+    """Seconds spent reading checkpoint pages the host had reclaimed, staged and after clearance together."""
+    staged_read_seconds: float = 0.0
+    """The part of ``disk_read_seconds`` a staged prefetch paid before clearance, outside ``load_seconds``."""
+    cleared_read_seconds: float = 0.0
+    """The part of ``disk_read_seconds`` paid after clearance, inside ``load_seconds``."""
+    retention_granted: bool | None = None
+    """Whether the job ended under a retention grant for its model; None until it completes."""
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -424,6 +504,16 @@ class _ProtectedDispatchHold:
 
 
 @dataclass(frozen=True)
+class _LaneObservation:
+    """One inference lane at the close of a tick: the state its child reports, and whether it is sampling."""
+
+    lane_id: int
+    state: HordeProcessState
+    sampling: bool
+    """Whether the lane's job is inside its sampling window, which its reported state alone cannot say."""
+
+
+@dataclass(frozen=True)
 class _TickObservation:
     """What one tick looked like to everything that judges whether the card was earning.
 
@@ -446,6 +536,8 @@ class _TickObservation:
     """The scheduler's own duty-bucket attribution for the parked head, as its stall classifier named it."""
     head_stall_reason: str | None
     protected_holds: tuple[_ProtectedDispatchHold, ...]
+    lane_states: tuple[_LaneObservation, ...]
+    """Every inference lane's state, so a row can ask what the other lanes were doing while one sampled."""
 
     @property
     def idle(self) -> bool:
@@ -620,6 +712,9 @@ class _DispatchWorld:
         disaggregated: bool = False,
         closed_loop: bool = False,
         clearance_lease: bool = False,
+        staged_lane_prefetch: bool = False,
+        tail_overlap: bool = False,
+        gpu_sampling_lease_slots: int | None = None,
         legacy_comfy_vram_unload: bool = False,
         child_free_view_lie_mb: float = 0.0,
         footprint_undershoot: float = 1.0,
@@ -649,7 +744,10 @@ class _DispatchWorld:
         """Build the process pool, the model map, and the scheduler for one row.
 
         Args:
-            host_ram: Opt-in conserved host RAM, including private pages and reclaimable checkpoint cache.
+            host_ram: Opt-in conserved host RAM, including private pages and reclaimable checkpoint cache. With
+                it, a device load of a RAM-held checkpoint also reads back whatever pages the host reclaimed and
+                a monolithic job's load carries its text encoder and VAE, so a lane that idled under host
+                pressure pays for its cold pages where the parent still books the model as held.
             ram_reserve_mb: Single additive host headroom reserve.
             ram_pause_percent: Hard danger-floor percentage for host-RAM rows.
             ram_report_interval_seconds: How stale children's per-process RAM readings may be. Zero
@@ -685,12 +783,28 @@ class _DispatchWorld:
                 state their tick bounds against.
             clearance_lease: Whether the per-process GPU denoise clearance lease governs sampling. Under it a
                 dispatch only *stages* a job: the lane goes to ``INFERENCE_PRIMED`` carrying its encode working
-                set alone, and the diffusion weights land on the card at clearance, which is when sampling
-                starts. Each tick builds the scheduler's own clearance snapshot and steps a real
+                set alone, and the diffusion weights land on the card at clearance. The lane goes on reading
+                ``INFERENCE_PRIMED`` through that load and reports ``INFERENCE_STARTING`` at its first step,
+                as a production child does. Each tick builds the scheduler's own clearance snapshot and steps a real
                 :class:`ClearanceController` over it, so the admission that decides the VRAM moment is
                 production's. A lane the controller holds for the whole lease-acquire timeout samples anyway
                 (liveness over pricing) and the world records the degradation. Off, dispatch is the VRAM
                 moment, which is what every row that does not vary this runs against.
+            staged_lane_prefetch: Whether a lane staged under the lease reads its checkpoint's reclaimed pages
+                while it waits for clearance, as hordelib's prefetch-and-touch does from the moment the job
+                starts on the lane, and keeps them resident each staged tick. The commit then pays only the
+                unfinished part of the read, plus anything evicted during the wait. Needs ``host_ram`` and the
+                lease; off, the whole read is paid after clearance.
+            tail_overlap: Whether each card's clearance controller may clear the next lane inside the outgoing
+                sample's tail, as production does by default. With it, each sampling lane reports its step
+                position through the parent's heartbeat path every tick, and each finished job that paid a device
+                load reports that load's seconds as a ``ram_to_vram`` phase through the parent's job-metrics path,
+                which are the two quantities the controller sizes the handoff window from. Off, the controller
+                clears only into a free slot and nothing reports progress, which is what every row that does not
+                vary this runs against.
+            gpu_sampling_lease_slots: The clearance controller's steady-state grant cap, the
+                ``gpu_sampling_lease_slots`` config axis. None takes ``max_threads``, which is what every row that
+                does not vary this runs against.
             legacy_comfy_vram_unload: Whether the escape hatch that restores the old flag-based child regime
                 is configured. Under it the child's executor returns the card at the end of every prompt below
                 anything a grant can suppress, so a closed-loop run evicts on every completion whatever the
@@ -797,6 +911,10 @@ class _DispatchWorld:
         self.clearance_lease = clearance_lease
         if clearance_lease and not closed_loop:
             raise ValueError("the clearance lease is a claim about time, so it needs the closed-loop fidelity")
+        if (staged_lane_prefetch or tail_overlap) and not clearance_lease:
+            raise ValueError("a staged prefetch and the tail overlap both act on staged lanes, so they need the lease")
+        self.staged_lane_prefetch = staged_lane_prefetch
+        self.tail_overlap = tail_overlap
         self.child_free_view_lie_mb = child_free_view_lie_mb
         self.footprint_undershoot = footprint_undershoot
         self.child_reports_card_sized_peaks = child_reports_card_sized_peaks
@@ -885,6 +1003,21 @@ class _DispatchWorld:
         the weights are committed, so it comes off the card in the same step that charges them."""
         self._offloaded_mb: dict[int, float] = {}
         """Per-lane weights the child kept in host RAM rather than commit, to relieve its own shortfall."""
+        self._ram_held_checkpoint_lanes: set[int] = set()
+        """Lanes that report their seated checkpoint as a held component while it sits in host RAM.
+
+        A pooled monolithic lane's report: the component is named with its RAM size and holds no device memory,
+        so the card ledger charges these lanes nothing for it."""
+        self._cleared_load_until: dict[int, float] = {}
+        """Per cleared lane under the lease, the instant its device load ends and its first step is taken.
+
+        Until then the lane reads ``INFERENCE_PRIMED``, as a production child does through its load."""
+        self._staged_prefetch: dict[str, _StagedPrefetch] = {}
+        """Per staged job, the checkpoint read its lane began at dispatch, until the clearance that commits it."""
+        self.job_windows: dict[str, _JobWindow] = {}
+        """Every dispatched job's instants, by job id, kept after the job completes."""
+        self.popped_at: dict[str, float] = {}
+        """When each job entered the tracker, by job id, so a row can tell whether work was pending."""
         self._held_component_mb: dict[int, float] = {}
         """Per-lane component weights the child holds device-warm between jobs.
 
@@ -1172,8 +1305,8 @@ class _DispatchWorld:
             for device_index in self._card_totals:
                 self._clearance_controllers[device_index] = ClearanceController(
                     device_index=device_index,
-                    slot_cap=max_threads,
-                    tail_overlap=False,
+                    slot_cap=max_threads if gpu_sampling_lease_slots is None else gpu_sampling_lease_slots,
+                    tail_overlap=tail_overlap,
                     clock=lambda: self.now,
                 )
             mp_context = multiprocessing.get_context()
@@ -1572,6 +1705,8 @@ class _DispatchWorld:
                     duration = occupancy.sample_until - occupancy.sample_from
                     progress = (self.now - occupancy.sample_from) / max(0.001, duration)
                     lane.last_heartbeat_percent_complete = max(0.0, min(100.0, 100.0 * progress))
+            if lane.process_id in self._ram_held_checkpoint_lanes:
+                lane.held_components = self._ram_held_checkpoint_report(lane)
             total_mb = self._card_totals[lane.device_index]
             lane.total_vram_mb = int(total_mb)
             lane.vram_usage_mb = int(total_mb - self.card_free_mb(lane.device_index))
@@ -1687,8 +1822,28 @@ class _DispatchWorld:
         ]
         self._sync_reported_vram()
 
+    def seed_ram_held_checkpoint(self, lane_id: int) -> None:
+        """Have ``lane_id`` report its seated checkpoint as a held component that lives in host RAM.
+
+        What a pooled monolithic lane reports between jobs: the checkpoint entry, sized by its RAM pages, with
+        nothing of it on the device. The report follows whichever model the lane holds, and no VRAM is charged
+        for it, so a fit that reads the report as device memory is pricing room the card still has.
+        """
+        self._ram_held_checkpoint_lanes.add(lane_id)
+        self._sync_reported_vram()
+
+    def _ram_held_checkpoint_report(self, lane: HordeProcessInfo) -> list[HeldComponentSnapshot] | None:
+        """The held-component report of a lane whose seated checkpoint sits in host RAM, or None when empty."""
+        model = _model_by_name(lane.loaded_horde_model_name or "")
+        if model is None:
+            return None
+        checkpoint_mb, _private_mb = self._host_model_ram(model)
+        return [HeldComponentSnapshot(kind=_CHECKPOINT_KIND, identity=model.name, approx_ram_mb=checkpoint_mb)]
+
     async def pop(self, job: ImageGenerateJobPopResponse) -> None:
         """Record a popped job, exactly as the pop path hands one to the tracker."""
+        if job.id_ is not None:
+            self.popped_at[str(job.id_)] = self.now
         await track_popped_job_async(self._job_tracker, job, time_popped=self.now)
         for lora in job.payload.loras or []:
             self._job_tracker.mark_aux_prefetched(lora.name, is_version=bool(lora.is_version), is_ti=False)
@@ -2002,6 +2157,25 @@ class _DispatchWorld:
                 continue
             lane.last_process_state = HordeProcessState.INFERENCE_STARTING
 
+    def _advance_cleared_loads(self) -> None:
+        """Report the first step of every cleared lane whose device load has finished.
+
+        A cleared child stays ``INFERENCE_PRIMED`` through its load and the parent advances it to
+        ``INFERENCE_STARTING`` on its first step, so the load is visible to the parent as a primed lane.
+        """
+        for lane_id, sample_from in list(self._cleared_load_until.items()):
+            if self.now < sample_from - _CLOCK_EPSILON:
+                continue
+            self._cleared_load_until.pop(lane_id, None)
+            self._report_first_step(lane_id)
+
+    def _report_first_step(self, lane_id: int) -> None:
+        """Move a primed lane to ``INFERENCE_STARTING`` through the parent's own state-change path."""
+        lane = self._process_map.get(lane_id)
+        if lane is None or lane.last_process_state != HordeProcessState.INFERENCE_PRIMED:
+            return
+        self._process_map.on_process_state_change(process_id=lane_id, new_state=HordeProcessState.INFERENCE_STARTING)
+
     def _release_sampler_pin(self, lane_id: int) -> None:
         """Give a pinned sampler's lane back to the available pool once its job is off it."""
         self._encode_until.pop(lane_id, None)
@@ -2154,6 +2328,17 @@ class _DispatchWorld:
                 "an admitted job's lane must have been told to start inference"
             )
             self._lane_of[job_id] = lanes[0]
+            booked = self._model_map.root.get(admitted.model or "")
+            self.job_windows[job_id] = _JobWindow(
+                job_id=job_id,
+                lane_id=lanes[0],
+                model=admitted.model or "",
+                dispatched_at=self.now,
+                booked_holding=booked is not None
+                and booked.process_id == lanes[0]
+                and booked.horde_model_load_state in (ModelLoadState.LOADED_IN_RAM, ModelLoadState.LOADED_IN_VRAM),
+                cleared_at=None if self.clearance_lease else self.now,
+            )
             if not self.clearance_lease:
                 # Sampling starts here only when dispatch is the VRAM moment; under the lease the job is
                 # merely staged, and the tick it reaches sampling is the tick the parent clears it.
@@ -2196,6 +2381,7 @@ class _DispatchWorld:
                 # state production stamped on it at dispatch, which is what makes it a clearance waiter.
                 self._encode_staging_mb[lanes[0]] = STAGING_ENCODE_VRAM_MB
                 self._clearance_waiting_since[job_id] = self.now
+                self._begin_staged_prefetch(admitted, lane_id=lanes[0])
                 self._sync_reported_vram()
                 continue
             # Dispatch is the moment staged weights commit to VRAM, so this is where the card is charged.
@@ -2251,6 +2437,57 @@ class _DispatchWorld:
                 encode_seconds=encode_seconds,
             )
 
+    def _begin_staged_prefetch(self, admitted: ImageGenerateJobPopResponse, *, lane_id: int) -> None:
+        """Start a staged lane's read of whatever of its checkpoint the host has reclaimed.
+
+        Only a lane whose weights wait in its RAM cache reads anything; a lane still holding them on the device
+        commits without a load.
+        """
+        if not self.staged_lane_prefetch or self.host_ram is None or lane_id not in self._staged_mb:
+            return
+        model_class = _model_by_name(admitted.model or "")
+        if model_class is None:
+            return
+        checkpoint_mb, _private_mb = self._host_model_ram(model_class)
+        self._staged_prefetch[str(admitted.id_)] = _StagedPrefetch(
+            model=model_class.name,
+            checkpoint_mb=checkpoint_mb,
+            started_at=self.now,
+            read_seconds=self.host_ram.read_into_cache(model_class.name, checkpoint_mb),
+        )
+
+    def _touch_staged_prefetches(self) -> None:
+        """Keep every staged lane's prefetched pages most recently used, and forget prefetches whose job left.
+
+        hordelib touches the weights it prefetched, so a pressure eviction takes them after anything idle.
+        """
+        assert self.host_ram is not None
+        for job_id, prefetch in list(self._staged_prefetch.items()):
+            window = self.job_windows.get(job_id)
+            lane = self._process_map.get(window.lane_id) if window is not None else None
+            owned = lane.current_inference_job() if lane is not None else None
+            if owned is None or str(owned.id_) != job_id:
+                del self._staged_prefetch[job_id]
+                continue
+            self.host_ram.touch(prefetch.model)
+
+    def _checkpoint_read_seconds(self, job_id: str, *, model: str, checkpoint_mb: float) -> tuple[float, float]:
+        """Return the disk read a committing job paid while staged and the read left for after clearance.
+
+        Without a staged prefetch the whole read follows clearance. With one, the elapsed staged time covers the
+        read up to its length, and pages evicted during the wait are read again after clearance; the after-
+        clearance part never exceeds a read of the whole checkpoint.
+        """
+        assert self.host_ram is not None
+        prefetch = self._staged_prefetch.pop(job_id, None)
+        if prefetch is None:
+            return 0.0, self.host_ram.read_into_cache(model, checkpoint_mb)
+        staged_seconds = min(prefetch.read_seconds, max(0.0, self.now - prefetch.started_at))
+        unfinished_seconds = prefetch.read_seconds - staged_seconds
+        reread_seconds = self.host_ram.read_into_cache(model, checkpoint_mb)
+        whole_read_seconds = checkpoint_mb / self.host_ram.read_mb_per_second
+        return staged_seconds, min(whole_read_seconds, unfinished_seconds + reread_seconds)
+
     # -- clearance lease ----------------------------------------------------------------------------------
 
     def _advance_clearance(self) -> None:
@@ -2283,6 +2520,9 @@ class _DispatchWorld:
             if job is None or job.id_ is None:
                 continue
             job_id = str(job.id_)
+            if job_id in self._occupancy:
+                # Cleared and still loading its weights: the window is already open.
+                continue
             semaphore = self._clearance_semaphores.get(lane.process_id)
             if semaphore is None:
                 continue
@@ -2295,13 +2535,17 @@ class _DispatchWorld:
                 self.clearance_timeouts.append((self.tick, lane.process_id, job_id))
             self._clearance_waiting_since.pop(job_id, None)
             self._encode_staging_mb.pop(lane.process_id, None)
-            self._process_map.on_process_state_change(
-                process_id=lane.process_id,
-                new_state=HordeProcessState.INFERENCE_STARTING,
-            )
             self._dispatched_at[job_id] = self.tick
             self.first_dispatch.setdefault(job_id, self.tick)
+            window = self.job_windows.get(job_id)
+            if window is not None:
+                window.cleared_at = self.now
             self._commit_staged_weights(job, lane_id=lane.process_id, encode_seconds=0.0)
+            occupancy = self._occupancy.get(job_id)
+            if occupancy is not None and occupancy.sample_from > self.now + _CLOCK_EPSILON:
+                self._cleared_load_until[lane.process_id] = occupancy.sample_from
+            else:
+                self._report_first_step(lane.process_id)
 
     # -- closed-loop occupancy ----------------------------------------------------------------------------
 
@@ -2341,6 +2585,24 @@ class _DispatchWorld:
         decode_spike_mb = self._actual_charge_mb(predict_job_decode_spike_mb(job, baseline) or 0.0) if phased else 0.0
         megapixels = float(job.payload.width * job.payload.height * (job.payload.n_iter or 1)) / (1024.0 * 1024.0)
         load_seconds = 0.0 if not loaded_now else (weights_mb / 1024.0) * _LOAD_SECONDS_PER_GB
+        staged_read_seconds = 0.0
+        cleared_read_seconds = 0.0
+        if loaded_now and self.host_ram is not None and model_class is not None:
+            # The weights come from the lane's mapped checkpoint, so pages the host reclaimed while the lane
+            # idled are read from disk first, less whatever a staged prefetch already read; a monolithic job
+            # also brings its text encoder and VAE across.
+            checkpoint_mb, _private_mb = self._host_model_ram(model_class)
+            staged_read_seconds, cleared_read_seconds = self._checkpoint_read_seconds(
+                job_id,
+                model=model,
+                checkpoint_mb=checkpoint_mb,
+            )
+            support_mb = (
+                0.0 if self._scheduler._is_disaggregation_class_eligible(job) else _support_component_mb(model_class)
+            )
+            load_seconds += cleared_read_seconds + (support_mb / 1024.0) * _LOAD_SECONDS_PER_GB
+        else:
+            self._staged_prefetch.pop(job_id, None)
         per_step = _SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL.get(
             str(baseline),
             _DEFAULT_SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL,
@@ -2367,6 +2629,7 @@ class _DispatchWorld:
         # encode wait sits between the dispatch and the first step rather than inside the sampling figure.
         sample_from = self.now + load_seconds + encode_seconds
         sample_until = sample_from + sample_seconds
+        total_steps = max(0, int(job.payload.ddim_steps or 0))
         occupancy = _SlotOccupancy(
             job_id=job_id,
             lane_id=lane_id,
@@ -2378,9 +2641,21 @@ class _DispatchWorld:
             decode_until=sample_until + decode_seconds,
             transient_charged=True,
             decode_spike_mb=decode_spike_mb,
+            step_seconds=sample_seconds / total_steps if total_steps > 0 else 0.0,
+            total_steps=total_steps,
         )
         self._occupancy[job_id] = occupancy
         self._transient_mb[lane_id] = self._transient_mb.get(lane_id, 0.0) + occupancy.transient_mb
+        window = self.job_windows.get(job_id)
+        if window is not None:
+            window.load_from = self.now
+            window.sample_from = sample_from
+            window.sample_until = sample_until
+            window.loaded_now = loaded_now
+            window.load_seconds = load_seconds
+            window.disk_read_seconds = staged_read_seconds + cleared_read_seconds
+            window.staged_read_seconds = staged_read_seconds
+            window.cleared_read_seconds = cleared_read_seconds
         self._sync_reported_vram()
 
     async def _advance_occupancy(self) -> None:
@@ -2392,6 +2667,9 @@ class _DispatchWorld:
             self.sampling_slot_seconds += sampled_seconds
             card = self._card_of(occupancy.lane_id)
             self.sampling_slot_seconds_by_card[card] = self.sampling_slot_seconds_by_card[card] + sampled_seconds
+            if self.host_ram is not None and sampled_seconds > 0.0:
+                # A sampling job reads its mapped weights, so its pages are the last a pressure eviction takes.
+                self.host_ram.touch(occupancy.model)
             if occupancy.transient_charged and self.now >= occupancy.sample_until:
                 self._release_transient(occupancy)
                 if self.now < occupancy.decode_until:
@@ -2399,6 +2677,60 @@ class _DispatchWorld:
             if self.now >= occupancy.decode_until:
                 await self._complete_occupancy(occupancy)
         self._sync_reported_vram()
+
+    def _report_step_progress(self) -> None:
+        """Report each sampling lane's newest completed step through the parent's heartbeat path.
+
+        The clearance controller's tail overlap extrapolates the outgoing sampler's remaining seconds from its
+        step position and the instant of its first step. ``ProcessMap`` stamps that instant on the wall clock
+        while the scheduler reads it against its injected clock, so the first step is restamped on the world's
+        clock at the instant it completed.
+        """
+        for occupancy in self._occupancy.values():
+            if occupancy.total_steps <= 0 or occupancy.step_seconds <= 0.0:
+                continue
+            lane = self._process_map.get(occupancy.lane_id)
+            if lane is None or lane.last_process_state != HordeProcessState.INFERENCE_STARTING:
+                continue
+            sampled_seconds = min(self.now, occupancy.sample_until) - occupancy.sample_from
+            completed_steps = min(
+                occupancy.total_steps,
+                int((sampled_seconds + _CLOCK_EPSILON) / occupancy.step_seconds),
+            )
+            if completed_steps < 1 or completed_steps == lane.last_current_step:
+                continue
+            first_report = lane.current_first_step_at is None
+            self._process_map.on_heartbeat(
+                occupancy.lane_id,
+                heartbeat_type=HordeHeartbeatType.INFERENCE_STEP,
+                percent_complete=int(100 * completed_steps / occupancy.total_steps),
+                current_step=completed_steps,
+                total_steps=occupancy.total_steps,
+            )
+            if first_report:
+                lane.current_first_step_at = occupancy.sample_from + occupancy.step_seconds
+
+    def _report_device_load(self, lane_id: int, window: _JobWindow) -> None:
+        """Report a finished job's device load as the ``ram_to_vram`` phase its job metrics carry.
+
+        One event covers the whole load the cleared window paid (unfinished read, weights and support
+        components), so the card's learned load figure is the time a handoff has to hide.
+        """
+        if not window.loaded_now or window.load_seconds <= 0.0:
+            return
+        self._process_map.on_job_metrics(
+            lane_id,
+            JobPhaseMetrics(
+                model_loads=[
+                    ModelLoadEvent(
+                        model_name=window.model,
+                        phase="ram_to_vram",
+                        duration_seconds=window.load_seconds,
+                        timestamp=self.now,
+                    ),
+                ],
+            ),
+        )
 
     def _release_transient(self, occupancy: _SlotOccupancy) -> None:
         """Give the card back the activation a finished sampling window was holding."""
@@ -2481,12 +2813,21 @@ class _DispatchWorld:
         # ownership. A slot that kept the ownership record would keep reading as the executor of a job that
         # has finished, and dispatch selection would pass it over for the rest of the run.
         owned = lane.current_inference_job()
+        window = self.job_windows.get(job_id)
+        if window is not None:
+            window.retention_granted = lane.retention_granted_model == occupancy.model
         if owned is None or str(owned.id_) == job_id:
             lane.settle_retention_after_job()
         lane.current_inference_started_at = None
         lane.current_first_step_at = None
         lane.current_job_expected_sampling_seconds = None
         lane.retire_inference_ownership(job)
+        if self.tail_overlap:
+            # The child's job metrics arrive with its result, and its return to WAITING_FOR_JOB clears the
+            # job-scoped step position, so a stale final step never reads as the next job's progress.
+            if window is not None:
+                self._report_device_load(occupancy.lane_id, window)
+            self._process_map.reset_heartbeat_state(occupancy.lane_id)
         # A finished child returns to WAITING_FOR_JOB whether or not its model stayed resident. That is not
         # cosmetic: PRELOADED_MODEL reads as busy, and a busy slot is refused by every eviction actuator, so a
         # retaining slot parked in it would hold weights nothing could ever ask back.
@@ -2657,6 +2998,7 @@ class _DispatchWorld:
         """Forget the hold a lane that has gone away was carrying, so no later tick completes its job."""
         self._granted_resident_evicted.discard(lane_id)
         self._release_sampler_pin(lane_id)
+        self._cleared_load_until.pop(lane_id, None)
         for job_id, occupancy in list(self._occupancy.items()):
             if occupancy.lane_id == lane_id:
                 self._occupancy.pop(job_id, None)
@@ -2841,12 +3183,20 @@ class _DispatchWorld:
         """Advance one scheduling tick, in the control loop's order."""
         self.tick += 1
         self.now += self.tick_seconds
+        if self.host_ram is not None:
+            # Host pressure moves on its own clock, and the reclaim it forces lands before any child acts.
+            self.host_ram.apply_foreign_script(self.tick)
+            self.host_ram.trim_cache()
+            self._touch_staged_prefetches()
         self._advance_safety_placement_transition()
         self._apply_control_flags()
         self._materialise_preloads()
         self._advance_encode_windows()
+        self._advance_cleared_loads()
         if self.closed_loop:
             await self._advance_occupancy()
+            if self.tail_overlap:
+                self._report_step_progress()
         else:
             await self._complete_finished_samplers()
         await self._drain_post_processing()
@@ -3221,6 +3571,11 @@ class _DispatchWorld:
                 head,
                 self._scheduler._model_metadata.require_reference(),
             )
+        sampling_lanes = {
+            occupancy.lane_id
+            for occupancy in self._occupancy.values()
+            if occupancy.sample_from <= self.now + _CLOCK_EPSILON and self.now < occupancy.sample_until
+        }
         self.tick_observations.append(
             _TickObservation(
                 tick=self.tick,
@@ -3234,6 +3589,14 @@ class _DispatchWorld:
                 head_stall_bucket=None if bucket is None else bucket.value,
                 head_stall_reason=reason,
                 protected_holds=self._protected_dispatch_holds(head, bucket),
+                lane_states=tuple(
+                    _LaneObservation(
+                        lane_id=lane.process_id,
+                        state=lane.last_process_state,
+                        sampling=lane.process_id in sampling_lanes,
+                    )
+                    for lane in self._inference_lanes()
+                ),
             ),
         )
 

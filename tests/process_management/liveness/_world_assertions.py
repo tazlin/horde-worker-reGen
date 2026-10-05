@@ -20,9 +20,12 @@ means the same thing in both places.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
-from tests.process_management.liveness._dispatch_world import _DispatchWorld, _TickObservation
+from tests.process_management.liveness._dispatch_world import _DispatchWorld, _JobWindow, _TickObservation
 
 _RUNG_ESCALATION_ORDER: tuple[ReclaimRungKind, ...] = (
     ReclaimRungKind.UNLOAD_IDLE_MODEL,
@@ -86,6 +89,160 @@ def jobs_per_simulated_hour(world: _DispatchWorld) -> float:
     """Return the completed-job rate the run achieved, in jobs per simulated hour."""
     elapsed = max(1e-9, world.now - world.started_at)
     return world.completed_jobs * 3600.0 / elapsed
+
+
+PREPARING_LANE_STATES = frozenset(
+    {
+        HordeProcessState.INFERENCE_PRIMED,
+        HordeProcessState.PRELOADING_MODEL,
+        HordeProcessState.PRELOADED_MODEL,
+    },
+)
+"""Lane states that mean a lane is getting the next job ready: staged and waiting for clearance, loading after
+clearance (a cleared lane reads primed until its first step), or bringing a checkpoint into host RAM."""
+
+
+def _work_pending_at(world: _DispatchWorld, instant: float) -> bool:
+    """Whether some job had been popped by ``instant`` and had not yet started sampling."""
+    for job_id, popped_at in world.popped_at.items():
+        if popped_at > instant:
+            continue
+        window = world.job_windows.get(job_id)
+        if window is None or window.sample_from is None or window.sample_from > instant:
+            return True
+    return False
+
+
+def handoff_gaps_by_card(world: _DispatchWorld) -> dict[int, list[float]]:
+    """Return, per card, the seconds between a sampling end and the next sampling start while work was pending.
+
+    Each sampling start is measured from the latest sampling end on the same card that precedes it. A start
+    made while another window on the card was still sampling is no handoff, and a gap with nothing popped and
+    unstarted at its opening is the workload's idle rather than the worker's, so neither is counted.
+    """
+    windows_by_card: dict[int, list[_JobWindow]] = {}
+    for window in world.job_windows.values():
+        if window.sample_from is None or window.sample_until is None:
+            continue
+        windows_by_card.setdefault(world.card_of_lane(window.lane_id), []).append(window)
+    gaps: dict[int, list[float]] = {}
+    for card, windows in windows_by_card.items():
+        for window in windows:
+            start = window.sample_from
+            assert start is not None
+            covered = any(
+                other is not window
+                and other.sample_from is not None
+                and other.sample_until is not None
+                and other.sample_from < start < other.sample_until
+                for other in windows
+            )
+            if covered:
+                continue
+            earlier_ends = [
+                other.sample_until
+                for other in windows
+                if other is not window and other.sample_until is not None and other.sample_until <= start
+            ]
+            if not earlier_ends:
+                continue
+            end = max(earlier_ends)
+            if _work_pending_at(world, end):
+                gaps.setdefault(card, []).append(start - end)
+    return gaps
+
+
+def staging_overlap_share(
+    world: _DispatchWorld,
+    *,
+    states: frozenset[HordeProcessState] = PREPARING_LANE_STATES,
+) -> float:
+    """Return the share of ticks with a lane sampling on which another lane was in one of ``states``.
+
+    The default counts a lane preparing a job: staged for clearance, loading after it, or loading a checkpoint
+    into host RAM, the work that keeps the next handoff short when it is done beside a running sample.
+    """
+    sampling_ticks = 0
+    overlapped = 0
+    for observation in world.tick_observations:
+        if not any(lane.sampling for lane in observation.lane_states):
+            continue
+        sampling_ticks += 1
+        overlapped += int(
+            any(not lane.sampling and lane.state in states for lane in observation.lane_states),
+        )
+    return overlapped / sampling_ticks if sampling_ticks else 0.0
+
+
+def two_sampler_share(world: _DispatchWorld) -> float:
+    """Return the share of sampling ticks on which some card had two or more lanes sampling at once.
+
+    A handoff that clears the next lane inside the outgoing sample's tail shows here; one that waits for the
+    outgoing sample to end never does.
+    """
+    sampling_ticks = 0
+    shared = 0
+    for observation in world.tick_observations:
+        samplers_by_card: dict[int, int] = {}
+        for lane in observation.lane_states:
+            if lane.sampling:
+                card = world.card_of_lane(lane.lane_id)
+                samplers_by_card[card] = samplers_by_card.get(card, 0) + 1
+        if not samplers_by_card:
+            continue
+        sampling_ticks += 1
+        shared += int(max(samplers_by_card.values()) >= 2)
+    return shared / sampling_ticks if sampling_ticks else 0.0
+
+
+@dataclass(frozen=True)
+class CheckpointReadSplit:
+    """Represents one device load's checkpoint read, split at the job's clearance."""
+
+    job_id: str
+    lane_id: int
+    model: str
+    staged_seconds: float
+    """Read seconds a staged prefetch paid before clearance, while the lane waited."""
+    cleared_seconds: float
+    """Read seconds paid after clearance, inside the job's device load."""
+
+
+def checkpoint_read_splits(world: _DispatchWorld) -> list[CheckpointReadSplit]:
+    """Return, per job that paid a device load, the read seconds paid while staged and after clearance."""
+    return [
+        CheckpointReadSplit(
+            job_id=window.job_id,
+            lane_id=window.lane_id,
+            model=window.model,
+            staged_seconds=window.staged_read_seconds,
+            cleared_seconds=window.cleared_read_seconds,
+        )
+        for window in world.job_windows.values()
+        if window.loaded_now
+    ]
+
+
+def dispatch_to_first_step_seconds(world: _DispatchWorld) -> list[float]:
+    """Return, per job that reached sampling, the seconds from its dispatch to its first step."""
+    return [
+        window.sample_from - window.dispatched_at
+        for window in world.job_windows.values()
+        if window.sample_from is not None
+    ]
+
+
+def booked_holding_disk_loads(world: _DispatchWorld) -> list[_JobWindow]:
+    """Return the device loads that read checkpoint pages from disk on a lane booked as holding the model.
+
+    The parent dispatched each of these believing the lane held the model, and the load still waited on the
+    disk, which is a cost nothing the parent records can see.
+    """
+    return [
+        window
+        for window in world.job_windows.values()
+        if window.loaded_now and window.booked_holding and window.disk_read_seconds > 0.0
+    ]
 
 
 def assert_duty_floor(world: _DispatchWorld, floor: float, *, context: str) -> None:
