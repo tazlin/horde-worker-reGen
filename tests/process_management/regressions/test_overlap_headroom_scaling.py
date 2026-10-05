@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from horde_worker_regen.process_management.ipc.messages import ModelLoadState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier
@@ -28,6 +28,8 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     MeasuredVramSnapshot,
     VramArbiter,
 )
+from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import PRELOAD_ADMISSION_FLOW
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -403,3 +405,111 @@ class TestMemoryQuestionIsTheArbiter:
         scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B))
 
         assert seen == [True]
+
+
+_FULL_JOB_MB = 6000.0
+"""A candidate's full measured delta that the staging card below cannot hold beside the running sample."""
+
+
+def _staging_card_state() -> DeviceVramState:
+    """A card with room for a staged job's encode charge and none for the candidate's full job."""
+    return DeviceVramState(
+        total_vram_mb=16000.0,
+        baseline_mb=0.0,
+        committed_vram_mb=11000.0,
+        planned_unmaterialized_mb=0.0,
+        committed_is_stale=False,
+        device_free_mb=5000.0,
+        noise_buffer_mb=512.0,
+    )
+
+
+class TestOverlapPricesWhatALeasedDispatchPutsOnTheCard:
+    """Under the clearance lease a dispatch beside a running sample only stages the job.
+
+    Its weights land at clearance, which prices the full job, so the overlap gate charges the staging cost.
+    It does so only while clearance is expected inside the lease-acquire timeout: past it the staged child
+    samples without a grant, and the full price at dispatch is then the only guard.
+    """
+
+    async def _leased_scheduler(
+        self,
+        job_tracker: JobTracker,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        lease: bool,
+        remaining_seconds: float | None,
+        load_seconds: float | None = 3.0,
+    ) -> InferenceScheduler:
+        """A scheduler with one heavy job sampling on lane 1 and a staging-sized card."""
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
+        scheduler._runtime_config.bridge_data.gpu_sampling_lease_enabled = lease
+        _install_cycle(scheduler, _staging_card_state())
+        running_job = await _running(job_tracker, _HEAVY_A)
+        lane = scheduler._process_map[1]
+        lane.record_inference_ownership(running_job, attempt_ordinal=1)
+        lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+        monkeypatch.setattr(
+            scheduler,
+            "_measured_admission_candidate_delta_mb",
+            lambda job, baseline, *, process_id, disaggregated: _FULL_JOB_MB,
+        )
+        monkeypatch.setattr(scheduler, "_remaining_sampling_seconds", lambda process_info: remaining_seconds)
+        monkeypatch.setattr(scheduler._process_map, "recent_vram_load_seconds", lambda device_index: load_seconds)
+        return scheduler
+
+    async def test_a_staging_dispatch_beside_a_short_sample_fits(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A sample ending well inside the timeout lets the next job stage at the encode charge."""
+        scheduler = await self._leased_scheduler(job_tracker, monkeypatch, lease=True, remaining_seconds=5.0)
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0)
+
+    async def test_without_the_lease_the_full_job_is_priced(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: without the lease the dispatch is the VRAM moment and the full job does not fit."""
+        scheduler = await self._leased_scheduler(job_tracker, monkeypatch, lease=False, remaining_seconds=5.0)
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
+
+    async def test_a_sample_outlasting_the_timeout_keeps_the_full_price(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A staged child would wait out the acquire timeout and sample unpriced, so the full job is priced."""
+        scheduler = await self._leased_scheduler(
+            job_tracker,
+            monkeypatch,
+            lease=True,
+            remaining_seconds=CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+        )
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
+
+    async def test_a_sampler_with_no_trusted_rate_keeps_the_full_price(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A running job whose remaining time is unknown could outlast the timeout."""
+        scheduler = await self._leased_scheduler(job_tracker, monkeypatch, lease=True, remaining_seconds=None)
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
+
+    async def test_a_staged_running_lane_keeps_the_full_price(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lane still waiting for its own clearance is not sampling, so no hand-over time can be estimated."""
+        scheduler = await self._leased_scheduler(job_tracker, monkeypatch, lease=True, remaining_seconds=5.0)
+        scheduler._process_map[1].last_process_state = HordeProcessState.INFERENCE_PRIMED
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
+
+    async def test_an_unmeasured_load_keeps_the_full_price(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a measured weight-load time on the card the wait for clearance cannot be bounded."""
+        scheduler = await self._leased_scheduler(
+            job_tracker, monkeypatch, lease=True, remaining_seconds=5.0, load_seconds=None
+        )
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False

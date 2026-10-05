@@ -5383,12 +5383,28 @@ class InferenceScheduler:
         The candidate's own staging charge is netted out, as the materialisation request nets it. A staged
         candidate's preload keeps its planned charge until its dispatch lands, and the candidate delta already
         is that load, so charging both prices the job twice and vetoes every overlap a staged job asks for.
+
+        Under the clearance lease the dispatch only stages the job, so it is priced at the staging charge while
+        clearance is expected inside the lease-acquire timeout (:func:`pricing.overlap_staging_charge_mb`).
+        Past that bound the staged child would sample unpriced, so the full price stands.
         """
         if not self._budget_active():
             return None
         arbiter = self._vram_arbiter
         if arbiter is None or not arbiter.has_cycle or candidate_job.model is None:
             return None
+        lease_active = self._clearance_lease_active()
+        staging_charge_mb = pricing.overlap_staging_charge_mb(
+            clearance_lease_active=lease_active,
+            running_remaining_sampling_seconds=(
+                self._running_remaining_sampling_seconds(target_device_index) if lease_active else ()
+            ),
+            incoming_load_seconds=(
+                self._process_map.recent_vram_load_seconds(target_device_index)
+                if lease_active and target_device_index is not None
+                else None
+            ),
+        )
         baseline = self._model_metadata.get_baseline(candidate_job.model)
         resident_model_info = self._horde_model_map.root.get(candidate_job.model)
         resident_pid = resident_model_info.process_id if resident_model_info is not None else None
@@ -5407,15 +5423,43 @@ class InferenceScheduler:
             baseline=baseline,
             device_index=target_device_index,
             target_process_id=resident_pid,
-            candidate_delta_mb=self._measured_admission_candidate_delta_mb(
-                candidate_job,
-                baseline,
-                process_id=resident_pid,
-                disaggregated=self._is_disaggregation_class_eligible(candidate_job),
+            candidate_delta_mb=(
+                staging_charge_mb
+                if staging_charge_mb is not None
+                else self._measured_admission_candidate_delta_mb(
+                    candidate_job,
+                    baseline,
+                    process_id=resident_pid,
+                    disaggregated=self._is_disaggregation_class_eligible(candidate_job),
+                )
             ),
             own_planned_unmaterialized_mb=own_planned_mb,
         )
         return arbiter.evaluate(request).admits
+
+    def _overlap_scope_jobs(
+        self,
+        target_device_index: int | None,
+    ) -> tuple[ImageGenerateJobPopResponse, ...] | list[ImageGenerateJobPopResponse]:
+        """The in-flight jobs an overlap onto ``target_device_index`` shares the card with (one card: all of them)."""
+        if self._multi_gpu_routing_active and target_device_index is not None:
+            return self._jobs_in_progress_on_card(target_device_index)
+        return self._job_tracker.jobs_in_progress
+
+    def _running_remaining_sampling_seconds(self, target_device_index: int | None) -> tuple[float | None, ...]:
+        """Each in-flight job's remaining sampling seconds, None for one that is not inside its denoise loop.
+
+        A job whose lane is staged, loading or not yet past the estimate's progress floor reads None, so the
+        caller cannot treat a sampler with no trusted rate as about to finish.
+        """
+        remaining: list[float | None] = []
+        for job in self._overlap_scope_jobs(target_device_index):
+            process_info = self._process_map.process_running_job(job)
+            if process_info is None or process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
+                remaining.append(None)
+                continue
+            remaining.append(self._remaining_sampling_seconds(process_info))
+        return tuple(remaining)
 
     def _concurrent_overlap_allowed(
         self,
@@ -5430,12 +5474,7 @@ class InferenceScheduler:
         verdict as the memory answer. No actuations run on a DEFER; reclaim is driven only by the preload path.
         A blocked job keeps its queue position and is re-asked on the next scheduling pass.
         """
-        if self._multi_gpu_routing_active and target_device_index is not None:
-            in_progress_jobs: tuple[ImageGenerateJobPopResponse, ...] | list[ImageGenerateJobPopResponse] = (
-                self._jobs_in_progress_on_card(target_device_index)
-            )
-        else:
-            in_progress_jobs = self._job_tracker.jobs_in_progress
+        in_progress_jobs = self._overlap_scope_jobs(target_device_index)
 
         running = tuple(
             RunningSampler(
@@ -6941,6 +6980,9 @@ class InferenceScheduler:
         card empty while runnable siblings that fit are turned away, which serves nobody. The head keeps its
         queue position and first claim on the next opportunity; it simply stops blocking work in the meantime.
 
+        It is released while every lane on the card holding the head's model is running a job
+        (:meth:`_head_waits_on_its_busy_lane`): that head cannot take the room before its lane frees.
+
         It is released the same way while a churn governor is deferring this head's whole-card establishment
         on this card. For the length of that deferral the head is not asking for the card at all (normal
         scheduling continues around it by design), so reserving its whole-card demand against smaller ready
@@ -6955,12 +6997,37 @@ class InferenceScheduler:
         if self._head_starved_seconds(displaced_head) >= HEAD_PROTECTION_MAX_STARVE_SECONDS:
             self._note_head_protection_released(displaced_head)
             return None
+        if self._head_waits_on_its_busy_lane(displaced_head, device_index=device_index):
+            return None
         baseline = self._model_metadata.get_baseline(displaced_head.model)
         return self._measured_admission_candidate_delta_mb(
             displaced_head,
             baseline,
             process_id=None,
             disaggregated=self._is_disaggregation_class_eligible(displaced_head),
+        )
+
+    def _head_waits_on_its_busy_lane(
+        self,
+        head: ImageGenerateJobPopResponse,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Whether every lane on the card holding the head's model is running a job.
+
+        Such a head cannot use room before its lane frees, and that lane's sampler returns its own memory when
+        it does. A lane mid-preload of the head's model runs no job, so it keeps the protection: the head
+        dispatches the moment the preload lands. A head with no lane on the card keeps it too, since on a
+        multi-card host a copy may be funded there. ``device_index`` None is the worker-wide key.
+        """
+        if head.model is None:
+            return False
+        lanes = self._process_map.get_processes_by_horde_model_name(
+            head.model,
+            allowed_cards=None if device_index is None else {device_index},
+        )
+        return bool(lanes) and all(
+            not lane.can_accept_job() and lane.current_inference_job() is not None for lane in lanes
         )
 
     def _note_head_protection_governor_deferred(self, head: ImageGenerateJobPopResponse) -> None:
@@ -10899,7 +10966,9 @@ class InferenceScheduler:
         # Head protection is preserved either way (the head's outstanding charge still reserves room), and the
         # full-price gate that used to park staging on materialisation grounds moves to the clearance VRAM
         # moment. Without the lease this is the VRAM moment, so the full materialisation is priced as before.
-        staging_charge_override = STAGING_ENCODE_VRAM_MB if self._clearance_lease_active() else None
+        staging_charge_override = pricing.dispatch_staging_charge_mb(
+            clearance_lease_active=self._clearance_lease_active(),
+        )
 
         outcome = self._evaluate_materialization_admission(
             next_job,
@@ -11368,7 +11437,7 @@ class InferenceScheduler:
             process_with_model,
             # A line-skip dispatch is not the true head of queue, so it presents is_head_of_queue=False and the
             # head it jumped priced as head_outstanding_mb. Head protection reserves the card's physical room
-            # for a head that may begin sampling on its own once the lane it waits on frees.
+            # for a head that could use it now; a head whose lanes are all running a job prices as no demand.
             is_head_of_queue=line_skip is None,
             head_outstanding_mb=(
                 None

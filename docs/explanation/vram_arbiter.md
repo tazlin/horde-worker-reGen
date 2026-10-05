@@ -399,6 +399,13 @@ been parked past its protection window without dispatching, the gate stops prese
 fitting sibling is admitted, and the release is disclosed and recorded as a dispatch decision. The head keeps
 its queue position and first claim on the next opportunity.
 
+Protection is also omitted while every lane on the target card that holds the head's model is running a job.
+That head cannot use room before its lane frees, and the lane's sampler returns its own memory when it does,
+so holding room for it only idles the skipper's lane. A lane mid-preload of the head's model runs no job and
+keeps the protection, as does a head with no lane on the card. The head keeps its place in clearance order,
+which is dispatch order: a skipper staged first is cleared first, so where both full jobs do not fit the head
+waits behind the skipper's sample.
+
 Protection is released the same way, and immediately, while a churn governor is deferring that head's
 whole-card establishment on the target card (see
 [Bounding residency churn](resource_governance.md#bounding-residency-churn)). For the length of that deferral

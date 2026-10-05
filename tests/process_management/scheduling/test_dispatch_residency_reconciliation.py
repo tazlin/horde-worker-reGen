@@ -281,6 +281,50 @@ class TestHeadProtectionIsBounded:
         assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
 
 
+class TestHeadOnABusyLaneStopsReservingRoom:
+    """A head whose lanes are all running a job cannot use room before one frees.
+
+    The lane it waits on returns its own sampler's memory when it frees, so holding room for that head only
+    idles the line-skipper's lane. A head that could take the room now keeps it.
+    """
+
+    async def _parked_head(self):  # noqa: ANN202
+        """A scheduler whose head is briefly parked, so only the lane's state can release head protection."""
+        scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+        _install_cycle(scheduler, _fitting_state())
+        scheduler._head_starved_seconds = Mock(return_value=5.0)  # type: ignore[method-assign]
+        return scheduler, job, target
+
+    @staticmethod
+    def _run_job_on(lane) -> None:  # noqa: ANN001
+        """Give ``lane`` an in-flight job for its own model, sampling."""
+        lane.record_inference_ownership(make_job_pop_response(lane.loaded_horde_model_name), attempt_ordinal=1)
+        lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+
+    async def test_a_head_whose_lane_runs_a_job_prices_no_demand(self) -> None:
+        """The head's only lane is sampling, so the line-skipper is not measured against the head."""
+        scheduler, job, target = await self._parked_head()
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is not None
+
+        self._run_job_on(target)
+
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
+
+    async def test_a_lane_preloading_the_head_keeps_its_protection(self) -> None:
+        """A lane mid-preload of the head's model runs no job; the head dispatches the moment it lands."""
+        scheduler, job, target = await self._parked_head()
+        target.last_process_state = HordeProcessState.PRELOADING_MODEL
+
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is not None
+
+    async def test_a_busy_lane_on_another_card_keeps_the_protection(self) -> None:
+        """On a multi-card host a copy of the head may be funded on the skipper's card, so its room stays held."""
+        scheduler, job, target = await self._parked_head()
+        self._run_job_on(target)
+
+        assert scheduler._displaced_head_outstanding_mb(job, device_index=1) is not None
+
+
 class TestGovernorDeferredHeadStopsReservingRoom:
     """A head whose whole-card establishment a churn governor defers is not asking for the card.
 

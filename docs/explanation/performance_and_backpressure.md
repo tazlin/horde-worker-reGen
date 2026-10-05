@@ -566,6 +566,14 @@ conservative here because a dispatchable candidate's weights are already residen
 drops to a small constant that still gives the running job its memory-hungry startup beat. No measurement
 (cold start) or a disabled VRAM budget keeps the strict fractions.
 
+Under the clearance lease a dispatch only stages the job, and its weights land at clearance, which prices the
+full job. The verdict then charges the staging cost (`pricing.overlap_staging_charge_mb`), the same charge the
+dispatch residency gate uses, but only while clearance is expected well inside the lease-acquire timeout:
+every running sampler's remaining seconds must be known, and the longest of them plus the card's measured
+weight-load seconds must fit the timeout twice over. A staged child that waits out the timeout samples without
+a grant, so behind a longer sample, a sampler with no trusted rate yet, or a card with no measured load, the
+full price stands. Without the lease the dispatch is the VRAM moment and the full price always stands.
+
 The required headway is finally scaled by the worker's performance mode
 (`performance_mode_headway_scale`): high-performance mode multiplies it by `0.5` and moderate-performance
 mode by `0.75`, so an operator who has provisioned the card for aggressive co-sampling brings the next

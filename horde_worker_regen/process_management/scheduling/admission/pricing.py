@@ -8,6 +8,7 @@ records anything.
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -33,6 +34,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot, SlotSnapshot
+from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.concurrent_overlap import prices_sampler_only_beside
 from horde_worker_regen.process_management.scheduling.governance.whole_card import max_coresident_for_peak
 from horde_worker_regen.utils.config_coercion import config_number
@@ -47,6 +49,45 @@ lease: the text-encoder footprint plus the conditioning working set for the larg
 *inside* the leased sample call, at clearance, not at dispatch, so a staged job's device footprint is
 only this encode working set until it is cleared. Dispatch admits staging while measured device free net
 of the reserve covers this charge; the full materialisation is priced at clearance instead."""
+
+
+def dispatch_staging_charge_mb(*, clearance_lease_active: bool) -> float | None:
+    """Return what a dispatch puts on the card when it only stages the job, or None when it is the VRAM moment.
+
+    Under the clearance lease the weights land at clearance, which prices the full materialisation, so the
+    dispatch charges the encode working set alone. The residency gate charges this with no duration term: its
+    head-protection arithmetic is stated against it, and the overlap gate, which governs a dispatch beside a
+    running sampler, adds the duration term through :func:`overlap_staging_charge_mb`.
+    """
+    return STAGING_ENCODE_VRAM_MB if clearance_lease_active else None
+
+
+def overlap_staging_charge_mb(
+    *,
+    clearance_lease_active: bool,
+    running_remaining_sampling_seconds: Sequence[float | None],
+    incoming_load_seconds: float | None,
+) -> float | None:
+    """Return the staging charge for a dispatch beside running samplers, or None to price the full job.
+
+    A staged child waits for clearance at most :data:`CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS` and then samples
+    without a grant, unpriced. The staging charge therefore holds only while clearance is expected well inside
+    that bound: every running sampler's remaining seconds is known, and the longest of them plus the card's
+    measured weight-load seconds fits the timeout twice over, so the estimate may be wrong by its own size. An
+    unknown remaining time or an unmeasured load keeps the full price.
+    """
+    staging_charge_mb = dispatch_staging_charge_mb(clearance_lease_active=clearance_lease_active)
+    if staging_charge_mb is None or incoming_load_seconds is None:
+        return None
+    known_remaining_seconds = [seconds for seconds in running_remaining_sampling_seconds if seconds is not None]
+    if len(known_remaining_seconds) != len(running_remaining_sampling_seconds):
+        return None
+    expected_wait_seconds = max(known_remaining_seconds, default=0.0) + incoming_load_seconds
+    margin_seconds = expected_wait_seconds
+    if expected_wait_seconds + margin_seconds >= CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:
+        return None
+    return staging_charge_mb
+
 
 # ---- context overheads
 

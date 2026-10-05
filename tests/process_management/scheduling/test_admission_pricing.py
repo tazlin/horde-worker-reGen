@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     LearnedFootprintStore,
 )
 from horde_worker_regen.process_management.scheduling.admission import pricing
+from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -264,4 +265,73 @@ class TestReclaimPredicates:
         snapshot = scheduler.snapshot()
         assert pricing.coresident_lookahead_affordable(snapshot, "resident", device_index=None) is (
             scheduler._coresident_lookahead_affordable("resident", device_index=None)  # type: ignore[attr-defined]
+        )
+
+
+class TestDispatchStagingCharge:
+    """Under the lease a dispatch charges its staging cost only while clearance is expected before the timeout.
+
+    A staged child that waits out the lease-acquire timeout samples without a grant, so the staging charge is
+    safe only when the running samplers will hand the card over well inside it.
+    """
+
+    def test_without_the_lease_both_gates_price_the_full_job(self) -> None:
+        """Without the lease the dispatch is the VRAM moment, so neither charge applies."""
+        assert pricing.dispatch_staging_charge_mb(clearance_lease_active=False) is None
+        assert (
+            pricing.overlap_staging_charge_mb(
+                clearance_lease_active=False,
+                running_remaining_sampling_seconds=(1.0,),
+                incoming_load_seconds=1.0,
+            )
+            is None
+        )
+
+    def test_the_residency_gate_charges_staging_whatever_the_duration(self) -> None:
+        """The residency gate's charge carries no duration term."""
+        assert pricing.dispatch_staging_charge_mb(clearance_lease_active=True) == pricing.STAGING_ENCODE_VRAM_MB
+
+    def test_a_short_wait_charges_staging(self) -> None:
+        """A sampler finishing well inside the timeout lets the next job stage at the encode charge."""
+        assert (
+            pricing.overlap_staging_charge_mb(
+                clearance_lease_active=True,
+                running_remaining_sampling_seconds=(5.0, 3.0),
+                incoming_load_seconds=4.0,
+            )
+            == pricing.STAGING_ENCODE_VRAM_MB
+        )
+
+    def test_a_wait_without_its_own_margin_prices_the_full_job(self) -> None:
+        """The longest remaining sample plus the load must fit the timeout twice over."""
+        half_timeout = CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS / 2.0
+        assert (
+            pricing.overlap_staging_charge_mb(
+                clearance_lease_active=True,
+                running_remaining_sampling_seconds=(1.0, half_timeout - 4.0),
+                incoming_load_seconds=4.0,
+            )
+            is None
+        )
+
+    def test_an_unknown_remaining_time_prices_the_full_job(self) -> None:
+        """A sampler with no trusted rate (staged, loading, under the progress floor) could run past the timeout."""
+        assert (
+            pricing.overlap_staging_charge_mb(
+                clearance_lease_active=True,
+                running_remaining_sampling_seconds=(2.0, None),
+                incoming_load_seconds=1.0,
+            )
+            is None
+        )
+
+    def test_an_unmeasured_load_prices_the_full_job(self) -> None:
+        """Without a measured weight-load time the wait cannot be bounded."""
+        assert (
+            pricing.overlap_staging_charge_mb(
+                clearance_lease_active=True,
+                running_remaining_sampling_seconds=(2.0,),
+                incoming_load_seconds=None,
+            )
+            is None
         )

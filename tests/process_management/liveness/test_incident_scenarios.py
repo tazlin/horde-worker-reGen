@@ -185,10 +185,12 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 )
 from horde_worker_regen.process_management.scheduling.admission import clearance as clearance_mod
 from horde_worker_regen.process_management.scheduling.admission import preload as preload_mod
+from horde_worker_regen.process_management.scheduling.admission import pricing as pricing_mod
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
 )
+from horde_worker_regen.process_management.scheduling.concurrent_overlap import OVERLAP_HEADWAY_AMPLE_VRAM
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import card_preload_order
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _GRACE_BUDGET_SECONDS,
@@ -5147,4 +5149,157 @@ async def test_y_retention_is_granted_beside_lanes_holding_checkpoints_in_ram() 
     assert world.weight_uploads <= _STREAK_WEIGHT_UPLOADS, (
         f"{world.weight_uploads} weight uploads over a {_RAM_HELD_STREAK_JOBS}-job streak, over the "
         f"{_STREAK_WEIGHT_UPLOADS} a retained streak pays. {world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Staging beside a sample on a small card: the next job stages under the lease without overcommitting
+# --------------------------------------------------------------------------------------------------------
+
+_STAGING_LANES = 2
+_STAGING_TICK_SECONDS = 0.5
+_STAGING_WIDTH = 1024
+_STAGING_HEIGHT = 1024
+_STAGING_STEPS = 30
+_STAGING_JOBS = 12
+_STAGING_MAX_TICKS = 2000
+
+_STAGING_UNMEASURED_JOBS = 2
+"""Jobs at the head of a run that cannot stage beside a sample: the first has nothing running beside it, and
+the second is dispatched before any job has reported a weight load, so the wait for clearance has no bound."""
+
+_LONG_SAMPLE_STEPS = 500
+"""Steps that put an SDXL megapixel sample well past the lease-acquire timeout once the overlap headway lets
+the next job in."""
+
+
+def _staging_world() -> _DispatchWorld:
+    """A 16 GB card, two lanes each holding one SDXL checkpoint in RAM, two sampling slots, and the lease.
+
+    Tail overlap is on, so each sampling lane reports its step position and each finished job its load, which
+    is what the parent bounds a staged job's wait for clearance from.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=_STAGING_LANES,
+        max_threads=_STAGING_LANES,
+        queue_depth=_STAGING_LANES,
+        closed_loop=True,
+        clearance_lease=True,
+        tail_overlap=True,
+        tick_seconds=_STAGING_TICK_SECONDS,
+    )
+    world.seed_resident(0, _SDXL, in_vram=False)
+    world.seed_resident(1, _SDXL_OTHER, in_vram=False)
+    return world
+
+
+def _staging_job(model: _ModelClass, *, steps: int = _STAGING_STEPS) -> ImageGenerateJobPopResponse:
+    return make_job_pop_response(model.name, width=_STAGING_WIDTH, height=_STAGING_HEIGHT, ddim_steps=steps)
+
+
+def _assert_two_full_jobs_overcommit_the_card(world: _DispatchWorld) -> None:
+    """Precondition: the card cannot hold two SDXL jobs at their full peaks, so only staging fits beside one."""
+    probe = _staging_job(_SDXL)
+    peak_mb = predict_job_sampling_vram_mb(probe, world.scheduler._model_metadata.get_baseline(_SDXL.name))
+    assert peak_mb is not None
+    assert 2 * peak_mb > world.card.total_mb, (
+        f"precondition: two {peak_mb:.0f}MB SDXL peaks must not fit a {world.card.total_mb:.0f}MB card, or this "
+        f"row says nothing about staging beside a sample. {world.state_dump()}"
+    )
+
+
+def _assert_staging_left_the_card_whole(world: _DispatchWorld, *, context: str) -> None:
+    """No staged lane sampled unpriced, the governor never saturated, and device free never cratered."""
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, so a staged "
+        f"job's weights landed beside a running sample with no clearance price. {world.state_dump()}"
+    )
+    assert_governor_never_reached(world, GovernorState.SATURATED, context=context)
+    assert_free_floor(world, _CHILD_FREE_MARGIN_MB, context=context)
+
+
+async def _drive_long_sample_then_candidate(world: _DispatchWorld) -> tuple[ImageGenerateJobPopResponse, ...]:
+    """Measure one weight load, then run a sample far past the acquire timeout with another job queued behind."""
+    warm = _staging_job(_SDXL)
+    await world.pop(warm)
+    for _ in range(_STAGING_MAX_TICKS):
+        await world.step()
+        if world.completed_jobs >= 1:
+            break
+    assert world.completed_jobs == 1, world.state_dump()
+    long_job = _staging_job(_SDXL, steps=_LONG_SAMPLE_STEPS)
+    candidate = _staging_job(_SDXL_OTHER)
+    await world.pop(long_job)
+    await world.pop(candidate)
+    for _ in range(_STAGING_MAX_TICKS):
+        await world.step()
+        if world.completed_jobs >= 3:
+            break
+    assert world.completed_jobs == 3, world.state_dump()
+    return warm, long_job, candidate
+
+
+def _long_sample_seconds() -> float:
+    return (
+        _LONG_SAMPLE_STEPS
+        * _SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL[KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value]
+        * (_STAGING_WIDTH * _STAGING_HEIGHT / (1024.0 * 1024.0))
+    )
+
+
+async def test_y_a_job_behind_a_long_sample_stages_only_when_clearance_comes_before_the_timeout() -> None:
+    """A job queued behind a sample longer than the lease-acquire timeout never samples unpriced.
+
+    A staged child waits for clearance at most the acquire timeout and then samples without a grant. Behind a
+    sample that outlasts it, staging at the encode charge would land the job's weights beside a running sample
+    the card cannot hold, so the dispatch is priced at the full job until the sample is near enough its end.
+    The job still stages inside the sample's tail.
+    """
+    # The staging charge relaxes the headway to the ample fraction, so the job would stage that early and wait
+    # out the rest of the sample: the row needs that rest to outlast the acquire timeout.
+    assert _long_sample_seconds() * (1.0 - OVERLAP_HEADWAY_AMPLE_VRAM) > CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
+    world = _staging_world()
+    _assert_two_full_jobs_overcommit_the_card(world)
+
+    _warm, long_job, candidate = await _drive_long_sample_then_candidate(world)
+
+    context = "a job queued behind a sample longer than the lease-acquire timeout"
+    _assert_staging_left_the_card_whole(world, context=context)
+    long_window = world.job_windows[str(long_job.id_)]
+    candidate_window = world.job_windows[str(candidate.id_)]
+    assert long_window.sample_until is not None, world.state_dump()
+    assert candidate_window.dispatched_at < long_window.sample_until, (
+        f"{context}: the queued job was dispatched at {candidate_window.dispatched_at:.1f}s, after the long sample "
+        f"ended at {long_window.sample_until:.1f}s, so it never staged in the sample's tail. {world.state_dump()}"
+    )
+
+
+async def test_y_defect_reinjection_staging_behind_a_long_sample_samples_unpriced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the staging charge applied whatever the wait, the queued job samples through the acquire timeout.
+
+    Reinjected at the duration term alone: the overlap gate prices every leased dispatch at the encode charge.
+    The job stages as soon as the headway lets it in, clearance withholds it for the rest of the long sample,
+    and it reaches its denoise loop through the timeout, unpriced, beside a sample the card cannot hold it
+    beside.
+    """
+
+    def unconditional(
+        *,
+        clearance_lease_active: bool,
+        running_remaining_sampling_seconds: object,
+        incoming_load_seconds: object,
+    ) -> float | None:
+        return pricing_mod.dispatch_staging_charge_mb(clearance_lease_active=clearance_lease_active)
+
+    monkeypatch.setattr(pricing_mod, "overlap_staging_charge_mb", unconditional)
+    world = _staging_world()
+
+    _warm, _long_job, candidate = await _drive_long_sample_then_candidate(world)
+
+    assert [job_id for _tick, _lane, job_id in world.clearance_timeouts] == [str(candidate.id_)], (
+        "the queued job must reach its denoise loop through the lease-acquire timeout once the duration term is "
+        f"gone; the run recorded {world.clearance_timeouts}. {world.state_dump()}"
     )
