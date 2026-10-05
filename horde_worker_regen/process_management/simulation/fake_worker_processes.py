@@ -329,6 +329,10 @@ class FakeInferenceProcess(HordeProcess):
         self._inference_semaphore = inference_semaphore
         self._job_delay_seconds = job_delay_seconds
         self._gpu_sampling_lease = gpu_sampling_lease
+        if gpu_sampling_lease is not None:
+            # The real child reports memory as its lease wait begins; registering the same hook keeps the
+            # fake's report traffic identical.
+            gpu_sampling_lease.set_wait_entry_callback(self._send_wait_entry_memory_report)
         self._fail_every_n = fail_every_n
         self._fault_profile = fault_profile if fault_profile is not None else FaultProfile()
         self._sim_vram_ledger = sim_vram_ledger
@@ -515,6 +519,10 @@ class FakeInferenceProcess(HordeProcess):
         if self._gpu_sampling_lease is not None:
             self._gpu_sampling_lease.begin_job()
 
+    def _send_wait_entry_memory_report(self) -> None:
+        """Report memory as a job's clearance wait begins, as the real child's wait-entry callback does."""
+        self.send_memory_report_message(include_vram=True)
+
     def _await_clearance(self) -> None:
         """Block where hordelib blocks the real child: at the sample call, until the parent grants clearance.
 
@@ -633,6 +641,9 @@ class FakeInferenceProcess(HordeProcess):
         else:
             result_info = "fake inference"
 
+        # The real child reports memory ahead of every result, so the parent applies the lane's post-job
+        # reservation before it acts on the result.
+        self.send_memory_report_message(include_vram=True)
         self.process_message_queue.put(
             HordeInferenceResultMessage(
                 process_id=self.process_id,

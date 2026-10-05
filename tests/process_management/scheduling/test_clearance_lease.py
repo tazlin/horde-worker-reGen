@@ -115,6 +115,118 @@ class TestProxyProtocol:
         assert clearance.value == 0  # release never grants a clearance permit
 
 
+class _TimeoutRecordingSemaphore(_FakeSemaphore):
+    """A fake clearance semaphore that also records the timeout each blocking acquire was given."""
+
+    def __init__(self, value: int = 0, *, bound: int | None = None) -> None:
+        super().__init__(value, bound=bound)
+        self.blocking_timeouts: list[float | None] = []
+
+    def acquire(self, block: bool = True, timeout: float | None = None) -> bool:
+        if block:
+            self.blocking_timeouts.append(timeout)
+        return super().acquire(block, timeout)
+
+
+class TestProxyWaitEntryCallback:
+    """The child's wait-entry callback runs once per job, just before the first acquire blocks.
+
+    The child reports memory there, because clearance prices a staged job net of the child's last reported
+    reservation and a reading taken before the child staged counts the staged set twice.
+    """
+
+    def test_the_callback_runs_before_a_blocking_wait(self) -> None:
+        """With no permit waiting, the callback runs and the acquire still waits for the grant."""
+        clearance = _TimeoutRecordingSemaphore(0, bound=1)
+        proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore())
+        calls: list[int] = []
+        proxy.set_wait_entry_callback(lambda: calls.append(clearance.value))
+        proxy.begin_job()
+
+        assert proxy.acquire(True, 5.0) is False
+        assert calls == [0]
+        assert len(clearance.blocking_timeouts) == 1, "the acquire must still block after the callback"
+
+    def test_a_waiting_grant_runs_no_callback(self) -> None:
+        """A permit already released is taken at once, with no report and no blocking wait."""
+        clearance = _TimeoutRecordingSemaphore(1, bound=1)
+        proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore())
+        calls: list[None] = []
+        proxy.set_wait_entry_callback(lambda: calls.append(None))
+        proxy.begin_job()
+
+        assert proxy.acquire(True, 5.0) is True
+        assert calls == []
+        assert clearance.blocking_timeouts == []
+
+    def test_a_later_sample_of_the_same_job_runs_no_callback(self) -> None:
+        """One report per job: the pass-through acquire of a second sample calls nothing."""
+        proxy = ClearanceLeaseProxy(clearance=_TimeoutRecordingSemaphore(0, bound=1), done=_FakeSemaphore())
+        calls: list[None] = []
+        proxy.set_wait_entry_callback(lambda: calls.append(None))
+        proxy.begin_job()
+
+        proxy.acquire(True, 0.0)
+        proxy.acquire(True, 0.0)
+
+        assert len(calls) == 1
+        proxy.begin_job()
+        proxy.acquire(True, 0.0)
+        assert len(calls) == 2, "the next job's wait reports again"
+
+    def test_a_raising_callback_does_not_stop_the_acquire(self) -> None:
+        """A failed report is logged; the child still takes its grant."""
+        clearance = _TimeoutRecordingSemaphore(0, bound=1)
+        proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore())
+
+        def grant_then_fail() -> None:
+            clearance.release()  # the parent grants while the child reports
+            raise RuntimeError("report failed")
+
+        proxy.set_wait_entry_callback(grant_then_fail)
+        proxy.begin_job()
+
+        assert proxy.acquire(True, 5.0) is True
+        assert clearance.value == 0
+
+    def test_the_callback_does_not_extend_the_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Time the callback spends comes out of the wait, so the child's total wait is the timeout it was given."""
+        import horde_worker_regen.process_management.scheduling.clearance_lease as clearance_lease_module
+
+        now = [100.0]
+        monkeypatch.setattr(clearance_lease_module.time, "monotonic", lambda: now[0])
+        clearance = _TimeoutRecordingSemaphore(0, bound=1)
+        proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore())
+
+        def slow_report() -> None:
+            now[0] += 3.0
+
+        proxy.set_wait_entry_callback(slow_report)
+        proxy.begin_job()
+        proxy.acquire(True, 5.0)
+
+        assert clearance.blocking_timeouts == [pytest.approx(2.0)]
+
+    def test_a_granted_wait_still_carries_the_cleared_figure(self) -> None:
+        """The figure is read on the acquire that obtained the permit, with or without the callback."""
+        clearance = _TimeoutRecordingSemaphore(0, bound=1)
+        figure = _shared_figure()
+        proxy = ClearanceLeaseProxy(clearance=clearance, done=_FakeSemaphore(), cleared_device_free=figure)
+        proxy.begin_job()
+        proxy.set_wait_entry_callback(lambda: proxy._parent_grant(device_free_mb=6144.0))
+
+        assert proxy.acquire(True, 5.0) is True
+        assert proxy.take_cleared_device_free_mb() == 6144.0
+        assert proxy.take_cleared_device_free_mb() is None
+
+    def test_a_fresh_proxy_carries_no_callback_in_its_state(self) -> None:
+        """The callback is child-local: a proxy as the parent builds and pickles it has none in its state."""
+        proxy = ClearanceLeaseProxy(clearance=_held_empty_clearance(), done=_FakeSemaphore())
+
+        assert "_wait_entry_callback" not in vars(proxy)
+        assert proxy._wait_entry_callback is None
+
+
 def _inputs(
     *,
     staged: tuple[ClearanceWaiter, ...] = (),

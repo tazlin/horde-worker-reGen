@@ -320,6 +320,9 @@ class HordeInferenceProcess(HordeProcess):
                     gpu_sampling_lease,
                     acquire_timeout_seconds=CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
                 )
+                # A staged child blocks holding its encode working set, and clearance prices the job net of the
+                # child's last reported reservation; a report as the wait begins keeps that reading current.
+                gpu_sampling_lease.set_wait_entry_callback(self._send_inference_memory_report)
                 logger.info("Registered GPU denoise clearance proxy for cross-process pipelining")
 
             # Subprocesses never download model references: the parent process owns downloading and
@@ -857,7 +860,7 @@ class HordeInferenceProcess(HordeProcess):
     a faulted result carried only the empty rate string) and classify a resource/OOM failure for retry."""
 
     def _send_inference_memory_report(self) -> None:
-        """Send a precise boundary VRAM report at an inference stage transition (sampling done / VAE decode).
+        """Send a precise boundary VRAM report at a stage transition (lease wait, sampling done, VAE decode).
 
         These stage-boundary reports carry the working set at a known moment and complement the reporter
         thread's interval sampling, which runs independently while the main loop is blocked in the GPU op.
@@ -1748,6 +1751,10 @@ class HordeInferenceProcess(HordeProcess):
 
                 process_state = HordeProcessState.INFERENCE_COMPLETE if results else HordeProcessState.INFERENCE_FAILED
                 logger.debug(f"Finished inference with process state {process_state}")
+                # The parent makes its next dispatch decision on receipt of the result, and hordelib's end-of-run
+                # unload has just released the weights; reporting first lets that decision read this lane's
+                # reservation after the unload instead of the sampling-time figure from the last stage report.
+                self.send_memory_report_message(include_vram=True)
                 self.send_inference_result_message(
                     process_state=process_state,
                     job_info=message.sdk_api_job_info,

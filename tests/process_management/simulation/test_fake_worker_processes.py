@@ -23,6 +23,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
     HordePreloadInferenceModelMessage,
+    HordeProcessMemoryMessage,
     HordeProcessState,
     HordeProcessStateChangeMessage,
     HordeSafetyControlMessage,
@@ -276,6 +277,30 @@ class TestFakeInferenceProcess:
         assert len(result_messages) == 1
         assert result_messages[0].state == GENERATION_STATE.faulted
         assert result_messages[0].job_image_results is None
+
+    @pytest.mark.parametrize("fail_every_n", [0, 1], ids=["completed", "faulted"])
+    def test_start_inference_reports_memory_before_its_result(self, fail_every_n: int) -> None:
+        """A fresh memory report precedes the result, as the real child sends one on both branches."""
+        process, queue = make_fake_inference_process(fail_every_n=fail_every_n)
+        process.preload_model("Deliberate")
+        queue.messages.clear()
+
+        process._receive_and_handle_control_message(
+            HordeInferenceControlMessage(
+                control_flag=HordeControlFlag.START_INFERENCE,
+                horde_model_name="Deliberate",
+                sdk_api_job_info=make_job_pop_response(model="Deliberate"),
+            ),
+        )
+
+        primed_at = next(i for i, m in enumerate(queue.messages) if isinstance(m, HordeModelStateChangeMessage))
+        result_at = next(i for i, m in enumerate(queue.messages) if isinstance(m, HordeInferenceResultMessage))
+        # The primed state change carries its own report; the one under test is sent after sampling.
+        assert isinstance(queue.messages[primed_at + 1], HordeProcessMemoryMessage)
+        assert isinstance(queue.messages[result_at - 1], HordeProcessMemoryMessage), (
+            f"the result must directly follow a fresh memory report: {queue.messages}"
+        )
+        assert result_at - 1 > primed_at + 1, f"no report was sent after sampling: {queue.messages}"
 
     def test_unload_from_ram_clears_active_model(self) -> None:
         """UNLOAD_MODELS_FROM_RAM must report the unload and clear the active model."""
@@ -538,9 +563,9 @@ class TestFakeInferenceClearanceLease:
         process._receive_and_handle_control_message(_sample_message())
         process._receive_and_handle_control_message(_sample_message())
 
-        # Two stages, two acquires: the first took the granted permit, the second found none and degraded
-        # into unpriced sampling rather than silently reusing the first stage's grant.
-        assert clearance.acquires == [True, False]
+        # The first stage took the granted permit at its probe. The second probed, found none, waited and
+        # degraded into unpriced sampling rather than silently reusing the first stage's grant.
+        assert clearance.acquires == [True, False, False]
 
     def test_leased_whole_job_primes_rather_than_reporting_itself_sampling(self) -> None:
         """A leased monolithic dispatch reports IN_USE at PRIMED; the parent advances it on the first step."""
@@ -558,6 +583,22 @@ class TestFakeInferenceClearanceLease:
         in_use = [m for m in model_states if m.horde_model_state == ModelLoadState.IN_USE]
         assert [m.process_state for m in in_use] == [HordeProcessState.INFERENCE_PRIMED]
         assert clearance.acquires == [True]
+
+    def test_a_job_that_waits_for_its_grant_reports_memory_once_more(self) -> None:
+        """The wait-entry report is sent only when the job has to wait, as the real child's callback is."""
+
+        def memory_reports(grants: int) -> int:
+            process, queue, _clearance = _leased_fake(grants=grants)
+            process._receive_and_handle_control_message(
+                HordeInferenceControlMessage(
+                    control_flag=HordeControlFlag.START_INFERENCE,
+                    horde_model_name="Deliberate",
+                    sdk_api_job_info=make_job_pop_response(model="Deliberate"),
+                ),
+            )
+            return len(queue.of_type(HordeProcessMemoryMessage))
+
+        assert memory_reports(grants=0) == memory_reports(grants=1) + 1
 
     def test_unleased_whole_job_reports_sampling_directly(self) -> None:
         """With no lease the fake keeps its original sequence: IN_USE at INFERENCE_STARTING, no priming."""

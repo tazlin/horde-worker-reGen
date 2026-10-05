@@ -105,7 +105,16 @@ class ClearanceLeaseProxy:
     reading, taken while the previous sampler still held the card; rebasing it on the clearance figure lets the
     child judge its load against the card the parent just admitted it to. The child reads the figure only on
     an acquire that obtained the permit, so a timed-out or passed-through acquire yields none.
+
+    The child can also register a wait-entry callback (:meth:`set_wait_entry_callback`), run once per job just
+    before the acquire blocks. The parent prices a staged child net of its last reported reservation, so the
+    child reports memory there rather than leaving the parent on a reading from before it staged.
     """
+
+    _wait_entry_callback: Callable[[], None] | None = None
+    """Child-local hook run before a job's first acquire blocks. A class-level default rather than an
+    ``__init__`` field, so a proxy pickled across the spawn boundary never carries it and one built before it
+    existed still reads None."""
 
     def __init__(
         self,
@@ -138,16 +147,52 @@ class ClearanceLeaseProxy:
         waits for two grants. A blocked acquire that times out still marks the job's grant consumed: the job
         proceeds to sample unpriced (hordelib's degraded path), and its remaining samples must not each pay
         the timeout again. :meth:`begin_job` clears the flag for the next job.
+
+        A blocking first acquire probes for a permit before it waits: a grant already waiting is taken at once,
+        and otherwise the wait-entry callback runs and the acquire blocks for what is left of ``timeout``, so
+        the callback never lengthens the total wait.
         """
         if self._grant_consumed:
             return True
-        acquired = bool(self._clearance.acquire(block, timeout))
+        acquired = self._acquire_clearance(block, timeout)
         # Consume the per-job grant on any completed attempt, granted or timed out: either way the job now
         # samples, and its later samples must pass through rather than block again.
         self._grant_consumed = True
         if acquired:
             self._granted_device_free_mb = self._read_cleared_device_free_mb()
         return acquired
+
+    def set_wait_entry_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register (or clear) the child-local callback run before a job's first acquire blocks.
+
+        Set in the child after the proxy crossed the spawn boundary; it is never pickled.
+        """
+        self._wait_entry_callback = callback
+
+    def _acquire_clearance(self, block: bool, timeout: float | None) -> bool:
+        """Take the clearance permit, running the wait-entry callback only when the acquire is about to block.
+
+        Without a callback the permit is taken in the single call the semaphore was always given; the probe
+        exists only to tell a waiting grant from a wait.
+        """
+        if not block or self._wait_entry_callback is None:
+            return bool(self._clearance.acquire(block, timeout))
+        started_at = time.monotonic()
+        if self._clearance.acquire(False):
+            return True
+        self._notify_wait_entry()
+        remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started_at))
+        return bool(self._clearance.acquire(True, remaining))
+
+    def _notify_wait_entry(self) -> None:
+        """Run the wait-entry callback; a failure is logged and never reaches the acquire."""
+        callback = self._wait_entry_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as e:  # noqa: BLE001 - a reporting hook must never stop the child sampling
+            logger.warning(f"Clearance wait-entry callback failed: {type(e).__name__} {e}")
 
     def take_cleared_device_free_mb(self) -> float | None:
         """Return the device free VRAM (MB) the parent admitted this child's grant against, once.

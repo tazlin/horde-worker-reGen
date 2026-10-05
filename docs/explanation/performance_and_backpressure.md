@@ -1281,7 +1281,11 @@ this pricing loop: the device-free governor sees the physical fall and owns the 
 
 To keep measurements fresh, GPU-bearing processes emit an interval-driven memory
 report (every `_memory_report_interval`, 5 s) in addition to the event-driven
-reports at model load/unload, and a dead process's stale VRAM figure is cleared on
+reports at model load/unload, as a staged child begins waiting on its clearance
+lease (clearance prices the job net of that reservation), and ahead of each
+inference result (so the dispatch decision the result triggers reads the lane
+after hordelib's end-of-run unload),
+and a dead process's stale VRAM figure is cleared on
 recovery so it cannot be counted as either used or free. That interval report runs
 on a dedicated reporter thread, not the main loop: the main loop is blocked for the
 entire duration of a GPU operation (a 20-150 s sample), so a main-loop report would
