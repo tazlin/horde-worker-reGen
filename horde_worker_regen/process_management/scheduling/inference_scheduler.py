@@ -5867,11 +5867,7 @@ class InferenceScheduler:
             if plan.verdict.measured_attempt:
                 self._mark_measured_attempt(job, plan.priced.request, device_index=plan.priced.device_index)
             self._resolve_clearance_hold(job)
-            self._upgrade_dispatch_reservation_to_full(
-                job,
-                process_info,
-                baseline=self._model_metadata.get_baseline(job.model),
-            )
+            self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.candidate_delta_mb)
             return True
 
         applied = self._actuate_materialization_verdict(
@@ -6887,9 +6883,10 @@ class InferenceScheduler:
         loading the diffusion weights to VRAM, which happens inside the leased sample call at clearance. With
         ``staging_only`` the reservation is booked at the encode charge (:data:`STAGING_ENCODE_VRAM_MB`)
         rather than the full activation-inclusive peak, so a staged job holds only the device footprint it
-        actually incurs. :meth:`_upgrade_dispatch_reservation_to_full` re-books it at the full peak when the
-        job is cleared (``set_planned`` refreshes the same ``(flow, unit)`` entry in place, re-charging in full
-        and resetting its materialisation watermark, so the encode charge is upgraded, never double-booked).
+        actually incurs. :meth:`_upgrade_dispatch_reservation_to_full` re-books it at what is left to
+        materialise when the job is cleared (``set_planned`` refreshes the same ``(flow, unit)`` entry in place,
+        re-charging in full and resetting its materialisation watermark, so the encode charge is upgraded, never
+        double-booked).
 
         A dispatch onto an already-resident model materialises the job's activation-inclusive peak (net of the
         resident-weight credit the model already holds) over the sampling window the device-free reading does
@@ -6915,6 +6912,21 @@ class InferenceScheduler:
                 process_id=process_info.process_id,
                 disaggregated=self._is_disaggregation_class_eligible(job),
             )
+        self._book_dispatch_reservation(job, process_info, charge_mb=charge_mb)
+
+    def _book_dispatch_reservation(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_info: HordeProcessInfo,
+        *,
+        charge_mb: float | None,
+    ) -> None:
+        """Book ``charge_mb`` as the job's dispatch reservation, decaying by growth past the lane's current report.
+
+        None (an unpriceable job) books nothing rather than a fabricated figure.
+        """
+        if job.id_ is None:
+            return
         self._reserve_ledger.set_planned(
             DISPATCH_ADMISSION_FLOW,
             str(job.id_),
@@ -6936,17 +6948,18 @@ class InferenceScheduler:
         job: ImageGenerateJobPopResponse,
         process_info: HordeProcessInfo,
         *,
-        baseline: str | None,
+        remaining_mb: float | None,
     ) -> None:
-        """Re-book a staged job's dispatch reservation at its full materialisation peak when it is cleared.
+        """Re-book a staged job's dispatch reservation at what clearance priced it to materialise.
 
-        Called at clearance (the VRAM moment) so the ledger reflects the weights-plus-activation peak the
-        leased sample call is about to materialise, rather than the encode-only staging charge. Re-registering
-        the same ``(DISPATCH_ADMISSION_FLOW, job id)`` entry through :meth:`_record_dispatch_reservation`
-        refreshes it in place: the full charge replaces the encode charge and the target's materialisation
-        watermark resets, so the upgrade is not a second, additive booking.
+        ``remaining_mb`` is the clearance price, ``staged_materialization_delta_mb``: the full peak net of
+        what the lane already reports. The booking decays by growth past that same report, so it reaches zero as
+        the job reaches its peak. Booked gross against that baseline, the staged holdings would stay outstanding
+        through the whole sample and be charged against the next waiter. Re-registering the same
+        ``(DISPATCH_ADMISSION_FLOW, job id)`` entry refreshes it in place and resets its watermark, so the upgrade
+        is not a second, additive booking.
         """
-        self._record_dispatch_reservation(job, process_info, baseline=baseline, staging_only=False)
+        self._book_dispatch_reservation(job, process_info, charge_mb=remaining_mb)
 
     def release_dispatch_reservation(self, job: ImageGenerateJobPopResponse) -> None:
         """Drop a dispatch's outstanding reservation on clean finalization (a latency tightener over omission).

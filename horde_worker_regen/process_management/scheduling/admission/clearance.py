@@ -12,6 +12,10 @@ from dataclasses import dataclass
 
 from strenum import StrEnum
 
+from horde_worker_regen.process_management.resources.resource_budget import (
+    predict_job_weight_mb,
+    predict_model_weight_mb,
+)
 from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, VramArbiter, VramVerdict
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.materialization import (
@@ -33,7 +37,7 @@ class ClearanceDecision(StrEnum):
     BUDGET_INACTIVE = "budget_inactive"
     """The VRAM budget is off: grant without pricing."""
     ADMIT = "admit"
-    """The full materialisation fits: grant and re-book the dispatch reservation at the full peak."""
+    """The full materialisation fits: grant and re-book the dispatch reservation at what is left to materialise."""
     HOLD = "hold"
     """The materialisation does not fit yet: withhold, run the verdict's evictions, and re-ask next pass."""
 
@@ -85,27 +89,45 @@ def staged_materialization_delta_mb(snapshot: SchedulingSnapshot, job_id: str, p
     By the clearance moment the child's text encoder, VAE and leftover allocator cache are on the device and
     already missing from the measured device-free reading, while the priced peak is the whole sampling-time
     reservation including them; charged gross, a child reads as further from fitting the more of its own job
-    it has staged. The reserve ledger decays the staging reservation by the same measured growth. An
-    unpriceable job (None) and a resident-weight candidate (already credited) pass through.
+    it has staged. Clearance prices this figure and the cleared job's dispatch reservation is booked at it
+    against the same report, so the booking has decayed to nothing once the job reaches its peak.
+
+    The report is the job's own only net of weights another model keeps on the slot, which stay beside the
+    job. Weights of the job's own model, whole or partial, are in the report too, so they are netted from the
+    peak before any resident-weight credit rather than credited whole. An unpriceable job (None) passes
+    through, and a slot with no report yet is charged its priced peak.
     """
     job = snapshot.queue.jobs[job_id]
     if job.model is None:
         return None
-    gross_mb = pricing.candidate_delta_mb(
+    payload = snapshot.queue.payloads[job_id]
+    priced_mb = pricing.candidate_delta_mb(
         snapshot,
-        snapshot.queue.payloads[job_id],
+        payload,
         job.baseline,
         process_id=process_id,
         disaggregated=job.disaggregation_class_eligible,
     )
-    if gross_mb is None:
+    if priced_mb is None:
         return None
+    reported_mb = snapshot.slots[process_id].reserved_mb
+    if reported_mb is None:
+        return priced_mb
+    peak_mb = priced_mb
     if pricing.candidate_weights_resident(snapshot, job.model, process_id):
-        return gross_mb
-    staged_mb = snapshot.slots[process_id].reserved_mb
-    if staged_mb is None:
-        return gross_mb
-    return max(0.0, gross_mb - float(staged_mb))
+        peak_mb += predict_job_weight_mb(payload, job.baseline) or 0.0
+    own_holdings_mb = max(0.0, float(reported_mb) - _other_models_weights_mb(snapshot, process_id, job.model))
+    return max(0.0, peak_mb - own_holdings_mb)
+
+
+def _other_models_weights_mb(snapshot: SchedulingSnapshot, process_id: int, model: str) -> float:
+    """The predicted weights (MB) of every model other than ``model`` whose weights the slot holds on the card."""
+    metadata = snapshot.services.model_metadata
+    return sum(
+        predict_model_weight_mb(resident_model, metadata.get_baseline(resident_model)) or 0.0
+        for resident_model in snapshot.slots[process_id].resident_weight_models
+        if resident_model != model
+    )
 
 
 def decide_clearance_admit(

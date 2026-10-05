@@ -609,8 +609,8 @@ the encode charge while staged; siblings staging ahead therefore never reserve t
 full-materialisation room. Second, the full-price fit-or-evict moves to **clearance**: before clearing a
 child the scheduler prices its job's full weights-plus-activation peak against measured device truth through
 the same `MONOLITHIC_DISPATCH` admission identity the dispatch residency gate uses, running the single reclaim
-owner's eviction on a non-fit and upgrading the reservation from the encode charge to the full peak on a
-grant. Weights the target slot already holds are credited out of that price: a slot carrying a retention
+owner's eviction on a non-fit and upgrading the reservation from the encode charge on a grant, to the peak
+net of what the slot already reports, the figure the admit priced. Weights the target slot already holds are credited out of that price: a slot carrying a retention
 grant for the model its next job needs never left those weights on the card, and the device-free reading
 already excludes them, so charging the whole peak would hold a same-model streak for room the card has
 already given it. Only the weights are credited; the activation peak and the noise buffer are charged in

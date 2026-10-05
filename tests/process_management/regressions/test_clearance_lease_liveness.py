@@ -124,7 +124,7 @@ class TestDispatchReservationCharge:
         full_mb = scheduler._measured_admission_candidate_delta_mb(job, None, process_id=0, disaggregated=False)
         assert full_mb is not None and full_mb > _ENCODE_MB  # the full peak exceeds the encode-only staging charge
 
-        scheduler._upgrade_dispatch_reservation_to_full(job, proc, baseline=None)
+        scheduler._upgrade_dispatch_reservation_to_full(job, proc, remaining_mb=full_mb)
         upgraded = self._reserved_vram_mb(scheduler)
         # A single entry upgraded in place: the reserved total is the full peak, not encode + full (double-book).
         assert upgraded == full_mb
