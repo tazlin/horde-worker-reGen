@@ -27,6 +27,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import enum
+import math
 import time
 from collections.abc import Callable, Mapping
 from typing import Protocol
@@ -78,6 +79,13 @@ class _ClearanceSemaphore(Protocol):
         ...
 
 
+class _SharedFigure(Protocol):
+    """A float shared between the parent and one child, such as a ``multiprocessing`` ``Value('d')``."""
+
+    value: float
+    """The shared figure; NaN when unset."""
+
+
 class ClearanceLeaseProxy:
     """The child-side sampling lease: block on the parent's clearance grant, signal when the window closes.
 
@@ -91,9 +99,21 @@ class ClearanceLeaseProxy:
     as the multiprocessing semaphores it wraps are. The per-job ``consumed`` flag is child-local instance
     state: the parent and child hold distinct unpickled copies and never read each other's flag, so the parent
     tracks grants through the controller instead.
+
+    A grant also carries the device free VRAM the parent measured when it admitted the child, written to a
+    shared figure before the permit is released. The child's free-VRAM clamp was set from the dispatch-time
+    reading, taken while the previous sampler still held the card; rebasing it on the clearance figure lets the
+    child judge its load against the card the parent just admitted it to. The child reads the figure only on
+    an acquire that obtained the permit, so a timed-out or passed-through acquire yields none.
     """
 
-    def __init__(self, *, clearance: _ClearanceSemaphore, done: _ClearanceSemaphore) -> None:
+    def __init__(
+        self,
+        *,
+        clearance: _ClearanceSemaphore,
+        done: _ClearanceSemaphore,
+        cleared_device_free: _SharedFigure | None = None,
+    ) -> None:
         """Wrap the parent-created clearance and done semaphores.
 
         Args:
@@ -101,10 +121,14 @@ class ClearanceLeaseProxy:
                 releases to grant one child one load-and-sample window.
             done: A semaphore the child releases when a sampling window closes, so the parent (draining it
                 non-blockingly) learns the grant was consumed and retired.
+            cleared_device_free: A parent-created shared float the parent sets to the admitted device free
+                (MB) before each grant, NaN when it had no reading. None carries no figure with any grant.
         """
         self._clearance = clearance
         self._done = done
+        self._cleared_device_free = cleared_device_free
         self._grant_consumed = False
+        self._granted_device_free_mb: float | None = None
 
     def acquire(self, block: bool = True, timeout: float | None = None) -> bool:
         """Wait for the parent's clearance grant, or pass through if this job already consumed one.
@@ -121,7 +145,20 @@ class ClearanceLeaseProxy:
         # Consume the per-job grant on any completed attempt, granted or timed out: either way the job now
         # samples, and its later samples must pass through rather than block again.
         self._grant_consumed = True
+        if acquired:
+            self._granted_device_free_mb = self._read_cleared_device_free_mb()
         return acquired
+
+    def take_cleared_device_free_mb(self) -> float | None:
+        """Return the device free VRAM (MB) the parent admitted this child's grant against, once.
+
+        Set by the :meth:`acquire` that obtained the permit and cleared on read, so a later sample of the same
+        job (whose own allocations the figure does not account for) never rebases on it again. None when the
+        last acquire timed out or passed through, or the parent had no reading.
+        """
+        figure = self._granted_device_free_mb
+        self._granted_device_free_mb = None
+        return figure
 
     def release(self) -> None:
         """Signal the parent that a sampling window closed; never touches the clearance permit.
@@ -136,15 +173,37 @@ class ClearanceLeaseProxy:
 
         Called by the child at job start, before the pipeline runs. Job execution in a child is
         single-threaded, so this un-consumes the grant exactly once per job with no race.
+
+        The shared figure is unset here too. A permit the parent released after the previous job had already
+        timed out is still available to this job's acquire, and the figure written with it describes the card
+        before the previous job sampled.
         """
         self._grant_consumed = False
+        self._granted_device_free_mb = None
+        if self._cleared_device_free is not None:
+            self._cleared_device_free.value = math.nan
 
-    def _parent_grant(self) -> None:
+    def _read_cleared_device_free_mb(self) -> float | None:
+        """Child-side: the figure the parent wrote with the grant just acquired, or None when unset."""
+        if self._cleared_device_free is None:
+            return None
+        figure = float(self._cleared_device_free.value)
+        if math.isnan(figure):
+            return None
+        return figure
+
+    def _parent_grant(self, *, device_free_mb: float | None) -> None:
         """Parent-side: release one clearance permit to grant this child a load-and-sample window.
 
+        The admitted device free is written before the release, so the child's acquire, which returns only
+        after the release, reads this grant's figure.
+
         A bounded clearance semaphore raises ``ValueError`` if a permit is already available (a prior grant
-        the child has not consumed), which the controller treats as already-cleared.
+        the child has not consumed), which the controller treats as already-cleared. The figure is still
+        replaced: it is the newer admission of the same child's waiting job.
         """
+        if self._cleared_device_free is not None:
+            self._cleared_device_free.value = math.nan if device_free_mb is None else device_free_mb
         self._clearance.release()
 
     def _parent_drain_done(self) -> bool:
@@ -569,7 +628,7 @@ class ClearanceController:
                 # Already holds a grant; do not clear twice.
                 continue
             if admit_fn(process_id):
-                if self._clear(process_id, job_id_by_pid.get(process_id)):
+                if self._clear(process_id, job_id_by_pid.get(process_id), device_free_mb=inputs.device_free_mb):
                     cleared.append(process_id)
                     if plan.tail_cleared_for_job_id is not None and process_id == plan.clear_process_ids[-1]:
                         self._tail_cleared_job_ids.add(plan.tail_cleared_for_job_id)
@@ -582,17 +641,21 @@ class ClearanceController:
 
         return ClearanceStepResult(cleared_process_ids=tuple(cleared), held_process_ids=tuple(held))
 
-    def _clear(self, process_id: int, job_id: str | None) -> bool:
+    def _clear(self, process_id: int, job_id: str | None, *, device_free_mb: float | None) -> bool:
         """Release one child's clearance permit exactly once, guarding a double clear. Returns success.
 
         Records the job the grant is issued for so the grant is later retired by job correlation (the child
         moving off that job), never by a stale done permit from a prior job.
+
+        ``device_free_mb`` is the measured device free the admission priced against, before any charge for
+        this child's materialisation. The child's clamp subtracts its own allocator growth from the figure, so
+        a figure already net of the child's charge would count that charge twice.
         """
         proxy = self._proxies.get(process_id)
         if proxy is None:
             return False
         try:
-            proxy._parent_grant()
+            proxy._parent_grant(device_free_mb=device_free_mb)
         except ValueError:
             # The child's clearance permit is already available (a prior grant it has not consumed, e.g. the
             # degraded timeout path). The bounded semaphore caps it at one, so treat it as already cleared.

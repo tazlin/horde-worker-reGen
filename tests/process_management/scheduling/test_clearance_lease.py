@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import multiprocessing
 import uuid
 from collections.abc import Callable
+from multiprocessing.sharedctypes import Synchronized
 from types import SimpleNamespace
 
 import pytest
@@ -318,8 +321,12 @@ class TestTailOverlapTimeTrigger:
 class _StubProxy(ClearanceLeaseProxy):
     """A proxy backed by fake semaphores, so the controller drives real grant/done edges under test."""
 
-    def __init__(self) -> None:
-        super().__init__(clearance=_held_empty_clearance(), done=_FakeSemaphore())
+    def __init__(self, *, cleared_device_free: Synchronized[float] | None = None) -> None:
+        super().__init__(
+            clearance=_held_empty_clearance(),
+            done=_FakeSemaphore(),
+            cleared_device_free=cleared_device_free,
+        )
 
     @property
     def clearance_value(self) -> int:
@@ -459,6 +466,133 @@ class TestControllerClearing:
         unpriced = [m for m in messages if "unpriced sampling" in m]
         assert len(unpriced) == 1
         assert controller.grant_state(2) is GrantState.SAMPLING
+
+
+def _shared_figure() -> Synchronized[float]:
+    """The shared float the spawn site creates beside a child's semaphores, unset."""
+    return multiprocessing.get_context("spawn").Value("d", math.nan)
+
+
+def _staged_child(proxy: ClearanceLeaseProxy, *, job_id: str) -> tuple[ClearanceWaiter, ...]:
+    """Start a job on the child side and return the snapshot's view of it primed and waiting."""
+    proxy.begin_job()
+    return (ClearanceWaiter(process_id=2, priority=1, job_id=job_id),)
+
+
+class TestGrantCarriesClearanceTruth:
+    """A grant hands the child the device free its admission priced against, once, and never to another job."""
+
+    def test_cleared_child_reads_the_device_free_it_was_admitted_against(self) -> None:
+        """The first sample of a cleared job yields the controller's figure; the job's later samples yield none."""
+        controller = _controller()
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 13_500.0
+        assert proxy.take_cleared_device_free_mb() is None, "the figure is handed over once per grant"
+        assert proxy.acquire(True, 0.0) is True, "a later sample of the same job passes through"
+        assert proxy.take_cleared_device_free_mb() is None, "a passed-through acquire carries no figure"
+
+    def test_held_child_times_out_with_no_figure(self) -> None:
+        """A child admission held never receives a permit, so its timed-out acquire yields no figure."""
+        controller = _controller()
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_never_admit)
+
+        assert proxy.acquire(True, 0.0) is False
+        assert proxy.take_cleared_device_free_mb() is None
+
+    def test_timed_out_acquire_ignores_a_figure_written_without_its_permit(self) -> None:
+        """Only an acquire that obtained the permit reads the shared figure, whatever the figure holds.
+
+        A grant written just after the child's wait expired leaves the figure set with no permit taken; the
+        job samples unpriced and has no admission to rebase on.
+        """
+        figure = _shared_figure()
+        proxy = _StubProxy(cleared_device_free=figure)
+        proxy.begin_job()
+        figure.value = 9_000.0
+
+        assert proxy.acquire(True, 0.0) is False
+        assert proxy.take_cleared_device_free_mb() is None
+
+    def test_uncleared_acquire_yields_no_figure(self) -> None:
+        """A child the parent never cleared times out with nothing to rebase on."""
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        proxy.begin_job()
+
+        assert proxy.acquire(True, 0.0) is False
+        assert proxy.take_cleared_device_free_mb() is None
+
+    def test_grant_without_a_reading_carries_no_figure(self) -> None:
+        """A grant the parent issued with no device reading leaves the child's clamp as it was."""
+        controller = _controller()
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+
+        controller.step(_inputs(staged=staged, device_free_mb=None), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() is None
+
+    def test_second_job_never_reads_the_previous_grants_figure(self) -> None:
+        """The next job on the lane sees its own grant's figure, or none, never the one before it."""
+        controller = _controller()
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+        assert proxy.acquire(True, 0.0) is True
+        controller.step(_inputs(), admit_fn=_always_admit)  # job-a finished: its grant retires
+
+        proxy.begin_job()
+        assert proxy.acquire(True, 0.0) is False, "job-b was never cleared"
+        assert proxy.take_cleared_device_free_mb() is None
+
+        staged = _staged_child(proxy, job_id="job-c")
+        controller.step(_inputs(staged=staged, device_free_mb=None), admit_fn=_always_admit)
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() is None, "a grant with no reading must not reuse job-a's"
+
+    def test_late_permit_left_from_a_timed_out_job_carries_no_figure(self) -> None:
+        """A permit released after its job sampled unpriced reaches the next job without the old figure.
+
+        The figure describes the card before the timed-out job sampled, so the next job, which inherits the
+        unconsumed permit, has nothing current to rebase on.
+        """
+        controller = _controller()
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, proxy)
+        proxy.begin_job()
+        assert proxy.acquire(True, 0.0) is False  # job-a timed out and sampled unpriced
+        controller.step(
+            _inputs(staged=(ClearanceWaiter(process_id=2, priority=1, job_id="job-a"),), device_free_mb=9_000.0),
+            admit_fn=_always_admit,
+        )  # a snapshot lagging the child clears job-a after the fact
+
+        proxy.begin_job()  # job-b
+        assert proxy.acquire(True, 0.0) is True, "the unconsumed permit is still there"
+        assert proxy.take_cleared_device_free_mb() is None
+
+    def test_proxy_without_a_shared_figure_carries_none(self) -> None:
+        """A proxy built with no shared figure behaves as before: grants carry nothing."""
+        controller = _controller()
+        proxy = _StubProxy()
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() is None
 
 
 class TestTailOverlapObservability:

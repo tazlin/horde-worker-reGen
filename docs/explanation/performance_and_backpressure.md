@@ -618,7 +618,14 @@ full. The parent's own retention record is what says the weights are there, whic
 covers a disaggregated sampler: its sample stage reports no model-load transition, so the model map never
 shows a pinned sampler's UNet VRAM-resident however long the slot holds it.
 The post-processing co-residency mutex is applied at clearance too, since clearance, not dispatch, is
-now the VRAM moment for a leased job. A clearance held for VRAM fit is attributed to the `clearance_hold`
+now the VRAM moment for a leased job. A grant also carries the measured device free the admission priced
+against. The controller writes it to a shared float beside the child's clearance semaphore before releasing
+the permit, and the child's `ClearanceLeaseProxy` hands it to hordelib once, on the acquire that obtained the
+permit. hordelib then rebases the run's free-VRAM clamp on it (see [VRAM arbiter](vram_arbiter.md)). The
+figure is the card before this child materialises, since the clamp subtracts the child's own growth from it. A
+timed-out or passed-through acquire carries none, and a job start unsets the figure so a permit left over from
+a timed-out job never brings the previous admission's figure into the next. A clearance held for VRAM fit is
+attributed to the `clearance_hold`
 slot-duty bucket (see [GPU duty cycle](duty-cycle.md)). Liveness always wins over pricing: a child whose
 clearance is starved past hordelib's bounded lease-acquire timeout samples anyway, and the parent logs that
 unpriced window once rather than ever wedging the pool. The lease brackets a disaggregated sample stage

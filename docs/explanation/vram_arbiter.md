@@ -1190,7 +1190,15 @@ craters to the paging cliff, where the governor saturates and the reclaim ladder
 capacity down. Retention is what makes that reachable at all, since it is what leaves a footprint standing
 across a job boundary for the child's own arithmetic to be the last defense over. The parent's figure is
 likewise taken as a ceiling on the child-reported free VRAM the scheduler prices admission and headroom from,
-so the same overstatement cannot buy headroom on the parent side either. The scenarios in
+so the same overstatement cannot buy headroom on the parent side either. Under the clearance lease the
+dispatch reading is taken while the previous sampler still holds the card, so by the time the child is cleared
+it is low by about that sampler's footprint, and a child judging its load against it would load partially
+after the parent has just admitted the full load. The grant therefore carries the device free the clearance
+admission priced against, and hordelib rebases the clamp on it at the acquire. The new figure replaces the
+dispatch reading and the child's growth is counted from that moment, since its earlier allocations are already
+absent from the newer measurement. A grant with no reading, a timed-out acquire, and a run without the lease
+keep the dispatch figure. The figure always comes from the parent. A child-side read of device free is the
+untruthful view the clamp exists to correct. The scenarios in
 `tests/process_management/liveness/test_incident_scenarios.py` hold this: a streak whose true footprint nearly
 fills the card keeps its margin and its duty when the reading is on the dispatch, and craters when it is not.
 

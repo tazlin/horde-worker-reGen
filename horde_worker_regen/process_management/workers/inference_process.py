@@ -1103,8 +1103,10 @@ class HordeInferenceProcess(HordeProcess):
             device_free_truth_mb (float | None, optional): The parent's device-level free VRAM (MB) at
                 dispatch, which clamps the free view this process's shortfall-based freeing is computed
                 against; the process-local view overstates the card under WDDM, so an unclamped shortfall
-                under-frees and the card's real free figure craters. None leaves the executor on its own
-                view. Defaults to None.
+                under-frees and the card's real free figure craters. Under the clearance lease the clamp is
+                rebased at the grant on the figure the parent admitted the grant against, since the dispatch
+                reading predates the previous sampler's exit. None leaves the executor on its own view.
+                Defaults to None.
 
         Returns:
             list[Image] | None: The generated images, or None if inference failed.
