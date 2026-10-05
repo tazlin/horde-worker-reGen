@@ -214,9 +214,12 @@ from tests.process_management.liveness._dispatch_world import (
     _CARD_16GB,
     _CARD_24GB,
     _CHILD_FREE_MARGIN_MB,
+    _DECODE_SECONDS_PER_MEGAPIXEL,
     _FILLER_MODEL_CLASSES,
     _FLUX,
     _ROTATION_MODEL_CLASSES,
+    _SAME_BASELINE_MODEL_CLASSES,
+    _SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL,
     _SD15,
     _SD15_C,
     _SD15_D,
@@ -235,6 +238,7 @@ from tests.process_management.liveness._dispatch_world import (
     _model_by_name,
     _ModelClass,
 )
+from tests.process_management.liveness._host_ram import HostRamLedger
 from tests.process_management.liveness._world_assertions import (
     FIRST_LANE_TEARDOWN_RUNG,
     LANE_TEARDOWN_RUNGS,
@@ -4971,3 +4975,176 @@ async def test_fp8_private_working_set_survives_a_floor_dip() -> None:
             break
     assert world.submitted_jobs == 1, "The protected fp8 job must reach submit through the floor dip"
     assert world.ram_recycles == []
+
+
+# --------------------------------------------------------------------------------------------------------
+# Same-baseline handoff: one card, one baseline, more checkpoints than lanes, host headroom as the axis
+# --------------------------------------------------------------------------------------------------------
+
+_SAME_BASELINE_ROTATION = (_SDXL, _SDXL_OTHER, _SDXL_C, *_SAME_BASELINE_MODEL_CLASSES)
+"""The checkpoints the traffic names: one baseline, more checkpoints than the pool has lanes."""
+
+_SAME_BASELINE_LANES = 4
+_SAME_BASELINE_MAX_THREADS = 2
+_SAME_BASELINE_QUEUE_DEPTH = 4
+_SAME_BASELINE_TICK_SECONDS = 0.5
+"""Fine enough that a handoff of two seconds and one of five are several ticks apart."""
+
+_SAME_BASELINE_WIDTH = 1024
+_SAME_BASELINE_HEIGHT = 1024
+_SAME_BASELINE_STEPS = 30
+
+_SAME_BASELINE_STREAKS = (2, 3, 2, 3, 2, 3, 2)
+"""Same-model streak lengths for one pass over the rotation, one streak per checkpoint."""
+
+_SAME_BASELINE_PASSES = 3
+_SAME_BASELINE_ARRIVAL_SECONDS = 5.0
+"""Seconds between arrivals, and between one streak and the next.
+
+A pass over the rotation then names each checkpoint once in about two minutes, so a lane waits well over
+thirty seconds between its streaks, which is the idle that lets the host reclaim its pages, while the card
+always has work pending behind the job it is running."""
+
+_SAME_BASELINE_SEED = 20261005
+_SAME_BASELINE_HOST_TOTAL_MB = 65536.0
+_SAME_BASELINE_READ_MB_PER_SECOND = 1250.0
+"""Rate at which a reclaimed checkpoint page is read back from disk: a consumer NVMe's sustained mapped read."""
+
+_SAME_BASELINE_MAX_TICKS = 3000
+"""Ceiling on a run's ticks, far past the roughly 1,400 the slowest headroom level needs to drain."""
+
+_SAME_BASELINE_MEGAPIXELS = _SAME_BASELINE_WIDTH * _SAME_BASELINE_HEIGHT / (1024.0 * 1024.0)
+_SAME_BASELINE_SAMPLE_SECONDS = (
+    _SAME_BASELINE_STEPS
+    * _SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL[KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value]
+    * _SAME_BASELINE_MEGAPIXELS
+)
+_SAME_BASELINE_DECODE_SECONDS = (
+    _DECODE_SECONDS_PER_MEGAPIXEL[KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value]
+    * _SAME_BASELINE_MEGAPIXELS
+)
+
+
+@dataclass(frozen=True)
+class _HostHeadroom:
+    """Host RAM other programs leave the worker, as checkpoints its page cache can hold beyond private pages."""
+
+    label: str
+    cached_checkpoints: float
+
+
+_HEADROOM_LEVELS = (
+    _HostHeadroom("ample", float(len(_SAME_BASELINE_ROTATION))),
+    _HostHeadroom("moderate", float(_SAME_BASELINE_LANES)),
+    _HostHeadroom("tight", _SAME_BASELINE_LANES / 2),
+)
+"""Every checkpoint the traffic names stays cached at the ample level. The moderate level holds the lanes'
+four only while no lane carries a transient, and the tight level holds half of them, so idle lanes go cold."""
+
+
+def _same_baseline_arrivals() -> tuple[tuple[float, _ModelClass], ...]:
+    """Build the pinned arrival script: each job's arrival offset in seconds and its checkpoint.
+
+    Each pass visits every checkpoint once, in an order drawn from a fixed seed, as a same-model streak.
+    """
+    rng = random.Random(_SAME_BASELINE_SEED)
+    arrivals: list[tuple[float, _ModelClass]] = []
+    offset = 0.0
+    for _ in range(_SAME_BASELINE_PASSES):
+        order = list(_SAME_BASELINE_ROTATION)
+        rng.shuffle(order)
+        for model, streak in zip(order, _SAME_BASELINE_STREAKS, strict=True):
+            for _ in range(streak):
+                arrivals.append((offset, model))
+                offset += _SAME_BASELINE_ARRIVAL_SECONDS
+            offset += _SAME_BASELINE_ARRIVAL_SECONDS
+    return tuple(arrivals)
+
+
+_SAME_BASELINE_ARRIVALS = _same_baseline_arrivals()
+
+
+def _same_baseline_world(headroom: _HostHeadroom) -> _DispatchWorld:
+    """A 24 GB card, four lanes each holding an SDXL checkpoint in RAM, two sampling slots, and the lease.
+
+    Foreign RAM is set after seeding, from the worker's settled private pages, so ``headroom`` is exactly the
+    page cache left for checkpoints.
+    """
+    ledger = HostRamLedger(
+        _SAME_BASELINE_HOST_TOTAL_MB,
+        0.0,
+        read_mb_per_second=_SAME_BASELINE_READ_MB_PER_SECOND,
+    )
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=_SAME_BASELINE_LANES,
+        max_threads=_SAME_BASELINE_MAX_THREADS,
+        queue_depth=_SAME_BASELINE_QUEUE_DEPTH,
+        closed_loop=True,
+        clearance_lease=True,
+        service_contexts=True,
+        tick_seconds=_SAME_BASELINE_TICK_SECONDS,
+        host_ram=ledger,
+        extra_model_classes=(_SDXL_C, *_SAME_BASELINE_MODEL_CLASSES),
+    )
+    for lane_id, model in enumerate(_SAME_BASELINE_ROTATION[:_SAME_BASELINE_LANES]):
+        world.seed_resident(lane_id, model, in_vram=False)
+    checkpoint_mb, _private_mb = world._host_model_ram(_SDXL)
+    settled_private_mb = sum(ledger.private_mb.values())
+    ledger.foreign_mb = ledger.total_mb - settled_private_mb - headroom.cached_checkpoints * checkpoint_mb
+    return world
+
+
+_RAM_HELD_STREAK_JOBS = 12
+"""Jobs in the streak the retention row serves: enough boundaries that a grant is decided on many of them."""
+
+
+async def test_y_retention_is_granted_beside_lanes_holding_checkpoints_in_ram() -> None:
+    """A retention fit is not denied for checkpoints idle sibling lanes hold in host RAM.
+
+    Each lane reports its seated checkpoint as a held component sized by its RAM pages and holds none of it on
+    the device. The card measures room for the retained weights beside the next job's peak, so a same-model
+    streak keeps its weights between jobs and pays for them only while the slot's first dispatch has no repeat
+    behind it.
+    """
+    world = _same_baseline_world(_HEADROOM_LEVELS[0])
+    for lane_id in world.inference_lane_ids():
+        world.seed_ram_held_checkpoint(lane_id)
+    streak_model = _SAME_BASELINE_ROTATION[0]
+    probe = make_job_pop_response(
+        streak_model.name,
+        width=_SAME_BASELINE_WIDTH,
+        height=_SAME_BASELINE_HEIGHT,
+        ddim_steps=_SAME_BASELINE_STEPS,
+    )
+    peak_mb = predict_job_sampling_vram_mb(probe, world.scheduler._model_metadata.get_baseline(streak_model.name))
+    assert peak_mb is not None
+    assert world.device_free_mb() >= streak_model.weights_mb + peak_mb, (
+        f"precondition: the card must hold the retained weights beside the next peak. {world.state_dump()}"
+    )
+    popped = 0
+    for _ in range(_SAME_BASELINE_MAX_TICKS):
+        while popped < _RAM_HELD_STREAK_JOBS and len(world.job_tracker.jobs_pending_inference) < 2:
+            job = make_job_pop_response(
+                streak_model.name,
+                width=_SAME_BASELINE_WIDTH,
+                height=_SAME_BASELINE_HEIGHT,
+                ddim_steps=_SAME_BASELINE_STEPS,
+            )
+            await world.pop(job)
+            popped += 1
+        await world.step()
+        if world.completed_jobs >= _RAM_HELD_STREAK_JOBS:
+            break
+    assert world.completed_jobs == _RAM_HELD_STREAK_JOBS, world.state_dump()
+    settled = [window for window in world.job_windows.values() if window.retention_granted is not None]
+    denials = [window for window in settled if not window.retention_granted]
+    assert len(denials) <= 1, (
+        f"retention was denied on {len(denials)} of {len(settled)} jobs while idle lanes held their checkpoints "
+        f"in RAM only, with the card holding {world.min_device_free_mb:.0f}MB free at its lowest. "
+        f"{world.state_dump()}"
+    )
+    assert world.weight_uploads <= _STREAK_WEIGHT_UPLOADS, (
+        f"{world.weight_uploads} weight uploads over a {_RAM_HELD_STREAK_JOBS}-job streak, over the "
+        f"{_STREAK_WEIGHT_UPLOADS} a retained streak pays. {world.state_dump()}"
+    )

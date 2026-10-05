@@ -947,8 +947,8 @@ to the card. It is instead a governed live gate that grants only when:
   must absorb the job's sampling peak plus the reserve, after charging everything else that shares the card
   while the weights are held: the sibling CUDA contexts (inference siblings, the post-processing lane, the
   disaggregated VAE and component lanes, the on-GPU safety process), the models other slots are already
-  holding resident under earlier grants, the component-cache tenancy idle lanes report holding between jobs,
-  the job's own post-processing, and any sibling the clearance lease is about to admit. That last term is
+  holding resident under earlier grants, the device memory idle lanes with a component cache hold between
+  jobs, the job's own post-processing, and any sibling the clearance lease is about to admit. That last term is
   what a multi-slot lease adds: a staged sibling's weights land at *its* clearance, so at this instant the
   shared ledger carries only its encode charge and the rest of its materialisation is charged here. Priced
   without it, two grants each fit "alone" and jointly overflow the card, which is the shape every observed
@@ -957,6 +957,14 @@ to the card. It is instead a governed live gate that grants only when:
   same accessor as the achievable ceiling. Retention cannot page that memory out, and a fit priced from the
   card's total would otherwise see none of it. The verdict's log line states the floor as its own figure
   when it is nonzero.
+
+An idle lane holding a component cache is charged its measured allocator reservation. A cache entry may sit in
+host RAM, where it costs the card nothing. A lane that holds components on the device (a component or VAE lane,
+a disaggregated sampler) has them inside that reservation. The entries' reported `approx_ram_mb` is a host RAM
+estimate, about a whole checkpoint per seated monolithic lane, and stands in only until the lane's first memory
+report. A lane that also holds a retained resident is left to the retained-resident term, since its reservation
+contains those same weights. Under WDDM the reservation can understate demand-paged allocations. The paging
+denial and the governor gate run ahead of the static fit and refuse the grant in that regime.
 
 A grant is settled into the slot's retained-resident record only when its job **succeeds**. A fault is
 evidence about the job and none at all about the device: a job that failed part-way through may have left
@@ -1149,11 +1157,13 @@ candidate named at all. It is keyed to a retained copy, so a worker holding none
 hatch, traffic with no repeat inside the queue window) schedules exactly as it did before.
 
 Dispatch admission charges the residents too. A dispatch that materializes weights is priced against every
-retained resident the card carries, not just the slot it lands on: on a non-fit the idle ones are evicted
-through the ladder's actuator and the job keeps its queue position until the child's own reports (a risen
-device-free reading, a fallen slot reservation, or the model map no longer placing those weights there)
-evidence the room is back, bounded so a child whose reports never arrive leaves the dispatch to the measured
-admission gate rather than parking the queue. The gate charges only *sibling* residents, because a
+retained resident the card carries, not just the slot it lands on: where the job fits only once those residents
+are gone, the idle ones are evicted through the ladder's actuator and the job keeps its queue position until the
+child's own reports (a risen device-free reading, a fallen slot reservation, or the model map no longer placing
+those weights there) evidence the room is back, bounded so a child whose reports never arrive leaves the dispatch
+to the measured admission gate rather than parking the queue. Where the job does not fit even with their charge
+returned, an eviction cannot make room the fit counts, so the retained weights stay and the dispatch goes to the
+measured admission gate directly. The gate charges only *sibling* residents, because a
 cross-model dispatch onto a retaining slot already evicts that slot's own weights ahead of its
 `START_INFERENCE`; the two paths act on disjoint slots and never ask for the same weights twice.
 

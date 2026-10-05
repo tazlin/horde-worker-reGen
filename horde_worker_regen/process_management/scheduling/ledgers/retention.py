@@ -136,6 +136,18 @@ class RetentionFit:
         """Whether the peak plus the noise buffer fits in what the card has left."""
         return self.predicted_mb is None or (self.predicted_mb + self.noise_mb) <= self.effective_available_mb
 
+    @property
+    def retained_residents_decide(self) -> bool:
+        """Whether the retained residents alone turn this fit from granted to denied.
+
+        True when the peak does not fit with them charged and does fit with their charge returned, which is the
+        only case where evicting them can make room. When the fit fails either way, an eviction cannot make it pass
+        and the evicted weights are reloaded later for nothing.
+        """
+        if self.predicted_mb is None or self.granted:
+            return False
+        return (self.predicted_mb + self.noise_mb) <= self.effective_available_mb + self.retained_resident_mb
+
     def describe(self) -> str:
         """The gate figures for a log line."""
         retained = f", retained residents {self.retained_resident_mb:.0f}MB" if self.retained_resident_mb > 0 else ""
@@ -199,16 +211,30 @@ def idle_lane_component_charges_mb(
     target_id: int,
     device_index: int | None,
 ) -> float:
-    """VRAM (MB) idle lanes report holding in their component caches between jobs.
+    """VRAM (MB) idle lanes holding component caches occupy on the card between jobs.
 
-    Read from what each lane reports rather than predicted, since a cache's contents are the lane's own history.
-    A lane mid-stage is priced by that stage's own admission and is not charged again here.
+    Each such lane is charged its measured allocator reservation. A cache entry may sit in host RAM, where it
+    costs the card nothing, and entries held on the device are inside that reservation, so the reservation is the
+    device figure wherever the cache is placed. The entries' ``approx_ram_mb`` is a host RAM estimate and stands
+    in only until the lane's first memory report, the conservative figure before anything is measured. A lane
+    mid-stage is priced by that stage's own admission. A lane holding a retained resident is charged by
+    :func:`retained_resident_charges_mb`, and its reservation contains those same weights, so it is skipped here.
     """
     return sum(
-        sum(max(0.0, held.approx_ram_mb) for held in p.held_components)
+        _held_component_device_mb(p)
         for p in processes
-        if p.process_id != target_id and _on_card(p, device_index) and not p.is_process_busy() and p.held_components
+        if p.process_id != target_id
+        and _on_card(p, device_index)
+        and not p.is_process_busy()
+        and p.retained_resident_model is None
+        and p.held_components
     )
+
+
+def _held_component_device_mb(process_info: HordeProcessInfo) -> float:
+    if process_info.process_reserved_mb is not None:
+        return max(0.0, float(process_info.process_reserved_mb))
+    return sum(max(0.0, held.approx_ram_mb) for held in process_info.held_components or ())
 
 
 _CONTEXT_HOLDING_TYPES = frozenset(

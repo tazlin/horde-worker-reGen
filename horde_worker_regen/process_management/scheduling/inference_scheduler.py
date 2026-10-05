@@ -9458,6 +9458,23 @@ class InferenceScheduler:
         may not race. None when the fit cannot be judged on evidence (budget off, no reported total, an
         unpriceable tenant, or no peak estimate); callers treat None as no verdict.
         """
+        fit = self._judged_retention_fit(
+            job,
+            target=target,
+            device_index=device_index,
+            include_target_retained=include_target_retained,
+        )
+        return None if fit is None else fit.granted
+
+    def _judged_retention_fit(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        target: HordeProcessInfo,
+        device_index: int | None,
+        include_target_retained: bool,
+    ) -> RetentionFit | None:
+        """The retention fit for loading ``job`` onto ``target``, or None when it cannot be judged on evidence."""
         if job.model is None or not self._budget_active():
             return None
         fit = self._retention_fit(
@@ -9468,7 +9485,7 @@ class InferenceScheduler:
         )
         if isinstance(fit, RetentionUnpriceable) or fit.predicted_mb is None:
             return None
-        return fit.granted
+        return fit
 
     def _retention_static_charges_mb(
         self,
@@ -9483,9 +9500,10 @@ class InferenceScheduler:
         Four of the worker's own tenants share the card with retained weights yet are invisible to the peak
         estimate and to the committed ledger at grant time (the standing foreign floor is the fit's fifth charge,
         taken in :meth:`_retention_fit`): sibling CUDA contexts (charged at the measured marginal per-context cost;
-        unpriceable when contexts exist but none has been measured), idle lanes' held component caches, the part of
-        a concurrently cleared sibling's materialisation the ledger does not yet carry, and the job's own
-        post-processing chain, which runs while the weights are held and enters the ledger one dispatch too late.
+        unpriceable when contexts exist but none has been measured), idle lanes' held component caches at their
+        measured device reservation, the part of a concurrently cleared sibling's materialisation the ledger does
+        not yet carry, and the job's own post-processing chain, which runs while the weights are held and enters
+        the ledger one dispatch too late.
         """
         charges_mb = 0.0
         sibling_contexts = sibling_context_count(
@@ -9615,8 +9633,8 @@ class InferenceScheduler:
         """Whether this dispatch must wait for sibling retained weights to leave the card before it loads.
 
         Weights another slot holds across jobs are as real a tenant as a sampling peak, and nothing else in the
-        dispatch path prices them. Where the load does not fit beside them the idle ones are evicted through the
-        reclaim actuator and the dispatch holds until the child's own reports evidence the room is back: the
+        dispatch path prices them. Where the load fits only once they are gone, the idle ones are evicted through
+        the reclaim actuator and the dispatch holds until the child's own reports evidence the room is back: the
         residency tracking clears the moment the unload is sent, so a dispatch trusting it would load into memory
         still occupied by the copy it asked for back. The slot's own retained weights are not charged, since a
         cross-model dispatch onto it is evicted ahead of START_INFERENCE by
@@ -9646,7 +9664,9 @@ class InferenceScheduler:
 
         The condition :meth:`_retained_resident_dispatch_holds` acts on, without the actuation, so the stall
         diagnostic can name the wait without evicting anything. A dispatch onto the slot that already retains this
-        model loads nothing and is never held.
+        model loads nothing and is never held. The hold applies only when the retained residents decide the fit.
+        Where the load does not fit even with their charge returned, evicting them cannot make it fit, so the
+        weights stay and the dispatch stands on the measured admission gate.
         """
         model = next_job.model
         if model is None:
@@ -9662,15 +9682,13 @@ class InferenceScheduler:
             device_index=device_index,
         ):
             return False
-        return (
-            self._fits_beside_retained_residents(
-                next_job,
-                target=process_with_model,
-                device_index=device_index,
-                include_target_retained=False,
-            )
-            is False
+        fit = self._judged_retention_fit(
+            next_job,
+            target=process_with_model,
+            device_index=device_index,
+            include_target_retained=False,
         )
+        return fit is not None and fit.retained_residents_decide
 
     def _note_retention_dispatch_hold(self, next_job: ImageGenerateJobPopResponse, *, reclaiming: bool) -> None:
         """Disclose (throttled) that a dispatch is waiting for retained weights to come back off the card."""
