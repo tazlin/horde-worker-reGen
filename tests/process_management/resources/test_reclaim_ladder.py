@@ -887,6 +887,61 @@ class TestStarvedHeadLanePauseObligation:
         assert actuator.calls == [("restore_pp", None)]
         assert engine.episode_holds_paused_lane(0) is False
 
+    def test_a_lane_pause_holds_while_its_clearance_waiter_is_staged(self) -> None:
+        """A lane paused for a staged clearance waiter is not restarted while that waiter is still waiting.
+
+        A staged waiter counts as inference in progress, so no head reads as parked and the caller reports the
+        lane ready; the freed context is what makes the card read HEALTHY. Restarts across the run are bounded
+        by the number of distinct waiters served: one waiter, at most one restart, and only after it cleared.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        waiting = {"job-a"}
+        for _ in range(3):
+            engine.record_lane_pause(
+                0,
+                ReclaimRungKind.PAUSE_PP_LANE,
+                tenant_label="post_process_lane",
+                promised_mb=487.0,
+                beneficiary="job-a",
+            )
+            engine.on_tick(
+                0,
+                saturated=False,
+                healthy=True,
+                device_free_mb=9000.0,
+                actuator=actuator,
+                ladder_builder=tuple,
+                lane_restore_ready=True,
+                lane_beneficiary_waiting=waiting.__contains__,
+            )
+            assert actuator.calls == [], "lane restarted while the waiter its pause served is still staged"
+            assert engine.episode_holds_paused_lane(0) is True
+
+    def test_a_lane_paused_for_a_waiter_is_restored_once_the_waiter_starts(self) -> None:
+        """Once the waiter the pause served is admitted, the next HEALTHY sample restores the lane, exactly once."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        waiting = {"job-a"}
+        engine.record_lane_pause(
+            0, ReclaimRungKind.PAUSE_PP_LANE, tenant_label="post_process_lane", promised_mb=487.0, beneficiary="job-a"
+        )
+        tick = {
+            "saturated": False,
+            "healthy": True,
+            "device_free_mb": 9000.0,
+            "actuator": actuator,
+            "ladder_builder": tuple,
+            "lane_beneficiary_waiting": waiting.__contains__,
+        }
+        engine.on_tick(0, **tick)
+        assert actuator.calls == []
+        waiting.clear()
+        engine.on_tick(0, **tick)
+        engine.on_tick(0, **tick)
+        assert actuator.calls == [("restore_pp", None)]
+        assert engine.episode_holds_paused_lane(0) is False
+
     def test_a_non_lane_kind_is_never_booked(self) -> None:
         """Only lane-pause rungs have a restore to book; anything else is ignored."""
         engine = VerifiedReclaimLadder()

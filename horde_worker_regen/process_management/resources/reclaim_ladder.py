@@ -515,6 +515,8 @@ class _Episode:
     restore_obligations: list[RestoreObligation] = field(default_factory=list)
     retention_logged: bool = False
     """Whether this episode has already disclosed that a refused restore left it holding a debt."""
+    lane_pause_beneficiaries: dict[ReclaimRungKind, set[str]] = field(default_factory=dict)
+    """Per booked lane pause, the ids of the jobs it was taken for; the restore waits until none still waits."""
 
     def reset_ladder_progress(self) -> None:
         """Drop this episode's ladder, cursor, pending rung and outcome, keeping only what it still owes.
@@ -560,6 +562,7 @@ class VerifiedReclaimLadder:
         ladder_builder: Callable[[], tuple[ReclaimRung, ...]],
         context_restore_ready: bool = True,
         lane_restore_ready: bool = True,
+        lane_beneficiary_waiting: Callable[[str], bool] | None = None,
         now: float | None = None,
     ) -> None:
         """Advance the reclaim episode for one card by one governor sample.
@@ -603,6 +606,11 @@ class VerifiedReclaimLadder:
                 head is still parked re-adds the context the pause removed, and the next cycle pauses it again,
                 a stop and a cold start per cycle with the queue served by nobody. The caller supplies the
                 evidence that no head is parked behind the pause.
+            lane_beneficiary_waiting: Whether the job a lane pause was booked for is still waiting to be
+                admitted. A staged clearance waiter counts as inference in progress, so no head reads as
+                parked, and the context the pause freed is what makes the card read HEALTHY; neither reading
+                says the waiter has been served. A pause with a recorded beneficiary is held while this
+                returns True for it. ``None`` treats every beneficiary as served.
             now: The monotonic-scale instant of this sample, which every verification budget and the safety
                 rung's cooldown are measured on. Defaults to :func:`time.monotonic`; a caller that drives the
                 control loop on its own clock passes that clock so the budgets are measured on the same
@@ -621,6 +629,7 @@ class VerifiedReclaimLadder:
                         actuator,
                         context_restore_ready=context_restore_ready,
                         lane_restore_ready=lane_restore_ready,
+                        lane_beneficiary_waiting=lane_beneficiary_waiting,
                     ):
                         self._episodes.pop(key, None)
                         continue
@@ -675,6 +684,7 @@ class VerifiedReclaimLadder:
         *,
         tenant_label: str,
         promised_mb: float,
+        beneficiary: str | None = None,
     ) -> None:
         """Book a lane pause the per-cycle admission path issued for a starved head as a restore obligation.
 
@@ -689,6 +699,8 @@ class VerifiedReclaimLadder:
             kind: The lane-pause rung kind that was actuated.
             tenant_label: The lane name for the restore log line.
             promised_mb: What the pause was expected to return (MB), for the same line.
+            beneficiary: The id of the job the pause was taken for. The restore waits until the caller's
+                ``lane_beneficiary_waiting`` reports every recorded beneficiary served or gone.
         """
         if kind not in LANE_PAUSE_RUNG_KINDS:
             return
@@ -696,6 +708,8 @@ class VerifiedReclaimLadder:
         if episode is None:
             episode = _Episode()
             self._episodes[device_index] = episode
+        if beneficiary is not None:
+            episode.lane_pause_beneficiaries.setdefault(kind, set()).add(beneficiary)
         for obligation in episode.restore_obligations:
             if isinstance(obligation, ReclaimRung) and obligation.kind is kind:
                 return
@@ -910,6 +924,7 @@ class VerifiedReclaimLadder:
         *,
         context_restore_ready: bool = True,
         lane_restore_ready: bool = True,
+        lane_beneficiary_waiting: Callable[[str], bool] | None = None,
     ) -> bool:
         """Undo everything this episode owes the card, in reverse order of the actions taken (LIFO unwind).
 
@@ -936,8 +951,15 @@ class VerifiedReclaimLadder:
             if isinstance(obligation, ReclaimRung) and not lane_restore_ready:
                 retained.append(obligation)
                 continue
+            if isinstance(obligation, ReclaimRung) and lane_beneficiary_waiting is not None:
+                beneficiaries = episode.lane_pause_beneficiaries.get(obligation.kind, set())
+                if any(lane_beneficiary_waiting(job_id) for job_id in beneficiaries):
+                    retained.append(obligation)
+                    continue
             if not unwind_restore_obligation(obligation, actuator):
                 retained.append(obligation)
+            elif isinstance(obligation, ReclaimRung):
+                episode.lane_pause_beneficiaries.pop(obligation.kind, None)
         retained.reverse()
         episode.restore_obligations[:] = retained
         if not retained:

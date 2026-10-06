@@ -164,6 +164,15 @@ the one loan), and returned once no job has been actively post-processed for a b
 jobs remain queued. A loan released this way is not re-borrowed for the same stalled episode (so the lane is
 not thrashed), and re-borrowing is re-enabled once the queue fully drains.
 
+A pause the scheduler books for a job that cannot be admitted records that job as its **beneficiary**
+(`ReclaimLadder.record_lane_pause`). The ladder restores the lane only once every recorded beneficiary has
+started sampling or left the queue (`InferenceScheduler.job_awaits_admission`), as well as the card reading
+`HEALTHY` and no head being parked. Neither of those two readings alone says the job was served: a job staged
+on its lane waiting for clearance counts as inference in progress, so no head reads as parked, and the context
+the pause returned is what makes the card read `HEALTHY`. Restoring on them would restart the lane in the same
+second and pay a cold start for no gain. A saturation-episode pause has no beneficiary and is restored as
+before.
+
 Behind both owners sits a conservative **self-heal backstop** in the parent's governor tick: a reclaim-ladder
 lane pause that no live saturation episode and no PP-borrow receipt still claims is restored once the card has
 been governor-`HEALTHY` for a debounced interval, with a WARNING naming what was stranded. It never lifts a

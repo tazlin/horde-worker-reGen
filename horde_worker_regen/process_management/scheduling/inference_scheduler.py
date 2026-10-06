@@ -6898,7 +6898,9 @@ class InferenceScheduler:
                 max_resident=max_resident,
             ),
         )
-        self._book_starved_head_lane_pauses(applied_actuations, device_index=target_device_index)
+        self._book_starved_head_lane_pauses(
+            applied_actuations, device_index=target_device_index, beneficiary=str(job.id_)
+        )
         return False
 
     def _mark_measured_attempt(
@@ -7290,6 +7292,7 @@ class InferenceScheduler:
         applied: tuple[ActuatorCommand, ...],
         *,
         device_index: int | None,
+        beneficiary: str,
     ) -> None:
         """Book each lane pause the head path just actuated as a reclaim-ladder restore obligation.
 
@@ -7308,6 +7311,7 @@ class InferenceScheduler:
                     tenant_label="post_process_lane",
                     promised_mb=self._marginal_process_overhead_mb(device_index)
                     or _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
+                    beneficiary=beneficiary,
                 )
             elif command.kind is ActuatorCommandKind.PAUSE_UTILITIES_LANE:
                 self._reclaim_ladder.record_lane_pause(
@@ -7316,6 +7320,7 @@ class InferenceScheduler:
                     tenant_label="utilities_lane",
                     promised_mb=self._marginal_process_overhead_mb(device_index)
                     or _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
+                    beneficiary=beneficiary,
                 )
 
     def release_cache(self, process_id: int) -> bool:
@@ -11336,7 +11341,7 @@ class InferenceScheduler:
                 max_resident=priced.max_resident,
             ),
         )
-        self._book_starved_head_lane_pauses(applied, device_index=priced.device_index)
+        self._book_starved_head_lane_pauses(applied, device_index=priced.device_index, beneficiary=str(job.id_))
         return applied
 
     def head_of_queue_is_parked(self) -> bool:
@@ -11353,6 +11358,23 @@ class InferenceScheduler:
         if head is None:
             return False
         return self._head_starved_seconds(head) >= DISPATCH_STALL_MIN_SECONDS
+
+    def job_awaits_admission(self, job_id: str) -> bool:
+        """Whether a queued job is still waiting to start sampling: undispatched, or staged and not yet stepping.
+
+        The restore evidence for a lane pause booked for this job. It reads the job's own place in the queue and
+        on its slot, never the card's free memory, which the pause itself changed. A staged lane counts as
+        waiting in every state short of sampling: a job sent with its preload leaves the child reporting the
+        preload's states before it primes.
+        """
+        for job in self._job_tracker.jobs_pending_inference:
+            if str(job.id_) != job_id:
+                continue
+            process_info = self._process_map.process_running_job(job)
+            if process_info is None:
+                return True
+            return process_info.last_process_state != HordeProcessState.INFERENCE_STARTING
+        return False
 
     def latest_affinity_skips(self) -> int:
         """Return the committed affinity line-skips the currently-tracked displaced head has taken (visibility)."""

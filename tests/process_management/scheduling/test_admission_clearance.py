@@ -341,3 +341,28 @@ async def test_a_dispatched_job_is_never_timed_by_the_head_clock() -> None:
 
     scheduler.reconcile_head_starvation()
     assert head_admission.starvation_job_id is None
+
+
+async def test_a_job_awaits_admission_until_its_lane_samples() -> None:
+    """A lane pause's beneficiary reads as waiting while queued or staged, and as served once it samples.
+
+    The restore evidence must not read the card: the context the pause freed is what makes the card healthy.
+    """
+    job_tracker = JobTracker()
+    job = make_job_pop_response("stable_diffusion")
+    await track_popped_job_async(job_tracker, job)
+    lane = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.WAITING_FOR_JOB)
+    scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}), job_tracker=job_tracker)
+    job_id = str(job.id_)
+
+    assert scheduler.job_awaits_admission(job_id) is True
+
+    await mark_job_in_progress_async(job_tracker, job)
+    lane.record_inference_ownership(job, attempt_ordinal=1)
+    for staged_state in (HordeProcessState.PRELOADED_MODEL, HordeProcessState.INFERENCE_PRIMED):
+        lane.last_process_state = staged_state
+        assert scheduler.job_awaits_admission(job_id) is True
+
+    lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+    assert scheduler.job_awaits_admission(job_id) is False
+    assert scheduler.job_awaits_admission("no-such-job") is False
