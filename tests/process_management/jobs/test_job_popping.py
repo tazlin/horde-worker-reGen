@@ -2576,6 +2576,21 @@ class TestIdleFillLadderShaping:
         assert low == {"sd15a"}
         assert "fluxA" not in high
 
+    def test_each_offer_is_logged_in_the_registered_shape(self) -> None:
+        """The offer line `horde-log` reads is emitted per rung with the rung, its count and the cap."""
+        from horde_worker_regen.analysis.log_signatures import pattern_for
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
+        try:
+            self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 2)
+        finally:
+            logger.remove(sink_id)
+        matches = [m for message in messages if (m := pattern_for("idle_fill_offer").search(message))]
+        assert len(matches) == 1
+        assert (matches[0]["rung"], matches[0]["rungs"], matches[0]["models"]) == ("3", "4", "2")
+        assert int(matches[0]["max_power"]) == _SMALL_CAP
+
     def test_metadata_none_falls_back_to_flat_small(self) -> None:
         """When the popper has no model metadata, the rung logic cannot narrow by baseline.
 

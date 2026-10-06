@@ -3096,6 +3096,69 @@ class TestIdleFillOfferStuck:
         assert "idle_fill_offer_stuck" not in _diagnose(tmp_path, log)
 
 
+def _advertised(clock: str, count: int) -> str:
+    return f"{clock} | DEBUG | x:y:1 - Advertising models in pop request: {count} (sha256:62b2abe2b0c9) sample=[]"
+
+
+def _empty_pop(clock: str, models_skipped: int) -> str:
+    return (
+        f"{clock} | INFO | x:y:1 - No job available. (Skipped reasons: {{'models': {models_skipped}, "
+        "'worker_id': 1, 'max_pixels': 46}})"
+    )
+
+
+class TestIdleFillOfferStuckFromAdvertisedOffer:
+    """A log without arm lines is read from the advertised offer and the horde's `models` skips."""
+
+    def test_a_narrowed_offer_with_models_skips_fires(self, tmp_path: Path) -> None:
+        """One of 109 models offered from 13:02 to the session end at 13:10, while the horde skipped jobs."""
+        log = _o2_log(
+            _advertised("13:01:00.000", 109),
+            _advertised("13:02:00.000", 1),
+            _empty_pop("13:05:00.000", 154),
+            "13:10:00.000 | INFO | x:y:1 - Status",
+        )
+        finding = _diagnose(tmp_path, log)["idle_fill_offer_stuck"]
+        assert finding.severity is Severity.CRITICAL
+        assert finding.headline == "The worker asked for 1 of 109 models for 8 minutes."
+        assert "still narrowed at the session end" in finding.evidence
+        assert any("horde skipped 154 job(s) for models" in line for line in finding.evidence)
+
+    def test_a_narrowed_offer_that_widens_within_seconds_does_not_fire(self, tmp_path: Path) -> None:
+        """The ladder's rungs narrow the offer for seconds at a time; that is the breaker working."""
+        log = _o2_log(
+            _advertised("13:01:00.000", 109),
+            _advertised("13:02:00.000", 2),
+            _empty_pop("13:02:03.000", 20),
+            _advertised("13:02:10.000", 108),
+            "13:30:00.000 | INFO | x:y:1 - Status",
+        )
+        assert "idle_fill_offer_stuck" not in _diagnose(tmp_path, log)
+
+    def test_a_narrowed_offer_the_horde_had_no_work_for_does_not_fire(self, tmp_path: Path) -> None:
+        """Without `models` skips the narrowed offer turned nothing away."""
+        log = _o2_log(
+            _advertised("13:01:00.000", 109),
+            _advertised("13:02:00.000", 1),
+            _empty_pop("13:05:00.000", 0),
+            "13:10:00.000 | INFO | x:y:1 - Status",
+        )
+        assert "idle_fill_offer_stuck" not in _diagnose(tmp_path, log)
+
+    def test_the_arm_finding_carries_the_advertised_offer(self, tmp_path: Path) -> None:
+        """When both line kinds exist the arm is the finding and the offer is its evidence."""
+        log = _o2_log(
+            _advertised("13:00:30.000", 109),
+            _ARMED,
+            _advertised("13:01:01.000", 3),
+            _OFFER,
+            "13:06:00.000 | INFO | x:y:1 - Status",
+        )
+        finding = _diagnose(tmp_path, log)["idle_fill_offer_stuck"]
+        assert finding.headline == "The worker asked for fewer models for 5 minutes with 3 models offered."
+        assert any("narrowed to 3 of 109 models" in line for line in finding.evidence)
+
+
 def _lane_pair(minute: int, restart_seconds: int) -> tuple[str, str]:
     """A reclaim-ladder stop of the post-processing lane at ``minute`` and its restart ``restart_seconds`` later."""
     return (

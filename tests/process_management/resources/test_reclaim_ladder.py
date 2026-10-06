@@ -918,6 +918,37 @@ class TestStarvedHeadLanePauseObligation:
             assert actuator.calls == [], "lane restarted while the waiter its pause served is still staged"
             assert engine.episode_holds_paused_lane(0) is True
 
+    def test_a_held_lane_pause_is_logged_once_in_the_registered_shape(self) -> None:
+        """The hold line `horde-log` reads names the lane and the waiter, once per pause however many ticks hold."""
+        from loguru import logger
+
+        from horde_worker_regen.analysis.log_signatures import pattern_for
+
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        engine.record_lane_pause(
+            0, ReclaimRungKind.PAUSE_PP_LANE, tenant_label="post_process_lane", promised_mb=487.0, beneficiary="job-a"
+        )
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
+        try:
+            for _ in range(3):
+                engine.on_tick(
+                    0,
+                    saturated=False,
+                    healthy=True,
+                    device_free_mb=9000.0,
+                    actuator=actuator,
+                    ladder_builder=tuple,
+                    lane_restore_ready=True,
+                    lane_beneficiary_waiting={"job-a"}.__contains__,
+                )
+        finally:
+            logger.remove(sink_id)
+        matches = [m for message in messages if (m := pattern_for("reclaim_lane_hold").search(message))]
+        assert len(matches) == 1
+        assert (matches[0]["lane"], matches[0]["job_id"]) == ("post-processing", "job-a")
+
     def test_a_lane_paused_for_a_waiter_is_restored_once_the_waiter_starts(self) -> None:
         """Once the waiter the pause served is admitted, the next HEALTHY sample restores the lane, exactly once."""
         engine = VerifiedReclaimLadder()

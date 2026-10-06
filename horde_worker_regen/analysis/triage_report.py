@@ -154,7 +154,8 @@ def _session_listing_lines(sessions: list[WorkerSession]) -> list[str]:
         )
         models = session.num_models if session.num_models is not None else "?"
         threads = session.max_threads if session.max_threads is not None else "?"
-        lines.append(f"    dreamer: {session.dreamer_name or '?'} | models: {models} | threads: {threads}")
+        hordelib = f" | hordelib: {session.hordelib}" if session.hordelib else ""
+        lines.append(f"    dreamer: {session.dreamer_name or '?'} | models: {models} | threads: {threads}{hordelib}")
         note = _start_bound_note(session)
         if note:
             lines.append(note)

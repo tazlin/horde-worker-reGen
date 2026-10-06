@@ -951,24 +951,96 @@ def detect_post_processing_offer_withheld(context: SessionContext) -> list[Findi
 _IDLE_FILL_ARMED_RE = pattern_for("idle_fill_armed")
 _IDLE_FILL_DISARMED_RE = pattern_for("idle_fill_disarmed")
 _IDLE_FILL_OFFER_RE = pattern_for("idle_fill_offer")
+_ADVERTISED_MODELS_RE = pattern_for("advertised_models")
+_NO_JOB_AVAILABLE_RE = pattern_for("no_job_available")
+_MODELS_SKIP_RE = pattern_for("models_skip_count")
 
 # The breaker arms after a head job waits `idle_fill_threshold_seconds` (5 by default) and disarms as soon as
 # the head dispatches, so a healthy arm lasts seconds. One that outlives this many minutes kept the offer
 # narrowed through many pop cycles.
 _IDLE_FILL_STUCK_SECONDS = 180.0
 
+# An offer under this share of the session's widest is a narrowed one. The ladder's rungs offer a handful of
+# models out of a full catalogue; a worker serving two or three models never narrows by this much.
+_NARROW_OFFER_FRACTION = 0.5
+
+
+@dataclass(frozen=True)
+class _NarrowOffer:
+    """A stretch the pop offer stayed narrowed, read from the advertised-models lines alone."""
+
+    opened: LogRecord
+    closed: LogRecord | None
+    seconds: float
+    models: int
+    widest: int
+    models_skipped: int | None
+    """The horde's `models` skip count on the last empty pop in the stretch: jobs it had that this offer excluded."""
+
+
+def _longest_narrow_offer(records: list[LogRecord], session_end: datetime) -> _NarrowOffer | None:
+    """The longest stretch the advertised offer stayed under half the session's widest, or None.
+
+    The advertised line is edge-triggered on the offered set, so a stretch runs from a narrow line to the next
+    wide one or the session end. Empty pops inside it carry the horde's skip counts.
+    """
+    offers = [(r, int(m["models"])) for r in records if (m := _ADVERTISED_MODELS_RE.search(r.message))]
+    if not offers:
+        return None
+    widest = max(count for _, count in offers)
+    stretches: list[_NarrowOffer] = []
+    opened: LogRecord | None = None
+    narrow_models = 0
+    skipped: int | None = None
+
+    def _close(closed: LogRecord | None) -> None:
+        assert opened is not None and opened.timestamp is not None
+        closed_at = closed.timestamp if closed is not None and closed.timestamp else session_end
+        seconds = (closed_at - opened.timestamp).total_seconds()
+        stretches.append(_NarrowOffer(opened, closed, seconds, narrow_models, widest, skipped))
+
+    for record in records:
+        if match := _ADVERTISED_MODELS_RE.search(record.message):
+            count = int(match["models"])
+            if count < widest * _NARROW_OFFER_FRACTION:
+                if opened is None:
+                    opened, narrow_models, skipped = record, count, None
+            elif opened is not None:
+                _close(record)
+                opened = None
+        elif opened is not None and (match := _NO_JOB_AVAILABLE_RE.search(record.message)):
+            skip = _MODELS_SKIP_RE.search(match["reasons"])
+            skipped = int(skip["count"]) if skip else 0
+    if opened is not None:
+        _close(None)
+    return max(stretches, key=lambda s: s.seconds, default=None)
+
 
 def detect_idle_fill_offer_stuck(context: SessionContext) -> list[Finding]:
     """The idle-fill breaker armed and stayed armed for minutes, narrowing the pop offer.
 
     An arm is closed by the next disarm line; one still open at the session end runs to it. The last ladder
-    offer line inside the longest arm says how narrow the offer was.
+    offer line inside the longest arm says how narrow the offer was. A log without arm lines (a worker that
+    predates them) is read from the advertised offer instead: a narrowed offer that lasted as long while the
+    horde reported jobs skipped for `models` is the same defect seen from the pop side.
     """
     start, end = context.session.start_ts, context.session.end_ts
     records = [r for r in _records_in_window(context.session.records, start, end) if r.timestamp is not None]
     if not records:
         return []
     session_end = end or records[-1].timestamp
+    assert session_end is not None
+    narrow = _longest_narrow_offer(records, session_end)
+    narrow_evidence = (
+        f"advertised offer narrowed to {narrow.models} of {narrow.widest} models for {_span_text(narrow.seconds)}"
+        + (
+            f", horde skipped {narrow.models_skipped} job(s) for models on its last empty pop"
+            if narrow.models_skipped
+            else ""
+        )
+        if narrow is not None
+        else None
+    )
     arms: list[tuple[LogRecord, LogRecord | None, LogRecord | None]] = []
     armed: LogRecord | None = None
     last_offer: LogRecord | None = None
@@ -990,7 +1062,31 @@ def detect_idle_fill_offer_stuck(context: SessionContext) -> list[Finding]:
 
     stuck = [arm for arm in arms if _arm_seconds(arm) >= _IDLE_FILL_STUCK_SECONDS]
     if not stuck:
-        return []
+        if (
+            arms
+            or narrow is None
+            or narrow.seconds < _IDLE_FILL_STUCK_SECONDS
+            or not narrow.models_skipped
+            or narrow_evidence is None
+        ):
+            return []
+        return [
+            Finding(
+                kind=FindingKind.IDLE_FILL_OFFER_STUCK,
+                severity=Severity.CRITICAL,
+                headline=(
+                    f"The worker asked for {narrow.models} of {narrow.widest} models for {_span_text(narrow.seconds)}."
+                ),
+                evidence=[
+                    f"narrowed: {_evidence(narrow.opened)}",
+                    f"widened: {_evidence(narrow.closed)}"
+                    if narrow.closed is not None
+                    else "still narrowed at the session end",
+                    narrow_evidence,
+                    "no idle-fill arm lines in this log; read from the advertised offer",
+                ],
+            ),
+        ]
     longest = max(stuck, key=_arm_seconds)
     opened, closed, offer = longest
     offer_match = _IDLE_FILL_OFFER_RE.search(offer.message) if offer is not None else None
@@ -999,6 +1095,7 @@ def detect_idle_fill_offer_stuck(context: SessionContext) -> list[Finding]:
         f"disarmed: {_evidence(closed)}" if closed is not None else "still armed at the session end",
         f"last offer: {_evidence(offer)}" if offer is not None else "no offer line while armed",
         f"{len(stuck)} of {len(arms)} arm(s) lasted {_IDLE_FILL_STUCK_SECONDS / 60:.0f} minutes or more",
+        *([narrow_evidence] if narrow_evidence is not None else []),
     ]
     models_text = f" with {offer_match['models']} models offered" if offer_match is not None else ""
     return [
@@ -3475,6 +3572,7 @@ def detect_session_summary(context: SessionContext) -> list[Finding]:
                 f"Version v{session.version or '?'}, {session.num_models or '?'} models, "
                 f"{session.max_threads or '?'} threads.",
             ]
+            + ([f"hordelib {session.hordelib}."] if session.hordelib else [])
             # A parent log rotates by size mid-run, so which archives were read decides the span every
             # figure above is measured over. Naming them keeps that attributable.
             + (

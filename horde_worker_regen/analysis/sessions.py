@@ -34,6 +34,7 @@ from .log_signatures import pattern_for
 
 _VERSION_RE = re.compile(r"\(v(?P<version>[^)]+)\)")
 _RECOVERIES_RE = re.compile(r"process_recoveries: (?P<count>\d+)")
+_HORDELIB_IDENTITY_RE = pattern_for("hordelib_identity")
 
 # The main process logs this exactly once, as its very first line, before any model loading or the
 # process-manager init banner. It is the most accurate session boundary because it does not let a new
@@ -76,6 +77,8 @@ class WorkerSession:
     index: int
     records: list[LogRecord] = field(default_factory=list)
     version: str | None = None
+    hordelib: str | None = None
+    """The run's hordelib version and source (``7.9.0 (editable hordelib gc3202bd0.modified)``), if logged."""
     dreamer_name: str | None = None
     num_models: int | None = None
     max_threads: int | None = None
@@ -234,6 +237,9 @@ def _populate_session(session: WorkerSession, *, is_last: bool) -> None:
             version = _VERSION_RE.search(record.message)
             if version is not None:
                 session.version = version.group("version")
+        hordelib = _HORDELIB_IDENTITY_RE.search(record.message)
+        if hordelib is not None:
+            session.hordelib = f"{hordelib.group('version')} ({hordelib.group('source')})"
         recoveries = _RECOVERIES_RE.search(record.message)
         if recoveries is not None:
             session.peak_process_recoveries = max(session.peak_process_recoveries, int(recoveries.group("count")))

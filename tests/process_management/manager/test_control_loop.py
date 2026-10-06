@@ -91,6 +91,32 @@ class TestControlLoopTick:
         assert process_manager._state.wants_idle_fill_candidate is False
         assert process_manager._state.idle_fill_rung == 0
 
+    async def test_tick_releases_the_ownership_of_a_job_that_ended_without_a_result(self) -> None:
+        """A lane owning an attempt for a job the tracker no longer holds is released, with the registered line."""
+        from loguru import logger
+
+        from horde_worker_regen.analysis.log_signatures import pattern_for
+
+        process_manager = _make_tickable_manager()
+        lane = make_mock_process_info(3, model_name="stable_diffusion", state=HordeProcessState.INFERENCE_STARTING)
+        process_manager._process_map.update({3: lane})
+        job = make_job_pop_response("stable_diffusion")
+        lane.record_inference_ownership(job, attempt_ordinal=0)
+        assert lane.inference_ownership is not None
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
+        try:
+            assert await process_manager._control_loop_tick() is True
+        finally:
+            logger.remove(sink_id)
+
+        assert lane.inference_ownership is None
+        matches = [m for message in messages if (m := pattern_for("ended_job_ownership_released").search(message))]
+        assert len(matches) == 1
+        assert matches[0]["process"] == "3"
+        assert matches[0]["job_id"] == str(job.id_)
+
     async def test_shutdown_keeps_inference_processes_up_while_queue_remains(self) -> None:
         """During a drain, inference processes are not ended while queued inference work remains.
 

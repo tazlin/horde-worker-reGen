@@ -1407,6 +1407,26 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_IDLE_FILL_NOT_ARMED,
     ),
     _signature(
+        "advertised_models",
+        r"Advertising models in pop request: (?P<models>\d+) ",
+        emitter="process_management.jobs.job_popper:api_job_pop",
+        sample="Advertising models in pop request: 2 [\"'Anima-Turbo-v1.1'\", \"'Babes'\"]",
+    ),
+    _signature(
+        "no_job_available",
+        r"^No job available\. .*\(Skipped reasons: (?P<reasons>\{.*\})\)$",
+        emitter="process_management.jobs.job_popper:api_job_pop",
+        sample="No job available. (Skipped reasons: {'models': 157, 'worker_id': 1, 'max_pixels': 46})",
+    ),
+    _signature(
+        "models_skip_count",
+        r"'models': (?P<count>\d+)",
+        emitter="process_management.jobs.job_popper:api_job_pop",
+        sample="'models': 157",
+        field_of="no_job_available",
+        dry_run_reason="the dry-run harness's canned horde skips no job for the models offered",
+    ),
+    _signature(
         "service_lane_stopped",
         r"(?P<owner>Reclaim ladder|Whole-card residency[^:]*): stopping the (?P<lane>[\w-]+) lane to free its VRAM "
         r"context\.",

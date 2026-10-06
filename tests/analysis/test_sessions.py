@@ -23,7 +23,7 @@ from horde_worker_regen.analysis.triage_report import render_findings, render_se
 # via save-our-ship, the second is stopped by the operator.
 _LOG = """\
 2026-06-24 18:00:00.000 | DEBUG    | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process
-2026-06-24 18:00:05.000 | INFO     | horde_worker_regen.reporting.status_reporter:_print_worker_info:442 -   dreamer_name: tazlin-tui-example | (v12.28.0+dev.gabc.dirty) | horde user: Tazlin#6572 | num_models: 113 | custom_models: False | max_power: 32 (1024x1024) | max_threads: 1 | queue_size: 3 | safety_on_gpu: True
+2026-06-24 18:00:05.000 | INFO     | horde_worker_regen.reporting.status_reporter:_print_worker_info:442 -   dreamer_name: tazlin-tui-example | (v12.28.0+dev.gabc.dirty) | hordelib: 7.9.0 (editable hordelib gc3202bd0.modified) | horde user: Tazlin#6572 | num_models: 113 | custom_models: False | max_power: 32 (1024x1024) | max_threads: 1 | queue_size: 3 | safety_on_gpu: True
 2026-06-24 18:00:10.000 | INFO     | horde_worker_regen.reporting.status_reporter:_print_job_info:295 -   Session job info: ... | process_recoveries: 17 | 0.00 seconds without jobs
 2026-06-24 18:00:20.000 | CRITICAL | horde_worker_regen.process_management.process_manager:_give_up_on_wedged_jobs:2123 - Save-our-ship: the worker cannot restore a working process pool; abandoning ship
 2026-06-24 18:00:21.000 | WARNING  | horde_worker_regen.process_management.process_manager:_process_control_loop:2156 - Found .abort file; aborting immediately
@@ -53,6 +53,14 @@ class TestSegmentation:
         assert session.num_models == 113
         assert session.max_threads == 1
         assert session.version == "12.28.0+dev.gabc.dirty"
+        assert session.hordelib == "7.9.0 (editable hordelib gc3202bd0.modified)"
+        assert _sessions()[1].hordelib is None
+
+    def test_listing_names_the_hordelib(self) -> None:
+        """The session listing carries the hordelib identity when the run logged one."""
+        listing = render_sessions(_sessions(), root=Path("bridge.log"))
+        assert "threads: 1 | hordelib: 7.9.0 (editable hordelib gc3202bd0.modified)" in listing
+        assert listing.count("hordelib:") == 1
 
     def test_peak_recoveries_captured(self) -> None:
         """The peak process_recoveries count for the session is read from its status line."""
