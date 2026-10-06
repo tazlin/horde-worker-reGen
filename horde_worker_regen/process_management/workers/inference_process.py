@@ -45,6 +45,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeRestoreComponentsControlMessage,
     HordeSampleControlMessage,
     HordeSampleResultMessage,
+    HordeWarmInferenceModelMessage,
     ModelLoadState,
     PipelineStageTag,
     SamplerTruncationReport,
@@ -208,9 +209,14 @@ class HordeInferenceProcess(HordeProcess):
     """The SharedModelManager instance used by this process. It is not shared between processes (despite the name)."""
 
     _active_model_name: str | None = None
+    """The name of the currently active model. Note that other models may be loaded in RAM or VRAM."""
+    _active_model_diffusion_model_only: bool = False
+    """Whether the active model's preload asked for its diffusion model alone.
+
+    A warm repeats that request: the loader's cached entry only ever widens, so it serves the same subset as a hit,
+    while asking for a component the preload left out would be a miss that reloads the checkpoint from disk."""
     _pending_load_peak_bytes: int | None = None
     """Private-RAM peak of the load just completed, sent with the next memory report and then cleared."""
-    """The name of the currently active model. Note that other models may be loaded in RAM or VRAM."""
 
     def __init__(
         self,
@@ -810,6 +816,7 @@ class HordeInferenceProcess(HordeProcess):
 
         logger.info(f"Preloaded model {horde_model_name}")
         self._active_model_name = horde_model_name
+        self._active_model_diffusion_model_only = diffusion_model_only
         self._pending_load_peak_bytes = peak_sampler.peak_bytes
         self.on_horde_model_state_change(
             process_state=HordeProcessState.PRELOADED_MODEL,
@@ -819,6 +826,50 @@ class HordeInferenceProcess(HordeProcess):
         )
 
         self.send_memory_report_message(include_vram=True)
+
+    def warm_model(self, horde_model_name: str) -> None:
+        """Start re-reading the held model's checkpoint pages from disk, ahead of a dispatch.
+
+        The weights are views over the checkpoint file, so pages the host dropped while the lane idled would
+        otherwise be faulted in by the move into VRAM after the sampling lease is held. A preload request that hits
+        the loader's cache starts hordelib's asynchronous prefetch of the served components and returns, so the
+        child stays ``WAITING_FOR_JOB`` and reports no model state. The request repeats the last preload's
+        component subset; ``will_load_loras`` and seamless tiling do not key the cache.
+
+        A request naming another model, or arriving while a job runs, is stale and is dropped: the parent's next
+        dispatch or preload says what the lane does next. So is one for a checkpoint the component cache no
+        longer holds, since the loader would answer it with a cold load from disk.
+
+        Args:
+            horde_model_name (str): The model the parent believes this lane holds.
+        """
+        if self._active_model_name != horde_model_name or self._is_busy:
+            logger.debug(
+                f"Ignoring a warm of {horde_model_name}: the active model is {self._active_model_name} "
+                f"and the process is {'busy' if self._is_busy else 'idle'}",
+            )
+            return
+
+        if not self._dry_run_skip_inference:
+            from hordelib.api import ComponentSlotKind
+
+            held = self._collect_held_components()
+            checkpoint_held = held is not None and any(
+                component.kind == ComponentSlotKind.CHECKPOINT and component.identity == horde_model_name
+                for component in held
+            )
+            if not checkpoint_held:
+                logger.debug(f"Ignoring a warm of {horde_model_name}: its checkpoint is not in the component cache")
+                return
+            self._horde.preload_model(
+                horde_model_name,
+                will_load_loras=False,
+                seamless_tiling_enabled=False,
+                diffusion_model_only=self._active_model_diffusion_model_only,
+            )
+
+        logger.debug(f"Warming {horde_model_name}'s checkpoint pages ahead of a dispatch")
+        self.send_memory_report_message()
 
     _is_busy: bool = False
 
@@ -1658,6 +1709,8 @@ class HordeInferenceProcess(HordeProcess):
                 job_info=message.sdk_api_job_info,
                 diffusion_model_only=message.diffusion_model_only,
             )
+        elif isinstance(message, HordeWarmInferenceModelMessage):
+            self.warm_model(message.horde_model_name)
         elif isinstance(message, HordeSampleControlMessage):
             self._run_sample_stage(message)
         elif isinstance(message, HordeInferenceControlMessage):

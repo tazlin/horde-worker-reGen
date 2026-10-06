@@ -580,6 +580,11 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to download a model."""
     PRELOAD_MODEL = auto()
     """Signal the child process to preload a model."""
+    WARM_MODEL = auto()
+    """Names :class:`HordeWarmInferenceModelMessage` only.
+
+    The parent never records it as a slot's ``last_control_flag``: a warm changes no model or process state, so
+    nothing downstream may read the slot as acting on it."""
     PREFETCH_AUX_MODELS = auto()
     """Signal the dedicated download process to fetch a set of a popped job's LoRAs/TIs ahead of dispatch.
 
@@ -853,6 +858,18 @@ class HordePreloadInferenceModelMessage(HordeControlModelMessage):
 
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
+
+
+class HordeWarmInferenceModelMessage(HordeControlModelMessage):
+    """Ask an idle inference child to re-read the pages of the model it holds, ahead of a dispatch.
+
+    A held model's weights are views over its checkpoint file, and the host may drop those pages while the lane
+    idles. The child starts reading them back so the dispatch that follows does not wait on the disk. The warm
+    changes no model state and books nothing; a child that no longer holds the named model, or is busy, ignores
+    it.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.WARM_MODEL
 
 
 class HordeInferenceControlMessage(HordeControlModelMessage):

@@ -1105,3 +1105,144 @@ def preload_ram_stage_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: 
     if predicted is None:
         return 0.0
     return max(0.0, predicted - snapshot.queue.jobs[job_id].feature_ram_mb)
+
+
+# ---- the idle-lane warm
+
+
+STAGED_LANE_STATES: frozenset[HordeProcessState] = frozenset({HordeProcessState.INFERENCE_PRIMED})
+"""The states of a lane holding a job it has not started sampling: staged for clearance, or loading after it."""
+
+
+@dataclass(frozen=True)
+class IdleLaneWarm:
+    """Represents one warm request: an idle lane re-reading its held checkpoint's pages ahead of a pending job."""
+
+    process_id: int
+    model: str
+    job_id: str
+    """The pending job the warm is for; the scheduler sends at most one warm per (process, job) pair."""
+    room_mb: float
+    """The host RAM (MB) the warm was judged against: available memory less the protected checkpoints."""
+
+
+def _staged_lane_models(snapshot: SchedulingSnapshot) -> set[str]:
+    """The models of lanes that own a job they have not started sampling."""
+    models: set[str] = set()
+    for slot in snapshot.slots.values():
+        if slot.state not in STAGED_LANE_STATES or slot.current_job_id is None:
+            continue
+        job = snapshot.queue.jobs.get(slot.current_job_id)
+        model = job.model if job is not None and job.model is not None else slot.model
+        if model is not None:
+            models.add(model)
+    return models
+
+
+def _checkpoint_sizes_mb(snapshot: SchedulingSnapshot) -> dict[str, float]:
+    """Each queued or running model's whole-checkpoint staging charge (MB), where one is known."""
+    sizes: dict[str, float] = {}
+    for job in snapshot.queue.jobs.values():
+        if job.model is not None and job.staging_charge_mb is not None:
+            sizes.setdefault(job.model, job.staging_charge_mb)
+    return sizes
+
+
+WARM_IDLE_LANE_STATES: frozenset[HordeProcessState] = frozenset(
+    {HordeProcessState.WAITING_FOR_JOB, HordeProcessState.PRELOADED_MODEL},
+)
+"""The states of a lane with no job that may take a warm. ``PRELOADED_MODEL`` counts as busy for dispatch, but a
+lane parked on a finished preload holds its model in RAM with nothing running, which is the case a warm is for."""
+
+
+def _lane_idles_holding(snapshot: SchedulingSnapshot, slot: SlotSnapshot, model: str) -> bool:
+    """Whether the lane is idle, holds ``model`` in RAM by the model map's record, and has no other load coming."""
+    if not (slot.is_alive and slot.can_accept_job) or slot.current_job_id is not None:
+        return False
+    if slot.state not in WARM_IDLE_LANE_STATES or slot.model != model:
+        return False
+    entry = snapshot.model_map.get(model)
+    if entry is None or entry.process_id != slot.process_id or entry.load_state is not ModelLoadState.LOADED_IN_RAM:
+        return False
+    return not any(
+        other.process_id == slot.process_id and other.load_state is ModelLoadState.LOADING
+        for name, other in snapshot.model_map.items()
+        if name != model
+    )
+
+
+def select_idle_lane_warms(
+    snapshot: SchedulingSnapshot,
+    *,
+    warmed: frozenset[tuple[int, str]],
+) -> list[IdleLaneWarm]:
+    """Return the idle lanes to warm this cycle, in queue order, while each warm's read fits the host.
+
+    A lane holding a model keeps its weights as views over the checkpoint file, and the host may drop those
+    pages while the lane idles; a warm has the child read them back before the job is dispatched. The pass runs
+    after the cycle's dispatch, so a pending job whose model sits on a lane that could take it now has already
+    been seated, and a job still pending here is one the cycle could not start.
+
+    A warm that evicts the pages of the lane that loads next trades one cold read for another. The protected
+    models are therefore those of staged lanes (:data:`STAGED_LANE_STATES`, owning a job) and of every earlier
+    pending job; each job's model joins the set before the job is judged, warmed or not. A cleared or sampling
+    lane's model is not protected: its weights are on the device, and its pages are needed again only by a later
+    job of that model, which the walk covers. The room for a warm is the host's available memory (free plus
+    reclaimable cache, as psutil reports it) less the whole checkpoints of the protected models other than the
+    job's own, and the warm needs room for its whole checkpoint: the parent cannot see which pages are cached,
+    and a staged lane's uncached pages are read at clearance and need the room. The walk stops at the first
+    warm that does not fit. A checkpoint's size is the job's ``staging_charge_mb``, the figure
+    :func:`decide_ram_admission` prices a preload's staging at; a model with no known size is not warmed and
+    charges the room nothing.
+
+    A candidate lane accepts jobs, owns no job, is in :data:`WARM_IDLE_LANE_STATES`, is seated with the job's
+    model, and is the model map's ``LOADED_IN_RAM`` holder of it with no load of another model in flight. A lane
+    is warmed at most once per pending job (``warmed`` holds the pairs already sent), and a lane with a warm
+    outstanding for any pending job, or chosen earlier in this walk, is not warmed again until that job leaves
+    the queue.
+
+    Args:
+        snapshot: The cycle's snapshot, taken after the dispatch pass.
+        warmed: The (process id, job id) pairs warmed in earlier cycles whose job is still pending.
+
+    Returns:
+        The warms to send, in queue order.
+    """
+    pending_ids = [
+        job_id
+        for job_id in snapshot.queue.pending_in_pop_order
+        if job_id in snapshot.queue.jobs and not snapshot.queue.jobs[job_id].in_progress
+    ]
+    owned_job_ids = {slot.current_job_id for slot in snapshot.slots.values() if slot.current_job_id is not None}
+    pending_set = set(pending_ids)
+    busy_warming = {process_id for process_id, job_id in warmed if job_id in pending_set}
+    sizes = _checkpoint_sizes_mb(snapshot)
+    protected = _staged_lane_models(snapshot)
+    warms: list[IdleLaneWarm] = []
+    for job_id in pending_ids:
+        job = snapshot.queue.jobs[job_id]
+        if job.model is None or job_id in owned_job_ids:
+            continue
+        model = job.model
+        protected.add(model)
+        lane = next(
+            (
+                slot
+                for process_id, slot in sorted(snapshot.slots.items())
+                if (process_id, job_id) not in warmed
+                and process_id not in busy_warming
+                and _lane_idles_holding(snapshot, slot, model)
+            ),
+            None,
+        )
+        own_mb = sizes.get(model)
+        if lane is None or own_mb is None:
+            continue
+        room_mb = snapshot.host_ram.available_mb - sum(
+            sizes.get(protected_model, 0.0) for protected_model in protected if protected_model != model
+        )
+        if room_mb < own_mb:
+            break
+        busy_warming.add(lane.process_id)
+        warms.append(IdleLaneWarm(process_id=lane.process_id, model=model, job_id=job_id, room_mb=room_mb))
+    return warms

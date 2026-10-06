@@ -5312,9 +5312,10 @@ async def test_y_the_handoff_gap_carries_no_device_load(headroom: _HostHeadroom)
 _COLD_READ_UNDER_PRESSURE_XFAIL = pytest.mark.xfail(
     strict=True,
     reason=(
-        "with the page cache short of the rotation, an idle lane's warm fits only part of the time, so some "
-        "booked-holding loads still read reclaimed pages after clearance; the bound is the world's stand-in "
-        "for the parent's warm message, and the retention dispatch hold under the lease is not landed"
+        "with the page cache short of the rotation, the parent's warm fits only part of the time (it reserves "
+        "the whole checkpoint of every protected model, since it cannot see which pages are cached), so some "
+        "booked-holding loads still read reclaimed pages after clearance; the retention dispatch hold under "
+        "the lease is not landed"
     ),
 )
 

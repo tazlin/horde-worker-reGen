@@ -99,6 +99,18 @@
     {
       "messages": [
         {
+          "control_flag": "WARM_MODEL",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": "sdxl-checkpoint-b",
+          "process_id": 1
+        }
+      ],
+      "tick": 4
+    },
+    {
+      "messages": [
+        {
           "control_flag": "START_INFERENCE",
           "job": "job-2",
           "keep_model_resident_after": true,

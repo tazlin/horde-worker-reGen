@@ -37,6 +37,7 @@ dedicated reader thread so a read that cannot return never freezes the loop (see
 | Message                             | Purpose                             | Carries                                                                                            |
 | ----------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `HordePreloadInferenceModelMessage` | Ask a process to load a model       | Model name, download/load flags                                                                    |
+| `HordeWarmInferenceModelMessage`    | Ask an idle lane to re-read its held model's checkpoint pages ahead of a dispatch (`WARM_MODEL`); changes no model state | Model name |
 | `HordePrepareAuxControlMessage`     | Resolve a pending job's LoRAs without sampling | Model name, full job, download deadline                                                 |
 | `HordeInferenceControlMessage`      | Start inference on a job            | Full `ImageGenerateJobPopResponse`, the retention verdict, and the parent's device-free reading (`device_free_mb`, see [Cross-job retention](vram_arbiter.md#cross-job-retention)) |
 | `HordeAlchemyControlMessage`        | Run one alchemy form (`START_ALCHEMY`) | `AlchemyFormSpec` (form name, pre-downloaded base64 source image, optional R2 upload URL)       |

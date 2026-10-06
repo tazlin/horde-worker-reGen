@@ -277,10 +277,10 @@ These fail as interactions, not as units, so component tests stay green through 
   prefetch-and-touch does; `tail_overlap=True` turns on the controller's handoff window and feeds it what
   production does, each sampler's step position through `ProcessMap.on_heartbeat` and each paid load as a
   `ram_to_vram` phase through `ProcessMap.on_job_metrics`; `gpu_sampling_lease_slots` sets the controller's cap
-  apart from `max_threads`. `idle_lane_warm=True` has an idle lane holding a pending job's model re-read its
-  reclaimed pages ahead of dispatch, in queue order while the host's free physical pages hold the read (a
-  stand-in for the parent's warm message, kept in one function until that lands); a dispatch adopts a running
-  warm and clearance pays only the unfinished part. All four default to the off or `max_threads` value. `performance_model=True` gives
+  apart from `max_threads`. `idle_lane_warm=True` has a lane honour the parent's warm message
+  (`InferenceScheduler.warm_idle_lanes`): an idle lane holding the named model re-reads its reclaimed pages
+  ahead of dispatch (off, the lane ignores the message); a dispatch adopts a running warm and clearance pays only
+  the unfinished part. All four default to the off or `max_threads` value. `performance_model=True` gives
   the scheduler an in-memory, unseeded `PerformanceModel` fed each finished job's sampling rate and its
   finalization, so a dispatched slot carries an expected sampling time once a signature has enough samples;
   `learned_footprints=True` sends each lane's per-tick memory report through a real `MessageDispatcher` into

@@ -64,6 +64,18 @@ it; the preload pass's own ceiling of one send per cycle is what bounds the pair
 until nothing more can start, and a gate withholding one selected job is not that: on a multi-card worker the
 walk resumes for work another card can take (see [Dispatch selection](#dispatch-selection)).
 
+Under the clearance lease a third step follows dispatch: `warm_idle_lanes`. A lane holding a model keeps its
+weights as views over the checkpoint file, and the host may drop those pages while the lane idles, so the
+device load at clearance would read them back from disk inside the job's window. For each job the cycle left
+pending, in queue order, the pass sends `HordeWarmInferenceModelMessage` to an idle lane that the model map
+records as holding the job's model in RAM, and the child starts hordelib's prefetch of the cached checkpoint
+([`select_idle_lane_warms`][horde_worker_regen.process_management.scheduling.admission.preload.select_idle_lane_warms]).
+A warm must not evict the pages of the lane that loads next, so the room for one is the host's available memory
+less the whole checkpoints of the staged lanes' models and of every earlier pending job's model, and the walk
+stops at the first warm whose checkpoint does not fit. Each (lane, job) pair is warmed once. The warm books
+nothing: it sets no control flag, leaves the model map alone, and charges no planned RAM or VRAM. Without the
+lease a dispatch is the load, and the job-start prefetch already covers the read.
+
 ## Where each decision lives
 
 | Decision | Function | Reads | Returns | Acted on by |

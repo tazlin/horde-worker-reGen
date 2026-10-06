@@ -33,6 +33,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeInferenceControlMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
+    HordeWarmInferenceModelMessage,
     ModelLoadState,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerEventKind, WorkerEventSink
@@ -158,6 +159,7 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     preload_head,
     preload_ram_stage_mb,
     price_preload,
+    select_idle_lane_warms,
 )
 from horde_worker_regen.process_management.scheduling.admission.pricing import STAGING_ENCODE_VRAM_MB
 from horde_worker_regen.process_management.scheduling.admission.snapshot import (
@@ -429,6 +431,8 @@ class InferenceScheduler:
 
     _preload_delay_notified: bool
     _pending_line_skip: NextJobAndProcess | None
+    _idle_lane_warmed: set[tuple[int, str]]
+    """The (process id, job id) pairs an idle-lane warm was sent for, kept while the job stays pending."""
     _model_last_in_demand: dict[str, float]
     _vram_budget: VramBudget
     _ram_budget: RamBudget
@@ -705,6 +709,7 @@ class InferenceScheduler:
 
         self._preload_delay_notified = False
         self._pending_line_skip = None
+        self._idle_lane_warmed = set()
         self._model_last_in_demand = {}
 
         # Constructed with safe defaults; the live reserves are synced from the (reloadable) config each
@@ -12294,6 +12299,44 @@ class InferenceScheduler:
         self.unload_from_ram(victim.process_id)
         return True
 
+    def warm_idle_lanes(self) -> int:
+        """Ask idle lanes holding pending jobs' models to read their reclaimed checkpoint pages back, after dispatch.
+
+        Runs after the cycle's dispatch pass, the only point at which a job this cycle could not seat is known.
+        Under the clearance lease a dispatch only stages the job and the weights move into VRAM at clearance,
+        where pages the host dropped while the lane idled are read from disk inside the sampling window; a warm
+        starts that read while the job waits. Without the lease a dispatch is the load, and hordelib's job-start
+        prefetch covers it, so the pass does nothing.
+
+        Which lanes are warmed is :func:`select_idle_lane_warms`. A warm is a message only: it sets no
+        ``last_control_flag``, leaves the model map alone, books no planned RAM or VRAM and emits no preload
+        event, since the child's model state does not change. Each (lane, job) pair is warmed once, and the
+        record of sent pairs is pruned to jobs still pending.
+
+        Returns:
+            The number of warms sent.
+        """
+        if not self._clearance_lease_active():
+            self._idle_lane_warmed.clear()
+            return 0
+        snapshot = self.snapshot()
+        pending_job_ids = set(snapshot.queue.pending_in_pop_order)
+        self._idle_lane_warmed = {pair for pair in self._idle_lane_warmed if pair[1] in pending_job_ids}
+        sent = 0
+        for warm in select_idle_lane_warms(snapshot, warmed=frozenset(self._idle_lane_warmed)):
+            process = self._process_map.get(warm.process_id)
+            if process is None:
+                continue
+            if not process.safe_send_message(HordeWarmInferenceModelMessage(horde_model_name=warm.model)):
+                continue
+            self._idle_lane_warmed.add((warm.process_id, warm.job_id))
+            sent += 1
+            logger.info(
+                f"Warming {warm.model} on process {warm.process_id} ahead of job {warm.job_id} "
+                f"({warm.room_mb:.0f} MB of host RAM outside protected checkpoints)",
+            )
+        return sent
+
     def begin_scheduling_cycle(self) -> None:
         """Discard the selection state that is only valid within one scheduling cycle.
 
@@ -12312,7 +12355,7 @@ class InferenceScheduler:
         self._dispatch_holds.clear_cycle_declines()
 
     async def run_scheduling_cycle(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
-        """Run a single scheduling cycle: preload, start inference, unload.
+        """Run a single scheduling cycle: preload, start inference, warm idle lanes, unload.
 
         Both stages run every cycle. A preload stages one model onto one slot and returns; the lanes that
         already hold resident weights are idle while it does, and on a multi-card worker they are mostly not
@@ -12343,6 +12386,7 @@ class InferenceScheduler:
         started = 0
         while await self.start_inference():
             started += 1
+        self.warm_idle_lanes()
 
         if not started:
             # Nothing dispatched this cycle though the queue has work: if the head has been parked
