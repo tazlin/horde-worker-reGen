@@ -161,6 +161,20 @@ policy once the card fits it), a paused lane stays down until something restarts
 issued the pause therefore owns the restore for exactly these rungs, unwinding them when the condition it
 paused for ends. Safety is excluded on purpose: it is restored by the placement policy, not by a rung issuer."""
 
+_PAUSED_LANE_NAMES: dict[ReclaimRungKind, str] = {
+    ReclaimRungKind.PAUSE_PP_LANE: "post-processing",
+    ReclaimRungKind.PAUSE_VAE_LANE: "VAE",
+    ReclaimRungKind.PAUSE_COMPONENT_LANE: "component",
+    ReclaimRungKind.PAUSE_UTILITIES_LANE: "image-utilities",
+}
+"""The lane each pause rung stops, as the log lines about that lane call it."""
+
+
+def _paused_lane_name(kind: ReclaimRungKind) -> str:
+    """The lane a pause rung stops, in words; the rung kind's own value for a kind that stops no lane."""
+    return _PAUSED_LANE_NAMES.get(kind, kind.value)
+
+
 _TEARDOWN_RUNG_KINDS = LANE_PAUSE_RUNG_KINDS | frozenset({ReclaimRungKind.SAFETY_OFF_GPU})
 """Rung kinds whose memory is freed by a process exiting, so they get the longer verification budget."""
 
@@ -517,6 +531,8 @@ class _Episode:
     """Whether this episode has already disclosed that a refused restore left it holding a debt."""
     lane_pause_beneficiaries: dict[ReclaimRungKind, set[str]] = field(default_factory=dict)
     """Per booked lane pause, the ids of the jobs it was taken for; the restore waits until none still waits."""
+    lane_holds_logged: set[ReclaimRungKind] = field(default_factory=set)
+    """Lane pauses whose hold for a waiting beneficiary has been logged; cleared when the pause is restored."""
 
     def reset_ladder_progress(self) -> None:
         """Drop this episode's ladder, cursor, pending rung and outcome, keeping only what it still owes.
@@ -953,13 +969,23 @@ class VerifiedReclaimLadder:
                 continue
             if isinstance(obligation, ReclaimRung) and lane_beneficiary_waiting is not None:
                 beneficiaries = episode.lane_pause_beneficiaries.get(obligation.kind, set())
-                if any(lane_beneficiary_waiting(job_id) for job_id in beneficiaries):
+                waiting = next((job_id for job_id in sorted(beneficiaries) if lane_beneficiary_waiting(job_id)), None)
+                if waiting is not None:
+                    # The unwind runs on every HEALTHY sample, so the hold is logged once per pause.
+                    if obligation.kind not in episode.lane_holds_logged:
+                        episode.lane_holds_logged.add(obligation.kind)
+                        logger.info(
+                            f"Reclaim ladder: keeping the {_paused_lane_name(obligation.kind)} lane down until "
+                            f"job {waiting} "
+                            "starts sampling.",
+                        )
                     retained.append(obligation)
                     continue
             if not unwind_restore_obligation(obligation, actuator):
                 retained.append(obligation)
             elif isinstance(obligation, ReclaimRung):
                 episode.lane_pause_beneficiaries.pop(obligation.kind, None)
+                episode.lane_holds_logged.discard(obligation.kind)
         retained.reverse()
         episode.restore_obligations[:] = retained
         if not retained:

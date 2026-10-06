@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from horde_worker_regen.runtime_version import runtime_version
+from horde_worker_regen.runtime_version import hordelib_identity, runtime_version
 from horde_worker_regen.update_check import NEWER_RELEASE_ENV_VAR
 from horde_worker_regen.utils import get_system_appropriate_updater
 
@@ -577,6 +577,7 @@ class StatusReporter:
                 [
                     f"dreamer_name: {bridge_data.dreamer_worker_name}",
                     f"(v{runtime_version()})",
+                    f"hordelib: {hordelib_identity()}",
                     f"horde user: {user_info.username if user_info is not None else 'Unknown'}",
                     f"num_models: {len(bridge_data.image_models_to_load)}",
                     "custom_models: "

@@ -21,6 +21,7 @@ try:
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from multiprocessing.synchronize import Lock
 from typing import TYPE_CHECKING, TypeVar, override
 
@@ -58,6 +59,18 @@ else:
 
 
 _T = TypeVar("_T")
+
+
+@dataclass
+class _LaneMeasurements:
+    """Per-job timings of the chain and upload-encode phases, summed over the job's images."""
+
+    chain_seconds: float = 0.0
+    encode_seconds: float = 0.0
+    output_size: tuple[int, int] | None = None
+    """The first image's output width and height."""
+    operations: list[str] = field(default_factory=list)
+    """The post-processor names in hordelib's execution order."""
 
 
 class PostProcessorNotOnDiskError(RuntimeError):
@@ -175,11 +188,12 @@ class HordePostProcessProcess(HordeProcess):
         image_bytes: bytes,
         post_processing: list[str],
         facefixer_strength: float | None,
+        measurements: _LaneMeasurements,
     ) -> HordeImageResult | None:
         """Run the requested post-processors over a single image as one hordelib chain.
 
         hordelib owns the operation order. Returns the result encoded for upload with the chain's faults,
-        or None if the chain produced no image.
+        or None if the chain produced no image. The chain and encode times accumulate into ``measurements``.
         """
         for operation in post_processing:
             self._require_post_processor_on_disk(operation)
@@ -187,34 +201,53 @@ class HordePostProcessProcess(HordeProcess):
         # The chain is one graph run; this heartbeat and the progress callback keep a long chain from
         # reading as a hung process.
         self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+        chain_start = time.perf_counter()
         result = self._horde.post_process_chain(
             PIL.Image.open(io.BytesIO(image_bytes)),
             post_processing,
             facefixer_strength=facefixer_strength,
         )
+        measurements.chain_seconds += time.perf_counter() - chain_start
         if result.image is None:
             logger.error(f"Post-processing chain produced no image: operations={post_processing}")
             return None
 
+        if measurements.output_size is None:
+            measurements.output_size = result.image.size
+        encode_start = time.perf_counter()
+        encoded_bytes = encode_image_for_upload(result.image).getvalue()
+        measurements.encode_seconds += time.perf_counter() - encode_start
+
         return HordeImageResult(
-            image_bytes=encode_image_for_upload(result.image).getvalue(),
+            image_bytes=encoded_bytes,
             image_encoding=UPLOAD_IMAGE_ENCODING,
             generation_faults=result.faults,
         )
 
-    def _post_process_all_images(self, message: HordePostProcessControlMessage) -> list[HordeImageResult]:
-        """Post-process every image in the job, raising if any chain yields no output image."""
+    def _post_process_all_images(
+        self,
+        message: HordePostProcessControlMessage,
+    ) -> tuple[list[HordeImageResult], _LaneMeasurements]:
+        """Post-process every image in the job, raising if any chain yields no output image.
+
+        Returns the processed images with the job's measurements. Each call measures afresh, so an
+        out-of-memory retry reports only the attempt that produced the images.
+        """
+        from hordelib.api import order_post_processing
+
+        measurements = _LaneMeasurements(operations=order_post_processing(message.post_processing))
         processed_images: list[HordeImageResult] = []
         for image_bytes in message.images_bytes:
             processed = self._post_process_one_image(
                 image_bytes,
                 message.post_processing,
                 message.facefixer_strength,
+                measurements,
             )
             if processed is None:
                 raise RuntimeError("post-processing produced no output image")
             processed_images.append(processed)
-        return processed_images
+        return processed_images, measurements
 
     def _reclaim_own_vram_for_retry(self) -> None:
         """Evict this lane's own resident post-processing models and cached pool before a retry.
@@ -262,12 +295,13 @@ class HordePostProcessProcess(HordeProcess):
         job_image_results: list[HordeImageResult] | None
         fault_is_resource_class = False
         fault_reason: str | None = None
+        measurements: _LaneMeasurements | None = None
 
         if self._dry_run_skip_post_processing:
             job_image_results = [HordeImageResult(image_bytes=image_bytes) for image_bytes in message.images_bytes]
         else:
             try:
-                job_image_results = self._run_with_oom_retry(
+                job_image_results, measurements = self._run_with_oom_retry(
                     lambda: self._post_process_all_images(message),
                     context=f"job {message.job_id}",
                 )
@@ -289,6 +323,11 @@ class HordePostProcessProcess(HordeProcess):
                 state=state,
                 fault_is_resource_class=fault_is_resource_class,
                 fault_reason=fault_reason,
+                chain_seconds=measurements.chain_seconds if measurements else None,
+                encode_seconds=measurements.encode_seconds if measurements else None,
+                output_width=measurements.output_size[0] if measurements and measurements.output_size else None,
+                output_height=measurements.output_size[1] if measurements and measurements.output_size else None,
+                operations=measurements.operations if measurements else None,
             ),
         )
 

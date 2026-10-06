@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
+from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeImageResult
@@ -22,6 +27,17 @@ from tests.process_management.conftest import (
     queue_job_for_submit_async,
     track_popped_job_async,
 )
+
+
+@contextmanager
+def _captured_messages() -> Iterator[list[str]]:
+    """Collect every loguru message text logged at DEBUG or above while the block runs."""
+    lines: list[str] = []
+    sink_id = logger.add(lambda record: lines.append(record.record["message"]), level="DEBUG")
+    try:
+        yield lines
+    finally:
+        logger.remove(sink_id)
 
 
 def _make_submitter(
@@ -92,9 +108,30 @@ class TestSubmitSingleGeneration:
         new_submit.completed_job_info = Mock(state=None)
         new_submit.completed_job_info.sdk_api_job_info.get_follow_up_failure_cleanup_request.return_value = []
 
-        await submitter.submit_single_generation(new_submit)
+        with _captured_messages() as lines:
+            await submitter.submit_single_generation(new_submit)
 
         assert encode_calls == []
+        assert "Upload for job test-id: bytes already in the upload encoding, not re-encoded." in lines
+        assert not any(line.startswith("Upload encode for job") for line in lines)
+
+    async def test_a_retry_whose_upload_landed_logs_no_encode_decision(self) -> None:
+        """A retry after the upload landed reaches neither the encode nor the pass-through line."""
+        submitter = _make_submitter(horde_client_session=AsyncMock())
+
+        new_submit = Mock(spec=PendingSubmitJob)
+        new_submit.job_id = "test-id"
+        new_submit.image_result = HordeImageResult(image_bytes=b"raw-bytes")
+        new_submit.is_faulted = False
+        new_submit.upload_completed = True
+        new_submit.completed_job_info = Mock(state=None)
+
+        # The mock carries no API submit fields, so the call raises after the upload decision; only that
+        # decision is under test here.
+        with _captured_messages() as lines, contextlib.suppress(TypeError):
+            await submitter.submit_single_generation(new_submit)
+
+        assert not any(line.startswith(("Upload encode for job", "Upload for job")) for line in lines)
 
     async def test_the_upload_encode_runs_off_the_event_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The upload encode is handed to a worker thread, so a large image never stalls the orchestrator."""
@@ -118,9 +155,12 @@ class TestSubmitSingleGeneration:
         new_submit.completed_job_info = Mock(state=None)
         new_submit.completed_job_info.sdk_api_job_info.get_follow_up_failure_cleanup_request.return_value = []
 
-        await submitter.submit_single_generation(new_submit)
+        with _captured_messages() as lines:
+            await submitter.submit_single_generation(new_submit)
 
         assert len(encode_threads) == 1
+        assert any(re.fullmatch(r"Upload encode for job test-id: \d+\.\d{2}s in a worker thread\.", x) for x in lines)
+        assert not any(line.startswith("Upload for job") for line in lines)
         assert encode_threads[0] is not threading.current_thread()
         new_submit.fault.assert_called_once()
 

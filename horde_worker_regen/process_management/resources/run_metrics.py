@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerEventPayload,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+from horde_worker_regen.runtime_version import hordelib_identity
 from horde_worker_regen.telemetry_spans import (
     job_e2e_histogram,
     job_queue_wait_histogram,
@@ -282,6 +283,14 @@ class JobMetricsRecord(BaseModel):
     """Other jobs queued for or running post-processing at the moment this job was dispatched.
 
     A job that requests post-processing behind a busy lane pays a tail its own generation did not cause."""
+    post_processing_chain_seconds: float | None = None
+    """Seconds the lane spent inside the post-processing chain, summed over the job's images."""
+    post_processing_encode_seconds: float | None = None
+    """Seconds the lane spent encoding the post-processed images for upload."""
+    post_processing_output_width: int | None = None
+    """Width of the first post-processed image."""
+    post_processing_output_height: int | None = None
+    """Height of the first post-processed image."""
     whole_card: bool | None = None
     """Whether a whole-card exclusive residency for this job's model was held on its card at dispatch.
 
@@ -359,6 +368,8 @@ class SessionStartEvent(BaseModel):
 
     event: Literal["session_start"] = "session_start"
     worker_version: str
+    hordelib_version: str = ""
+    """hordelib's version and install source, as ``hordelib_identity`` formats it."""
     timestamp: float
     config: FlatScalarMap = Field(default_factory=dict)
 
@@ -1049,6 +1060,10 @@ class WorkerRunMetrics:
             dispatch_hold_seconds=tracked.dispatch_hold_seconds,
             queue_depth_at_dispatch=tracked.queue_depth_at_dispatch,
             post_processing_depth_at_dispatch=tracked.post_processing_depth_at_dispatch,
+            post_processing_chain_seconds=tracked.post_processing_chain_seconds,
+            post_processing_encode_seconds=tracked.post_processing_encode_seconds,
+            post_processing_output_width=tracked.post_processing_output_width,
+            post_processing_output_height=tracked.post_processing_output_height,
             whole_card=tracked.served_whole_card,
             process_age_seconds=tracked.serving_process_age_seconds,
             kudos_reward=tracked.kudos_reward,
@@ -1195,8 +1210,15 @@ class WorkerRunMetrics:
         """
         now = time.time() if timestamp is None else timestamp
         self._session_start_time = now
+        hordelib_version = hordelib_identity()
+        logger.info(f"hordelib: {hordelib_version}")
         self._write_export_event(
-            SessionStartEvent(worker_version=self._worker_version, timestamp=now, config=dict(config)),
+            SessionStartEvent(
+                worker_version=self._worker_version,
+                hordelib_version=hordelib_version,
+                timestamp=now,
+                config=dict(config),
+            ),
         )
 
     @property

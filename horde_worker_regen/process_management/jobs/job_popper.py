@@ -701,6 +701,9 @@ class JobPopper:
         # edge-triggered: it fires only when the outgoing capability (or the reason it is withheld) changes,
         # never once per pop at steady state.
         self._last_logged_lora_advertise: tuple[bool, str] | None = None
+        # Last idle-fill offer logged as (rung index, model count, max_power); cleared by a pop the ladder does
+        # not shape, so each arm logs its first offer and then only rung changes.
+        self._last_logged_idle_fill_offer: tuple[int, int, int] | None = None
 
         # Digest of the last advertised model set actually logged, so the "Advertising models" line is
         # edge-triggered the same way: it fires only when the offered set changes, never once per pop.
@@ -937,6 +940,13 @@ class JobPopper:
 
         rung_index = min(self._state.idle_fill_rung, len(rungs) - 1)
         rung_models, rung_cap = rungs[rung_index]
+        offer = (rung_index, len(rung_models), rung_cap)
+        if offer != self._last_logged_idle_fill_offer:
+            self._last_logged_idle_fill_offer = offer
+            logger.info(
+                f"Idle-fill offer: rung {rung_index + 1} of {len(rungs)}, {len(rung_models)} model(s) "
+                f"at max_power {rung_cap}",
+            )
         return rung_models, rung_cap
 
     def _large_models_loaded_or_queued(self) -> frozenset[str]:
@@ -2230,6 +2240,8 @@ class JobPopper:
             # fed the quickest work the horde currently has, widening only when it has nothing lighter.
             models, pop_max_power = self._apply_idle_fill_ladder(models, pop_max_power, bridge_data)
             pop_allow_lora = False
+        else:
+            self._last_logged_idle_fill_offer = None
 
         # Whole-card pop claim: while a residency holds the card, ask for its model and nothing else, so the
         # horde stops sending work whose arrival would evict the weights the residency exists to keep resident.

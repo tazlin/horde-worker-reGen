@@ -795,6 +795,52 @@ class TestPostProcessResultHandling:
         assert job_info in process_manager._job_tracker.jobs_pending_safety_check
         assert job_info.job_image_results == [processed]
 
+    async def _finish_line(self, **measurements: object) -> tuple[str, str]:
+        from loguru import logger
+
+        process_manager = make_testable_process_manager()
+        job_info = await self._job_being_post_processed(process_manager)
+        message = HordePostProcessResultMessage(
+            process_id=7,
+            process_launch_identifier=0,
+            info="done",
+            time_elapsed=3.856,
+            job_id=job_info.sdk_api_job_info.id_,
+            job_image_results=[HordeImageResult(image_bytes=b"post-processed")],
+            state=GENERATION_STATE.ok,
+            **measurements,  # type: ignore[arg-type]
+        )
+        lines: list[str] = []
+        sink_id = logger.add(lambda record: lines.append(record.record["message"]), level="INFO")
+        try:
+            await process_manager._message_dispatcher._handle_post_process_result(message)
+        finally:
+            logger.remove(sink_id)
+        finished = [line for line in lines if line.startswith("Post-processing finished for job")]
+        assert len(finished) == 1
+        return finished[0], str(job_info.sdk_api_job_info.id_)[:8]
+
+    async def test_finish_line_carries_the_lane_measurements(self) -> None:
+        """A result with the lane's measurements extends the finish line with the chain and encode split."""
+        line, short_id = await self._finish_line(
+            chain_seconds=2.5,
+            encode_seconds=0.314,
+            output_width=2048,
+            output_height=1536,
+            operations=["GFPGAN", "RealESRGAN_x4plus"],
+        )
+
+        assert line == (
+            f"Post-processing finished for job {short_id} in 3.86 seconds on process 7 "
+            "(chain 2.50s, encode 0.31s, 2048x1536, GFPGAN, RealESRGAN_x4plus)."
+        )
+
+    async def test_finish_line_without_measurements_is_unchanged(self) -> None:
+        """A result without the lane's measurements logs the plain finish line."""
+        line, short_id = await self._finish_line()
+
+        assert line == f"Post-processing finished for job {short_id} in 3.86 seconds on process 7."
+
     async def test_result_releases_post_process_vram_reserve(self) -> None:
         """The active post-processing reserve is released when the lane returns a result."""
         process_manager = make_testable_process_manager()

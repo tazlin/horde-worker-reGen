@@ -391,7 +391,10 @@ stage did not complete.
    `facefixer_strength` rides the control message to the face-fix stage. The lane encodes the result once,
    in the upload encoding (`encode_image_for_upload`), and marks it (`HordeImageResult.image_encoding`); the
    submit path uploads bytes so marked as they are and encodes anything else in a worker thread, off the
-   event loop. A censored image is replaced whole, with the replacement's own encoding. The lane sends a
+   event loop. The lane times the chain and the encode per job and reports them, with the first image's
+   output size and hordelib's operation order, on `HordePostProcessResultMessage`; the parent's
+   `Post-processing finished` line carries them, and the submit path logs at DEBUG whether it encoded the
+   bytes or passed them through. A censored image is replaced whole, with the replacement's own encoding. The lane sends a
    heartbeat before the chain and, rate-limited, on ComfyUI's progress events. A chain that never fits the
    card ages out to a no-image
    fault; an orphan watchdog requeues a job whose result was lost (bounded), then faults without images.

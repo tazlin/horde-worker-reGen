@@ -97,6 +97,11 @@ _TEXT_BACKEND_NOT_LAUNCHED = (
     "printed once by the text backend into its own `logs/text_backend.log`, which a dry run never launches"
 )
 _TEXT_FLOW_NOT_EXERCISED = "the dry-run contract scenario serves image jobs only, so the text flow never runs"
+_IDLE_FILL_NOT_ARMED = "the dry-run harness never leaves a head job waiting long enough to arm the idle-fill breaker"
+_RECLAIM_HOLD_NOT_EXERCISED = "the dry-run harness never pauses a lane for VRAM, so no lane restore is held"
+_LANE_MEASUREMENTS_NOT_SENT = (
+    "the dry-run post-processing lane runs no chain and sends no measurements, so the finish line is the short form"
+)
 _RUN_NOT_ABORTED = "a completed dry run ends through a graceful shutdown; only an abort writes the sentinel file"
 _DEFERRED_GPU_START_NOT_EXERCISED = (
     "the dry-run harness's fake children report no free-VRAM reading that falls short of a GPU start, so no "
@@ -1345,6 +1350,47 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.jobs.text_generation_coordinator:_note_submitted",
         sample="Submitted text job 817d78c0 for 0.66 kudos. Job popped 3.84 seconds ago.",
         dry_run_reason=_TEXT_FLOW_NOT_EXERCISED,
+    ),
+    _signature(
+        "hordelib_identity",
+        r"hordelib: (?P<version>\S+) \((?P<source>[^)]+)\)",
+        emitter="process_management.resources.run_metrics:WorkerRunMetrics.record_session_start",
+        sample="hordelib: 7.9.0 (editable hordelib gc3202bd0.modified)",
+    ),
+    _signature(
+        "post_processing_phase_split",
+        r"Post-processing finished for job [0-9a-fA-F]{8} in (?P<total>[\d.]+) seconds on process (?P<process>\d+) "
+        r"\(chain (?P<chain>[\d.]+)s, encode (?P<encode>[\d.]+)s, (?P<width>\d+)x(?P<height>\d+), "
+        r"(?P<operations>[^)]*)\)\.",
+        emitter="process_management.ipc.message_dispatcher:_handle_post_process_result",
+        sample="Post-processing finished for job 284ef66f in 3.86 seconds on process 1 "
+        "(chain 2.50s, encode 0.31s, 2048x1536, GFPGAN, RealESRGAN_x4plus).",
+        dry_run_reason=_LANE_MEASUREMENTS_NOT_SENT,
+    ),
+    _signature(
+        "idle_fill_offer",
+        r"Idle-fill offer: rung (?P<rung>\d+) of (?P<rungs>\d+), (?P<models>\d+) model\(s\) "
+        r"at max_power (?P<max_power>\d+)",
+        emitter="process_management.jobs.job_popper:JobPopper._apply_idle_fill_ladder",
+        sample="Idle-fill offer: rung 2 of 4, 3 model(s) at max_power 32",
+        dry_run_reason=_IDLE_FILL_NOT_ARMED,
+    ),
+    _signature(
+        "ended_job_ownership_released",
+        r"Released process (?P<process>\d+)'s ownership of job (?P<job_id>\S+): "
+        r"the job ended without a result from that lane\.",
+        emitter="process_management.process_manager:HordeWorkerProcessManager._control_loop_tick",
+        sample="Released process 3's ownership of job 0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0: "
+        "the job ended without a result from that lane.",
+        dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
+        "reclaim_lane_hold",
+        r"Reclaim ladder: keeping the (?P<lane>[\w-]+) lane down until job (?P<job_id>\S+) starts sampling\.",
+        emitter="process_management.resources.reclaim_ladder:ReclaimLadder._unwind_restore_obligations",
+        sample="Reclaim ladder: keeping the post-processing lane down until job "
+        "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0 starts sampling.",
+        dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
     ),
 ]
 

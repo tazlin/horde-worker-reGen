@@ -714,8 +714,13 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].clear_retained_resident()
         self[process_id].vram_unload_refused = False
 
-    def retire_ownership_of_ended_jobs(self, in_progress_job_ids: set[GenerationID]) -> list[int]:
-        """Retire every inference ownership whose job is no longer in progress; return the freed process IDs.
+    def retire_ownership_of_ended_jobs(
+        self, in_progress_job_ids: set[GenerationID]
+    ) -> list[tuple[int, GenerationID | None]]:
+        """Retire every inference ownership whose job is no longer in progress.
+
+        Returns:
+            list[tuple[int, GenerationID | None]]: One ``(process_id, job_id)`` pair per retired ownership.
 
         A lane owning an attempt accepts no job, so an ownership left behind by a path that ended its job
         without a result (a fault, a timeout) would otherwise hold the lane for the rest of its launch.
@@ -723,13 +728,13 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         Args:
             in_progress_job_ids (set[GenerationID]): IDs of the jobs the tracker holds in progress.
         """
-        freed: list[int] = []
+        freed: list[tuple[int, GenerationID | None]] = []
         for process_id, process_info in self.items():
             job = process_info.current_inference_job()
             if job is None or job.id_ in in_progress_job_ids:
                 continue
             process_info.retire_inference_ownership(job)
-            freed.append(process_id)
+            freed.append((process_id, job.id_))
         return freed
 
     def on_model_ram_clear(

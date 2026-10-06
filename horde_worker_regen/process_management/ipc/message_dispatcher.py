@@ -1804,10 +1804,31 @@ class MessageDispatcher:
         self._release_post_process_reserve(message.job_id)
 
         if message.time_elapsed is not None:
-            logger.info(
-                f"Post-processing finished for job {str(message.job_id)[:8]} in "
-                f"{round(message.time_elapsed, 2)} seconds on process {message.process_id}.",
-            )
+            if (
+                message.chain_seconds is not None
+                and message.encode_seconds is not None
+                and message.output_width is not None
+                and message.output_height is not None
+                and message.operations is not None
+            ):
+                logger.info(
+                    f"Post-processing finished for job {str(message.job_id)[:8]} in "
+                    f"{message.time_elapsed:.2f} seconds on process {message.process_id} "
+                    f"(chain {message.chain_seconds:.2f}s, encode {message.encode_seconds:.2f}s, "
+                    f"{message.output_width}x{message.output_height}, {', '.join(message.operations)}).",
+                )
+            else:
+                logger.info(
+                    f"Post-processing finished for job {str(message.job_id)[:8]} in "
+                    f"{round(message.time_elapsed, 2)} seconds on process {message.process_id}.",
+                )
+
+        measured_job = self._job_tracker.get_tracked_job(message.job_id)
+        if measured_job is not None:
+            measured_job.post_processing_chain_seconds = message.chain_seconds
+            measured_job.post_processing_encode_seconds = message.encode_seconds
+            measured_job.post_processing_output_width = message.output_width
+            measured_job.post_processing_output_height = message.output_height
 
         if message.state == GENERATION_STATE.faulted or message.job_image_results is None:
             fault_reason = message.fault_reason or message.info or "post-processing failed"

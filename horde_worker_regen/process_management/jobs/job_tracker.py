@@ -455,6 +455,14 @@ class TrackedJob:
 
     Counts tracked jobs in ``PENDING_POST_PROCESSING`` and ``POST_PROCESSING`` other than this one. A job
     that requests post-processing behind a busy lane pays a tail its own generation did not cause."""
+    post_processing_chain_seconds: float | None = None
+    """Seconds the lane spent inside the post-processing chain for this job, summed over its images."""
+    post_processing_encode_seconds: float | None = None
+    """Seconds the lane spent encoding this job's post-processed images for upload."""
+    post_processing_output_width: int | None = None
+    """Width of this job's first post-processed image."""
+    post_processing_output_height: int | None = None
+    """Height of this job's first post-processed image."""
     dispatch_hold_seconds: float | None = None
     """Seconds this job's dispatch was held by the residency-reconciliation gate before it was admitted;
     None when it was never held. Recorded by the scheduler on the release so the job record can carry

@@ -8,7 +8,10 @@ from unittest.mock import Mock
 import PIL.Image
 import pytest
 
-from horde_worker_regen.process_management.ipc.messages import HordePostProcessControlMessage
+from horde_worker_regen.process_management.ipc.messages import (
+    HordePostProcessControlMessage,
+    HordePostProcessResultMessage,
+)
 from horde_worker_regen.process_management.workers.post_process_process import HordePostProcessProcess
 from horde_worker_regen.utils.image_utils import UPLOAD_IMAGE_ENCODING
 
@@ -42,7 +45,7 @@ def test_lane_calls_the_chain_once_with_operations_and_strength() -> None:
     """One chain call per image carries the requested operations and strength; the result is upload-encoded."""
     lane, horde = _make_lane(PIL.Image.new("RGB", (16, 16), "blue"))
 
-    results = lane._post_process_all_images(_message(0.4))
+    results, _ = lane._post_process_all_images(_message(0.4))
 
     horde.post_process_chain.assert_called_once()
     call = horde.post_process_chain.call_args
@@ -60,3 +63,45 @@ def test_chain_without_an_image_raises() -> None:
 
     with pytest.raises(RuntimeError, match="no output image"):
         lane._post_process_all_images(_message(None))
+
+
+def test_lane_reports_its_measurements_on_the_result() -> None:
+    """The result message carries the chain and encode times, the first image's size and hordelib's order."""
+    lane, _ = _make_lane(PIL.Image.new("RGB", (32, 24), "blue"))
+    lane._dry_run_skip_post_processing = False
+    lane.process_id = 3
+    lane.process_launch_identifier = 0
+    lane.process_message_queue = Mock()
+    lane.send_process_state_change_message = Mock()  # type: ignore[method-assign]
+    lane.send_memory_report_message = Mock()  # type: ignore[method-assign]
+    message = _message(None)
+    message.post_processing = ["RealESRGAN_x4plus", "GFPGAN"]
+    message.images_bytes = [_png_bytes(), _png_bytes()]
+
+    lane._run_post_processing(message)
+
+    result = lane.process_message_queue.put.call_args.args[0]
+    assert isinstance(result, HordePostProcessResultMessage)
+    assert result.chain_seconds is not None and result.chain_seconds >= 0.0
+    assert result.encode_seconds is not None and result.encode_seconds > 0.0
+    assert (result.output_width, result.output_height) == (32, 24)
+    assert result.operations == ["GFPGAN", "RealESRGAN_x4plus"]
+
+
+def test_faulted_result_carries_no_measurements() -> None:
+    """A chain without an image faults the job and leaves the measurement fields absent."""
+    lane, _ = _make_lane(None)
+    lane._dry_run_skip_post_processing = False
+    lane.process_id = 3
+    lane.process_launch_identifier = 0
+    lane.process_message_queue = Mock()
+    lane.send_process_state_change_message = Mock()  # type: ignore[method-assign]
+    lane.send_memory_report_message = Mock()  # type: ignore[method-assign]
+
+    lane._run_post_processing(_message(None))
+
+    result = lane.process_message_queue.put.call_args.args[0]
+    assert result.chain_seconds is None
+    assert result.encode_seconds is None
+    assert result.output_width is None
+    assert result.operations is None

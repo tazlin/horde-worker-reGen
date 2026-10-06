@@ -1132,6 +1132,16 @@ class HordePostProcessResultMessage(HordeProcessMessage):
     ``state`` is not ``faulted``."""
     fault_reason: str | None = None
     """The originating exception summary (``"{type}: {message}"``) when the stage faulted, else None."""
+    chain_seconds: float | None = None
+    """Seconds spent inside hordelib's post-processing chain, summed over the job's images; None when unmeasured."""
+    encode_seconds: float | None = None
+    """Seconds spent encoding the chain output for upload, summed over the job's images; None when unmeasured."""
+    output_width: int | None = None
+    """The width of the job's first post-processed image, or None when unmeasured."""
+    output_height: int | None = None
+    """The height of the job's first post-processed image, or None when unmeasured."""
+    operations: list[str] | None = None
+    """The post-processor names in the order hordelib ran them, or None when unmeasured."""
 
 
 # ---------------------------------------------------------------------------------------------------

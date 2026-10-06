@@ -4425,9 +4425,13 @@ class HordeWorkerProcessManager:
             self._inference_scheduler.reconcile_head_starvation()
             # Every iteration: a lane owning an attempt accepts no job, and a job ended by a fault or timeout
             # that sent no result leaves its ownership behind with nothing else to retire it.
-            self._process_map.retire_ownership_of_ended_jobs(
+            for process_id, job_id in self._process_map.retire_ownership_of_ended_jobs(
                 {job.id_ for job in self._job_tracker.jobs_in_progress if job.id_ is not None},
-            )
+            ):
+                logger.info(
+                    f"Released process {process_id}'s ownership of job {job_id}: "
+                    "the job ended without a result from that lane.",
+                )
 
             # Drive the GPU denoise clearance controllers every tick, independent of queue depth: they must be
             # able to clear a staged child into its load-and-sample window as a slot frees and to retire a

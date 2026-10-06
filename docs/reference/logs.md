@@ -177,6 +177,23 @@ While the exclusion stands, a job that only that card can serve remains queued a
 classified as `safety_backlog_exclusion`. Other cards continue accepting work. Single-GPU workers retain the
 runtime demote/restore policy and use the pop self-throttle as their backlog relief valve.
 
+## Lines that say a mechanism acted
+
+Each of these is logged once per edge, so a session can be read for whether one mechanism acted without
+inferring it from throughput. All are registered in `analysis/log_signatures.py`.
+
+| Line | Level | Logged when |
+| ---- | ----- | ----------- |
+| `hordelib: <version> (<source>)` | INFO | Once at start. `<source>` is `site-packages`, or `editable <checkout> g<commit>` with `.modified` on a dirty tree. The same string is in the status block's Worker Info line and the stats `session_start` row. |
+| `Idle-fill armed: head job model <model> waited <n>s for dispatch` | INFO | The idle-fill breaker arms. |
+| `Idle-fill disarmed: ...` | INFO | It disarms: the head dispatched, left the queue, or no sibling is free. |
+| `Idle-fill offer: rung <i> of <n>, <k> model(s) at max_power <p>` | INFO | A pop is shaped by the idle-fill ladder and the shaped offer changed. |
+| `Released process <n>'s ownership of job <id>: the job ended without a result from that lane.` | INFO | The control loop retired a lane's ownership of a job that ended some other way than that lane's result. Rare by design. |
+| `Reclaim ladder: keeping the <lane> lane down until job <id> starts sampling.` | INFO | A lane pause booked for a job is held because that job still waits. Once per pause. |
+| `Post-processing finished for job <id> in <t> seconds on process <n> (chain <a>s, encode <b>s, <w>x<h>, <operations>).` | INFO | A post-processing job returns with the lane's measurements. The short form without the parenthesis is logged when the lane sent none. |
+| `Upload encode for job <id>: <t>s in a worker thread.` | DEBUG | Submit encoded the image for upload. |
+| `Upload for job <id>: bytes already in the upload encoding, not re-encoded.` | DEBUG | Submit uploaded the bytes as the lane produced them. |
+
 ## Supervisor stall forgiveness
 
 Two lines in `bridge_tui.log` / `bridge_host.log` describe the *supervisor's* own liveness rather than the

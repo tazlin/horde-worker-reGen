@@ -230,10 +230,18 @@ class JobSubmitter:
             image_in_buffer: BytesIO | None
             if new_submit.image_result.image_encoding == UPLOAD_IMAGE_ENCODING:
                 image_in_buffer = BytesIO(new_submit.image_result.image_bytes)
+                logger.debug(
+                    f"Upload for job {new_submit.job_id}: bytes already in the upload encoding, not re-encoded.",
+                )
             else:
+                encode_start = time.perf_counter()
                 image_in_buffer = await asyncio.to_thread(
                     image_bytes_to_stream_buffer,
                     new_submit.image_result.image_bytes,
+                )
+                logger.debug(
+                    f"Upload encode for job {new_submit.job_id}: "
+                    f"{time.perf_counter() - encode_start:.2f}s in a worker thread.",
                 )
             if image_in_buffer is None:
                 logger.critical(

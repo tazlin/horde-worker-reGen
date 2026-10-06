@@ -94,3 +94,49 @@ def test_git_unavailable_degrades_to_plain(monkeypatch: pytest.MonkeyPatch, tmp_
     """If git fails for everything (binary missing, not a repo), fall back to the clean version."""
     _with_git(monkeypatch, tmp_path, {})  # every _git call returns None
     assert rv.runtime_version() == __version__
+
+
+class _FakeDistribution:
+    """A stand-in for ``importlib.metadata.Distribution`` carrying a version and optional ``direct_url.json``."""
+
+    def __init__(self, direct_url: str | None) -> None:
+        self.version = "7.9.0"
+        self._direct_url = direct_url
+
+    def read_text(self, filename: str) -> str | None:
+        return self._direct_url if filename == "direct_url.json" else None
+
+
+def _with_hordelib(monkeypatch: pytest.MonkeyPatch, distribution: _FakeDistribution | None, dirty: bool) -> None:
+    """Stub the hordelib distribution lookup and the checkout's git answers."""
+    rv.hordelib_identity.cache_clear()
+
+    def _distribution(name: str) -> _FakeDistribution:
+        if distribution is None:
+            raise rv.metadata.PackageNotFoundError(name)
+        return distribution
+
+    responses = {("rev-parse", "--short", "HEAD"): "c3202bd0", ("status", "--porcelain"): " M x.py" if dirty else ""}
+    monkeypatch.setattr(rv.metadata, "distribution", _distribution)
+    monkeypatch.setattr(rv, "_git", lambda *args, cwd=None: responses.get(tuple(args)))
+
+
+def test_hordelib_site_packages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A regular install reports its version from site-packages."""
+    _with_hordelib(monkeypatch, _FakeDistribution(None), dirty=False)
+    assert rv.hordelib_identity() == "7.9.0 (site-packages)"
+
+
+@pytest.mark.parametrize(("dirty", "suffix"), [(False, ""), (True, ".modified")])
+def test_hordelib_editable_checkout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dirty: bool, suffix: str) -> None:
+    """An editable install names the checkout's commit, marked when the tree is dirty."""
+    checkout = tmp_path / "hordelib"
+    direct_url = f'{{"url": "{checkout.as_uri()}", "dir_info": {{"editable": true}}}}'
+    _with_hordelib(monkeypatch, _FakeDistribution(direct_url), dirty=dirty)
+    assert rv.hordelib_identity() == f"7.9.0 (editable hordelib gc3202bd0{suffix})"
+
+
+def test_hordelib_not_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing distribution degrades to an unknown identity without raising."""
+    _with_hordelib(monkeypatch, None, dirty=False)
+    assert rv.hordelib_identity() == "unknown (not installed)"
