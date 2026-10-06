@@ -109,7 +109,7 @@ class TestIdleFillLadderProgression:
         assert [(set(request.models), request.max_pixels) for request in requests] == [
             ({"light-model"}, small * 8 * 64 * 64),
             ({"light-model"}, 128 * 8 * 64 * 64),
-            ({"heavy-model"}, small * 8 * 64 * 64),
-            ({"heavy-model"}, 128 * 8 * 64 * 64),
+            ({"light-model", "heavy-model"}, small * 8 * 64 * 64),
+            ({"light-model", "heavy-model"}, 128 * 8 * 64 * 64),
         ]
         assert all(request.allow_lora is False for request in requests)

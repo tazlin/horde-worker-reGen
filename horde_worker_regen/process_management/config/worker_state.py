@@ -332,8 +332,8 @@ class WorkerState:
     Armed and cleared by the scheduler around head-starvation."""
 
     idle_fill_rung: int = 0
-    """Index into the idle-fill ladder (small sd15 -> large sd15 -> small sdxl -> large sdxl), advanced by one
-    each time a fill pop returns no job so the worker tries the next-heaviest quick-start work, and reset to 0
+    """Index into the idle-fill ladder (small sd15 -> large sd15 -> small sd15 and sdxl -> large sd15 and sdxl),
+    advanced by one each time a fill pop returns no job so the offer widens to heavier quick-start work, and reset to 0
     when a fill job is obtained or the scheduler clears ``wants_idle_fill_candidate``. Clamped to the concrete
     rung count (which skips baselines the worker has no model for) at pop time."""
 

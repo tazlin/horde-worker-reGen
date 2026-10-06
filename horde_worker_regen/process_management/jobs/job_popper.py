@@ -894,12 +894,13 @@ class JobPopper:
 
         Groups the already-serviceable offered models by size tier (LIGHT = sd15/sd2, HEAVY = sdxl; the
         whole-card EXTRA_LARGE tier can never quick-start, so it is dropped) and builds a smallest-fastest-first
-        rung list -- (light, small), (light, large), (heavy, small), (heavy, large) -- skipping any rung whose
-        group the worker has no model for. The current ``idle_fill_rung`` (clamped to the concrete rung count)
-        selects the offered subset and its max-power cap. Falls back to a flat small offer when model metadata
-        is unavailable (baselines would all read light) or no light/heavy model is configured, so the fill
-        degrades to a single small pop rather than mislabelling a heavy model as light. The caller sets
-        ``allow_lora=False``.
+        rung list: (light, small), (light, large), (light and heavy, small), (light and heavy, large), skipping
+        any rung whose group the worker has no model for. A heavy rung keeps the light models, so climbing only
+        widens the offer and a long arm settles on every quick-start model, never on the heavy group alone.
+        The current ``idle_fill_rung`` (clamped to the concrete rung count) selects the offered subset and its
+        max-power cap. Falls back to a flat small offer when model metadata is unavailable (baselines would all
+        read light) or no light/heavy model is configured, so the fill degrades to a single small pop rather
+        than mislabelling a heavy model as light. The caller sets ``allow_lora=False``.
         """
         small_cap = min(
             pop_max_power,
@@ -928,8 +929,8 @@ class JobPopper:
             rungs.append((light, small_cap))
             rungs.append((light, large_cap))
         if heavy:
-            rungs.append((heavy, small_cap))
-            rungs.append((heavy, large_cap))
+            rungs.append((light | heavy, small_cap))
+            rungs.append((light | heavy, large_cap))
 
         if not rungs:
             return models, small_cap
@@ -2225,8 +2226,8 @@ class JobPopper:
 
         if idle_fill_wanted:
             # Idle-fill ladder: offer a no-LoRA, smallest-fastest-first slice of the models (small sd15 ->
-            # large sd15 -> small sdxl -> large sdxl) so a card idled behind a download is fed the quickest
-            # work the horde currently has, escalating only when it has nothing lighter.
+            # large sd15 -> small sd15 and sdxl -> large sd15 and sdxl) so a card idled behind a download is
+            # fed the quickest work the horde currently has, widening only when it has nothing lighter.
             models, pop_max_power = self._apply_idle_fill_ladder(models, pop_max_power, bridge_data)
             pop_allow_lora = False
 

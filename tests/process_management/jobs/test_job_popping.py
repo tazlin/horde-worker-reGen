@@ -2513,8 +2513,9 @@ def _idle_fill_state(rung: int = 0) -> WorkerState:
 class TestIdleFillLadderShaping:
     """``_apply_idle_fill_ladder`` offers a smallest-fastest-first, size-narrowed no-LoRA slice per rung.
 
-    The rungs are (light=sd15, small), (light, large), (heavy=sdxl, small), (heavy, large); rungs whose
-    baseline the worker has no model for are skipped, and the whole-card EXTRA_LARGE tier is never a fill.
+    The rungs are (light=sd15, small), (light, large), (light and heavy=sdxl, small), (light and heavy, large);
+    rungs whose baseline the worker has no model for are skipped, and the whole-card EXTRA_LARGE tier is never
+    a fill.
     """
 
     @staticmethod
@@ -2541,18 +2542,24 @@ class TestIdleFillLadderShaping:
         assert models == {"sd15a"}
         assert cap == large
 
-    def test_rung2_offers_heavy_at_small_cap(self) -> None:
-        """Rung 2 is the first heavy rung, offering heavy at small cap."""
+    def test_rung2_adds_heavy_at_small_cap(self) -> None:
+        """Rung 2 is the first heavy rung, offering light and heavy at small cap."""
         models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 2)
-        assert models == {"sdxlA"}
+        assert models == {"sd15a", "sdxlA"}
         assert cap == _SMALL_CAP
 
-    def test_rung3_offers_heavy_at_large_cap(self) -> None:
-        """Rung 3 is the last rung, offering heavy at large cap."""
+    def test_rung3_offers_light_and_heavy_at_large_cap(self) -> None:
+        """Rung 3 is the last rung, offering light and heavy at large cap."""
         large = _SMALL_CAP * 4
         models, cap = self._ladder({"sd15a": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}, 3, max_power=large)
-        assert models == {"sdxlA"}
+        assert models == {"sd15a", "sdxlA"}
         assert cap == large
+
+    def test_climbing_never_removes_a_model(self) -> None:
+        """Each rung offers at least the models of the rung below, so a long arm never narrows to one group."""
+        baselines = {"sd15a": _SD15_BASELINE, "sd15b": _SD15_BASELINE, "sdxlA": _SDXL_BASELINE}
+        offers = [self._ladder(baselines, rung)[0] for rung in range(4)]
+        assert all(lower <= higher for lower, higher in zip(offers, offers[1:], strict=False))
 
     def test_absent_light_baseline_skips_to_heavy(self) -> None:
         """Rung 0 is light, but if the worker has no light models, it should skip to the heavy rung."""

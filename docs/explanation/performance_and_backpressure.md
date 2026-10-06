@@ -504,9 +504,11 @@ suppress it because they occupy concurrency without feeding the GPU; any actual 
 Once it passes `idle_fill_threshold_seconds` with a free inference sibling, the scheduler arms
 `WorkerState.wants_idle_fill_candidate` and the popper over-pops a small no-LoRA **fill** job to run in the
 meantime. The fill climbs a smallest-fastest-first **ladder** so the card is fed the quickest work the horde
-currently has: (light=sd15, small) → (light, large) → (heavy=sdxl, small) →
-(heavy, large), narrowing both the offered models (by size tier, dropping the
+currently has: (light=sd15, small) → (light, large) → (light and heavy=sdxl, small) →
+(light and heavy, large), narrowing both the offered models (by size tier, dropping the
 whole-card EXTRA_LARGE tier that can never quick-start) and the `max_power` per rung.
+A heavy rung keeps the light models, so each climb widens the offer and the top rung is
+every quick-start model at full size.
 Rungs whose baseline the worker has no model for are skipped, and when model metadata
 is unavailable the fill degrades to a single flat small pop. The ladder advances one
 rung each time a fill pop finds no job at the current rung (so it tries the
