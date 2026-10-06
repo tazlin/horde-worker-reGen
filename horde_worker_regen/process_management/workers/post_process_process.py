@@ -43,6 +43,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     UnsupportedControlMessageError,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
+from horde_worker_regen.utils.image_utils import UPLOAD_IMAGE_ENCODING, encode_image_for_upload
 from horde_worker_regen.utils.oom_signature import is_out_of_memory_text
 
 if TYPE_CHECKING:
@@ -71,19 +72,9 @@ class PostProcessorNotOnDiskError(RuntimeError):
         self.model_name = model_name
 
 
-def _sort_facefixers_last(post_processing: list[str]) -> list[str]:
-    """Return the requested post-processors with face-fixers ordered after upscalers.
-
-    Mirrors the inline post-processing order: an upscaler runs on the base image, then a face-fixer
-    refines the upscaled result. ``classify_post_processor`` decides which names are face-fixers so an
-    unknown name keeps its position rather than being dropped.
-    """
-    from hordelib.api import PostProcessorKind, classify_post_processor
-
-    def _key(name: str) -> int:
-        return 1 if classify_post_processor(name) is PostProcessorKind.facefixer else 0
-
-    return sorted(post_processing, key=_key)
+_PROGRESS_HEARTBEAT_MIN_INTERVAL_SECONDS = 1.0
+"""ComfyUI reports progress per sampler step and node; one heartbeat per interval keeps the parent's queue
+from flooding."""
 
 
 class HordePostProcessProcess(HordeProcess):
@@ -92,6 +83,7 @@ class HordePostProcessProcess(HordeProcess):
     _horde: HordeLib
     _shared_model_manager: SharedModelManager
     _dry_run_skip_post_processing: bool
+    _last_progress_heartbeat_monotonic: float = 0.0
 
     def __init__(
         self,
@@ -146,7 +138,7 @@ class HordePostProcessProcess(HordeProcess):
             try:
                 logger.info("Initialising HordeLib for post-processing")
                 with logger.catch(reraise=True):
-                    self._horde = HordeLib(aggressive_unloading=False)
+                    self._horde = HordeLib(aggressive_unloading=False, comfyui_callback=self._comfyui_callback)
                     self._shared_model_manager = SharedModelManager(do_not_load_model_mangers=True)
             except Exception as e:
                 logger.critical(f"Failed to initialise HordeLib: {type(e).__name__} {e}")
@@ -170,43 +162,55 @@ class HordePostProcessProcess(HordeProcess):
             info="Waiting for job",
         )
 
-    def _post_process_one_image(self, image_bytes: bytes, post_processing: list[str]) -> HordeImageResult | None:
-        """Run the requested post-processors over a single image, threading each result into the next.
+    def _comfyui_callback(self, label: str, data: dict, _id: str) -> None:  # pyrefly: ignore[implicit-any-type-argument] - we don't control the type signature of this callback
+        """Send a liveness heartbeat on ComfyUI progress, at most once per interval."""
+        now = time.monotonic()
+        if now - self._last_progress_heartbeat_monotonic < _PROGRESS_HEARTBEAT_MIN_INTERVAL_SECONDS:
+            return
+        self._last_progress_heartbeat_monotonic = now
+        self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
 
-        Returns the post-processed image (encoded as PNG bytes, matching the pre-post-processing format)
-        with any faults the operations recorded, or None if no output image survived.
+    def _post_process_one_image(
+        self,
+        image_bytes: bytes,
+        post_processing: list[str],
+        facefixer_strength: float | None,
+    ) -> HordeImageResult | None:
+        """Run the requested post-processors over a single image as one hordelib chain.
+
+        hordelib owns the operation order. Returns the result encoded for upload with the chain's faults,
+        or None if the chain produced no image.
         """
-        from horde_sdk.ai_horde_api.apimodels.base import GenMetadataEntry
-
-        current_image = PIL.Image.open(io.BytesIO(image_bytes))
-        faults: list[GenMetadataEntry] = []
-
-        for operation in _sort_facefixers_last(post_processing):
-            # Upscales can run for many seconds; a heartbeat per operation keeps the parent's liveness
-            # view fresh so a legitimately busy post-processing pass is not mistaken for a hung process.
-            self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+        for operation in post_processing:
             self._require_post_processor_on_disk(operation)
-            result = self._horde.post_process(
-                {
-                    "model": operation,
-                    "source_image": current_image,
-                },
-            )
-            if result.image is None:
-                logger.error(f"Post-processor produced no image; aborting remaining operations: op={operation}")
-                return None
-            current_image = result.image
-            faults += result.faults
 
-        buffer = io.BytesIO()
-        current_image.save(buffer, format="PNG")
-        return HordeImageResult(image_bytes=buffer.getvalue(), generation_faults=faults)
+        # The chain is one graph run; this heartbeat and the progress callback keep a long chain from
+        # reading as a hung process.
+        self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+        result = self._horde.post_process_chain(
+            PIL.Image.open(io.BytesIO(image_bytes)),
+            post_processing,
+            facefixer_strength=facefixer_strength,
+        )
+        if result.image is None:
+            logger.error(f"Post-processing chain produced no image: operations={post_processing}")
+            return None
+
+        return HordeImageResult(
+            image_bytes=encode_image_for_upload(result.image).getvalue(),
+            image_encoding=UPLOAD_IMAGE_ENCODING,
+            generation_faults=result.faults,
+        )
 
     def _post_process_all_images(self, message: HordePostProcessControlMessage) -> list[HordeImageResult]:
-        """Post-process every image in the job, raising if any operation yields no output image."""
+        """Post-process every image in the job, raising if any chain yields no output image."""
         processed_images: list[HordeImageResult] = []
         for image_bytes in message.images_bytes:
-            processed = self._post_process_one_image(image_bytes, message.post_processing)
+            processed = self._post_process_one_image(
+                image_bytes,
+                message.post_processing,
+                message.facefixer_strength,
+            )
             if processed is None:
                 raise RuntimeError("post-processing produced no output image")
             processed_images.append(processed)

@@ -31,6 +31,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadAvailabilityMessage,
     HordeDownloadMetricsMessage,
     HordeHeartbeatType,
+    HordeImageResult,
     HordeInferenceResultMessage,
     HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
@@ -79,6 +80,7 @@ from horde_worker_regen.telemetry_spans import (
     jobs_faulted_counter,
     queue_depth_counter,
 )
+from horde_worker_regen.utils.image_utils import ImageEncoding
 
 _excludes_for_job_dump = {"source_image", "source_mask", "extra_source_images", "r2_upload"}
 
@@ -2011,7 +2013,13 @@ class MessageDispatcher:
                 )
 
             if replacement_image is not None:
-                completed_job_info.job_image_results[i].image_bytes = replacement_image
+                # Replace the result whole: the replacement is PNG, and bytes swapped in under the checked
+                # image's encoding marker would be uploaded as something they are not.
+                completed_job_info.job_image_results[i] = HordeImageResult(
+                    image_bytes=replacement_image,
+                    generation_faults=completed_job_info.job_image_results[i].generation_faults,
+                    image_encoding=ImageEncoding.PNG,
+                )
                 num_images_censored += 1
                 if message.safety_evaluations[i].is_csam:
                     num_images_csam += 1

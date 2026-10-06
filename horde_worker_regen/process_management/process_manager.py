@@ -314,6 +314,7 @@ from horde_worker_regen.text_backends.provision import (
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers, mean_across_cards
+from horde_worker_regen.utils.image_utils import UPLOAD_IMAGE_ENCODING
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 from horde_worker_regen.utils.wddm_paging_monitor import WddmPagingMonitor, assess_worker_paging
@@ -5053,7 +5054,10 @@ class HordeWorkerProcessManager:
 
         adopted = await self._job_tracker.readopt_post_inference_result(
             tracked.job_info,
-            job_image_results=[HordeImageResult(image_bytes=image) for image in message.images_bytes],
+            job_image_results=[
+                HordeImageResult(image_bytes=image, image_encoding=UPLOAD_IMAGE_ENCODING)
+                for image in message.images_bytes
+            ],
         )
         if not adopted:
             logger.warning(

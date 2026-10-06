@@ -62,6 +62,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeStripResultMessage,
 )
 from horde_worker_regen.process_management.lifecycle.process_info import ChildProcessHandle
+from horde_worker_regen.utils.image_utils import encode_image_for_upload
 
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
@@ -538,9 +539,9 @@ class UtilitiesProcessAdapter:
     def remove_background(self, image_bytes: bytes) -> bytes:
         """Strip an image's background via the service and return the result WebP-encoded for R2.
 
-        The service's client decodes the PNG, runs rembg, and returns a ``PIL.Image``; this encodes that
-        to WebP with the same settings the post-processing lane uses (``quality=95, method=6``) so the
-        submit path is byte-shape-identical regardless of which lane produced the result.
+        The service's client decodes the image, runs rembg, and returns a ``PIL.Image``; this encodes it once
+        in the upload encoding (:func:`encode_image_for_upload`), so the submit path uploads the bytes as they
+        are, whichever lane produced them.
 
         Raises:
             Exception: Any client-side or service-side failure (surfaced as a faulted result by the caller).
@@ -551,9 +552,7 @@ class UtilitiesProcessAdapter:
 
         source_image = Image.open(io.BytesIO(image_bytes))
         result_image = self._server.client.remove_background(source_image)
-        buffer = io.BytesIO()
-        result_image.save(buffer, format="WebP", quality=95, method=6)
-        return buffer.getvalue()
+        return encode_image_for_upload(result_image).getvalue()
 
     def annotate(self, control_type: str, image_bytes: bytes, resolution: int = 512) -> bytes:
         """POST a source image to the annotators endpoint and return the control map PNG bytes.

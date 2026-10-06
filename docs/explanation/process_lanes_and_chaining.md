@@ -385,7 +385,15 @@ stage did not complete.
    at the generate stage's completion milestone.
 4. **Post-process** (when requested): the dispatcher queues the job for the lane; the post-processing
    orchestrator dispatches the first fittable pending job, sends the raw images and the requested operations,
-   and the processed images replace the raw ones. A chain that never fits the card ages out to a no-image
+   and the processed images replace the raw ones. The lane runs each image's operations as one hordelib
+   chain (`HordeLib.post_process_chain`): hordelib orders them (face fixers, then upscalers) and runs them as
+   a single composed graph, so the image is not encoded or decoded between operations, and the job's
+   `facefixer_strength` rides the control message to the face-fix stage. The lane encodes the result once,
+   in the upload encoding (`encode_image_for_upload`), and marks it (`HordeImageResult.image_encoding`); the
+   submit path uploads bytes so marked as they are and encodes anything else in a worker thread, off the
+   event loop. A censored image is replaced whole, with the replacement's own encoding. The lane sends a
+   heartbeat before the chain and, rate-limited, on ComfyUI's progress events. A chain that never fits the
+   card ages out to a no-image
    fault; an orphan watchdog requeues a job whose result was lost (bounded), then faults without images.
    `strip_background` is excluded from this pass (it has no in-graph path) and runs last on the
    [image-utilities lane](image_utilities_lane.md) instead (step 5).

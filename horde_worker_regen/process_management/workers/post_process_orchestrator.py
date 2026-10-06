@@ -826,7 +826,8 @@ class PostProcessOrchestrator:
         # Background removal is not run here: it has no in-graph path (its ``rembg`` stack is not in the
         # main venv) and is applied last on the image-utilities lane after this pass. Only the pure-torch
         # transforms (upscale/face-fix) go to the post-processing child.
-        post_processing = completed_job_info.sdk_api_job_info.payload.post_processing or []
+        payload = completed_job_info.sdk_api_job_info.payload
+        post_processing = payload.post_processing or []
         lane_forms = [form for form in post_processing if not is_strip_background_form(form)]
         message_sent_succeeded = post_process_process.safe_send_message(
             HordePostProcessControlMessage(
@@ -834,6 +835,7 @@ class PostProcessOrchestrator:
                 job_id=completed_job_info.sdk_api_job_info.id_,
                 images_bytes=completed_job_info.images_bytes,
                 post_processing=lane_forms,
+                facefixer_strength=payload.facefixer_strength,
             ),
         )
 

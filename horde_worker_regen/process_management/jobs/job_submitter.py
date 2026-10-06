@@ -8,6 +8,7 @@ import random
 import ssl
 import time
 from asyncio import CancelledError, Task
+from io import BytesIO
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -32,7 +33,7 @@ from horde_worker_regen.process_management.jobs.job_models import (
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
-from horde_worker_regen.utils.image_utils import image_bytes_to_stream_buffer
+from horde_worker_regen.utils.image_utils import UPLOAD_IMAGE_ENCODING, image_bytes_to_stream_buffer
 
 if TYPE_CHECKING:
     from horde_model_reference.model_reference_records import ImageGenerationModelRecord
@@ -223,9 +224,17 @@ class JobSubmitter:
         # The image bytes are identical across this generation's submit retries, so a generation whose upload
         # already landed re-attempts only the API submit below, never the bandwidth-heavy R2 upload again.
         if new_submit.image_result is not None and not new_submit.upload_completed:
-            image_in_buffer = image_bytes_to_stream_buffer(
-                new_submit.image_result.image_bytes,
-            )
+            # Off the event loop: the encode is CPU work that scales with the pixel count, and everything the
+            # orchestrator does (dispatch, clearance, the message pump) shares this loop. Bytes a stage already
+            # encoded for upload go as they are.
+            image_in_buffer: BytesIO | None
+            if new_submit.image_result.image_encoding == UPLOAD_IMAGE_ENCODING:
+                image_in_buffer = BytesIO(new_submit.image_result.image_bytes)
+            else:
+                image_in_buffer = await asyncio.to_thread(
+                    image_bytes_to_stream_buffer,
+                    new_submit.image_result.image_bytes,
+                )
             if image_in_buffer is None:
                 logger.critical(
                     f"There is an invalid image in the job results for {new_submit.job_id}, "

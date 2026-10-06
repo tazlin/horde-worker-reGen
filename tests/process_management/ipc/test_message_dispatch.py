@@ -812,6 +812,41 @@ class TestHandleSafetyResult:
         assert job_info in job_tracker.jobs_pending_submit
         assert job_info not in job_tracker.jobs_being_safety_checked
 
+    async def test_a_censored_image_is_replaced_whole_with_its_own_encoding(self) -> None:
+        """The censor replacement is PNG, so the replaced result must not keep the checked image's encoding.
+
+        A post-processed image arrives in the upload encoding and the submit path uploads such bytes as they
+        are; a replacement swapped in under that marker would be uploaded as something it is not.
+        """
+        from horde_worker_regen.process_management.ipc.messages import HordeImageResult
+        from horde_worker_regen.utils.image_utils import UPLOAD_IMAGE_ENCODING, ImageEncoding
+
+        job_tracker = JobTracker()
+        job = Mock()
+        job.id_ = "censor-test-id"
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        job_info.job_image_results = [
+            HordeImageResult(image_bytes=b"post-processed", image_encoding=UPLOAD_IMAGE_ENCODING),
+        ]
+        await move_job_to_being_safety_checked_async(job_tracker, job_info)
+        message_dispatcher = _make_dispatcher(job_tracker=job_tracker)
+
+        safety_eval = Mock()
+        safety_eval.failed = False
+        safety_eval.replacement_image_bytes = b"replacement-png"
+        safety_eval.is_csam = False
+        safety_eval.is_nsfw = True
+        safety_eval.aesthetic_score = None
+
+        await message_dispatcher._handle_safety_result(
+            Mock(job_id=job.id_, safety_evaluations=[safety_eval], time_elapsed=1.0),
+        )
+
+        replaced = job_info.job_image_results[0]
+        assert replaced.image_bytes == b"replacement-png"
+        assert replaced.image_encoding is ImageEncoding.PNG
+
     async def test_safety_result_attaches_aesthetic_metadata(self) -> None:
         """A safety evaluation that carries an aesthetic score attaches it as gen_metadata.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
@@ -72,6 +73,55 @@ class TestSubmitSingleGeneration:
         new_submit.completed_job_info = Mock(state=None)
 
         await submitter.submit_single_generation(new_submit)
+        new_submit.fault.assert_called_once()
+
+    async def test_bytes_in_the_upload_encoding_are_not_re_encoded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A result a stage already encoded for upload skips the submit-side encode."""
+        from horde_worker_regen.process_management.jobs import job_submitter
+        from horde_worker_regen.utils.image_utils import UPLOAD_IMAGE_ENCODING
+
+        encode_calls: list[bytes] = []
+        monkeypatch.setattr(job_submitter, "image_bytes_to_stream_buffer", encode_calls.append)
+        submitter = _make_submitter(horde_client_session=AsyncMock())
+
+        new_submit = Mock(spec=PendingSubmitJob)
+        new_submit.job_id = "test-id"
+        new_submit.image_result = HordeImageResult(image_bytes=b"webp-bytes", image_encoding=UPLOAD_IMAGE_ENCODING)
+        new_submit.is_faulted = False
+        new_submit.upload_completed = False
+        new_submit.completed_job_info = Mock(state=None)
+        new_submit.completed_job_info.sdk_api_job_info.get_follow_up_failure_cleanup_request.return_value = []
+
+        await submitter.submit_single_generation(new_submit)
+
+        assert encode_calls == []
+
+    async def test_the_upload_encode_runs_off_the_event_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The upload encode is handed to a worker thread, so a large image never stalls the orchestrator."""
+        import threading
+
+        from horde_worker_regen.process_management.jobs import job_submitter
+
+        encode_threads: list[threading.Thread] = []
+
+        def _record_thread(_image_bytes: bytes) -> None:
+            encode_threads.append(threading.current_thread())
+
+        monkeypatch.setattr(job_submitter, "image_bytes_to_stream_buffer", _record_thread)
+        submitter = _make_submitter(horde_client_session=AsyncMock())
+
+        new_submit = Mock(spec=PendingSubmitJob)
+        new_submit.job_id = "test-id"
+        new_submit.image_result = Mock(image_bytes=b"encoded")
+        new_submit.is_faulted = False
+        new_submit.upload_completed = False
+        new_submit.completed_job_info = Mock(state=None)
+        new_submit.completed_job_info.sdk_api_job_info.get_follow_up_failure_cleanup_request.return_value = []
+
+        await submitter.submit_single_generation(new_submit)
+
+        assert len(encode_threads) == 1
+        assert encode_threads[0] is not threading.current_thread()
         new_submit.fault.assert_called_once()
 
     async def test_already_faulted_no_image_proceeds_to_submit(self) -> None:

@@ -383,6 +383,26 @@ class TestStartPostProcessing:
         assert sent.images_bytes == [b"raw-image"]
         assert sent.post_processing == ["RealESRGAN_x4plus", "GFPGAN"]
 
+    async def test_dispatch_carries_the_jobs_facefixer_strength(self) -> None:
+        """The control message carries the payload's face-fixer strength to the lane."""
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+
+        job_info = _make_pp_job_info(["GFPGAN"])
+        job = job_info.sdk_api_job_info
+        job_info.sdk_api_job_info = job.model_copy(
+            update={"payload": job.payload.model_copy(update={"facefixer_strength": 0.35})},
+        )
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        sent = lane.pipe_connection.send.call_args.args[0]
+        assert isinstance(sent, HordePostProcessControlMessage)
+        assert sent.facefixer_strength == 0.35
+
     async def test_strip_background_is_dropped_from_the_post_processing_lane_pass(self) -> None:
         """Background removal has no in-graph path, so only the pure-torch transforms go to the lane."""
         process_manager = make_testable_process_manager()
