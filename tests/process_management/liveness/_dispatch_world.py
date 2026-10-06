@@ -405,7 +405,8 @@ class _StagedPrefetch:
     """A staged lane's read of its checkpoint's reclaimed pages, begun at dispatch and overlapping the wait.
 
     hordelib starts its prefetch-and-touch as the job starts on the lane, so the read runs while the lane waits
-    for clearance and the commit pays only what has not finished.
+    for clearance and the commit pays only what has not finished. An idle lane's warm is the same read begun
+    before dispatch, and the dispatch that stages a job of its model on that lane carries it on.
     """
 
     model: str
@@ -413,6 +414,8 @@ class _StagedPrefetch:
     started_at: float
     read_seconds: float
     """The disk read the checkpoint needed when the prefetch began."""
+    staged_at: float | None
+    """When a job was staged on the lane; None while an idle lane's warm waits for its dispatch."""
 
 
 @dataclass
@@ -438,7 +441,9 @@ class _JobWindow:
     """Whether the job paid a host-to-device load of its weights."""
     load_seconds: float = 0.0
     disk_read_seconds: float = 0.0
-    """Seconds spent reading checkpoint pages the host had reclaimed, staged and after clearance together."""
+    """Seconds spent reading checkpoint pages the host had reclaimed, warm, staged and after clearance together."""
+    warm_read_seconds: float = 0.0
+    """The part of ``disk_read_seconds`` an idle lane's warm paid before dispatch, outside ``load_seconds``."""
     staged_read_seconds: float = 0.0
     """The part of ``disk_read_seconds`` a staged prefetch paid before clearance, outside ``load_seconds``."""
     cleared_read_seconds: float = 0.0
@@ -725,6 +730,7 @@ class _DispatchWorld:
         closed_loop: bool = False,
         clearance_lease: bool = False,
         staged_lane_prefetch: bool = False,
+        idle_lane_warm: bool = False,
         tail_overlap: bool = False,
         gpu_sampling_lease_slots: int | None = None,
         performance_model: bool = False,
@@ -808,6 +814,11 @@ class _DispatchWorld:
                 starts on the lane, and keeps them resident each staged tick. The commit then pays only the
                 unfinished part of the read, plus anything evicted during the wait. Needs ``host_ram`` and the
                 lease; off, the whole read is paid after clearance.
+            idle_lane_warm: Whether an idle lane holding a pending job's model in RAM reads its checkpoint's
+                reclaimed pages back while the job is not dispatchable, as the parent's warm message will have
+                the child do, and keeps them resident while the lane idles. A dispatch of that model to the lane
+                carries the read on, so clearance pays only what the warm has not finished. Needs ``host_ram``
+                and the lease; off, a lane reads nothing before its job is staged.
             tail_overlap: Whether each card's clearance controller may clear the next lane inside the outgoing
                 sample's tail, as production does by default. With it, each sampling lane reports its step
                 position through the parent's heartbeat path every tick, and each finished job that paid a device
@@ -930,7 +941,10 @@ class _DispatchWorld:
             raise ValueError("the clearance lease is a claim about time, so it needs the closed-loop fidelity")
         if (staged_lane_prefetch or tail_overlap) and not clearance_lease:
             raise ValueError("a staged prefetch and the tail overlap both act on staged lanes, so they need the lease")
+        if idle_lane_warm and not clearance_lease:
+            raise ValueError("an idle lane's warm is credited at its job's clearance, so it needs the lease")
         self.staged_lane_prefetch = staged_lane_prefetch
+        self.idle_lane_warm = idle_lane_warm
         self.tail_overlap = tail_overlap
         self.child_free_view_lie_mb = child_free_view_lie_mb
         self.footprint_undershoot = footprint_undershoot
@@ -1038,6 +1052,13 @@ class _DispatchWorld:
         Until then the lane reads ``INFERENCE_PRIMED``, as a production child does through its load."""
         self._staged_prefetch: dict[str, _StagedPrefetch] = {}
         """Per staged job, the checkpoint read its lane began at dispatch, until the clearance that commits it."""
+        self._idle_lane_warms: dict[int, _StagedPrefetch] = {}
+        """Per idle lane, the warm read of its checkpoint begun ahead of a pending job, until a dispatch adopts it.
+
+        Keyed by lane rather than sharing ``_staged_prefetch``: no job is staged on the lane yet, and the read is
+        handed to whichever job of its model the lane is dispatched next."""
+        self._idle_lane_warmed: set[tuple[int, str]] = set()
+        """Every (lane, job id) pair a warm was started for, so a pair is warmed at most once."""
         self.job_windows: dict[str, _JobWindow] = {}
         """Every dispatched job's instants, by job id, kept after the job completes."""
         self.popped_at: dict[str, float] = {}
@@ -2559,8 +2580,14 @@ class _DispatchWorld:
         """Start a staged lane's read of whatever of its checkpoint the host has reclaimed.
 
         Only a lane whose weights wait in its RAM cache reads anything; a lane still holding them on the device
-        commits without a load.
+        commits without a load. A warm the idle lane began for the job's model is carried on rather than restarted,
+        so the time it has already run counts toward the read.
         """
+        warm = self._idle_lane_warms.pop(lane_id, None)
+        if warm is not None and lane_id in self._staged_mb and warm.model == admitted.model:
+            warm.staged_at = self.now
+            self._staged_prefetch[str(admitted.id_)] = warm
+            return
         if not self.staged_lane_prefetch or self.host_ram is None or lane_id not in self._staged_mb:
             return
         model_class = _model_by_name(admitted.model or "")
@@ -2572,12 +2599,95 @@ class _DispatchWorld:
             checkpoint_mb=checkpoint_mb,
             started_at=self.now,
             read_seconds=self.host_ram.read_into_cache(model_class.name, checkpoint_mb),
+            staged_at=self.now,
         )
+
+    def _lane_idles_holding(self, lane_id: int, *, model: str) -> bool:
+        """Whether a lane holds ``model`` in its RAM cache, owns no job, and has no load of another model coming."""
+        lane = self._process_map.get(lane_id)
+        if lane is None or lane_id not in self._staged_mb or self._staged_model.get(lane_id) != model:
+            return False
+        if lane.current_inference_job() is not None:
+            return False
+        pending = self._loading.get(lane_id)
+        return pending is None or pending.model == model
+
+    def _begin_idle_lane_warms(self) -> None:
+        """Start warm reads on idle lanes holding pending jobs' models, in queue order, while each read fits.
+
+        A stand-in for the parent's warm message to such a lane; the world's handling of that message replaces
+        this when it lands. A warm that evicts the pages of the lane that loads next trades one cold read for
+        another, so the protected set is the staged lanes' models and the earlier pending jobs' models, and the
+        room for a warm is the host's free pages plus the cached pages of every unprotected model other than its
+        own; the walk stops at the first warm that does not fit. A cleared or sampling lane's model is not
+        protected: its weights are on the device, and its pages are needed again only by a later job of that
+        model, which the walk covers. Protected models are touched before each warm (earliest pending most recent),
+        as a lane that loads next holds its pages in its working set, which the standby trim takes last. Production
+        takes the same set from its process map and queue, and the room from the host's available memory (free plus
+        reclaimable cache, as psutil reports it) less the protected checkpoints' sizes. Each (lane, job) pair is
+        warmed once; a fully cached checkpoint starts nothing.
+        """
+        assert self.host_ram is not None
+        in_progress = {str(job.id_) for job in self._job_tracker.jobs_in_progress}
+        staged_models: list[str] = []
+        for lane in self._process_map.values():
+            owned = lane.current_inference_job()
+            if owned is not None and owned.model is not None and str(owned.id_) not in self._occupancy:
+                staged_models.append(owned.model)
+        protected_models: set[str] = set(staged_models)
+        earlier_pending_models: list[str] = []
+        for job in self._job_tracker.jobs_pending_inference:
+            if job.model is None or job.id_ is None:
+                continue
+            job_id = str(job.id_)
+            if job_id in in_progress or job_id in self.job_windows:
+                continue
+            # The room for this job's warm excludes its own pages, so its model joins the protected set before any
+            # later job is judged, whether or not this one is warmed.
+            protected_models.add(job.model)
+            earlier_pending_models.append(job.model)
+            model_class = _model_by_name(job.model)
+            if model_class is None:
+                continue
+            lane_id = next(
+                (
+                    candidate
+                    for candidate in sorted(self._staged_mb)
+                    if (candidate, job_id) not in self._idle_lane_warmed
+                    and candidate not in self._idle_lane_warms
+                    and self._lane_idles_holding(candidate, model=job.model)
+                ),
+                None,
+            )
+            if lane_id is None:
+                continue
+            checkpoint_mb, _private_mb = self._host_model_ram(model_class)
+            uncached_mb = checkpoint_mb - self.host_ram.cache_mb.get(job.model, 0.0)
+            if uncached_mb <= 0.0:
+                continue
+            room_mb = self.host_ram.free_mb + sum(
+                cached_mb
+                for cached_model, cached_mb in self.host_ram.cache_mb.items()
+                if cached_model not in protected_models
+            )
+            if room_mb < uncached_mb:
+                return
+            for protected_model in (*staged_models, *reversed(earlier_pending_models)):
+                self.host_ram.touch(protected_model)
+            self._idle_lane_warmed.add((lane_id, job_id))
+            self._idle_lane_warms[lane_id] = _StagedPrefetch(
+                model=job.model,
+                checkpoint_mb=checkpoint_mb,
+                started_at=self.now,
+                read_seconds=self.host_ram.read_into_cache(job.model, checkpoint_mb),
+                staged_at=None,
+            )
 
     def _touch_staged_prefetches(self) -> None:
         """Keep every staged lane's prefetched pages most recently used, and forget prefetches whose job left.
 
-        hordelib touches the weights it prefetched, so a pressure eviction takes them after anything idle.
+        hordelib touches the weights it prefetched, so a pressure eviction takes them after anything idle. An idle
+        lane's warm is touched the same way while the lane idles holding its model, and forgotten once it does not.
         """
         assert self.host_ram is not None
         for job_id, prefetch in list(self._staged_prefetch.items()):
@@ -2588,23 +2698,40 @@ class _DispatchWorld:
                 del self._staged_prefetch[job_id]
                 continue
             self.host_ram.touch(prefetch.model)
+        for lane_id, warm in list(self._idle_lane_warms.items()):
+            if not self._lane_idles_holding(lane_id, model=warm.model):
+                del self._idle_lane_warms[lane_id]
+                continue
+            self.host_ram.touch(warm.model)
 
-    def _checkpoint_read_seconds(self, job_id: str, *, model: str, checkpoint_mb: float) -> tuple[float, float]:
-        """Return the disk read a committing job paid while staged and the read left for after clearance.
+    def _checkpoint_read_seconds(
+        self,
+        job_id: str,
+        *,
+        model: str,
+        checkpoint_mb: float,
+    ) -> tuple[float, float, float]:
+        """Return the disk read a committing job paid as an idle lane's warm, while staged, and after clearance.
 
-        Without a staged prefetch the whole read follows clearance. With one, the elapsed staged time covers the
-        read up to its length, and pages evicted during the wait are read again after clearance; the after-
-        clearance part never exceeds a read of the whole checkpoint.
+        Without a prefetch the whole read follows clearance. With one, the time elapsed since the read began
+        covers it up to its length, split at the dispatch that staged the job, and pages evicted in the meantime
+        are read again after clearance; the after-clearance part never exceeds a read of the whole checkpoint.
         """
         assert self.host_ram is not None
         prefetch = self._staged_prefetch.pop(job_id, None)
         if prefetch is None:
-            return 0.0, self.host_ram.read_into_cache(model, checkpoint_mb)
-        staged_seconds = min(prefetch.read_seconds, max(0.0, self.now - prefetch.started_at))
-        unfinished_seconds = prefetch.read_seconds - staged_seconds
+            return 0.0, 0.0, self.host_ram.read_into_cache(model, checkpoint_mb)
+        covered_seconds = min(prefetch.read_seconds, max(0.0, self.now - prefetch.started_at))
+        staged_at = prefetch.started_at if prefetch.staged_at is None else prefetch.staged_at
+        warm_seconds = min(covered_seconds, max(0.0, staged_at - prefetch.started_at))
+        unfinished_seconds = prefetch.read_seconds - covered_seconds
         reread_seconds = self.host_ram.read_into_cache(model, checkpoint_mb)
         whole_read_seconds = checkpoint_mb / self.host_ram.read_mb_per_second
-        return staged_seconds, min(whole_read_seconds, unfinished_seconds + reread_seconds)
+        return (
+            warm_seconds,
+            covered_seconds - warm_seconds,
+            min(whole_read_seconds, unfinished_seconds + reread_seconds),
+        )
 
     # -- clearance lease ----------------------------------------------------------------------------------
 
@@ -2718,14 +2845,15 @@ class _DispatchWorld:
         decode_spike_mb = self._actual_charge_mb(predict_job_decode_spike_mb(job, baseline) or 0.0) if phased else 0.0
         megapixels = float(job.payload.width * job.payload.height * (job.payload.n_iter or 1)) / (1024.0 * 1024.0)
         load_seconds = 0.0 if not loaded_now else (weights_mb / 1024.0) * _LOAD_SECONDS_PER_GB
+        warm_read_seconds = 0.0
         staged_read_seconds = 0.0
         cleared_read_seconds = 0.0
         if loaded_now and self.host_ram is not None and model_class is not None:
             # The weights come from the lane's mapped checkpoint, so pages the host reclaimed while the lane
-            # idled are read from disk first, less whatever a staged prefetch already read; a monolithic job
-            # also brings its text encoder and VAE across.
+            # idled are read from disk first, less whatever a warm or a staged prefetch already read; a
+            # monolithic job also brings its text encoder and VAE across.
             checkpoint_mb, _private_mb = self._host_model_ram(model_class)
-            staged_read_seconds, cleared_read_seconds = self._checkpoint_read_seconds(
+            warm_read_seconds, staged_read_seconds, cleared_read_seconds = self._checkpoint_read_seconds(
                 job_id,
                 model=model,
                 checkpoint_mb=checkpoint_mb,
@@ -2786,7 +2914,8 @@ class _DispatchWorld:
             window.sample_until = sample_until
             window.loaded_now = loaded_now
             window.load_seconds = load_seconds
-            window.disk_read_seconds = staged_read_seconds + cleared_read_seconds
+            window.disk_read_seconds = warm_read_seconds + staged_read_seconds + cleared_read_seconds
+            window.warm_read_seconds = warm_read_seconds
             window.staged_read_seconds = staged_read_seconds
             window.cleared_read_seconds = cleared_read_seconds
         self._sync_reported_vram()
@@ -3405,6 +3534,10 @@ class _DispatchWorld:
             dispatched = 0
         else:
             dispatched = await self._dispatch_until_full()
+        if self.idle_lane_warm and self.host_ram is not None:
+            # After the dispatch pass, which is the only point that knows which pending jobs this tick left
+            # unseated, and where the parent's warm branch will read the same thing.
+            self._begin_idle_lane_warms()
         # A job the dispatch gate held is one it refused for a reason of its own, so its idle lane is not a
         # window the preload cost. The holds are read after the pass, which is where the gate records them.
         could_have_seated -= self._dispatch_held_job_ids()

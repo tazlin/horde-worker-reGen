@@ -197,11 +197,13 @@ def two_sampler_share(world: _DispatchWorld) -> float:
 
 @dataclass(frozen=True)
 class CheckpointReadSplit:
-    """Represents one device load's checkpoint read, split at the job's clearance."""
+    """Represents one device load's checkpoint read, split at the job's dispatch and at its clearance."""
 
     job_id: str
     lane_id: int
     model: str
+    warm_seconds: float
+    """Read seconds an idle lane's warm paid before dispatch, while the job was pending."""
     staged_seconds: float
     """Read seconds a staged prefetch paid before clearance, while the lane waited."""
     cleared_seconds: float
@@ -211,12 +213,13 @@ class CheckpointReadSplit:
 
 
 def checkpoint_read_splits(world: _DispatchWorld) -> list[CheckpointReadSplit]:
-    """Return, per job that paid a device load, the read seconds paid while staged and after clearance."""
+    """Return, per job that paid a device load, the read seconds paid as a warm, while staged and after clearance."""
     return [
         CheckpointReadSplit(
             job_id=window.job_id,
             lane_id=window.lane_id,
             model=window.model,
+            warm_seconds=window.warm_read_seconds,
             staged_seconds=window.staged_read_seconds,
             cleared_seconds=window.cleared_read_seconds,
             booked_holding=window.booked_holding,
