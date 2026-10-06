@@ -5206,9 +5206,10 @@ _SAME_BASELINE_ARRIVALS = _same_baseline_arrivals()
 def _same_baseline_world(headroom: _HostHeadroom) -> _DispatchWorld:
     """A 24 GB card, four lanes each holding an SDXL checkpoint in RAM, two sampling slots, and the lease.
 
-    The lease runs with production's default tail overlap. The staged lane's prefetch stays off, since its
-    production side is not in place. Foreign RAM is set after seeding, from the worker's settled private pages,
-    so ``headroom`` is exactly the page cache left for checkpoints.
+    The lease runs with production's default tail overlap, and a staged lane reads its checkpoint back from
+    disk while it waits, as hordelib's loader prefetches a cache-hit component at job start. Foreign RAM is set
+    after seeding, from the worker's settled private pages, so ``headroom`` is exactly the page cache left for
+    checkpoints.
     """
     ledger = HostRamLedger(
         _SAME_BASELINE_HOST_TOTAL_MB,
@@ -5223,6 +5224,7 @@ def _same_baseline_world(headroom: _HostHeadroom) -> _DispatchWorld:
         closed_loop=True,
         clearance_lease=True,
         tail_overlap=True,
+        staged_lane_prefetch=True,
         service_contexts=True,
         tick_seconds=_SAME_BASELINE_TICK_SECONDS,
         host_ram=ledger,
@@ -5274,8 +5276,9 @@ async def _same_baseline_run(headroom: _HostHeadroom) -> _DispatchWorld:
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "the device load is paid after clearance: the next lane's warm step (hordelib prefetch at job "
-        "start on a cache hit) and the retention dispatch hold under the lease are not landed"
+        "the device load is paid after clearance: the parent warms no idle lane ahead of dispatch (a "
+        "staged waiter clears within about a tick, too soon for its job-start prefetch to finish the read) "
+        "and the retention dispatch hold under the lease is not landed"
     ),
 )
 @pytest.mark.parametrize("headroom", _HEADROOM_LEVELS, ids=[level.label for level in _HEADROOM_LEVELS])
@@ -5307,8 +5310,9 @@ async def test_y_the_handoff_gap_carries_no_device_load(headroom: _HostHeadroom)
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "a lane booked as holding its model reads reclaimed pages after clearance: the warm step "
-        "(hordelib prefetch at job start on a cache hit, covering the text encoder) is not landed"
+        "a lane booked as holding its model reads reclaimed pages after clearance: the parent warms no "
+        "idle lane ahead of dispatch (a preload to a lane already holding the model), and a staged waiter "
+        "clears too soon for its job-start prefetch to finish the read"
     ),
 )
 @pytest.mark.parametrize("headroom", _HEADROOM_LEVELS, ids=[level.label for level in _HEADROOM_LEVELS])
