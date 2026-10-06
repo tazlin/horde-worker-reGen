@@ -1313,8 +1313,10 @@ class _DispatchWorld:
         # The rows vary VRAM, never host RAM: pinning an ample reading keeps the RAM admission gates out of
         # the variation and stops a row's outcome depending on how much memory the machine running it has.
         self._scheduler.set_available_ram_mb_provider(lambda: _AMPLE_RAM_MB)
+        self._scheduler.set_available_commit_mb_provider(lambda: None)
         if host_ram is not None:
             self._scheduler.set_available_ram_mb_provider(lambda: host_ram.available_mb)
+            self._scheduler.set_available_commit_mb_provider(lambda: host_ram.available_commit_mb)
             self._scheduler._measured_total_ram_mb = lambda: host_ram.total_mb
             self._scheduler._resolve_checkpoint_path = self._host_checkpoint_path
             self._scheduler._read_component_sidecar = lambda _model: None

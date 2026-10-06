@@ -1013,12 +1013,61 @@ class RamAdmission:
     """The system-RAM budget's verdict for a preload and the accounting that produced it."""
 
     verdict: BudgetVerdict
+    """The physical-RAM verdict at the load's marginal accounting."""
     kind: RamChargeKind
+    commit_verdict: BudgetVerdict | None = None
+    """The verdict for the checkpoint mapping against available commit, or None when it is not priced
+    (:func:`decide_commit_admission`)."""
+
+    @property
+    def commit_bound(self) -> bool:
+        """Whether physical RAM fits the load and commit alone refuses it."""
+        return self.verdict.fits and self.commit_verdict is not None and not self.commit_verdict.fits
 
     @property
     def fits(self) -> bool:
-        """Whether the staging charge fits available host RAM above the danger floor."""
-        return self.verdict.fits
+        """Whether the staging charge fits available host RAM above the danger floor, and its mapping fits commit."""
+        return self.verdict.fits and not self.commit_bound
+
+    def reason(self) -> str:
+        """Return a short explanation for logging the decision, naming commit when commit refused the load."""
+        commit = self.commit_verdict
+        if commit is None or not self.commit_bound or commit.predicted_mb is None or commit.available_mb is None:
+            return self.verdict.reason()
+        available = "n/a" if self.verdict.available_mb is None else f"{self.verdict.available_mb:.0f}"
+        return (
+            f"job needs ~{commit.predicted_mb:.0f} MB + {commit.reserve_mb:.0f} MB reserve "
+            f"vs {available} MB available (commit-bound: {commit.available_mb:.0f} MB committable): does NOT fit"
+        )
+
+
+def decide_commit_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> BudgetVerdict | None:
+    """Judge the checkpoint mapping a load makes against the host's available commit.
+
+    A child maps the checkpoint as a copy-on-write view, which on Windows charges the whole file to commit at map
+    time however few of its pages are resident. The charge is therefore the job's whole staging charge plus its
+    feature RAM (private allocations charge commit too), with no page-reuse or component credit; the reserve,
+    the danger floor and the outstanding planned RAM are the RAM verdict's own.
+
+    Returns:
+        The verdict, or None when the load is not priced against commit: the host reports no commit figure
+        (POSIX), the checkpoint's size is unknown, or the target already holds the checkpoint and maps nothing.
+    """
+    committable_mb = snapshot.host_ram.available_commit_mb
+    job = snapshot.queue.jobs[job_id]
+    if committable_mb is None or job.model is None or job.staging_charge_mb is None:
+        return None
+    if job.model in snapshot.slots[process_id].checkpoint_models_held:
+        return None
+    return snapshot.services.ram_budget.check_job(
+        snapshot.queue.payloads[job_id],
+        job.baseline,
+        committable_mb,
+        committed_reserve_mb=snapshot.services.reserve_ledger.total_ram_mb(),
+        danger_floor_mb=snapshot.host_ram.danger_floor_mb,
+        staging_charge_mb=job.staging_charge_mb + job.feature_ram_mb,
+        outstanding_planned_mb=snapshot.host_ram.outstanding_planned_mb,
+    )
 
 
 def component_charge_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
@@ -1050,9 +1099,13 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
     A swap onto a slot that kept its pages is priced at the checkpoint's learned swap growth once that
     evidence is trusted, in place of the credit heuristic; swaps are most loads on a worker whose models
     stay resident, so this is where learning has evidence.
+
+    Where the host reports commit, the load's checkpoint mapping is judged against it as well
+    (:func:`decide_commit_admission`), and the admission fits only when both verdicts do.
     """
     job = snapshot.queue.jobs[job_id]
     slot = snapshot.slots[process_id]
+    commit_verdict = decide_commit_admission(snapshot, job_id, process_id)
     component = component_charge_mb(snapshot, job_id, process_id)
     is_component = component is not None
     features = job.feature_ram_mb
@@ -1073,7 +1126,7 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
                 uncredited_predicted_mb=whole,
                 reusable_credit_mb=whole - learned.predicted_mb,
             )
-        return RamAdmission(verdict=learned, kind=RamChargeKind.PAGE_REUSE)
+        return RamAdmission(verdict=learned, kind=RamChargeKind.PAGE_REUSE, commit_verdict=commit_verdict)
     verdict = snapshot.services.ram_budget.check_job(
         snapshot.queue.payloads[job_id],
         job.baseline,
@@ -1092,7 +1145,7 @@ def decide_ram_admission(snapshot: SchedulingSnapshot, job_id: str, process_id: 
         kind = RamChargeKind.PAGE_REUSE
     else:
         kind = RamChargeKind.WHOLE
-    return RamAdmission(verdict=verdict, kind=kind)
+    return RamAdmission(verdict=verdict, kind=kind, commit_verdict=commit_verdict)
 
 
 def preload_ram_stage_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float:

@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.analysis.log_signatures import pattern_for
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -638,3 +639,88 @@ class TestRamAdmission:
 
         scheduler._checkpoint_models_held_on = lambda _pid: frozenset({"sd"})  # type: ignore[method-assign]
         assert preload.component_charge_mb(scheduler.snapshot(), job_id, 0) == 0.0
+
+
+class TestCommitAdmission:
+    """A load that maps a checkpoint is priced against available commit beside physical RAM."""
+
+    @staticmethod
+    async def _commit_worker(
+        *,
+        available_commit_mb: float | None,
+        available_ram_mb: float = 65536.0,
+    ) -> tuple[InferenceScheduler, str]:
+        scheduler, jobs = await _worker(
+            slots={0: _slot(0, model=None)},
+            pending=["sd"],
+            available_ram_mb=available_ram_mb,
+        )
+        scheduler._checkpoint_staging_charge_mb = lambda _job: 7000.0  # type: ignore[method-assign]
+        scheduler.set_available_commit_mb_provider(lambda: available_commit_mb)
+        return scheduler, str(jobs[0].id_)
+
+    async def test_commit_refuses_a_load_physical_ram_fits(self) -> None:
+        """The whole checkpoint plus features is charged to commit, and commit alone defers the load."""
+        scheduler, job_id = await self._commit_worker(available_commit_mb=1000.0)
+        snapshot = scheduler.snapshot()
+
+        admission = decide_ram_admission(snapshot, job_id, 0)
+
+        assert admission.verdict.fits, "physical RAM admits the load"
+        assert admission.commit_bound is True
+        assert admission.fits is False
+        assert admission.commit_verdict is not None
+        assert admission.commit_verdict.predicted_mb == 7000.0 + snapshot.queue.jobs[job_id].feature_ram_mb
+        assert "(commit-bound: 1000 MB committable): does NOT fit" in admission.reason()
+
+    async def test_a_commit_bound_deferral_still_matches_the_registered_log_line(self) -> None:
+        """The commit-bound reason keeps the registered RAM-defer signature's fields parseable."""
+        scheduler, job_id = await self._commit_worker(available_commit_mb=1000.0)
+
+        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+        line = f"RAM budget deferring preload of sd: {admission.reason()}. Reclaiming idle RAM."
+
+        match = pattern_for("ram_preload_defer").search(line)
+        assert match is not None
+        assert match.group("available") == "65536"
+
+    async def test_ample_commit_leaves_the_ram_verdict_in_charge(self) -> None:
+        """Commit that covers the mapping admits exactly what physical RAM admits."""
+        scheduler, job_id = await self._commit_worker(available_commit_mb=1_000_000.0)
+
+        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+
+        assert admission.commit_verdict is not None and admission.commit_verdict.fits
+        assert admission.fits is True
+        assert admission.commit_bound is False
+
+    async def test_a_ram_bound_deferral_is_reported_as_today(self) -> None:
+        """When physical RAM refuses the load, the RAM verdict and its reason stand unchanged."""
+        scheduler, job_id = await self._commit_worker(available_commit_mb=1_000_000.0, available_ram_mb=1000.0)
+
+        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+
+        assert admission.fits is False
+        assert admission.commit_bound is False
+        assert admission.reason() == admission.verdict.reason()
+        assert "commit-bound" not in admission.reason()
+
+    async def test_an_unreported_commit_leaves_the_gate_as_today(self) -> None:
+        """A host with no commit figure (POSIX) prices physical RAM alone."""
+        scheduler, job_id = await self._commit_worker(available_commit_mb=None)
+
+        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+
+        assert admission.commit_verdict is None
+        assert admission.fits is admission.verdict.fits
+        assert admission.reason() == admission.verdict.reason()
+
+    async def test_a_checkpoint_the_target_holds_maps_nothing(self) -> None:
+        """A target already holding the checkpoint maps no new view, so commit does not price the load."""
+        scheduler, job_id = await self._commit_worker(available_commit_mb=1000.0)
+        scheduler._checkpoint_models_held_on = lambda _pid: frozenset({"sd"})  # type: ignore[method-assign]
+
+        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+
+        assert admission.commit_verdict is None
+        assert admission.fits is admission.verdict.fits

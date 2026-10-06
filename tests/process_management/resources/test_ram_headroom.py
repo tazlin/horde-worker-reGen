@@ -288,3 +288,21 @@ def test_host_cache_eviction_conserves_physical_ram_and_delays_the_next_load() -
     assert sum(ledger.cache_mb.values()) <= ledger.available_mb
     assert ledger.stage(0, "sdxl", 6500, 8500) > 0
     assert ledger.rss_mb(0) == 9600 + ledger.available_mb
+
+
+def test_host_commit_charges_every_mapped_checkpoint_whole_until_the_lane_drops_it() -> None:
+    """A mapped checkpoint charges its full size to commit even after its cached pages are reclaimed."""
+    from tests.process_management.liveness._host_ram import HostRamLedger
+
+    assert HostRamLedger(65536, 30000).available_commit_mb is None, "a row without a limit models no commit"
+    ledger = HostRamLedger(65536, 10000, commit_limit_mb=90000)
+    ledger.stage(0, "flux", 16000, 1000)
+    ledger.stage(1, "qwen", 19000, 1000)
+    private_mb = 10000 + 2 * (1100 + 1000)
+    assert ledger.available_commit_mb == 90000 - 35000 - private_mb
+    ledger.foreign_mb = 60000
+    ledger.trim_cache()
+    assert sum(ledger.cache_mb.values()) < 35000, "physical pressure reclaimed cached pages"
+    assert ledger.available_commit_mb == 0.0, "the mappings still charge their whole size"
+    ledger.evict(1)
+    assert ledger.commit_charged_mb == 16000 + 60000 + 1100 + 2100

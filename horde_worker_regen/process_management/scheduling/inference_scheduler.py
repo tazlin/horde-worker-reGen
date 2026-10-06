@@ -223,6 +223,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     post_process_context_fits,
     residency_has_holder,
 )
+from horde_worker_regen.process_management.scheduling.host_commit import measure_available_commit_mb
 from horde_worker_regen.process_management.scheduling.ledgers import retention
 from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds import (
     DISPATCH_HOLD_LIVENESS_SECONDS,
@@ -617,6 +618,7 @@ class InferenceScheduler:
         # and admission defers with the missing-reading diagnostic.
         self._device_free_mb_provider: Callable[[int], float | None] | None = None
         self._available_ram_mb_provider: Callable[[], float] | None = None
+        self._available_commit_mb_provider: Callable[[], float | None] | None = None
         # The head-preload context the current deferred verdict's actuations act on, set immediately before the
         # adapter runs a verdict's commands and cleared once they have. None outside that window.
 
@@ -4221,6 +4223,12 @@ class InferenceScheduler:
             return self._available_ram_mb_provider()
         return psutil.virtual_memory().available / (1024 * 1024)
 
+    def _measured_available_commit_mb(self) -> float | None:
+        """The host's available commit (MB): the injected provider, else a live read; None where not charged."""
+        if self._available_commit_mb_provider is not None:
+            return self._available_commit_mb_provider()
+        return measure_available_commit_mb()
+
     def _measured_total_ram_mb(self) -> float:
         """The measured system-wide total RAM (MB), read live in the parent process."""
         return psutil.virtual_memory().total / (1024 * 1024)
@@ -4742,6 +4750,15 @@ class InferenceScheduler:
         heavy model passes or fails with the runner's free RAM instead of the scenario's own state.
         """
         self._available_ram_mb_provider = provider
+
+    def set_available_commit_mb_provider(self, provider: Callable[[], float | None]) -> None:
+        """Inject the available-commit reading source, replacing the live read.
+
+        Production never overrides this. A harness pins it for the reason it pins available RAM: an unpinned
+        read prices every load that maps a checkpoint against the commit of whatever Windows machine runs the
+        suite. A provider returning None prices physical RAM alone, as a POSIX host does.
+        """
+        self._available_commit_mb_provider = provider
 
     def set_footprint_store(self, store: LearnedFootprintStore) -> None:
         """Inject the shared learned-footprint store the message dispatcher also observes into.
@@ -5309,6 +5326,7 @@ class InferenceScheduler:
                 outstanding_planned_mb=self._outstanding_planned_ram_mb(),
                 danger_floor_mb=self._ram_danger_floor_mb(),
                 pressure=ram_verdict if ram_verdict is not None else self._ram_pressure_verdict(),
+                available_commit_mb=self._measured_available_commit_mb(),
             ),
             budget_active=self._budget_active(),
             vram_reserve_mb=self._vram_budget.reserve_mb,
@@ -6655,7 +6673,7 @@ class InferenceScheduler:
             snapshot = self.snapshot()
         admission = decide_ram_admission(snapshot, str(job.id_), available_process.process_id)
         ram_verdict = admission.verdict
-        if ram_verdict.fits:
+        if admission.fits:
             self._diagnostics.forget("ram_budget_defer")
             if admission.kind is RamChargeKind.COMPONENT:
                 self._note_component_admission(job, available_process, ram_verdict)
@@ -6666,10 +6684,13 @@ class InferenceScheduler:
             self._resolve_head_ram_defer(job, reason="admitted")
             return True
 
-        suppressed = self._diagnostics.suppressed_count("ram_budget_defer", (job.model, admission.kind))
+        suppressed = self._diagnostics.suppressed_count(
+            "ram_budget_defer",
+            (job.model, admission.kind, admission.commit_bound),
+        )
         if suppressed is not None:
             logger.opt(colors=True).warning(
-                f"<fg #f0beff>RAM budget deferring preload of {{}}: {ram_verdict.reason()}. Reclaiming idle RAM."
+                f"<fg #f0beff>RAM budget deferring preload of {{}}: {admission.reason()}. Reclaiming idle RAM."
                 f"{suppressed_suffix(suppressed)}</>",
                 job.model,
             )

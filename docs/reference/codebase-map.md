@@ -54,7 +54,8 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | VRAM pricing over the snapshot         | `process_management/scheduling/admission/pricing.py` (candidate delta, streaming forecast, reclaimable idle residents) |
 | Materialisation request               | `process_management/scheduling/admission/materialization.py` (`build_materialization_request`) |
 | Clearance admit decision              | `process_management/scheduling/admission/clearance.py` (`decide_clearance_admit`, `ClearancePlan`) |
-| Preload gate ladder, target choice, budget pricing, the RAM verdict and the idle-lane warm selection | `process_management/scheduling/admission/preload.py` (`decide_preload_gates`, `select_preload_target`, `price_preload`, `decide_ram_admission`, `select_idle_lane_warms`) |
+| Preload gate ladder, target choice, budget pricing, the RAM and commit verdicts and the idle-lane warm selection | `process_management/scheduling/admission/preload.py` (`decide_preload_gates`, `select_preload_target`, `price_preload`, `decide_ram_admission`, `decide_commit_admission`, `select_idle_lane_warms`) |
+| Host available-commit reading (Windows; None on POSIX) | `process_management/scheduling/host_commit.py` (`measure_available_commit_mb`) |
 | Admission commands (fault, replace)   | `process_management/scheduling/admission/commands.py` (`FaultJob`, `ReplaceProcess`) |
 | Governance, verdict and command act site | `process_management/scheduling/admission/executor.py` (`PlanExecutor`, `ExecutionHost`) |
 | Model serviceability (offer and preload gate) | `process_management/resources/model_serviceability.py` (`model_serviceability_verdicts`, `assess_model_serviceability`) |

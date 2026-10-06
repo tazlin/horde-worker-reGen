@@ -95,6 +95,7 @@ def _make_inference_scheduler(
     on_pool_pressure_eviction: Callable[[str], None] | None = None,
     device_free_mb: float | None = 24000.0,
     available_ram_mb: float | None = 65536.0,
+    available_commit_mb: float | None = None,
     clock: Callable[[], float] | None = None,
 ) -> InferenceScheduler:
     """Build an InferenceScheduler with mostly-mocked dependencies.
@@ -107,7 +108,9 @@ def _make_inference_scheduler(
     ``available_ram_mb`` pins the RAM admission gates the same way: the default is an ample host so a
     scenario's outcome depends on its own constructed state, never on the free RAM of whatever machine runs
     the suite (an unpinned read admits a heavy model on a large dev box and defers it on a small CI runner).
-    Tests exercising RAM pressure pass a small figure; None restores the live psutil read.
+    Tests exercising RAM pressure pass a small figure; None restores the live psutil read. A pinned host
+    reports ``available_commit_mb`` as its commit, unreported (None) by default, so a scenario never prices
+    against the commit of the Windows machine running the suite.
     """
     if state is None:
         state = WorkerState()
@@ -151,6 +154,7 @@ def _make_inference_scheduler(
         scheduler.set_device_free_mb_provider(lambda _device_index: device_free_mb)
     if available_ram_mb is not None:
         scheduler.set_available_ram_mb_provider(lambda: available_ram_mb)
+        scheduler.set_available_commit_mb_provider(lambda: available_commit_mb)
     return scheduler
 
 

@@ -565,8 +565,10 @@ def make_testable_process_manager(
     # Pin the RAM admission gates to an ample host, mirroring the device-free seeding above: an unpinned
     # scheduler reads the suite machine's real free RAM through psutil, so a scenario admitting a heavy
     # model would pass on a large dev box and defer on a small CI runner regardless of the scenario's own
-    # constructed state. Tests exercising RAM pressure install their own provider over this one.
+    # constructed state. Tests exercising RAM pressure install their own provider over this one. Commit is pinned
+    # unreported for the same reason: a live read prices loads against the Windows machine running the suite.
     process_manager._inference_scheduler.set_available_ram_mb_provider(lambda: 65536.0)
+    process_manager._inference_scheduler.set_available_commit_mb_provider(lambda: None)
     return process_manager
 
 

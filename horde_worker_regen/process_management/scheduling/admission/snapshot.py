@@ -234,6 +234,9 @@ class HostRamSnapshot:
     """The governor's verdict for this tick, or a live reading before the first tick."""
     outstanding_planned_mb: float = 0.0
     """Admitted RAM (MB) the available reading does not yet reflect, net of what has materialised."""
+    available_commit_mb: float | None = None
+    """The host's available commit (MB), against which a load that maps a checkpoint is also priced. None where
+    a mapping is not charged to commit (POSIX), so the RAM gates price physical RAM alone."""
 
 
 @dataclass(frozen=True)

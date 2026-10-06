@@ -25,6 +25,11 @@ class HostRamLedger:
     """Disk read rate a checkpoint load pays for the part of the checkpoint that is not cached."""
     foreign_mb_by_tick: dict[int, float] = field(default_factory=dict)
     """Scripted foreign RAM, keyed by the tick it takes effect on, so host pressure can move inside one run."""
+    commit_limit_mb: float | None = None
+    """The host's commit limit (physical RAM plus page files), or None for a row that does not model commit.
+
+    When set, every checkpoint a lane maps charges its whole size against the limit for as long as the lane
+    holds it, as a copy-on-write file view does on Windows, whether or not its pages are cached."""
 
     @property
     def available_mb(self) -> float:
@@ -32,6 +37,20 @@ class HostRamLedger:
         return max(
             0.0, self.total_mb - self.foreign_mb - sum(self.private_mb.values()) - sum(self.transients_mb.values())
         )
+
+    @property
+    def commit_charged_mb(self) -> float:
+        """Return the commit charged: each lane's mapped checkpoint at full size, plus every private allocation."""
+        mapped_mb = sum(checkpoint_mb for _model, checkpoint_mb in self.checkpoints.values())
+        private_mb = self.foreign_mb + sum(self.private_mb.values()) + sum(self.transients_mb.values())
+        return mapped_mb + private_mb
+
+    @property
+    def available_commit_mb(self) -> float | None:
+        """Return the commit left under the limit, or None when the row does not model commit."""
+        if self.commit_limit_mb is None:
+            return None
+        return max(0.0, self.commit_limit_mb - self.commit_charged_mb)
 
     @property
     def free_mb(self) -> float:

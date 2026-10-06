@@ -170,6 +170,16 @@ class TestSchedulingSnapshot:
         assert snapshot.host_ram.outstanding_planned_mb == 1200
         assert scheduler.snapshot().host_ram.outstanding_planned_mb == 5000
 
+    async def test_available_commit_is_captured_from_its_provider(self) -> None:
+        """The snapshot carries the commit reading of its build, and None where the host reports none."""
+        _initial, scheduler = await self._scheduler()
+        assert scheduler.snapshot().host_ram.available_commit_mb is None, "the harness pins commit unreported"
+        scheduler.set_available_commit_mb_provider(lambda: 30000.0)
+        snapshot = scheduler.snapshot()
+        scheduler.set_available_commit_mb_provider(lambda: 1000.0)
+        assert snapshot.host_ram.available_commit_mb == 30000.0
+        assert scheduler.snapshot().host_ram.available_commit_mb == 1000.0
+
     async def test_building_twice_is_pure(self) -> None:
         """Two snapshots of an unchanged worker are equal, and no child received a message."""
         snapshot, scheduler = await self._scheduler()
