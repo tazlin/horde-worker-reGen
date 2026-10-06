@@ -13,6 +13,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     HeadReclaimContext,
 )
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob, ReplaceProcess
+from horde_worker_regen.process_management.scheduling.governance import RestoreCardProcess, RestoreWorkerProcess
 from tests.process_management.conftest import make_job_pop_response, make_mock_bridge_data, make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
@@ -128,3 +129,36 @@ class TestSchedulerCommands:
         scheduler.executor.execute_commands((ReplaceProcess(9),))
 
         scheduler._process_lifecycle._replace_inference_process.assert_not_called()
+
+
+class TestGovernanceRestoreWhileDraining:
+    """A shed context is not restored once the worker is shutting down."""
+
+    @staticmethod
+    def _restores() -> list[RestoreCardProcess | RestoreWorkerProcess]:
+        return [
+            RestoreWorkerProcess(target_count=2, planned_count=2),
+            RestoreCardProcess(device_index=0, target_count=2, planned_count=2),
+        ]
+
+    def test_restores_are_skipped_while_shutting_down(self) -> None:
+        """No context is scaled up for a drain: the worker pops nothing more and the restore re-enters the floor."""
+        scheduler = _scheduler()
+        scheduler._state.shutting_down = True
+        scheduler._ram_governor_state.shed_cards.add(0)
+
+        scheduler.executor.execute_governance_actions(self._restores())
+
+        scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
+        assert 0 in scheduler._ram_governor_state.shed_cards
+
+    def test_restores_scale_up_while_serving(self) -> None:
+        """A serving worker restores each shed context and stops tracking a card back at its plan."""
+        scheduler = _scheduler()
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=2)  # type: ignore[method-assign]
+        scheduler._ram_governor_state.shed_cards.add(0)
+
+        scheduler.executor.execute_governance_actions(self._restores())
+
+        assert scheduler._process_lifecycle.scale_inference_processes.call_count == 2
+        assert 0 not in scheduler._ram_governor_state.shed_cards

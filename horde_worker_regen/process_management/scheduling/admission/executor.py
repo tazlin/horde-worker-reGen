@@ -300,6 +300,10 @@ class PlanExecutor:
                     self._host._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
                     self._host.ram_reclaim.note_cycle()
                     self._host._record_churn("process_cycle")
+                case RestoreCardProcess() | RestoreWorkerProcess() if self._host._state.shutting_down:
+                    # A draining worker pops nothing more, so a restored context would serve no new work: it
+                    # would pay a cold start, re-enter the RAM floor that shed it, and shorten the drain's budget.
+                    continue
                 case RestoreCardProcess(device_index=device_index, target_count=target_count, planned_count=planned):
                     current = self._host._process_map.num_loaded_inference_processes(device_index=device_index)
                     after = self._host._process_lifecycle.scale_inference_processes(
