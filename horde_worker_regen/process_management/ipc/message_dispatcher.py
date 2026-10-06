@@ -1382,7 +1382,7 @@ class MessageDispatcher:
                 message.process_id,
                 message.info,
             )
-            self._process_map.on_model_ram_clear(process_id=message.process_id, from_child_report=True)
+            self._process_map.on_model_ram_clear(process_id=message.process_id)
 
         if message.process_state == HordeProcessState.WAITING_FOR_JOB:
             self._reap_lost_inference_result(

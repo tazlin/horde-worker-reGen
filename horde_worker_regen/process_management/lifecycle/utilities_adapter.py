@@ -530,11 +530,10 @@ class UtilitiesProcessAdapter:
 
         from PIL import Image
 
+        from horde_worker_regen.utils.image_utils import encode_image_for_upload
+
         control_map_bytes = self.annotate(control_type, image_bytes)
-        control_map = Image.open(io.BytesIO(control_map_bytes))
-        buffer = io.BytesIO()
-        control_map.save(buffer, format="WebP", quality=95, method=6)
-        return buffer.getvalue()
+        return encode_image_for_upload(Image.open(io.BytesIO(control_map_bytes))).getvalue()
 
     def remove_background(self, image_bytes: bytes) -> bytes:
         """Strip an image's background via the service and return the result WebP-encoded for R2.

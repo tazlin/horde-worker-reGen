@@ -737,28 +737,20 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             freed.append((process_id, job.id_))
         return freed
 
-    def on_model_ram_clear(
-        self,
-        process_id: int,
-        *,
-        from_child_report: bool = False,
-    ) -> None:
+    def on_model_ram_clear(self, process_id: int) -> None:
         """Update the model load state for the given process ID.
 
-        A child's report keeps the launch's inference ownership: a job dispatched alongside its preload is
-        still queued behind that preload's unload, so the report says nothing about the job ending.
+        The launch's inference ownership is kept: a job dispatched alongside its preload is still queued
+        behind that preload's unload, so a child's ``UNLOADED_MODEL_FROM_RAM`` report says nothing about the
+        job ending, and a parent-initiated unload only targets a lane that owns nothing. Ownership ends with
+        its job or its launch.
 
         Args:
             process_id (int): The ID of the process to update.
-            from_child_report (bool): True when the clear applies the child's ``UNLOADED_MODEL_FROM_RAM``
-                report rather than a parent-initiated unload of an idle lane.
         """
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
-        if from_child_report:
-            self[process_id].preload_job_intent = None
-        else:
-            self[process_id].clear_job_references()
+        self[process_id].preload_job_intent = None
         # A model gone from RAM is certainly gone from the device, so no retained residency survives it, and
         # a refusal to give the device back cannot outlive the weights it was about.
         self[process_id].clear_retained_resident()

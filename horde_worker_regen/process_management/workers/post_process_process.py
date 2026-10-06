@@ -362,9 +362,7 @@ class HordePostProcessProcess(HordeProcess):
         if result.image is None:
             raise RuntimeError("Alchemy form produced no image")
 
-        buffer = io.BytesIO()
-        result.image.save(buffer, format="WebP", quality=95, method=6)
-        return buffer.getvalue()
+        return encode_image_for_upload(result.image).getvalue()
 
     def _run_graph_alchemy(self, form: AlchemyFormSpec) -> None:
         """Run a graph-backed alchemy form (upscale/facefix) and report the result.

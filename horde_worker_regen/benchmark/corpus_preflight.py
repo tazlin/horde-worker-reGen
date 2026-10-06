@@ -54,9 +54,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     ResolutionBucket,
 )
 from horde_worker_regen.run_root import AbortSentinelKind, abort_sentinel_path
-
-HORDELIB_DISTRIBUTION = "horde_engine"
-"""Distribution name behind the ``hordelib`` import name; its metadata carries the ComfyUI pins."""
+from horde_worker_regen.runtime_version import HORDELIB_DISTRIBUTION
 
 KUDOS_MANIFEST_MODULE = "hordelib.kudos_training.manifest"
 """The feature manifest the census and heavy vocabularies are derived from."""
