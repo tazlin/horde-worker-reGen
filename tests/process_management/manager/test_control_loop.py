@@ -17,6 +17,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeControlFlag,
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from tests.process_management.conftest import (
+    make_job_pop_response,
     make_mock_job,
     make_mock_process_info,
     make_testable_process_manager,
@@ -66,6 +67,29 @@ class TestControlLoopTick:
 
         assert await process_manager._control_loop_tick() is False
         process_manager._publish_supervisor_snapshot.assert_called_once()
+
+    async def test_tick_disarms_idle_fill_once_its_head_left_an_empty_queue(self) -> None:
+        """An idle-fill arm whose starved head left the queue undispatched is disarmed by the next tick.
+
+        The scheduling cycle is skipped while the queue is empty, and an armed breaker narrows every pop, so
+        an arm only a cycle could clear would hold the offer narrowed for as long as the narrowed offer finds
+        no job.
+        """
+        process_manager = _make_tickable_manager()
+        job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(process_manager._job_tracker, job)
+        scheduler = process_manager._inference_scheduler
+        scheduler.head_admission.track_head_starvation(str(job.id_), work_in_progress=False)
+        process_manager._state.wants_idle_fill_candidate = True
+        process_manager._state.idle_fill_rung = 3
+
+        assert await process_manager._job_tracker.drop_pending_inference(job)
+        assert len(process_manager._job_tracker.jobs_pending_inference) == 0
+        assert await process_manager._control_loop_tick() is True
+
+        assert scheduler.head_admission.starvation_job_id is None
+        assert process_manager._state.wants_idle_fill_candidate is False
+        assert process_manager._state.idle_fill_rung == 0
 
     async def test_shutdown_keeps_inference_processes_up_while_queue_remains(self) -> None:
         """During a drain, inference processes are not ended while queued inference work remains.

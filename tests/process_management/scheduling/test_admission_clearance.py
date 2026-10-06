@@ -339,5 +339,5 @@ async def test_a_dispatched_job_is_never_timed_by_the_head_clock() -> None:
     )
     assert head_starved_seconds(still_pending, job_id) == 30.0
 
-    scheduler._release_head_starvation_of_dispatched_job()  # type: ignore[attr-defined]
+    scheduler.reconcile_head_starvation()
     assert head_admission.starvation_job_id is None

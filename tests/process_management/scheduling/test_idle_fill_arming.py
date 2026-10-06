@@ -12,8 +12,14 @@ import time
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from tests.process_management.conftest import make_mock_bridge_data, make_mock_process_info
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_mock_process_info,
+    track_popped_job_async,
+)
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 
@@ -111,6 +117,36 @@ def test_dispatch_clears_the_breaker_and_ladder() -> None:
 
     scheduler._clear_head_starvation_timer()
 
+    assert scheduler._state.wants_idle_fill_candidate is False
+    assert scheduler._state.idle_fill_rung == 0
+
+
+async def test_a_timed_head_that_leaves_undispatched_disarms_on_an_empty_queue_cycle() -> None:
+    """A starved head that leaves the tracker without a dispatch stops the clock and disarms the breaker.
+
+    No scheduling cycle runs on an empty queue, so the reconcile alone has to do it: nothing here calls the
+    preload pass or the arm update.
+    """
+    job_tracker = JobTracker()
+    job = make_job_pop_response("stable_diffusion")
+    await track_popped_job_async(job_tracker, job)
+    bridge = make_mock_bridge_data()
+    bridge.idle_fill_threshold_seconds = 5
+    scheduler = _make_inference_scheduler(
+        state=WorkerState(),
+        process_map=_free_sibling_map(),
+        job_tracker=job_tracker,
+        bridge_data=bridge,
+    )
+    scheduler._update_head_starvation_timer(job)
+    scheduler.head_admission.starvation_since -= 30.0
+    scheduler._update_idle_fill_arm(bridge)
+    assert scheduler._state.wants_idle_fill_candidate is True
+
+    assert await job_tracker.drop_pending_inference(job)
+    scheduler.reconcile_head_starvation()
+
+    assert scheduler.head_admission.starvation_job_id is None
     assert scheduler._state.wants_idle_fill_candidate is False
     assert scheduler._state.idle_fill_rung == 0
     assert scheduler.head_admission.starvation_since == 0.0

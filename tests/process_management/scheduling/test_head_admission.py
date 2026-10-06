@@ -69,6 +69,18 @@ class TestHeadStarvation:
         ledger.track_head_starvation(None, work_in_progress=False)
         assert ledger.starvation_job_id is None
 
+    def test_reconcile_stops_the_clock_only_for_a_job_no_longer_waiting(self) -> None:
+        """A timed job still waiting keeps its clock; one that left the queue, by any path, stops it."""
+        ledger, clock = _ledger()
+        assert ledger.reconcile_head_starvation(set()) is False
+        ledger.track_head_starvation("head", work_in_progress=False)
+        clock.now += 30.0
+        assert ledger.reconcile_head_starvation({"head", "other"}) is False
+        assert ledger.starved_seconds("head") == 30.0
+        assert ledger.reconcile_head_starvation({"other"}) is True
+        assert ledger.starvation_job_id is None and ledger.starvation_since == 0.0
+        assert ledger.reconcile_head_starvation(set()) is False
+
 
 class TestRamDeferBarrier:
     """The RAM-defer clock latches the barrier past its bound and declines the head past the cap."""

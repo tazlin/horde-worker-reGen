@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 
 from horde_worker_regen.process_management.scheduling.diagnostic_throttle import DiagnosticThrottle
@@ -204,6 +205,18 @@ class HeadAdmissionLedger:
         """Stop timing: a job dispatched, so the wedge, if any, is broken."""
         self.starvation_job_id = None
         self.starvation_since = 0.0
+
+    def reconcile_head_starvation(self, waiting_job_ids: AbstractSet[str]) -> bool:
+        """Stop the clock when the job it times is no longer waiting for dispatch; return whether it stopped.
+
+        A timed job leaves the queue by dispatch, result, fault or drop. The pass that retimes the head is
+        skipped on cycles with nothing to preload, an empty queue among them, so without this a departed job
+        keeps the clock, and every reader of it, running.
+        """
+        if self.starvation_job_id is None or self.starvation_job_id in waiting_job_ids:
+            return False
+        self.clear_head_starvation()
+        return True
 
     # ---- head RAM defer and the dispatch barrier
 

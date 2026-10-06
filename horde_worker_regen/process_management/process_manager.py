@@ -4416,6 +4416,9 @@ class HordeWorkerProcessManager:
             # governance tick below acts on.
             self._apply_post_processing_headroom_gate()
             self._inference_scheduler.run_governance_tick()
+            # Every iteration for the same reason as the governance tick: the idle-fill breaker narrows the pop
+            # offer, and the scheduling cycle that would disarm it runs only while the queue holds work.
+            self._inference_scheduler.reconcile_head_starvation()
 
             # Drive the GPU denoise clearance controllers every tick, independent of queue depth: they must be
             # able to clear a staged child into its load-and-sample window as a slot frees and to retire a

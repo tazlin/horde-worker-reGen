@@ -501,6 +501,11 @@ A card can idle behind a main-model download or an empty queue: the head is park
 sibling but its checkpoint is not yet resident. The head-starvation clock runs while nothing is sampling or
 conservatively unclassified as in-progress. Mapped jobs that are only downloading auxiliary files do not
 suppress it because they occupy concurrency without feeding the GPU; any actual sampler still resets it.
+The clock holds a job only while that job is queued and not in progress. The control loop reconciles it
+against the queue on every iteration, since a scheduling cycle runs only while the queue holds work. A timed
+job that was dispatched, finished, faulted or dropped stops the clock, and the arm, which is read from the
+clock, disarms with it. Arm and
+disarm are each logged once at INFO; the arm line names the head's model and how long it waited.
 Once it passes `idle_fill_threshold_seconds` with a free inference sibling, the scheduler arms
 `WorkerState.wants_idle_fill_candidate` and the popper over-pops a small no-LoRA **fill** job to run in the
 meantime. The fill climbs a smallest-fastest-first **ladder** so the card is fed the quickest work the horde

@@ -3583,48 +3583,58 @@ class InferenceScheduler:
             return False
         return self._horde_model_map.is_model_loading(head.model) or self._missing_model_recovery_latched()
 
-    def _release_head_starvation_of_dispatched_job(self) -> None:
-        """Stop the head-starvation clock once the job it times is in progress.
+    def reconcile_head_starvation(self) -> None:
+        """Stop the head-starvation clock once the job it times is no longer queued and waiting for dispatch.
 
         The clock times a job's wait for dispatch; a dispatched job's wait for clearance is clearance's own
-        clock. The preload pass that would retime the head returns early once every pending model is accounted
-        for, so without this a dispatched job whose model needed no preload keeps the clock it started at pop.
+        clock, and a job that finished or faulted waits for nothing. The process manager calls this every
+        control-loop iteration: a scheduling cycle runs only while the queue holds work, so a clock whose job
+        left an empty queue behind would otherwise keep the idle-fill breaker armed with no cycle to disarm it.
         """
-        timed_job_id = self._head_admission.starvation_job_id
-        if timed_job_id is None:
-            return
-        if any(str(job.id_) == timed_job_id for job in self._job_tracker.jobs_in_progress):
-            self._clear_head_starvation_timer()
+        in_progress_ids = {str(job.id_) for job in self._job_tracker.jobs_in_progress}
+        waiting_ids = {
+            str(job.id_) for job in self._job_tracker.jobs_pending_inference if str(job.id_) not in in_progress_ids
+        }
+        if self._head_admission.reconcile_head_starvation(waiting_ids):
+            self._disarm_idle_fill()
 
     def _clear_head_starvation_timer(self) -> None:
         """Reset the head-starvation clock once a job is dispatched (the wedge, if any, is broken)."""
         self._head_admission.clear_head_starvation()
-        # A dispatch means the card is fed, so the idle-fill breaker (if armed) is done; disarm it and
-        # restart the ladder so the next idle episode begins at the smallest, quickest rung.
-        if self._state.wants_idle_fill_candidate:
-            self._state.wants_idle_fill_candidate = False
-            self._state.idle_fill_rung = 0
+        self._disarm_idle_fill()
+
+    def _disarm_idle_fill(self) -> None:
+        """Disarm the idle-fill breaker and restart its ladder so the next idle episode begins at rung 0."""
+        if not self._state.wants_idle_fill_candidate:
+            return
+        self._state.wants_idle_fill_candidate = False
+        self._state.idle_fill_rung = 0
+        logger.info("Idle-fill disarmed: the head is no longer starved or no inference sibling is free")
 
     def _update_idle_fill_arm(self, bridge_data: reGenBridgeData) -> None:
         """Arm or disarm the idle-fill breaker from the head-starvation clock and free-sibling availability.
 
-        Arms when a queue head has sat on an idle device past ``idle_fill_threshold_seconds`` (its model still
-        loading, nothing in progress) while an inference sibling is free to run a fill job. The head-starvation
-        clock is already forced to zero whenever any job is in progress, so this is inert in steady state and
-        fires only for the "stuck doing nothing but downloading" case. Disarms (and resets the ladder) once
-        the head is no longer starved or no sibling is free.
+        Arms when a queue head has sat on an idle device past ``idle_fill_threshold_seconds`` while an inference
+        sibling is free to run a fill job. The clock is zero whenever any job is in progress or the timed job has
+        left the queue, so this is inert in steady state.
         """
         threshold = bridge_data.idle_fill_threshold_seconds
         starvation_since = self._head_admission.starvation_since
-        starved_long_enough = (
-            threshold is not None and starvation_since > 0.0 and (self._clock() - starvation_since) >= threshold
-        )
+        waited_seconds = self._clock() - starvation_since
+        starved_long_enough = threshold is not None and starvation_since > 0.0 and waited_seconds >= threshold
         has_free_sibling = self._process_map.get_first_available_inference_process() is not None
-        if starved_long_enough and has_free_sibling:
-            self._state.wants_idle_fill_candidate = True
-        elif self._state.wants_idle_fill_candidate:
-            self._state.wants_idle_fill_candidate = False
-            self._state.idle_fill_rung = 0
+        if not (starved_long_enough and has_free_sibling):
+            self._disarm_idle_fill()
+            return
+        if self._state.wants_idle_fill_candidate:
+            return
+        self._state.wants_idle_fill_candidate = True
+        timed_job_id = self._head_admission.starvation_job_id
+        head_model = next(
+            (job.model for job in self._job_tracker.jobs_pending_inference if str(job.id_) == timed_job_id),
+            None,
+        )
+        logger.info(f"Idle-fill armed: head job model {head_model} waited {waited_seconds:.0f}s for dispatch")
 
     def _govern_head_ram_defer(self, job: ImageGenerateJobPopResponse, *, made_reclaim_progress: bool) -> None:
         """Advance the head RAM-defer clock and latch, release or hard-cap the head-priority barrier.
@@ -8012,7 +8022,7 @@ class InferenceScheduler:
                     new_state=HordeProcessState.WAITING_FOR_JOB,
                 )
 
-        self._release_head_starvation_of_dispatched_job()
+        self.reconcile_head_starvation()
         snapshot = self.snapshot()
         loaded_models = loaded_or_loading_models(snapshot)
         if every_pending_model_accounted_for(snapshot, loaded_models):
