@@ -74,6 +74,9 @@ class FindingKind(enum.StrEnum):
     STUCK_INFERENCE_STEP = "stuck_inference_step"
     POST_PROCESSING_VRAM_STALL = "post_processing_vram_stall"
     POST_PROCESSING_OFFER_WITHHELD = "post_processing_offer_withheld"
+    IDLE_FILL_OFFER_STUCK = "idle_fill_offer_stuck"
+    SERVICE_LANE_RESTART_CHURN = "service_lane_restart_churn"
+    LANE_DOUBLE_DISPATCH_SIGNATURE = "lane_double_dispatch_signature"
     ORPHAN_WEDGE = "orphan_wedge"
     INFERENCE_SLOT_RETIRED = "inference_slot_retired"
     SAFETY_START_ESCALATED_TO_CPU = "safety_start_escalated_to_cpu"
@@ -279,6 +282,40 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "While it is off, requests with an upscaler or face fixer cannot be assigned to this worker."
         ),
         see_also=FindingKind.POST_PROCESSING_VRAM_STALL,
+        reference_page="docs/explanation/resilience_and_recovery.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.IDLE_FILL_OFFER_STUCK,
+        title="The worker asked for fewer models for a long time",
+        action="Send the log with `horde-log bundle` to the worker maintainers.",
+        detail=(
+            "When the next job waits for a free process, the worker asks the horde for fewer models "
+            "so an idle process can take a quick job. This is the idle-fill breaker. It should stop within seconds. "
+            "Here it stayed on for minutes, so the worker turned away work it could have done."
+        ),
+        reference_page="docs/explanation/performance_and_backpressure.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.SERVICE_LANE_RESTART_CHURN,
+        title="A helper process was stopped and restarted again and again",
+        action="Send the log with `horde-log bundle` to the worker maintainers.",
+        detail=(
+            "To free memory for a large job, the worker can stop a helper process such as post-processing "
+            "(the reclaim ladder). Restarting it costs 6 to 27 seconds. A restart within 5 seconds of the stop "
+            "freed nothing useful and cost a cold start."
+        ),
+        reference_page="docs/explanation/resilience_and_recovery.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.LANE_DOUBLE_DISPATCH_SIGNATURE,
+        title="Jobs were lost while a process still held them",
+        action="Send the log with `horde-log bundle` to the worker maintainers.",
+        detail=(
+            "Each job belongs to one process. A job was released as lost while its process still worked on it. "
+            "Or a result came for a job the worker no longer tracked, or an image started without a memory grant. "
+            "Each means two parts of the worker disagreed about who owned a job."
+        ),
+        see_also=FindingKind.ORPHAN_WEDGE,
         reference_page="docs/explanation/resilience_and_recovery.md",
     ),
     FindingSpec(

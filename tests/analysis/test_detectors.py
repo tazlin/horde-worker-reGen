@@ -3063,3 +3063,88 @@ class TestHostRamStarvation:
             "job needs ~6500 MB + 8192 MB reserve vs 14000 MB available",
         ]
         assert "host_ram_starvation" not in _diagnose(tmp_path, "\n".join(lines))
+
+
+def _o2_log(*lines: str) -> str:
+    """A single-session bridge log: the startup boundary, then ``(clock, message)`` lines on one day."""
+    return "\n".join(
+        [f"2026-06-25 13:00:00.000 | DEBUG | x:y:1 - {_STARTUP}", *(f"2026-06-25 {line}" for line in lines)]
+    )
+
+
+_ARMED = "13:01:00.000 | INFO | x:y:1 - Idle-fill armed: head job model m waited 6s for dispatch"
+_OFFER = "13:01:05.000 | INFO | x:y:1 - Idle-fill offer: rung 2 of 4, 3 model(s) at max_power 32"
+
+
+class TestIdleFillOfferStuck:
+    """An arm that outlives minutes fires; one disarmed within seconds does not."""
+
+    def test_an_arm_open_for_minutes_fires(self, tmp_path: Path) -> None:
+        """Armed at 13:01 and never disarmed before 13:06 is a five-minute narrowed offer."""
+        log = _o2_log(_ARMED, _OFFER, "13:06:00.000 | INFO | x:y:1 - Status")
+        finding = _diagnose(tmp_path, log)["idle_fill_offer_stuck"]
+        assert finding.severity is Severity.CRITICAL
+        assert finding.headline == "The worker asked for fewer models for 5 minutes with 3 models offered."
+
+    def test_an_arm_disarmed_within_seconds_does_not_fire(self, tmp_path: Path) -> None:
+        """A healthy arm closes within seconds of opening."""
+        disarmed = (
+            "13:01:08.000 | INFO | x:y:1 - Idle-fill disarmed: the head is no longer starved or no inference "
+            "sibling is free"
+        )
+        log = _o2_log(_ARMED, _OFFER, disarmed, "13:30:00.000 | INFO | x:y:1 - Status")
+        assert "idle_fill_offer_stuck" not in _diagnose(tmp_path, log)
+
+
+def _lane_pair(minute: int, restart_seconds: int) -> tuple[str, str]:
+    """A reclaim-ladder stop of the post-processing lane at ``minute`` and its restart ``restart_seconds`` later."""
+    return (
+        f"13:{minute:02d}:00.000 | INFO | x:y:1 - Reclaim ladder: stopping the post-processing lane to free its "
+        "VRAM context.",
+        f"13:{minute:02d}:{restart_seconds:02d}.000 | INFO | x:y:1 - Reclaim ladder: restarting the "
+        "post-processing lane after releasing the card.",
+    )
+
+
+class TestServiceLaneRestartChurn:
+    """Three quick stop and restart pairs on one lane fire; two do not."""
+
+    def test_three_quick_pairs_fire(self, tmp_path: Path) -> None:
+        """Each pair restarts two seconds after its stop."""
+        log = _o2_log(*_lane_pair(1, 2), *_lane_pair(2, 2), *_lane_pair(3, 2))
+        finding = _diagnose(tmp_path, log)["service_lane_restart_churn"]
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == "The post-processing process was stopped and restarted within 5 seconds 3 times."
+        assert finding.evidence[0] == (
+            "post-processing: 3 stop and restart pair(s), 3 restarted within 5 s, median 2.0 s, 0 held for a job"
+        )
+
+    def test_slow_or_few_pairs_do_not_fire(self, tmp_path: Path) -> None:
+        """Two quick pairs and one that stayed down for 40 seconds are below the threshold."""
+        log = _o2_log(*_lane_pair(1, 2), *_lane_pair(2, 2), *_lane_pair(3, 40))
+        assert "service_lane_restart_churn" not in _diagnose(tmp_path, log)
+
+
+class TestLaneDoubleDispatchSignature:
+    """Any lost-while-held, untracked-result or ungranted-sampling line fires; a plain release does not."""
+
+    _RELEASED = (
+        "13:01:00.000 | INFO | x:y:1 - Released process 3's ownership of job 0b1c2d3e: the job ended without a "
+        "result from that lane."
+    )
+
+    def test_a_lost_result_fires_with_counts(self, tmp_path: Path) -> None:
+        """One lost result and one release are counted separately."""
+        lost = (
+            "13:02:00.000 | ERROR | x:y:1 - Process 2 returned to idle while job 0b1c2d3e was still in progress; "
+            "its inference result was lost. Releasing the job so it can be retried."
+        )
+        finding = _diagnose(tmp_path, _o2_log(self._RELEASED, lost))["lane_double_dispatch_signature"]
+        assert finding.severity is Severity.CRITICAL
+        assert finding.headline == "The worker lost track of which process owned a job, 1 in total."
+        assert "inference_result_lost: 1" in finding.evidence
+        assert "ended_job_ownership_released: 1" in finding.evidence
+
+    def test_a_release_alone_does_not_fire(self, tmp_path: Path) -> None:
+        """The release is the designed cleanup, so on its own it is not a finding."""
+        assert "lane_double_dispatch_signature" not in _diagnose(tmp_path, _o2_log(self._RELEASED))

@@ -505,6 +505,36 @@ CONTRACTS: dict[str, Contract] = {
         ),
         severity=Severity.CRITICAL,
     ),
+    "detect_idle_fill_offer_stuck": Contract(
+        bridge=_bridge(
+            "2026-06-24 18:00:00.000 | INFO | x:y:1 - Idle-fill armed: head job model m waited 6s for dispatch",
+            "2026-06-24 18:00:05.000 | INFO | x:y:1 - Idle-fill offer: rung 1 of 4, 3 model(s) at max_power 32",
+            "2026-06-24 18:05:00.000 | INFO | x:y:1 - Status",
+        ),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_service_lane_restart_churn": Contract(
+        bridge=_bridge(
+            *(
+                line
+                for minute in range(3)
+                for line in (
+                    f"2026-06-24 18:0{minute}:00.000 | INFO | x:y:1 - Reclaim ladder: stopping the post-processing "
+                    "lane to free its VRAM context.",
+                    f"2026-06-24 18:0{minute}:02.000 | INFO | x:y:1 - Reclaim ladder: restarting the "
+                    "post-processing lane after releasing the card.",
+                )
+            ),
+        ),
+        severity=Severity.WARNING,
+    ),
+    "detect_lane_double_dispatch_signature": Contract(
+        bridge=_bridge(
+            "2026-06-24 18:00:00.000 | ERROR | x:y:1 - Job 0b1c2d3e not found in jobs_in_progress. Did it fault? "
+            "(Process 2)",
+        ),
+        severity=Severity.CRITICAL,
+    ),
     "detect_oom": Contract(
         bridge=_bridge(_oom("18:00:10.000")),
         severity=Severity.CRITICAL,

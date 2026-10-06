@@ -1392,6 +1392,61 @@ _SIGNATURE_LIST: list[LogSignature] = [
         "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0 starts sampling.",
         dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
     ),
+    _signature(
+        "idle_fill_armed",
+        r"Idle-fill armed: head job model (?P<model>.+) waited (?P<waited>\d+)s for dispatch",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._update_idle_fill_arm",
+        sample="Idle-fill armed: head job model AlbedoBase XL (SDXL) waited 7s for dispatch",
+        dry_run_reason=_IDLE_FILL_NOT_ARMED,
+    ),
+    _signature(
+        "idle_fill_disarmed",
+        r"Idle-fill disarmed: the head is no longer starved or no inference sibling is free",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._disarm_idle_fill",
+        sample="Idle-fill disarmed: the head is no longer starved or no inference sibling is free",
+        dry_run_reason=_IDLE_FILL_NOT_ARMED,
+    ),
+    _signature(
+        "service_lane_stopped",
+        r"(?P<owner>Reclaim ladder|Whole-card residency[^:]*): stopping the (?P<lane>[\w-]+) lane to free its VRAM "
+        r"context\.",
+        emitter="process_management.lifecycle.process_lifecycle:ProcessLifecycleManager.pause_post_process_off_gpu",
+        sample="Reclaim ladder: stopping the post-processing lane to free its VRAM context.",
+        dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
+    ),
+    _signature(
+        "service_lane_restarted",
+        r"(?P<owner>Reclaim ladder|Whole-card residency[^:]*): restarting the (?P<lane>[\w-]+) lane after releasing "
+        r"the card\.",
+        emitter="process_management.lifecycle.process_lifecycle:ProcessLifecycleManager.restore_post_process_off_gpu",
+        sample="Reclaim ladder: restarting the post-processing lane after releasing the card.",
+        dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
+    ),
+    _signature(
+        "inference_result_lost",
+        r"Process (?P<process>\d+) returned to idle while job (?P<job_id>\S+) was still in progress; its inference "
+        r"result was lost\.",
+        emitter="process_management.ipc.message_dispatcher:MessageDispatcher._reap_lost_inference_result",
+        sample="Process 2 returned to idle while job 0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0 was still in progress; "
+        "its inference result was lost. Releasing the job so it can be retried.",
+        dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
+        "inference_result_job_missing",
+        r"Job (?P<job_id>\S+) not found in jobs_in_progress\. Did it fault\? \(Process (?P<process>\d+)\)",
+        emitter="process_management.ipc.message_dispatcher:_handle_inference_result",
+        sample="Job 0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0 not found in jobs_in_progress. Did it fault? (Process 2)",
+        dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
+        "unpriced_sampling_window",
+        r"Clearance lease on device (?P<device>\d+): process (?P<process>\d+) entered its denoise loop without a "
+        r"recorded grant",
+        emitter="process_management.scheduling.clearance_lease:ClearanceController._reconcile_grants",
+        sample="Clearance lease on device 0: process 2 entered its denoise loop without a recorded grant "
+        "(unpriced sampling window); liveness preserved.",
+        dry_run_reason=_NO_FAULT,
+    ),
 ]
 
 SIGNATURES: dict[str, LogSignature] = {signature.name: signature for signature in _SIGNATURE_LIST}

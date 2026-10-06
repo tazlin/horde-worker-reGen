@@ -948,6 +948,171 @@ def detect_post_processing_offer_withheld(context: SessionContext) -> list[Findi
     ]
 
 
+_IDLE_FILL_ARMED_RE = pattern_for("idle_fill_armed")
+_IDLE_FILL_DISARMED_RE = pattern_for("idle_fill_disarmed")
+_IDLE_FILL_OFFER_RE = pattern_for("idle_fill_offer")
+
+# The breaker arms after a head job waits `idle_fill_threshold_seconds` (5 by default) and disarms as soon as
+# the head dispatches, so a healthy arm lasts seconds. One that outlives this many minutes kept the offer
+# narrowed through many pop cycles.
+_IDLE_FILL_STUCK_SECONDS = 180.0
+
+
+def detect_idle_fill_offer_stuck(context: SessionContext) -> list[Finding]:
+    """The idle-fill breaker armed and stayed armed for minutes, narrowing the pop offer.
+
+    An arm is closed by the next disarm line; one still open at the session end runs to it. The last ladder
+    offer line inside the longest arm says how narrow the offer was.
+    """
+    start, end = context.session.start_ts, context.session.end_ts
+    records = [r for r in _records_in_window(context.session.records, start, end) if r.timestamp is not None]
+    if not records:
+        return []
+    session_end = end or records[-1].timestamp
+    arms: list[tuple[LogRecord, LogRecord | None, LogRecord | None]] = []
+    armed: LogRecord | None = None
+    last_offer: LogRecord | None = None
+    for record in records:
+        if _IDLE_FILL_ARMED_RE.search(record.message):
+            if armed is None:
+                armed, last_offer = record, None
+        elif armed is not None and _IDLE_FILL_OFFER_RE.search(record.message):
+            last_offer = record
+        elif armed is not None and _IDLE_FILL_DISARMED_RE.search(record.message):
+            arms.append((armed, record, last_offer))
+            armed = None
+    if armed is not None:
+        arms.append((armed, None, last_offer))
+
+    def _arm_seconds(arm: tuple[LogRecord, LogRecord | None, LogRecord | None]) -> float:
+        closed_at = arm[1].timestamp if arm[1] is not None and arm[1].timestamp else session_end
+        return (closed_at - arm[0].timestamp).total_seconds() if closed_at and arm[0].timestamp else 0.0
+
+    stuck = [arm for arm in arms if _arm_seconds(arm) >= _IDLE_FILL_STUCK_SECONDS]
+    if not stuck:
+        return []
+    longest = max(stuck, key=_arm_seconds)
+    opened, closed, offer = longest
+    offer_match = _IDLE_FILL_OFFER_RE.search(offer.message) if offer is not None else None
+    evidence = [
+        f"armed: {_evidence(opened)}",
+        f"disarmed: {_evidence(closed)}" if closed is not None else "still armed at the session end",
+        f"last offer: {_evidence(offer)}" if offer is not None else "no offer line while armed",
+        f"{len(stuck)} of {len(arms)} arm(s) lasted {_IDLE_FILL_STUCK_SECONDS / 60:.0f} minutes or more",
+    ]
+    models_text = f" with {offer_match['models']} models offered" if offer_match is not None else ""
+    return [
+        Finding(
+            kind=FindingKind.IDLE_FILL_OFFER_STUCK,
+            severity=Severity.CRITICAL,
+            headline=(f"The worker asked for fewer models for {_span_text(_arm_seconds(longest))}{models_text}."),
+            evidence=evidence,
+        ),
+    ]
+
+
+_LANE_STOPPED_RE = pattern_for("service_lane_stopped")
+_LANE_RESTARTED_RE = pattern_for("service_lane_restarted")
+_LANE_HOLD_RE = pattern_for("reclaim_lane_hold")
+
+# A lane cold start costs 6 to 27 seconds, so a restart within this many seconds of its stop freed nothing a
+# job could use. Three such pairs on one lane is a pattern; one or two can be a single pressure spike.
+_LANE_QUICK_RESTART_SECONDS = 5.0
+_LANE_CHURN_QUICK_PAIRS = 3
+
+
+def detect_service_lane_restart_churn(context: SessionContext) -> list[Finding]:
+    """A service lane stopped by the reclaim ladder and restarted within seconds, repeatedly.
+
+    Pairs are the reclaim ladder's stop line and the next restart of the same lane. A hold line for that lane
+    between them means the lane was kept down as designed.
+    """
+    records = _records_in_window(context.session.records, context.session.start_ts, context.session.end_ts)
+    open_stop: dict[str, LogRecord] = {}
+    held: dict[str, bool] = {}
+    pairs: dict[str, list[tuple[float, bool]]] = {}
+    for record in records:
+        if record.timestamp is None:
+            continue
+        if (match := _LANE_STOPPED_RE.search(record.message)) and match["owner"] == "Reclaim ladder":
+            open_stop[match["lane"]] = record
+            held[match["lane"]] = False
+        elif match := _LANE_HOLD_RE.search(record.message):
+            held[match["lane"]] = True
+        elif (match := _LANE_RESTARTED_RE.search(record.message)) and match["lane"] in open_stop:
+            stopped = open_stop.pop(match["lane"])
+            seconds = (record.timestamp - stopped.timestamp).total_seconds() if stopped.timestamp else 0.0
+            pairs.setdefault(match["lane"], []).append((seconds, held.get(match["lane"], False)))
+    churning = {
+        lane: lane_pairs
+        for lane, lane_pairs in pairs.items()
+        if sum(1 for seconds, _ in lane_pairs if seconds < _LANE_QUICK_RESTART_SECONDS) >= _LANE_CHURN_QUICK_PAIRS
+    }
+    if not churning:
+        return []
+    evidence = []
+    for lane, lane_pairs in sorted(churning.items()):
+        quick = sum(1 for seconds, _ in lane_pairs if seconds < _LANE_QUICK_RESTART_SECONDS)
+        median = _median([seconds for seconds, _ in lane_pairs]) or 0.0
+        kept = sum(1 for _, was_held in lane_pairs if was_held)
+        evidence.append(
+            f"{lane}: {len(lane_pairs)} stop and restart pair(s), {quick} restarted within "
+            f"{_LANE_QUICK_RESTART_SECONDS:.0f} s, median {median:.1f} s, {kept} held for a job",
+        )
+    worst = max(churning, key=lambda lane: len(churning[lane]))
+    worst_quick = sum(1 for seconds, _ in churning[worst] if seconds < _LANE_QUICK_RESTART_SECONDS)
+    return [
+        Finding(
+            kind=FindingKind.SERVICE_LANE_RESTART_CHURN,
+            severity=Severity.WARNING,
+            headline=(
+                f"The {worst} process was stopped and restarted within {_LANE_QUICK_RESTART_SECONDS:.0f} seconds "
+                f"{worst_quick} times."
+            ),
+            evidence=evidence,
+        ),
+    ]
+
+
+_DOUBLE_DISPATCH_SIGNATURES = ("inference_result_lost", "inference_result_job_missing", "unpriced_sampling_window")
+_OWNERSHIP_RELEASED_RE = pattern_for("ended_job_ownership_released")
+
+
+def detect_lane_double_dispatch_signature(context: SessionContext) -> list[Finding]:
+    """Jobs released as lost while a lane held them, results for untracked jobs, or ungranted sampling.
+
+    The ownership-release count is context only: a release on its own is the designed cleanup.
+    """
+    records = _records_in_window(context.session.records, context.session.start_ts, context.session.end_ts)
+    patterns = {name: pattern_for(name) for name in _DOUBLE_DISPATCH_SIGNATURES}
+    hits: dict[str, list[LogRecord]] = {name: [] for name in _DOUBLE_DISPATCH_SIGNATURES}
+    released = 0
+    for record in records:
+        if _OWNERSHIP_RELEASED_RE.search(record.message):
+            released += 1
+            continue
+        for name, pattern in patterns.items():
+            if pattern.search(record.message):
+                hits[name].append(record)
+                break
+    total = sum(len(found) for found in hits.values())
+    if total == 0:
+        return []
+    first = min((found[0] for found in hits.values() if found), key=lambda record: record.timestamp or datetime.min)
+    return [
+        Finding(
+            kind=FindingKind.LANE_DOUBLE_DISPATCH_SIGNATURE,
+            severity=Severity.CRITICAL,
+            headline=f"The worker lost track of which process owned a job, {total} in total.",
+            evidence=[
+                *(f"{name}: {len(found)}" for name, found in hits.items()),
+                f"ended_job_ownership_released: {released}",
+                f"first: {_evidence(first)}",
+            ],
+        ),
+    ]
+
+
 # Residency-reconciliation holds are benign at low volume; sustained, they are a real swap-churn duty cost.
 # A rate past this many holds per hour, or a cumulative parked share past this fraction of the session, is
 # worth a warning rather than the informational default.
@@ -3943,6 +4108,9 @@ DETECTORS: list[Detector] = [
     detect_stuck_inference_step,
     detect_post_processing_vram_stall,
     detect_post_processing_offer_withheld,
+    detect_idle_fill_offer_stuck,
+    detect_service_lane_restart_churn,
+    detect_lane_double_dispatch_signature,
     detect_post_processing_deferral_starvation,
     detect_oom,
     detect_file_descriptor_exhaustion,
