@@ -2123,8 +2123,8 @@ async def _drive_pinned_sampler_scenario(world: _DispatchWorld) -> tuple[ImageGe
     assert world.scheduler._process_map[lane_id].current_inference_job() is not None, (
         f"precondition: the dispatched sampler must own its job. {world.state_dump()}"
     )
-    assert world.scheduler._process_map[lane_id].can_accept_job(), (
-        "precondition: the pinned sampler must still report itself idle, or the scenario measures nothing. "
+    assert world.scheduler._process_map[lane_id].last_process_state is HordeProcessState.WAITING_FOR_JOB, (
+        "precondition: the pinned sampler's child must still report itself idle, or the scenario measures nothing. "
         f"{world.state_dump()}"
     )
     head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=30)

@@ -1380,7 +1380,7 @@ class MessageDispatcher:
                 message.process_id,
                 message.info,
             )
-            self._process_map.on_model_ram_clear(process_id=message.process_id)
+            self._process_map.on_model_ram_clear(process_id=message.process_id, from_child_report=True)
 
         if message.process_state == HordeProcessState.WAITING_FOR_JOB:
             self._reap_lost_inference_result(
@@ -1500,6 +1500,9 @@ class MessageDispatcher:
             process_timeout=self._runtime_config.bridge_data.process_timeout,
             retryable=True,
         )
+        # The slot is idle and the job is gone from it, so the lane is free for the next dispatch in this
+        # same message rather than on the next control-loop reconcile.
+        process_info.retire_inference_ownership(job)
 
     def _handle_model_state_change(self, message: HordeModelStateChangeMessage) -> None:
         """Handle a model state change message."""

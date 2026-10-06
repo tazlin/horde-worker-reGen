@@ -11,6 +11,7 @@ from typing import override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.fields import GenerationID
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 from pydantic import ConfigDict
@@ -713,18 +714,46 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].clear_retained_resident()
         self[process_id].vram_unload_refused = False
 
+    def retire_ownership_of_ended_jobs(self, in_progress_job_ids: set[GenerationID]) -> list[int]:
+        """Retire every inference ownership whose job is no longer in progress; return the freed process IDs.
+
+        A lane owning an attempt accepts no job, so an ownership left behind by a path that ended its job
+        without a result (a fault, a timeout) would otherwise hold the lane for the rest of its launch.
+
+        Args:
+            in_progress_job_ids (set[GenerationID]): IDs of the jobs the tracker holds in progress.
+        """
+        freed: list[int] = []
+        for process_id, process_info in self.items():
+            job = process_info.current_inference_job()
+            if job is None or job.id_ in in_progress_job_ids:
+                continue
+            process_info.retire_inference_ownership(job)
+            freed.append(process_id)
+        return freed
+
     def on_model_ram_clear(
         self,
         process_id: int,
+        *,
+        from_child_report: bool = False,
     ) -> None:
         """Update the model load state for the given process ID.
 
+        A child's report keeps the launch's inference ownership: a job dispatched alongside its preload is
+        still queued behind that preload's unload, so the report says nothing about the job ending.
+
         Args:
             process_id (int): The ID of the process to update.
+            from_child_report (bool): True when the clear applies the child's ``UNLOADED_MODEL_FROM_RAM``
+                report rather than a parent-initiated unload of an idle lane.
         """
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
-        self[process_id].clear_job_references()
+        if from_child_report:
+            self[process_id].preload_job_intent = None
+        else:
+            self[process_id].clear_job_references()
         # A model gone from RAM is certainly gone from the device, so no retained residency survives it, and
         # a refusal to give the device back cannot outlive the weights it was about.
         self[process_id].clear_retained_resident()

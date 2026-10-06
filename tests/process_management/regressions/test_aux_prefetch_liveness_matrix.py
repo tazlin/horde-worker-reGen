@@ -294,11 +294,14 @@ class _AuxLivenessWorld:
             )
             await self._job_tracker.queue_for_safety(job_info)
             self._in_progress_since.pop(job_id, None)
-            # A real child returns its lane to a resident, accepting state once the result lands; mirror that so
-            # a shared lane can take the next same-model job rather than staying stuck mid-sample.
+            # A real child returns its lane to a resident, accepting state once the result lands, and the result
+            # handler retires the lane's ownership of the job; mirror both so a shared lane can take the next
+            # same-model job rather than staying stuck mid-sample.
             lane_id = self._lane_of.pop(job_id, None)
             if lane_id is not None:
                 lane = self._process_by_id(lane_id)
+                if lane is not None:
+                    lane.retire_inference_ownership(job)
                 if lane is not None and lane.loaded_horde_model_name is not None:
                     lane.last_process_state = HordeProcessState.PRELOADED_MODEL
 

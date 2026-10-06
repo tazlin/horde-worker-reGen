@@ -214,6 +214,12 @@ control-loop tick for it. One preload per cycle remains the ceiling. One cycle:
    `PENDING_SUBMIT` (`handle_job_fault`). A successful send records typed execution ownership containing the
    job, process-launch identifier, and attempt ordinal. Crash recovery, lost-result reaping, clearance, and
    overlap decisions consult that record rather than the display-oriented last-job compatibility view.
+   The record also makes the lane busy: `HordeProcessInfo.can_accept_job()` is false while the launch owns an
+   attempt, whatever state the child last reported. A job sent in the same cycle as its preload leaves the
+   child reporting the preload's states (`UNLOADED_MODEL_FROM_RAM`, `PRELOADED_MODEL`) with the job queued
+   behind them, and those reports neither clear the record nor free the lane. Ownership ends with the job's
+   result, with the lost-result reap, or on the next control-loop iteration after the job leaves
+   `jobs_in_progress` by any other path (`ProcessMap.retire_ownership_of_ended_jobs`), and with the launch.
 6. **`unload_models()` / `unload_models_from_vram()`**: evict idle models not needed by the upcoming
    queue (LRU-informed; see [model eviction](performance_and_backpressure.md#model-eviction-lru)).
 

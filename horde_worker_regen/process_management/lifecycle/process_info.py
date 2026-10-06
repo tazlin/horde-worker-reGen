@@ -691,7 +691,14 @@ class HordeProcessInfo:
         )
 
     def can_accept_job(self) -> bool:
-        """Return true if the process can accept a job."""
+        """Return true if the process can accept a job.
+
+        A launch that owns an inference attempt accepts nothing, whatever state it last reported: a job
+        dispatched alongside its preload leaves the child reporting the preload's states (``PRELOADED_MODEL``
+        among them) while the job is still queued behind it.
+        """
+        if self.current_inference_job() is not None:
+            return False
         return (
             self.last_process_state == HordeProcessState.WAITING_FOR_JOB
             or self.last_process_state == HordeProcessState.PRELOADED_MODEL
