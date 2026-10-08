@@ -35,6 +35,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceResultMessage,
     HordeProcessState,
+    HordeProcessStateChangeMessage,
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from tests.process_management.conftest import (
@@ -196,3 +197,75 @@ async def test_dropped_result_retires_the_slots_dispatch_stamp() -> None:
     # The dropped result retired the stamp, so the slot can no longer phantom-own its stale reference.
     assert slot.current_inference_started_at is None
     assert pm._recovery_coordinator.inference_slot_owns_job(dropped_job.id_) is False
+
+
+def _state_report(process_id: int, state: HordeProcessState) -> HordeProcessStateChangeMessage:
+    return HordeProcessStateChangeMessage(
+        process_id=process_id,
+        process_launch_identifier=0,
+        process_state=state,
+        info=state.name,
+    )
+
+
+async def test_lane_keeps_a_job_dispatched_during_its_unload_through_the_stale_idle_report() -> None:
+    """A job dispatched behind the lane's own unload stays owned while the unload's reports drain.
+
+    The scheduler evicts the lane's previous model and dispatches the next job in one cycle. The child then
+    reports the eviction (``UNLOADED_MODEL_FROM_VRAM``) and the idle that follows it, both older than the
+    dispatch. That idle makes the lane read as an unloadable resident to the next VRAM sweep, whose unload
+    clears the lane's job references. Execution ownership is not a reference the unload may clear: the job is
+    still queued in the child behind those reports, so the lane must keep it through the preload and the
+    primed wait, and the orphaned-job watchdog must never punt it.
+    """
+    pm = make_testable_process_manager()
+
+    lane = make_mock_process_info(4, model_name="majicMIX realistic", state=HordeProcessState.WAITING_FOR_JOB)
+    pm._process_map[4] = lane
+    other_lane = make_mock_process_info(3, model_name="Anima-Turbo", state=HordeProcessState.INFERENCE_PRIMED)
+    pm._process_map[3] = other_lane
+
+    job = make_job_pop_response(model="stable_diffusion")
+    await track_popped_job_async(pm._job_tracker, job)
+    await pm._job_tracker.mark_inference_started(job)
+    assert job.id_ is not None
+
+    # The dispatch, stamped as the scheduler stamps it, after the eviction was sent in the same cycle.
+    lane.last_control_flag = HordeControlFlag.START_INFERENCE
+    lane.current_inference_started_at = time.time()
+    lane.record_inference_ownership(job, attempt_ordinal=1)
+
+    dispatcher = pm._message_dispatcher
+    dispatcher._handle_process_state_change(_state_report(4, HordeProcessState.UNLOADED_MODEL_FROM_VRAM))
+    dispatcher._handle_process_state_change(_state_report(4, HordeProcessState.WAITING_FOR_JOB))
+    assert job in pm._job_tracker.jobs_in_progress
+
+    # The stale idle leaves the lane looking like an idle majicMIX resident; a head-of-queue sweep for the
+    # other lane's load evicts it.
+    assert pm._inference_scheduler.unload_models_from_vram(other_lane, for_head_of_queue=True, under_pressure=True)
+    assert lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+    assert lane.current_inference_job() == job
+    assert pm._recovery_coordinator.inference_slot_owns_job(job.id_) is True
+
+    lane.loaded_horde_model_name = "stable_diffusion"
+    for state in (
+        HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+        HordeProcessState.PRELOADING_MODEL,
+        HordeProcessState.PRELOADED_MODEL,
+        HordeProcessState.INFERENCE_PRIMED,
+    ):
+        dispatcher._handle_process_state_change(_state_report(4, state))
+        assert lane.current_inference_job() == job, state
+
+    pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
+    assert job.id_ not in pm._recovery_coordinator.orphan_in_progress_since
+    # Thirty seconds of watchdog time pass while the lane waits primed for clearance.
+    coordinator_clock = pm._recovery_coordinator._clock
+    pm._recovery_coordinator._clock = lambda: (
+        coordinator_clock() + pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+    )
+    pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
+
+    assert pm._job_tracker.get_stage(job.id_) == JobStage.INFERENCE_IN_PROGRESS
+    assert pm._recovery_coordinator.orphan_punt_history == []

@@ -82,6 +82,16 @@ class LoadCompletionSample:
     peak_private_bytes: int
 
 
+_INFERENCE_ACTIVE_STATES = frozenset(
+    {
+        HordeProcessState.INFERENCE_STARTING,
+        HordeProcessState.INFERENCE_COMPLETE,
+        HordeProcessState.INFERENCE_FAILED,
+    },
+)
+"""Slot states from which a return to idle can follow a run of the owned job."""
+
+
 @dataclass(frozen=True)
 class PreloadJobIntent:
     """A job that selected this launch for model preparation, without execution ownership."""
@@ -511,7 +521,7 @@ class HordeProcessInfo:
         Assignments in older integrations and tests are classified from the slot state/control flag.
         """
         if job is None:
-            self.clear_job_references()
+            self.end_launch_job_references()
             return
         if self.last_control_flag == HordeControlFlag.START_INFERENCE or self.last_process_state in {
             HordeProcessState.INFERENCE_PRIMED,
@@ -564,8 +574,49 @@ class HordeProcessInfo:
             self.record_preload_intent(ownership.job)
         return True
 
+    def idle_report_closes_owned_job(
+        self,
+        *,
+        previous_state: HordeProcessState,
+        previous_state_started_at: float,
+    ) -> ImageGenerateJobPopResponse | None:
+        """Return the owned job a ``WAITING_FOR_JOB`` report closes, or None when the report is no job boundary.
+
+        Ownership is stamped at dispatch, before the child reads the job, so the child can still be draining
+        reports from before the dispatch: the idle after evicting the previous model, or the end of a preload.
+        Only a return to idle from an inference-active state that began after the dispatch can follow a run of
+        the owned job.
+
+        Args:
+            previous_state: The state the slot reported before this idle.
+            previous_state_started_at: When the parent recorded that state.
+        """
+        if previous_state not in _INFERENCE_ACTIVE_STATES:
+            return None
+        if (
+            self.current_inference_started_at is not None
+            and self.current_inference_started_at > previous_state_started_at
+        ):
+            return None
+        # A disaggregated sampler takes no sampling-timing stamp at dispatch; its ownership record carries the
+        # instant it was bound.
+        ownership = self.inference_ownership
+        if ownership is not None and ownership.recorded_at > previous_state_started_at:
+            return None
+        return self.current_inference_job()
+
     def clear_job_references(self) -> None:
-        """Clear preload attribution and execution ownership at a job/process boundary."""
+        """Clear preload attribution when the parent tears the slot's model down.
+
+        Execution ownership survives. A parent-side unload can reach a slot whose dispatched job is still queued
+        in the child behind reports older than the dispatch, and the unload ends nothing about that job.
+        Ownership ends with its job (:meth:`retire_inference_ownership`) or its launch
+        (:meth:`end_launch_job_references`).
+        """
+        self.preload_job_intent = None
+
+    def end_launch_job_references(self) -> None:
+        """Clear preload attribution and execution ownership when the launch ends."""
         self.preload_job_intent = None
         self.inference_ownership = None
 

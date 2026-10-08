@@ -217,7 +217,12 @@ control-loop tick for it. One preload per cycle remains the ceiling. One cycle:
    The record also makes the lane busy: `HordeProcessInfo.can_accept_job()` is false while the launch owns an
    attempt, whatever state the child last reported. A job sent in the same cycle as its preload leaves the
    child reporting the preload's states (`UNLOADED_MODEL_FROM_RAM`, `PRELOADED_MODEL`) with the job queued
-   behind them, and those reports neither clear the record nor free the lane. Ownership ends with the job's
+   behind them, and those reports neither clear the record nor free the lane. Neither does a parent-side
+   unload (`HordeProcessInfo.clear_job_references` clears preload intent only): the idle a child reports after
+   an eviction sent in the dispatch's own cycle can make the lane look like an idle resident to the next
+   sweep. Which idle reports close the owned job is decided on the record
+   (`HordeProcessInfo.idle_report_closes_owned_job`), and the lost-result reap and the orphaned-job watchdog
+   both read it. Ownership ends with the job's
    result, with the lost-result reap, or on the next control-loop iteration after the job leaves
    `jobs_in_progress` by any other path (`ProcessMap.retire_ownership_of_ended_jobs`), and with the launch.
 6. **`unload_models()` / `unload_models_from_vram()`**: evict idle models not needed by the upcoming

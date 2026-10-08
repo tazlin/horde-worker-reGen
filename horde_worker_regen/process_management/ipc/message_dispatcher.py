@@ -102,19 +102,6 @@ class _RetiredLaunchMessageAction(enum.Enum):
     ACCEPT_SAFETY_RESULT = enum.auto()
 
 
-_INFERENCE_ACTIVE_STATES = frozenset(
-    {
-        HordeProcessState.INFERENCE_STARTING,
-        HordeProcessState.INFERENCE_COMPLETE,
-        HordeProcessState.INFERENCE_FAILED,
-    },
-)
-"""Slot states from which a return to idle means a job actually ran (so a missing result was lost).
-
-Used by the lost-result reap to exclude the dispatch window: a slot transitioning to idle from a
-teardown/preload path is carrying a job the scheduler only just stamped onto it, which it has not run
-yet, so there is no result to have lost."""
-
 _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS = 20.0
 """How long a queue deadlock must persist continuously before it counts as a structural wedge.
 
@@ -1448,28 +1435,13 @@ class MessageDispatcher:
         child acknowledges it, so a slot can carry a freshly dispatched job while it is still draining
         state messages from *before* the dispatch: the ``WAITING_FOR_JOB`` it reports after unloading the
         previous model to free VRAM, for example. Reading that stale idle report against the optimistically
-        stamped job would fault a job that never ran (a window that widens on slower disks/model swaps). The
-        slot's prior state is the discriminator: only a return to idle from an inference-active state can
-        mean a result was produced and then lost. A return from a teardown/preload path is the dispatch
-        window, so the job is left for the slot to take up. The same ordering check also needs the active
-        dispatch timestamp: if a newer dispatch was stamped after the state being closed began, then the
-        idle report belongs to older slot work and must not release the newer job.
+        stamped job would fault a job that never ran (a window that widens on slower disks/model swaps). Which
+        idle reports close the owned job is decided on the ownership record
+        (:meth:`HordeProcessInfo.idle_report_closes_owned_job`), the same record the orphaned-job watchdog
+        reads.
         """
-        if previous_state not in _INFERENCE_ACTIVE_STATES:
-            return
         process_info = self._process_map.get(process_id)
         if process_info is None:
-            return
-        if (
-            process_info.current_inference_started_at is not None
-            and process_info.current_inference_started_at > previous_state_started_at
-        ):
-            return
-        # A disaggregated sampler takes no sampling-timing stamp at dispatch, but its ownership record carries
-        # the instant it was bound; an idle report whose state began before that instant is the previous job's
-        # trailing transition, not this job's slot going idle.
-        ownership = process_info.inference_ownership
-        if ownership is not None and ownership.recorded_at > previous_state_started_at:
             return
         # Only a whole-job INFERENCE slot can lose an inference result here. A disaggregated stage lane
         # (the encode service reports INFERENCE_STARTING, then WAITING_FOR_JOB) would otherwise trip this
@@ -1477,7 +1449,10 @@ class MessageDispatcher:
         # stage results, so this reap does not apply to it.
         if process_info.process_type != HordeProcessType.INFERENCE:
             return
-        job = process_info.current_inference_job()
+        job = process_info.idle_report_closes_owned_job(
+            previous_state=previous_state,
+            previous_state_started_at=previous_state_started_at,
+        )
         if job is None or job not in self._job_tracker.jobs_in_progress:
             return
 

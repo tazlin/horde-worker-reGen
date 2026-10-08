@@ -350,7 +350,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_process_state_started_at = time.time()
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
-        self[process_id].clear_job_references()
+        self[process_id].end_launch_job_references()
         # A dead process's device weights go with it, so it can no longer be a retained resident the
         # retention static fit charges or the dispatch path evicts.
         self[process_id].clear_retained_resident()
@@ -742,7 +742,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
         The launch's inference ownership is kept: a job dispatched alongside its preload is still queued
         behind that preload's unload, so a child's ``UNLOADED_MODEL_FROM_RAM`` report says nothing about the
-        job ending, and a parent-initiated unload only targets a lane that owns nothing. Ownership ends with
+        job ending. A parent-initiated unload keeps it too (:meth:`HordeProcessInfo.clear_job_references`):
+        a stale idle report can make a lane that owns a job look like an idle resident. Ownership ends with
         its job or its launch.
 
         Args:
