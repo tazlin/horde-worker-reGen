@@ -132,7 +132,11 @@ class GpuUtilizationSampler:
             return list(self._samples)
         cutoff = time.time() - window_seconds if window_seconds is not None else None
         floor = max(cutoff, not_before) if cutoff is not None and not_before is not None else (cutoff or not_before)
-        return [value for timestamp, value in self._timeline if floor is None or timestamp >= floor]
+        # The sampler thread appends while readers query, and a full bounded deque drops its oldest entry on
+        # every append, which raises in any reader iterating it in place. ``list()`` copies under the GIL, so
+        # the window is filtered from a stable snapshot.
+        timeline = list(self._timeline)
+        return [value for timestamp, value in timeline if floor is None or timestamp >= floor]
 
     def mean_percent(self, window_seconds: float | None = None, *, not_before: float | None = None) -> float | None:
         """Average GPU core utilization (the duty cycle), over the whole run or the last window.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 
 import pytest
@@ -82,6 +83,33 @@ class TestGpuUtilizationSampler:
         assert sampler.sample_count >= 1
         assert sampler.mean_percent() == 80.0
         assert sampler.busy_fraction() == 1.0
+
+    def test_windowed_query_survives_concurrent_appends(self) -> None:
+        """A rolling-window read never raises while the sampling thread keeps appending.
+
+        The timeline is a bounded deque: once full, every append from the sampler thread also drops the
+        oldest entry, so a reader iterating it in place sees ``deque mutated during iteration``. The parent
+        reads this from its control loop, where that error is fatal.
+        """
+        sampler = GpuUtilizationSampler(max_samples=50_000)
+        now = time.time()
+        sampler._timeline.extend((now, 50) for _ in range(50_000))  # noqa: SLF001 - fill to capacity
+        stop = threading.Event()
+
+        def append_forever() -> None:
+            while not stop.is_set():
+                sampler._timeline.append((time.time(), 50))  # noqa: SLF001 - the sampler thread's write
+
+        writer = threading.Thread(target=append_forever, daemon=True)
+        writer.start()
+        try:
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                assert sampler.mean_percent(window_seconds=3600) == 50.0
+                assert sampler.busy_fraction(window_seconds=3600, not_before=now - 1) == 1.0
+        finally:
+            stop.set()
+            writer.join(timeout=2.0)
 
     def test_stop_is_safe_when_never_started(self) -> None:
         """Stopping a sampler that never started (or had no reader) is harmless."""
