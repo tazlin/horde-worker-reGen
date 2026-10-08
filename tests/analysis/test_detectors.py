@@ -3211,3 +3211,77 @@ class TestLaneDoubleDispatchSignature:
     def test_a_release_alone_does_not_fire(self, tmp_path: Path) -> None:
         """The release is the designed cleanup, so on its own it is not a finding."""
         assert "lane_double_dispatch_signature" not in _diagnose(tmp_path, _o2_log(self._RELEASED))
+
+    def test_an_unpriced_sampling_window_alone_does_not_fire(self, tmp_path: Path) -> None:
+        """Sampling without a recorded grant is a pricing or ledger gap, not lost job ownership."""
+        log = _o2_log(_inference_started("13:01:00.000", process=3), _unpriced_window("13:01:01.000", process=3))
+        assert "lane_double_dispatch_signature" not in _diagnose(tmp_path, log)
+
+
+def _inference_started(clock: str, *, process: int, job_id: str = "0b1c2d3e") -> str:
+    """The scheduler handing a job to an inference process at ``clock``."""
+    return f"{clock} | INFO | x:y:1 - Starting inference for job {job_id} on process {process}"
+
+
+def _unpriced_window(clock: str, *, process: int) -> str:
+    """The clearance controller seeing ``process`` sample without a recorded grant at ``clock``."""
+    return (
+        f"{clock} | WARNING | x:y:1 - Clearance lease on device 0: process {process} entered its denoise loop "
+        "without a recorded grant (unpriced sampling window); liveness preserved."
+    )
+
+
+_SHORT_WINDOWS = (
+    _inference_started("13:01:00.000", process=1),
+    _unpriced_window("13:01:01.000", process=1),
+    _inference_started("13:02:00.000", process=2),
+    _unpriced_window("13:02:02.000", process=2),
+)
+_LONG_WINDOWS = tuple(
+    line
+    for minute, process in ((3, 1), (5, 2), (7, 3))
+    for line in (
+        _inference_started(f"13:{minute:02d}:00.000", process=process),
+        _unpriced_window(f"13:{minute + 1:02d}:00.000", process=process),
+    )
+)
+
+
+class TestUnpricedSamplingWindows:
+    """Each window is paired with its process's last start and banded by the wait between them."""
+
+    def test_three_lease_timeouts_warn(self, tmp_path: Path) -> None:
+        """Two short windows and three 60 second ones: the long band decides the severity."""
+        finding = _diagnose(tmp_path, _o2_log(*_SHORT_WINDOWS, *_LONG_WINDOWS))["unpriced_sampling_windows"]
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "Image generation started without a recorded memory grant 5 times, 3 of them after waiting "
+            "30 seconds or more."
+        )
+        assert "waits: 2 under 3 s, 0 from 3 s to under 30 s, 3 at 30 s or more" in finding.evidence
+        assert "median wait: 60.0 s" in finding.evidence
+        assert any(line.startswith("first at 30 s or more: 13:04:00") for line in finding.evidence)
+        assert finding.see_also is FindingKind.SCHEDULER_STARVATION_WEDGE
+
+    def test_short_windows_alone_are_a_note(self, tmp_path: Path) -> None:
+        """Grants issued but missing from the ledger cost nothing, so the finding is context only."""
+        finding = _diagnose(tmp_path, _o2_log(*_SHORT_WINDOWS))["unpriced_sampling_windows"]
+        assert finding.severity is Severity.INFO
+        assert finding.headline == (
+            "Image generation started without a recorded memory grant 2 times, each after a wait under 30 seconds."
+        )
+        assert "waits: 2 under 3 s, 0 from 3 s to under 30 s, 0 at 30 s or more" in finding.evidence
+        assert "median wait: 1.5 s" in finding.evidence
+        assert any(line.startswith("first under 3 s: 13:01:01") for line in finding.evidence)
+
+    def test_a_window_pairs_with_its_own_process(self, tmp_path: Path) -> None:
+        """A later start on another process does not shorten the wait."""
+        log = _o2_log(
+            *_SHORT_WINDOWS,
+            _inference_started("13:10:00.000", process=1),
+            _inference_started("13:10:50.000", process=2),
+            _unpriced_window("13:11:00.000", process=1),
+        )
+        finding = _diagnose(tmp_path, log)["unpriced_sampling_windows"]
+        assert "waits: 2 under 3 s, 0 from 3 s to under 30 s, 1 at 30 s or more" in finding.evidence
+        assert finding.severity is Severity.INFO

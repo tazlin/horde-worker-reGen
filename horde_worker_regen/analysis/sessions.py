@@ -47,6 +47,9 @@ _MAIN_STARTUP_RE = re.compile(r"Setting up logger for main process")
 _ABANDON_SHIP_RE = re.compile(r"cannot restore a working process pool|abandoning ship")
 _ABORT_FILE_RE = pattern_for("abort_sentinel_found")
 _SUPERVISOR_SHUTDOWN_RE = re.compile(r"Supervisor requested shutdown")
+# The control loop's last word before an unexpected exception. The graceful shutdown that follows also logs
+# the clean-exit marker, so this must outrank it: the run ended because the parent faulted, not by choice.
+_CONTROL_LOOP_CRASH_RE = pattern_for("control_loop_crash")
 # This is emitted only after ``start_working`` returns through session persistence. The process manager's
 # earlier "Shutting down process manager" line proves only that child teardown began/completed; a gathered
 # sibling task can still hold the worker process open, so treating that line as final produced false clean exits.
@@ -64,6 +67,8 @@ class SessionEndReason(enum.StrEnum):
     """An ``.abort`` sentinel forced an immediate stop (not via the give-up path)."""
     SUPERVISOR_SHUTDOWN = "supervisor_shutdown"
     """An operator/TUI shutdown (e.g. Ctrl-Q) stopped the worker."""
+    CONTROL_LOOP_CRASH = "control_loop_crash"
+    """The parent's control loop raised an unexpected exception and the worker shut itself down."""
     KILLED_OR_CRASHED = "killed_or_crashed"
     """No exit marker before the next session began: the run was killed or died without draining."""
     STILL_RUNNING = "still_running"
@@ -253,6 +258,7 @@ def _classify_end_reason(session: WorkerSession, *, is_last: bool) -> SessionEnd
     saw_abandon = False
     saw_abort = False
     saw_supervisor = False
+    saw_control_loop_crash = False
     for record in session.records:
         text = record.full_text
         if _ABANDON_SHIP_RE.search(text):
@@ -261,11 +267,15 @@ def _classify_end_reason(session: WorkerSession, *, is_last: bool) -> SessionEnd
             saw_abort = True
         if _SUPERVISOR_SHUTDOWN_RE.search(text):
             saw_supervisor = True
+        if _CONTROL_LOOP_CRASH_RE.search(text):
+            saw_control_loop_crash = True
         if _CLEAN_EXIT_RE.search(text):
             saw_clean_exit = True
 
     if saw_abandon:
         return SessionEndReason.GAVE_UP_ABORTED
+    if saw_control_loop_crash:
+        return SessionEndReason.CONTROL_LOOP_CRASH
     if saw_supervisor and saw_clean_exit:
         return SessionEndReason.SUPERVISOR_SHUTDOWN
     if saw_abort:

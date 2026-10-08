@@ -103,6 +103,7 @@ _LANE_MEASUREMENTS_NOT_SENT = (
     "the dry-run post-processing lane runs no chain and sends no measurements, so the finish line is the short form"
 )
 _RUN_NOT_ABORTED = "a completed dry run ends through a graceful shutdown; only an abort writes the sentinel file"
+_CONTROL_LOOP_NOT_FAULTED = "a completed dry run's control loop raises nothing, so the line never follows"
 _DEFERRED_GPU_START_NOT_EXERCISED = (
     "the dry-run harness's fake children report no free-VRAM reading that falls short of a GPU start, so no "
     "start is ever deferred"
@@ -453,6 +454,13 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.process_manager:_process_control_loop",
         sample="Found .abort_benchmark file; aborting immediately",
         dry_run_reason=_RUN_NOT_ABORTED,
+    ),
+    _signature(
+        "control_loop_crash",
+        r"Unexpected error in control loop; shutting down gracefully: (?P<error>.+)",
+        emitter="process_management.process_manager:_process_control_loop",
+        sample="Unexpected error in control loop; shutting down gracefully: deque mutated during iteration",
+        dry_run_reason=_CONTROL_LOOP_NOT_FAULTED,
     ),
     # --- Recovery supervisor (save-our-ship) ---
     _signature(

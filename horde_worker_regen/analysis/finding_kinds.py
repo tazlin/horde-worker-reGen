@@ -86,6 +86,7 @@ class FindingKind(enum.StrEnum):
     FILE_DESCRIPTOR_EXHAUSTION = "file_descriptor_exhaustion"
     PAGEFILE_EXHAUSTION = "pagefile_exhaustion"
     SCHEDULER_STARVATION_WEDGE = "scheduler_starvation_wedge"
+    UNPRICED_SAMPLING_WINDOWS = "unpriced_sampling_windows"
     UNSATISFIABLE_HEAD_STARVATION = "unsatisfiable_head_starvation"
     RESIDENCY_RECONCILIATION_HOLDS = "residency_reconciliation_holds"
     WHOLE_CARD_CONVERGENCE_WEDGE = "whole_card_convergence_wedge"
@@ -312,7 +313,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         action="Send the log with `horde-log bundle` to the worker maintainers.",
         detail=(
             "Each job belongs to one process. A job was released as lost while its process still worked on it. "
-            "Or a result came for a job the worker no longer tracked, or an image started without a memory grant. "
+            "Or a result came for a job the worker no longer tracked. "
             "Each means two parts of the worker disagreed about who owned a job."
         ),
         see_also=FindingKind.ORPHAN_WEDGE,
@@ -427,6 +428,21 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "to size each process from, so it over-charges every load. When the wait runs long enough the "
             "worker rebuilds its processes and drops the queued jobs, which the horde counts as dropped."
         ),
+    ),
+    FindingSpec(
+        kind=FindingKind.UNPRICED_SAMPLING_WINDOWS,
+        title="Image generation started without a recorded memory grant",
+        detail=(
+            "An image process waits for a memory grant before it starts generating (the clearance lease). "
+            "The wait from the job's start to the moment it generated without a grant on record shows the cost. "
+            "A wait under 3 seconds is a grant that was issued but is missing from the worker's records. "
+            'A "cleared process" line exists for it, and it costs nothing. '
+            "A wait of 30 seconds or more is the process running out its 60 second grant timeout while the card "
+            "sat idle. That points at how the job's memory was priced or freed. "
+            "A wait in between needs the log around it to tell which."
+        ),
+        see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
+        reference_page="docs/explanation/admission_pipeline.md",
     ),
     FindingSpec(
         kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,

@@ -535,6 +535,22 @@ CONTRACTS: dict[str, Contract] = {
         ),
         severity=Severity.CRITICAL,
     ),
+    "detect_unpriced_sampling_windows": Contract(
+        bridge=_bridge(
+            *(
+                line
+                for minute, process in ((0, 1), (2, 2), (4, 3))
+                for line in (
+                    f"2026-06-24 18:0{minute}:00.000 | INFO | x:y:1 - Starting inference for job 0b1c2d3e on "
+                    f"process {process}",
+                    f"2026-06-24 18:0{minute + 1}:00.000 | WARNING | x:y:1 - Clearance lease on device 0: process "
+                    f"{process} entered its denoise loop without a recorded grant (unpriced sampling window); "
+                    "liveness preserved.",
+                )
+            ),
+        ),
+        severity=Severity.WARNING,
+    ),
     "detect_oom": Contract(
         bridge=_bridge(_oom("18:00:10.000")),
         severity=Severity.CRITICAL,

@@ -120,6 +120,17 @@ class TestEndReason:
         """An operator-stopped session is SUPERVISOR_SHUTDOWN."""
         assert _sessions()[1].end_reason is SessionEndReason.SUPERVISOR_SHUTDOWN
 
+    def test_control_loop_crash_outranks_the_clean_exit_it_causes(self) -> None:
+        """A control-loop exception shuts the worker down gracefully, so the clean-exit marker still follows."""
+        log = (
+            "2026-06-24 18:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process\n"
+            "2026-06-24 18:00:01.000 | ERROR | a.b:c:1 - Unexpected error in control loop; shutting down gracefully: "
+            "deque mutated during iteration\n"
+            "2026-06-24 18:00:02.000 | INFO  | a.b:c:1 - Worker has finished working\n"
+        )
+        sessions = segment_sessions(parse_lines(log.splitlines(), Path("bridge.log")))
+        assert sessions[0].end_reason is SessionEndReason.CONTROL_LOOP_CRASH
+
     def test_truncated_middle_session_is_killed_or_crashed(self) -> None:
         """A non-final session with no exit marker is treated as killed/crashed mid-run."""
         log = (

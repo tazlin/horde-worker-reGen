@@ -1171,14 +1171,15 @@ def detect_service_lane_restart_churn(context: SessionContext) -> list[Finding]:
     ]
 
 
-_DOUBLE_DISPATCH_SIGNATURES = ("inference_result_lost", "inference_result_job_missing", "unpriced_sampling_window")
+_DOUBLE_DISPATCH_SIGNATURES = ("inference_result_lost", "inference_result_job_missing")
 _OWNERSHIP_RELEASED_RE = pattern_for("ended_job_ownership_released")
 
 
 def detect_lane_double_dispatch_signature(context: SessionContext) -> list[Finding]:
-    """Jobs released as lost while a lane held them, results for untracked jobs, or ungranted sampling.
+    """Jobs released as lost while a lane held them, or results for jobs no longer tracked.
 
-    The ownership-release count is context only: a release on its own is the designed cleanup.
+    The ownership-release count is context only: a release on its own is the designed cleanup. Sampling
+    without a recorded grant is not an ownership defect; :func:`detect_unpriced_sampling_windows` ranks it.
     """
     records = _records_in_window(context.session.records, context.session.start_ts, context.session.end_ts)
     patterns = {name: pattern_for(name) for name in _DOUBLE_DISPATCH_SIGNATURES}
@@ -1206,6 +1207,102 @@ def detect_lane_double_dispatch_signature(context: SessionContext) -> list[Findi
                 f"ended_job_ownership_released: {released}",
                 f"first: {_evidence(first)}",
             ],
+        ),
+    ]
+
+
+_INFERENCE_DISPATCHED_RE = pattern_for("inference_dispatched")
+_UNPRICED_SAMPLING_WINDOW_RE = pattern_for("unpriced_sampling_window")
+
+# A wait this short from the start of inference means the grant was issued and the parent's ledger missed it.
+_UNPRICED_SHORT_WAIT_SECONDS = 3.0
+# A wait this long means the child sat through most of its lease-acquire timeout (60 s) with the card idle.
+_UNPRICED_LONG_WAIT_SECONDS = 30.0
+# One lease timeout can be a transient; this many in a session is a pricing or reclaim pattern worth a look.
+_UNPRICED_LONG_WAIT_WARNING_COUNT = 3
+
+
+def detect_unpriced_sampling_windows(context: SessionContext) -> list[Finding]:
+    """Sampling without a recorded clearance grant, banded by the wait since that process's start of inference.
+
+    Each window pairs with the most recent start of inference on the same process. A short wait is a grant
+    the parent's ledger missed; a wait of 30 s or more is a child that ran out its lease-acquire timeout with
+    the card idle, which is what costs throughput. A window with no prior start on its process is counted
+    but not banded.
+    """
+    records = _records_in_window(context.session.records, context.session.start_ts, context.session.end_ts)
+    last_start: dict[str, datetime] = {}
+    short_windows: list[LogRecord] = []
+    middle_windows: list[LogRecord] = []
+    long_windows: list[LogRecord] = []
+    waits: list[float] = []
+    unpaired = 0
+    for record in records:
+        if record.timestamp is None:
+            continue
+        if match := _INFERENCE_DISPATCHED_RE.search(record.message):
+            last_start[match["process"]] = record.timestamp
+            continue
+        if not (match := _UNPRICED_SAMPLING_WINDOW_RE.search(record.message)):
+            continue
+        started = last_start.get(match["process"])
+        if started is None:
+            unpaired += 1
+            continue
+        wait = (record.timestamp - started).total_seconds()
+        waits.append(wait)
+        if wait < _UNPRICED_SHORT_WAIT_SECONDS:
+            short_windows.append(record)
+        elif wait < _UNPRICED_LONG_WAIT_SECONDS:
+            middle_windows.append(record)
+        else:
+            long_windows.append(record)
+    total = len(waits) + unpaired
+    if total == 0:
+        return []
+    severity = Severity.WARNING if len(long_windows) >= _UNPRICED_LONG_WAIT_WARNING_COUNT else Severity.INFO
+    if long_windows:
+        headline = (
+            f"Image generation started without a recorded memory grant {total} times, {len(long_windows)} of them "
+            f"after waiting {_UNPRICED_LONG_WAIT_SECONDS:.0f} seconds or more."
+        )
+    else:
+        headline = (
+            f"Image generation started without a recorded memory grant {total} times, each after a wait under "
+            f"{_UNPRICED_LONG_WAIT_SECONDS:.0f} seconds."
+        )
+    if severity is Severity.WARNING:
+        action = (
+            'Read the "Clearance held for process" line before each long wait. '
+            "It says why the worker held back the memory grant."
+        )
+    else:
+        action = "No action needed."
+    evidence = [
+        f"waits: {len(short_windows)} under {_UNPRICED_SHORT_WAIT_SECONDS:.0f} s, {len(middle_windows)} from "
+        f"{_UNPRICED_SHORT_WAIT_SECONDS:.0f} s to under {_UNPRICED_LONG_WAIT_SECONDS:.0f} s, {len(long_windows)} at "
+        f"{_UNPRICED_LONG_WAIT_SECONDS:.0f} s or more",
+    ]
+    if (median := _median(waits)) is not None:
+        evidence.append(f"median wait: {median:.1f} s")
+    if unpaired:
+        evidence.append(f"no start of inference on the same process before it: {unpaired}")
+    costliest_bands = (
+        (long_windows, f"{_UNPRICED_LONG_WAIT_SECONDS:.0f} s or more", "at"),
+        (middle_windows, f"{_UNPRICED_SHORT_WAIT_SECONDS:.0f} s to under {_UNPRICED_LONG_WAIT_SECONDS:.0f} s", "from"),
+        (short_windows, f"{_UNPRICED_SHORT_WAIT_SECONDS:.0f} s", "under"),
+    )
+    for band, label, preposition in costliest_bands:
+        if band:
+            evidence.append(f"first {preposition} {label}: {_evidence(band[0])}")
+            break
+    return [
+        Finding(
+            kind=FindingKind.UNPRICED_SAMPLING_WINDOWS,
+            severity=severity,
+            headline=headline,
+            action_addendum=action,
+            evidence=evidence,
         ),
     ]
 
@@ -3549,6 +3646,7 @@ _SESSION_END_PHRASES: dict[SessionEndReason, str] = {
     SessionEndReason.GAVE_UP_ABORTED: "stopped itself after its processes could not be restored",
     SessionEndReason.ABORTED: "was stopped by the abort file",
     SessionEndReason.SUPERVISOR_SHUTDOWN: "was shut down from the dashboard",
+    SessionEndReason.CONTROL_LOOP_CRASH: "shut itself down after an error in its control loop",
     SessionEndReason.KILLED_OR_CRASHED: "was killed or crashed without shutting down",
     SessionEndReason.STILL_RUNNING: "is still running",
 }
@@ -3560,7 +3658,11 @@ def detect_session_summary(context: SessionContext) -> list[Finding]:
     session = context.session
     duration = session.duration_seconds
     duration_text = f"{duration / 60:.1f} minutes" if duration is not None else "an unknown time"
-    severity = Severity.WARNING if session.end_reason is SessionEndReason.KILLED_OR_CRASHED else Severity.INFO
+    severity = (
+        Severity.WARNING
+        if session.end_reason in (SessionEndReason.KILLED_OR_CRASHED, SessionEndReason.CONTROL_LOOP_CRASH)
+        else Severity.INFO
+    )
     return [
         Finding(
             kind=FindingKind.SESSION_SUMMARY,
@@ -4209,6 +4311,7 @@ DETECTORS: list[Detector] = [
     detect_idle_fill_offer_stuck,
     detect_service_lane_restart_churn,
     detect_lane_double_dispatch_signature,
+    detect_unpriced_sampling_windows,
     detect_post_processing_deferral_starvation,
     detect_oom,
     detect_file_descriptor_exhaustion,
