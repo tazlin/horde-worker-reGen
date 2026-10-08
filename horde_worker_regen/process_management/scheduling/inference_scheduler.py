@@ -2464,8 +2464,12 @@ class InferenceScheduler:
                 spared_process_id=target_process.process_id if target_process is not None else None,
             )
 
+        # The note says a move is being asked for; a safety process another owner already holds off the card
+        # (the reclaim ladder's rung, most often) has nothing left to move, so the line must not claim it.
         safety_pause_requested = (
-            self._residency_should_pause_safety(device_index) and self._job_tracker.safety_backlog_depth == 0
+            self._residency_should_pause_safety(device_index)
+            and self._job_tracker.safety_backlog_depth == 0
+            and not self._process_lifecycle.is_safety_gpu_paused
         )
         post_process_paused = self._pause_post_process_for_residency_if_idle(
             device_index,
@@ -3979,6 +3983,21 @@ class InferenceScheduler:
                 "is holding it (the in-flight job has not made enough progress to share the card)"
             )
 
+        # Read before the whole-card convergence branch: a residency head parked behind a post-processing chain
+        # is held by that chain, and the hold ledger carries the dispatch pass's own verdict for it.
+        # The post-processing co-residency defer gate holds an already-resident head while an in-flight (or
+        # imminent) post-processing chain's committed VRAM would collide with this job's sampling peak on the
+        # card. The dispatch path records that verdict in the hold ledger on the pass it
+        # computes it, so this reads the gate's own truthful state rather than re-deriving the PP fit (the two
+        # must never disagree). The head dispatches once the chain finishes, so this is a real named head-park,
+        # not the gate-less scheduler stall the fall-through reports.
+        if head.id_ is not None and str(head.id_) in self._dispatch_holds.pp_defer_holds:
+            return SlotDutyBucket.POST_PROCESSING_DEFER, (
+                f"its model is resident and idle on process {process.process_id}, but dispatch is held while an "
+                "in-flight post-processing chain finishes: the chain's committed VRAM and this job's sampling "
+                "peak cannot share the card, and it dispatches once the chain releases the device"
+            )
+
         # A held whole-card residency parks its own pre-staged head until the live inference-process count
         # collapses to the forecast's target (sole residency). The convergence teardown is meant to stop the
         # idle siblings, including ones holding a model queued behind the head, sparing only the head's
@@ -4013,19 +4032,6 @@ class InferenceScheduler:
             return SlotDutyBucket.DEGRADED_ISOLATION_PENDING, (
                 f"its model is resident and idle on process {process.process_id}, but its next dispatch must run "
                 f"degraded/isolated and is waiting for the card to clear of other work"
-            )
-
-        # The post-processing co-residency defer gate holds an already-resident head while an in-flight (or
-        # imminent) post-processing chain's committed VRAM would collide with this job's sampling peak on the
-        # card. The dispatch path records that verdict in the hold ledger on the pass it
-        # computes it, so this reads the gate's own truthful state rather than re-deriving the PP fit (the two
-        # must never disagree). The head dispatches once the chain finishes, so this is a real named head-park,
-        # not the gate-less scheduler stall the fall-through reports.
-        if head.id_ is not None and str(head.id_) in self._dispatch_holds.pp_defer_holds:
-            return SlotDutyBucket.POST_PROCESSING_DEFER, (
-                f"its model is resident and idle on process {process.process_id}, but dispatch is held while an "
-                "in-flight post-processing chain finishes: the chain's committed VRAM and this job's sampling "
-                "peak cannot share the card, and it dispatches once the chain releases the device"
             )
 
         # The dispatch-time residency-reconciliation gate holds an already-resident head while it evicts idle
