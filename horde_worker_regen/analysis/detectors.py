@@ -3641,6 +3641,115 @@ def detect_pop_api_error_dominance(context: SessionContext) -> list[Finding]:
     ]
 
 
+_SUBMITTED_GENERATION_RE = pattern_for("submitted_generation")
+
+# A model with fewer jobs than this has too few samples for its per-second rates to rank it against the rest.
+_MODEL_ECONOMICS_MIN_JOBS = 20
+_MODEL_ECONOMICS_TOP_MODELS = 8
+# A well-sampled model earning under this fraction of the session's kudos per wall-second is listed even when
+# it is outside the top earners, since a cheap model holding much of the wall clock is what the table is for.
+_MODEL_ECONOMICS_CHEAP_FRACTION = 0.5
+
+
+@dataclass
+class _ModelEconomics:
+    """One model's submitted jobs summed over a session: kudos, sampling seconds, and popped-to-submit seconds."""
+
+    model: str
+    jobs: int = 0
+    kudos: float = 0.0
+    sampling_seconds: float = 0.0
+    wall_seconds: float = 0.0
+
+    @property
+    def kudos_per_sampling_second(self) -> float | None:
+        return self.kudos / self.sampling_seconds if self.sampling_seconds > 0 else None
+
+    @property
+    def kudos_per_wall_second(self) -> float | None:
+        return self.kudos / self.wall_seconds if self.wall_seconds > 0 else None
+
+
+def _rate_text(rate: float | None) -> str:
+    return f"{rate:.2f}" if rate is not None else "no time recorded"
+
+
+def detect_model_economics(context: SessionContext) -> list[Finding]:
+    """Kudos per sampling-second and per wall-second, per model, from each submitted job's line.
+
+    Wall is popped-to-submit, so it counts every second a job held a place in the worker, including the waits
+    around sampling. The kudos price is the horde's, so the rates rank models by what they pay; the share of
+    wall a model takes is the worker's scheduling. Always informational: it is a table, not a problem.
+    """
+    records = _records_in_window(context.session.records, context.session.start_ts, context.session.end_ts)
+    by_model: dict[str, _ModelEconomics] = {}
+    for record in records:
+        if not (match := _SUBMITTED_GENERATION_RE.search(record.message)):
+            continue
+        economics = by_model.setdefault(match["model"], _ModelEconomics(model=match["model"]))
+        economics.jobs += 1
+        economics.kudos += float(match["kudos"])
+        economics.sampling_seconds += float(match["generate"])
+        economics.wall_seconds += float(match["popped_ago"])
+    if not by_model:
+        return []
+
+    models = list(by_model.values())
+    total_kudos = sum(economics.kudos for economics in models)
+    total_sampling = sum(economics.sampling_seconds for economics in models)
+    total_wall = sum(economics.wall_seconds for economics in models)
+    session_per_sampling = total_kudos / total_sampling if total_sampling > 0 else None
+    session_per_wall = total_kudos / total_wall if total_wall > 0 else None
+
+    well_sampled = [
+        economics
+        for economics in models
+        if economics.jobs >= _MODEL_ECONOMICS_MIN_JOBS and economics.kudos_per_wall_second is not None
+    ]
+    headline = (
+        f"Jobs earned {total_kudos:.0f} kudos, {_rate_text(session_per_sampling)} per sampling second and "
+        f"{_rate_text(session_per_wall)} per wall second"
+    )
+    if well_sampled and total_wall > 0:
+        lowest = min(well_sampled, key=lambda economics: economics.kudos_per_wall_second or 0.0)
+        headline += (
+            f', and the lowest payer, "{lowest.model}", took {100 * lowest.wall_seconds / total_wall:.1f}% of '
+            "wall time."
+        )
+    else:
+        headline += "."
+
+    by_kudos = sorted(models, key=lambda economics: -economics.kudos)
+    listed = by_kudos[:_MODEL_ECONOMICS_TOP_MODELS]
+    if session_per_wall is not None:
+        cheap_floor = _MODEL_ECONOMICS_CHEAP_FRACTION * session_per_wall
+        well_sampled_models = {economics.model for economics in well_sampled}
+        listed += [
+            economics
+            for economics in by_kudos[_MODEL_ECONOMICS_TOP_MODELS:]
+            if economics.model in well_sampled_models and (economics.kudos_per_wall_second or 0.0) < cheap_floor
+        ]
+
+    evidence: list[str] = []
+    for economics in listed:
+        kudos_share = 100 * economics.kudos / total_kudos if total_kudos else 0.0
+        wall_share = 100 * economics.wall_seconds / total_wall if total_wall > 0 else 0.0
+        jobs_text = "1 job" if economics.jobs == 1 else f"{economics.jobs} jobs"
+        evidence.append(
+            f"{economics.model}: {jobs_text}, {economics.kudos:.0f} kudos ({kudos_share:.1f}%), "
+            f"{_rate_text(economics.kudos_per_sampling_second)} per sampling-second, "
+            f"{_rate_text(economics.kudos_per_wall_second)} per wall-second, {wall_share:.1f}% of wall"
+        )
+    return [
+        Finding(
+            kind=FindingKind.MODEL_ECONOMICS,
+            severity=Severity.INFO,
+            headline=headline,
+            evidence=evidence,
+        ),
+    ]
+
+
 _SESSION_END_PHRASES: dict[SessionEndReason, str] = {
     SessionEndReason.CLEAN_EXIT: "ended with a normal shutdown",
     SessionEndReason.GAVE_UP_ABORTED: "stopped itself after its processes could not be restored",
@@ -4318,6 +4427,7 @@ DETECTORS: list[Detector] = [
     detect_pagefile_exhaustion,
     detect_swallowed_oom,
     detect_orphan_wedge,
+    detect_model_economics,
     detect_session_summary,
 ]
 

@@ -612,6 +612,14 @@ CONTRACTS: dict[str, Contract] = {
         },
         severity=Severity.WARNING,
     ),
+    "detect_model_economics": Contract(
+        bridge=_bridge(
+            "2026-06-24 18:01:00.000 | SUCCESS | x:y:1 - Submitted generation 9c46c418 (model: "
+            "WAI-NSFW-illustrious-SDXL) for 22.62 kudos. Job popped 12.98 seconds ago and took 6.55 to generate. "
+            "(3.46 kudos/second for the whole batch. 0.4 or greater is ideal)",
+        ),
+        severity=Severity.INFO,
+    ),
     "detect_session_summary": Contract(
         bridge=_bridge(),
         severity=Severity.INFO,

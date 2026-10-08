@@ -3285,3 +3285,79 @@ class TestUnpricedSamplingWindows:
         finding = _diagnose(tmp_path, log)["unpriced_sampling_windows"]
         assert "waits: 2 under 3 s, 0 from 3 s to under 30 s, 1 at 30 s or more" in finding.evidence
         assert finding.severity is Severity.INFO
+
+
+def _submitted_jobs(
+    model: str, count: int, *, kudos: float, generate: float, popped_ago: float, start: int
+) -> list[str]:
+    """``count`` submit lines for ``model``, one second apart from the ``start``-th second after 13:01."""
+    lines = []
+    for offset in range(count):
+        second = start + offset
+        lines.append(
+            f"13:{1 + second // 60:02d}:{second % 60:02d}.000 | SUCCESS | x:y:1 - Submitted generation "
+            f"{second:08x} (model: {model}) for {kudos} kudos. Job popped {popped_ago} seconds ago and took "
+            f"{generate} to generate. (1.00 kudos/second for the whole batch. 0.4 or greater is ideal)"
+        )
+    return lines
+
+
+def _expensive_models(count: int) -> list[str]:
+    """``count`` models with one 100-kudos job each, at 10 kudos per sampling and per wall second."""
+    return [
+        line
+        for index in range(count)
+        for line in _submitted_jobs(f"Big{index}", 1, kudos=100.0, generate=10.0, popped_ago=10.0, start=index)
+    ]
+
+
+class TestModelEconomics:
+    """Per-model kudos per sampling second and per wall second, summed from the submit lines."""
+
+    def test_three_models_report_their_own_rates(self, tmp_path: Path) -> None:
+        """Each row divides the model's kudos by its own sampling and wall seconds."""
+        log = _o2_log(
+            *_submitted_jobs("Alpha", 2, kudos=30.0, generate=10.0, popped_ago=20.0, start=0),
+            *_submitted_jobs("Beta", 1, kudos=20.0, generate=5.0, popped_ago=10.0, start=2),
+            *_submitted_jobs("Gamma", 20, kudos=1.0, generate=1.0, popped_ago=2.0, start=3),
+        )
+        finding = _diagnose(tmp_path, log)["model_economics"]
+        assert finding.severity is Severity.INFO
+        assert finding.headline == (
+            'Jobs earned 100 kudos, 2.22 per sampling second and 1.11 per wall second, and the lowest payer, "Gamma", '
+            "took 44.4% of wall time."
+        )
+        assert finding.evidence == [
+            "Alpha: 2 jobs, 60 kudos (60.0%), 3.00 per sampling-second, 1.50 per wall-second, 44.4% of wall",
+            "Beta: 1 job, 20 kudos (20.0%), 4.00 per sampling-second, 2.00 per wall-second, 11.1% of wall",
+            "Gamma: 20 jobs, 20 kudos (20.0%), 1.00 per sampling-second, 0.50 per wall-second, 44.4% of wall",
+        ]
+        assert finding.see_also is FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES
+
+    def test_a_cheap_model_outside_the_top_earners_is_listed_at_twenty_jobs(self, tmp_path: Path) -> None:
+        """Ninth by kudos, but under half the session's rate per wall second with enough jobs to rank."""
+        log = _o2_log(
+            *_expensive_models(8),
+            *_submitted_jobs("Cheap", 20, kudos=1.0, generate=1.0, popped_ago=5.0, start=8),
+        )
+        finding = _diagnose(tmp_path, log)["model_economics"]
+        assert len(finding.evidence) == 9
+        assert finding.evidence[-1] == (
+            "Cheap: 20 jobs, 20 kudos (2.4%), 1.00 per sampling-second, 0.20 per wall-second, 55.6% of wall"
+        )
+        assert finding.headline.endswith(', and the lowest payer, "Cheap", took 55.6% of wall time.')
+
+    def test_a_cheap_model_with_too_few_jobs_is_not_listed(self, tmp_path: Path) -> None:
+        """Nineteen jobs are too few to rank, so the row and the lowest-payer clause both stay out."""
+        log = _o2_log(
+            *_expensive_models(8),
+            *_submitted_jobs("Cheap", 19, kudos=1.0, generate=1.0, popped_ago=5.0, start=8),
+        )
+        finding = _diagnose(tmp_path, log)["model_economics"]
+        assert len(finding.evidence) == 8
+        assert not any(line.startswith("Cheap:") for line in finding.evidence)
+        assert finding.headline == "Jobs earned 819 kudos, 8.27 per sampling second and 4.68 per wall second."
+
+    def test_no_submitted_job_emits_nothing(self, tmp_path: Path) -> None:
+        """A session that sent nothing back has no table to show."""
+        assert "model_economics" not in _diagnose(tmp_path, _o2_log())

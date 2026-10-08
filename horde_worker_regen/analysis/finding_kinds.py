@@ -116,6 +116,7 @@ class FindingKind(enum.StrEnum):
     MODEL_REFERENCE_SAMPLE_FAULT = "model_reference_sample_fault"
     TEXT_BACKEND_WEDGED = "text_backend_wedged"
 
+    MODEL_ECONOMICS = "model_economics"
     SESSION_SUMMARY = "session_summary"
 
     # Read from the running worker's state by the dashboard's Insights tab, never from a log.
@@ -793,6 +794,27 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         see_also=FindingKind.FAULTED_JOB_CENSUS,
     ),
     # --- Session context ---
+    FindingSpec(
+        kind=FindingKind.MODEL_ECONOMICS,
+        title="What each model earned per second",
+        action=(
+            "No action needed. Read it beside the findings on asking the horde for one model and on the card "
+            "sitting idle."
+        ),
+        detail=(
+            "A sampling second is a second the card spent generating a job's images. "
+            "A wall second runs from when the horde handed the job over until the worker sent it back. "
+            "Jobs overlap, so wall seconds add up to more than the session's length. "
+            "Each row gives a model's jobs, its kudos and their share, kudos per sampling second and per wall "
+            "second, and its share of all wall seconds. "
+            "The rows are the eight models that earned most, plus any model with 20 or more jobs earning under "
+            "half the session's rate per wall second. "
+            "The horde sets each model's kudos price, so a model that pays little per second is not the "
+            "worker's fault. "
+            "The share of wall seconds a model takes is the worker's own scheduling."
+        ),
+        see_also=FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
+    ),
     FindingSpec(
         kind=FindingKind.SESSION_SUMMARY,
         title="Session summary",

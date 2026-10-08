@@ -106,6 +106,7 @@ For how the detectors, the log lines they read, and the dashboard stay in step, 
 
 | Id | Severity | Fires when | Remedy |
 |----|----------|------------|--------|
+| `model_economics` | info | Any job was submitted. Read from each `Submitted generation` line: the headline gives the session's kudos, kudos per sampling second (the job's generation time) and per wall second (popped to submit), and the share of wall time taken by the model paying least per wall second among those with 20 or more jobs. The evidence has one row per model for the eight that earned most, plus any model with 20 or more jobs earning under half the session's rate per wall second. | Nothing to do by itself. The horde sets the kudos price, so a model that pays little is not the worker's fault; the share of wall time it takes is the worker's scheduling. Read it beside `whole_card_pop_claim_episodes` and the duty findings. |
 | `session_summary` | varies | Always, once per session. Says how the session ended and how long it ran, with the worker version, model count, recovery counts and any rotated archives folded into the parse in the evidence. | Nothing; it is the header the other findings are read against. |
 
 ## Live dashboard
