@@ -1056,7 +1056,8 @@ This is not a second reclaim ladder. Genuine saturation remains the verified lad
 residents are already first-class candidates for it; the sweep only removes holds that had stopped being a bet
 on anything. Revocation actuates through the ordinary idle-model unload and registers the same in-flight
 eviction record a dispatch-time eviction does, so a dispatch priced against those weights waits for the card
-to evidence the free rather than for the request to have been sent. A busy slot is never touched.
+to evidence the free rather than for the request to have been sent. A busy slot, or one that owns a dispatched
+job, is never touched.
 
 ### Reading retention back
 

@@ -475,6 +475,58 @@ class TestParkedPreloadIsReclaimable:
         assert scheduler.unload_idle_model(1) is False
 
 
+class TestDispatchedLaneIsNotReclaimed:
+    """A lane that owns a dispatched job is never a VRAM unload target, whatever state it last reported.
+
+    A lane dispatched during its own unload keeps reporting states from before the dispatch, and a model-state
+    message can restore the previous model as its resident. Read naively that is an idle lane with a resident
+    model, but the dispatched job replaces that model anyway, so a second unload frees nothing for a head.
+    """
+
+    _PREVIOUS_MODEL = "previous-model"
+    _DISPATCHED_MODEL = "dispatched-model"
+
+    def _scheduler_with_dispatched_lane(self) -> InferenceScheduler:
+        anchor = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        lane = make_mock_process_info(1, model_name=self._PREVIOUS_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
+        lane.record_inference_ownership(make_job_pop_response(model=self._DISPATCHED_MODEL), attempt_ordinal=1)
+        return _make_inference_scheduler(
+            process_map=ProcessMap({0: anchor, 1: lane}),
+            bridge_data=make_mock_bridge_data(),
+        )
+
+    def test_the_pressure_sweep_passes_it_over(self) -> None:
+        """Even the head-of-queue escalation, which overrides every residency guard, leaves the lane alone."""
+        scheduler = self._scheduler_with_dispatched_lane()
+
+        freed = scheduler.unload_models_from_vram(
+            scheduler._process_map[0], under_pressure=True, for_head_of_queue=True
+        )
+
+        assert freed is False
+        assert scheduler._process_map[1].last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+    def test_the_ladder_does_not_unload_it(self) -> None:
+        """The reclaim ladder's named-process actuator refuses the lane."""
+        scheduler = self._scheduler_with_dispatched_lane()
+
+        assert scheduler.unload_idle_model(1) is False
+
+    def test_the_coldest_idle_selection_does_not_offer_it(self) -> None:
+        """The selection behind the eviction rung agrees with its actuator, so no rung is offered for it."""
+        scheduler = self._scheduler_with_dispatched_lane()
+
+        assert scheduler.has_evictable_idle_resident(None) is False
+
+    def test_the_ladder_candidates_leave_it_out(self) -> None:
+        """The ladder assembles no resident rung its actuator would refuse."""
+        scheduler = self._scheduler_with_dispatched_lane()
+
+        candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+        assert candidates.idle_residents == ()
+
+
 class TestPreloadDoesNotDisplaceTheHeadsCopy:
     """A later job's preload must not be staged onto the slot holding the queue head's own model.
 

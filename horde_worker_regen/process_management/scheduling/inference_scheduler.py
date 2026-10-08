@@ -7524,6 +7524,9 @@ class InferenceScheduler:
                 # in the ladder spends the cheap resident rungs on nothing and opens every later episode
                 # directly onto the lane and safety rungs.
                 continue
+            if process_info.current_inference_job() is not None:
+                # :meth:`unload_idle_model` refuses a slot that owns a dispatched job, for the same reason.
+                continue
             if (
                 process_info.loaded_horde_model_name in in_progress_models
                 or process_info.loaded_horde_model_name in protected_models
@@ -7740,7 +7743,8 @@ class InferenceScheduler:
         """Unload one idle process's resident model from VRAM to RAM (reclaim-ladder actuator).
 
         Targets a single named process rather than sweeping the card, so the verified ladder controls exactly
-        which resident it gives back and in what order. Never touches an actively-sampling process, and treats
+        which resident it gives back and in what order. Never touches an actively-sampling process or one that
+        owns a dispatched job, and treats
         a process already unloading (or without a resident model) as a no-op so the engine does not open a
         verification window on a rung that frees nothing.
         """
@@ -7748,6 +7752,8 @@ class InferenceScheduler:
         if process_info is None:
             return False
         if process_info.is_process_busy() and not self._slot_is_reclaimable_while_busy(process_info):
+            return False
+        if process_info.current_inference_job() is not None:
             return False
         if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
             return False
@@ -7820,9 +7826,10 @@ class InferenceScheduler:
     def _coldest_idle_resident(self, device_index: int | None) -> IdleResidentCandidate | None:
         """Return the least-recently-demanded idle inference resident no queued or running job needs, if any.
 
-        Skips busy slots, slots already unloading, and any model a pending or in-progress job needs, since
-        yielding one of those would only force an immediate reload. Inference slots only, so a lane's models are
-        never chosen. ``device_index`` scopes the search to one card; None considers every card.
+        Skips busy slots, slots that own a dispatched job, slots already unloading, and any model a pending or
+        in-progress job needs, since yielding one of those would only force an immediate reload. Inference slots
+        only, so a lane's models are never chosen. ``device_index`` scopes the search to one card; None considers
+        every card.
         """
         pending_models = {job.model for job in self._job_tracker.jobs_pending_inference}
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
@@ -7838,6 +7845,8 @@ class InferenceScheduler:
             if device_index is not None and process_info.device_index != device_index:
                 continue
             if process_info.is_process_busy() or process_info.loaded_horde_model_name is None:
+                continue
+            if process_info.current_inference_job() is not None:
                 continue
             model_name = process_info.loaded_horde_model_name
             if model_name in pending_models or model_name in in_progress_models:
@@ -12022,6 +12031,12 @@ class InferenceScheduler:
 
             if process_info.is_process_busy() and not self._slot_is_reclaimable_while_busy(process_info):
                 logger.debug(f"Process {process_info.process_id} is busy")
+                continue
+
+            # A lane that owns a dispatched job can read idle with a resident model while its reports from
+            # before the dispatch drain, and the job is about to replace that model anyway, so an unload frees
+            # nothing for anyone. pricing.has_reclaimable_idle_model skips the same slot.
+            if process_info.current_inference_job() is not None:
                 continue
 
             if process_info.loaded_horde_model_name is not None:

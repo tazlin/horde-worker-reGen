@@ -507,13 +507,15 @@ def has_reclaimable_idle_model(
     """Whether an idle resident model could be evicted on the card to reclaim VRAM for a head.
 
     A read-only mirror of the pressure eviction's targeting: an idle post-processing lane not already
-    unloading, or an inference slot holding a model that is idle or parked on a stale preload, not in
-    progress, not spared by the lookahead or whole-card guards (which the head escalation overrides), and not
-    already unloading. The head's own target slot is excluded on the terms :func:`target_slot_is_spared` sets.
+    unloading, or an inference slot holding a model that is idle or parked on a stale preload, owns no
+    dispatched job, is not in progress, not spared by the lookahead or whole-card guards (which the head
+    escalation overrides), and not already unloading. The head's own target slot is excluded on the terms
+    :func:`target_slot_is_spared` sets.
 
-    The busy-or-parked term is the actuator's own (`unload_models_from_vram` skips a busy slot that is not a
-    parked preload). A mirror that counted a fresh preload as evictable would keep the arbiter's ladder
-    non-empty with a rung that frees nothing, and the lane rungs behind it would never be offered.
+    The busy-or-parked and job-ownership terms are the actuator's own (`unload_models_from_vram` skips a busy
+    slot that is not a parked preload, and a slot that owns a dispatched job). A mirror that counted either as
+    evictable would keep the arbiter's ladder non-empty with a rung that frees nothing, and the lane rungs
+    behind it would never be offered.
     """
     running = in_progress_models(snapshot)
     lookahead = next_models(snapshot, snapshot.max_inference_processes)
@@ -529,6 +531,8 @@ def has_reclaimable_idle_model(
         if slot.process_type is not HordeProcessType.INFERENCE or slot.model is None:
             continue
         if slot.is_busy and not slot.parked_preload:
+            continue
+        if slot.current_job_id is not None:
             continue
         if slot.model in running:
             continue

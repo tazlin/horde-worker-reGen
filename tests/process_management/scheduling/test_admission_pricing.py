@@ -232,6 +232,27 @@ class TestReclaimPredicates:
         assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is True
         assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=False, device_index=None) is False
 
+    async def test_a_lane_that_owns_a_dispatched_job_is_not_reclaimable(self) -> None:
+        """A lane idle by state with a resident model is no reclaim target while it owns a dispatched job.
+
+        Reports from before the dispatch can read idle and restore the previous model as resident. The actuator
+        skips that lane, so the mirror offering it would hold a rung that frees nothing.
+        """
+        owner = _slot(1, model="previous")
+        scheduler, jobs = await _worker(slots={0: _slot(0, model=None), 1: owner}, pending=[], in_progress=["next"])
+        assert pricing.has_reclaimable_idle_model(
+            scheduler.snapshot(), 0, for_head_of_queue=True, device_index=None
+        ), "without the ownership the idle resident is a reclaim target"
+
+        owner.record_inference_ownership(jobs[0], attempt_ordinal=1)  # type: ignore[attr-defined]
+
+        snapshot = scheduler.snapshot()
+        assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is False
+        assert (
+            scheduler.unload_models_from_vram(scheduler._process_map[0], under_pressure=True, for_head_of_queue=True)
+            is False
+        )
+
     async def test_teardown_predicates(self) -> None:
         """The teardownable siblings, what the bare ones return, and the warm tenancy the head could reclaim."""
         components = _slot(2, model=None)
