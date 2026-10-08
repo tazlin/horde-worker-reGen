@@ -400,6 +400,7 @@ class WholeCardResidencyLedger:
         cooldown_until: float,
         now: float,
         establish_grace_seconds: float = 0.0,
+        new_demand: bool = True,
     ) -> WholeCardGrantKind:
         """Record a residency grant (an establishment or a RAM pre-stage) for ``device_index``.
 
@@ -418,6 +419,11 @@ class WholeCardResidencyLedger:
         teardown churn on jobs that caused none, hand the supervisor a fresh excuse for a queue nothing is
         tearing down, and restart the drain backstop of a residency that has already converged. The grant
         forecast is likewise captured only for a physical grant, keeping it immutable across repeated asks.
+
+        ``new_demand`` is False when the asker is a head that already asked and is re-asking while it waits
+        for the residency to converge. Such a reuse is no new evidence of demand, so it leaves the empty-pop
+        run alone; resetting the run on every re-ask would keep the claim from ever releasing while the head
+        is parked.
         """
         state = self.state_for(device_index)
         kind = (
@@ -425,11 +431,12 @@ class WholeCardResidencyLedger:
             if state.model is not None and state.model == model and state.established_at != 0.0
             else WholeCardGrantKind.ESTABLISH
         )
-        # A grant of either kind is a job asking for this model, which is the direct contradiction of the
-        # empty-pop evidence: the run restarts from the demand that just arrived. An establishment additionally
-        # restarts the maximum hold, since the clock measures one physical residency episode.
-        state.pop_claim_empty_pops = 0
-        state.pop_claim_empty_pop_since = 0.0
+        # A job asking for this model is the direct contradiction of the empty-pop evidence, so the run restarts
+        # from the demand that just arrived. An establishment additionally restarts the maximum hold, since the
+        # clock measures one physical residency episode.
+        if kind is WholeCardGrantKind.ESTABLISH or new_demand:
+            state.pop_claim_empty_pops = 0
+            state.pop_claim_empty_pop_since = 0.0
         if kind is WholeCardGrantKind.ESTABLISH:
             state.established_at = now
             state.min_hold_until = now + _MIN_HOLD_SECONDS

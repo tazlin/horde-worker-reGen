@@ -15,6 +15,8 @@ the grant decision and the gate that releases a reserved head:
 - the churn governors charge physical teardowns rather than the jobs riding one residency, and hold a head
   they refuse only for a bounded dwell before ordinary admission decides
   (:class:`TestGovernorsBrakeChurnWithoutParkingTheQueue`);
+- a parked head re-asking for the residency its card already holds reserves nothing again
+  (:class:`TestReaskingAHeldResidencyIsANoOp`);
 - and making room for a head never evicts an in-flight job's model (:class:`TestMakingRoomNeverStrandsInflight`).
 
 :class:`TestForecastVerdicts` pins the representative forecast verdicts the grant tests reason about, so a change
@@ -721,6 +723,17 @@ class TestChurnGovernors:
         lifecycle.post_process_lane_enabled = Mock(return_value=False)
         lifecycle.component_lane_enabled = Mock(return_value=False)
         lifecycle.vae_lane_enabled = Mock(return_value=False)
+
+        def end_idle_siblings(target: int, **_kwargs: object) -> int:
+            """Stop idle non-head processes down to ``target`` and report the count, as the real shrink does."""
+            for process_info in process_map.values():
+                if process_map.num_loaded_inference_processes() <= target:
+                    break
+                if process_info.process_id != 1 and not process_info.is_process_busy():
+                    process_info.last_process_state = HordeProcessState.PROCESS_ENDED
+            return process_map.num_loaded_inference_processes()
+
+        lifecycle.scale_inference_processes = Mock(side_effect=end_idle_siblings)
         scheduler._process_lifecycle = lifecycle
         forecast = _forecast_16gb(
             weights_mb=_FLUX_WEIGHTS_MB,
@@ -1186,6 +1199,128 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
         assert scheduler._job_tracker.is_admitted_exclusive(flux_job) is False, (
             "a co-resident dispatch is not an exclusive admission"
         )
+
+
+class TestReaskingAHeldResidencyIsANoOp:
+    """A parked head re-asking for the residency its card already holds changes nothing.
+
+    The head re-asks every scheduling cycle until the residency converges. A re-ask that reran the establishment
+    wrote another reservation line, which the log analysis counts as one more reservation, and restarted the pop
+    claim's empty-pop run, so the claim could not release while the head waited.
+    """
+
+    _RESERVATION_LINE = "Whole-card residency: reserving the device"
+
+    @staticmethod
+    def _scheduler_and_head(
+        **bridge_overrides: object,
+    ) -> tuple[InferenceScheduler, HordeProcessInfo, StreamForecast]:
+        """A tight-card scheduler with a card-filling head, its bridge data overridden by ``bridge_overrides``."""
+        scheduler, available_process, forecast = TestChurnGovernors._scheduler_and_head()
+        for key, override in bridge_overrides.items():
+            setattr(scheduler._runtime_config.bridge_data, key, override)
+        return scheduler, available_process, forecast
+
+    @staticmethod
+    def _ask(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse, process: HordeProcessInfo) -> None:
+        """Run one scheduling cycle's whole-card ask for ``job``."""
+        forecast = _forecast_16gb(
+            weights_mb=_FLUX_WEIGHTS_MB,
+            reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
+            free_now_mb=_FLUX16_ESTABLISH_FREE_NOW_MB,
+            wants_whole_card=True,
+        )
+        scheduler._decide_whole_card_demand(
+            job,
+            process,
+            forecast,
+            None,
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+
+    async def test_a_parked_head_reasking_reserves_once(self) -> None:
+        """Three cycles of the same parked head: one reservation line, one shrink, the empty-pop run kept.
+
+        Safety is configured to leave the card and has not yet, so the residency stays short of convergence and
+        the policy that moves safety holds on every cycle. That policy alone never writes the line.
+        """
+        scheduler, available_process, _forecast = self._scheduler_and_head(
+            whole_card_residency_safety_off_gpu=True,
+        )
+        assert scheduler._residency_should_pause_safety(None) is True, "precondition: the residency moves safety"
+        head = await track_popped_job_async(
+            scheduler._job_tracker,
+            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4),
+        )
+        messages: list[str] = []
+        sink_id = inference_scheduler_module.logger.add(messages.append, format="{message}", level="WARNING")
+        try:
+            self._ask(scheduler, head, available_process)
+            state = scheduler._whole_card_ledger.state_for(None)
+            assert state.model == _FLUX_MODEL, "precondition: the first ask established the residency"
+            empty_pop_since = time.time() - 5.0
+            state.pop_claim_empty_pops = 2
+            state.pop_claim_empty_pop_since = empty_pop_since
+            for _cycle in range(2):
+                self._ask(scheduler, head, available_process)
+        finally:
+            inference_scheduler_module.logger.remove(sink_id)
+
+        reservations = [message for message in messages if self._RESERVATION_LINE in message]
+        assert len(reservations) == 1, f"one establishment writes one reservation line, got {reservations}"
+        assert "requesting safety off-GPU" in reservations[0]
+        lifecycle = scheduler._process_lifecycle
+        assert isinstance(lifecycle, Mock)
+        assert lifecycle.scale_inference_processes.call_count == 1, "the pool was shrunk once, at the establishment"
+        assert state.pop_claim_empty_pops == 2, "the same head re-asking is no new demand for the resident model"
+        assert state.pop_claim_empty_pop_since == empty_pop_since
+        assert len(state.establishments) == 1
+
+    async def test_a_reask_after_the_teardown_settles_stops_at_the_ledger(self) -> None:
+        """Once the teardown is structurally complete a re-ask only extends the cooldown."""
+        scheduler, available_process, _forecast = self._scheduler_and_head()
+        head = await track_popped_job_async(
+            scheduler._job_tracker,
+            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4),
+        )
+        self._ask(scheduler, head, available_process)
+        state = scheduler._whole_card_ledger.state_for(None)
+        assert state.structural_complete_at != 0.0, "precondition: the first ask's teardown settled"
+        state.cooldown_until = 0.0
+        with patch.object(
+            scheduler,
+            "_pause_post_process_for_residency_if_idle",
+            wraps=scheduler._pause_post_process_for_residency_if_idle,
+        ) as post_process_pause:
+            self._ask(scheduler, head, available_process)
+        assert post_process_pause.call_count == 0, "a settled residency has nothing left to stop"
+        assert state.cooldown_until > time.time(), "a re-ask still holds the residency through its cooldown"
+
+    def test_a_different_model_after_a_restore_establishes_again(self) -> None:
+        """A residency released and claimed for another model is a new establishment and announces itself."""
+        scheduler, available_process, forecast = self._scheduler_and_head()
+        flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
+        scheduler._establish_whole_card_residency(flux_job, forecast, announce=True)
+        state = scheduler._whole_card_ledger.state_for(None)
+        state.cooldown_until = 0.0
+        scheduler._restore_siblings_after_whole_card()
+        assert scheduler.is_whole_card_residency_active() is False, "precondition: the residency was restored"
+        state.pop_claim_empty_pops = 2
+
+        other_model = "Krea2-Turbo_fp8"
+        other_job = make_job_pop_response(other_model, width=1216, height=1216, ddim_steps=4)
+        messages: list[str] = []
+        sink_id = inference_scheduler_module.logger.add(messages.append, format="{message}", level="WARNING")
+        try:
+            scheduler._establish_whole_card_residency(other_job, forecast, announce=False)
+        finally:
+            inference_scheduler_module.logger.remove(sink_id)
+
+        assert state.model == other_model
+        assert len(state.establishments) == 2
+        assert state.pop_claim_empty_pops == 0, "an establishment restarts the empty-pop run"
+        assert any(self._RESERVATION_LINE in message and other_model in message for message in messages)
 
 
 class TestMakingRoomNeverStrandsInflight:

@@ -495,6 +495,14 @@ steady-state preference. The pool the reduction shrank is booked with the verifi
 obligation and regrown when that card recovers, so a reduction is not a permanent capacity loss (see
 [The verified LIFO reclaim ladder](performance_and_backpressure.md#the-verified-lifo-reclaim-ladder)).
 
+**A re-ask is not a second grant.** A parked head asks for its residency every cycle until the card converges.
+The ledger answers each grant as an establishment or a reuse (`WholeCardGrantKind`), and the establish path acts
+on that answer. A reuse extends the cooldown and nothing else: it leaves the pop claim's empty-pop run alone
+unless a job is asking for the first time, and once the teardown is structurally complete it returns there.
+Before that the sibling shrink and the lane pauses are retried, each a no-op once taken. The "reserving the
+device" line is written on an establishment, or when a retry actually stopped a sibling or a lane; that the
+residency moves safety off the card holds on every cycle and only adds a note to the line.
+
 A head deferred past the 60s diagnostic threshold with reclaim genuinely exhausted and no such teardown target
 (no first-party context reclaim remains) emits a warning with the full arithmetic and increments
 `starvation_diagnostics`; it still does not admit. The job stays queued for the structural queue wedge recovery

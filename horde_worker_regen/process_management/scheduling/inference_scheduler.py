@@ -219,6 +219,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_DRAIN_SETTLE_SECONDS,
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
+    WholeCardGrantKind,
     convergence_blockers,
     post_process_context_fits,
     residency_has_holder,
@@ -2423,17 +2424,29 @@ class InferenceScheduler:
         stopped. ``target_override`` sizes the depth from a rejected admission peak instead of the forecast.
         ``target_process`` is the slot this head will load on and is spared from the shrink, since a head not
         yet staged anywhere carries no model name for the protected-model rule to match.
+
+        The head re-asks every cycle while it is parked, so a re-ask for the residency the card already holds
+        only extends the cooldown. ``announce`` marks a job's first ask; a later ask from the same head leaves
+        the pop claim's empty-pop run alone. Once the teardown is structurally complete a re-ask returns there.
+        Before that the shrink and the lane pauses are retried (each is a no-op once taken), since a sibling or
+        lane that was busy at the establishment may have drained since, and the reservation line is written
+        only when this call established the residency or actually stopped something.
         """
-        self._whole_card_ledger.record_grant(
+        grant_kind = self._whole_card_ledger.record_grant(
             device_index,
             model=job.model,
             forecast=forecast,
             cooldown_until=self._clock() + self._whole_card_cooldown_seconds(),
             now=self._clock(),
             establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+            new_demand=announce,
         )
         if target_override is not None:
             self._whole_card_ledger.tighten_target(device_index, target_override)
+        established = grant_kind is WholeCardGrantKind.ESTABLISH
+        teardown_settled = self._whole_card_ledger.state_for(device_index).structural_complete_at != 0.0
+        if not established and teardown_settled and target_override is None:
+            return
 
         # ``target_override`` lets a caller size the depth from the admission verdict's rejected peak rather
         # than the forecast's lighter resident-weight estimate, for the activation-peak context over-commit the
@@ -2466,18 +2479,21 @@ class InferenceScheduler:
         # under it buys nothing and discards the sample the lane's short decode hold cannot outlast. The pause
         # is retried each cycle by _converge_whole_card_residency once that work drains. A no-op unless
         # disaggregation is enabled and the lane sits on this card.
+        vae_lane_paused = False
         if self._residency_should_pause_vae_lane(device_index) and not self._vae_lane_pause_deferred_for_decode(
             requester=VaeLanePauseRequester.WHOLE_CARD_RESIDENCY,
         ):
-            self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
+            vae_lane_paused = self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
         # The disaggregated pipeline's component (text-encode) lane holds an equivalent bare CUDA context plus
         # resident encoders; stop it off-GPU on the residency's card for the same reason as the VAE lane.
         # Stopping it also drops the lane out of the disaggregation liveness predicate, so new jobs route
         # monolithic while the residency holds. A no-op unless disaggregation is enabled and the lane sits here.
+        component_lane_paused = False
         if self._residency_should_pause_component_lane(device_index):
-            self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
+            component_lane_paused = self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
-        if announce or after < current or safety_pause_requested or post_process_paused:
+        # Moving safety off the card is a policy that holds on every tick of the residency, so it only adds a note.
+        if established or after < current or post_process_paused or vae_lane_paused or component_lane_paused:
             safety_note = " and requesting safety off-GPU" if safety_pause_requested else ""
             total_mb = forecast.total_vram_mb
             card_phrase = f"the whole ~{total_mb / 1024:.0f}GB card" if total_mb else "nearly the whole card"
