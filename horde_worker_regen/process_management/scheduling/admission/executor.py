@@ -69,6 +69,7 @@ class ExecutionHost(VramActuator, Protocol):
     _max_inference_processes: int
     _last_ram_verdict: RamPressureVerdict | None
     _last_ram_headroom: RamHeadroom | None
+    _reclaim_ladder: VerifiedReclaimLadder | None
 
     @property
     def _ram_governor_state(self) -> RamGovernorState:
@@ -143,9 +144,20 @@ class PlanExecutor:
         Routed through :meth:`VerifiedReclaimLadder.execute_arbiter_commands` so a verdict's DEFER path and
         the governor's SATURATED verified ladder share one reclaim execution surface: the two triggers can never
         become two mechanisms evicting the same card by different rules. ``head`` names the head an eviction or
-        context reduction acts on behalf of.
+        context reduction acts on behalf of. The worker's one ladder instance owns the safety cycle's cooldown,
+        so the call goes through that instance.
+
+        Raises:
+            RuntimeError: The host has no reclaim ladder injected. The worker builds and injects it before
+                scheduling starts, so a missing ladder here is a wiring defect.
         """
-        return VerifiedReclaimLadder.execute_arbiter_commands(
+        reclaim_ladder = self._host._reclaim_ladder
+        if reclaim_ladder is None:
+            raise RuntimeError(
+                "The admission executor ran arbiter actuations before the worker's reclaim ladder was injected; "
+                "the safety cycle's cooldown lives on that ladder, so set_reclaim_ladder must run first."
+            )
+        return reclaim_ladder.execute_arbiter_commands(
             commands,
             self._host,
             device_index=device_index,

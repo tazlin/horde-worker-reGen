@@ -29,6 +29,7 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
+from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -90,6 +91,7 @@ def _scheduler(
         lru=LRUCache(2),
     )
     scheduler.set_device_free_mb_provider(lambda _device_index: device_free_mb)
+    scheduler.set_reclaim_ladder(VerifiedReclaimLadder())
     return scheduler
 
 

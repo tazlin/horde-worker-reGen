@@ -118,6 +118,7 @@ class PostProcessOrchestrator:
     _model_metadata: ModelMetadata
     _reserve_ledger: CommittedReserveLedger
     _request_vram_reclaim: Callable[[HordeProcessInfo, int], bool]
+    _reclaim_ladder: VerifiedReclaimLadder
     _vram_actuator: VramActuator | None
     _clock: Callable[[], float]
 
@@ -132,6 +133,7 @@ class PostProcessOrchestrator:
         model_metadata: ModelMetadata,
         reserve_ledger: CommittedReserveLedger,
         request_vram_reclaim: Callable[[HordeProcessInfo, int], bool],
+        reclaim_ladder: VerifiedReclaimLadder,
         vram_actuator: VramActuator | None = None,
         sampling_coresidency_check: Callable[[float], bool] | None = None,
         whole_card_residency_active: Callable[[], bool] = lambda: False,
@@ -150,6 +152,8 @@ class PostProcessOrchestrator:
             model_metadata: Provides the baseline needed for post-processing VRAM estimates.
             reserve_ledger: Shared committed-resource ledger used by every workload flow.
             request_vram_reclaim: Callback that asks the scheduler to evict idle VRAM on the lane's card.
+            reclaim_ladder: The worker's single reclaim ladder. The arbiter's plan runs through it so a safety
+                cycle taken for this lane spends the same cooldown as the governor's verified ladder.
             vram_actuator: Optional shared actuator used to execute the arbiter's complete reclaim plan.
             sampling_coresidency_check: Given a chain's estimated peak (MB), whether the card can run it
                 alongside the sampling currently in progress. None (unit tests) allows co-running always.
@@ -165,6 +169,7 @@ class PostProcessOrchestrator:
         self._model_metadata = model_metadata
         self._reserve_ledger = reserve_ledger
         self._request_vram_reclaim = request_vram_reclaim
+        self._reclaim_ladder = reclaim_ladder
         self._vram_actuator = vram_actuator
         self._sampling_coresidency_check = sampling_coresidency_check
         self._whole_card_residency_active = whole_card_residency_active
@@ -375,7 +380,7 @@ class PostProcessOrchestrator:
             if command in applied:
                 continue
             applied.add(command)
-            acted = VerifiedReclaimLadder.execute_arbiter_commands(
+            acted = self._reclaim_ladder.execute_arbiter_commands(
                 (command,),
                 self._vram_actuator,
                 device_index=post_process_process.device_index,

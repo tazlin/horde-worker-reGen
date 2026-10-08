@@ -36,6 +36,7 @@ from horde_worker_regen.process_management.models.horde_model_map import (
 )
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.admission import preload, pricing
@@ -150,6 +151,9 @@ def _make_inference_scheduler(
         card_runtimes=card_runtimes,
         clock=clock,
     )
+    # The worker injects its one reclaim ladder before scheduling starts, and the executor refuses to run
+    # arbiter actuations without it.
+    scheduler.set_reclaim_ladder(VerifiedReclaimLadder())
     if device_free_mb is not None:
         scheduler.set_device_free_mb_provider(lambda _device_index: device_free_mb)
     if available_ram_mb is not None:

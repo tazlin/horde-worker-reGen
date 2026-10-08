@@ -557,8 +557,16 @@ class VerifiedReclaimLadder:
     while still SATURATED, the signal a later kill rung reads.
     """
 
-    def __init__(self) -> None:
-        """Initialise with zeroed counters and no per-device episodes."""
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        """Initialise with zeroed counters and no per-device episodes.
+
+        Args:
+            clock: The monotonic-scale clock every `now` default reads. The verification budgets and the
+                safety rung's cooldown are measured on it from both triggers (the governor tick and the
+                arbiter's per-cycle plan), so a caller that drives the worker on its own clock passes it
+                here once and the two paths never compare instants from different timelines.
+        """
+        self._clock = clock
         self.rungs_issued = 0
         self.verified_frees_mb = 0.0
         self.verification_shortfalls = 0
@@ -628,12 +636,12 @@ class VerifiedReclaimLadder:
                 says the waiter has been served. A pause with a recorded beneficiary is held while this
                 returns True for it. ``None`` treats every beneficiary as served.
             now: The monotonic-scale instant of this sample, which every verification budget and the safety
-                rung's cooldown are measured on. Defaults to :func:`time.monotonic`; a caller that drives the
+                rung's cooldown are measured on. Defaults to the ladder's clock; a caller that drives the
                 control loop on its own clock passes that clock so the budgets are measured on the same
                 timeline as everything else it gates.
         """
         if now is None:
-            now = time.monotonic()
+            now = self._clock()
         if not saturated:
             if healthy:
                 for key in (device_index, None):
@@ -912,8 +920,18 @@ class VerifiedReclaimLadder:
 
         Counted once per refusal so the cost of the dwell is visible; the ladder advances past a refused rung
         within the tick, so this cannot repeat per sample while an episode is running.
+
+        The card-agnostic ``None`` scope is only produced where exactly one card is governed, so it shares that
+        card's clock: the governor tick stamps the card's index while the single-card post-processing path
+        stamps ``None``, and either actuation starts the dwell for both.
         """
-        actuated_at = self._safety_actuated_at.get(device_index)
+        if device_index is None:
+            stamps = list(self._safety_actuated_at.values())
+        else:
+            stamps = [
+                stamp for key in (device_index, None) if (stamp := self._safety_actuated_at.get(key)) is not None
+            ]
+        actuated_at = max(stamps, default=None)
         if actuated_at is None or (now - actuated_at) >= _SAFETY_RUNG_COOLDOWN_SECONDS:
             return False
         self.safety_rungs_refused += 1
@@ -1023,14 +1041,15 @@ class VerifiedReclaimLadder:
             "is kept and retried once the card can take it back.",
         )
 
-    @staticmethod
     def execute_arbiter_commands(
+        self,
         commands: tuple[ActuatorCommand, ...],
         actuator: VramActuator,
         *,
         device_index: int | None,
         for_head_of_queue: bool,
         head: HeadReclaimContext | None = None,
+        now: float | None = None,
     ) -> tuple[ActuatorCommand, ...]:
         """Run the arbiter's deferred-preload actuations through this single reclaim owner.
 
@@ -1045,7 +1064,14 @@ class VerifiedReclaimLadder:
         disturbed. Returns exactly the commands whose actuator reported that it acted; callers that temporarily
         borrow a service lane use this receipt to restore only a pause they actually acquired, never a same-owner
         pause that the governor's independent saturation episode already held.
+
+        CYCLE_SAFETY_OFF_GPU spends the same :data:`_SAFETY_RUNG_COOLDOWN_SECONDS` dwell the verified ladder's
+        safety rung does: a cycle inside it is skipped as a command that did not act, and one that acts restarts
+        it. ``now`` is the monotonic-scale instant the dwell is measured on, the ladder's clock when None,
+        the clock :meth:`on_tick` defaults to.
         """
+        if now is None:
+            now = self._clock()
         applied: list[ActuatorCommand] = []
         for command in commands:
             if command.kind is ActuatorCommandKind.RELEASE_CACHE and command.target_process_id is not None:
@@ -1063,7 +1089,11 @@ class VerifiedReclaimLadder:
             elif command.kind is ActuatorCommandKind.DEMOTE_SAFETY_WEIGHTS:
                 acted = actuator.demote_safety_weights(device_index)
             elif command.kind is ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU:
-                acted = actuator.cycle_safety_off_gpu(device_index)
+                acted = not self._safety_rung_in_cooldown(device_index, now) and actuator.cycle_safety_off_gpu(
+                    device_index
+                )
+                if acted:
+                    self._safety_actuated_at[device_index] = now
             elif command.kind is ActuatorCommandKind.PAUSE_POST_PROCESS_LANE:
                 acted = actuator.pause_post_process_lane(device_index)
             elif command.kind is ActuatorCommandKind.PAUSE_UTILITIES_LANE:

@@ -1395,7 +1395,7 @@ class _DispatchWorld:
         self._lane_of: dict[str, int] = {}
 
         self._governor = DeviceFreeGovernor()
-        self._reclaim_ladder = VerifiedReclaimLadder()
+        self._reclaim_ladder = VerifiedReclaimLadder(clock=lambda: self.now)
         self._actuator = _RecordingActuator(self)
         self._healthy_since: dict[int, float] = {}
         self.governor_states_by_card: dict[int, list[GovernorState]] = {index: [] for index in self._card_totals}
@@ -1420,11 +1420,12 @@ class _DispatchWorld:
         of the retained copy uploads once per job, and the difference is entirely GPU time not spent sampling."""
         self.dispatch_lanes: list[tuple[str, int]] = []
         """Every dispatch as (model, lane), so a scenario can say where a streak's successors were seated."""
-        if closed_loop:
-            # The engine is the single owner of every reclaim restore obligation, including the live-context
-            # reductions the scheduler's own admission path books. Sharing one instance is what makes a
-            # reduction unwound on the same debounced-HEALTHY signal the ladder's lane pauses are.
-            self._scheduler.set_reclaim_ladder(self._reclaim_ladder)
+        # The engine is the single owner of every reclaim restore obligation, including the live-context
+        # reductions the scheduler's own admission path books, and of the safety rung's cooldown that the
+        # admission executor reads. Sharing one instance is what makes a reduction unwound on the same
+        # debounced-HEALTHY signal the ladder's lane pauses are; an open-loop world books obligations it never
+        # unwinds, exactly as a worker whose governor never samples HEALTHY would.
+        self._scheduler.set_reclaim_ladder(self._reclaim_ladder)
 
     # -- card model ---------------------------------------------------------------------------------------
 

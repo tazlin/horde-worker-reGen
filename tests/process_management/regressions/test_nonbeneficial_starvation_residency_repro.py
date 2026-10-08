@@ -177,7 +177,7 @@ async def test_starvation_request_does_not_offer_a_non_reducing_context_teardown
         ),
     )
     scheduler._vram_arbiter = arbiter
-    scheduler.executor.execute_actuations = Mock()  # type: ignore[method-assign]
+    scheduler.executor.execute_actuations = Mock(return_value=())  # type: ignore[method-assign]
 
     assert scheduler._admit_preload_under_budget(head, target, is_head_blocker=True) is False
 

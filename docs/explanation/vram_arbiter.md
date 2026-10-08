@@ -821,7 +821,11 @@ run metrics.
 
 Reclaim stays single-owner across three seams: preload, dispatch reconciliation, and post-processing all run a
 `DEFER` verdict's actuations through the one reclaim engine (`execute_arbiter_commands`), which the governor's
-SATURATED verified ladder shares. Every other authoritative seam (overlap, disaggregated sampling, safety)
+SATURATED verified ladder shares. That engine is one instance per worker and holds the safety rung's per-card
+dwell, so a `CYCLE_SAFETY_OFF_GPU` on a `DEFER` plan and the verified ladder's `SAFETY_OFF_GPU` rung read one
+clock. Either actuation starts it, and a cycle asked for inside it is skipped as a command that did not act. The
+single-card post-processing path addresses the card-agnostic `None` scope, which shares the one card's clock.
+Every other authoritative seam (overlap, disaggregated sampling, safety)
 simply withholds the demand and re-asks next cycle, so no second mechanism evicts the same card by different
 rules.
 

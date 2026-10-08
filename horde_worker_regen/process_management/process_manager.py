@@ -1869,6 +1869,7 @@ class HordeWorkerProcessManager:
                 under_pressure=True,
                 device_index=device_index,
             ),
+            reclaim_ladder=self._reclaim_ladder,
             vram_actuator=self._inference_scheduler,
             sampling_coresidency_check=(
                 lambda pp_reserve_mb: self._inference_scheduler.pp_sampling_coresidency_affordable(

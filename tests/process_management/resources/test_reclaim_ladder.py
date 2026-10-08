@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import time
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
@@ -1007,7 +1008,7 @@ class TestArbiterCommandExecution:
         actuator.evict_coldest_idle_model.return_value = True
         command = ActuatorCommand(kind=ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL, device_index=None)
 
-        applied = VerifiedReclaimLadder.execute_arbiter_commands(
+        applied = VerifiedReclaimLadder().execute_arbiter_commands(
             (command,),
             actuator,
             device_index=1,
@@ -1024,7 +1025,7 @@ class TestArbiterCommandExecution:
         actuator.evict_coldest_idle_model.return_value = False
         command = ActuatorCommand(kind=ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL, device_index=None)
 
-        applied = VerifiedReclaimLadder.execute_arbiter_commands(
+        applied = VerifiedReclaimLadder().execute_arbiter_commands(
             (command,),
             actuator,
             device_index=0,
@@ -1032,3 +1033,97 @@ class TestArbiterCommandExecution:
         )
 
         assert applied == ()
+
+
+class TestArbiterSafetyCycleCooldown:
+    """The arbiter's per-cycle safety cycle spends the same dwell as the verified ladder's safety rung."""
+
+    @staticmethod
+    def _cycle_safety(
+        engine: VerifiedReclaimLadder, actuator: Mock, *, device_index: int | None, now: float | None
+    ) -> tuple[ActuatorCommand, ...]:
+        command = ActuatorCommand(kind=ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU, device_index=device_index)
+        if now is None:
+            return engine.execute_arbiter_commands(
+                (command,), actuator, device_index=device_index, for_head_of_queue=True
+            )
+        return engine.execute_arbiter_commands(
+            (command,), actuator, device_index=device_index, for_head_of_queue=True, now=now
+        )
+
+    def test_a_second_cycle_inside_the_dwell_is_refused_and_one_past_it_acts(self) -> None:
+        """A per-cycle plan that cycles safety again inside the dwell is skipped as a command that did not act."""
+        engine = VerifiedReclaimLadder()
+        actuator = Mock()
+        actuator.cycle_safety_off_gpu.return_value = True
+
+        assert len(self._cycle_safety(engine, actuator, device_index=0, now=1000.0)) == 1
+        assert self._cycle_safety(engine, actuator, device_index=0, now=1200.0) == ()
+        assert actuator.cycle_safety_off_gpu.call_count == 1
+        assert engine.safety_rungs_refused == 1
+
+        assert len(self._cycle_safety(engine, actuator, device_index=0, now=1000.0 + 301.0)) == 1
+        assert actuator.cycle_safety_off_gpu.call_count == 2
+
+    def test_a_cycle_the_actuator_declined_does_not_start_the_dwell(self) -> None:
+        """Only an actuation that acted stamps the clock, so a declined cycle leaves the rung spendable."""
+        engine = VerifiedReclaimLadder()
+        actuator = Mock()
+        actuator.cycle_safety_off_gpu.return_value = False
+        assert self._cycle_safety(engine, actuator, device_index=0, now=0.0) == ()
+
+        actuator.cycle_safety_off_gpu.return_value = True
+        assert len(self._cycle_safety(engine, actuator, device_index=0, now=10.0)) == 1
+
+    def test_the_verified_ladder_actuation_refuses_a_worker_wide_cycle(self) -> None:
+        """Card 0's ladder rung and the single-card post-processing path's ``None`` scope share one clock.
+
+        The per-cycle path takes ``now`` from :func:`time.monotonic` when the caller passes none, the clock the
+        governor tick reads, so the two triggers measure the dwell on one timeline.
+        """
+        engine = VerifiedReclaimLadder()
+        ladder_actuator = _FakeActuator()
+        ladder = _ladder(_pause_rung(ReclaimRungKind.SAFETY_OFF_GPU, 3000.0))
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=100.0,
+            actuator=ladder_actuator,
+            ladder_builder=lambda: ladder,
+            now=time.monotonic(),
+        )
+        assert ladder_actuator.calls == [("safety", None)]
+
+        arbiter_actuator = Mock()
+        arbiter_actuator.cycle_safety_off_gpu.return_value = True
+        assert self._cycle_safety(engine, arbiter_actuator, device_index=None, now=None) == ()
+        arbiter_actuator.cycle_safety_off_gpu.assert_not_called()
+
+    def test_a_worker_wide_cycle_refuses_the_card_rung_inside_the_dwell(self) -> None:
+        """A cycle under the ``None`` scope starts the dwell card 0's verified ladder then honours."""
+        engine = VerifiedReclaimLadder()
+        arbiter_actuator = Mock()
+        arbiter_actuator.cycle_safety_off_gpu.return_value = True
+        assert len(self._cycle_safety(engine, arbiter_actuator, device_index=None, now=0.0)) == 1
+
+        ladder_actuator = _FakeActuator()
+        ladder = _ladder(_pause_rung(ReclaimRungKind.SAFETY_OFF_GPU, 3000.0))
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=ladder_actuator, ladder_builder=lambda: ladder, now=200.0
+        )
+        assert ladder_actuator.calls == []
+        assert engine.safety_rungs_refused == 1
+
+        engine.on_tick(
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=ladder_actuator,
+            ladder_builder=tuple,
+            now=250.0,
+        )
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=ladder_actuator, ladder_builder=lambda: ladder, now=301.0
+        )
+        assert ladder_actuator.calls == [("safety", None)]
