@@ -87,8 +87,10 @@ records retain both the ordered requested tuple and the ordered applied tuple; a
 eviction, context reduction, or lane pause is never reported as performed merely because the arbiter requested
 it. A borrow therefore restores only a pause it truly acquired, never a same-owner pause an independent episode already held. A
 conservative self-heal backstop in the governor tick reclaims any reclaim-ladder lane pause that has outlived
-both owners (no live episode, no borrow receipt) once the card has been debounced-`HEALTHY`, so a lost claimant
-can never strand a lane off the GPU indefinitely. The recovery coordinator's constructive remedy takes its lane
+both owners (no live episode for the card or for the worker-wide scope, no borrow receipt) once the card has
+been debounced-`HEALTHY` and, for the post-processing lane, the pause itself is older than the debounce, so a
+lost claimant can never strand a lane off the GPU indefinitely and a pause the ladder took this tick is never
+reversed on the next. The recovery coordinator's constructive remedy takes its lane
 pauses through the same actuator, so the lifecycle records the ladder as their owner while the coordinator holds
 the receipt: the backstop consults that claim too, or it would read a live remedy as an orphan, lift the pause
 inside the remedy's yield window, and cold-start the lane process on every re-issue.

@@ -979,6 +979,24 @@ class TestStarvedHeadLanePauseObligation:
         engine.record_lane_pause(0, ReclaimRungKind.SAFETY_OFF_GPU, tenant_label="safety", promised_mb=3044.0)
         assert engine.episode_holds_paused_lane(0) is False
 
+    def test_a_worker_wide_lane_pause_is_held_for_every_card(self) -> None:
+        """A pause booked under the worker-wide key is owed to the card, so the card's query reports it held.
+
+        The single-GPU admission path books under ``None`` while the stranded-lane backstop asks with the card
+        index; reading only the card's key would call a pause the ladder still owes an orphan.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        engine.record_lane_pause(
+            None, ReclaimRungKind.PAUSE_PP_LANE, tenant_label="post_process_lane", promised_mb=487.0
+        )
+        assert engine.episode_holds_paused_lane(0) is True
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple
+        )
+        assert actuator.calls == [("restore_pp", None)]
+        assert engine.episode_holds_paused_lane(0) is False
+
 
 class TestArbiterCommandExecution:
     """The arbiter's described commands map onto the actuator method that performs each one."""

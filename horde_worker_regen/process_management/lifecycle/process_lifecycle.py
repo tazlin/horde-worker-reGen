@@ -810,6 +810,8 @@ class ProcessLifecycleManager:
         # Which initiator (whole-card residency or the reclaim ladder) holds the current pause, so only its
         # restore path clears it; None while the lane is not paused. See :class:`PauseOwner`.
         self._post_process_pause_owner: PauseOwner | None = None
+        # The monotonic instant the current post-processing pause was taken; meaningful only while paused.
+        self._post_process_gpu_paused_at: float | None = None
         self._post_process_gpu_pause_count = 0
         # The image-utilities lane's off-GPU pause, on the same owner contract as the post-processing lane:
         # the reclaim ladder stops it for a starved head whose deficit nothing cheaper closes, and only the
@@ -817,6 +819,8 @@ class ProcessLifecycleManager:
         # subprocess through the ordinary replacement state machine and the restore starts it again.
         self._utilities_gpu_paused = False
         self._utilities_pause_owner: PauseOwner | None = None
+        # The monotonic instant the current image-utilities pause was taken; meaningful only while paused.
+        self._utilities_gpu_paused_at: float | None = None
         self._utilities_gpu_pause_count = 0
         self._utilities_gpu_restore_count = 0
         self._post_process_gpu_restore_count = 0
@@ -4003,6 +4007,20 @@ class ProcessLifecycleManager:
         return self._post_process_pause_owner
 
     @property
+    def post_process_paused_at(self) -> float | None:
+        """The monotonic instant the post-processing lane's current off-GPU pause was taken (None when running).
+
+        The stranded-lane backstop measures its debounce from this, so a pause taken on a card that has been
+        healthy for a long time is not reversed on the next tick.
+        """
+        return self._post_process_gpu_paused_at if self._post_process_gpu_paused else None
+
+    @property
+    def utilities_paused_at(self) -> float | None:
+        """The monotonic instant the image-utilities lane's current off-GPU pause was taken (None when running)."""
+        return self._utilities_gpu_paused_at if self._utilities_gpu_paused else None
+
+    @property
     def post_process_gpu_pause_count(self) -> int:
         """How many whole-card residency post-processing-lane off-GPU pauses this manager initiated."""
         return self._post_process_gpu_pause_count
@@ -4034,6 +4052,7 @@ class ProcessLifecycleManager:
             return False
         self._post_process_gpu_paused = True
         self._post_process_pause_owner = owner
+        self._post_process_gpu_paused_at = time.monotonic()
         self._post_process_gpu_pause_count += 1
         if self._process_map.num_post_process_processes() > 0:
             self._post_process_replacement_intentional = True
@@ -4091,6 +4110,7 @@ class ProcessLifecycleManager:
             return False
         self._utilities_gpu_paused = True
         self._utilities_pause_owner = owner
+        self._utilities_gpu_paused_at = time.monotonic()
         self._utilities_gpu_pause_count += 1
         self._utilities_replacement_intentional = True
         self._initiate_utilities_replacement()

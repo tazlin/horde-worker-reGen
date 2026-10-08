@@ -3787,12 +3787,14 @@ class HordeWorkerProcessManager:
             )
 
     _STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS = 60.0
-    """How long a card must have been continuously HEALTHY before the backstop reclaims an orphaned lane pause.
+    """How long a card must be HEALTHY, and a post-processing pause held, before the backstop reclaims it.
 
     The self-heal backstop is a last resort behind the two responsible restore owners (a live saturation
     episode's LIFO unwind and the post-processing drain's borrow receipt). Requiring a debounced-HEALTHY card
     keeps it from racing those owners or lifting a lane while the card is still tight: only a pause that has
-    outlived both owners on a card that no longer needs the memory is reclaimed."""
+    outlived both owners on a card that no longer needs the memory is reclaimed. The post-processing lane's
+    debounce is also measured from its pause: a card that has been healthy for an hour would otherwise reverse
+    a pause the ladder took this tick."""
 
     _CONTEXT_RESTORE_DWELL_SECONDS = 60.0
     """How long a card must have been continuously HEALTHY before a live-context reduction is regrown.
@@ -3832,14 +3834,18 @@ class HordeWorkerProcessManager:
         post-processing borrow receipt, once the card has been HEALTHY for
         :attr:`_STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS`, it restores the lane through the same owner-guarded
         actuator and logs a WARNING naming what was stranded. A whole-card residency pause (a different owner)
-        and a pause a live claimant still holds are never touched.
+        and a pause a live claimant still holds are never touched. A live episode is read for the card and for
+        the worker-wide scope, where the per-cycle admission path books its pauses on a single-GPU host. The
+        post-processing lane must also have been paused for the debounce, so a pause taken on a card that has
+        long been HEALTHY is left to its owner instead of being reversed on the next tick.
         """
         if device_index != self._process_lifecycle.vae_lane_card_index():
             return
         healthy_since = self._healthy_since_by_device.get(device_index)
         if healthy_since is None:
             return
-        if (time.monotonic() - healthy_since) < self._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS:
+        now = time.monotonic()
+        if (now - healthy_since) < self._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS:
             return
         if self._reclaim_ladder.episode_holds_paused_lane(device_index):
             # A live saturation episode owns its own lane pauses; its LIFO unwind is the responsible restore.
@@ -3876,8 +3882,13 @@ class HordeWorkerProcessManager:
             )
             scheduler.restore_component_lane(device_index)
 
+        post_process_paused_at = lifecycle.post_process_paused_at
+        post_process_pause_outlived_debounce = (
+            post_process_paused_at is not None
+            and (now - post_process_paused_at) >= self._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS
+        )
         if (
-            lifecycle.is_post_process_gpu_paused
+            post_process_pause_outlived_debounce
             and lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
             and not recovery.holds_lane_pause(ReclaimRungKind.PAUSE_PP_LANE)
         ):

@@ -183,6 +183,51 @@ async def test_backstop_leaves_a_recovery_remedys_own_lane_pause_alone(monkeypat
     # Once the remedy's own unwind has run, the receipt is gone and the backstop is free to act on a pause that
     # really did outlive its owner.
     coordinator.reclaim_paused_lanes.clear()
+    _age_post_process_pause_past_debounce(manager)
+    manager._reclaim_stranded_service_lane_pauses(0)
+    assert manager._process_lifecycle.is_post_process_gpu_paused is False
+
+
+def _age_post_process_pause_past_debounce(manager: HordeWorkerProcessManager) -> None:
+    """Backdate the post-processing lane's current pause so it has been held longer than the backstop debounce."""
+    lifecycle = manager._process_lifecycle
+    assert lifecycle._post_process_gpu_paused_at is not None
+    lifecycle._post_process_gpu_paused_at -= manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0
+
+
+async def test_backstop_leaves_a_worker_wide_ladder_pp_pause_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A post-processing pause the ladder booked under the worker-wide key has a live owner on card 0.
+
+    The single-GPU admission path books its starved-head lane pause under the ``None`` key; the backstop runs
+    for card 0. The ladder still owes that pause its restore, so the backstop must not lift it.
+    """
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    assert manager._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    manager._reclaim_ladder.record_lane_pause(
+        None, ReclaimRungKind.PAUSE_PP_LANE, tenant_label="post-processing lane", promised_mb=512.0
+    )
+    _age_post_process_pause_past_debounce(manager)
+    manager._healthy_since_by_device[0] = time.monotonic() - (manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0)
+
+    manager._reclaim_stranded_service_lane_pauses(0)
+
+    assert manager._process_lifecycle.is_post_process_gpu_paused is True
+    assert manager._process_lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
+
+
+async def test_backstop_leaves_a_fresh_pp_pause_on_a_long_healthy_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The debounce runs from the pause: a card healthy for an hour does not reverse a pause taken just now."""
+    manager, _vae, _component, _safety = _live_shaped_manager(monkeypatch)
+    manager._healthy_since_by_device[0] = time.monotonic() - 3600.0
+    assert manager._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+
+    manager._reclaim_stranded_service_lane_pauses(0)
+
+    assert manager._process_lifecycle.is_post_process_gpu_paused is True
+    assert manager._process_lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
+
+    # Once the pause has itself outlived the debounce with no claimant, it is an orphan and is reclaimed.
+    _age_post_process_pause_past_debounce(manager)
     manager._reclaim_stranded_service_lane_pauses(0)
     assert manager._process_lifecycle.is_post_process_gpu_paused is False
 

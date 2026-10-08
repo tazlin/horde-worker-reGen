@@ -174,8 +174,9 @@ second and pay a cold start for no gain. A saturation-episode pause has no benef
 before.
 
 Behind both owners sits a conservative **self-heal backstop** in the parent's governor tick: a reclaim-ladder
-lane pause that no live saturation episode and no PP-borrow receipt still claims is restored once the card has
-been governor-`HEALTHY` for a debounced interval, with a WARNING naming what was stranded. It never lifts a
+lane pause that no live episode (for the card or for the worker-wide scope the admission path books under)
+and no PP-borrow receipt still claims is restored once the card has been governor-`HEALTHY` for a debounced
+interval and the pause itself is that old, with a WARNING naming what was stranded. It never lifts a
 whole-card pause or a pause a live claimant holds; it exists only to reclaim an orphan neither responsible
 owner will.
 
