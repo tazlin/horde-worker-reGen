@@ -557,6 +557,21 @@ class HordeProcessInfo:
             return None
         return ownership.job
 
+    def is_staged_short_of_sampling(self) -> bool:
+        """Return whether this slot owns a dispatched job it has not yet started sampling.
+
+        Ownership is stamped at dispatch, before the child reads the job, so the slot's state is read against
+        that stamp: the job has reached its denoise loop only once the slot reports an inference-active state
+        that began after it. A child sent its job with a preload reports the preload's states before it primes,
+        and a re-bound slot can still report its previous job's sampling or completion. The first-step stamp
+        cannot mark the boundary because a completion report clears it while the job is still owned.
+        """
+        ownership = self.inference_ownership
+        if ownership is None or self.current_inference_job() is None:
+            return False
+        state_follows_ownership = self.last_process_state_started_at >= ownership.recorded_at
+        return not (state_follows_ownership and self.last_process_state in _INFERENCE_ACTIVE_STATES)
+
     def retire_inference_ownership(self, job: ImageGenerateJobPopResponse) -> bool:
         """Retire matching execution ownership while retaining resident-model attribution.
 

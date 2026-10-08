@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import replace
 
+import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -33,7 +36,12 @@ from horde_worker_regen.process_management.scheduling.admission.clearance import
     staged_materialization_delta_mb,
 )
 from horde_worker_regen.process_management.scheduling.admission.materialization import head_starved_seconds
-from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
+from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+    ClearanceController,
+    ClearanceLeaseProxy,
+    GrantState,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import DISPATCH_ADMISSION_FLOW
 from tests.process_management.conftest import (
@@ -436,3 +444,59 @@ async def test_a_job_awaits_admission_until_its_sample_finishes() -> None:
     )
     assert scheduler.job_awaits_admission(job_id) is False
     assert scheduler.job_awaits_admission("no-such-job") is False
+
+
+@pytest.mark.parametrize("primed_tick_observed", [True, False], ids=["primed_tick", "first_step_before_tick"])
+async def test_a_grant_survives_the_staged_childs_preload_reports(primed_tick_observed: bool) -> None:
+    """A cleared child keeps its grant through the preload states it reports and samples priced.
+
+    The parent marks a slot primed at dispatch and the controller clears it there. A child sent its job with a
+    preload then reports the preload's states before it primes, and the first step can flip the slot to
+    sampling between two controller ticks. A grant retired on those reports leaves the onset reading as an
+    unpriced window although the child samples on the permit it was granted.
+    """
+    scheduler, _job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    controller = ClearanceController(device_index=0, slot_cap=1, tail_overlap=False)
+    clearance = threading.BoundedSemaphore(1)
+    clearance.acquire()
+    controller.register(0, ClearanceLeaseProxy(clearance=clearance, done=threading.Semaphore(0)))
+
+    def tick() -> None:
+        controller.step(scheduler.build_clearance_inputs(device_index=0), admit_fn=scheduler.clearance_admit_process)
+
+    tick()
+    assert controller.grant_state(0) is GrantState.CLEARED
+
+    staged_reports = [
+        HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+        HordeProcessState.PRELOADING_MODEL,
+        HordeProcessState.PRELOADED_MODEL,
+    ]
+    if primed_tick_observed:
+        staged_reports.append(HordeProcessState.INFERENCE_PRIMED)
+    for reported_state in staged_reports:
+        waiter.last_process_state = reported_state
+        waiter.last_process_state_started_at = time.time()
+        tick()
+        assert controller.grant_state(0) is GrantState.CLEARED, reported_state
+
+    waiter.last_process_state = HordeProcessState.INFERENCE_STARTING
+    waiter.last_process_state_started_at = time.time()
+    waiter.current_first_step_at = time.time()
+    waiter.last_current_step = 3
+    waiter.last_total_steps = 20
+    tick()
+
+    assert controller.grant_state(0) is GrantState.SAMPLING
+    assert controller.unpriced_sampling_windows == 0
+    assert controller.grants_issued == 1
+
+    # The completion report clears the first-step stamp while the slot still owns the job until its result
+    # lands; the finished sample retires its grant and is never cleared again.
+    waiter.last_process_state = HordeProcessState.INFERENCE_COMPLETE
+    waiter.last_process_state_started_at = time.time()
+    waiter.current_first_step_at = None
+    tick()
+
+    assert controller.grant_state(0) is GrantState.IDLE
+    assert controller.grants_issued == 1

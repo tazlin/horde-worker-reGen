@@ -5843,9 +5843,10 @@ class InferenceScheduler:
     def build_clearance_inputs(self, *, device_index: int) -> ClearanceInputs:
         """Snapshot the per-tick truth the clearance controller reads for ``device_index``.
 
-        A child that has staged and primed its next job (:attr:`HordeProcessState.INFERENCE_PRIMED`) is a
-        clearance waiter: it holds the job and its encode-staging reservation and is waiting for the parent to
-        clear it into its load-and-sample window. A child inside its denoise loop
+        A child that owns a dispatched job it has not started sampling
+        (:meth:`HordeProcessInfo.is_staged_short_of_sampling`) is a clearance waiter, whatever preload, idle or
+        primed state it reports: it holds the job and its encode-staging reservation and is waiting for the parent
+        to clear it into its load-and-sample window. A child inside its denoise loop
         (:attr:`HordeProcessState.INFERENCE_STARTING`) is an active sampler. The controller owns each child's
         grant state and derives the held-slot count and tail-overlap sampler from these populations plus the
         measured free/reserve/paging truth. Each sampler additionally carries its estimated remaining sampling
@@ -5864,29 +5865,26 @@ class InferenceScheduler:
                 continue
             if process_info.device_index != device_index:
                 continue
-            state = process_info.last_process_state
             referenced = process_info.current_inference_job()
-            if state == HordeProcessState.INFERENCE_PRIMED:
+            if referenced is None:
+                continue
+            if process_info.is_staged_short_of_sampling():
+                # A grant issued to a staged child has to outlive the preload and idle states the child reports
+                # before it primes, or the controller retires it and the child's onset reads as unpriced. A slot
+                # re-bound inside its previous job's result tick is staged too: the active state it still reports
+                # belongs to that job, and read as the new job sampling it would leave the new job ungranted.
                 # Earlier dispatch time sorts closer to the head; a process with no stamp yet sorts last.
                 dispatched_at = process_info.current_inference_started_at or float("inf")
-                primed_job_id = str(referenced.id_) if referenced is not None and referenced.id_ is not None else None
                 waiters.append(
                     ClearanceWaiter(
                         process_id=process_info.process_id,
                         priority=int(dispatched_at * 1000.0) if dispatched_at != float("inf") else 2**62,
-                        job_id=primed_job_id,
+                        job_id=str(referenced.id_) if referenced.id_ is not None else None,
                     ),
                 )
-            elif state == HordeProcessState.INFERENCE_STARTING:
-                if referenced is None or referenced.id_ is None:
-                    continue
-                # A sampler re-bound inside the previous job's result tick still reports that job's active
-                # state for a moment; read against the new ownership it would look like the new job sampling
-                # with no grant, the reconciler would mark it sampling, and the child's real PRIMED that follows
-                # would never be granted. An active state older than the ownership belongs to the previous job.
-                ownership = process_info.inference_ownership
-                if ownership is not None and ownership.recorded_at > process_info.last_process_state_started_at:
-                    continue
+            elif (
+                process_info.last_process_state == HordeProcessState.INFERENCE_STARTING and referenced.id_ is not None
+            ):
                 samplers.append(
                     ActiveSampler(
                         process_id=process_info.process_id,
