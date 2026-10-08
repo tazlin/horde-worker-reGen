@@ -241,8 +241,8 @@ async def test_lane_keeps_a_job_dispatched_during_its_unload_through_the_stale_i
     assert job in pm._job_tracker.jobs_in_progress
 
     # The stale idle leaves the lane looking like an idle majicMIX resident. A head-of-queue sweep for the
-    # other lane's load passes it over because it owns a dispatched job, and a parent-side unload that does
-    # reach an owning lane (the RAM-pressure sweep picks on state alone) still leaves the ownership standing.
+    # other lane's load passes it over because it owns a dispatched job, and a teardown that does clear the
+    # slot's model references still leaves the ownership standing.
     assert not pm._inference_scheduler.unload_models_from_vram(other_lane, for_head_of_queue=True, under_pressure=True)
     assert lane.last_control_flag == HordeControlFlag.START_INFERENCE
     lane.clear_job_references()

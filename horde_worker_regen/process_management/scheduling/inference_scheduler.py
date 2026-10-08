@@ -12313,7 +12313,7 @@ class InferenceScheduler:
         ``for_head_of_queue`` is the last-resort escalation when the head-of-queue job cannot be loaded
         and gentle reclaim freed nothing because every idle resident copy is another *queued* job's
         model: it additionally overrides the still-needed-by-a-pending-job guard so the head can be
-        given room. It never evicts an in-progress (live) model.
+        given room. It never evicts an in-progress (live) model or targets a slot that owns a dispatched job.
         """
         bridge_data = self._runtime_config.bridge_data
 
@@ -12340,6 +12340,12 @@ class InferenceScheduler:
                 continue
 
             if process_info.is_process_busy() or process_info.last_process_state == HordeProcessState.PRELOADED_MODEL:
+                continue
+
+            # A lane that owns a dispatched job can read idle with a resident model while its reports from
+            # before the dispatch drain. A RAM unload sent to it lands under the job it is about to start and
+            # clears the resident record that job's load reads. unload_models_from_vram skips the same slot.
+            if process_info.current_inference_job() is not None:
                 continue
 
             if process_info.loaded_horde_model_name is not None:

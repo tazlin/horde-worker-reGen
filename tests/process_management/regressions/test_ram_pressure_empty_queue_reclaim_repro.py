@@ -12,6 +12,7 @@ The contract these tests pin:
   job is pending or in flight (the reclaim is not gated on there being other queued work).
 * Under pressure, the degrade response cycles an idle model-less process that still holds RAM after an
   unload, returning the allocator-retained pages to the OS, again without requiring queued work.
+* The sweep never targets a lane that owns a dispatched job, whatever state that lane last reported.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.scheduling.governance.actions import EvictIdleModels
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from tests.process_management.conftest import make_mock_process_info, mark_ram_unload_settled
+from tests.process_management.conftest import make_job_pop_response, make_mock_process_info, mark_ram_unload_settled
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 _TOTAL_RAM_MB = 64000.0
@@ -65,6 +66,37 @@ class TestUnderPressureReclaimWithEmptyQueue:
 
         assert reclaimed is True, "an idle resident model must be reclaimable under pressure with an empty queue"
         assert process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+
+    def test_lane_that_owns_a_dispatched_job_is_passed_over(self) -> None:
+        """A lane reading idle with a resident model while it owns a dispatched job is never the sweep's target.
+
+        Even the head-of-queue escalation, which overrides every residency guard, leaves it alone.
+        """
+        model_name = "WAI-NSFW-illustrious-SDXL"
+        process_info = make_mock_process_info(
+            0,
+            model_name=model_name,
+            state=HordeProcessState.WAITING_FOR_JOB,
+        )
+        process_info.record_inference_ownership(make_job_pop_response(model="dispatched-model"), attempt_ordinal=1)
+        process_map = ProcessMap({0: process_info})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(
+            horde_model_name=model_name,
+            load_state=ModelLoadState.LOADED_IN_RAM,
+            process_id=0,
+        )
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=JobTracker(),
+        )
+
+        reclaimed = scheduler.unload_models(under_pressure=True, for_head_of_queue=True)
+
+        assert reclaimed is False
+        assert process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+        assert process_info.loaded_horde_model_name == model_name
 
     def test_degrade_response_cycles_stale_ram_slot_with_empty_queue(
         self,

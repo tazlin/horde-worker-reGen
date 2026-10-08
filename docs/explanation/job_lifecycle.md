@@ -219,9 +219,9 @@ control-loop tick for it. One preload per cycle remains the ceiling. One cycle:
    child reporting the preload's states (`UNLOADED_MODEL_FROM_RAM`, `PRELOADED_MODEL`) with the job queued
    behind them, and those reports neither clear the record nor free the lane. Neither does a parent-side
    unload (`HordeProcessInfo.clear_job_references` clears preload intent only): the idle a child reports after
-   an eviction sent in the dispatch's own cycle can make the lane look like an idle resident, so every VRAM
+   an eviction sent in the dispatch's own cycle can make the lane look like an idle resident, so every
    unload that picks its own target (`unload_models_from_vram`, the reclaim ladder's candidates and
-   `unload_idle_model`) and the arbiter's mirror of them (`pricing.has_reclaimable_idle_model`) skip a slot
+   `unload_idle_model`, and the RAM-pressure sweep `unload_models`) and the arbiter's mirror of the VRAM ones (`pricing.has_reclaimable_idle_model`) skip a slot
    that owns an attempt. Which idle reports close the owned job is decided on the record
    (`HordeProcessInfo.idle_report_closes_owned_job`), and the lost-result reap and the orphaned-job watchdog
    both read it. Ownership ends with the job's
