@@ -7,14 +7,19 @@ from dataclasses import replace
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
-from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_weight_mb,
     predict_model_weight_mb,
+)
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
+    ActuatorCommandKind,
 )
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
@@ -318,6 +323,53 @@ async def test_a_held_lone_waiter_is_timed_until_another_lanes_work_can_help() -
     assert scheduler.clearance_admit_process(0) is False
     now[0] += 7.0
     assert scheduler._staged_waiter_clock(waiter, job).starved_seconds == 0.0  # type: ignore[attr-defined]
+
+
+async def test_a_starved_waiter_beside_a_fresh_preload_is_offered_the_post_processing_lane() -> None:
+    """A sibling still busy on a fresh preload is no eviction rung, so a starved waiter reaches the lane rung.
+
+    The eviction actuator skips a busy slot until its preload is parked past the retention horizon. Counted as
+    reclaimable regardless, the slot kept the ladder non-empty with a rung that never acted, and the lane rung
+    behind it was unreachable for that whole horizon.
+    """
+    scheduler, _job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    now = [1000.0]
+    scheduler._clock = lambda: now[0]  # type: ignore[method-assign]
+    preloading_sibling = make_mock_process_info(1, model_name=_OTHER_MODEL, state=HordeProcessState.PRELOADED_MODEL)
+    preloading_sibling.total_vram_mb = 16000
+    preloading_sibling.process_reserved_mb = 3200
+    preloading_sibling.process_allocated_mb = 3200
+    post_process_lane = make_mock_process_info(
+        2, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, process_type=HordeProcessType.POST_PROCESS
+    )
+    post_process_lane.process_reserved_mb = 1500
+    post_process_lane.process_allocated_mb = 1500
+    # Its models were already unloaded, so the lane's context is all it still holds.
+    post_process_lane.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+    scheduler._process_map = ProcessMap({0: waiter, 1: preloading_sibling, 2: post_process_lane})
+    scheduler._process_lifecycle.is_post_process_gpu_paused = False  # type: ignore[attr-defined]
+    preloading_sibling.last_process_state_started_at = now[0]
+    snapshot = scheduler.snapshot()
+    assert snapshot.slots[1].is_busy and not snapshot.slots[1].parked_preload
+
+    arbiter = scheduler._ensure_preload_arbiter()  # type: ignore[attr-defined]
+    starved = StagedWaiterClock(starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0, load_seconds=None)
+    ample = decide_clearance_admit(snapshot, 0, arbiter=arbiter, post_processing_deferred=False, waiter_clock=starved)
+    assert ample.priced is not None and ample.verdict is not None
+    candidate_mb = ample.priced.request.candidate_delta_mb
+    noise_mb = ample.verdict.measured.noise_buffer_mb
+    reservations_mb = ample.verdict.measured.outstanding_reservations_mb
+    assert candidate_mb is not None
+    # Short by less than the post-processing lane's reservation alone, so pausing it closes the deficit.
+    scheduler.set_device_free_mb_provider(lambda _device_index: candidate_mb + noise_mb + reservations_mb - 500.0)
+
+    arbiter = scheduler._ensure_preload_arbiter()  # type: ignore[attr-defined]
+    plan = decide_clearance_admit(
+        scheduler.snapshot(), 0, arbiter=arbiter, post_processing_deferred=False, waiter_clock=starved
+    )
+
+    assert plan.decision is ClearanceDecision.HOLD
+    assert [command.kind for command in plan.actuations] == [ActuatorCommandKind.PAUSE_POST_PROCESS_LANE]
 
 
 async def test_a_dispatched_job_is_never_timed_by_the_head_clock() -> None:
