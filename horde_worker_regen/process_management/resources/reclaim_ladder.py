@@ -984,7 +984,7 @@ class VerifiedReclaimLadder:
                         logger.info(
                             f"Reclaim ladder: keeping the {_paused_lane_name(obligation.kind)} lane down until "
                             f"job {waiting} "
-                            "starts sampling.",
+                            "finishes sampling.",
                         )
                     retained.append(obligation)
                     continue

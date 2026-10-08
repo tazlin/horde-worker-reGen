@@ -11392,21 +11392,16 @@ class InferenceScheduler:
         return self._head_starved_seconds(head) >= DISPATCH_STALL_MIN_SECONDS
 
     def job_awaits_admission(self, job_id: str) -> bool:
-        """Whether a queued job is still waiting to start sampling: undispatched, or staged and not yet stepping.
+        """Whether a queued job has yet to finish sampling: undispatched, staged, or inside its denoise loop.
 
-        The restore evidence for a lane pause booked for this job. It reads the job's own place in the queue and
-        on its slot, never the card's free memory, which the pause itself changed. A staged lane counts as
-        waiting in every state short of sampling: a job sent with its preload leaves the child reporting the
-        preload's states before it primes.
+        The restore evidence for a lane pause booked for this job, held for the whole sample the head was cleared
+        for: the paused lanes' contexts and the sample's remaining growth after its first step do not fit
+        together on a card the arbiter had to clear. It reads the job's place in the queue, which it leaves when
+        its inference result or fault lands. The card's free memory is not read because the pause changed it,
+        and the slot's state is not read because a warm slot reports the previous job's ``INFERENCE_COMPLETE``
+        until the new job primes.
         """
-        for job in self._job_tracker.jobs_pending_inference:
-            if str(job.id_) != job_id:
-                continue
-            process_info = self._process_map.process_running_job(job)
-            if process_info is None:
-                return True
-            return process_info.last_process_state != HordeProcessState.INFERENCE_STARTING
-        return False
+        return any(str(job.id_) == job_id for job in self._job_tracker.jobs_pending_inference)
 
     def latest_affinity_skips(self) -> int:
         """Return the committed affinity line-skips the currently-tracked displaced head has taken (visibility)."""

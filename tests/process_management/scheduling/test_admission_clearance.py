@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
@@ -395,15 +397,17 @@ async def test_a_dispatched_job_is_never_timed_by_the_head_clock() -> None:
     assert head_admission.starvation_job_id is None
 
 
-async def test_a_job_awaits_admission_until_its_lane_samples() -> None:
-    """A lane pause's beneficiary reads as waiting while queued or staged, and as served once it samples.
+async def test_a_job_awaits_admission_until_its_sample_finishes() -> None:
+    """A lane pause's beneficiary reads as waiting until its inference result lands, sampling included.
 
     The restore evidence must not read the card: the context the pause freed is what makes the card healthy.
+    The sample keeps growing after its first step, so a lane restored at that step lands on the same card.
+    A warm slot still reports the previous job's ``INFERENCE_COMPLETE`` when the head is dispatched to it.
     """
     job_tracker = JobTracker()
     job = make_job_pop_response("stable_diffusion")
     await track_popped_job_async(job_tracker, job)
-    lane = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.WAITING_FOR_JOB)
+    lane = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.INFERENCE_COMPLETE)
     scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}), job_tracker=job_tracker)
     job_id = str(job.id_)
 
@@ -411,10 +415,24 @@ async def test_a_job_awaits_admission_until_its_lane_samples() -> None:
 
     await mark_job_in_progress_async(job_tracker, job)
     lane.record_inference_ownership(job, attempt_ordinal=1)
-    for staged_state in (HordeProcessState.PRELOADED_MODEL, HordeProcessState.INFERENCE_PRIMED):
-        lane.last_process_state = staged_state
-        assert scheduler.job_awaits_admission(job_id) is True
+    for slot_state in (
+        HordeProcessState.INFERENCE_COMPLETE,
+        HordeProcessState.PRELOADED_MODEL,
+        HordeProcessState.INFERENCE_PRIMED,
+        HordeProcessState.INFERENCE_STARTING,
+    ):
+        lane.last_process_state = slot_state
+        assert scheduler.job_awaits_admission(job_id) is True, slot_state
 
-    lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+    lane.last_process_state = HordeProcessState.INFERENCE_COMPLETE
+    await job_tracker.queue_for_safety(
+        HordeJobInfo(
+            sdk_api_job_info=job,
+            job_image_results=[HordeImageResult(image_bytes=b"raw")],
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=0.0,
+        ),
+    )
     assert scheduler.job_awaits_admission(job_id) is False
     assert scheduler.job_awaits_admission("no-such-job") is False

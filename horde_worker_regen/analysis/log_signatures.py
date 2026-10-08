@@ -1394,10 +1394,10 @@ _SIGNATURE_LIST: list[LogSignature] = [
     ),
     _signature(
         "reclaim_lane_hold",
-        r"Reclaim ladder: keeping the (?P<lane>[\w-]+) lane down until job (?P<job_id>\S+) starts sampling\.",
+        r"Reclaim ladder: keeping the (?P<lane>[\w-]+) lane down until job (?P<job_id>\S+) finishes sampling.",
         emitter="process_management.resources.reclaim_ladder:ReclaimLadder._unwind_restore_obligations",
         sample="Reclaim ladder: keeping the post-processing lane down until job "
-        "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0 starts sampling.",
+        "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0 finishes sampling.",
         dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
     ),
     _signature(

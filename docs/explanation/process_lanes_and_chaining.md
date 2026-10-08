@@ -166,8 +166,11 @@ not thrashed), and re-borrowing is re-enabled once the queue fully drains.
 
 A pause the scheduler books for a job that cannot be admitted records that job as its **beneficiary**
 (`ReclaimLadder.record_lane_pause`). The ladder restores the lane only once every recorded beneficiary has
-started sampling or left the queue (`InferenceScheduler.job_awaits_admission`), as well as the card reading
-`HEALTHY` and no head being parked. Neither of those two readings alone says the job was served: a job staged
+finished sampling or left the queue (`InferenceScheduler.job_awaits_admission`), as well as the card reading
+`HEALTHY` and no head being parked. The first denoise step is too early: the head's component keeps
+materialising through the sample, and on a card the arbiter had to clear the paused lanes' contexts and that
+remaining growth do not fit together, so a lane restored at the first step pushes the sample into demand
+paging. Neither of those two readings alone says the job was served: a job staged
 on its lane waiting for clearance counts as inference in progress, so no head reads as parked, and the context
 the pause returned is what makes the card read `HEALTHY`. Restoring on them would restart the lane in the same
 second and pay a cold start for no gain. A saturation-episode pause has no beneficiary and is restored as

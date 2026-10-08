@@ -189,7 +189,7 @@ inferring it from throughput. All are registered in `analysis/log_signatures.py`
 | `Idle-fill disarmed: ...` | INFO | It disarms: the head dispatched, left the queue, or no sibling is free. |
 | `Idle-fill offer: rung <i> of <n>, <k> model(s) at max_power <p>` | INFO | A pop is shaped by the idle-fill ladder and the shaped offer changed. |
 | `Released process <n>'s ownership of job <id>: the job ended without a result from that lane.` | INFO | The control loop retired a lane's ownership of a job that ended some other way than that lane's result. Rare by design. |
-| `Reclaim ladder: keeping the <lane> lane down until job <id> starts sampling.` | INFO | A lane pause booked for a job is held because that job still waits. Once per pause. |
+| `Reclaim ladder: keeping the <lane> lane down until job <id> finishes sampling.` | INFO | A lane pause booked for a job is held because that job still waits. Once per pause. |
 | `Post-processing finished for job <id> in <t> seconds on process <n> (chain <a>s, encode <b>s, <w>x<h>, <operations>).` | INFO | A post-processing job returns with the lane's measurements. The short form without the parenthesis is logged when the lane sent none. |
 | `Upload encode for job <id>: <t>s in a worker thread.` | DEBUG | Submit encoded the image for upload. |
 | `Upload for job <id>: bytes already in the upload encoding, not re-encoded.` | DEBUG | Submit uploaded the bytes as the lane produced them. |
