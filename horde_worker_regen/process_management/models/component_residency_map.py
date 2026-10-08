@@ -21,7 +21,7 @@ from loguru import logger
 
 from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot
 
-_CHECKPOINT_KIND = "checkpoint"
+CHECKPOINT_KIND = "checkpoint"
 """The component kind whose identity is the bare horde model name, so it is the staged-model set."""
 
 
@@ -115,5 +115,5 @@ class ComponentResidencyMap:
             for process_id, residency in self._by_process.items()
             if process_id in wanted
             for snapshot in residency.held
-            if snapshot.kind == _CHECKPOINT_KIND
+            if snapshot.kind == CHECKPOINT_KIND
         )

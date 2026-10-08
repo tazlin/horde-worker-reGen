@@ -78,7 +78,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     ProcessLifecycleManager,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.models.component_residency_map import _CHECKPOINT_KIND
+from horde_worker_regen.process_management.models.component_residency_map import CHECKPOINT_KIND
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
@@ -1917,7 +1917,7 @@ class _DispatchWorld:
         if model is None:
             return None
         checkpoint_mb, _private_mb = self._host_model_ram(model)
-        return [HeldComponentSnapshot(kind=_CHECKPOINT_KIND, identity=model.name, approx_ram_mb=checkpoint_mb)]
+        return [HeldComponentSnapshot(kind=CHECKPOINT_KIND, identity=model.name, approx_ram_mb=checkpoint_mb)]
 
     async def pop(self, job: ImageGenerateJobPopResponse) -> None:
         """Record a popped job, exactly as the pop path hands one to the tracker."""

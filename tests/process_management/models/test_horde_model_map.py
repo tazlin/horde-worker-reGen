@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from horde_worker_regen.process_management.ipc.messages import (
+    HeldComponentSnapshot,
     HordeControlFlag,
     HordeProcessState,
     ModelInfo,
@@ -117,3 +118,22 @@ class TestExpireStaleEntries:
 
         assert [(e.model, e.reason, e.holder_model) for e in expired] == [("sd", StaleEntryReason.DISPLACED, "xl")]
         assert set(model_map.root) == {"xl"}
+
+    def test_a_model_the_slot_holds_in_ram_is_not_displaced_by_its_vram_resident(self) -> None:
+        """A lane holds a VRAM resident and a RAM-staged checkpoint at once; only a model held in neither expires.
+
+        Expiring the RAM-staged entry loses the record of weights the slot still holds, and the child's next
+        ``LOADED_IN_RAM`` report re-creates it, so the sweep and the report fight every preload pass.
+        """
+        owner = make_mock_process_info(1, model_name="xl", state=HordeProcessState.WAITING_FOR_JOB)
+        owner.held_components = [HeldComponentSnapshot(kind="checkpoint", identity="sd", approx_ram_mb=2034.0)]
+        model_map = _map(
+            xl=(ModelLoadState.LOADED_IN_VRAM, 1),
+            sd=(ModelLoadState.LOADED_IN_RAM, 1),
+            flux=(ModelLoadState.LOADED_IN_RAM, 1),
+        )
+
+        expired = model_map.expire_stale_entries(ProcessMap({1: owner}), now=_NOW)
+
+        assert [(e.model, e.reason, e.holder_model) for e in expired] == [("flux", StaleEntryReason.DISPLACED, "xl")]
+        assert set(model_map.root) == {"xl", "sd"}

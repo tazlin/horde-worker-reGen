@@ -186,12 +186,14 @@ class HordeModelMap(RootModel[dict[str, ModelInfo]]):
     def expire_stale_entries(self, processes: Mapping[int, HordeProcessInfo], *, now: float) -> list[ExpiredEntry]:
         """Remove every entry whose owning process can no longer be holding or loading that model.
 
-        A slot holds one model at a time, so an entry naming a slot that now names a different model is a
-        record of weights nothing holds. It is not inert: the preload pass reads the map as part of the
-        already-loaded set, so a displaced model's surviving entry makes its pending job look served and the
-        job is never staged onto a free slot. A ``LOADING`` entry whose owner is in a state that cannot be
-        loading is likewise stale, except inside :data:`PRELOAD_FIRST_REPORT_GRACE_SECONDS` of a preload sent
-        to that owner for that model, when the child has simply not reported yet.
+        An entry naming a slot whose VRAM resident is a different model, and whose reported RAM-held checkpoints
+        do not include this one, is a record of weights nothing holds. A lane can hold a VRAM resident and a
+        RAM-staged checkpoint at once, so an entry for the staged one is still the truth. A stale entry is not
+        inert: the preload pass reads the map as part of the already-loaded set, so a displaced model's surviving
+        entry makes its pending job look served and the job is never staged onto a free slot. A ``LOADING``
+        entry whose owner is in a state that cannot be loading is likewise stale, except inside
+        :data:`PRELOAD_FIRST_REPORT_GRACE_SECONDS` of a preload sent to that owner for that model, when the child
+        has simply not reported yet.
 
         Returns:
             What was removed and why, in map order, for the caller to log and act on.
@@ -227,7 +229,7 @@ class HordeModelMap(RootModel[dict[str, ModelInfo]]):
                     ),
                 )
                 continue
-            if process_info.holds_different_model(model_name):
+            if process_info.holds_different_model(model_name) and not process_info.holds_model_in_ram(model_name):
                 self.root.pop(model_name, None)
                 expired.append(
                     ExpiredEntry(

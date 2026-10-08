@@ -6136,13 +6136,16 @@ class InferenceScheduler:
                     )
                 case StaleEntryReason.LOADING_ABANDONED:
                     state = entry.process_state.name if entry.process_state is not None else "unknown"
-                    logger.warning(
+                    # A job dispatched onto the slot supersedes its preload; that is routine, not a fault.
+                    level = "DEBUG" if entry.process_state == HordeProcessState.INFERENCE_PRIMED else "WARNING"
+                    logger.log(
+                        level,
                         f"Expiring stale loading entry for {entry.model} on process {entry.process_id}: "
                         f"process is {state}.",
                     )
                 case StaleEntryReason.DISPLACED:
                     # Log contract: analysis/log_signatures.py (displaced_entry_expired).
-                    logger.warning(
+                    logger.debug(
                         f"Expiring displaced entry for {entry.model} on process {entry.process_id}: "
                         f"the slot now holds {entry.holder_model}.",
                     )
