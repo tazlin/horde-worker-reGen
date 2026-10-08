@@ -9,13 +9,15 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_job,
@@ -286,6 +288,115 @@ class TestControlLoopTick:
 
         assert job in process_manager._job_tracker.jobs_in_progress
         inf_proc.pipe_connection.send.assert_called()  # type: ignore[attr-defined]
+
+
+class _SteppedSchedulerClock:
+    """A stand-in for the scheduler module's ``time`` whose ``time()`` moves only when the test steps it."""
+
+    def __init__(self, start: float) -> None:
+        self.now = start
+
+    def time(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
+class TestSlotDutyObservedEveryTick:
+    """Slot duty is observed once per control-loop tick, whether or not the scheduling cycle runs.
+
+    The scheduling cycle runs only while some lane can take a job, so a pool whose every lane is busy skips it.
+    An observation owned by the cycle would leave those ticks unpriced and the published hold stale, and the
+    next observation would price the whole busy span at the state it closes on: a freed lane with a queued
+    head, which reads as a gate-less stall.
+    """
+
+    async def _one_busy_lane_with_a_queued_head(
+        self,
+        state: HordeProcessState,
+        *,
+        clearance_lease: bool,
+    ) -> HordeWorkerProcessManager:
+        process_manager = make_testable_process_manager(gpu_sampling_lease_enabled=clearance_lease)
+        process_manager._sleep = _noop_sleep
+        process_manager._last_status_message_time = time.time()
+        lane = make_mock_process_info(1, model_name="stable_diffusion", state=state)
+        process_manager._process_map.update({1: lane})
+        running = await track_popped_job_async(process_manager._job_tracker, make_job_pop_response("stable_diffusion"))
+        await process_manager._job_tracker.mark_inference_started(running)
+        lane.record_inference_ownership(running, attempt_ordinal=0)
+        await track_popped_job_async(process_manager._job_tracker, make_job_pop_response("stable_diffusion"))
+        return process_manager
+
+    async def _tick_three_times_ten_seconds_apart(
+        self,
+        process_manager: HordeWorkerProcessManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> AsyncMock:
+        scheduler = process_manager._inference_scheduler
+        cycle = AsyncMock(wraps=scheduler.run_scheduling_cycle)
+        scheduler.run_scheduling_cycle = cycle  # type: ignore[method-assign]
+        scheduler._slot_duty_current_hold = SlotDutyBucket.UNEXPLAINED
+        clock = _SteppedSchedulerClock(time.time())
+        monkeypatch.setattr(inference_scheduler_module, "time", clock)
+        for _ in range(3):
+            assert await process_manager._control_loop_tick() is True
+            clock.now += 10.0
+        return cycle
+
+    async def test_a_sampling_lane_accrues_sampling_while_no_cycle_runs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The only lane sampling a job leaves no lane to dispatch to, yet every tick prices it as sampling."""
+        process_manager = await self._one_busy_lane_with_a_queued_head(
+            HordeProcessState.INFERENCE_STARTING,
+            clearance_lease=False,
+        )
+
+        cycle = await self._tick_three_times_ten_seconds_apart(process_manager, monkeypatch)
+
+        cycle.assert_not_called()
+        totals, capacity, hold = process_manager._inference_scheduler.slot_duty_snapshot()
+        assert capacity == 1
+        assert totals == {SlotDutyBucket.SAMPLING: 20.0}
+        assert hold is None, "the hold published to the stats stream is the current tick's, not a stale stall"
+
+    async def test_a_primed_lane_accrues_clearance_hold_while_no_cycle_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under the clearance lease a staged lane's empty sampling slot is the clearance gate's on every tick."""
+        process_manager = await self._one_busy_lane_with_a_queued_head(
+            HordeProcessState.INFERENCE_PRIMED,
+            clearance_lease=True,
+        )
+
+        cycle = await self._tick_three_times_ten_seconds_apart(process_manager, monkeypatch)
+
+        cycle.assert_not_called()
+        totals, _capacity, hold = process_manager._inference_scheduler.slot_duty_snapshot()
+        assert totals == {SlotDutyBucket.CLEARANCE_HOLD: 20.0}
+        assert hold == str(SlotDutyBucket.CLEARANCE_HOLD)
+
+    async def test_a_tick_that_runs_the_cycle_observes_after_its_dispatch_pass(self) -> None:
+        """A head the cycle is about to dispatch is priced at what the pass did, not as a gate-less stall."""
+        process_manager = _make_tickable_manager()
+        process_manager._process_map.update({0: make_mock_process_info(0, model_name="stable_diffusion")})
+        await track_popped_job_async(process_manager._job_tracker, make_job_pop_response("stable_diffusion"))
+        scheduler = process_manager._inference_scheduler
+        calls: list[str] = []
+
+        async def _cycle(_reference: object) -> None:
+            calls.append("cycle")
+
+        def _observe(_reference: object) -> None:
+            calls.append("observe")
+
+        scheduler.run_scheduling_cycle = _cycle  # type: ignore[method-assign]
+        scheduler.record_slot_duty = _observe  # type: ignore[method-assign]
+
+        assert await process_manager._control_loop_tick() is True
+
+        assert calls == ["cycle", "observe"]
 
 
 class TestPeriodicUpdateCheckLoopShutdown:

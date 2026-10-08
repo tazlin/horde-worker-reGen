@@ -4480,6 +4480,10 @@ class HordeWorkerProcessManager:
 
             if free_process_or_model_loaded and len(self._job_tracker.jobs_pending_inference) > 0:
                 await self._inference_scheduler.run_scheduling_cycle(self.stable_diffusion_reference)
+            # Slot duty is observed every tick because the cycle above is skipped while no lane can take a job,
+            # and every lane is busy then. Observing after the dispatch pass prices a head that pass dispatched as
+            # in progress, and reads the declines it recorded.
+            self._inference_scheduler.record_slot_duty(self.stable_diffusion_reference)
 
             await self._sleep(self._loop_interval)
             await self.receive_and_handle_process_messages()

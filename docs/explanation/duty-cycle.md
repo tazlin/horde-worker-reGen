@@ -211,9 +211,10 @@ The device counters cannot distinguish a saturated one-thread worker from a two-
 at half capacity: one busy sampler reads as "busy" either way. The same duty line therefore also
 carries a **slot attribution** fragment from
 [`SlotDutyAccumulator`][horde_worker_regen.process_management.scheduling.slot_duty.SlotDutyAccumulator]:
-every scheduler tick attributes each configured inference slot's elapsed time to `sampling` or to
+every control-loop tick attributes each configured inference slot's elapsed time to `sampling` or to
 exactly one named reason the slot stayed empty, so the shares sum to 100% of `capacity x wall` and
-"active vs idle vs gated" is a direct read:
+"active vs idle vs gated" is a direct read. The attribution is observed on every tick, including ticks that
+skip the scheduling cycle because every lane is busy, and after the dispatch pass on ticks that run one:
 
 ```text
 slot attribution (capacity 2): sampling 61%, overlap_headway 17%, no_local_work 12%, model_loading 6%

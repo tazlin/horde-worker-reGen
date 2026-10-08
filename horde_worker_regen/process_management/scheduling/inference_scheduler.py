@@ -797,9 +797,9 @@ class InferenceScheduler:
         # missing-model latch, the dispatch-stall diagnostic and the heavy-head load grace.
         self._head_admission = HeadAdmissionLedger(ledger_clock)
 
-        # Capacity-normalized wall-clock accounting: every scheduler tick attributes each configured
+        # Capacity-normalized wall-clock accounting: every control-loop tick attributes each configured
         # inference slot's elapsed time to SAMPLING or to the gate/supply state that kept it empty, so
-        # "active vs idle vs gated" is a direct read over any window. Fed once per scheduling cycle
+        # "active vs idle vs gated" is a direct read over any window. Fed once per control-loop tick
         # (record_slot_duty); snapshotted into the stats stream and the periodic duty-cycle log line.
         self._slot_duty = SlotDutyAccumulator()
         self._slot_duty_current_hold: SlotDutyBucket | None = None
@@ -4112,9 +4112,13 @@ class InferenceScheduler:
     # ---- end head-of-queue admission state ---------------------------------------------------------------
 
     def record_slot_duty(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
-        """Attribute the wall clock since the last scheduling cycle across the configured inference slots.
+        """Attribute the wall clock since the last observation across the configured inference slots.
 
-        Called once per scheduling cycle. Busy slots accrue ``SAMPLING``; when capacity is spare and a
+        Called once per control-loop tick, after the scheduling cycle's dispatch pass when a cycle runs. The
+        cycle is skipped while every lane is busy, and the observation must still price those ticks. After the
+        pass, a head the pass dispatched counts as in progress and the declines it recorded name the gate.
+
+        Busy slots accrue ``SAMPLING``; when capacity is spare and a
         queued job is waiting, the empty slots accrue the bucket the stall classifier names (the same
         derivation that explains a parked head, but priced every tick instead of only after a multi-second
         park); with no waiting work they accrue ``NO_LOCAL_WORK``. The classification is a read-only
@@ -12437,7 +12441,6 @@ class InferenceScheduler:
         bridge_data = self._runtime_config.bridge_data
 
         self._refresh_model_demand()
-        self.record_slot_duty(stable_diffusion_reference)
 
         # Resource governance is not driven here: the process manager runs run_governance_tick() every
         # control-loop iteration, so the danger-floor verdict and shed/restore response are already fresh
