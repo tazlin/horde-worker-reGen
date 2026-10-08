@@ -5,6 +5,9 @@ contexts held, and the ladder had no rung that named them: it emptied, the hold 
 head waited on a fit nothing produced. The lanes now enter the ladder for a starved head, cheapest first and
 one per evaluation, only past the teardown grace, only when the permitted rungs would close the deficit, and
 never when policy withholds lane reclaim.
+
+A post-processing job's safety cycle answers to the same closability test: offered only when no eviction or
+demotion is on the ladder and moving safety alone covers the deficit.
 """
 
 from __future__ import annotations
@@ -142,3 +145,52 @@ def test_a_non_head_and_a_post_processing_request_never_reach_the_lane_rungs() -
 
     pp_job = _head(kind=VramRequestKind.PP_JOB)
     assert ActuatorCommandKind.PAUSE_POST_PROCESS_LANE not in _kinds(_verdict(_lane_state(), pp_job))
+
+
+_PP_CANDIDATE_MB = 8000.0
+
+
+def _pp_job_short_by(deficit_mb: float, **overrides: object) -> tuple[DeviceVramState, VramRequest]:
+    """A post-processing job on its own lane, short of room by ``deficit_mb``, beside an on-card safety."""
+    state = _lane_state(
+        post_process=True,
+        safety=True,
+        device_free_mb=_PP_CANDIDATE_MB + _NOISE_MB - deficit_mb,
+    )
+    request = _head(
+        kind=VramRequestKind.PP_JOB,
+        target_process_id=1,
+        candidate_delta_mb=_PP_CANDIDATE_MB,
+        is_head_of_queue=False,
+        starved_seconds=0.0,
+    )
+    return state, replace(request, **overrides)  # type: ignore[arg-type]
+
+
+def test_a_post_processing_deficit_demotion_covers_is_not_offered_the_safety_cycle() -> None:
+    """A small deficit takes the in-place demotion; cycling the safety process waits for a later evaluation."""
+    state, request = _pp_job_short_by(154.0)
+    state = replace(state, safety_weights_demotable=True)
+
+    assert _kinds(_verdict(state, request)) == [ActuatorCommandKind.DEMOTE_SAFETY_WEIGHTS]
+
+
+def test_a_post_processing_deficit_beyond_the_safety_footprint_is_not_offered_the_safety_cycle() -> None:
+    """Moving safety cannot close a deficit larger than what safety holds, so the move would be pure churn."""
+    state, request = _pp_job_short_by(5077.0)
+
+    assert ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU not in _kinds(_verdict(state, request))
+
+
+def test_a_post_processing_deficit_safety_alone_closes_is_offered_the_safety_cycle() -> None:
+    """With no resident to evict and nothing to demote, a deficit within safety's footprint names the move."""
+    state, request = _pp_job_short_by(2000.0)
+
+    assert _kinds(_verdict(state, request)) == [ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU]
+
+
+def test_a_post_processing_job_with_an_evictable_resident_is_not_offered_the_safety_cycle() -> None:
+    """The eviction is cheaper and is priced first; the next evaluation decides whether safety must move."""
+    state, request = _pp_job_short_by(2000.0, has_reclaimable_idle_model=True)
+
+    assert _kinds(_verdict(state, request)) == [ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL]

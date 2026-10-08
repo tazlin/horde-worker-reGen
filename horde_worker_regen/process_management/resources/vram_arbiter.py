@@ -89,6 +89,7 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     _ADMISSION_NOISE_BUFFER_MB,
     AdmissionRoom,
     AdmissionVerdict,
+    RoomRungKind,
     TenantLane,
     admission_room,
     evaluate_admission,
@@ -1335,12 +1336,16 @@ class VramArbiter:
         busy lane is never a target, and the request's own target slot is never asked to release the cache it
         is about to load into); EVICT_IDLE_MODEL is emitted only when an idle resident model exists to evict,
         and a PP_JOB takes the single-step EVICT_COLDEST_IDLE_MODEL in its place;
-        REDUCE_LIVE_CONTEXTS only when a warranted context reduction is available. An empty ladder therefore
+        REDUCE_LIVE_CONTEXTS only when a warranted context reduction is available. A PP_JOB is offered
+        CYCLE_SAFETY_OFF_GPU only when no eviction or safety demotion is on the ladder and moving safety alone
+        covers the deficit: the process rebuild is the dearest rung, so it waits for the cheaper rungs to be priced
+        on an earlier evaluation and is never spent on a deficit it cannot close. An empty ladder therefore
         means the arbiter's own per-cycle reclamation is structurally exhausted: nothing the caller could run
         this cycle would free memory. The commands are described for the caller to execute; the arbiter runs
         none of them.
         """
         commands: list[ActuatorCommand] = []
+        weight_reclaim_offered = False
         for pid in sorted(state.idle_process_ids):
             if pid in state.busy_process_ids or pid == request.target_process_id:
                 continue
@@ -1358,12 +1363,14 @@ class VramArbiter:
                 else ActuatorCommandKind.EVICT_IDLE_MODEL
             )
             commands.append(ActuatorCommand(kind=evict_kind, device_index=None))
+            weight_reclaim_offered = True
         if request.can_reduce_live_contexts:
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None))
         if state.safety_context_count > 0 and state.safety_weights_demotable:
             # Offered to every request kind: it keeps the safety process and its context, so unlike the
             # process-cycling rung below it needs no cooldown and costs the next evaluation only a re-stage.
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.DEMOTE_SAFETY_WEIGHTS, device_index=None))
+            weight_reclaim_offered = True
         service_lane_added = False
         if request.kind is VramRequestKind.PP_JOB and request.allow_idle_service_lane_reclaim and not commands:
             # PP cannot pause its own lane. Offer one idle disaggregation service context in the verified
@@ -1378,8 +1385,10 @@ class VramArbiter:
         if (
             request.kind is VramRequestKind.PP_JOB
             and not service_lane_added
+            and not weight_reclaim_offered
             and state.safety_context_count > 0
             and state.safety_reclaim_allowed
+            and self._safety_move_closes_deficit(state, request)
         ):
             commands.append(ActuatorCommand(kind=ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU, device_index=None))
         if not commands:
@@ -1417,6 +1426,21 @@ class VramArbiter:
         if state.utilities_context_count > 0 and state.utilities_reclaim_allowed:
             return ActuatorCommand(kind=ActuatorCommandKind.PAUSE_UTILITIES_LANE, device_index=None)
         return None
+
+    def _safety_move_closes_deficit(self, state: DeviceVramState, request: VramRequest) -> bool:
+        """Whether moving safety off the card alone would cover this request's measured deficit.
+
+        Reads the room breakdown the verdict is priced from, so the deficit and safety's promised return are the
+        same figures the starved-head closability test uses. A fixed safety residency lists no rung and so never
+        qualifies.
+        """
+        room = self._room(request, state, self._measured(request, state))
+        if room is None or room.deficit_mb <= 0:
+            return False
+        return any(
+            rung.kind is RoomRungKind.SAFETY_OFF_GPU and rung.permitted and rung.promised_mb >= room.deficit_mb
+            for rung in room.rungs
+        )
 
     @staticmethod
     def _has_first_party_context_reclaim(request: VramRequest) -> bool:

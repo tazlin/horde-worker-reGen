@@ -701,7 +701,11 @@ bookkeeping (each newly available reclaim plan at most once, throttled warning, 
 bounded. The orchestrator retains
 the verdict rather than reducing it to a boolean, and executes its reclaim commands through the same shared
 reclaim owner as preload and dispatch admission. For a post-processing head this plan may move safety off-GPU
-after idle cache/weight reclaim when `whole_card_residency_safety_off_gpu` permits it. The reserve bypass is
+when `whole_card_residency_safety_off_gpu` permits it, and only when no idle-model eviction or safety weight
+demotion is on the plan and moving safety alone covers the measured deficit (the same room breakdown the
+starved-head lane rungs test closability against). A deficit the demotion or an eviction may close is priced
+again on the next evaluation before safety is moved; a deficit larger than safety's footprint never moves it.
+The reserve bypass is
 preserved: a disabled VRAM budget or a zero-peak chain always admits. The lane's non-memory guards (the
 allocator-guard cap fault and sampling co-residency hold) stay.
 
