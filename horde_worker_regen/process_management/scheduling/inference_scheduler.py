@@ -1750,6 +1750,21 @@ class InferenceScheduler:
         """Seconds of continuous forecast headroom a safety restore must have (never below the demotion dwell)."""
         return self._safety_placement_dwell_seconds() * SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR
 
+    def _note_safety_restore_hold(self, reason: str, inputs: SafetyPlacementInputs) -> None:
+        """Disclose (edge-triggered) which gate keeps a paused safety process off the card this cycle.
+
+        The gates after an admitting forecast return without a word, so a card that keeps safety on the CPU
+        for a session shows nothing but the inputs line. The reason is the key: a changed gate logs at once,
+        an unchanged one only on the repeat interval.
+        """
+        suppressed = self._diagnostics.suppressed_count("safety_restore_hold", reason)
+        if suppressed is None:
+            return
+        logger.debug(
+            f"Runtime safety placement: restore held by {reason} ({inputs.describe()})."
+            f"{suppressed_suffix(suppressed)}",
+        )
+
     def _reconcile_runtime_safety_placement(self, *, update_policy: bool = True) -> None:
         """Apply the single reconciled safety placement chosen from every resource-governance request.
 
@@ -1858,6 +1873,10 @@ class InferenceScheduler:
                 ledger.reclaim_pause_requested = False
                 return
             if requested_owner is not None or residency_veto:
+                self._note_safety_restore_hold(
+                    "another owner asks for the card" if requested_owner is not None else "a residency veto",
+                    inputs,
+                )
                 return
             pause_owner = self._process_lifecycle.safety_pause_owner
             if pause_owner is None:
@@ -1868,15 +1887,28 @@ class InferenceScheduler:
                 # rebuild for it. A ladder pause is exempt because it was taken for a head, not for the backlog,
                 # and a CPU check takes many times its GPU time, so a backlog of one or two is the steady state
                 # of that placement and would hold the restore off for as long as images keep arriving.
+                self._note_safety_restore_hold("a shallow safety backlog drains on the CPU", inputs)
                 return
             if ledger.post_processing_defers_restore(pp_backlog_depth):
+                self._note_safety_restore_hold("the post-processing backlog", inputs)
                 return
             if self.is_vram_growth_held(safety_card):
+                self._note_safety_restore_hold("the VRAM growth hold", inputs)
                 return
             if pause_owner in MEMORY_PRESSURE_PAUSE_OWNERS and not ledger.dwell_met(
                 ledger.headroom_since,
                 self._safety_placement_restore_dwell_seconds(),
             ):
+                headroom_held = (
+                    "no headroom yet"
+                    if ledger.headroom_since is None
+                    else f"{self._clock() - ledger.headroom_since:.0f}s so far"
+                )
+                self._note_safety_restore_hold(
+                    f"the restore dwell ({self._safety_placement_restore_dwell_seconds():.0f}s of forecast "
+                    f"headroom; {headroom_held})",
+                    inputs,
+                )
                 # A pause taken because the card was short of memory is part of why the instantaneous gates
                 # now pass: the memory it returned is the memory they are reading. Restoring on that alone
                 # hands the card straight back into the pressure that evicted safety, and each round trip ends
@@ -1897,6 +1929,10 @@ class InferenceScheduler:
                         f"Runtime safety placement: unloaded idle resident model {victim} from card {safety_card} "
                         "(its RAM copy is kept) so the safety process can return to the GPU "
                         f"({inputs.describe()})."
+                    )
+                else:
+                    self._note_safety_restore_hold(
+                        "the arbiter withholds the load and no idle resident is evictable", inputs
                     )
                 return
             headroom_since = ledger.headroom_since or self._clock()
