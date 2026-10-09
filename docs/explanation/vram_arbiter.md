@@ -910,6 +910,14 @@ The room is also what the other frames read, so they cannot disagree with the ve
   `measured_load_probe_seconds` and the card's measured load seconds, because at the timeout the child makes
   the same load anyway, unpriced. Reclaim keeps its turn: the probe still needs a converged card with no rung
   left that could close the deficit.
+- **A refusal past the deadline holds the waiter unless its sample is known to crash.** The unpriced sample
+  at the lease-acquire timeout can succeed, since clearance prices the whole weights and ComfyUI can load
+  a checkpoint partially. Two conditions make the refusal terminal: the driver paging the worker's
+  allocations for the request (`VramRequest.wddm_paging_active`), or the job's model having crashed an
+  inference child natively while staged or sampling this session
+  (`ProcessLifecycleManager.model_has_crashed_a_child_natively`). A native crash is never classified as a
+  resource failure, so under either one `clearance_admit_process` faults the job for reissue and replaces the
+  lane deliberately. The native-crash record never feeds the model quarantine.
 - **Recovery defers to a standing hold** inside its liveness bound (the probe clock, the teardown grace and
   the heavy head's load window end to end), logging the deferral once on each edge; past the bound the hold
   is a wedge like any other.

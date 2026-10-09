@@ -528,11 +528,15 @@ async def test_a_pinned_disaggregated_sampler_waits_on_clearance_only_from_its_s
     assert staged_waiter_ids() == [0], "the sample stage's prime makes the pinned sampler a waiter"
 
 
-async def test_a_terminal_refusal_faults_the_staged_job_and_replaces_the_lane(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A DENY on a card with nothing to reclaim and no other lane at work ends the wait, not the lease timeout.
+async def _refused_past_its_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wddm_paging_active: bool,
+    model_crashed_a_child_natively: bool,
+) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, HordeProcessInfo, Mock]:
+    """A staged waiter the arbiter still DENYs past its attempt deadline, with nothing to reclaim or wait for.
 
-    No later pass answers differently, and the staged child's only exit would be sampling unpriced on a card the
-    verdict says cannot hold it. The job is faulted for reissue and the lane replaced deliberately.
+    Returns the scheduler, the staged job, the waiter, and the stand-in for the lane replacement.
     """
     from horde_worker_regen.process_management.resources.vram_arbiter import VramDisposition
     from horde_worker_regen.process_management.scheduling import inference_scheduler as scheduler_module
@@ -541,7 +545,12 @@ async def test_a_terminal_refusal_faults_the_staged_job_and_replaces_the_lane(mo
     real_plan = _decide(scheduler, 0)
     assert real_plan.verdict is not None and real_plan.priced is not None
     # Refused, and starved past the deadline the one real load was bounded by.
-    starved_request = replace(real_plan.priced.request, starved_seconds=50.0, attempt_deadline_seconds=40.0)
+    starved_request = replace(
+        real_plan.priced.request,
+        starved_seconds=50.0,
+        attempt_deadline_seconds=40.0,
+        wddm_paging_active=wddm_paging_active,
+    )
     denied = replace(
         real_plan,
         verdict=replace(real_plan.verdict, disposition=VramDisposition.DENY),
@@ -550,12 +559,70 @@ async def test_a_terminal_refusal_faults_the_staged_job_and_replaces_the_lane(mo
     monkeypatch.setattr(scheduler_module, "decide_clearance_admit", lambda *args, **kwargs: denied)
     scheduler._actuate_materialization_verdict = Mock(return_value=())  # type: ignore[method-assign]
     scheduler._waiting_can_help_staged_waiter = Mock(return_value=False)  # type: ignore[method-assign]
+    scheduler._process_lifecycle.model_has_crashed_a_child_natively = Mock(  # type: ignore[method-assign]
+        return_value=model_crashed_a_child_natively,
+    )
     replaced = Mock()
     scheduler._process_lifecycle._replace_inference_process = replaced  # type: ignore[method-assign]
+    return scheduler, job, waiter, replaced
+
+
+async def test_a_terminal_refusal_faults_the_staged_job_and_replaces_the_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DENY past the deadline on a paging card ends the wait, not the lease timeout.
+
+    While the driver pages the worker's allocations, the child's unpriced sample at its lease-acquire timeout
+    fails natively instead of degrading. The job is faulted for reissue and the lane replaced deliberately.
+    """
+    scheduler, _job, waiter, replaced = await _refused_past_its_deadline(
+        monkeypatch,
+        wddm_paging_active=True,
+        model_crashed_a_child_natively=False,
+    )
 
     assert scheduler.clearance_admit_process(0) is False
 
     replaced.assert_called_once()
     assert replaced.call_args.args[0] is waiter
     assert replaced.call_args.kwargs["intentional_reason"]
+    assert replaced.call_args.kwargs["resource_fault_reason"]
+
+
+async def test_a_refusal_past_the_deadline_without_crash_evidence_keeps_the_waiter_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without paging or a prior native crash of the model, a refusal past the deadline stays a hold.
+
+    Clearance prices the whole weights, and ComfyUI can serve a checkpoint it loads partially, so the child's
+    sample at its lease-acquire timeout is the job's remaining path to success.
+    """
+    scheduler, job, _waiter, replaced = await _refused_past_its_deadline(
+        monkeypatch,
+        wddm_paging_active=False,
+        model_crashed_a_child_natively=False,
+    )
+
+    assert scheduler.clearance_admit_process(0) is False
+
+    replaced.assert_not_called()
+    assert str(job.id_) in scheduler._clearance_starved_since, "the waiter is held, its starvation recorded"
+
+
+async def test_a_prior_native_crash_of_the_jobs_model_makes_the_refusal_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model that has crashed an inference child natively this session makes a refusal past the deadline final.
+
+    Its unpriced sample is known to end in a native crash, which is never classified as a resource failure.
+    """
+    scheduler, job, waiter, replaced = await _refused_past_its_deadline(
+        monkeypatch,
+        wddm_paging_active=False,
+        model_crashed_a_child_natively=True,
+    )
+
+    assert scheduler.clearance_admit_process(0) is False
+
+    scheduler._process_lifecycle.model_has_crashed_a_child_natively.assert_called_with(job.model)
+    replaced.assert_called_once()
+    assert replaced.call_args.args[0] is waiter
     assert replaced.call_args.kwargs["resource_fault_reason"]

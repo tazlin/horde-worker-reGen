@@ -637,6 +637,7 @@ class ProcessLifecycleManager:
     _recent_load_failure_by_process: dict[int, tuple[str, float]]
     _on_model_quarantined: Callable[[str], None] | None
     _blank_model_identity_warned: bool
+    _models_that_crashed_a_child_natively: set[str]
 
     def __init__(
         self,
@@ -950,6 +951,7 @@ class ProcessLifecycleManager:
         self._inference_lanes_due_replacement = {}
         self._on_model_quarantined = None
         self._blank_model_identity_warned = False
+        self._models_that_crashed_a_child_natively = set()
         self._pending_gpu_starts: dict[tuple[HordeProcessType, int], _PendingGpuStart] = {}
         self._pending_gpu_start_last_free_mb_by_device: dict[int, float] = {}
         self._pending_gpu_start_last_progress_at_by_device: dict[int, float] = {}
@@ -4607,6 +4609,15 @@ class ProcessLifecycleManager:
         """The set of models currently quarantined for repeated load failures or sampler hangs."""
         return frozenset(self._quarantined_models)
 
+    def model_has_crashed_a_child_natively(self, model_name: str | None) -> bool:
+        """Whether ``model_name`` has crashed an inference child natively while staged or sampling this session.
+
+        A native crash is never classified as a resource failure, so clearance reads this to stop such a model
+        sampling unpriced at its lease-acquire timeout. It is evidence for that one rule and never feeds the
+        quarantine.
+        """
+        return model_name is not None and model_name in self._models_that_crashed_a_child_natively
+
     def _take_recent_load_failure_for_process(self, process_id: int) -> str | None:
         """Pop and return the model this process most recently failed to load, if that failure is fresh.
 
@@ -5077,6 +5088,15 @@ class ProcessLifecycleManager:
                 and (preload_deadline_exceeded or not process_info.mp_process.is_alive())
             ):
                 self.record_model_incident(preloading_model, ModelIncidentKind.LOAD_FAILURE)
+            crash_exitcode = process_info.mp_process.exitcode
+            if (
+                process_info.loaded_horde_model_name is not None
+                and process_info.last_process_state
+                in (HordeProcessState.INFERENCE_PRIMED, HordeProcessState.INFERENCE_STARTING)
+                and isinstance(crash_exitcode, int)
+                and crash_exitcode != 0
+            ):
+                self._models_that_crashed_a_child_natively.add(process_info.loaded_horde_model_name)
             replacements_in_window = self._record_slot_recovery(process_info.process_id)
             consecutive_start_failures = self._record_start_failure(process_info)
             crash_looped = replacements_in_window > CRASH_LOOP_MAX_REPLACEMENTS

@@ -2373,6 +2373,77 @@ def test_oom_kill_is_labelled_oom_and_spares_the_slot_crash_breaker(monkeypatch:
     assert plm._slot_recovery_history.get(1, []) == [], "OS OOM kills must not feed the per-slot crash-loop breaker"
 
 
+_NATIVE_ACCESS_VIOLATION_EXITCODE = 3221225477
+
+
+@pytest.mark.parametrize(
+    ("state", "exitcode", "low_host_ram", "intentional_reason", "recorded"),
+    [
+        pytest.param(
+            HordeProcessState.INFERENCE_STARTING,
+            _NATIVE_ACCESS_VIOLATION_EXITCODE,
+            False,
+            None,
+            True,
+            id="sampling-native-crash",
+        ),
+        pytest.param(HordeProcessState.INFERENCE_PRIMED, 1, False, None, True, id="primed-native-crash"),
+        pytest.param(HordeProcessState.INFERENCE_STARTING, -9, True, None, False, id="os-oom-kill"),
+        pytest.param(
+            HordeProcessState.INFERENCE_STARTING,
+            _NATIVE_ACCESS_VIOLATION_EXITCODE,
+            False,
+            "operator reload",
+            False,
+            id="deliberate-replacement",
+        ),
+        pytest.param(
+            HordeProcessState.PRELOADING_MODEL,
+            _NATIVE_ACCESS_VIOLATION_EXITCODE,
+            False,
+            None,
+            False,
+            id="preload-crash",
+        ),
+        pytest.param(HordeProcessState.INFERENCE_STARTING, None, False, None, False, id="hang-still-alive"),
+        pytest.param(HordeProcessState.INFERENCE_STARTING, 0, False, None, False, id="clean-exit"),
+    ],
+)
+def test_a_native_crash_while_sampling_records_its_model(
+    monkeypatch: pytest.MonkeyPatch,
+    state: HordeProcessState,
+    exitcode: int | None,
+    low_host_ram: bool,
+    intentional_reason: str | None,
+    recorded: bool,
+) -> None:
+    """A child that dies natively while staged or sampling marks its model as having crashed a child natively.
+
+    An OS OOM kill, a deliberate replacement, a hang and a clean exit are not that child's own native crash, and
+    a crash during preload is a load failure counted per model already.
+    """
+    import psutil
+
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+    available_mb = 900 if low_host_ram else 24 * 1024
+    monkeypatch.setattr(
+        psutil,
+        "virtual_memory",
+        lambda: Mock(available=int(available_mb * 1024 * 1024), total=int(32 * 1024 * 1024 * 1024), percent=50.0),
+    )
+    child = make_mock_process_info(1, model_name="sampled_model", state=state)
+    child.mp_process = Mock(is_alive=Mock(return_value=exitcode is None), exitcode=exitcode, pid=100001)
+    plm._process_map[1] = child
+
+    plm._replace_inference_process(child, intentional_reason=intentional_reason)
+
+    assert plm.model_has_crashed_a_child_natively("sampled_model") is recorded
+    assert plm.model_has_crashed_a_child_natively("another_model") is False
+    assert plm.is_model_load_quarantined("sampled_model") is False, "the record never feeds the quarantine"
+
+
 class TestPagedSlowdownWatchdog:
     """The last reclaim rung: a crawling sampler is replaced once the card is wedged over the paging cliff.
 

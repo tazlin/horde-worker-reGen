@@ -5998,23 +5998,23 @@ class InferenceScheduler:
         )
         if applied or self._waiting_can_help_staged_waiter(process_info):
             self._stop_staged_waiter_clock(job)
-        elif self._staged_waiter_past_its_deadline(plan):
-            # A refusal that has outlasted the waiter's attempt deadline on a card with nothing left to reclaim
-            # and no other lane at work: the one real load the deadline bounded can no longer complete before
-            # the child's lease-acquire timeout, after which the child samples the job unpriced on a card the
-            # verdict says cannot hold it. The job is faulted to the horde for reissue and the lane replaced
-            # deliberately, a bounded cost instead of a native crash.
+        elif (terminal_evidence := self._terminal_refusal_evidence(plan, job.model)) is not None:
+            # A refusal past the waiter's attempt deadline leaves the child one exit, sampling unpriced at its
+            # lease-acquire timeout. That sample can succeed, because clearance prices the whole weights and
+            # ComfyUI can load a checkpoint partially, so the waiter stays held unless the sample is known to
+            # crash natively. A native crash is never classified as a resource failure, so there the job is
+            # faulted for reissue and the lane replaced deliberately, a bounded cost.
             self._stop_staged_waiter_clock(job)
             self._resolve_clearance_hold(job)
             logger.warning(
-                f"Clearance refused outright for process {process_id} ({job.model}): {plan.reason}; the staged job "
-                "cannot be served on this card, so it is faulted for reissue and the lane is replaced rather than "
-                "left to sample unpriced at its lease-acquire timeout.",
+                f"Clearance refused outright for process {process_id} ({job.model}): {plan.reason} "
+                f"({terminal_evidence}). The staged job cannot be served on this card, so it is faulted for reissue "
+                "and the lane is replaced.",
             )
             self._process_lifecycle._replace_inference_process(
                 process_info,
                 intentional_reason="clearance refused outright: the staged job cannot be held on this card",
-                resource_fault_reason=f"clearance refused outright: {plan.reason}",
+                resource_fault_reason=f"clearance refused outright: {plan.reason} ({terminal_evidence})",
             )
             return False
         elif job.id_ is not None:
@@ -6029,6 +6029,22 @@ class InferenceScheduler:
             actuations=applied,
         )
         return False
+
+    def _terminal_refusal_evidence(self, plan: ClearancePlan, model: str) -> str | None:
+        """Name why a refused staged waiter's unpriced sample would crash natively, or None to keep it held.
+
+        Only a waiter past its deadline qualifies, and only on evidence of a native crash: the driver paging the
+        worker's allocations for this request, or the job's model having crashed an inference child natively
+        this session.
+        """
+        if not self._staged_waiter_past_its_deadline(plan):
+            return None
+        assert plan.priced is not None
+        if plan.priced.request.wddm_paging_active:
+            return "the card is paging the worker's allocations"
+        if self._process_lifecycle.model_has_crashed_a_child_natively(model) is True:
+            return f"{model} has crashed an inference child natively this session"
+        return None
 
     @staticmethod
     def _staged_waiter_past_its_deadline(plan: ClearancePlan) -> bool:
