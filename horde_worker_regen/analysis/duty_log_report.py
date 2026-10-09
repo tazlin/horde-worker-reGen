@@ -7,10 +7,14 @@ banner, then for each epoch parses the periodic ``GPU duty cycle`` lines (and th
 per-job-gap attribution they now carry), the effective worker config, and any disk-pressure warnings,
 and prints a compact per-epoch verdict plus the biggest loss buckets.
 
-Pure stdlib (re + datetime + argparse) so it imports without the inference stack; usable from the CLI
-(``horde-duty-report``) or the benchmark/TUI. The grep-friendly log format is the contract: see the
-regexes below, which mirror what ``process_manager._log_duty_cycle_summary`` and
-``status_reporter`` emit.
+When stats JSONL is present the stats-backed report leads (:mod:`horde_worker_regen.analysis.session_duty`).
+A log named beside it adds each session's clearance-hold digest from the matching epoch, and the learned
+footprint store's sampling prices follow (:mod:`horde_worker_regen.analysis.footprint_view`).
+
+It imports without the inference stack; usable from the CLI (``horde-duty-report``, or ``horde-log duty``)
+or the benchmark/TUI. The grep-friendly log format is the contract: see the regexes below, which mirror
+what ``process_manager._log_duty_cycle_summary``, ``status_reporter`` and
+``InferenceScheduler._log_clearance_hold`` emit.
 """
 
 from __future__ import annotations
@@ -19,16 +23,26 @@ import argparse
 import json
 import re
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from horde_worker_regen.analysis.footprint_view import (
+    default_footprint_store_path,
+    learned_sampling_footprints,
+    render_learned_sampling_footprints,
+)
 from horde_worker_regen.analysis.governor_signatures import (
     GOVERNOR_ENTER_RE,
     GOVERNOR_EXIT_RE,
     GOVERNOR_LABELS,
 )
-from horde_worker_regen.analysis.session_duty import analyze_stats_sessions, render_session_duty_report
+from horde_worker_regen.analysis.session_duty import (
+    SessionDutyReport,
+    analyze_stats_sessions,
+    render_session_duty_report,
+    stats_session_local_start,
+)
 from horde_worker_regen.stats_operations import default_stats_dir
 
 _TS_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)")
@@ -69,6 +83,22 @@ _IDENTITY_RE = re.compile(
     r"queue_size: (?P<queue_size>\d+) \| safety_on_gpu: (?P<safety>\w+)",
 )
 _DISK_RE = re.compile(r"Low disk space on .*?: (?P<free>[\d.]+) GB free")
+
+CLEARANCE_HOLD_RE = re.compile(
+    r"Clearance held for process (?P<process>\d+) \((?P<model>.+?)\): (?P<decision>[^;]+); "
+    r"(?:candidate (?:(?P<candidate>-?\d+)MB|unpriced) \(child already holds (?:(?P<held>-?\d+)MB|unreported)\) "
+    r"vs device free (?:(?P<free>-?\d+)MB|n/a), available (?:(?P<available>-?\d+)MB|n/a), "
+    r"reserve (?P<reserve>-?\d+)MB, outstanding reservations (?P<outstanding>-?\d+)MB, "
+    r"noise buffer (?P<noise>-?\d+)MB; reclaim run: (?P<reclaim>[^.;]+)(?:; outstanding by unit: [^.]*)?\.)?",
+)
+"""Matches the clearance-hold line ``InferenceScheduler._log_clearance_hold`` emits.
+
+The arithmetic group is optional: a hold for the post-processing co-residency mutex carries prose in its
+place. The line is edge-logged once per distinct ``(process, decision)``, so a count of these lines is a
+count of distinct holds, never of held ticks."""
+_NO_RECLAIM = "none"
+_STATS_EPOCH_MATCH_SECONDS = 120.0
+"""How far a stats file's start stamp may sit from its session's manager-init banner and still match it."""
 
 # Duty bands for the distribution, as (exclusive-upper-bound, label); the last catches the rest.
 _DUTY_BANDS: tuple[tuple[float, str], ...] = ((40, "<40%"), (60, "40-60%"), (75, "60-75%"), (90, "75-90%"))
@@ -355,6 +385,152 @@ def analyze_log(lines: list[str]) -> list[EpochReport]:
     return [report for report in reports if report.windows]
 
 
+@dataclass
+class ClearanceHold:
+    """Represents one ``Clearance held for process`` line.
+
+    The figures are None for a hold whose line carries no arithmetic (the post-processing co-residency
+    mutex), and individually None where the line printed ``unpriced``, ``unreported`` or ``n/a``.
+    """
+
+    timestamp: datetime | None
+    process_id: int
+    model: str
+    decision: str
+    candidate_mb: int | None
+    child_holds_mb: int | None
+    device_free_mb: int | None
+    available_mb: int | None
+    reserve_mb: int | None
+    outstanding_mb: int | None
+    noise_buffer_mb: int | None
+    reclaim_run: str | None
+    """The reclaim commands the arbiter ran, comma-joined, ``none`` for no reclaim, None without arithmetic."""
+
+
+@dataclass
+class ClearanceHoldDigest:
+    """Represents one model's clearance holds across a session."""
+
+    model: str
+    hold_lines: int
+    """Distinct holds logged; the line is edge-triggered per process and decision, so this is not tick time."""
+    decisions: dict[str, int]
+    median_candidate_mb: float | None
+    median_available_mb: float | None
+    median_outstanding_mb: float | None
+    reclaim_runs: dict[str, int]
+    """Holds per reclaim-run text, ``none`` included; holds without arithmetic are not counted here."""
+
+
+def parse_clearance_hold(line: str) -> ClearanceHold | None:
+    """Parse one ``Clearance held for process`` log line, or return None when it is not one."""
+    match = CLEARANCE_HOLD_RE.search(line)
+    if match is None:
+        return None
+    return ClearanceHold(
+        timestamp=_parse_ts(line),
+        process_id=int(match.group("process")),
+        model=match.group("model"),
+        decision=match.group("decision").strip(),
+        candidate_mb=_int_group(match, "candidate"),
+        child_holds_mb=_int_group(match, "held"),
+        device_free_mb=_int_group(match, "free"),
+        available_mb=_int_group(match, "available"),
+        reserve_mb=_int_group(match, "reserve"),
+        outstanding_mb=_int_group(match, "outstanding"),
+        noise_buffer_mb=_int_group(match, "noise"),
+        reclaim_run=match.group("reclaim"),
+    )
+
+
+def summarize_clearance_holds(lines: list[str]) -> list[ClearanceHoldDigest]:
+    """Group the clearance-hold lines among ``lines`` by model, most holds first."""
+    by_model: dict[str, list[ClearanceHold]] = {}
+    for line in lines:
+        hold = parse_clearance_hold(line)
+        if hold is not None:
+            by_model.setdefault(hold.model, []).append(hold)
+    digests = [_clearance_digest(model, holds) for model, holds in by_model.items()]
+    digests.sort(key=lambda digest: (-digest.hold_lines, digest.model))
+    return digests
+
+
+def epoch_lines_for_stats_session(lines: list[str], started_local: datetime) -> list[str]:
+    """Return the log epoch a stats session belongs to, matched by start time on the host clock.
+
+    Args:
+        lines: The whole ``bridge.log``.
+        started_local: The stats session's start stamp (its filename), in the host's local time.
+
+    Returns:
+        The lines of the epoch whose first line sits closest to ``started_local``, within
+        ``_STATS_EPOCH_MATCH_SECONDS``; empty when no epoch starts that close (a tail-capped log, for one).
+    """
+    best: list[str] = []
+    best_distance: float | None = None
+    for epoch in split_into_epochs(lines):
+        epoch_start = _parse_ts(epoch[0]) if epoch else None
+        if epoch_start is None:
+            continue
+        distance = abs((epoch_start - started_local).total_seconds())
+        if distance > _STATS_EPOCH_MATCH_SECONDS:
+            continue
+        if best_distance is None or distance < best_distance:
+            best, best_distance = epoch, distance
+    return best
+
+
+def render_clearance_hold_digest(digests: list[ClearanceHoldDigest]) -> list[str]:
+    """Render the per-model clearance-hold digest as report lines, empty when no hold was logged."""
+    if not digests:
+        return []
+    total = sum(digest.hold_lines for digest in digests)
+    out = [f"   clearance holds (distinct holds logged): {total}"]
+    for digest in digests:
+        decisions = ", ".join(f"{decision} {count}" for decision, count in digest.decisions.items())
+        # A run of several commands is comma-joined in the line itself, so it is rejoined with "+" here.
+        reclaim = ", ".join(f"{run.replace(', ', '+')} {count}" for run, count in digest.reclaim_runs.items()) or "n/a"
+        out.append(
+            f"     {digest.model}: {digest.hold_lines} ({decisions}); median candidate "
+            f"{_mb_or_na(digest.median_candidate_mb)}, available {_mb_or_na(digest.median_available_mb)}, "
+            f"outstanding {_mb_or_na(digest.median_outstanding_mb)}; reclaim run: {reclaim}"
+        )
+    return out
+
+
+def _clearance_digest(model: str, holds: list[ClearanceHold]) -> ClearanceHoldDigest:
+    decisions: dict[str, int] = {}
+    reclaim_runs: dict[str, int] = {}
+    for hold in holds:
+        decisions[hold.decision] = decisions.get(hold.decision, 0) + 1
+        if hold.reclaim_run is not None:
+            reclaim_runs[hold.reclaim_run] = reclaim_runs.get(hold.reclaim_run, 0) + 1
+    return ClearanceHoldDigest(
+        model=model,
+        hold_lines=len(holds),
+        decisions=dict(sorted(decisions.items(), key=lambda kv: -kv[1])),
+        median_candidate_mb=_median_or_none([hold.candidate_mb for hold in holds]),
+        median_available_mb=_median_or_none([hold.available_mb for hold in holds]),
+        median_outstanding_mb=_median_or_none([hold.outstanding_mb for hold in holds]),
+        reclaim_runs=dict(sorted(reclaim_runs.items(), key=lambda kv: (kv[0] != _NO_RECLAIM, -kv[1]))),
+    )
+
+
+def _int_group(match: re.Match[str], group: str) -> int | None:
+    value = match.group(group)
+    return None if value is None else int(value)
+
+
+def _median_or_none(values: list[int | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return float(statistics.median(present)) if present else None
+
+
+def _mb_or_na(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.0f}MB"
+
+
 def _verdict(report: EpochReport) -> str:
     """A one-line plain-language read of the epoch's headline number."""
     mean = report.mean_duty()
@@ -440,9 +616,8 @@ def _report_to_dict(report: EpochReport) -> dict[str, object]:
     }
 
 
-def main() -> None:
-    """CLI entry point: prefer stats JSONL, then fall back to bridge.log parsing."""
-    parser = argparse.ArgumentParser(description="Offline GPU duty-cycle report over stats JSONL or bridge.log.")
+def add_duty_report_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the duty report's options to ``parser``, shared by ``horde-duty-report`` and ``horde-log duty``."""
     parser.add_argument(
         "log",
         nargs="?",
@@ -460,38 +635,101 @@ def main() -> None:
         "--logs",
         type=Path,
         default=None,
-        help="Log file or directory containing bridge.log, used as enrichment/fallback.",
+        help="Log file or directory containing bridge.log; with stats, adds each session's clearance holds.",
+    )
+    parser.add_argument(
+        "--footprints",
+        type=Path,
+        default=None,
+        help=(
+            "Learned VRAM footprint store to list sampling prices from (default: the bundle's "
+            "config/vram_footprints.json beside --stats, else the worker's own store)."
+        ),
     )
     parser.add_argument("--last", action="store_true", help="Only report the most recent session/epoch.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text.")
-    args = parser.parse_args()
 
+
+def run_duty_report(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Print the duty report for parsed ``args``: stats sessions when present, else the bridge.log epochs.
+
+    Args:
+        args: Arguments parsed by a parser built with :func:`add_duty_report_arguments`.
+        parser: That parser, for reporting a missing input.
+
+    Returns:
+        The process exit code.
+    """
     explicit_log = args.log is not None or args.logs is not None
     stats_dir = args.stats or default_stats_dir()
     stats_reports = []
     if args.stats is not None or not explicit_log:
         stats_reports = analyze_stats_sessions(stats_dir, last=args.last)
 
-    if stats_reports:
-        if args.json:
-            print(json.dumps([report.to_dict() for report in stats_reports], indent=2))
-        else:
-            print(render_session_duty_report(stats_reports))
-        return
-
     log_path = _resolve_log_path(args.logs or args.log or Path("logs/bridge.log"))
+    if stats_reports:
+        log_lines = _read_log_lines(log_path) if explicit_log and log_path.exists() else []
+        holds = [_clearance_holds_for(report, log_lines) for report in stats_reports]
+        if args.json:
+            payload = [report.to_dict() for report in stats_reports]
+            if log_lines:
+                for session_payload, digests in zip(payload, holds, strict=True):
+                    session_payload["clearance_holds"] = [asdict(digest) for digest in digests]
+            print(json.dumps(payload, indent=2))
+            return 0
+        blocks = [
+            "\n".join([render_session_duty_report([report]), *render_clearance_hold_digest(digests)])
+            for report, digests in zip(stats_reports, holds, strict=True)
+        ]
+        print("\n\n".join(blocks))
+        _print_footprints(args)
+        return 0
+
     if not log_path.exists():
         parser.error(f"stats not found in {stats_dir} and log file not found: {log_path}")
 
-    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    reports = analyze_log(lines)
+    reports = analyze_log(_read_log_lines(log_path))
     if args.last and reports:
         reports = reports[-1:]
 
     if args.json:
         print(json.dumps([_report_to_dict(r) for r in reports], indent=2))
-    else:
-        print(render_report(reports))
+        return 0
+    print(render_report(reports))
+    _print_footprints(args)
+    return 0
+
+
+def main() -> None:
+    """CLI entry point: prefer stats JSONL, then fall back to bridge.log parsing."""
+    parser = argparse.ArgumentParser(description="Offline GPU duty-cycle report over stats JSONL or bridge.log.")
+    add_duty_report_arguments(parser)
+    exit_code = run_duty_report(parser.parse_args(), parser)
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
+def _read_log_lines(log_path: Path) -> list[str]:
+    return log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+
+def _clearance_holds_for(report: SessionDutyReport, log_lines: list[str]) -> list[ClearanceHoldDigest]:
+    """Return the clearance-hold digest from the log epoch the stats session belongs to, empty without one."""
+    started_local = stats_session_local_start(report)
+    if not log_lines or started_local is None:
+        return []
+    return summarize_clearance_holds(epoch_lines_for_stats_session(log_lines, started_local))
+
+
+def _print_footprints(args: argparse.Namespace) -> None:
+    """Print the learned-footprint view; a missing default store prints nothing, a missing named one says so."""
+    store_path = args.footprints or default_footprint_store_path(args.stats)
+    if not store_path.is_file():
+        if args.footprints is not None:
+            print(f"\nLearned footprint store not found: {store_path}")
+        return
+    print()
+    print(render_learned_sampling_footprints(store_path, learned_sampling_footprints(store_path)))
 
 
 def _resolve_log_path(path: Path) -> Path:

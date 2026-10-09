@@ -21,6 +21,7 @@ from pathlib import Path
 from .bundle import LogBundle
 from .correlate import build_session_context, build_timeline
 from .diagnose import diagnose, select_sessions
+from .duty_log_report import add_duty_report_arguments, run_duty_report
 from .job_lifecycle import job_lifecycle_for
 from .sessions import WorkerSession, segment_bundle_sessions
 from .support_bundle import build_support_bundle
@@ -352,6 +353,14 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--once", action="store_true", help="Run a single pass and exit (for scripting/tests).")
     watch_parser.set_defaults(func=_run_watch)
 
+    duty_parser = subparsers.add_parser(
+        "duty",
+        help="GPU duty report: stats-backed sampling concurrency, clearance holds and learned footprint prices.",
+        description="The same report as horde-duty-report, with the same options.",
+    )
+    add_duty_report_arguments(duty_parser)
+    duty_parser.set_defaults(func=lambda args: run_duty_report(args, duty_parser))
+
     return parser
 
 
@@ -359,7 +368,8 @@ def main() -> None:
     """CLI entry point for ``horde-log``."""
     parser = build_parser()
     args = parser.parse_args()
-    if not args.path.exists():
+    # ``duty`` takes the duty report's own inputs (``--stats``, ``--logs``) and reports a missing one itself.
+    if "path" in vars(args) and not args.path.exists():
         parser.error(f"path not found: {args.path}")
     raise SystemExit(args.func(args))
 

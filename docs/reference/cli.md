@@ -108,7 +108,7 @@ Installed as console scripts (defined in `pyproject.toml`):
 | `horde-worker-web` | `horde_worker_regen.tui.web:main` | Serve the dashboard over the web. |
 | `horde-worker-host` | `horde_worker_regen.tui.worker_host:main` | Background worker host the web dashboard attaches to. |
 | `horde-benchmark` | `horde_worker_regen.benchmark.cli:main` | Progressive benchmark. |
-| `horde-duty-report` | `horde_worker_regen.analysis.duty_log_report:main` | Per-session GPU duty-cycle report over stats JSONL, with `bridge.log` fallback. |
+| `horde-duty-report` | `horde_worker_regen.analysis.duty_log_report:main` | Per-session GPU duty-cycle report over stats JSONL, with `bridge.log` fallback. Also `horde-log duty`. |
 | `horde-log` | `horde_worker_regen.analysis.log_triage_cli:main` | Triage worker logs: sessions, timelines, and what-went-wrong findings. |
 | `horde-stats` | `horde_worker_regen.stats_operations:main` | Compress or downsample retained stats JSONL files. |
 
@@ -162,13 +162,15 @@ or orphaned worker therefore stays visible and stoppable. See
 Analyze GPU duty-cycle loss across worker sessions. By default, the command reads retained stats JSONL
 from `.horde_worker_regen/stats/` when files are present, because those samples carry structured worker
 state and finalized-job phase metrics. If no stats session is available, or when you pass a log path, it
-falls back to the legacy epoch-aware `bridge.log` parser.
+falls back to the legacy epoch-aware `bridge.log` parser. `horde-log duty` runs the same report with the same
+options.
 
 | Flag / argument | Meaning |
 |-----------------|---------|
 | `LOG` | Optional `bridge.log` path for the legacy log parser. Supplying this makes the command log-focused unless `--stats` is also supplied. |
 | `--stats DIR` | Analyze `stats-v*.jsonl` and `stats-v*.jsonl.gz` files from a stats directory. Rotated files with the same filename stamp are grouped into one session. |
-| `--logs PATH` | Log file or directory containing `bridge.log`, used as fallback or for log-only analysis. |
+| `--logs PATH` | Log file or directory containing `bridge.log`. Beside `--stats` it adds each session's clearance-hold digest; alone it selects log-only analysis. |
+| `--footprints PATH` | Learned VRAM footprint store to list sampling prices from. Defaults to the bundle's `config/vram_footprints.json` when `--stats` sits in a support bundle, else the worker's `.horde_worker_regen/vram_footprints.json`; a missing default store prints nothing. |
 | `--last` | Only report the newest stats session or log epoch. |
 | `--json` | Emit the machine-readable report schema. Stats-backed JSON uses `SessionDutyReport.to_dict()`. |
 
@@ -179,9 +181,28 @@ horde-duty-report
 horde-duty-report --stats .horde_worker_regen/stats --last
 horde-duty-report --logs logs --json
 horde-duty-report logs/bridge.log
+horde-log duty --stats <bundle>/stats --logs <bundle>/logs --last
 ```
 
 The stats-backed report separates idle loss from partial-utilization loss, reports popped-job `inference_queue_wait` before inference starts, reports sampled `inference_dispatch_gap` when queued inference work has no active inference process, and keeps `unknown` as a first-class bucket when older files lack enough state to attribute a sampled interval.
+
+Three more views read what a support bundle carries:
+
+- **Sampling concurrency.** `concurrency occupancy` counts jobs in progress, and a staged job counts there
+  while its lane waits. `sampling concurrency` counts the inference lanes in `INFERENCE_STARTING` per stats
+  sample (0, 1, 2+). The zero share is split by what the lanes were doing with a job in progress (`primed`,
+  `loading`, other) or with none. Each row below the slot-duty capacity is broken down by the sample's
+  `dispatch_hold_bucket` and by whether inference work was pending.
+- **Clearance holds.** With `--logs`, the `bridge.log` epoch the stats session belongs to (matched by the stats
+  filename's start stamp, which is the worker host's clock) is read for `Clearance held for process` lines.
+  Per model it prints the hold count, the median candidate, available and outstanding-reservation figures,
+  and how many holds ran each reclaim (`none` included). The worker logs a hold once per process and
+  decision, so the count is distinct holds, not held time.
+- **Learned footprints.** Each sampling key in the footprint store with the two terms admission prices it
+  from: the raise-only watermark and the margined measured figure net of the context charge (`n/a` until the
+  key's window holds enough jobs), beside the `sample_activation` watermark for the same band and the
+  resident figures of the baseline's checkpoints. The text report prints figures only; the JSON output
+  carries the sampling concurrency and the clearance holds, not the footprints.
 
 ## `horde-stats`
 
@@ -557,6 +578,7 @@ an operator sent you.
 | `job <ID> [PATH]` | Trace one job across the parent and the inference slot that ran it. |
 | `watch [PATH]` | Live-poll the logs and alert when a new warning/critical finding or a rising recovery count appears. |
 | `bundle [PATH]` | Build a single redacted `.zip` (logs + diagnosis + config + system/cache info) to send a maintainer. |
+| `duty` | The GPU duty report, with the options of [`horde-duty-report`](#horde-duty-report): stats-backed sampling concurrency, the session's clearance holds and the learned footprint prices. |
 
 `PATH` defaults to `logs/`. `sessions`, `diagnose`, `timeline`, and `jobs` take `--session N` or
 `--last` to select a worker session, `--benchmark N` or `--last-benchmark` to select a benchmark run, and

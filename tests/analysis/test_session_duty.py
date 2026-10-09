@@ -500,3 +500,110 @@ class TestSlotDutyAndOccupancy:
         assert reports[0].slot_duty_seconds == {}
         assert reports[0].slot_duty_capacity is None
         assert reports[0].concurrency_occupancy["1"] > 0.0
+
+
+class TestSamplingConcurrency:
+    """Inference lanes in ``INFERENCE_STARTING`` per stats sample, and what held the rest below capacity.
+
+    ``concurrency occupancy`` counts a staged job as in progress while its lane waits for clearance, so it
+    cannot tell a primed lane from a sampling one. These rows read each lane's own state.
+    """
+
+    @staticmethod
+    def _write_session(stats_dir: Path) -> None:
+        def lanes_sample(timestamp: float, summary: str, **overrides: object) -> dict[str, object]:
+            return _sample(timestamp, process_state_summary=summary, slot_duty_capacity=2, **overrides)
+
+        _write_jsonl(
+            stats_dir / "stats-v1.0.0-20260101-000000-000.jsonl",
+            [
+                lanes_sample(
+                    100.0,
+                    "inference#1=INFERENCE_STARTING inference#2=WAITING_FOR_JOB",
+                    jobs_in_progress=1,
+                    jobs_pending_inference=1,
+                    dispatch_hold_bucket="overlap_headway",
+                ),
+                lanes_sample(
+                    101.0,
+                    "inference#1=INFERENCE_STARTING inference#2=INFERENCE_STARTING",
+                    jobs_in_progress=2,
+                ),
+                lanes_sample(
+                    102.0,
+                    "inference#1=INFERENCE_PRIMED inference#2=WAITING_FOR_JOB",
+                    jobs_in_progress=1,
+                    jobs_pending_inference=2,
+                    dispatch_hold_bucket="clearance_hold",
+                ),
+                lanes_sample(
+                    103.0,
+                    "inference#1=INFERENCE_PRIMED inference#2=WAITING_FOR_JOB",
+                    jobs_in_progress=1,
+                    jobs_pending_inference=2,
+                    dispatch_hold_bucket="clearance_hold",
+                ),
+                lanes_sample(104.0, "inference#1=PRELOADING_MODEL inference#2=WAITING_FOR_JOB", jobs_in_progress=1),
+                lanes_sample(105.0, "component#3=INFERENCE_STARTING inference#1=WAITING_FOR_JOB"),
+                lanes_sample(106.0, ""),
+            ],
+        )
+
+    def test_rows_split_by_sampling_lanes_and_lane_state(self, tmp_path: Path) -> None:
+        """A primed lane with a job in progress is a not-sampling row, and a text-encoding component never samples."""
+        from horde_worker_regen.analysis.session_duty import NotSamplingLaneState
+
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        self._write_session(stats_dir)
+
+        summary = analyze_stats_sessions(stats_dir)[0].sampling_concurrency
+
+        assert summary is not None
+        assert summary.total_samples == 6, "a sample naming no lane carries no evidence and is skipped"
+        assert summary.capacity == 2
+        rows = {(row.sampling_lanes, row.lane_state): row for row in summary.rows}
+        assert {key: row.samples for key, row in rows.items()} == {
+            (0, NotSamplingLaneState.PRIMED): 2,
+            (0, NotSamplingLaneState.LOADING): 1,
+            (0, NotSamplingLaneState.NO_JOB): 1,
+            (1, None): 1,
+            (2, None): 1,
+        }
+        primed_holds = rows[(0, NotSamplingLaneState.PRIMED)].holds
+        assert [(hold.dispatch_hold_bucket, hold.work_pending, hold.samples) for hold in primed_holds] == [
+            ("clearance_hold", True, 2),
+        ]
+        loading_holds = rows[(0, NotSamplingLaneState.LOADING)].holds
+        assert [(hold.dispatch_hold_bucket, hold.work_pending) for hold in loading_holds] == [("none", False)]
+        assert [hold.dispatch_hold_bucket for hold in rows[(1, None)].holds] == ["overlap_headway"]
+        assert rows[(2, None)].holds == [], "a row at capacity is full, so nothing held it"
+
+    def test_render_puts_sampling_concurrency_beside_occupancy(self, tmp_path: Path) -> None:
+        """The text report keeps ``concurrency occupancy`` and adds the sampling line and its held rows."""
+        from horde_worker_regen.analysis.session_duty import render_session_duty_report
+
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        self._write_session(stats_dir)
+
+        output = render_session_duty_report(analyze_stats_sessions(stats_dir))
+
+        assert "concurrency occupancy (capacity 2):" in output
+        assert "sampling concurrency (capacity 2): 0 66.7%  1 16.7%  2+ 16.7% of 6 samples" in output
+        assert "primed but not sampling 33.3% (2 samples, 2s): clearance_hold with work pending 2 (2s)" in output
+        assert "1 sampling 16.7% (1 samples, 1s): overlap_headway with work pending 1 (1s)" in output
+
+    def test_samples_without_lane_summaries_leave_it_unset(self, tmp_path: Path) -> None:
+        """Stats written without a ``process_state_summary`` report no sampling concurrency."""
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        _write_jsonl(
+            stats_dir / "stats-v1.0.0-20260101-000000-000.jsonl",
+            [_sample(100.0, process_state_summary=""), _sample(101.0, process_state_summary="")],
+        )
+
+        report = analyze_stats_sessions(stats_dir)[0]
+
+        assert report.sampling_concurrency is None
+        assert report.to_dict()["sampling_concurrency"] is None

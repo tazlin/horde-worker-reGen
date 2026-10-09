@@ -34,12 +34,22 @@ An optional lower-case ``temperature:`` segment sits between ``=`` and the state
 richer per-slot rendering, so the state is read after it rather than from the raw token.
 """
 
+_INFERENCE_LANE_LABEL = "inference"
 _POST_PROCESS_LANE_LABEL = "post_process"
 _VAE_LANE_LABEL = "vae_lane"
 _COMPONENT_LANE_LABEL = "component"
 _MODEL_LOAD_LANE_STATES = frozenset({"DOWNLOADING_MODEL", "DOWNLOAD_COMPLETE", "PRELOADING_MODEL", "PRELOADED_MODEL"})
 _MODEL_UNLOAD_LANE_STATES = frozenset({"UNLOADED_MODEL_FROM_VRAM", "UNLOADED_MODEL_FROM_RAM"})
 _STAGING_LANE_STATES = frozenset({"INFERENCE_PRIMED"})
+_SAMPLING_LANE_STATES = frozenset({"INFERENCE_STARTING"})
+"""The state an inference lane reports while its denoise loop runs.
+
+The component lane reports the same state while text-encoding, so a lane counts as sampling only when its
+label is ``inference``."""
+_SAMPLING_CONCURRENCY_TOP = 2
+"""Sampling-lane counts at or above this are reported together as one ``2+`` row."""
+_NO_DISPATCH_HOLD = "none"
+"""The hold label for a sample whose ``dispatch_hold_bucket`` is unset."""
 _POST_PROCESSING_LANE_STATES = frozenset({"POST_PROCESSING"})
 _TEXT_ENCODE_LANE_STATES = frozenset({"INFERENCE_STARTING"})
 """The state the component lane reports while it is encoding.
@@ -141,6 +151,61 @@ class InferenceDispatchGapSummary:
     top_states: dict[str, float] = field(default_factory=dict)
 
 
+class NotSamplingLaneState(StrEnum):
+    """What the inference lanes were doing in a stats sample where none of them sampled."""
+
+    PRIMED = "primed"
+    """A job is in progress and an inference lane sits ``INFERENCE_PRIMED``, staged and waiting for clearance."""
+    LOADING = "loading"
+    """A job is in progress and an inference lane is downloading or preloading a model."""
+    OTHER = "other"
+    """A job is in progress and no inference lane is primed or loading."""
+    NO_JOB = "no_job"
+    """No job is in progress."""
+
+
+@dataclass
+class SamplingHoldShare:
+    """Represents the samples of one sampling-concurrency row under one dispatch hold and pending-work state."""
+
+    dispatch_hold_bucket: str
+    work_pending: bool
+    """Whether ``jobs_pending_inference`` was above zero in the sample."""
+    samples: int = 0
+    seconds: float = 0.0
+
+
+@dataclass
+class SamplingConcurrencyRow:
+    """Represents the stats samples with one count of sampling inference lanes.
+
+    A zero-sampling row is split further by ``lane_state``. ``holds`` covers only samples below the slot-duty
+    capacity, so a full row carries none.
+    """
+
+    sampling_lanes: int
+    """The number of inference lanes in ``INFERENCE_STARTING``; the top row counts this many or more."""
+    lane_state: NotSamplingLaneState | None
+    """What the lanes were doing when ``sampling_lanes`` is zero, else None."""
+    samples: int = 0
+    seconds: float = 0.0
+    holds: list[SamplingHoldShare] = field(default_factory=list)
+
+
+@dataclass
+class SamplingConcurrencySummary:
+    """Represents how many inference lanes were sampling across a session's stats samples.
+
+    ``concurrency occupancy`` counts jobs in progress, and a staged job counts there while its lane waits.
+    This counts the lanes whose denoise loop ran, so the gap between the two is the in-progress time that
+    produced no steps.
+    """
+
+    total_samples: int
+    capacity: int | None
+    rows: list[SamplingConcurrencyRow] = field(default_factory=list)
+
+
 @dataclass
 class SessionDutyReport:
     """A complete stats-backed duty-cycle analysis for one worker stats session."""
@@ -179,6 +244,8 @@ class SessionDutyReport:
     concurrency_occupancy: dict[str, float] = field(default_factory=dict)
     """Seconds spent at each concurrent in-flight job count (key = the count as text), from adjacent
     stats samples. The direct read of how much of the configured thread capacity actually ran."""
+    sampling_concurrency: SamplingConcurrencySummary | None = None
+    """How many inference lanes sampled per stats sample, or None when no sample names its lanes."""
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation with enum values, not enum objects."""
@@ -239,6 +306,20 @@ def discover_stats_sessions(stats_dir: Path) -> list[tuple[str, list[Path]]]:
             session_id = f"{match.group('stamp')} v{match.group('version')}"
         grouped.setdefault(session_id, []).append(path)
     return sorted(grouped.items(), key=lambda item: _stats_file_order_key(item[1][0]))
+
+
+def stats_session_local_start(report: SessionDutyReport) -> datetime | None:
+    """Return the session's start on the worker host's clock, from its stats filename stamp.
+
+    The stamp is written in the host's local time, the clock its ``bridge.log`` uses, while sample timestamps
+    are epoch seconds. Matching a log epoch by the stamp needs no guess at the host's time zone. None for a
+    file whose name carries no stamp.
+    """
+    for source in report.source_files:
+        match = _STATS_SESSION_RE.match(Path(source).name)
+        if match is not None:
+            return datetime.strptime(match.group("stamp"), "%Y%m%d-%H%M%S")
+    return None
 
 
 def analyze_stats_files(
@@ -318,6 +399,7 @@ def analyze_stats_files(
         slot_duty_seconds=slot_duty_delta,
         slot_duty_capacity=slot_duty_capacity,
         concurrency_occupancy=_concurrency_occupancy(samples),
+        sampling_concurrency=_sampling_concurrency(samples, capacity=slot_duty_capacity),
     )
     report.busy_fraction_percent = (
         report.mean_gpu_busy_fraction * 100.0 if report.mean_gpu_busy_fraction is not None else None
@@ -349,6 +431,8 @@ def render_session_duty_report(reports: list[SessionDutyReport]) -> str:
                 )
                 capacity = f" (capacity {report.slot_duty_capacity})" if report.slot_duty_capacity else ""
                 out.append(f"   concurrency occupancy{capacity}: {shares}")
+        if report.sampling_concurrency is not None:
+            out.extend(_render_sampling_concurrency(report.sampling_concurrency))
         if report.slot_duty_seconds:
             slot_total = sum(report.slot_duty_seconds.values())
             if slot_total > 0:
@@ -870,6 +954,103 @@ def _concurrency_occupancy(samples: list[dict[str, Any]]) -> dict[str, float]:
     return occupancy
 
 
+def _sampling_concurrency(samples: list[dict[str, Any]], *, capacity: int | None) -> SamplingConcurrencySummary | None:
+    """Count the inference lanes sampling in each stats sample, and what held the rest.
+
+    A sample whose ``process_state_summary`` names no lane carries no evidence either way and is skipped.
+    Hold shares are recorded for samples below ``capacity``; with no capacity recorded, every sample is.
+    """
+    rows: dict[tuple[int, NotSamplingLaneState | None], SamplingConcurrencyRow] = {}
+    total_samples = 0
+    for sample, interval in zip(samples, _sample_intervals(samples), strict=False):
+        lanes = _lane_states(sample)
+        if not lanes:
+            continue
+        total_samples += 1
+        inference_states = [state for label, state in lanes if label == _INFERENCE_LANE_LABEL]
+        sampling_lanes = sum(1 for state in inference_states if state in _SAMPLING_LANE_STATES)
+        lane_state = None if sampling_lanes else _not_sampling_lane_state(sample, inference_states)
+        row_key = (min(sampling_lanes, _SAMPLING_CONCURRENCY_TOP), lane_state)
+        row = rows.get(row_key)
+        if row is None:
+            row = SamplingConcurrencyRow(sampling_lanes=row_key[0], lane_state=lane_state)
+            rows[row_key] = row
+        row.samples += 1
+        row.seconds += interval
+        below_capacity = capacity is None or sampling_lanes < capacity
+        if below_capacity:
+            _add_sampling_hold(row, sample, interval)
+    if total_samples == 0:
+        return None
+    ordered = sorted(
+        rows.values(), key=lambda row: (row.sampling_lanes, row.lane_state is NotSamplingLaneState.NO_JOB)
+    )
+    for row in ordered:
+        row.holds.sort(key=lambda hold: hold.samples, reverse=True)
+    return SamplingConcurrencySummary(total_samples=total_samples, capacity=capacity, rows=ordered)
+
+
+def _not_sampling_lane_state(sample: dict[str, Any], inference_states: list[str]) -> NotSamplingLaneState:
+    if _int_value(sample.get("jobs_in_progress")) <= 0:
+        return NotSamplingLaneState.NO_JOB
+    if any(state in _STAGING_LANE_STATES for state in inference_states):
+        return NotSamplingLaneState.PRIMED
+    if any(state in _MODEL_LOAD_LANE_STATES for state in inference_states):
+        return NotSamplingLaneState.LOADING
+    return NotSamplingLaneState.OTHER
+
+
+def _add_sampling_hold(row: SamplingConcurrencyRow, sample: dict[str, Any], interval: float) -> None:
+    bucket = str(sample.get("dispatch_hold_bucket") or _NO_DISPATCH_HOLD)
+    work_pending = _int_value(sample.get("jobs_pending_inference")) > 0
+    hold = next(
+        (hold for hold in row.holds if hold.dispatch_hold_bucket == bucket and hold.work_pending == work_pending),
+        None,
+    )
+    if hold is None:
+        hold = SamplingHoldShare(dispatch_hold_bucket=bucket, work_pending=work_pending)
+        row.holds.append(hold)
+    hold.samples += 1
+    hold.seconds += interval
+
+
+def _sampling_row_label(row: SamplingConcurrencyRow) -> str:
+    if row.lane_state is NotSamplingLaneState.NO_JOB:
+        return "no job in progress"
+    if row.lane_state is NotSamplingLaneState.OTHER:
+        return "in progress but not sampling"
+    if row.lane_state is not None:
+        return f"{row.lane_state.value} but not sampling"
+    plus = "+" if row.sampling_lanes >= _SAMPLING_CONCURRENCY_TOP else ""
+    return f"{row.sampling_lanes}{plus} sampling"
+
+
+def _render_sampling_concurrency(summary: SamplingConcurrencySummary) -> list[str]:
+    total = summary.total_samples
+    by_count: dict[int, int] = {}
+    for row in summary.rows:
+        by_count[row.sampling_lanes] = by_count.get(row.sampling_lanes, 0) + row.samples
+    counts = "  ".join(
+        f"{count}{'+' if count >= _SAMPLING_CONCURRENCY_TOP else ''} {samples / total:.1%}"
+        for count, samples in sorted(by_count.items())
+    )
+    capacity = f" (capacity {summary.capacity})" if summary.capacity else ""
+    lines = [f"   sampling concurrency{capacity}: {counts} of {total} samples"]
+    for row in summary.rows:
+        if not row.holds:
+            continue
+        holds = "; ".join(
+            f"{hold.dispatch_hold_bucket} {'with' if hold.work_pending else 'without'} work pending "
+            f"{hold.samples} ({hold.seconds:.0f}s)"
+            for hold in row.holds[:4]
+        )
+        lines.append(
+            f"   {_sampling_row_label(row)} {row.samples / total:.1%} ({row.samples} samples, {row.seconds:.0f}s): "
+            f"{holds}"
+        )
+    return lines
+
+
 def _counter_delta(samples: list[dict[str, Any]], key: str) -> dict[str, float]:
     first = samples[0].get(key) if samples else None
     last = samples[-1].get(key) if samples else None
@@ -1027,9 +1208,14 @@ __all__ = [
     "DutyLossBucket",
     "DutyLossKind",
     "DutyWindowBreakdown",
+    "NotSamplingLaneState",
+    "SamplingConcurrencyRow",
+    "SamplingConcurrencySummary",
+    "SamplingHoldShare",
     "SessionDutyReport",
     "analyze_stats_files",
     "analyze_stats_sessions",
     "discover_stats_sessions",
     "render_session_duty_report",
+    "stats_session_local_start",
 ]
