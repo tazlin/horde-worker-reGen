@@ -891,12 +891,23 @@ class HordeInferenceProcess(HordeProcess):
             if not checkpoint_held:
                 logger.debug(f"Ignoring a warm of {horde_model_name}: its checkpoint is not in the component cache")
                 return
-            self._horde.preload_model(
-                horde_model_name,
-                will_load_loras=False,
-                seamless_tiling_enabled=False,
-                diffusion_model_only=self._active_model_diffusion_model_only,
-            )
+            try:
+                self._horde.preload_model(
+                    horde_model_name,
+                    will_load_loras=False,
+                    seamless_tiling_enabled=False,
+                    diffusion_model_only=self._active_model_diffusion_model_only,
+                )
+            except Exception as warm_error:
+                if not _is_host_commit_error(warm_error):
+                    raise
+                # The loader answered the warm with a fresh mapping of the checkpoint (the cache lacked a
+                # component the request named) and the host refused to commit it. Nothing was adopted and the
+                # held weights are as they were, so the lane stays available and the dispatch loads what it needs.
+                logger.warning(
+                    f"Warm of {horde_model_name} skipped: {warm_error}",
+                )
+                return
 
         logger.debug(f"Warming {horde_model_name}'s checkpoint pages ahead of a dispatch")
         self.send_memory_report_message()

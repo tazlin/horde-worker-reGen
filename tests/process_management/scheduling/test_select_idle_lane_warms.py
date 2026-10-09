@@ -398,3 +398,19 @@ class TestWarmPass:
 
         assert scheduler.warm_idle_lanes() == 0
         assert _sent_warms(scheduler) == []
+
+
+class TestWarmUnderCommitBoundHost:
+    """No warm is sent while available commit, not physical RAM, bounds the host."""
+
+    async def test_a_commit_bound_host_sends_no_warm(self) -> None:
+        """A warm the cache cannot serve maps the checkpoint, the one charge a commit-bound host refuses."""
+        scheduler, _job_id = await _pass_worker(lease=True)
+        scheduler.set_available_ram_mb_provider(lambda: 60000.0)
+        scheduler.set_available_commit_mb_provider(lambda: 8000.0)
+
+        assert scheduler.warm_idle_lanes() == 0
+        assert _sent_warms(scheduler) == []
+
+        scheduler.set_available_commit_mb_provider(lambda: None)
+        assert scheduler.warm_idle_lanes() == 1

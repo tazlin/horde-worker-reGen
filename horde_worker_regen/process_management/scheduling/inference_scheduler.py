@@ -12467,6 +12467,11 @@ class InferenceScheduler:
         snapshot = self.snapshot()
         pending_job_ids = set(snapshot.queue.pending_in_pop_order)
         self._idle_lane_warmed = {pair for pair in self._idle_lane_warmed if pair[1] in pending_job_ids}
+        if snapshot.host_ram.commit_bound:
+            # A warm the loader cannot serve from its cache maps the checkpoint afresh, which charges the whole
+            # file to commit. Under a commit-bound host that mapping is the one thing the admission just
+            # refused, so no speculative read is started; the dispatch's own load is priced when its turn comes.
+            return 0
         sent = 0
         for warm in select_idle_lane_warms(snapshot, warmed=frozenset(self._idle_lane_warmed)):
             process = self._process_map.get(warm.process_id)

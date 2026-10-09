@@ -281,6 +281,22 @@ class TestChildSurvivesABadPreloadArgument:
         infos = [call.kwargs.get("info") for call in proc.on_horde_model_state_change.call_args_list]  # pyrefly: ignore
         assert HOST_COMMIT_FAILED_INFO in infos
 
+    def test_a_warm_the_host_cannot_commit_is_skipped_without_ending_the_process(self) -> None:
+        """A warm the host refuses to commit leaves the lane and its held weights as they were."""
+        from hordelib.api import ComponentSlotKind
+        from hordelib.execution.zero_copy_load import HostCommitError
+
+        proc = _PreloadStubProcess.build(preload_error=HostCommitError("The host could not commit a mapping"))
+        proc._active_model_name = "Krea2-Turbo_fp8"
+        proc._active_model_diffusion_model_only = False
+        held = Mock(kind=ComponentSlotKind.CHECKPOINT, identity="Krea2-Turbo_fp8")
+        proc._collect_held_components = Mock(return_value=[held])  # pyrefly: ignore
+
+        proc.warm_model("Krea2-Turbo_fp8")
+
+        assert proc._end_process is False
+        assert proc._active_model_name == "Krea2-Turbo_fp8"
+
     def test_a_genuine_preload_failure_still_ends_the_process(self) -> None:
         """Containment is scoped: a failure part-way through a real load still replaces the slot."""
         proc = _PreloadStubProcess.build(preload_error=RuntimeError("CUDA error: an illegal memory access"))
