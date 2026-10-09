@@ -248,20 +248,22 @@ def _progress_report(*, step: int = 1, total: int = 20) -> SimpleNamespace:
     )
 
 
-def test_progress_callback_midstep_does_not_poll_vram(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A mid-inference step no longer polls VRAM: the reporter thread owns interval sampling now.
+def test_progress_callback_reports_once_at_the_first_step_and_never_polls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first sampling step sends one boundary VRAM report; later steps do not poll.
 
-    The progress callback runs on the main thread, which is blocked for the whole GPU op, so any report it
-    emitted would still be an on-the-main-thread snapshot. Periodic sampling moved to the dedicated reporter
-    thread, so a plain mid-step callback emits only a heartbeat and no memory report.
+    The reporter thread owns interval sampling, so steps after the first emit only a heartbeat. The first step
+    is a boundary: the weights and the first step's activations are allocated, and the parent's planned charge
+    for this job decays only on a reported reservation, which a sample shorter than the reporter's period
+    would otherwise never carry.
     """
     _install_fake_hordelib_api(monkeypatch)
     proc = _make_inference_proc_for_progress()
 
     proc.progress_callback(cast(Any, _progress_report(step=3)))
     proc.progress_callback(cast(Any, _progress_report(step=4)))
+    proc.progress_callback(cast(Any, _progress_report(step=5)))
 
-    cast(Mock, proc.send_memory_report_message).assert_not_called()
+    cast(Mock, proc.send_memory_report_message).assert_called_once_with(include_vram=True)
 
 
 def test_sampling_complete_emits_one_boundary_vram_report(monkeypatch: pytest.MonkeyPatch) -> None:

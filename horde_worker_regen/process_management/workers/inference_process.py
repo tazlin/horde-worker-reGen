@@ -947,6 +947,13 @@ class HordeInferenceProcess(HordeProcess):
     _start_inference_time: float = 0.0
 
     _current_job_inference_steps_complete: bool = False
+    _first_step_report_sent: bool = False
+    """Whether this job's first sampling step has sent its memory report.
+
+    The parent books a dispatched job's VRAM as a planned charge that decays only as this process's reported
+    reservation grows, and the interval reporter can miss a sample shorter than its period entirely. The report at
+    the first step, with the weights and the first step's activations allocated, lets that charge decay while the
+    job samples instead of standing beside the allocation it describes."""
     _vae_lock_was_acquired: bool = False
     _inference_slot_released: bool = False
 
@@ -1117,6 +1124,9 @@ class HordeInferenceProcess(HordeProcess):
                 iterations_per_second=rate,
                 nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
             )
+            if not self._first_step_report_sent:
+                self._first_step_report_sent = True
+                self._send_inference_memory_report()
         else:
             self.send_heartbeat_message(
                 heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
@@ -1261,6 +1271,7 @@ class HordeInferenceProcess(HordeProcess):
         logger.info("Acquired inference semaphore.")
         self._is_busy = True
         self._current_job_inference_steps_complete = False
+        self._first_step_report_sent = False
         self._inference_slot_released = False
         self._vae_lock_was_acquired = False
         self._current_job_kept_model_resident = keep_model_resident
