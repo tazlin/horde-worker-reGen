@@ -69,6 +69,17 @@ Its absolute requirements obey `hard_floor <= soft_hold <= preload <= restore`. 
 `ram_reserve_mb` protects the same free pages as the danger floor, so the retained headroom is their
 maximum, not their sum.
 
+The available reading every floor and hold compares against is admissible host RAM: physical available
+RAM, lowered to the host's available commit where the host reports one (`GlobalMemoryStatusEx` on
+Windows, through `scheduling/host_commit.py`; POSIX reports none and physical RAM stands alone). A child
+maps its checkpoint as a copy-on-write view, which Windows charges in full to commit at map time, so a
+host whose commit limit binds before its physical memory fails the mapping while pages are still free.
+The danger-floor verdict (`assess_ram_pressure`) carries both figures, and its reason names the bound
+(`available 8000 MB (commit-bound; physical 30000 MB) above danger floor ...`). The soft pop hold, the
+degrade response with its process reduction and over-ceiling reclaim, the shed restore headroom, the
+head-of-queue reclaim and the idle-lane warm's room all read the admissible figure. The preload
+admission prices the job's own mapping against commit separately, on the same measured commit figure.
+
 Every requirement counts outstanding RAM: work already admitted whose allocation the available
 reading does not yet show. Preload requires `max(floor, reserve) + outstanding + incoming`, and
 restore the same with a context in place of the incoming load. An accepted admission therefore keeps

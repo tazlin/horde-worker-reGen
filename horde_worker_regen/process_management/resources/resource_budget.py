@@ -2225,20 +2225,39 @@ class RamPressureVerdict:
     """
 
     under_pressure: bool
-    """True when available RAM is below the danger floor (or, conservatively, when no reading exists)."""
+    """True when admissible RAM is below the danger floor (or, conservatively, when no reading exists)."""
     available_mb: float | None
-    """Measured available system RAM (MB) at check time, or None when no telemetry exists."""
+    """Admissible host RAM (MB) at check time: the lower of physical available and available commit where
+    the host reports commit, else physical available. None when no telemetry exists."""
     floor_mb: float
     """The absolute available-RAM floor (MB) below which the worker degrades."""
     total_mb: float | None = None
     """Total system RAM (MB), or None when unknown."""
+    physical_available_mb: float | None = None
+    """Measured physical available RAM (MB), kept beside the admissible figure for the lines that print both."""
+    available_commit_mb: float | None = None
+    """The host's available commit (MB), or None where a mapping is not charged to commit (POSIX)."""
+
+    @property
+    def commit_bound(self) -> bool:
+        """Whether available commit, not physical RAM, set the admissible figure."""
+        return (
+            self.available_commit_mb is not None
+            and self.physical_available_mb is not None
+            and self.available_commit_mb < self.physical_available_mb
+        )
 
     def reason(self) -> str:
         """Return a short human-readable explanation, for logging a degrade/clear decision."""
         if self.available_mb is None:
             return f"no RAM telemetry; floor {self.floor_mb:.0f} MB"
         verb = "below" if self.under_pressure else "above"
-        return f"available {self.available_mb:.0f} MB {verb} danger floor {self.floor_mb:.0f} MB"
+        bound = (
+            f" (commit-bound; physical {self.physical_available_mb:.0f} MB)"
+            if self.commit_bound and self.physical_available_mb is not None
+            else ""
+        )
+        return f"available {self.available_mb:.0f} MB{bound} {verb} danger floor {self.floor_mb:.0f} MB"
 
 
 def assess_ram_pressure(
@@ -2247,19 +2266,27 @@ def assess_ram_pressure(
     *,
     pause_percent: float = _DEFAULT_RAM_PRESSURE_PAUSE_PERCENT,
     min_free_mb: float = _DEFAULT_RAM_PRESSURE_MIN_FREE_MB,
+    available_commit_mb: float | None = None,
 ) -> RamPressureVerdict:
     """Return whether the host is below its absolute system-RAM danger floor.
 
-    Pure policy over measured readings: ``under_pressure`` is True when measured available RAM has fallen
-    below :func:`ram_pressure_floor_mb`. A missing available reading yields ``under_pressure=False`` (no
+    Pure policy over measured readings: ``under_pressure`` is True when admissible RAM has fallen below
+    :func:`ram_pressure_floor_mb`. Admissible RAM is ``available_ram_mb`` lowered to ``available_commit_mb``
+    when a commit figure exists, because a host whose commit limit binds first fails a checkpoint mapping
+    while physical pages are still free. A missing available reading yields ``under_pressure=False`` (no
     telemetry never *fabricates* pressure, so a worker that has not yet measured RAM is not wedged); a
     missing total only widens the floor to the absolute ``min_free_mb``. Never raises.
     """
     floor_mb = ram_pressure_floor_mb(total_ram_mb, pause_percent=pause_percent, min_free_mb=min_free_mb)
-    under = available_ram_mb is not None and available_ram_mb < floor_mb
+    admissible_mb = available_ram_mb
+    if available_ram_mb is not None and available_commit_mb is not None:
+        admissible_mb = min(available_ram_mb, available_commit_mb)
+    under = admissible_mb is not None and admissible_mb < floor_mb
     return RamPressureVerdict(
         under_pressure=under,
-        available_mb=available_ram_mb,
+        available_mb=admissible_mb,
         floor_mb=floor_mb,
         total_mb=total_ram_mb,
+        physical_available_mb=available_ram_mb,
+        available_commit_mb=available_commit_mb,
     )

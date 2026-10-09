@@ -12,6 +12,8 @@ The contract these tests pin:
   a latched pop hold on a healthy, idle worker is cleared without any pending job to trigger a scheduling
   cycle.
 * The scheduling cycle itself no longer drives the governor, so a busy iteration ticks it exactly once.
+* The danger floor and the hold read admissible RAM, the lower of physical available and available commit,
+  so a host whose commit limit binds first holds pops before a child is asked to map what it cannot commit.
 """
 
 from __future__ import annotations
@@ -21,8 +23,10 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from horde_worker_regen.analysis.log_signatures import pattern_for
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.resource_budget import assess_ram_pressure
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_mock_bridge_data,
@@ -129,3 +133,70 @@ class TestControlLoopGovernsWithEmptyQueue:
 
         governance.assert_called_once()
         scheduling.assert_not_called()
+
+
+_COMMIT_BELOW_FLOOR_MB = 500.0
+"""Available commit under any danger floor while physical RAM reads healthy: a host whose commit limit binds
+before its physical memory, where a checkpoint mapping fails on commit with physical pages still free."""
+
+
+class TestCommitBoundGovernance:
+    """The danger floor and the soft pop hold read the lower of physical available RAM and available commit."""
+
+    def test_commit_below_the_floor_engages_the_hold_on_a_physically_roomy_host(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Physical RAM far above the floor with commit below it puts the host under pressure and holds pops."""
+        scheduler = _budget_enabled_scheduler()
+        _pin_available_ram(scheduler, monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
+        scheduler.set_available_commit_mb_provider(lambda: _COMMIT_BELOW_FLOOR_MB)
+
+        scheduler.run_governance_tick()
+
+        verdict = scheduler._governor.last_ram_verdict
+        assert verdict is not None
+        assert verdict.under_pressure is True, "commit under the floor must read as pressure"
+        assert verdict.available_mb == _COMMIT_BELOW_FLOOR_MB
+        assert verdict.physical_available_mb == _HEALTHY_AVAILABLE_RAM_MB
+        assert verdict.commit_bound is True
+        assert scheduler._state.ram_pressure_pop_hold is True, (
+            "a host whose commit is below the danger floor must hold pops even with physical RAM to spare"
+        )
+
+    def test_unreported_commit_governs_on_physical_ram_alone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A host that reports no commit figure (POSIX) is governed exactly as before, on physical RAM."""
+        scheduler = _budget_enabled_scheduler()
+        _pin_available_ram(scheduler, monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
+        scheduler.set_available_commit_mb_provider(lambda: None)
+
+        scheduler.run_governance_tick()
+
+        verdict = scheduler._governor.last_ram_verdict
+        assert verdict is not None
+        assert verdict.under_pressure is False
+        assert verdict.available_mb == _HEALTHY_AVAILABLE_RAM_MB
+        assert verdict.commit_bound is False
+        assert scheduler._state.ram_pressure_pop_hold is False
+
+    def test_commit_bound_reason_matches_the_registered_pop_hold_line(self) -> None:
+        """The pop-hold line carries the commit note in a form the registered log signature still parses."""
+        verdict = assess_ram_pressure(
+            _HEALTHY_AVAILABLE_RAM_MB,
+            _TOTAL_RAM_MB,
+            available_commit_mb=_COMMIT_BELOW_FLOOR_MB,
+        )
+        line = (
+            f"Host RAM pop hold engaged: {verdict.reason()}, soft hold 8500 MB, preload 14500 MB, restore 32500 MB; "
+            "in-flight jobs continue."
+        )
+
+        match = pattern_for("host_ram_pop_hold").search(line)
+
+        assert "(commit-bound; physical 30000 MB)" in verdict.reason()
+        assert match is not None, line
+        assert float(match.group("available")) == _COMMIT_BELOW_FLOOR_MB
+        assert float(match.group("physical")) == _HEALTHY_AVAILABLE_RAM_MB

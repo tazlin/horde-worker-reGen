@@ -238,6 +238,18 @@ class HostRamSnapshot:
     """The host's available commit (MB), against which a load that maps a checkpoint is also priced. None where
     a mapping is not charged to commit (POSIX), so the RAM gates price physical RAM alone."""
 
+    @property
+    def admissible_mb(self) -> float:
+        """Physical available RAM (MB), lowered to available commit where the host reports one."""
+        if self.available_commit_mb is None:
+            return self.available_mb
+        return min(self.available_mb, self.available_commit_mb)
+
+    @property
+    def commit_bound(self) -> bool:
+        """Whether available commit, not physical RAM, sets :attr:`admissible_mb`."""
+        return self.available_commit_mb is not None and self.available_commit_mb < self.available_mb
+
 
 @dataclass(frozen=True)
 class HeadAdmissionView:

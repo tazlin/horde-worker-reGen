@@ -182,11 +182,10 @@ class TestEarlyRamPreStage:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Guard: with the in-flight job already near the RAM ceiling, do not pre-stage (it would page).
+        """Guard: with the in-flight job already near the RAM ceiling, no spare is sent the pre-stage (it would page).
 
-        The user's premise is explicitly "assuming the RAM can support it". When the heavy head's RAM cost
-        would not fit alongside the live job, the scheduler must fall back to the prior claim-the-card-and-wait
-        behavior rather than force a second multi-GB checkpoint into a RAM-pressured host.
+        When the heavy head's RAM cost would not fit alongside the live job, the RAM preload admission defers the
+        pre-stage rather than force a second multi-GB checkpoint into a RAM-pressured host.
         """
         _seed_flux_weight_estimates(monkeypatch)
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 60000.0)
@@ -220,8 +219,11 @@ class TestEarlyRamPreStage:
 
         scheduler, _process_map, job_tracker, _busy, idle = _build_overlap_scheduler(free_mb=2000.0)
         scheduler._measured_available_ram_mb = lambda: 64000.0  # type: ignore[method-assign]
+        scheduler._measured_total_ram_mb = lambda: 64000.0  # type: ignore[method-assign]
         scheduler._checkpoint_staging_charge_mb = lambda _job: _FLUX_WEIGHTS_MB  # type: ignore[method-assign]
-        scheduler.set_available_commit_mb_provider(lambda: 1000.0)
+        # Commit sits above the 9600 MB danger floor of a 64000 MB host, so the governor's floor does not hold the
+        # host, yet below the mapping plus reserve and floor the admission prices, so only the admission defers.
+        scheduler.set_available_commit_mb_provider(lambda: 20000.0)
 
         sdxl_job = make_job_pop_response(_RESIDENT_SDXL)
         await track_popped_job_async(job_tracker, sdxl_job)

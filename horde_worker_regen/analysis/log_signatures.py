@@ -117,11 +117,13 @@ _SIGNATURE_LIST: list[LogSignature] = [
     _signature(
         "host_ram_pop_hold",
         r"Host RAM pop hold (?P<edge>engaged|released): available (?P<available>[\d.]+) MB "
+        r"(?:\(commit-bound; physical (?P<physical>[\d.]+) MB\) )?"
         r"(?:above|below) danger floor (?P<floor>[\d.]+) MB, "
         r"(?:(?:hold margin (?P<legacy_margin>[\d.]+) MB above the floor while work is in flight)|"
         r"(?:soft hold (?P<soft>[\d.]+) MB, preload (?P<preload>[\d.]+) MB, restore (?P<restore>[\d.]+) MB))",
         emitter="process_management.scheduling.admission.executor:execute_governance_actions",
-        sample="Host RAM pop hold engaged: available 8000 MB above danger floor 6343 MB, "
+        sample="Host RAM pop hold engaged: available 8000 MB (commit-bound; physical 30000 MB) above danger floor "
+        "6343 MB, "
         "soft hold 8500 MB, preload 14500 MB, restore 32500 MB; in-flight jobs continue.",
         dry_run_reason=_RAM_NOT_EXERCISED,
     ),

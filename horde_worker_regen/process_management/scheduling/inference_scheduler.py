@@ -4265,6 +4265,12 @@ class InferenceScheduler:
             return self._available_commit_mb_provider()
         return measure_available_commit_mb()
 
+    def _measured_admissible_ram_mb(self) -> float:
+        """Physical available RAM (MB), lowered to the host's available commit where the host reports one."""
+        physical_mb = self._measured_available_ram_mb()
+        commit_mb = self._measured_available_commit_mb()
+        return physical_mb if commit_mb is None else min(physical_mb, commit_mb)
+
     def _measured_total_ram_mb(self) -> float:
         """The measured system-wide total RAM (MB), read live in the parent process."""
         return psutil.virtual_memory().total / (1024 * 1024)
@@ -4292,6 +4298,7 @@ class InferenceScheduler:
             self._measured_total_ram_mb(),
             pause_percent=pause_pct,
             min_free_mb=min_free_mb,
+            available_commit_mb=self._measured_available_commit_mb(),
         )
 
     @property
@@ -6376,7 +6383,7 @@ class InferenceScheduler:
         ram_verdict = self._ram_budget.check_job(
             job,
             baseline,
-            self._measured_available_ram_mb(),
+            self._measured_admissible_ram_mb(),
             committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
             staging_charge_mb=self._whole_job_ram_charge_mb(job),
             danger_floor_mb=self._ram_danger_floor_mb(),
@@ -12441,7 +12448,8 @@ class InferenceScheduler:
             sent += 1
             logger.info(
                 f"Warming {warm.model} on process {warm.process_id} ahead of job {warm.job_id} "
-                f"({warm.room_mb:.0f} MB of host RAM outside protected checkpoints)",
+                f"({warm.room_mb:.0f} MB of host RAM outside protected checkpoints"
+                f"{', commit-bound' if snapshot.host_ram.commit_bound else ''})",
             )
         return sent
 

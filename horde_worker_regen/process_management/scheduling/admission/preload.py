@@ -1240,8 +1240,9 @@ def select_idle_lane_warms(
     models are therefore those of staged lanes (:data:`STAGED_LANE_STATES`, owning a job) and of every earlier
     pending job; each job's model joins the set before the job is judged, warmed or not. A cleared or sampling
     lane's model is not protected: its weights are on the device, and its pages are needed again only by a later
-    job of that model, which the walk covers. The room for a warm is the host's available memory (free plus
-    reclaimable cache, as psutil reports it) less the whole checkpoints of the protected models other than the
+    job of that model, which the walk covers. The room for a warm is the host's admissible memory (free plus
+    reclaimable cache, as psutil reports it, lowered to available commit where the host reports one) less the
+    whole checkpoints of the protected models other than the
     job's own, and the warm needs room for its whole checkpoint: the parent cannot see which pages are cached,
     and a staged lane's uncached pages are read at clearance and need the room. The walk stops at the first
     warm that does not fit. A checkpoint's size is the job's ``staging_charge_mb``, the figure
@@ -1291,7 +1292,7 @@ def select_idle_lane_warms(
         own_mb = sizes.get(model)
         if lane is None or own_mb is None:
             continue
-        room_mb = snapshot.host_ram.available_mb - sum(
+        room_mb = snapshot.host_ram.admissible_mb - sum(
             sizes.get(protected_model, 0.0) for protected_model in protected if protected_model != model
         )
         if room_mb < own_mb:
