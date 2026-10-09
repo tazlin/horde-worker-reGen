@@ -9664,6 +9664,20 @@ class InferenceScheduler:
             and line_skip is None
             and not self._resident_whole_card_head_ready(next_job, process_with_model)
         ):
+            # The stall classifier re-derives most gates, but this one decides on the residency's live teardown
+            # and drain, which no later read reproduces exactly; the pass's own record names it.
+            if next_job.id_ is not None:
+                self._dispatch_holds.note_decline(
+                    DispatchDecline(
+                        job_id=str(next_job.id_),
+                        bucket=SlotDutyBucket.WHOLE_CARD_CONVERGENCE,
+                        device_index=process_with_model.device_index,
+                        detail=(
+                            "its whole-card residency has not yet cleared the card for it: the teardown is "
+                            "incomplete or the freed memory has not finished draining"
+                        ),
+                    ),
+                )
             self._pending_line_skip = None
             return None
 

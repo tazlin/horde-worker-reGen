@@ -71,6 +71,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
     InferenceScheduler,
     _WholeCardDemandOutcome,
 )
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -1373,3 +1374,29 @@ class TestMakingRoomNeverStrandsInflight:
         assert busy.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM, (
             "the in-progress job's model must never be evicted to make room for the head, or that job wedges too"
         )
+
+
+class TestWholeCardHoldIsNamedByTheDispatchPass:
+    """A head the selection-time whole-card gate holds is recorded as that gate's decline for the cycle."""
+
+    async def test_the_held_head_is_declined_under_whole_card_convergence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The stall reason reads the pass's own record, so it names the whole-card hold, never a gate-less stall."""
+        scheduler, _holder, _forecast = TestChurnGovernors._scheduler_and_head()
+        head = await track_popped_job_async(
+            scheduler._job_tracker,
+            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4),
+        )
+        monkeypatch.setattr(scheduler, "_resident_whole_card_head_ready", lambda _job, _process: False)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+        assert head.id_ is not None
+        decline = scheduler._dispatch_holds.cycle_declines.get(str(head.id_))
+        assert decline is not None, "the whole-card hold left no record of why the selected head was withheld"
+        assert decline.bucket is SlotDutyBucket.WHOLE_CARD_CONVERGENCE
+        reason = scheduler._diagnose_dispatch_stall(head, {})
+        assert "no matching gate" not in reason
+        assert "whole-card" in reason
