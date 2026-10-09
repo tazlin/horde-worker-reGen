@@ -8279,11 +8279,19 @@ class InferenceScheduler:
         if self._resident_head_should_dispatch_before_preload(head_job):
             return False
 
+        residency_lanes = self._residency_promoted_lanes()
         stopped_cards: set[int] = set()
         for job_id in snapshot.queue.pending_in_placement_order:
             if job_id not in snapshot.queue.jobs:
                 continue
             plan = decide_preload_gates(snapshot, job_id, head_job_id=head_job_id, loaded_models=loaded_models)
+            reserved_model = (
+                residency_lanes.get(plan.target_process_id) if plan.target_process_id is not None else None
+            )
+            if reserved_model is not None and snapshot.queue.jobs[job_id].model != reserved_model:
+                # The promoted job is waiting for its slot (another lane's work, or its isolation), not for a
+                # load. Loading a foreign model here would unload the very weights the promotion kept it for.
+                continue
             if self._preload_plan_card(snapshot, plan) in stopped_cards:
                 # An earlier job already stopped this card for a reason that still stands, so this job's load
                 # onto it is refused for the same reason. Deciding it again would only restate that.
@@ -8635,6 +8643,28 @@ class InferenceScheduler:
         if not candidates and rejections:
             self._trace_empty_affinity_scan("; ".join(rejections), head_job)
         return candidates
+
+    def _residency_promoted_lanes(self) -> dict[int, str]:
+        """The lanes holding a model whose queued job the placement order promoted for a held residency.
+
+        Keyed by process id, valued by the model each holds. The promoted job runs on that lane as soon as its
+        slot frees, so the preload pass keeps every other model off it in the meantime.
+        """
+        pending = self._job_tracker.jobs_pending_inference
+        head_job = next(
+            (
+                job
+                for job in pending
+                if job not in self._job_tracker.jobs_in_progress
+                and not self._job_tracker.job_requires_aux_preparation(job)
+            ),
+            None,
+        )
+        return {
+            process.process_id: job.model
+            for job, process in self._retention_affinity_candidates(head_job)
+            if job.model is not None and self._whole_card_ledger.holder_for_model(job.model)[0]
+        }
 
     def _residency_reorder_resident(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
         """The free slot on a held whole-card residency's card that holds ``job``'s model, or None.

@@ -2840,14 +2840,20 @@ class TestWholeCardResidencyPlacement:
         residency_held: bool = True,
         expected_seconds: float | None = _EXPECTED_SAMPLING_SECONDS,
         head_age_seconds: float = 0.0,
+        sibling_finishing: bool = False,
     ) -> tuple[InferenceScheduler, dict[int, HordeProcessInfo], JobTracker]:
-        """Lane 1, the residency's only lane, holds its model in RAM with no retention grant and no work running.
+        """Lane 1 holds the residency's model in RAM with no retention grant; the cold head can only load there.
 
-        That is the card between two of the residency's jobs: its siblings were stopped, so the cold head can
-        only load onto the lane the residency's next job is about to run on.
+        That is the card between two of the residency's jobs. With ``sibling_finishing`` lane 2 is still running
+        a job that started before the teardown, which spends the sampling slot, so the residency's next job cannot
+        dispatch yet while its own lane sits free.
         """
         fixture = TestRetentionPlacementProtection()
-        scheduler, processes, tracker = await fixture._worker(spare_lane=False, cap_spent=False, retain=False)
+        scheduler, processes, tracker = await fixture._worker(
+            spare_lane=False,
+            cap_spent=sibling_finishing,
+            retain=False,
+        )
         if residency_held:
             scheduler._whole_card_ledger.state_for(None).model = TestRetentionPlacementProtection._RETAINED_MODEL
         scheduler._state.recent_job_ttl = self._TTL_SECONDS
@@ -2872,6 +2878,21 @@ class TestWholeCardResidencyPlacement:
         scheduler.preload_models()
         assert processes[1].last_control_flag != HordeControlFlag.PRELOAD_MODEL, (
             "the head's load was sent over the lane holding the residency's model"
+        )
+
+    async def test_a_residency_job_waiting_on_a_finishing_sibling_keeps_its_lane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """While another lane's job holds the slot, no foreign preload is sent over the residency job's lane."""
+        scheduler, processes, _tracker = await self._worker(monkeypatch, sibling_finishing=True)
+
+        assert scheduler.pending_inference_in_placement_order()[0].model == (
+            TestRetentionPlacementProtection._RETAINED_MODEL
+        )
+        scheduler.preload_models()
+        assert processes[1].last_control_flag != HordeControlFlag.PRELOAD_MODEL, (
+            "a foreign preload took the lane the residency's next job is waiting to run on"
         )
 
     async def test_a_head_that_would_start_past_its_ttl_share_keeps_its_place(

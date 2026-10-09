@@ -1318,7 +1318,10 @@ the head's own ttl in place of the free-win test. The ttl is the one the horde a
 recent ttl the worker saw. `_head_starts_within_ttl_share` applies the anti-starvation bound
 (`ANTI_STARVATION_TTL_FRACTION` of the ttl) to the age the head would have once every job promoted ahead of it has
 sampled for its expected time, and a job with no expected sampling time is not promoted, since its cost to the
-head cannot be foreseen. The skip ceiling and the head's current-age check still apply.
+head cannot be foreseen. The skip ceiling and the head's current-age check still apply. The promoted job often
+waits for its slot rather than a load (an earlier job on another lane is still finishing, or the residency's
+isolation holds it), so while the promotion stands the preload pass keeps every other model off its lane
+(`_residency_promoted_lanes`): a foreign load there would unload the weights the promotion kept it for.
 
 Candidacy locates the retainer with `include_reserved=True`. A disaggregation-pinned sampler lane is a lane no
 job may be dispatched onto *yet*, and it is still a lane carrying weights: the pin is taken when a job is
