@@ -11,7 +11,9 @@ so there are never two mechanisms independently evicting against the same card. 
   resident model, then release the reclaimable allocator caches on idle processes, then evict the older idle
   residents, then pause the post-processing / VAE / component lanes, then move safety off the GPU. An
   actively-sampling process is never a rung: it is the one process the driver did not demote, and tearing it
-  down would trade a slow job for a faulted one.
+  down would trade a slow job for a faulted one. The teardown rungs (the lane pauses and safety off the GPU)
+  are held until the episode's saturation has persisted for a dwell, so a transient activation peak that
+  clears on its own never costs a service lane its restart; the cheaper rungs past them still act at once.
 
 - It verifies. Freeing on WDDM is externally checkable: NVML device-used drops once a real release lands.
   After issuing a rung the engine watches the following governor samples and compares the realized device-free
@@ -80,7 +82,14 @@ _TEARDOWN_VERIFICATION_BASE_SECONDS = 12.0
 
 A process's device memory does not return to the driver until the OS has torn the process down, so these rungs
 pay a full process exit before their first megabyte arrives. Larger than :data:`_VERIFICATION_BASE_SECONDS` by
-that exit, which is a whole-process cost rather than a per-byte one."""
+that exit, which is a whole-process cost rather than a per-byte one.
+
+It is also how long an episode's saturation must persist before a teardown rung may issue. A teardown rung costs
+a process exit and, at the restore, a cold start of several seconds or more, while a sampler's activation peak
+can cross the hard floor and end within a sample or two. Stopping a lane for a saturation that clears on its own
+frees nothing in time to matter and still pays the restart. The cheaper rungs act at once; the teardown rungs
+wait until the saturation has outlasted the process exit they would pay for. Read at the point of use, so a
+patch of this constant moves the budget and the dwell together."""
 
 _TEARDOWN_VERIFICATION_SECONDS_PER_GB = _VERIFICATION_SECONDS_PER_GB
 """Per-gigabyte part of a teardown rung's budget: once the process is gone the release scales as any other."""
@@ -523,6 +532,8 @@ class _Episode:
     """
 
     ladder: tuple[ReclaimRung, ...] | None = None
+    saturated_since: float | None = None
+    """The instant of the first SATURATED sample this ladder was built on, which the teardown dwell runs from."""
     next_index: int = 0
     pending: _PendingVerification | None = None
     unresolved: bool = False
@@ -541,6 +552,7 @@ class _Episode:
         saturates again builds a fresh ladder against the topology of that moment.
         """
         self.ladder = None
+        self.saturated_since = None
         self.next_index = 0
         self.pending = None
         self.unresolved = False
@@ -593,7 +605,9 @@ class VerifiedReclaimLadder:
 
         When the card is SATURATED, a pending rung is verified first (crediting a realized free or, once the
         rung has spent its whole verification budget without realizing further free, logging the shortfall and
-        escalating), then the next rung is issued if the ladder is not exhausted. An exhausted ladder on a
+        escalating), then the next rung is issued if the ladder is not exhausted. A lane pause or the safety
+        move waits until the saturation has persisted for :data:`_TEARDOWN_VERIFICATION_BASE_SECONDS`, so a
+        saturation that clears sooner closes the episode with no lane touched. An exhausted ladder on a
         still-SATURATED card marks the episode unresolved.
 
         When the card is not SATURATED the episode is winding down, but the engine holds it (issuing no further
@@ -672,6 +686,7 @@ class VerifiedReclaimLadder:
             self._episodes[device_index] = episode
         if episode.ladder is None:
             episode.ladder = tuple(ladder_builder())
+            episode.saturated_since = now
 
         if episode.pending is not None and not self._verify(episode, device_free_mb, actuator, now):
             return
@@ -892,11 +907,29 @@ class VerifiedReclaimLadder:
         actuation is skipped the same way: cycling safety again this soon rebuilds the process for relief the
         last cycle already failed to hold. The first rung that acts opens a fresh verification budget and stops
         the tick.
+
+        A teardown rung reached while the episode's saturation is younger than
+        :data:`_TEARDOWN_VERIFICATION_BASE_SECONDS` is held rather than spent: the scan passes over it to the
+        cheaper rungs behind it, and the held rungs are kept, in their order, at the head of what remains so a
+        later tick past the dwell issues them. An episode with only held rungs left is waiting, not unresolved.
         """
         ladder = episode.ladder or ()
-        while episode.next_index < len(ladder):
-            rung = ladder[episode.next_index]
-            episode.next_index += 1
+        start_index = episode.next_index
+        scan_index = start_index
+        spent: list[ReclaimRung] = []
+        held: list[ReclaimRung] = []
+        inside_dwell = (
+            episode.saturated_since is not None
+            and (now - episode.saturated_since) < _TEARDOWN_VERIFICATION_BASE_SECONDS
+        )
+        issued = False
+        while scan_index < len(ladder):
+            rung = ladder[scan_index]
+            scan_index += 1
+            if inside_dwell and rung.kind in _TEARDOWN_RUNG_KINDS:
+                held.append(rung)
+                continue
+            spent.append(rung)
             if rung.kind is ReclaimRungKind.SAFETY_OFF_GPU and self._safety_rung_in_cooldown(device_index, now):
                 continue
             if execute_reclaim_rung(rung, actuator):
@@ -912,8 +945,13 @@ class VerifiedReclaimLadder:
                     baseline_free_mb=device_free_mb,
                     progress_at=now,
                 )
-                return
-        episode.unresolved = True
+                issued = True
+                break
+        if held:
+            episode.ladder = (*ladder[:start_index], *spent, *held, *ladder[scan_index:])
+        episode.next_index = start_index + len(spent)
+        if not issued and not held:
+            episode.unresolved = True
 
     def _safety_rung_in_cooldown(self, device_index: int | None, now: float) -> bool:
         """Whether ``device_index``'s last safety actuation is recent enough to refuse another one.

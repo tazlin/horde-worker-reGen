@@ -1219,6 +1219,13 @@ _THRASH_TICKS = 900
 The signature being forbidden is a safety process ended and rebuilt every couple of minutes, so the run has to
 be long enough that a worker doing that shows several cycles and a worker holding its dwell does not."""
 
+_THRASH_DDIM_STEPS = 50
+"""Steps per job in the thrash scenario, long enough that a saturation episode outlasts the teardown dwell.
+
+The ladder holds its lane pauses and the safety move until saturation has persisted for
+``_TEARDOWN_VERIFICATION_BASE_SECONDS``, so a scenario about how often safety is cycled needs episodes that
+reach that rung at all. A thirty-step sampling window ends each episode inside the dwell."""
+
 _SHORT_BUDGET_BASE_SECONDS = 2.0 * _TICK_SECONDS
 """The in-process verification allowance a sample-counted window amounts to, for the defect reinjections."""
 
@@ -1297,6 +1304,7 @@ async def _drive_pressure(
     ticks: int,
     models: tuple[_ModelClass, ...] | None = None,
     shape: tuple[int, int] | None = None,
+    ddim_steps: int = 30,
 ) -> None:
     """Keep ``world``'s queue full with a rotation for ``ticks``, so pressure recurs rather than happens once.
 
@@ -1314,7 +1322,7 @@ async def _drive_pressure(
     for _ in range(ticks):
         while len(world.job_tracker.jobs_pending_inference) < _QUEUE_DEPTH and popped < job_count:
             model = models[popped % len(models)]
-            await world.pop(make_job_pop_response(model.name, width=width, height=height, ddim_steps=30))
+            await world.pop(make_job_pop_response(model.name, width=width, height=height, ddim_steps=ddim_steps))
             popped += 1
         await world.step()
 
@@ -1500,7 +1508,7 @@ async def test_h_recurring_pressure_cycles_safety_at_most_once_per_dwell(monkeyp
     _blind_children_to_device_truth(monkeypatch)
     world = _pressure_world()
 
-    await _drive_pressure(world, job_count=_THRASH_JOBS, ticks=_THRASH_TICKS)
+    await _drive_pressure(world, job_count=_THRASH_JOBS, ticks=_THRASH_TICKS, ddim_steps=_THRASH_DDIM_STEPS)
 
     context = "safety thrash"
     assert len(_saturation_episodes(world)) > 1, (

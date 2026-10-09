@@ -19,6 +19,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import Pa
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRung, ReclaimRungKind
 from horde_worker_regen.process_management.workers import post_process_orchestrator as pp_module
 from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
+from tests.process_management.resources.test_reclaim_ladder import _saturate_past_dwell
 from tests.process_management.workers.test_post_process_orchestration import _make_pp_job_info
 
 
@@ -51,14 +52,8 @@ def test_ladder_paused_pp_lane_is_restored_when_the_card_returns_healthy() -> No
     )
     ladder = _pp_pause_ladder()
 
-    # SATURATED: the ladder issues its PP-lane pause through the real scheduler actuator.
-    process_manager._reclaim_ladder.on_tick(
-        0,
-        saturated=True,
-        device_free_mb=100.0,
-        actuator=process_manager._inference_scheduler,
-        ladder_builder=lambda: ladder,
-    )
+    # SATURATED past the teardown dwell: the ladder issues its PP-lane pause through the real scheduler actuator.
+    issued_at = _saturate_past_dwell(process_manager._reclaim_ladder, process_manager._inference_scheduler, ladder)
     assert process_manager._process_lifecycle.is_post_process_gpu_paused is True
     assert process_manager._process_lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
 
@@ -70,6 +65,7 @@ def test_ladder_paused_pp_lane_is_restored_when_the_card_returns_healthy() -> No
         device_free_mb=9000.0,
         actuator=process_manager._inference_scheduler,
         ladder_builder=lambda: ladder,
+        now=issued_at + 1.0,
     )
     assert process_manager._process_lifecycle.is_post_process_gpu_paused is False
     assert process_manager._process_lifecycle.post_process_pause_owner is None
@@ -86,13 +82,7 @@ def test_ladder_pause_is_held_through_pressure_and_not_cleared_by_a_residency_re
     )
     ladder = _pp_pause_ladder()
 
-    process_manager._reclaim_ladder.on_tick(
-        0,
-        saturated=True,
-        device_free_mb=100.0,
-        actuator=process_manager._inference_scheduler,
-        ladder_builder=lambda: ladder,
-    )
+    issued_at = _saturate_past_dwell(process_manager._reclaim_ladder, process_manager._inference_scheduler, ladder)
     assert process_manager._process_lifecycle.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
 
     # A whole-card residency completion restore (a different owner) must not lift the ladder's hold.
@@ -108,6 +98,7 @@ def test_ladder_pause_is_held_through_pressure_and_not_cleared_by_a_residency_re
         device_free_mb=500.0,
         actuator=process_manager._inference_scheduler,
         ladder_builder=lambda: ladder,
+        now=issued_at + 1.0,
     )
     assert process_manager._process_lifecycle.is_post_process_gpu_paused is True
 

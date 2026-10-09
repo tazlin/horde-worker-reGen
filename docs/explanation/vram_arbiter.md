@@ -68,7 +68,7 @@ Nothing frees synchronously, so
 grading a rung on a sample count reads a working multi-gigabyte release as a failure; the deepest rung (safety
 off the GPU) additionally carries a per-card dwell, because spending it is a whole process cycle. The teardown
 rungs (each lane pause and safety off the GPU) are also held until the episode's saturation has persisted for
-`_TEARDOWN_RUNG_SATURATION_DWELL_SECONDS`, the teardown rung's fixed verification allowance. A sampler's
+`_TEARDOWN_VERIFICATION_BASE_SECONDS`, the teardown rung's fixed verification allowance. A sampler's
 activation peak can cross the hard floor and end a second later, and a lane stopped for it frees nothing in time
 and still pays a cold start at the restore. While the dwell runs the scan passes over the held rungs, so the
 idle unloads, cache releases and safety's weight demotion still act on the first saturated sample, and the held

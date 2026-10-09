@@ -867,7 +867,11 @@ offering post-processing at all, a non-idle `POST_PROCESS` process, or queued sh
 post-processing or graph-backed alchemy) is not a pause candidate. An **actively-sampling process is never a
 rung**: it is the one process the driver did not demote, and tearing it down would trade a slow job for a
 faulted one. A VAE, component, or post-processing service lane doing live work is likewise never a pause rung.
-Both candidate assembly and the targeted action re-check liveness, so immunity holds at two layers.
+Both candidate assembly and the targeted action re-check liveness, so immunity holds at two layers. The lane
+pauses and the safety move are also held until the saturation has persisted for the teardown verification
+base (twelve seconds): a sampler's activation peak can cross the hard floor and end within a sample or two,
+and stopping a lane for that frees nothing in time while still paying the cold start. The cheaper rungs act
+on the first saturated sample.
 
 SOS recovery adds one further protection when it borrows this ladder for a structural wedge: models demanded
 by accepted pending work are not idle-resident unload candidates. In particular, it never unloads the model

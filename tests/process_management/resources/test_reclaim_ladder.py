@@ -8,10 +8,12 @@ from unittest.mock import Mock
 
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     _SAFETY_RUNG_COOLDOWN_SECONDS,
+    _TEARDOWN_VERIFICATION_BASE_SECONDS,
     CacheReleaseTarget,
     IdleResidentModel,
     LadderCandidates,
     LaneReclaimCandidate,
+    ReclaimLadderActuator,
     ReclaimRung,
     ReclaimRungKind,
     VerifiedReclaimLadder,
@@ -196,6 +198,34 @@ def _budget_for(rung: ReclaimRung) -> float:
     that hard-coded seconds would be asserting one card's arithmetic instead of the rule.
     """
     return VerifiedReclaimLadder._verification_budget_for(rung)
+
+
+def _saturate_past_dwell(
+    engine: VerifiedReclaimLadder,
+    actuator: ReclaimLadderActuator,
+    ladder: tuple[ReclaimRung, ...],
+    *,
+    start: float = 0.0,
+    device_free_mb: float = 100.0,
+) -> float:
+    """Open a saturated episode at ``start`` and tick again once the teardown dwell has passed.
+
+    For a ladder of teardown rungs only, which the first tick holds, so the second tick issues the first of
+    them. Returns the instant of the second tick, from which the caller's later ticks are stated.
+    """
+    engine.on_tick(
+        0, saturated=True, device_free_mb=device_free_mb, actuator=actuator, ladder_builder=lambda: ladder, now=start
+    )
+    issue_at = start + _TEARDOWN_VERIFICATION_BASE_SECONDS
+    engine.on_tick(
+        0,
+        saturated=True,
+        device_free_mb=device_free_mb,
+        actuator=actuator,
+        ladder_builder=lambda: ladder,
+        now=issue_at,
+    )
+    return issue_at
 
 
 class TestVerifiedReclaimLadderEngine:
@@ -449,6 +479,103 @@ class TestVerifiedReclaimLadderEngine:
         assert actuator.calibration_events == []
 
 
+class TestTeardownRungSaturationDwell:
+    """A lane pause or the safety move waits until the saturation has outlasted the restart it would cost."""
+
+    def test_a_saturation_that_clears_inside_the_dwell_never_stops_the_lane(self) -> None:
+        """A sampler's activation peak that ends a second later closes the episode with the lane untouched."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_PP_LANE))
+        builds = 0
+
+        def _build() -> tuple[ReclaimRung, ...]:
+            nonlocal builds
+            builds += 1
+            return ladder
+
+        engine.on_tick(0, saturated=True, device_free_mb=197.0, actuator=actuator, ladder_builder=_build, now=0.0)
+        assert actuator.calls == [], "the lane was stopped on the first saturated sample, before any dwell"
+        assert engine.rungs_issued == 0
+        assert engine.is_saturation_unresolved(0) is False
+
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=6935.0, actuator=actuator, ladder_builder=_build, now=1.0
+        )
+        assert actuator.calls == [], "a lane that was never stopped was restored"
+        assert engine.episode_holds_paused_lane(0) is False
+
+        # The episode closed: the next saturation builds a fresh ladder and starts its own dwell.
+        engine.on_tick(0, saturated=True, device_free_mb=197.0, actuator=actuator, ladder_builder=_build, now=2.0)
+        assert builds == 2
+        assert actuator.calls == []
+
+    def test_a_saturation_that_outlasts_the_dwell_stops_the_lane(self) -> None:
+        """A held lane pause issues on the first saturated sample past the dwell."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_PP_LANE))
+
+        engine.on_tick(
+            0, saturated=True, device_free_mb=197.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        assert actuator.calls == []
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=197.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=_TEARDOWN_VERIFICATION_BASE_SECONDS + 1.0,
+        )
+        assert actuator.calls == [("pp", None)]
+        assert engine.rungs_issued == 1
+        assert engine.episode_holds_paused_lane(0) is True
+
+    def test_a_cheaper_rung_ahead_of_the_lanes_acts_at_once(self) -> None:
+        """An idle unload ahead of a lane pause is issued on the first saturated sample."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_unload_rung(1, 1000.0), _pause_rung(ReclaimRungKind.PAUSE_PP_LANE))
+
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        assert actuator.calls == [("unload", 1)]
+
+    def test_a_cheaper_rung_behind_held_rungs_acts_at_once_and_the_held_rungs_keep_their_order(self) -> None:
+        """Safety's in-place weight demotion is not held by the lane pause ahead of it, which issues later."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(
+            _pause_rung(ReclaimRungKind.PAUSE_PP_LANE),
+            _pause_rung(ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS),
+            _pause_rung(ReclaimRungKind.SAFETY_OFF_GPU),
+        )
+
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        assert actuator.calls == [("demote_safety", None)]
+
+        # Past the dwell the demotion verifies and the held lane pause issues before the safety move.
+        past_dwell = _TEARDOWN_VERIFICATION_BASE_SECONDS + 1.0
+        engine.on_tick(
+            0, saturated=True, device_free_mb=400.0, actuator=actuator, ladder_builder=lambda: ladder, now=past_dwell
+        )
+        assert actuator.calls == [("demote_safety", None), ("pp", None)]
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=700.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=past_dwell + 1.0,
+        )
+        assert actuator.calls == [("demote_safety", None), ("pp", None), ("safety", None)]
+        assert engine.is_saturation_unresolved(0) is False
+
+
 class TestReclaimLadderVerifiedRestore:
     """Lane-pause rungs the engine issues are restored (LIFO) when the card returns HEALTHY, safety excepted."""
 
@@ -462,16 +589,14 @@ class TestReclaimLadderVerifiedRestore:
         engine = VerifiedReclaimLadder()
         actuator = _FakeActuator()
         pause = _pause_rung(ReclaimRungKind.PAUSE_PP_LANE, 5000.0)
-        ladder = _ladder(pause, _unload_rung(2, 500.0))
+        ladder = _ladder(pause, _pause_rung(ReclaimRungKind.PAUSE_VAE_LANE))
         teardown_budget = _budget_for(pause)
         assert teardown_budget > _budget_for(_unload_rung(1, pause.promised_freed_mb)), (
             "a teardown rung is given no more time than an in-process rung returning the same memory, so the "
             "process exit it pays for is unaccounted"
         )
 
-        engine.on_tick(
-            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
-        )
+        issued_at = _saturate_past_dwell(engine, actuator, ladder)
         assert actuator.calls == [("pp", None)]
         # Samples inside the teardown budget are short and too small to count as progress, but the pause holds:
         # an in-process rung of the same promise would already have been escalated past by the second of them.
@@ -482,7 +607,7 @@ class TestReclaimLadderVerifiedRestore:
                 device_free_mb=free_mb,
                 actuator=actuator,
                 ladder_builder=lambda: ladder,
-                now=elapsed,
+                now=issued_at + elapsed,
             )
         assert engine.rungs_issued == 1
         assert engine.verification_shortfalls == 0
@@ -493,11 +618,11 @@ class TestReclaimLadderVerifiedRestore:
             device_free_mb=140.0,
             actuator=actuator,
             ladder_builder=lambda: ladder,
-            now=teardown_budget + 1.0,
+            now=issued_at + teardown_budget + 1.0,
         )
         assert engine.verification_shortfalls == 1
         assert engine.rungs_issued == 2
-        assert actuator.calls == [("pp", None), ("unload", 2)]
+        assert actuator.calls == [("pp", None), ("vae", None)]
 
     def test_paused_lanes_restored_lifo_only_when_healthy(self) -> None:
         """Paused lanes are held through PRESSURE and restored newest-first once the card is HEALTHY."""
@@ -508,9 +633,16 @@ class TestReclaimLadderVerifiedRestore:
             _pause_rung(ReclaimRungKind.PAUSE_VAE_LANE),
         )
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        issued_at = _saturate_past_dwell(engine, actuator, ladder)
         # Free rose enough to verify the PP pause; the VAE pause issues the same tick.
-        engine.on_tick(0, saturated=True, device_free_mb=400.0, actuator=actuator, ladder_builder=lambda: ladder)
+        engine.on_tick(
+            0,
+            saturated=True,
+            device_free_mb=400.0,
+            actuator=actuator,
+            ladder_builder=lambda: ladder,
+            now=issued_at + 1.0,
+        )
         assert actuator.calls == [("pp", None), ("vae", None)]
 
         # Saturation lifted but the card is only in the PRESSURE band (not HEALTHY): lanes stay paused.
@@ -588,7 +720,7 @@ class TestReclaimLadderVerifiedRestore:
         actuator = _FakeActuator()
         ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_PP_LANE))
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        _saturate_past_dwell(engine, actuator, ladder)
         engine.record_context_reduction(0)
 
         engine.on_tick(
@@ -622,7 +754,7 @@ class TestReclaimLadderVerifiedRestore:
         actuator = _FakeActuator()
         ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_PP_LANE))
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        _saturate_past_dwell(engine, actuator, ladder)
         assert actuator.calls == [("pp", None)]
         engine.record_context_reduction(0)
 
@@ -646,7 +778,7 @@ class TestReclaimLadderVerifiedRestore:
             _pause_rung(ReclaimRungKind.PAUSE_VAE_LANE),
         )
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        _saturate_past_dwell(engine, actuator, ladder)
         # PP pause was a no-op so the engine advanced to the VAE pause the same tick.
         assert actuator.calls == [("pp_noop", None), ("vae", None)]
 
@@ -669,7 +801,7 @@ class TestReclaimLadderVerifiedRestore:
             ),
         )
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        _saturate_past_dwell(engine, actuator, ladder)
         assert actuator.calls == [("safety", None)]
         engine.on_tick(
             0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=lambda: ladder
@@ -760,7 +892,7 @@ class TestRefusedRestoresStayOwed:
         actuator = _LaneStandDownActuator()
         ladder = _ladder(_pause_rung(ReclaimRungKind.PAUSE_VAE_LANE))
 
-        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder)
+        _saturate_past_dwell(engine, actuator, ladder)
         engine.on_tick(
             0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=lambda: ladder
         )
@@ -790,19 +922,21 @@ class TestSafetyRungCooldown:
         safety = _pause_rung(ReclaimRungKind.SAFETY_OFF_GPU, 3000.0)
         ladder = _ladder(safety)
 
-        engine.on_tick(
-            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
-        )
+        issued_at = _saturate_past_dwell(engine, actuator, ladder)
         assert actuator.calls == [("safety", None)]
 
         # The card recovers and crosses the cliff again a minute later: the fresh episode builds the rung, and
-        # the engine declines to spend it.
+        # once its saturation dwell has passed the engine declines to spend it.
         engine.on_tick(
-            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple, now=30.0
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=actuator,
+            ladder_builder=tuple,
+            now=issued_at + 30.0,
         )
-        engine.on_tick(
-            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=60.0
-        )
+        _saturate_past_dwell(engine, actuator, ladder, start=issued_at + 60.0)
         assert actuator.calls == [("safety", None)]
         assert engine.safety_rungs_refused == 1
         assert engine.is_saturation_unresolved(0) is True
@@ -813,20 +947,17 @@ class TestSafetyRungCooldown:
         actuator = _FakeActuator()
         ladder = _ladder(_pause_rung(ReclaimRungKind.SAFETY_OFF_GPU, 3000.0))
 
-        engine.on_tick(
-            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
-        )
-        engine.on_tick(
-            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple, now=30.0
-        )
+        issued_at = _saturate_past_dwell(engine, actuator, ladder)
         engine.on_tick(
             0,
-            saturated=True,
-            device_free_mb=100.0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
             actuator=actuator,
-            ladder_builder=lambda: ladder,
-            now=_SAFETY_RUNG_COOLDOWN_SECONDS + 1.0,
+            ladder_builder=tuple,
+            now=issued_at + 30.0,
         )
+        _saturate_past_dwell(engine, actuator, ladder, start=issued_at + _SAFETY_RUNG_COOLDOWN_SECONDS + 1.0)
         assert actuator.calls == [("safety", None), ("safety", None)]
         assert engine.safety_rungs_refused == 0
 
@@ -1084,13 +1215,8 @@ class TestArbiterSafetyCycleCooldown:
         engine = VerifiedReclaimLadder()
         ladder_actuator = _FakeActuator()
         ladder = _ladder(_pause_rung(ReclaimRungKind.SAFETY_OFF_GPU, 3000.0))
-        engine.on_tick(
-            0,
-            saturated=True,
-            device_free_mb=100.0,
-            actuator=ladder_actuator,
-            ladder_builder=lambda: ladder,
-            now=time.monotonic(),
+        _saturate_past_dwell(
+            engine, ladder_actuator, ladder, start=time.monotonic() - _TEARDOWN_VERIFICATION_BASE_SECONDS
         )
         assert ladder_actuator.calls == [("safety", None)]
 
@@ -1108,9 +1234,7 @@ class TestArbiterSafetyCycleCooldown:
 
         ladder_actuator = _FakeActuator()
         ladder = _ladder(_pause_rung(ReclaimRungKind.SAFETY_OFF_GPU, 3000.0))
-        engine.on_tick(
-            0, saturated=True, device_free_mb=100.0, actuator=ladder_actuator, ladder_builder=lambda: ladder, now=200.0
-        )
+        _saturate_past_dwell(engine, ladder_actuator, ladder, start=200.0)
         assert ladder_actuator.calls == []
         assert engine.safety_rungs_refused == 1
 
@@ -1123,7 +1247,5 @@ class TestArbiterSafetyCycleCooldown:
             ladder_builder=tuple,
             now=250.0,
         )
-        engine.on_tick(
-            0, saturated=True, device_free_mb=100.0, actuator=ladder_actuator, ladder_builder=lambda: ladder, now=301.0
-        )
+        _saturate_past_dwell(engine, ladder_actuator, ladder, start=301.0)
         assert ladder_actuator.calls == [("safety", None)]
