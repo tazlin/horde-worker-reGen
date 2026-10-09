@@ -755,3 +755,170 @@ async def test_a_grant_is_recorded_for_the_cleared_job() -> None:
     assert scheduler.clearance_admit_process(0) is True
 
     assert str(job.id_) in scheduler.snapshot().ledgers.dispatch_holds.clearance_granted_ids
+
+
+_KREA2_MODEL = "Krea2-Turbo_fp8"
+_KREA2_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo
+_KREA2_SHAPE = (768, 1344)
+_SIXTEEN_GB_MB = 16384
+_KREA2_DEVICE_FREE_MB = 13000.0
+"""What a converged 16 GB card reads free with the staged child's context and encode set on it."""
+
+
+async def _krea2_staged_waiter(
+    *, with_lora: bool = False, paging: bool = False
+) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, HordeProcessInfo]:
+    """One primed child on a 16 GB card holding a staged Krea2 job whose one real load on the card is spent.
+
+    The job's whole sampling peak sits above the card's achievable ceiling, and a spent attempt leaves the
+    ceiling trigger nothing to offer, so the full price alone refuses it.
+    """
+    from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
+
+    tracker = JobTracker()
+    scheduler = _make_inference_scheduler(
+        bridge_data=make_mock_bridge_data(
+            gpu_sampling_lease_enabled=True,
+            enable_vram_budget=True,
+            vram_reserve_mb=2048,
+            ram_reserve_mb=4096,
+        ),
+        job_tracker=tracker,
+        device_free_mb=_KREA2_DEVICE_FREE_MB,
+        model_metadata=make_test_model_metadata(
+            {_KREA2_MODEL: make_mock_model_reference_record(_KREA2_MODEL, baseline=_KREA2_BASELINE)},
+        ),
+    )
+    waiter = make_mock_process_info(0, model_name=_KREA2_MODEL, state=HordeProcessState.INFERENCE_PRIMED)
+    waiter.total_vram_mb = _SIXTEEN_GB_MB
+    waiter.process_reserved_mb = 900
+    scheduler._process_map = ProcessMap({0: waiter})
+    width, height = _KREA2_SHAPE
+    loras = [LorasPayloadEntry(name="some_lora", model=1.0, clip=1.0)] if with_lora else None
+    job = make_job_pop_response(_KREA2_MODEL, width=width, height=height, loras=loras)
+    await track_popped_job_async(tracker, job)
+    await mark_job_in_progress_async(tracker, job)
+    assert job.id_ is not None
+    tracked = tracker.get_tracked_job(job.id_)
+    assert tracked is not None
+    # A single-card worker scopes the card as None. The retry's earlier attempt ran there.
+    tracked.measured_attempted_device_indices.add(None)
+    waiter.last_job_referenced = job
+    scheduler._record_dispatch_reservation(job, waiter, baseline=None, staging_only=True)  # type: ignore[attr-defined]
+    if paging:
+        scheduler.note_wddm_paging({100001: 512.0}, active=True)
+    return scheduler, job, waiter
+
+
+def _expected_seat_mb(
+    scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse, weight_fraction: float
+) -> float:
+    """The seat the pricing owners describe: a share of the weights plus the larger non-weight charge."""
+    from horde_worker_regen.process_management.resources.resource_budget import effective_inference_reserve_mb
+
+    snapshot = scheduler.snapshot()
+    weights_mb = predict_job_weight_mb(job, str(_KREA2_BASELINE))
+    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, str(_KREA2_BASELINE))
+    assert weights_mb is not None and activation_mb is not None
+    return weight_fraction * weights_mb + max(activation_mb, effective_inference_reserve_mb(_SIXTEEN_GB_MB, 0.0))
+
+
+async def test_an_extra_large_job_over_the_ceiling_is_admitted_at_its_partial_load_seat() -> None:
+    """A Krea2 job without LoRAs on a converged 16 GB card is granted at its seat, which the full price refuses.
+
+    The full sampling peak exceeds what the emptied card offers, and with its one real load spent the job has
+    no other priced way onto the card. ComfyUI serves it by loading the weights partially, so clearance
+    prices that seat: half the weights without a measured upload rate, plus the larger of the activation and
+    ComfyUI's inference reserve.
+    """
+    scheduler, job, _waiter = await _krea2_staged_waiter()
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None and plan.verdict is not None
+    request = plan.priced.request
+    assert request.partial_seat_mb == pytest.approx(
+        _expected_seat_mb(scheduler, job, pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION),
+    )
+    assert plan.decision is ClearanceDecision.ADMIT
+    assert plan.verdict.partial_seat is True
+    assert plan.verdict.measured_attempt is False
+
+
+async def test_a_seat_admit_books_no_more_than_the_room_the_child_was_granted() -> None:
+    """The cleared job is booked the room it may load into, which decays to nothing once it reaches its peak.
+
+    Booked at the full outstanding charge, the part above the granted room would stay outstanding through the
+    whole sample, because the child only grows into what it was given.
+    """
+    scheduler, job, _waiter = await _krea2_staged_waiter()
+    plan = _decide(scheduler, 0)
+    assert plan.verdict is not None and plan.verdict.partial_seat is True
+    available_mb = plan.verdict.measured.available_mb
+    assert available_mb is not None and plan.candidate_delta_mb is not None
+    assert available_mb < plan.candidate_delta_mb
+    assert plan.booking_mb == pytest.approx(available_mb)
+
+    assert scheduler.clearance_admit_process(0) is True
+
+    ledger = scheduler._reserve_ledger  # type: ignore[attr-defined]
+    assert ledger.planned_charge_for_unit(DISPATCH_ADMISSION_FLOW, str(job.id_), {0: 900.0}) == pytest.approx(
+        available_mb,
+    )
+
+
+async def test_a_lora_job_keeps_the_full_price() -> None:
+    """A LoRA job is never seated partially, since its patch temporaries crash a child natively in that regime."""
+    scheduler, _job, _waiter = await _krea2_staged_waiter(with_lora=True)
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None and plan.verdict is not None
+    assert plan.priced.request.partial_seat_mb is None
+    assert plan.decision is ClearanceDecision.HOLD
+    assert plan.verdict.partial_seat is False
+
+
+async def test_a_paging_card_keeps_the_full_price() -> None:
+    """A card whose driver is paging the worker's allocations never seats a job partially."""
+    scheduler, _job, _waiter = await _krea2_staged_waiter(paging=True)
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None and plan.verdict is not None
+    assert plan.priced.request.partial_seat_mb is None
+    assert plan.decision is ClearanceDecision.HOLD
+    assert plan.verdict.partial_seat is False
+
+
+async def test_the_seat_weight_share_follows_the_waiter_clocks_upload_rate_and_step_time() -> None:
+    """With an upload rate and a step time on the clock, the seat's weight share is derived from them."""
+    scheduler, job, _waiter = await _krea2_staged_waiter()
+    weights_mb = predict_job_weight_mb(job, str(_KREA2_BASELINE))
+    assert weights_mb is not None
+    upload_mb_per_second = 0.6 * weights_mb
+    clock = StagedWaiterClock(
+        starved_seconds=0.0,
+        load_seconds=None,
+        seconds_per_step=1.0,
+        upload_mb_per_second=upload_mb_per_second,
+    )
+    arbiter = scheduler._ensure_preload_arbiter()  # type: ignore[attr-defined]
+    plan = decide_clearance_admit(
+        scheduler.snapshot(), 0, arbiter=arbiter, post_processing_deferred=False, waiter_clock=clock
+    )
+
+    assert plan.priced is not None
+    assert plan.priced.request.partial_seat_mb == pytest.approx(_expected_seat_mb(scheduler, job, 0.4))
+
+
+async def test_the_waiter_clock_carries_the_cards_measured_upload_rate() -> None:
+    """The clock reads the card's upload rate from the last job its inference lanes reported."""
+    from hordelib.metrics import JobPhaseMetrics, JobVramFootprint, ModelLoadEvent
+
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    assert scheduler._staged_waiter_clock(waiter, job).upload_mb_per_second is None  # type: ignore[attr-defined]
+
+    waiter.last_job_metrics = JobPhaseMetrics(
+        model_loads=[ModelLoadEvent(model_name="m", phase="ram_to_vram", duration_seconds=4.0, timestamp=0.0)],
+        vram_footprint=JobVramFootprint(peak_resident_weights_mb=8000.0),
+    )
+    clock = scheduler._staged_waiter_clock(waiter, job)  # type: ignore[attr-defined]
+    assert clock.upload_mb_per_second == pytest.approx(2000.0)

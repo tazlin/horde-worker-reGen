@@ -151,6 +151,8 @@ class _JobSamplingPeak:
     """The highest plausible reading seen for the job so far (MB)."""
     plausible_max_mb: float | None
     """The bound the highest reading was checked against, passed on to the store at commit."""
+    peak_resident_weights_mb: float | None = None
+    """The weights the job held on the card at its peak, from its measured footprint, once its metrics arrive."""
 
 
 def _no_aux_holds() -> set[GenerationID]:
@@ -1208,19 +1210,34 @@ class MessageDispatcher:
             )
             return
         running = self._job_sampling_peaks.get(job.id_)
-        if running is None or peak_mb > running.peak_mb:
+        if running is None:
             self._job_sampling_peaks[job.id_] = _JobSamplingPeak(
                 key=key,
                 peak_mb=float(peak_mb),
                 plausible_max_mb=plausible_max_mb,
             )
+        elif peak_mb > running.peak_mb:
+            running.peak_mb = float(peak_mb)
+            running.plausible_max_mb = plausible_max_mb
 
     def _commit_job_sampling_peak(self, job_id: GenerationID) -> None:
-        """Commit ``job_id``'s highest sampling reading to the store as one observation, if it has one."""
+        """Commit ``job_id``'s highest sampling reading to the store as one observation, if it has one.
+
+        A job whose measured footprint arrived also commits its peak less the weights it held under the activation
+        key, since only the two figures together separate a partial load's weights from the rest.
+        """
         running = self._job_sampling_peaks.pop(job_id, None)
         if running is None or self._footprint_store is None:
             return
         self._footprint_store.observe_peak(running.key, running.peak_mb, plausible_max_mb=running.plausible_max_mb)
+        if running.peak_resident_weights_mb is None:
+            return
+        activation_key = running.key.model_copy(update={"stage": FootprintStage.SAMPLE_ACTIVATION})
+        self._footprint_store.observe_peak(
+            activation_key,
+            running.peak_mb - running.peak_resident_weights_mb,
+            plausible_max_mb=running.plausible_max_mb,
+        )
 
     def _commit_ended_job_sampling_peaks(self) -> None:
         """Commit the figure of every folded job that has left progress without a result reaching this handler.
@@ -1247,17 +1264,24 @@ class MessageDispatcher:
         Alchemy forms carry no image-generation baseline and are skipped. A footprint that does not name its
         baseline falls back to the parent's model metadata; one that cannot be keyed at all is dropped by the
         store rather than guessed at here.
+
+        The weights the job held at its peak are kept beside its running sampling peak, which commits when the
+        job's result arrives after these metrics, so the two can be split into weights and activation there.
         """
         store = self._footprint_store
         if store is None or message.is_alchemy:
             return
 
-        # Read through getattr rather than the attribute: the supported backend range includes versions whose
-        # per-job metrics predate the measured footprint, and a missing field must leave the worker learning
-        # from memory reports alone rather than faulting the metrics seam.
-        footprint = getattr(message.phase_metrics, "vram_footprint", None)
+        footprint = message.phase_metrics.vram_footprint
         if footprint is None:
             return
+
+        running = next(
+            (peak for job_id, peak in self._job_sampling_peaks.items() if str(job_id) == message.job_id),
+            None,
+        )
+        if running is not None:
+            running.peak_resident_weights_mb = footprint.peak_resident_weights_mb
 
         baseline = self._model_metadata.get_baseline(footprint.model_name) if footprint.model_name else None
         store.observe_job_footprint(

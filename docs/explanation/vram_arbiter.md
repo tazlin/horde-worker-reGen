@@ -198,6 +198,13 @@ The arbiter keeps four concerns deliberately separate:
     its measurement cannot see the LoRA patch transient of a job that faulted before reporting. A LoRA job
     priced from the measurement therefore carries the same LoRA feature delta the static seed charges
     (`pricing.lora_feature_delta_mb`, read from hordelib's feature impact table).
+
+    The two sources meet in one more key. When a monolithic job's footprint arrives, the dispatcher keeps its
+    `peak_resident_weights_mb` beside the job's running sampling peak, and the commit on the job's result also
+    records the peak less those weights under `SAMPLE_ACTIVATION`. A partially loaded checkpoint's peak
+    carries only the share of the weights that fit, so this difference is the one figure that separates the
+    job's non-weight memory (activations, conditioning, the VAE once loaded beside the model, allocator cache)
+    from however much of the file was on the card. It prices the partial-load seat below.
     A backend that reports no footprint (an older one, or a dry run) leaves the memory-report path as the
     only source for every key. The store persists to `.horde_worker_regen/vram_footprints.json` (schema-versioned,
     atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration.
@@ -960,6 +967,51 @@ The admission margin itself is platform-aware (`vram_admission_noise_mb`): the p
 of it where the NVML reading is device-wide, with the operator's override winning whole. The device-free
 governor's pressure floors stay on the physics buffer regardless, because on a device-wide platform an
 over-commit is a hard OOM and those floors are what stand between growth and it.
+
+## The partial-load seat
+
+ComfyUI serves a checkpoint the card cannot hold whole by loading a share of its weights and streaming the
+rest across the bus on every step. Clearance prices the whole weights, so for an extra-large model on a card
+whose achievable ceiling sits below its full need, the full price is refused. The ceiling trigger's one real
+load is spent per job and card, so without another price a retried job has no priced way onto the card and
+samples unpriced at its lease-acquire timeout, where the same partial load serves it.
+
+Clearance therefore gives such a job a second price, `VramRequest.partial_seat_mb`
+(`pricing.partial_seat_mb`):
+
+```text
+seat = f x weights + max(activation, ComfyUI inference reserve)
+```
+
+- **Who qualifies.** A model at `ModelSizeTier.EXTRA_LARGE` or above, without LoRAs (a LoRA's patch
+  temporaries have crashed children natively in this regime), on a card the driver is not paging. Only
+  clearance sets the seat, since only its grant carries the free figure the child's partial load is sized
+  against. Dispatch and preload pricing are unchanged.
+- **Activation.** The static sampler-only peak less the weights, raised by the `SAMPLE_ACTIVATION`
+  watermark. ComfyUI's inference reserve (`effective_inference_reserve_mb`) is the free memory ComfyUI keeps
+  for those same activations, so the seat takes the larger of the two and adds no separate VAE term.
+- **Weight share.** `pricing.partial_seat_weight_fraction` sizes `f` so the bus moves the offloaded share
+  within one step: `f = 1 - seconds_per_step x upload_mb_per_second / weights`, clamped to
+  `[PARTIAL_SEAT_MIN_WEIGHT_FRACTION, PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION]` (0.25 to 0.5). The step time is
+  the performance model's expected rate for the job's signature. The upload rate is the median, over the card's
+  inference lanes, of each lane's last job's peak resident weights over its `ram_to_vram` seconds
+  (`pricing.job_upload_mb_per_second`). Those seconds include the text encoder's load and the page reads, so
+  the rate is below the bus's raw rate and errs toward a larger share. A missing figure, or a rate outside 256
+  to 65536 MB/s, prices the 0.5 fallback. The fallback is also the ceiling: a seat is only taken on a card
+  with nothing left to reclaim, where a refusal leaves the child to sample at its timeout with whatever fits,
+  so a larger share would only delay the same load.
+- **When it admits.** Only where the full need exceeds the achievable ceiling, and only on a converged-empty
+  card. Before convergence the request keeps its full charge, so the ladder and the whole-card teardown run
+  toward the most room the card can give, and `_ceiling_attempt_pending_convergence` keeps the verdict at
+  DEFER while reclaim remains. On a converged card the seat's outstanding part (net of what
+  the job holds) is priced against the reading ahead of the measured attempt, so a qualifying job never spends
+  or needs the one-shot. A seat that does not fit falls through to the ceiling attempt and the DENY unchanged.
+- **Grant and booking.** The grant is unchanged: it carries the measured device free the admission priced
+  against, and hordelib rebases ComfyUI's clamp on it, so the child loads every weight that fits after
+  ComfyUI's own holdback, at least the seat's share. The verdict carries `partial_seat`, and
+  `ClearancePlan.booking_mb` books the dispatch reservation at the remaining charge capped at the measured
+  available room, since the child grows only into what it was granted and a larger booking would stay
+  outstanding through its whole sample.
 
 ## Doomed model prevention
 

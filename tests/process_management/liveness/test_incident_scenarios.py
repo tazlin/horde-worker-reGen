@@ -232,6 +232,7 @@ from tests.process_management.liveness._dispatch_world import (
     _DECODE_SECONDS_PER_MEGAPIXEL,
     _FILLER_MODEL_CLASSES,
     _FLUX,
+    _KREA2,
     _POST_PROCESS_LANE_ID,
     _ROTATION_MODEL_CLASSES,
     _SAFETY_PROCESS_ID,
@@ -3082,6 +3083,84 @@ async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has()
     assert [job_id for _tick, _lane, job_id in world.clearance_grants] == [str(job.id_)], (
         f"{context}: the job entered its load-and-sample window without a grant "
         f"({world.clearance_grants}), so nothing here was decided by the clearance gate at all. "
+        f"{world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Partial-load seat: an extra-large checkpoint over the card's ceiling clears at the seat ComfyUI loads it into
+# --------------------------------------------------------------------------------------------------------
+
+_PARTIAL_SEAT_JOB_SHAPE = (768, 1344)
+"""The Krea2 job's resolution: a portrait megapixel, whose static sampling peak sits above a 16 GB card's
+achievable ceiling while its weights alone sit under it."""
+
+_PARTIAL_SEAT_JOB_COUNT = 3
+"""Jobs queued back to back, each a retry whose one real load on this card already ran."""
+
+_PARTIAL_SEAT_TICKS = _CLEARANCE_TIMEOUT_TICKS * (_PARTIAL_SEAT_JOB_COUNT + 1)
+"""Ticks the row runs: long enough for every job to sample even if each one waited its whole lease timeout."""
+
+
+def _partial_seat_world() -> _DispatchWorld:
+    """One lane under the clearance lease on a 16 GB card, serving the Krea2 class alone."""
+    return _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=_PARTIAL_SEAT_JOB_COUNT,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        tick_seconds=_TICK_SECONDS,
+        unload_models_from_vram_often=True,
+        extra_model_classes=(_KREA2,),
+    )
+
+
+async def test_r_an_extra_large_checkpoint_over_the_ceiling_clears_at_its_partial_load_seat() -> None:
+    """Every Krea2 job on a 16 GB card is cleared by clearance, none by its lease-acquire timeout.
+
+    The failure this encodes: the job's whole sampling peak sits above what the emptied card offers, so clearance
+    refused it as impossible unless it took the ceiling trigger's one real load. That load is spent per job and
+    card. A job retried after a sampling fault that was not a resource failure had already spent it, so it was
+    denied and held until its child sampled unpriced at the lease-acquire timeout, where ComfyUI loaded the
+    checkpoint partially and served it anyway. Each such job left the card dark for the whole timeout.
+
+    Clearance now prices an extra-large job without LoRAs at its partial-load seat on a converged card: a share
+    of its weights plus the larger of its measured activation and ComfyUI's inference reserve. The seat fits
+    the card, so each job is granted as soon as the card has nothing left to reclaim.
+    """
+    world = _partial_seat_world()
+    width, height = _PARTIAL_SEAT_JOB_SHAPE
+    jobs = [
+        make_job_pop_response(_KREA2.name, width=width, height=height, ddim_steps=8)
+        for _ in range(_PARTIAL_SEAT_JOB_COUNT)
+    ]
+    for job in jobs:
+        await world.pop(job)
+        assert job.id_ is not None
+        tracked = world._job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        # A single-card worker scopes the card as None. The retry's earlier attempt ran there and failed without
+        # a resource fault, which leaves the attempt spent and no continuation in progress.
+        tracked.measured_attempted_device_indices.add(None)
+    for _ in range(_PARTIAL_SEAT_TICKS):
+        await world.step()
+        if all(world.dispatch_tick(job) is not None for job in jobs):
+            break
+
+    context = "partial-load seat"
+    unsampled = [str(job.id_) for job in jobs if world.dispatch_tick(job) is None]
+    assert not unsampled, f"{context}: job(s) {unsampled} never sampled. {world.state_dump()}"
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, so a job the "
+        f"card serves by a partial load left it dark for {CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f}s. "
+        f"{world.state_dump()}"
+    )
+    granted = [job_id for _tick, _lane, job_id in world.clearance_grants]
+    assert granted == [str(job.id_) for job in jobs], (
+        f"{context}: clearance granted {granted}, so not every job was priced by the clearance gate. "
         f"{world.state_dump()}"
     )
 

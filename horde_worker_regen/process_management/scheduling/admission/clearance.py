@@ -46,7 +46,8 @@ class ClearanceDecision(StrEnum):
     BUDGET_INACTIVE = "budget_inactive"
     """The VRAM budget is off: grant without pricing."""
     ADMIT = "admit"
-    """The full materialisation fits: grant and re-book the dispatch reservation at what is left to materialise."""
+    """The full materialisation or the job's partial-load seat fits: grant and re-book the dispatch reservation at
+    what is left to materialise, capped at the granted room for a seat."""
     HOLD = "hold"
     """The materialisation does not fit yet: withhold, run the verdict's evictions, and re-ask next pass."""
 
@@ -91,6 +92,21 @@ class ClearancePlan:
         """The staged child's remaining materialisation charge, when priced."""
         return self.priced.candidate_delta_mb if self.priced is not None else None
 
+    @property
+    def booking_mb(self) -> float | None:
+        """The dispatch reservation a grant books: the remaining charge, capped at the room a partial seat grants.
+
+        A child admitted at its partial-load seat loads into the free room its grant carries and no further, so
+        a booking above that room would stay outstanding through its whole sample.
+        """
+        remaining_mb = self.candidate_delta_mb
+        if remaining_mb is None or self.verdict is None or not self.verdict.partial_seat:
+            return remaining_mb
+        available_mb = self.verdict.measured.available_mb
+        if available_mb is None:
+            return remaining_mb
+        return min(remaining_mb, max(0.0, available_mb))
+
 
 @dataclass(frozen=True)
 class StagedWaiterClock:
@@ -103,6 +119,10 @@ class StagedWaiterClock:
     """The card's measured RAM-to-VRAM load seconds, or None when none is measured yet."""
     lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG
     """Where the waiter's starvation episode stands with the service-lane rungs applied for it."""
+    seconds_per_step: float | None = None
+    """The performance model's expected seconds per sampling step for the waiter's job, or None when unknown."""
+    upload_mb_per_second: float | None = None
+    """The rate (MB/s) the card has measured jobs putting their weights on it, or None when none is measured."""
 
 
 @dataclass
@@ -317,6 +337,11 @@ def decide_clearance_admit(
                 load_seconds=waiter_clock.load_seconds,
             ),
             lane_rung_grade=waiter_clock.lane_rung_grade,
+            seat_weight_fraction=pricing.partial_seat_weight_fraction(
+                weights_mb=predict_job_weight_mb(snapshot.queue.payloads[job_id], job.baseline),
+                seconds_per_step=waiter_clock.seconds_per_step,
+                upload_mb_per_second=waiter_clock.upload_mb_per_second,
+            ),
         ),
         nets_own_dispatch_reservation=True,
         sibling_staging_relief_mb=sibling_staging_relief_mb(snapshot, job_id, process_id),

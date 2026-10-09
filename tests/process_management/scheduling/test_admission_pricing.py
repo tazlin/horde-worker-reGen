@@ -414,3 +414,74 @@ class TestDispatchStagingCharge:
             )
             is None
         )
+
+
+# ---- the partial-load seat's weight share
+
+
+@pytest.mark.parametrize(
+    ("seconds_per_step", "upload_mb_per_second"),
+    [
+        (None, 4000.0),
+        (1.0, None),
+        (1.0, 10.0),
+        (1.0, 1_000_000.0),
+        (0.0, 4000.0),
+    ],
+    ids=["no_step_time", "no_upload_rate", "implausibly_slow_upload", "implausibly_fast_upload", "zero_step_time"],
+)
+def test_the_seat_weight_share_falls_back_without_a_usable_measurement(
+    seconds_per_step: float | None,
+    upload_mb_per_second: float | None,
+) -> None:
+    """A missing or implausible step time or upload rate prices the fallback share."""
+    fraction = pricing.partial_seat_weight_fraction(
+        weights_mb=12000.0,
+        seconds_per_step=seconds_per_step,
+        upload_mb_per_second=upload_mb_per_second,
+    )
+    assert fraction == pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION
+
+
+@pytest.mark.parametrize(
+    ("seconds_per_step", "upload_mb_per_second", "expected"),
+    [
+        (1.0, 7200.0, 0.4),
+        (1.0, 11000.0, pricing.PARTIAL_SEAT_MIN_WEIGHT_FRACTION),
+        (1.37, 1100.0, pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION),
+    ],
+    ids=["streams_its_share_in_one_step", "fast_bus_floors_the_share", "slow_bus_caps_at_the_fallback"],
+)
+def test_the_seat_weight_share_streams_the_offloaded_weights_within_one_step(
+    seconds_per_step: float,
+    upload_mb_per_second: float,
+    expected: float,
+) -> None:
+    """The share left off the card is what the bus moves in one step's time, clamped to the share's bounds."""
+    fraction = pricing.partial_seat_weight_fraction(
+        weights_mb=12000.0,
+        seconds_per_step=seconds_per_step,
+        upload_mb_per_second=upload_mb_per_second,
+    )
+    assert fraction == pytest.approx(expected)
+
+
+def test_a_jobs_upload_rate_is_its_peak_weights_over_its_device_load_seconds() -> None:
+    """The rate is what the job put on the card over the seconds its device loads took."""
+    from hordelib.metrics import JobPhaseMetrics, JobVramFootprint, ModelLoadEvent
+
+    def load(phase: str, seconds: float) -> ModelLoadEvent:
+        return ModelLoadEvent(model_name="m", phase=phase, duration_seconds=seconds, timestamp=0.0)  # type: ignore[arg-type]
+
+    metrics = JobPhaseMetrics(
+        model_loads=[load("disk_to_ram", 9.0), load("ram_to_vram", 5.0), load("ram_to_vram", 3.0)],
+        vram_footprint=JobVramFootprint(peak_resident_weights_mb=8000.0),
+    )
+    assert pricing.job_upload_mb_per_second(metrics) == pytest.approx(1000.0)
+
+    assert pricing.job_upload_mb_per_second(JobPhaseMetrics(model_loads=[load("ram_to_vram", 5.0)])) is None
+    no_upload = JobPhaseMetrics(
+        model_loads=[load("disk_to_ram", 9.0)],
+        vram_footprint=JobVramFootprint(peak_resident_weights_mb=8000.0),
+    )
+    assert pricing.job_upload_mb_per_second(no_upload) is None

@@ -66,6 +66,8 @@ class StagedWaiterTerms:
     """The clock reading by which its measured-load probe must be eligible."""
     lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG
     """Where the waiter's starvation episode stands with the service-lane rungs applied for it."""
+    seat_weight_fraction: float = pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION
+    """The share of the checkpoint's weights a partial-load seat must hold (:func:`pricing.partial_seat_mb`)."""
 
 
 def head_starved_seconds(snapshot: SchedulingSnapshot, job_id: str) -> float:
@@ -112,6 +114,9 @@ def build_materialization_request(
     rule that an aux-prepared job beside live work on the card re-prices its activation even where its weights
     are resident; a preload never does. The idle-context teardown is widened in the measured frame through the
     arbiter's deficit, the one thing here that is not read from the snapshot.
+
+    A staged waiter's dispatch also carries its partial-load seat, since only clearance hands the child a grant
+    whose free figure its partial load is sized against.
     """
     job = snapshot.queue.jobs[job_id]
     payload = snapshot.queue.payloads[job_id]
@@ -175,6 +180,17 @@ def build_materialization_request(
         and bool(pricing.active_jobs_on_card(snapshot, device_index))
     )
     config = snapshot.config_for(device_index)
+    partial_seat_mb = (
+        pricing.partial_seat_mb(
+            snapshot,
+            payload,
+            baseline,
+            device_index=device_index,
+            weight_fraction=staged_waiter.seat_weight_fraction,
+        )
+        if staged_waiter is not None and kind is VramRequestKind.MONOLITHIC_DISPATCH
+        else None
+    )
     request = VramRequest(
         kind=kind,
         job_label=str(job.model),
@@ -198,6 +214,7 @@ def build_materialization_request(
         is_head_of_queue=is_head_of_queue,
         head_job_id=job_id,
         wddm_paging_active=snapshot.ledgers.retention.wddm_paging_active,
+        partial_seat_mb=partial_seat_mb,
         candidate_measured=pricing.sampling_peak_measured(
             snapshot,
             payload,

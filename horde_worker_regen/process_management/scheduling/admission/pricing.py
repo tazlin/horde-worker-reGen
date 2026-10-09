@@ -12,6 +12,7 @@ from collections.abc import Sequence
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from hordelib.metrics import JobPhaseMetrics
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -21,6 +22,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
     StreamForecast,
     _job_feature_kinds,
+    effective_inference_reserve_mb,
     forecast_weight_streaming,
     predict_job_decode_spike_mb,
     predict_job_footprint_mb,
@@ -399,6 +401,127 @@ def candidate_delta_mb(
     if candidate_weights_resident(snapshot, job.model, process_id):
         resident_credit_mb = predict_job_weight_mb(job, baseline) or 0.0
     return max(0.0, gross_mb - resident_credit_mb)
+
+
+# ---- the partial-load seat
+
+PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION = 0.5
+"""The share of an extra-large checkpoint's weights a partial-load seat must hold while no step time or upload
+rate is measured, and the most the derived share may ask.
+
+It is also the ceiling of the derived share. A seat is only priced on a card that has nothing left to reclaim,
+where a refusal leaves the child to sample at its lease-acquire timeout with whatever share fits anyway, so a
+larger share would only delay the same load by the timeout."""
+
+PARTIAL_SEAT_MIN_WEIGHT_FRACTION = 0.25
+"""The smallest share of the weights a seat may hold however fast the bus, so a sample never streams most of
+its model across it on every step."""
+
+_PLAUSIBLE_UPLOAD_MB_PER_SECOND = (256.0, 65536.0)
+"""The range (MB/s) a measured weight-upload rate must fall in to size a seat.
+
+The top is a PCIe 5.0 x16 link. A rate below the bottom is a load that waited on disk, which says nothing
+about the bus a partial load streams its offloaded weights across."""
+
+
+def job_upload_mb_per_second(phase_metrics: JobPhaseMetrics) -> float | None:
+    """Return the rate (MB/s) a finished job put its weights on the card, or None when it uploaded nothing.
+
+    The weights the job held at its peak over the seconds its device loads took. The loads include the text
+    encoder's and reading the checkpoint's pages back from the host cache, so the figure is below the bus's
+    raw rate, which keeps the share of weights a seat derives from it on the cautious side.
+    """
+    footprint = phase_metrics.vram_footprint
+    if footprint is None or footprint.peak_resident_weights_mb is None or footprint.peak_resident_weights_mb <= 0:
+        return None
+    upload_seconds = sum(
+        model_load.duration_seconds for model_load in phase_metrics.model_loads if model_load.phase == "ram_to_vram"
+    )
+    if upload_seconds <= 0.0:
+        return None
+    return footprint.peak_resident_weights_mb / upload_seconds
+
+
+def partial_seat_weight_fraction(
+    *,
+    weights_mb: float | None,
+    seconds_per_step: float | None,
+    upload_mb_per_second: float | None,
+) -> float:
+    """Return the share of a checkpoint's weights its partial-load seat must hold.
+
+    The weights left off the card cross the bus on every step, so the share is the one whose offloaded part the
+    measured upload rate moves within one step's time: ``1 - seconds_per_step * upload_mb_per_second /
+    weights_mb``, clamped to :data:`PARTIAL_SEAT_MIN_WEIGHT_FRACTION` and
+    :data:`PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION`. A missing or non-positive figure, or an upload rate outside
+    :data:`_PLAUSIBLE_UPLOAD_MB_PER_SECOND`, prices the fallback share.
+    """
+    low_rate_mb, high_rate_mb = _PLAUSIBLE_UPLOAD_MB_PER_SECOND
+    if (
+        weights_mb is None
+        or weights_mb <= 0.0
+        or seconds_per_step is None
+        or seconds_per_step <= 0.0
+        or upload_mb_per_second is None
+        or not low_rate_mb <= upload_mb_per_second <= high_rate_mb
+    ):
+        return PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION
+    streamed_share = seconds_per_step * upload_mb_per_second / weights_mb
+    return min(PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION, max(PARTIAL_SEAT_MIN_WEIGHT_FRACTION, 1.0 - streamed_share))
+
+
+def partial_seat_activation_mb(
+    snapshot: SchedulingSnapshot,
+    job: ImageGenerateJobPopResponse,
+    baseline: str | None,
+) -> float | None:
+    """Return the non-weight memory (MB) a whole job needs, or None when its weights or peak cannot be predicted.
+
+    The static seed is the sampler-only peak less the weights, raised by the learned activation watermark for
+    the job's key. The learned figure carries the VAE and the encoded conditioning the seed leaves out.
+    """
+    weights_mb = predict_job_weight_mb(job, baseline)
+    sampler_only_mb = predict_job_sampler_only_vram_mb(job, baseline)
+    if weights_mb is None or sampler_only_mb is None:
+        return None
+    static_seed_mb = max(0.0, sampler_only_mb - weights_mb)
+    store = snapshot.services.footprint_store
+    key = sampling_footprint_key(job, baseline, stage=FootprintStage.SAMPLE_ACTIVATION)
+    if store is None or key is None:
+        return static_seed_mb
+    return store.estimate_mb(key, static_seed_mb=static_seed_mb)
+
+
+def partial_seat_mb(
+    snapshot: SchedulingSnapshot,
+    job: ImageGenerateJobPopResponse,
+    baseline: str | None,
+    *,
+    device_index: int | None,
+    weight_fraction: float,
+) -> float | None:
+    """Return the whole need (MB) of a partial load of the job's checkpoint, or None when the job does not qualify.
+
+    ComfyUI serves an extra-large checkpoint the card cannot hold whole by loading a share of its weights. The
+    seat is that share plus the larger of the job's non-weight memory and ComfyUI's inference reserve, since
+    the reserve is the free memory ComfyUI keeps for those same activations. A LoRA job never qualifies, because
+    its patch temporaries crash a child natively in this regime, and neither does any job on a card whose driver
+    is paging the worker's allocations.
+    """
+    if snapshot.ledgers.retention.wddm_paging_active:
+        return None
+    if size_tier(snapshot, job.model) < ModelSizeTier.EXTRA_LARGE:
+        return None
+    from hordelib.feature_impact import FEATURE_KIND
+
+    if FEATURE_KIND.lora in _job_feature_kinds(job):
+        return None
+    weights_mb = predict_job_weight_mb(job, baseline)
+    activation_mb = partial_seat_activation_mb(snapshot, job, baseline)
+    if weights_mb is None or activation_mb is None:
+        return None
+    comfy_reserve_mb = effective_inference_reserve_mb(snapshot.card(device_index).total_vram_mb, 0.0)
+    return weight_fraction * weights_mb + max(activation_mb, comfy_reserve_mb)
 
 
 # ---- the streaming forecast and the co-resident maximum

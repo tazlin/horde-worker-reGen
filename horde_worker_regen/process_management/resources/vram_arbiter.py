@@ -46,7 +46,10 @@ does or does not fit:
   REDUCE_LIVE_CONTEXTS actuation and re-asks once the room frees.
 - A candidate that cannot fit an even fully-cleared card DENIES: no escalation on this card could seat it,
   unless it clears the achievable ceiling by so little that the prediction is the likelier explanation (see
-  :data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION`), where one real load settles it instead.
+  :data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION`), where one real load settles it instead. A staged job that
+  carries a partial-load seat (:attr:`VramRequest.partial_seat_mb`) FITS at that seat first, once the card
+  has nothing left to reclaim and the seat fits the reading, since ComfyUI serves it by loading a share of its
+  weights.
 - A card with no device-free reading yet DEFERS with a throttled diagnostic: the primary admission input is
   absent, so the arbiter neither denies nor fabricates a fictional free figure; it waits for the next reading.
 
@@ -79,7 +82,7 @@ log for the post-mortem.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from loguru import logger
@@ -429,6 +432,12 @@ class VramRequest:
     """Whether the driver is demand-paging the worker's own allocations on this card. A measured attempt is
     judged by what the card reports, and a paging card reports free memory it does not have, so an attempt
     made then decides by dying rather than by measurement."""
+    partial_seat_mb: float | None = None
+    """The job's whole need (MB) when ComfyUI loads its checkpoint partially, or None when the job has no such
+    seat. Set by clearance alone, for an extra-large job without LoRAs off a paging card.
+
+    Consulted only where the full need exceeds the achievable ceiling: there the partial load is the only way
+    the card serves the job, and it admits once the card has nothing left to reclaim and the seat fits."""
     head_outstanding_mb: float | None = None
     """For a non-head request, the true head of queue's priced outstanding demand (MB) on this device, or None
     when unknown or when this request is itself the head. Head protection: a non-head request that fits is still
@@ -691,6 +700,10 @@ class VramVerdict:
     :data:`_MEASURED_ATTEMPT_BAND_MB`). The scheduler tags the job on this flag so a subsequent child OOM is
     routed to a terminal scheduling-recovery fault that arms the ceiling hold with real-attempt evidence, rather
     than to the ordinary degraded retry. False for every arithmetic fit and every non-FITS disposition."""
+    partial_seat: bool = False
+    """True when this FITS admits the job at its :attr:`VramRequest.partial_seat_mb`, so its full charge does
+    not fit the card. The child loads what the grant's free figure allows, which the caller books in place of
+    the full charge."""
     room: AdmissionRoom | None = None
     """The measured room decomposed by tenant and reclaim rung for a non-admit on a card with a device-free
     reading, so the refusal names who holds the card and what could return it; None for an admit, an
@@ -921,6 +934,10 @@ class VramArbiter:
         # verified teardown, every other non-fitting demand rides the per-cycle reclaim ladder and re-asks once
         # the room frees.
         structurally_impossible = self._structurally_impossible(request, state)
+        if structurally_impossible:
+            partial_seat_verdict = self._partial_seat_admission(request, measured, state)
+            if partial_seat_verdict is not None:
+                return partial_seat_verdict
         measured_attempt = self._measured_attempt(request, measured, state, impossible=structurally_impossible)
         if measured_attempt is not None:
             return measured_attempt
@@ -1182,11 +1199,61 @@ class VramArbiter:
         ceiling_mb = state.achievable_ceiling_mb()
         if ceiling_mb is None:
             return False
-        if not self._ceiling_attempt_candidate_eligible(request, ceiling_mb):
+        if not (
+            self._ceiling_attempt_candidate_eligible(request, ceiling_mb)
+            or self._partial_seat_eligible(request, state)
+        ):
             return False
         if self._card_converged_empty(request, measured):
             return False
         return not self.any_other_device_can_seat(request, exclude_device_index=request.device_index)
+
+    @staticmethod
+    def _partial_seat_eligible(request: VramRequest, state: DeviceVramState) -> bool:
+        """Whether a staged dispatch carries a partial-load seat the emptied card could hold.
+
+        A paging card is excluded here as well as at pricing, since the seat fit is judged by the card's own
+        reading and a paging card reports memory it does not have.
+        """
+        if request.partial_seat_mb is None or request.kind is not VramRequestKind.MONOLITHIC_DISPATCH:
+            return False
+        if request.wddm_paging_active:
+            return False
+        ceiling_mb = state.achievable_ceiling_mb()
+        return ceiling_mb is not None and request.partial_seat_mb <= ceiling_mb
+
+    def _partial_seat_admission(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+        state: DeviceVramState,
+    ) -> VramVerdict | None:
+        """Return a FITS at the job's partial-load seat, or None to fall through to the ceiling paths.
+
+        The card must have nothing left to reclaim, so the seat is taken only once the most room the card can
+        give is in the reading: before that the full charge keeps driving the reclaim, and a fuller load samples
+        faster. The seat's outstanding part, net of what the job already holds, must then fit the reading.
+        """
+        if not self._partial_seat_eligible(request, state) or request.partial_seat_mb is None:
+            return None
+        if not self._card_converged_empty(request, measured):
+            return None
+        seat_outstanding_mb = max(0.0, request.partial_seat_mb - max(0.0, request.candidate_held_mb))
+        seat_measured = self._measured(replace(request, candidate_delta_mb=seat_outstanding_mb), state)
+        if not seat_measured.fits:
+            return None
+        return VramVerdict(
+            disposition=VramDisposition.FITS,
+            request_kind=request.kind,
+            device_index=request.device_index,
+            reason=(
+                "partial-load seat: the full charge exceeds this card's achievable ceiling, and the share of the "
+                "weights ComfyUI loads beside the job's activation fits the emptied card"
+            ),
+            measured=seat_measured,
+            detail=seat_measured.reason(),
+            partial_seat=True,
+        )
 
     def _ceiling_attempt_candidate_eligible(self, request: VramRequest, ceiling_mb: float) -> bool:
         """Whether an over-ceiling candidate is bounded enough to earn convergence and one real attempt.

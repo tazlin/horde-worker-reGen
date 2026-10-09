@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import statistics
 import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -6009,7 +6010,7 @@ class InferenceScheduler:
                 self._mark_measured_attempt(job, plan.priced.request, device_index=plan.priced.device_index)
             self._resolve_clearance_hold(job)
             self._note_clearance_granted(job)
-            self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.candidate_delta_mb)
+            self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.booking_mb)
             return True
 
         applied = self._actuate_materialization_verdict(
@@ -6092,7 +6093,11 @@ class InferenceScheduler:
         *,
         lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG,
     ) -> StagedWaiterClock:
-        """Return the staged job's clearance clock, its card's measured load seconds and its lane-rung grade."""
+        """Return the staged job's clearance clock, its card's measured load seconds and its lane-rung grade.
+
+        The clock also carries the job's expected seconds per step and the card's measured weight-upload rate,
+        which size the share of weights a partial-load seat must hold.
+        """
         since = self._clearance_starved_since.get(str(job.id_)) if job is not None and job.id_ is not None else None
         return StagedWaiterClock(
             starved_seconds=0.0 if since is None else max(0.0, self._clock() - since),
@@ -6102,7 +6107,36 @@ class InferenceScheduler:
                 else None
             ),
             lane_rung_grade=lane_rung_grade,
+            seconds_per_step=self._expected_seconds_per_step(job) if job is not None else None,
+            upload_mb_per_second=(
+                self._card_upload_mb_per_second(process_info.device_index) if process_info is not None else None
+            ),
         )
+
+    def _expected_seconds_per_step(self, job: ImageGenerateJobPopResponse) -> float | None:
+        """The performance model's expected seconds per sampling step for the job, or None when it has no rate."""
+        if self._performance_model is None or job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        signature = signature_from_job(job, str(baseline) if baseline is not None else None)
+        if signature is None:
+            return None
+        iterations_per_second = self._performance_model.expected_its(signature)
+        if iterations_per_second is None or iterations_per_second <= 0.0:
+            return None
+        return 1.0 / iterations_per_second
+
+    def _card_upload_mb_per_second(self, device_index: int) -> float | None:
+        """The median weight-upload rate (MB/s) of the last job each inference lane on the card reported."""
+        rates = [
+            rate
+            for process_info in self._process_map.values()
+            if process_info.process_type is HordeProcessType.INFERENCE
+            and process_info.device_index == device_index
+            and process_info.last_job_metrics is not None
+            and (rate := pricing.job_upload_mb_per_second(process_info.last_job_metrics)) is not None
+        ]
+        return statistics.median(rates) if rates else None
 
     def _stop_staged_waiter_clock(self, job: ImageGenerateJobPopResponse | None) -> None:
         """Stop the staged job's clearance clock and end its starvation episode.
@@ -7269,8 +7303,9 @@ class InferenceScheduler:
         """Re-book a staged job's dispatch reservation at what clearance priced it to materialise.
 
         ``remaining_mb`` is the clearance price, ``staged_materialization_delta_mb``: the full peak net of
-        what the lane already reports. The booking decays by growth past that same report, so it reaches zero as
-        the job reaches its peak. Booked gross against that baseline, the staged holdings would stay outstanding
+        what the lane already reports, capped at the granted room for a job admitted at its partial-load seat.
+        The booking decays by growth past that same report, so it reaches zero as the job reaches its peak.
+        Booked gross against that baseline, the staged holdings would stay outstanding
         through the whole sample and be charged against the next waiter. Re-registering the same
         ``(DISPATCH_ADMISSION_FLOW, job id)`` entry refreshes it in place and resets its watermark, so the upgrade
         is not a second, additive booking.

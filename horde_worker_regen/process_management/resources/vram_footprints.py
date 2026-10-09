@@ -263,6 +263,13 @@ class FootprintStage(enum.StrEnum):
     than an isolated sampler's), and watermarks are raise-only: folding a monolithic whole-job peak into the
     isolated key would permanently over-price a disaggregated sampler and deny the second concurrent sampler the
     card physically holds."""
+    SAMPLE_ACTIVATION = "sample_activation"
+    """A monolithic job's sampling peak less the weights it held on the card at its peak: the non-weight memory
+    a whole job needs (activations, conditioning, the VAE once loaded beside the model, allocator cache).
+
+    Kept apart from :attr:`SAMPLE` because a partially loaded checkpoint's peak carries only the share of the
+    weights that fit, and a :attr:`SAMPLE` reading cannot be split into weights and the rest after the fact.
+    Prices the non-weight term of a partial-load seat."""
     DECODE = "decode"
     """The VAE-decode stage."""
     ENCODE = "encode"
@@ -392,10 +399,10 @@ unrepresentative run (a job that faulted mid-sample, a slot that never finished 
 consumer into planning below the static seed. A per-job window prices at its second-highest job, and with five
 jobs that figure is matched or exceeded by two of them, which a lone outlier cannot do."""
 
-_PER_JOB_STAGES = frozenset({FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED})
+_PER_JOB_STAGES = frozenset({FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED, FootprintStage.SAMPLE_ACTIVATION})
 """Stages whose window holds one figure per job, priced at the window's second-highest entry.
 
-Both activation stages are fed once per job. The at-rest stages are fed a reading per report and keep the
+The activation stages are fed once per job. The at-rest stages are fed a reading per report and keep the
 window's maximum, since their entries are repeated readings of one steady state."""
 
 _MEASURED_ESTIMATE_MARGIN = 1.10

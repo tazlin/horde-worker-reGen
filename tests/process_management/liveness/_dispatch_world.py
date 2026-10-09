@@ -243,8 +243,13 @@ _SAME_BASELINE_MODEL_CLASSES = (_SDXL_D, _SDXL_E, _SDXL_F, _SDXL_G)
 Same weight class throughout, so what separates one job's cost from another's is only whether its checkpoint
 is still on a lane, in its pages, or on disk."""
 
+# krea2_turbo: 12600 MB core weights, EXTRA_LARGE by tier, and a static sampling peak above a 16 GB card's
+# achievable ceiling, so on that card it is served only by a partial load.
+_KREA2 = _ModelClass("krea2", "Krea2-Turbo_fp8", KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo, 12600.0)
+
 _KNOWN_MODEL_CLASSES = (
     *_MODEL_CLASSES,
+    _KREA2,
     *_FILLER_MODEL_CLASSES,
     *_ROTATION_MODEL_CLASSES,
     *_SAME_BASELINE_MODEL_CLASSES,

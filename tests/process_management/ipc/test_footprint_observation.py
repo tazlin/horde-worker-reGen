@@ -651,3 +651,77 @@ async def test_a_sampling_peak_at_the_card_size_is_not_attributed() -> None:
     assert job.id_ is not None
     dispatcher._commit_job_sampling_peak(job.id_)
     assert len(store) == 1
+
+
+def _job_metrics_message(job_id: str, *, peak_resident_weights_mb: float | None) -> HordeJobMetricsMessage:
+    """The metrics a child sends as its job ends, with its measured footprint when it has one."""
+    from hordelib.metrics import JobVramFootprint
+
+    footprint = (
+        JobVramFootprint(peak_resident_weights_mb=peak_resident_weights_mb, model_name=_MODEL)
+        if peak_resident_weights_mb is not None
+        else None
+    )
+    return HordeJobMetricsMessage(
+        process_id=1,
+        process_launch_identifier=0,
+        info="Job metrics",
+        job_id=job_id,
+        phase_metrics=JobPhaseMetrics(vram_footprint=footprint),
+    )
+
+
+def _activation_key() -> FootprintKey:
+    return FootprintKey(
+        model_baseline=str(_BASELINE),
+        resolution_bucket=ResolutionBucket.LE_1024,
+        platform=sys.platform,
+        stage=FootprintStage.SAMPLE_ACTIVATION,
+    )
+
+
+async def test_a_jobs_activation_is_its_sampling_peak_less_its_resident_weights() -> None:
+    """The job's sampling peak less the weights its footprint reports lands under the activation key.
+
+    A partially loaded checkpoint's peak carries only the weights that fit, so the peak less those weights is
+    the non-weight memory the job needed, whatever share of the file was on the card.
+    """
+    process_info = make_mock_process_info(1, model_name=_MODEL)
+    job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+    process_info.record_inference_ownership(job, attempt_ordinal=1)
+    job_tracker = JobTracker()
+    await mark_job_in_progress_async(job_tracker, job)
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(
+        process_map=ProcessMap({1: process_info}), job_tracker=job_tracker, store=store
+    )
+
+    dispatcher._handle_memory_report(_memory_message(1, peak_mb=11000))
+    dispatcher._observe_job_footprint(_job_metrics_message(str(job.id_), peak_resident_weights_mb=6500.0))
+    assert job.id_ is not None
+    dispatcher._commit_job_sampling_peak(job.id_)
+
+    observation = store.get_observation(_activation_key())
+    assert observation is not None
+    assert observation.watermark_mb == pytest.approx(4500.0)
+
+
+async def test_a_job_without_a_measured_footprint_records_no_activation() -> None:
+    """Without the weights the job held, its peak cannot be split, so only the sampling key learns from it."""
+    process_info = make_mock_process_info(1, model_name=_MODEL)
+    job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+    process_info.record_inference_ownership(job, attempt_ordinal=1)
+    job_tracker = JobTracker()
+    await mark_job_in_progress_async(job_tracker, job)
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(
+        process_map=ProcessMap({1: process_info}), job_tracker=job_tracker, store=store
+    )
+
+    dispatcher._handle_memory_report(_memory_message(1, peak_mb=11000))
+    dispatcher._observe_job_footprint(_job_metrics_message(str(job.id_), peak_resident_weights_mb=None))
+    assert job.id_ is not None
+    dispatcher._commit_job_sampling_peak(job.id_)
+
+    assert store.get_observation(_activation_key()) is None
+    assert len(store) == 1
