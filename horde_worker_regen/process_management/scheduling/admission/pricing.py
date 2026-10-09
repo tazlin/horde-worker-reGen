@@ -20,6 +20,7 @@ from horde_worker_regen.process_management.resources.admission_identity import a
 from horde_worker_regen.process_management.resources.resource_budget import (
     _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
     StreamForecast,
+    _job_feature_kinds,
     forecast_weight_streaming,
     predict_job_decode_spike_mb,
     predict_job_footprint_mb,
@@ -251,7 +252,9 @@ def learned_sampling_peak_mb(
     """The static sampling-peak seed raised by the learned watermark, lowered by the key's trusted measurement.
 
     Never lowered below the job's own core weights, which is what stops a light sibling's measurements in the
-    same band from underpricing a heavy checkpoint.
+    same band from underpricing a heavy checkpoint. A LoRA job's measured figure carries the LoRA delta the seed
+    charges (:func:`lora_feature_delta_mb`): the key has no LoRA axis, so its measurement is the maximum over
+    mixed jobs and cannot see the patch transient of a LoRA job that faulted before reporting it.
     """
     store = snapshot.services.footprint_store
     if store is None:
@@ -264,11 +267,40 @@ def learned_sampling_peak_mb(
     if job.model is not None:
         raw_mb = store.measured_estimate_mb(key)
         if raw_mb is not None:
-            measured_mb = max(0.0, raw_mb - snapshot.context_constant_mb)
+            measured_mb = max(0.0, raw_mb - snapshot.context_constant_mb) + lora_feature_delta_mb(job, baseline)
     if measured_mb is None or measured_mb >= raised_mb:
         return raised_mb
     floor_mb = predict_job_weight_mb(job, baseline) or 0.0
     return min(raised_mb, max(measured_mb, floor_mb))
+
+
+def lora_feature_delta_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float:
+    """The sampling-phase VRAM (MB) the static seed charges for the job's LoRAs, zero for a job without any.
+
+    Read as hordelib's burden estimate with the LoRA feature less the same estimate without it, so a
+    per-baseline or per-megapixel term in the feature table carries over unchanged.
+    """
+    from hordelib.feature_impact import FEATURE_KIND, estimate_job_burden
+
+    if FEATURE_KIND.lora not in _job_feature_kinds(job):
+        return 0.0
+    baseline_name = baseline if baseline is not None else ""
+    batch = max(1, job.payload.n_iter)
+    with_lora = estimate_job_burden(
+        baseline=baseline_name,
+        width=job.payload.width,
+        height=job.payload.height,
+        batch=batch,
+        features=[FEATURE_KIND.lora],
+    )
+    without_lora = estimate_job_burden(
+        baseline=baseline_name,
+        width=job.payload.width,
+        height=job.payload.height,
+        batch=batch,
+        features=[],
+    )
+    return float(max(0, with_lora.vram_sampling_mb - without_lora.vram_sampling_mb))
 
 
 def candidate_weights_resident(snapshot: SchedulingSnapshot, model: str | None, process_id: int | None) -> bool:

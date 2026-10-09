@@ -4938,7 +4938,13 @@ class InferenceScheduler:
             return static_seed_mb
         raised_mb = store.estimate_mb(key, static_seed_mb=static_seed_mb)
         measured_mb = self._measured_sampling_peak_mb(job, key)
-        if measured_mb is None or measured_mb >= raised_mb:
+        if measured_mb is None:
+            return raised_mb
+        # The footprint key has no LoRA axis, so a measurement cannot see the patch transient of a LoRA job
+        # that faulted; the seed's LoRA delta rides on the measured price, as pricing.learned_sampling_peak_mb
+        # does.
+        measured_mb += pricing.lora_feature_delta_mb(job, baseline)
+        if measured_mb >= raised_mb:
             return raised_mb
         floor_mb = predict_job_weight_mb(job, baseline) or 0.0
         return min(raised_mb, max(measured_mb, floor_mb))

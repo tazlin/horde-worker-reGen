@@ -10,7 +10,9 @@ from __future__ import annotations
 import sys
 from unittest.mock import Mock
 
+import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -19,11 +21,14 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
+    predict_job_weight_mb,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    _MIN_OBSERVATIONS_FOR_MEASURED,
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
@@ -172,6 +177,59 @@ class TestForecastAndDeltas:
             assert scheduler_mb == predict_job_sampler_only_vram_mb(candidate, baseline)
         whole_job_mb = predict_job_sampling_vram_mb(candidate, baseline)
         assert whole_job_mb is not None and scheduler_mb is not None and scheduler_mb < whole_job_mb
+
+    async def test_a_lora_job_priced_from_the_measurement_carries_the_seed_lora_delta(self) -> None:
+        """Two jobs share one trusted measurement; the LoRA job prices above it by the seed's LoRA term.
+
+        The sampling key has no LoRA axis, so the measurement cannot tell the two jobs apart. The job without
+        LoRAs keeps the measured price unchanged.
+        """
+        reference = {
+            "sdxl_model": make_mock_model_reference_record(
+                "sdxl_model",
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+        }
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: _slot(0, model=None)}),  # type: ignore[arg-type]
+            job_tracker=JobTracker(),
+            model_metadata=make_test_model_metadata(reference),
+        )
+        plain_job = make_job_pop_response(model="sdxl_model", width=1024, height=1024)
+        lora_job = make_job_pop_response(
+            model="sdxl_model",
+            width=1024,
+            height=1024,
+            loras=[LorasPayloadEntry(name="detail_lora")],
+        )
+        baseline = scheduler._model_metadata.get_baseline("sdxl_model")  # type: ignore[attr-defined]
+        plain_seed_mb = predict_job_sampling_vram_mb(plain_job, baseline)
+        lora_seed_mb = predict_job_sampling_vram_mb(lora_job, baseline)
+        assert plain_seed_mb is not None and lora_seed_mb is not None
+        seed_lora_delta_mb = lora_seed_mb - plain_seed_mb
+        assert seed_lora_delta_mb > 0.0
+        key = sampling_footprint_key(plain_job, baseline, stage=FootprintStage.SAMPLE)
+        assert key is not None
+        assert key == sampling_footprint_key(lora_job, baseline, stage=FootprintStage.SAMPLE)
+        floor_mb = predict_job_weight_mb(plain_job, baseline) or 0.0
+        store = LearnedFootprintStore()
+        for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
+            store.observe_peak(key, floor_mb + 100.0)
+        scheduler.set_footprint_store(store)
+        snapshot = scheduler.snapshot()
+        measured_estimate_mb = store.measured_estimate_mb(key)
+        assert measured_estimate_mb is not None
+
+        plain_mb = pricing.learned_sampling_peak_mb(
+            snapshot, plain_job, baseline, static_seed_mb=plain_seed_mb, stage=FootprintStage.SAMPLE
+        )
+        lora_mb = pricing.learned_sampling_peak_mb(
+            snapshot, lora_job, baseline, static_seed_mb=lora_seed_mb, stage=FootprintStage.SAMPLE
+        )
+
+        assert floor_mb < plain_mb < plain_seed_mb, "the trusted measurement prices the job without LoRAs"
+        assert plain_mb == pytest.approx(measured_estimate_mb - snapshot.context_constant_mb)
+        assert lora_mb == pytest.approx(plain_mb + seed_lora_delta_mb)
 
     async def test_max_coresident_sizes_from_the_card_total_and_overheads(self) -> None:
         """The structural depth is the loader's context plus the marginal contexts the remaining total seats."""

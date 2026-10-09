@@ -188,7 +188,10 @@ The arbiter keeps four concerns deliberately separate:
     observed enough, and never below the job's own core weights. That measured authority is key-wide: a
     model's first job after a start is priced from its baseline-and-resolution population rather than held
     to the all-time watermark, and the weight floor keeps a light sibling's readings from underpricing a
-    heavy checkpoint.
+    heavy checkpoint. The activation keys have no LoRA axis, so LoRA and plain jobs feed one population and
+    its measurement cannot see the LoRA patch transient of a job that faulted before reporting. A LoRA job
+    priced from the measurement therefore carries the same LoRA feature delta the static seed charges
+    (`pricing.lora_feature_delta_mb`, read from hordelib's feature impact table).
     A backend that reports no footprint (an older one, or a dry run) leaves the memory-report path as the
     only source for every key. The store persists to `.horde_worker_regen/vram_footprints.json` (schema-versioned,
     atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration
