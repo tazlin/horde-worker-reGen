@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.jobs.pool_lanes import PoolLaneState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
@@ -82,6 +83,7 @@ def _make_popper(
     pool_pop_outcome_sink: Callable[..., None] | None = None,
     card_runtimes: dict[int, CardRuntime] | None = None,
     run_metrics: WorkerRunMetrics | None = None,
+    deliberate_safety_rebuild_provider: Callable[[], bool] | None = None,
 ) -> JobPopper:
     """Build a JobPopper with mostly-mocked dependencies."""
     if state is None:
@@ -124,6 +126,7 @@ def _make_popper(
         pool_pop_outcome_sink=pool_pop_outcome_sink,
         card_runtimes=card_runtimes,
         run_metrics=run_metrics,
+        deliberate_safety_rebuild_provider=deliberate_safety_rebuild_provider,
     )
 
 
@@ -3401,6 +3404,110 @@ class TestPopGateStamping:
 
 
 # endregion
+
+
+class TestSafetyPoolPopGate:
+    """The safety pop gate holds intake only while the safety pool is gone without a deliberate rebuild.
+
+    Each case stops the flow at the inference gate that follows, so passing the safety gate shows as the
+    ``no_inference_process`` stamp, and no API call is made.
+    """
+
+    @staticmethod
+    def _safety_process(state: HordeProcessState, *, alive: bool = True) -> HordeProcessInfo:
+        process_info = make_mock_process_info(
+            10,
+            model_name=None,
+            state=state,
+            process_type=HordeProcessType.SAFETY,
+        )
+        process_info.mp_process.is_alive.return_value = alive
+        return process_info
+
+    @staticmethod
+    def _starting_inference_process() -> HordeProcessInfo:
+        return make_mock_process_info(0, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+
+    def _popper(
+        self,
+        *,
+        process_map: ProcessMap,
+        state: WorkerState | None = None,
+        deliberate_rebuild: bool = False,
+    ) -> JobPopper:
+        return _make_popper(
+            state=state if state is not None else WorkerState(last_job_pop_time=0.0),
+            process_map=process_map,
+            deliberate_safety_rebuild_provider=lambda: deliberate_rebuild,
+        )
+
+    async def test_a_busy_safety_process_does_not_hold_pops(self) -> None:
+        """A safety process evaluating a check still serves the pool. The safety-backlog gate throttles it."""
+        process_map = ProcessMap(
+            {
+                10: self._safety_process(HordeProcessState.JOB_RECEIVED),
+                0: self._starting_inference_process(),
+            },
+        )
+        popper = self._popper(process_map=process_map)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == str(PopGate.NO_INFERENCE_PROCESS)
+
+    async def test_a_deliberate_safety_move_does_not_hold_pops_while_its_replacement_starts(self) -> None:
+        """The old safety process has ended and the new one is still starting, by the lifecycle's intent."""
+        process_map = ProcessMap(
+            {
+                10: self._safety_process(HordeProcessState.PROCESS_STARTING),
+                0: self._starting_inference_process(),
+            },
+        )
+        popper = self._popper(process_map=process_map, deliberate_rebuild=True)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == str(PopGate.NO_INFERENCE_PROCESS)
+
+    async def test_a_deliberate_safety_move_does_not_hold_pops_between_end_and_start(self) -> None:
+        """Between ending the old process and spawning the new one the pool is empty, and still not broken."""
+        popper = self._popper(
+            process_map=ProcessMap({0: self._starting_inference_process()}),
+            deliberate_rebuild=True,
+        )
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == str(PopGate.NO_INFERENCE_PROCESS)
+
+    async def test_a_starting_safety_process_without_intent_holds_pops(self) -> None:
+        """A first boot or a crash respawn has not proved it can start, so intake waits on it."""
+        process_map = ProcessMap(
+            {
+                10: self._safety_process(HordeProcessState.PROCESS_STARTING),
+                0: self._starting_inference_process(),
+            },
+        )
+        popper = self._popper(process_map=process_map)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_gate == str(PopGate.NO_SAFETY_PROCESS)
+
+    async def test_a_crashed_safety_process_holds_pops_and_reads_as_a_broken_pool(self) -> None:
+        """A dead child that last reported a busy state is not serving, and the recovery coordinator sees it."""
+        manager = make_testable_process_manager()
+        manager._process_map.clear()
+        manager._process_map[10] = self._safety_process(HordeProcessState.JOB_RECEIVED, alive=False)
+        manager._process_map[0] = self._starting_inference_process()
+        manager._state.last_job_pop_time = 0.0
+        popper = self._popper(process_map=manager._process_map, state=manager._state)
+
+        await popper.api_job_pop()
+
+        assert manager._state.last_pop_gate == str(PopGate.NO_SAFETY_PROCESS)
+        assert manager._recovery_coordinator.intake_held_without_safety() is True
+        assert manager._recovery_coordinator.safety_start_pending() is True
 
 
 class TestIntakeBudget:

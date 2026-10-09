@@ -4469,6 +4469,17 @@ class ProcessLifecycleManager:
         """
         return self._safety_child_failure_in_streak
 
+    @property
+    def safety_rebuild_is_deliberate(self) -> bool:
+        """Whether the safety pool is being rebuilt on purpose and has shown no sign of failing.
+
+        True from a placement move or supervised rebuild until its replacement reaches readiness. A child
+        that dies or is reaped inside that window, or a start-failure streak, ends it, because the rebuild is
+        then a failing pool whatever began it.
+        """
+        rebuild_intended = self._safety_replacement_intentional or self._safety_replacement_intentional_until_ready
+        return rebuild_intended and not self._safety_child_failure_in_streak and not self.safety_pool_start_failing
+
     def _release_held_primitives(self, process_info: HordeProcessInfo) -> None:
         """Release every shared primitive a replaced inference child might still be holding.
 

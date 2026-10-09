@@ -463,6 +463,7 @@ class JobPopper:
     _extended_controlnet_ready_provider: Callable[[], bool]
     _post_processing_lane_paused_provider: Callable[[], bool]
     _safety_off_gpu_provider: Callable[[], bool]
+    _deliberate_safety_rebuild_provider: Callable[[], bool]
     _vram_pressure_provider: Callable[[], bool]
 
     def __init__(
@@ -489,6 +490,7 @@ class JobPopper:
         extended_controlnet_ready_provider: Callable[[], bool] | None = None,
         post_processing_lane_paused_provider: Callable[[], bool] | None = None,
         safety_off_gpu_provider: Callable[[], bool] | None = None,
+        deliberate_safety_rebuild_provider: Callable[[], bool] | None = None,
         vram_pressure_provider: Callable[[], bool] | None = None,
         staged_models_provider: Callable[[], frozenset[str]] | None = None,
         action_ledger: ActionLedger | None = None,
@@ -544,6 +546,11 @@ class JobPopper:
         its card. It only shapes the safety-backlog diagnostic's advice, which otherwise tells an operator who
         already set `safety_on_gpu` to set it. It defaults to "on the card", the truth for a worker wired
         without a lifecycle manager.
+
+        `deliberate_safety_rebuild_provider` reports whether the lifecycle manager is rebuilding the safety
+        pool on purpose (a placement move or a supervised rebuild). While it is, the safety pop gate admits
+        intake with no safety process serving. It defaults to "never", so a popper wired without it holds
+        pops whenever no safety process serves.
 
         `vram_pressure_provider` reports whether every governed card is at or below the device-free governor's
         PRESSURE floor. It gates the very-large-model offer narrowing, which stops advertising models that want
@@ -619,6 +626,9 @@ class JobPopper:
         )
         self._safety_off_gpu_provider = (
             safety_off_gpu_provider if safety_off_gpu_provider is not None else (lambda: False)
+        )
+        self._deliberate_safety_rebuild_provider = (
+            deliberate_safety_rebuild_provider if deliberate_safety_rebuild_provider is not None else (lambda: False)
         )
         self._vram_pressure_provider = (
             vram_pressure_provider if vram_pressure_provider is not None else (lambda: False)
@@ -1559,6 +1569,15 @@ class JobPopper:
         capacity = int(budget_seconds * num_safety / avg_safety)
         return max(_MIN_POST_INFERENCE_BACKLOG * num_safety, capacity)
 
+    def _safety_pool_admits_intake(self) -> bool:
+        """Return whether the safety pool is serving, or is being rebuilt on purpose.
+
+        A busy safety process counts as serving. The safety-backlog gate bounds the work queued behind it, and
+        holding intake here as well idles the card while the queue runs dry. A pool gone by crash or start
+        failure holds, since its respawn has not proved it can start.
+        """
+        return self._process_map.has_serving_safety_process() or self._deliberate_safety_rebuild_provider()
+
     def _submit_backlog_cap(self) -> int:
         """How deep the pending-submit backlog may grow before it counts as post-inference backpressure.
 
@@ -2077,7 +2096,7 @@ class JobPopper:
             self._note_pop_gate(PopGate.WARMUP_FIRST_JOB)
             return
 
-        if self._process_map.get_first_available_safety_process() is None:
+        if not self._safety_pool_admits_intake():
             self._note_pop_gate(PopGate.NO_SAFETY_PROCESS)
             return
 

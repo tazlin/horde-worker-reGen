@@ -1074,8 +1074,9 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         bound_seconds=None,
         bound_source="",
         backstop=(
-            "the no_safety_process pop gate stops intake while safety is unavailable, so the pause cannot "
-            "silently accumulate work it will not clear"
+            "the safety-backlog pop gate caps the work waiting on a moved safety process, and the "
+            "no_safety_process gate stops intake when safety is absent without a deliberate rebuild, so the pause "
+            "cannot silently accumulate work it will not clear"
         ),
         observable_at="the lane pause/restore log lines, which name the initiating subsystem",
     ),

@@ -81,7 +81,8 @@ defines the structured protocol over it:
   to warn while a replacement is recent and report the count as information afterwards.
   `pop_gate` and `pop_gate_since` carry the gate that ended the image popper's last cycle and when it engaged.
   The Now line and the overview show them, and the overview's pipeline strip marks the Safety stage while the
-  gate is `no_safety_process`, which the popper records when no safety process can take a check. The
+  gate is `no_safety_process`, which the popper records when no safety process is serving and no deliberate
+  safety rebuild is in progress. The
   whole-worker `seconds_since_last_pop` is the youngest flow's figure, so a text pop seconds ago would hide an
   image intake silent for an hour. `seconds_since_last_pop_per_workload` carries each flow's own figure, read
   from the `last_pop_time` every registered `FlowCoordinator` exposes. On a worker serving several flows the

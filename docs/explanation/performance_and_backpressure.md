@@ -154,6 +154,17 @@ slower CPU path. On multi-GPU workers the same headroom-aware card choice is use
 second card with room can take the safety context; on single-GPU workers the same rule
 applies to the one card.
 
+Throttling belongs to this backlog gate alone. The `no_safety_process` pop gate counts a safety process
+that is busy with a check as serving, so intake continues behind it up to the
+cap above. The gate also stays open while the lifecycle manager rebuilds the safety pool on
+purpose (`ProcessLifecycleManager.safety_rebuild_is_deliberate`): a placement move ends the
+on-GPU safety process before its CPU replacement is up, and a CPU start can take tens of
+seconds, during which a held gate would let the queue run dry with the GPU idle. The
+deliberate window closes when the replacement reaches readiness, when any safety child
+dies or is reaped inside it, or when the start-failure streak trips. A pool that is absent
+without a deliberate rebuild (first boot, a crash, a start that keeps failing) holds pops
+at `no_safety_process`, and the recovery coordinator reads that hold as a broken pool.
+
 ### Safety-recovery admission hold
 
 The placement policy above yields safety onto a card that has room; it cannot help when the card has **no**

@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.lifecycle import process_lifecycle as
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    SAFETY_CRASH_LOOP_MAX_START_FAILURES,
     SAFETY_READINESS_LATENCY_CEILING_SECONDS,
     SAFETY_READINESS_LATENCY_FLOOR_SECONDS,
     ModelIncidentKind,
@@ -1917,6 +1918,96 @@ def test_soft_reset_safety_rebuild_not_counted_as_recovery() -> None:
     assert plm._num_process_recoveries == before  # the deliberate rebuild is not a crash recovery
     assert plm._safety_recovery_history == []  # crash-loop breaker reset, mirroring rebuild_inference_pool
     assert plm._safety_replacement_intentional is False  # consumed
+
+
+def test_a_placement_move_is_a_deliberate_safety_rebuild_until_its_replacement_is_ready() -> None:
+    """The window covers ending the old process, the empty pool, and the replacement's startup."""
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+    assert plm.safety_rebuild_is_deliberate is False
+
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.safety_rebuild_is_deliberate is True
+
+    plm._replace_all_safety_process()
+    plm._replace_all_safety_process()
+    plm._process_map[0] = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.PROCESS_STARTING,
+        process_type=HordeProcessType.SAFETY,
+    )
+    assert plm.safety_rebuild_is_deliberate is True
+
+    plm._process_map[0].last_process_state = HordeProcessState.WAITING_FOR_JOB
+    plm._observe_safety_pool_readiness()
+    assert plm.safety_rebuild_is_deliberate is False
+
+
+def test_a_soft_reset_is_a_deliberate_safety_rebuild() -> None:
+    """A supervised rebuild cycles a healthy pool on purpose."""
+    plm = _make_plm()
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+    plm.end_safety_processes = Mock()  # type: ignore[method-assign]
+
+    plm.rebuild_safety_pool(reason="soft reset #1")
+
+    assert plm.safety_rebuild_is_deliberate is True
+
+
+def test_a_crashed_safety_process_is_not_a_deliberate_rebuild() -> None:
+    """A crash respawn has to prove it can start before intake trusts it."""
+    safety = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.JOB_RECEIVED,
+        process_type=HordeProcessType.SAFETY,
+    )
+    safety.mp_process.is_alive.return_value = False
+    plm = _make_plm(process_map=ProcessMap({0: safety}))
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+    plm.end_safety_processes = Mock()  # type: ignore[method-assign]
+
+    assert plm._reap_if_crashed(safety) is True
+
+    assert plm.safety_processes_should_be_replaced is True
+    assert plm.safety_rebuild_is_deliberate is False
+
+
+def test_a_child_that_dies_inside_a_placement_move_ends_the_deliberate_window() -> None:
+    """A replacement that crashes on start is a failing pool, whatever began the rebuild."""
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+    plm.end_safety_processes = Mock()  # type: ignore[method-assign]
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    plm._replace_all_safety_process()
+    plm._replace_all_safety_process()
+    replacement = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.PROCESS_STARTING,
+        process_type=HordeProcessType.SAFETY,
+    )
+    replacement.mp_process.is_alive.return_value = False
+    plm._process_map[0] = replacement
+
+    assert plm._reap_if_crashed(replacement) is True
+
+    assert plm.safety_rebuild_is_deliberate is False
+
+
+def test_a_start_failure_streak_is_not_a_deliberate_rebuild() -> None:
+    """Rebuilds that never reach readiness stop reading as placement churn once the streak is futile."""
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+    assert plm.pause_safety_on_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    plm._safety_consecutive_start_failures = SAFETY_CRASH_LOOP_MAX_START_FAILURES
+
+    assert plm.safety_pool_start_failing is True
+    assert plm.safety_rebuild_is_deliberate is False
 
 
 def test_end_safety_processes_stops_starting_process_and_marks_intent() -> None:

@@ -1259,6 +1259,19 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 return p
         return None
 
+    def has_serving_safety_process(self) -> bool:
+        """Return whether a live safety process is past its startup, whether idle or evaluating a check.
+
+        The OS process is consulted as well as the reported state, because a child that died mid-check keeps
+        its last busy state until the lifecycle manager reaps it.
+        """
+        return any(
+            p.process_type == HordeProcessType.SAFETY
+            and p.last_process_state != HordeProcessState.PROCESS_STARTING
+            and p.is_process_alive()
+            for p in self.values()
+        )
+
     def get_stoppable_safety_processes(self) -> list[HordeProcessInfo]:
         """Return safety processes that can be sent an end command.
 
