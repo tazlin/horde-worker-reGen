@@ -6798,10 +6798,9 @@ class InferenceScheduler:
         return predict_job_unet_only_ram_mb(sidecar.residual_tensor_bytes)
 
     def _checkpoint_models_held_on(self, process_id: int) -> frozenset[str]:
-        """The checkpoints staged in ``process_id``'s RAM component cache, by bare model name.
+        """The models whose diffusion weights are staged in ``process_id``'s RAM component cache, by bare name.
 
-        A checkpoint entry's residency identity is the bare horde model name, so this is the residency map's
-        own answer. Empty when no residency map is wired (unit tests, or a worker whose budgeted component
+        Empty when no residency map is wired (unit tests, or a worker whose budgeted component
         cache is disabled), so a component charge then defaults to the full UNet residual.
         """
         if self._component_residency_map is None:
@@ -12490,7 +12489,8 @@ class InferenceScheduler:
                 evictable = evictable - {process_info.loaded_horde_model_name}
             if not evictable:
                 continue
-            if process_info.safe_send_message(HordeEvictComponentsControlMessage(identities=sorted(evictable))):
+            identities = self._component_residency_map.staged_identities_on(process_info.process_id, evictable)
+            if process_info.safe_send_message(HordeEvictComponentsControlMessage(identities=sorted(identities))):
                 logger.opt(colors=True).info(
                     f"<fg #ff8c69>RAM pressure: evicting {len(evictable)} idle unprotected staged component(s) "
                     "{} "

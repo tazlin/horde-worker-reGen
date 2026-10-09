@@ -95,6 +95,32 @@ class TestQueuedModelSurvives:
         assert scheduler._component_residency_map.checkpoint_models_held_on([0]) >= {"A", "B"}
         assert process.is_process_alive() is True
 
+    async def test_split_files_unet_is_evicted_by_its_cache_identity(self) -> None:
+        """An idle split-files model is evicted by its UNet entry's identity, never by its bare model name."""
+        from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot
+        from horde_worker_regen.process_management.models.component_residency_map import UNET_KIND
+
+        scheduler, process = await _scheduler_holding(
+            active_model="A",
+            staged_identities=("A", "B"),
+            queued_model="B",
+        )
+        scheduler._component_residency_map.update_from_report(
+            0,
+            0,
+            [
+                *_checkpoint_snapshots("A", "B"),
+                HeldComponentSnapshot(kind=UNET_KIND, identity=f"Krea2:{UNET_KIND}", approx_ram_mb=13000.0),
+            ],
+        )
+
+        acted = scheduler._evict_unprotected_components_under_pressure()
+
+        assert acted is True
+        message = _sent_evict_message(process)
+        assert message is not None
+        assert message.identities == [f"Krea2:{UNET_KIND}"]
+
     async def test_governance_rung_short_circuits_the_whole_ram_unload(self) -> None:
         """When the gentle eviction acts, the coarse whole-RAM unload is not run this tick."""
         scheduler, process = await _scheduler_holding(

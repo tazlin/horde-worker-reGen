@@ -61,9 +61,9 @@ class TestUpdateAndQuery:
         assert residency.checkpoint_models_held_on([1]) == frozenset({"ModelA"})
 
     def test_non_checkpoint_kinds_excluded_from_staged_set(self) -> None:
-        """Bare unet/clip/vae components are not staged whole-model checkpoints."""
+        """Text encoder and VAE entries are keyed by file, so they never name a staged model."""
         residency = ComponentResidencyMap()
-        residency.update_from_report(1, 5, [_snapshot("vae", "vae@abc"), _snapshot("unet", "ModelA:unet")])
+        residency.update_from_report(1, 5, [_snapshot("vae", "vae@abc"), _snapshot("clip", "ModelA:unet")])
 
         assert residency.checkpoint_models_held_on([1]) == frozenset()
 
@@ -76,6 +76,38 @@ class TestUpdateAndQuery:
         assert residency.identities_held() == frozenset({"ModelA", "vae@abc", "ModelB"})
         assert residency.identities_held(kind="checkpoint") == frozenset({"ModelA", "ModelB"})
         assert residency.identities_held(kind="vae") == frozenset({"vae@abc"})
+
+    def test_a_split_files_unet_is_a_staged_model(self) -> None:
+        """A split-files model staged as its bare UNet counts, under its bare model name."""
+        residency = ComponentResidencyMap()
+        residency.update_from_report(
+            1,
+            5,
+            [
+                _snapshot(UNET_KIND, f"Krea2-Turbo_fp8:{UNET_FILE_TYPE}"),
+                _snapshot("clip", "text_encoders/qwen.safetensors:qwen_image:default"),
+                _snapshot("vae", "vae/krea2_vae.safetensors"),
+            ],
+        )
+        assert residency.checkpoint_models_held_on([1]) == frozenset({"Krea2-Turbo_fp8"})
+
+    def test_staged_identities_name_the_cache_entries(self) -> None:
+        """An eviction must name the entry's identity, which for a split-files UNet is not the model name."""
+        residency = ComponentResidencyMap()
+        residency.update_from_report(
+            1,
+            5,
+            [
+                _snapshot(UNET_KIND, f"Krea2-Turbo_fp8:{UNET_FILE_TYPE}"),
+                _snapshot(CHECKPOINT_KIND, "ModelA"),
+                _snapshot("vae", "vae/krea2_vae.safetensors"),
+            ],
+        )
+        assert residency.staged_identities_on(1, {"Krea2-Turbo_fp8", "ModelA"}) == frozenset(
+            {f"Krea2-Turbo_fp8:{UNET_FILE_TYPE}", "ModelA"},
+        )
+        assert residency.staged_identities_on(1, {"ModelA"}) == frozenset({"ModelA"})
+        assert residency.staged_identities_on(2, {"ModelA"}) == frozenset()
 
     def test_checkpoint_models_held_on_restricts_to_named_processes(self) -> None:
         """Only the requested processes' checkpoints are returned."""

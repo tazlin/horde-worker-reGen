@@ -32,19 +32,27 @@ The parent never imports hordelib's pipeline, so the value is copied here and pi
 """
 
 
-def holds_model(held: Iterable[HeldComponentSnapshot], model_name: str) -> bool:
-    """Whether ``held`` includes an entry that loads ``model_name``'s diffusion weights.
+_UNET_IDENTITY_SUFFIX = f":{UNET_KIND}"
 
-    That is the whole-checkpoint entry, keyed by the bare model name, or a split-files model's bare diffusion
+
+def staged_model_name(component: HeldComponentSnapshot) -> str | None:
+    """The horde model whose diffusion weights ``component`` holds, or None for any other entry.
+
+    That is a whole-checkpoint entry, keyed by the bare model name, or a split-files model's bare diffusion
     model, which hordelib keys as ``<model name>:<file type>``. A split-files preload leaves only the latter, so
-    a check for the checkpoint entry alone reads such a slot as empty.
+    a check for the checkpoint entry alone reads such a slot as empty. A split-files model's text encoder and
+    VAE are keyed by file, so they never name a model.
     """
-    unet_identity = f"{model_name}:{UNET_KIND}"
-    return any(
-        (component.kind == CHECKPOINT_KIND and component.identity == model_name)
-        or (component.kind == UNET_KIND and component.identity == unet_identity)
-        for component in held
-    )
+    if component.kind == CHECKPOINT_KIND:
+        return component.identity
+    if component.kind == UNET_KIND and component.identity.endswith(_UNET_IDENTITY_SUFFIX):
+        return component.identity.removesuffix(_UNET_IDENTITY_SUFFIX)
+    return None
+
+
+def holds_model(held: Iterable[HeldComponentSnapshot], model_name: str) -> bool:
+    """Whether ``held`` includes an entry that loads ``model_name``'s diffusion weights."""
+    return any(staged_model_name(component) == model_name for component in held)
 
 
 @dataclass(frozen=True)
@@ -124,18 +132,29 @@ class ComponentResidencyMap:
         )
 
     def checkpoint_models_held_on(self, process_ids: Collection[int]) -> frozenset[str]:
-        """Return the checkpoint identities (bare horde model names) held on the given processes.
+        """Return the horde models whose diffusion weights are staged on the given processes, by bare name.
 
-        A checkpoint entry's identity is the bare horde model name, so its checkpoint-kind identities are the
+        Covers whole-checkpoint and split-files entries alike (:func:`staged_model_name`), so this is the
         worker's RAM-staged model set with no sidecar lookup. Restricting to the given processes lets a caller
         ask only about the slots it cares about (for example the live, healthy inference processes eligible to
         sample).
         """
         wanted = set(process_ids)
         return frozenset(
-            snapshot.identity
+            model_name
             for process_id, residency in self._by_process.items()
             if process_id in wanted
             for snapshot in residency.held
-            if snapshot.kind == CHECKPOINT_KIND
+            if (model_name := staged_model_name(snapshot)) is not None
         )
+
+    def staged_identities_on(self, process_id: int, model_names: Collection[str]) -> frozenset[str]:
+        """Return the cache identities on ``process_id`` that stage any of ``model_names``.
+
+        An eviction names cache entries, and a split-files model's entry identity is not its bare model name.
+        """
+        residency = self._by_process.get(process_id)
+        if residency is None:
+            return frozenset()
+        wanted = set(model_names)
+        return frozenset(snapshot.identity for snapshot in residency.held if staged_model_name(snapshot) in wanted)
