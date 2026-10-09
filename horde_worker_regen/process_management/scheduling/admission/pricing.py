@@ -237,10 +237,10 @@ def measured_resident_footprint_mb(
         stage=FootprintStage.RESIDENT,
         checkpoint=model,
     )
-    measured_mb = store.measured_estimate_mb(key)
+    measured_mb = store.measured_estimate_net_of_context_mb(key)
     if measured_mb is None:
         return (None, 0)
-    return (max(0.0, measured_mb - snapshot.context_constant_mb), store.observation_count(key))
+    return (measured_mb, store.observation_count(key))
 
 
 def learned_sampling_peak_mb(
@@ -267,9 +267,9 @@ def learned_sampling_peak_mb(
     raised_mb = store.estimate_mb(key, static_seed_mb=static_seed_mb)
     measured_mb: float | None = None
     if job.model is not None:
-        raw_mb = store.measured_estimate_mb(key)
-        if raw_mb is not None:
-            measured_mb = max(0.0, raw_mb - snapshot.context_constant_mb) + lora_feature_delta_mb(job, baseline)
+        net_mb = store.measured_estimate_net_of_context_mb(key)
+        if net_mb is not None:
+            measured_mb = net_mb + lora_feature_delta_mb(job, baseline)
     if measured_mb is None or measured_mb >= raised_mb:
         return raised_mb
     floor_mb = predict_job_weight_mb(job, baseline) or 0.0

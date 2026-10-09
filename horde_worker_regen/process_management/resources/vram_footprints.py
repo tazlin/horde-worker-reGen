@@ -691,6 +691,18 @@ class LearnedFootprintStore:
             basis_mb = max(observation.recent_mb)
         return (basis_mb * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(platform=key.platform)
 
+    def measured_estimate_net_of_context_mb(self, key: FootprintKey) -> float | None:
+        """Return :meth:`measured_estimate_mb` without the context charge it adds, or None while under-observed.
+
+        A job-level price charges the process's context separately, so it takes back exactly the figure this
+        store added. Subtracting a different context figure (a measured marginal in place of the platform seed)
+        would move every learned price by the gap between the two.
+        """
+        measured_mb = self.measured_estimate_mb(key)
+        if measured_mb is None:
+            return None
+        return max(0.0, measured_mb - platform_context_constant_mb(platform=key.platform))
+
     def get_observation(self, key: FootprintKey) -> _FootprintObservation | None:
         """Return the raw running statistics for ``key`` (EWMA, watermark, count), or None if cold.
 

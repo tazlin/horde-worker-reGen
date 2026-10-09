@@ -4938,10 +4938,10 @@ class InferenceScheduler:
             stage=FootprintStage.RESIDENT,
             checkpoint=model_name,
         )
-        measured_mb = store.measured_estimate_mb(key)
+        measured_mb = store.measured_estimate_net_of_context_mb(key)
         if measured_mb is None:
             return (None, 0)
-        return (max(0.0, measured_mb - self.resolved_context_constant_mb()), store.observation_count(key))
+        return (measured_mb, store.observation_count(key))
 
     def _learned_sampling_peak_mb(
         self,
@@ -5001,10 +5001,7 @@ class InferenceScheduler:
         store = self._footprint_store
         if store is None or job.model is None:
             return None
-        measured_mb = store.measured_estimate_mb(key)
-        if measured_mb is None:
-            return None
-        return max(0.0, measured_mb - self.resolved_context_constant_mb())
+        return store.measured_estimate_net_of_context_mb(key)
 
     def observe_disaggregated_sampling_peak(self, job_info: HordeJobInfo, peak_reserved_mb: float) -> None:
         """Fold a disaggregated sampler's measured peak into the store under this job's SAMPLE_ISOLATED key.

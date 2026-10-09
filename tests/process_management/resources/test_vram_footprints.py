@@ -381,6 +381,15 @@ class TestMeasuredEstimate:
         # The raise-only policy is untouched by the measured one: they are separate answers.
         assert store.estimate_mb(key, static_seed_mb=16400.0) == pytest.approx(16400.0)
 
+    def test_net_of_context_takes_back_exactly_the_context_it_added(self) -> None:
+        """A job-level price is the margined basis alone, whatever the platform's context figure."""
+        store = LearnedFootprintStore()
+        for platform in ("linux", "win32"):
+            key = _key(platform=platform)
+            self._observe(store, key, _MIN_OBSERVATIONS_FOR_MEASURED)
+            assert store.measured_estimate_net_of_context_mb(key) == pytest.approx(13500.0 * _MEASURED_ESTIMATE_MARGIN)
+        assert store.measured_estimate_net_of_context_mb(_key(platform="darwin")) is None
+
     def test_estimate_tracks_the_recent_window_not_the_all_time_watermark(self) -> None:
         """A figure that has aged out of the window stops holding the estimate up."""
         store = LearnedFootprintStore()
