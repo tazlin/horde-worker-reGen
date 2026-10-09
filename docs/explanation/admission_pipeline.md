@@ -204,7 +204,7 @@ flowchart LR
     gates -->|"DEFER_*, NO_TARGET, EXCLUSIVE_IN_PROGRESS"| stop[pass stops this cycle]
     gates -->|"REPLACE_PROCESS: ReplaceProcess"| cycle[executor cycles the child] --> stop
     gates -->|ADMIT| wc{whole-card demand}
-    wc -->|PRESTAGE| send
+    wc -->|PRESTAGE| ram
     wc -->|DEFER| stop
     wc -->|FALL_THROUGH| price["snapshot(), price_preload, arbiter.evaluate"]
     price -->|FITS| ram{decide_ram_admission}

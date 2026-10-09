@@ -66,7 +66,14 @@ Only a genuinely unknowable footprint prices at zero, which takes the unverifiab
 credit, escalate on an honest absence of evidence) rather than being graded on the base allowance alone.
 Nothing frees synchronously, so
 grading a rung on a sample count reads a working multi-gigabyte release as a failure; the deepest rung (safety
-off the GPU) additionally carries a per-card dwell, because spending it is a whole process cycle. The
+off the GPU) additionally carries a per-card dwell, because spending it is a whole process cycle. The teardown
+rungs (each lane pause and safety off the GPU) are also held until the episode's saturation has persisted for
+`_TEARDOWN_RUNG_SATURATION_DWELL_SECONDS`, the teardown rung's fixed verification allowance. A sampler's
+activation peak can cross the hard floor and end a second later, and a lane stopped for it frees nothing in time
+and still pays a cold start at the restore. While the dwell runs the scan passes over the held rungs, so the
+idle unloads, cache releases and safety's weight demotion still act on the first saturated sample, and the held
+rungs issue in their original order once the dwell has passed. A saturation that clears inside the dwell closes
+the episode with no lane touched. The
 **per-step floor** is the fast detector that forces that ladder early: two
 consecutive sampling steps each several times their expected per-step time, on a PRESSURE-or-SATURATED card,
 mean a job is being demand-paged (not merely heavy) and reclaim should run without waiting for the whole-job
@@ -588,7 +595,9 @@ is governed instead by the device-free governor and the verified reclaim ladder 
 **Preloads.** The scheduler's preload adapter consults the whole-card residency state machine first (which
 stays external, pre-staging or deferring a whole-card head), then prices the preload through the arbiter and
 acts on the single verdict: a `FITS` admits and runs the marginal RAM verdict, and a `DEFER` runs the
-described actuations and re-asks. There is no second, parallel admission arithmetic: the
+described actuations and re-asks. A whole-card pre-stage skips the arbiter, since the head is not meant to fit
+co-resident, but runs the same marginal RAM verdict (commit included) before its preload is sent; a RAM
+deferral leaves the residency recorded and the head re-asks next cycle. There is no second, parallel admission arithmetic: the
 ledger-driven identity is the only gate. Because the reserve is a sampling-headroom term and never a
 load-feasibility floor, a preload is never denied by `vram_reserve_mb`; a model whose weights fit the drained
 card admits even when the operator's reserve would have read it as unloadable. Under the clearance lease a

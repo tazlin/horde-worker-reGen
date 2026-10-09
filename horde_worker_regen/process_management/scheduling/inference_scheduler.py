@@ -2300,10 +2300,10 @@ class InferenceScheduler:
         ):
             # A live job still holds the device, but the heavy head's weights can begin loading into a spare
             # process's RAM right now: preload_model is a RAM-only load (weights move to VRAM at sampling
-            # time), so it does not contend with the in-flight job's VRAM. Record the residency and send the
-            # preload; _converge_whole_card_residency then collapses the live process count to sole VRAM
-            # residency before the staged model samples. The heavy disk->RAM load overlaps the in-flight job
-            # instead of waiting for the device to drain first.
+            # time), so it does not contend with the in-flight job's VRAM. Record the residency; the caller sends
+            # the preload once the RAM admission admits it. _converge_whole_card_residency then collapses the live
+            # process count to sole VRAM residency before the staged model samples. The heavy disk->RAM load
+            # overlaps the in-flight job instead of waiting for the device to drain first.
             self._begin_whole_card_residency(
                 job,
                 forecast,
@@ -6840,8 +6840,16 @@ class InferenceScheduler:
             return False
         if whole_card is _WholeCardDemandOutcome.PRESTAGE:
             # A RAM-only pre-stage of a whole-card head: the VRAM budget deliberately does not fit it
-            # co-resident (that is *why* it gets the whole card), so skip the verdict and send the preload.
-            return True
+            # co-resident (that is *why* it gets the whole card), so the VRAM verdict is skipped. The child still
+            # maps the checkpoint into host RAM and commit, so the RAM verdict every preload passes decides it.
+            # A deferral leaves the residency recorded and the head re-asks next cycle.
+            return self._apply_ram_verdict(
+                job,
+                available_process,
+                is_head_blocker=is_head_blocker,
+                no_live_resource_consumer=no_live_resource_consumer,
+                snapshot=self.snapshot(),
+            )
 
         # The whole-card demand may have acted on the card (a residency established, idle siblings unloaded), so
         # the pricing reads the card after it, and the predictive verdict and the arbiter read one frozen picture

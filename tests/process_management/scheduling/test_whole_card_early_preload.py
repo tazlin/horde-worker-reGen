@@ -21,6 +21,7 @@ from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -203,6 +204,45 @@ class TestEarlyRamPreStage:
 
         assert admitted is False
         assert _idle_preloading_flux(idle) == [], "no idle sibling should be given Flux's RAM preload"
+
+    async def test_prestage_waits_for_the_ram_admission_when_commit_cannot_hold_the_mapping(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A pre-stage is a preload, so it passes the same RAM admission, commit included, before it is sent.
+
+        Physical RAM holds the weights beside the live job, but the host cannot commit the checkpoint mapping.
+        A child sent the preload would fail to map the file, so the pre-stage defers with the admission's line
+        and leaves the residency recorded for the next cycle to re-ask.
+        """
+        _seed_flux_weight_estimates(monkeypatch)
+        monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 12000.0)
+
+        scheduler, _process_map, job_tracker, _busy, idle = _build_overlap_scheduler(free_mb=2000.0)
+        scheduler._measured_available_ram_mb = lambda: 64000.0  # type: ignore[method-assign]
+        scheduler._checkpoint_staging_charge_mb = lambda _job: _FLUX_WEIGHTS_MB  # type: ignore[method-assign]
+        scheduler.set_available_commit_mb_provider(lambda: 1000.0)
+
+        sdxl_job = make_job_pop_response(_RESIDENT_SDXL)
+        await track_popped_job_async(job_tracker, sdxl_job)
+        await mark_job_in_progress_async(job_tracker, sdxl_job)
+        flux_head = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
+        await track_popped_job_async(job_tracker, flux_head)
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda record: messages.append(str(record)), level="DEBUG")
+        try:
+            admitted = scheduler.preload_models()
+        finally:
+            logger.remove(sink_id)
+
+        assert any("Pre-staging whole-card head" in message for message in messages), "the pre-stage was chosen"
+        assert _idle_preloading_flux(idle) == [], "no spare may be asked to map a checkpoint commit cannot hold"
+        assert admitted is False
+        assert any(
+            "RAM budget deferring preload of" in message and "commit-bound" in message for message in messages
+        ), "the deferral is the ordinary RAM admission's line"
+        assert job_tracker.is_admitted_exclusive(flux_head) is True, "the residency stays recorded for a re-ask"
 
 
 class TestResidencyConvergesAfterDrain:
