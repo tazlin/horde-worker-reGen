@@ -7378,7 +7378,7 @@ class InferenceScheduler:
             device_index=device_index,
         )
         if self._reclaim_ladder is not None:
-            self._reclaim_ladder.record_context_reduction(device_index)
+            self._reclaim_ladder.record_context_reduction(device_index, beneficiary=head.beneficiary)
         # Stamped only once the reduction has actually been taken, so a bail-out added above can never charge
         # the rate limit for a reduction that did not happen.
         self._context_reduction_at[device_index] = self._clock()

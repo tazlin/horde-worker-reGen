@@ -551,6 +551,10 @@ class _Episode:
     """Per booked lane pause, the ids of the jobs it was taken for; the restore waits until none still waits."""
     lane_holds_logged: set[ReclaimRungKind] = field(default_factory=set)
     """Lane pauses whose hold for a waiting beneficiary has been logged; cleared when the pause is restored."""
+    context_reduction_beneficiaries: set[str] = field(default_factory=set)
+    """The ids of the jobs the booked context reduction was taken for; the regrowth waits until none still waits."""
+    context_hold_logged: bool = False
+    """Whether the reduction's hold for a waiting beneficiary has been logged; cleared when the pool is regrown."""
 
     def reset_ladder_progress(self) -> None:
         """Drop this episode's ladder, cursor, pending rung and outcome, keeping only what it still owes.
@@ -605,7 +609,7 @@ class VerifiedReclaimLadder:
         ladder_builder: Callable[[], tuple[ReclaimRung, ...]],
         context_restore_ready: bool = True,
         lane_restore_ready: bool = True,
-        lane_beneficiary_waiting: Callable[[str], bool] | None = None,
+        beneficiary_waiting: Callable[[str], bool] | None = None,
         now: float | None = None,
     ) -> None:
         """Advance the reclaim episode for one card by one governor sample.
@@ -651,11 +655,11 @@ class VerifiedReclaimLadder:
                 head is still parked re-adds the context the pause removed, and the next cycle pauses it again,
                 a stop and a cold start per cycle with the queue served by nobody. The caller supplies the
                 evidence that no head is parked behind the pause.
-            lane_beneficiary_waiting: Whether the job a lane pause was booked for is still waiting to be
-                admitted. A staged clearance waiter counts as inference in progress, so no head reads as
-                parked, and the context the pause freed is what makes the card read HEALTHY; neither reading
-                says the waiter has been served. A pause with a recorded beneficiary is held while this
-                returns True for it. ``None`` treats every beneficiary as served.
+            beneficiary_waiting: Whether the job a lane pause or a context reduction was booked for is still
+                waiting to be admitted. A staged clearance waiter counts as inference in progress, so no head
+                reads as parked, and the context the pause or reduction freed is what makes the card read
+                HEALTHY; neither reading says the waiter has been served. An obligation with a recorded
+                beneficiary is held while this returns True for it. ``None`` treats every beneficiary as served.
             now: The monotonic-scale instant of this sample, which every verification budget and the safety
                 rung's cooldown are measured on. Defaults to the ladder's clock; a caller that drives the
                 control loop on its own clock passes that clock so the budgets are measured on the same
@@ -674,7 +678,7 @@ class VerifiedReclaimLadder:
                         actuator,
                         context_restore_ready=context_restore_ready,
                         lane_restore_ready=lane_restore_ready,
-                        lane_beneficiary_waiting=lane_beneficiary_waiting,
+                        beneficiary_waiting=beneficiary_waiting,
                     ):
                         self._episodes.pop(key, None)
                         continue
@@ -700,7 +704,7 @@ class VerifiedReclaimLadder:
 
         self._issue_next(episode, device_free_mb, actuator, device_index=device_index, now=now)
 
-    def record_context_reduction(self, device_index: int | None) -> None:
+    def record_context_reduction(self, device_index: int | None, *, beneficiary: str | None = None) -> None:
         """Record that a card's live inference-context count was reduced under admission pressure.
 
         The per-cycle admission path reduces the live context count directly (it is the one relief that
@@ -713,11 +717,18 @@ class VerifiedReclaimLadder:
         Args:
             device_index: The card whose contexts were reduced; ``None`` is the card-agnostic worker-wide
                 (single-GPU) scope.
+            beneficiary: The id of the job the reduction was taken for. The regrowth waits until the caller's
+                ``beneficiary_waiting`` reports every recorded beneficiary served or gone: a staged clearance
+                waiter counts as inference in progress, so the parked-head reading the caller's readiness
+                term uses cannot see it, and regrowing the pool under it re-adds the context whose charge is
+                why its clearance cannot land.
         """
         episode = self._episodes.get(device_index)
         if episode is None:
             episode = _Episode()
             self._episodes[device_index] = episode
+        if beneficiary is not None:
+            episode.context_reduction_beneficiaries.add(beneficiary)
         reduction = ContextReduction(device_index=device_index)
         if reduction in episode.restore_obligations:
             return
@@ -747,7 +758,7 @@ class VerifiedReclaimLadder:
             tenant_label: The lane name for the restore log line.
             promised_mb: What the pause was expected to return (MB), for the same line.
             beneficiary: The id of the job the pause was taken for. The restore waits until the caller's
-                ``lane_beneficiary_waiting`` reports every recorded beneficiary served or gone.
+                ``beneficiary_waiting`` reports every recorded beneficiary served or gone.
         """
         if kind not in LANE_PAUSE_RUNG_KINDS:
             return
@@ -798,6 +809,8 @@ class VerifiedReclaimLadder:
         if len(remaining) == len(episode.restore_obligations):
             return False
         episode.restore_obligations[:] = remaining
+        episode.context_reduction_beneficiaries.clear()
+        episode.context_hold_logged = False
         return True
 
     def is_saturation_unresolved(self, device_index: int) -> bool:
@@ -1011,7 +1024,7 @@ class VerifiedReclaimLadder:
         *,
         context_restore_ready: bool = True,
         lane_restore_ready: bool = True,
-        lane_beneficiary_waiting: Callable[[str], bool] | None = None,
+        beneficiary_waiting: Callable[[str], bool] | None = None,
     ) -> bool:
         """Undo everything this episode owes the card, in reverse order of the actions taken (LIFO unwind).
 
@@ -1035,12 +1048,24 @@ class VerifiedReclaimLadder:
             if isinstance(obligation, ContextReduction) and not context_restore_ready:
                 retained.append(obligation)
                 continue
+            if isinstance(obligation, ContextReduction) and beneficiary_waiting is not None:
+                beneficiaries = episode.context_reduction_beneficiaries
+                waiting = next((job_id for job_id in sorted(beneficiaries) if beneficiary_waiting(job_id)), None)
+                if waiting is not None:
+                    if not episode.context_hold_logged:
+                        episode.context_hold_logged = True
+                        logger.info(
+                            f"Reclaim ladder: keeping the inference pool reduced until job {waiting} finishes "
+                            "sampling.",
+                        )
+                    retained.append(obligation)
+                    continue
             if isinstance(obligation, ReclaimRung) and not lane_restore_ready:
                 retained.append(obligation)
                 continue
-            if isinstance(obligation, ReclaimRung) and lane_beneficiary_waiting is not None:
+            if isinstance(obligation, ReclaimRung) and beneficiary_waiting is not None:
                 beneficiaries = episode.lane_pause_beneficiaries.get(obligation.kind, set())
-                waiting = next((job_id for job_id in sorted(beneficiaries) if lane_beneficiary_waiting(job_id)), None)
+                waiting = next((job_id for job_id in sorted(beneficiaries) if beneficiary_waiting(job_id)), None)
                 if waiting is not None:
                     # The unwind runs on every HEALTHY sample, so the hold is logged once per pause.
                     if obligation.kind not in episode.lane_holds_logged:
@@ -1057,6 +1082,9 @@ class VerifiedReclaimLadder:
             elif isinstance(obligation, ReclaimRung):
                 episode.lane_pause_beneficiaries.pop(obligation.kind, None)
                 episode.lane_holds_logged.discard(obligation.kind)
+            else:
+                episode.context_reduction_beneficiaries.clear()
+                episode.context_hold_logged = False
         retained.reverse()
         episode.restore_obligations[:] = retained
         if not retained:

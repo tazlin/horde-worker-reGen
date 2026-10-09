@@ -3756,7 +3756,7 @@ class HordeWorkerProcessManager:
                 lane_restore_ready=not self._inference_scheduler.head_of_queue_is_parked(),
                 # A lane paused for a staged clearance waiter stays down until that job starts or leaves: the
                 # waiter counts as inference in progress, so the parked-head reading above cannot see it.
-                lane_beneficiary_waiting=self._inference_scheduler.job_awaits_admission,
+                beneficiary_waiting=self._inference_scheduler.job_awaits_admission,
             )
 
             # Defence in depth: restore a reclaim-ladder service-lane pause that has lost its restore owner (no

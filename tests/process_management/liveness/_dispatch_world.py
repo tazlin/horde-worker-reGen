@@ -3389,25 +3389,6 @@ class _DispatchWorld:
         )
         self._scheduler._ensure_preload_arbiter().begin_cycle(self.snapshot)
 
-    def _discharge_context_reductions(self) -> None:
-        """Grow the pool back after a pressure reduction, the obligation the scheduler records but never closes.
-
-        A head that does not fit may collapse the card's live inference contexts to make room; the scheduler
-        takes that reduction and records the restore obligation, but discharging it belongs to the control
-        loop, which calls ``restore_live_contexts`` once the card recovers. Driving only the scheduler's half
-        would leave a card permanently one lane short after any pressure episode, and a pool shrunk to the
-        single lane that holds an idle resident model cannot reclaim it: that lane is then the next head's own
-        preload target, which every eviction path deliberately spares. The actuator is the production one, so
-        it stands down under a held whole-card residency (whose own restore owns the regrowth) and no-ops once
-        the pool is back at its configured size. Both of the control loop's restore paths hold while the head
-        of queue is parked, because regrowing underneath a parked head re-adds the context footprint the head
-        cannot be admitted over and the pair then oscillates at one cold start per tick; that gate is honoured
-        here through the same predicate they read.
-        """
-        if self._scheduler.head_of_queue_is_parked():
-            return
-        self._scheduler.restore_live_contexts(None)
-
     def _evaluate_device_free_governor(self) -> None:
         """Sample the card, debounce the governor, and drive the verified reclaim ladder for one tick.
 
@@ -3456,6 +3437,8 @@ class _DispatchWorld:
                 self._scheduler.build_reclaim_ladder_candidates(device_index),
             ),
             context_restore_ready=self._context_restore_ready(device_index),
+            lane_restore_ready=not self._scheduler.head_of_queue_is_parked(),
+            beneficiary_waiting=self._scheduler.job_awaits_admission,
             now=self.now,
         )
 
@@ -3521,7 +3504,6 @@ class _DispatchWorld:
         # The parent drives the clearance controllers every control-loop iteration, independent of queue
         # depth, so a staged child is cleared as a slot frees whether or not new work is pending.
         self._advance_clearance()
-        self._discharge_context_reductions()
         # The tick drives the cycle's stages directly rather than through run_scheduling_cycle, so the cycle
         # boundary is opened here: selection state scoped to one cycle must not survive the child reports this
         # tick applied, or the world presents the scheduler a staleness its own control loop never can.

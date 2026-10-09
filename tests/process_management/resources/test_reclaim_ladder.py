@@ -1049,7 +1049,7 @@ class TestStarvedHeadLanePauseObligation:
                 actuator=actuator,
                 ladder_builder=tuple,
                 lane_restore_ready=True,
-                lane_beneficiary_waiting=waiting.__contains__,
+                beneficiary_waiting=waiting.__contains__,
             )
             assert actuator.calls == [], "lane restarted while the waiter its pause served is still staged"
             assert engine.episode_holds_paused_lane(0) is True
@@ -1077,7 +1077,7 @@ class TestStarvedHeadLanePauseObligation:
                     actuator=actuator,
                     ladder_builder=tuple,
                     lane_restore_ready=True,
-                    lane_beneficiary_waiting={"job-a"}.__contains__,
+                    beneficiary_waiting={"job-a"}.__contains__,
                 )
         finally:
             logger.remove(sink_id)
@@ -1099,7 +1099,7 @@ class TestStarvedHeadLanePauseObligation:
             "device_free_mb": 9000.0,
             "actuator": actuator,
             "ladder_builder": tuple,
-            "lane_beneficiary_waiting": waiting.__contains__,
+            "beneficiary_waiting": waiting.__contains__,
         }
         engine.on_tick(0, **tick)
         assert actuator.calls == []
@@ -1185,7 +1185,7 @@ class TestStarvedHeadLanePauseObligation:
             "device_free_mb": 9000.0,
             "actuator": actuator,
             "ladder_builder": tuple,
-            "lane_beneficiary_waiting": waiting.__contains__,
+            "beneficiary_waiting": waiting.__contains__,
         }
 
         engine.on_tick(0, **tick)
@@ -1194,6 +1194,34 @@ class TestStarvedHeadLanePauseObligation:
         waiting.clear()
         engine.on_tick(0, **tick)
         assert actuator.calls == [("restore_pp", None)]
+
+    def test_a_context_reduction_is_held_for_the_beneficiary_the_head_names(self) -> None:
+        """A reduction taken for a head keeps the pool shrunk until that job is served, even on a HEALTHY card.
+
+        The staged waiter counts as inference in progress, so the caller's parked-head readiness term cannot
+        see it; regrowing the pool under it re-adds the context whose charge is why its clearance cannot land.
+        """
+        engine = VerifiedReclaimLadder()
+        engine.record_context_reduction(0, beneficiary="job-a")
+        waiting = {"job-a"}
+        actuator = _FakeActuator()
+        tick = {
+            "saturated": False,
+            "healthy": True,
+            "device_free_mb": 9000.0,
+            "actuator": actuator,
+            "ladder_builder": tuple,
+            "beneficiary_waiting": waiting.__contains__,
+        }
+
+        engine.on_tick(0, **tick)
+        assert actuator.calls == []
+        assert engine.has_context_reduction(0) is True
+
+        waiting.clear()
+        engine.on_tick(0, **tick)
+        assert actuator.calls == [("restore_contexts", 0)]
+        assert engine.has_context_reduction(0) is False
 
     def test_a_disaggregation_lane_borrow_is_left_to_the_post_processing_drain(self) -> None:
         """The drain holds a VAE or component loan while a job uses it; a HEALTHY unwind would end the loan early."""
