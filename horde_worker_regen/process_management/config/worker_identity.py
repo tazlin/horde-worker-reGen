@@ -236,7 +236,7 @@ def _verify_worker_names_owned(bridge_data: reGenBridgeData) -> None:
         try:
             owned_worker_ids, account_username = _fetch_account_identity(bridge_data.api_key)
             for name in names:
-                worker = _lookup_registered_worker(name, bridge_data.api_key)
+                worker = lookup_registered_worker(name, bridge_data.api_key)
                 if worker is None:
                     logger.info(f"Worker name {name!r} is not yet registered; it will be created on first pop.")
                     continue
@@ -295,7 +295,7 @@ def _fetch_account_identity(api_key: str) -> tuple[set[str], str | None]:
     return worker_ids, response.username
 
 
-def _lookup_registered_worker(name: str, api_key: str) -> WorkerDetailItem | None:
+def lookup_registered_worker(name: str, api_key: str) -> WorkerDetailItem | None:
     """Return the worker registered under ``name``, or None only when the name is genuinely free.
 
     Uses the single-worker-by-name endpoint rather than the all-workers list: the list only returns
@@ -364,7 +364,7 @@ def lookup_worker_by_name(
     server interprets the filter. The list endpoint only returns *active* workers, which suits its
     callers (e.g. toggling maintenance on the worker you are currently running). The startup ownership
     preflight deliberately does not use this: it must also see idle workers, so it goes through the
-    single-worker-by-name endpoint instead (see ``_lookup_registered_worker``).
+    single-worker-by-name endpoint instead (see ``lookup_registered_worker``).
     """
     response = simple_client.workers_all_details(worker_name=name, api_key=api_key)
     for worker in response:

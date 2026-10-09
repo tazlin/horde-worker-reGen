@@ -80,6 +80,7 @@ from horde_worker_regen.process_management.config.bridge_data_reloader import Br
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_identity import (
     enabled_worker_names_by_workload,
+    lookup_registered_worker,
     lookup_worker_by_name,
 )
 from horde_worker_regen.process_management.config.worker_state import PopGate, PopPauseOwner, WorkerState
@@ -2815,6 +2816,11 @@ class HordeWorkerProcessManager:
         for workload in chosen:
             worker_name = names_by_workload[workload]
             worker_details = lookup_worker_by_name(simple_client, worker_name)
+            if worker_details is None:
+                # The list lookup sees active workers only. A worker that was stopped while in maintenance
+                # is idle on the horde at the next start, and it is exactly the one the startup clear is for,
+                # so the idle-aware by-name endpoint is asked before the name is declared unregistered.
+                worker_details = lookup_registered_worker(worker_name, self.bridge_data.api_key)
             if worker_details is None:
                 logger.debug(
                     f"Worker with name {worker_name} is not registered yet (the horde creates it on first "

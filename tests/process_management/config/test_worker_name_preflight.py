@@ -84,7 +84,7 @@ class TestLocalNameValidation:
         monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: (set(), "me#1"))
         monkeypatch.setattr(
             worker_identity,
-            "_lookup_registered_worker",
+            "lookup_registered_worker",
             lambda name, api_key: looked_up.append(name),
         )
 
@@ -148,7 +148,7 @@ class TestOwnershipCheck:
         """A registered worker whose id is owned by this API key passes."""
         worker = Mock(id_="worker-123", name="Unique Dreamer", owner="Me#1")
         monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: ({"worker-123"}, "Me#1"))
-        monkeypatch.setattr(worker_identity, "_lookup_registered_worker", lambda name, api_key: worker)
+        monkeypatch.setattr(worker_identity, "lookup_registered_worker", lambda name, api_key: worker)
 
         verify_worker_identity(_bridge_data(dreamer="Unique Dreamer"))
 
@@ -168,7 +168,7 @@ class TestOwnershipCheck:
             "_fetch_account_identity",
             lambda api_key: ({"some-other-id"}, "Tazlin#6572"),
         )
-        monkeypatch.setattr(worker_identity, "_lookup_registered_worker", lambda name, api_key: worker)
+        monkeypatch.setattr(worker_identity, "lookup_registered_worker", lambda name, api_key: worker)
 
         verify_worker_identity(_bridge_data(dreamer="My Alchemist"))
 
@@ -181,7 +181,7 @@ class TestOwnershipCheck:
         """
         worker = Mock(id_="someone-else", name="Unique Dreamer", owner="Someone#999")
         monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: ({"mine-1"}, "Me#1"))
-        monkeypatch.setattr(worker_identity, "_lookup_registered_worker", lambda name, api_key: worker)
+        monkeypatch.setattr(worker_identity, "lookup_registered_worker", lambda name, api_key: worker)
 
         with pytest.raises(WorkerNameConfigError, match="another account"):
             verify_worker_identity(_bridge_data(dreamer="Unique Dreamer"))
@@ -196,14 +196,14 @@ class TestOwnershipCheck:
         """
         worker = Mock(id_="alch-77", name="My Alchemist", owner=None)
         monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: ({"dreamer-1"}, "Me#1"))
-        monkeypatch.setattr(worker_identity, "_lookup_registered_worker", lambda name, api_key: worker)
+        monkeypatch.setattr(worker_identity, "lookup_registered_worker", lambda name, api_key: worker)
 
         verify_worker_identity(_bridge_data(dreamer="My Alchemist"))
 
     def test_unregistered_worker_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A name not yet registered is the normal first-run case and passes."""
         monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: (set(), "Me#1"))
-        monkeypatch.setattr(worker_identity, "_lookup_registered_worker", lambda name, api_key: None)
+        monkeypatch.setattr(worker_identity, "lookup_registered_worker", lambda name, api_key: None)
 
         verify_worker_identity(_bridge_data(dreamer="Brand New Worker"))
 
@@ -214,7 +214,7 @@ class TestOwnershipCheck:
             raise RuntimeError("worker-details-by-name returned an error")
 
         monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: (set(), "Me#1"))
-        monkeypatch.setattr(worker_identity, "_lookup_registered_worker", _boom)
+        monkeypatch.setattr(worker_identity, "lookup_registered_worker", _boom)
         monkeypatch.setattr(worker_identity, "_OWNERSHIP_CHECK_RETRY_DELAY_SECONDS", 0.0)
 
         with pytest.raises(WorkerNameConfigError, match="Could not verify"):
@@ -307,7 +307,7 @@ class TestLookupRegisteredWorker:
         error = RequestErrorResponse(message="Worker not found", rc=RC.WorkerNotFound)
         monkeypatch.setattr(worker_identity, "AIHordeAPIClientSession", lambda: _FakeSession(error))
 
-        assert worker_identity._lookup_registered_worker("Idle Worker", "0" * 22) is None
+        assert worker_identity.lookup_registered_worker("Idle Worker", "0" * 22) is None
 
     def test_other_error_response_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Any non-WorkerNotFound error response is raised, never read as an absent worker."""
@@ -318,14 +318,14 @@ class TestLookupRegisteredWorker:
         monkeypatch.setattr(worker_identity, "AIHordeAPIClientSession", lambda: _FakeSession(error))
 
         with pytest.raises(RuntimeError, match="returned an error"):
-            worker_identity._lookup_registered_worker("Some Worker", "0" * 22)
+            worker_identity.lookup_registered_worker("Some Worker", "0" * 22)
 
     def test_found_worker_is_returned(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A successful response (the worker exists, active or idle) is returned for ownership checks."""
         worker = Mock(id_="w-1", name="Some Worker", owner="Me#1")
         monkeypatch.setattr(worker_identity, "AIHordeAPIClientSession", lambda: _FakeSession(worker))
 
-        assert worker_identity._lookup_registered_worker("Some Worker", "0" * 22) is worker
+        assert worker_identity.lookup_registered_worker("Some Worker", "0" * 22) is worker
 
 
 def test_the_enabled_roles_map_to_their_workloads_and_names() -> None:

@@ -128,6 +128,32 @@ class TestSetMaintenanceApiCall:
 
         assert looked_up == ["An Alchemist", "A Scribe"]
 
+    def test_an_idle_worker_absent_from_the_active_list_is_still_cleared(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker stopped in maintenance is idle on the horde at the next start; the setter still reaches it."""
+        modified: list[object] = []
+
+        class FakeClient:
+            def workers_all_details(self, worker_name: str | None = None, *, api_key: str | None = None) -> list[Mock]:
+                return []
+
+            def worker_modify(self, request: object) -> None:
+                modified.append(request)
+
+        idle = Mock()
+        idle.id_ = "idle-worker-id"
+        idle.name = "A Dreamer"
+        monkeypatch.setattr(process_manager_module, "AIHordeAPISimpleClient", lambda: FakeClient())
+        monkeypatch.setattr(process_manager_module, "lookup_registered_worker", lambda name, api_key: idle)
+        manager = make_testable_process_manager(dreamer_name="A Dreamer")
+
+        manager.set_maintenance(False)
+
+        assert len(modified) == 1
+        assert modified[0].worker_id == "idle-worker-id"
+        assert modified[0].maintenance is False
+
     def test_remove_maintenance_clears_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``remove_maintenance`` is the ``set_maintenance(False)`` convenience wrapper."""
         manager = make_testable_process_manager()
