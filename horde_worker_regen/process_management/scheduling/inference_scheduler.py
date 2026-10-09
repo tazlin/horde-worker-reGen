@@ -135,6 +135,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
     ClearanceDecision,
+    ClearancePlan,
     StagedWaiterClock,
     decide_clearance_admit,
 )
@@ -5997,6 +5998,25 @@ class InferenceScheduler:
         )
         if applied or self._waiting_can_help_staged_waiter(process_info):
             self._stop_staged_waiter_clock(job)
+        elif self._staged_waiter_past_its_deadline(plan):
+            # A refusal that has outlasted the waiter's attempt deadline on a card with nothing left to reclaim
+            # and no other lane at work: the one real load the deadline bounded can no longer complete before
+            # the child's lease-acquire timeout, after which the child samples the job unpriced on a card the
+            # verdict says cannot hold it. The job is faulted to the horde for reissue and the lane replaced
+            # deliberately, a bounded cost instead of a native crash.
+            self._stop_staged_waiter_clock(job)
+            self._resolve_clearance_hold(job)
+            logger.warning(
+                f"Clearance refused outright for process {process_id} ({job.model}): {plan.reason}; the staged job "
+                "cannot be served on this card, so it is faulted for reissue and the lane is replaced rather than "
+                "left to sample unpriced at its lease-acquire timeout.",
+            )
+            self._process_lifecycle._replace_inference_process(
+                process_info,
+                intentional_reason="clearance refused outright: the staged job cannot be held on this card",
+                resource_fault_reason=f"clearance refused outright: {plan.reason}",
+            )
+            return False
         elif job.id_ is not None:
             self._clearance_starved_since.setdefault(str(job.id_), self._clock())
         self._note_clearance_hold(job, reclaim_applied=bool(applied))
@@ -6009,6 +6029,19 @@ class InferenceScheduler:
             actuations=applied,
         )
         return False
+
+    @staticmethod
+    def _staged_waiter_past_its_deadline(plan: ClearancePlan) -> bool:
+        """Whether a refused staged waiter has been starved past the deadline its one real load was bounded by.
+
+        The deadline sits inside the child's lease-acquire timeout by the card's probe and load seconds, so a
+        waiter still refused at the deadline has no priced path left before the child samples on its own.
+        """
+        if plan.verdict is None or plan.priced is None or plan.verdict.disposition is not VramDisposition.DENY:
+            return False
+        request = plan.priced.request
+        deadline = request.attempt_deadline_seconds
+        return deadline is not None and request.starved_seconds >= deadline
 
     def _staged_waiter_clock(
         self,

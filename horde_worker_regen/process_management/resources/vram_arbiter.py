@@ -402,6 +402,10 @@ class VramRequest:
     execution attempt. Unlike the arbiter's in-memory emission set, this fact is owned by the job tracker and
     therefore survives arbiter replacement. An active continuation takes precedence; otherwise a spent
     job/device pair falls through to the ordinary denial or deferral path."""
+    wddm_paging_active: bool = False
+    """Whether the driver is demand-paging the worker's own allocations on this card. A measured attempt is
+    judged by what the card reports, and a paging card reports free memory it does not have, so an attempt
+    made then decides by dying rather than by measurement."""
     head_outstanding_mb: float | None = None
     """For a non-head request, the true head of queue's priced outstanding demand (MB) on this device, or None
     when unknown or when this request is itself the head. Head protection: a non-head request that fits is still
@@ -1165,6 +1169,11 @@ class VramArbiter:
         """
         overshoot_mb = _whole_need_mb(request) - ceiling_mb
         if overshoot_mb <= 0.0:
+            return False
+        if request.wddm_paging_active:
+            # The one real load is an experiment the card's own reading grades. With the driver already paging
+            # the worker's allocations out, the reading is the thing that is wrong, and the load's extra
+            # allocations (a LoRA patch's temporaries, the activations) fail natively instead of reporting.
             return False
         if overshoot_mb <= self._ceiling_attempt_allowance_mb(ceiling_mb):
             return True

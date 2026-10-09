@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
@@ -525,3 +526,36 @@ async def test_a_pinned_disaggregated_sampler_waits_on_clearance_only_from_its_s
     waiter.last_process_state_started_at = ownership.recorded_at + 2.0
     assert waiter.is_staged_short_of_sampling() is True
     assert staged_waiter_ids() == [0], "the sample stage's prime makes the pinned sampler a waiter"
+
+
+async def test_a_terminal_refusal_faults_the_staged_job_and_replaces_the_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DENY on a card with nothing to reclaim and no other lane at work ends the wait, not the lease timeout.
+
+    No later pass answers differently, and the staged child's only exit would be sampling unpriced on a card the
+    verdict says cannot hold it. The job is faulted for reissue and the lane replaced deliberately.
+    """
+    from horde_worker_regen.process_management.resources.vram_arbiter import VramDisposition
+    from horde_worker_regen.process_management.scheduling import inference_scheduler as scheduler_module
+
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=100.0)
+    real_plan = _decide(scheduler, 0)
+    assert real_plan.verdict is not None and real_plan.priced is not None
+    # Refused, and starved past the deadline the one real load was bounded by.
+    starved_request = replace(real_plan.priced.request, starved_seconds=50.0, attempt_deadline_seconds=40.0)
+    denied = replace(
+        real_plan,
+        verdict=replace(real_plan.verdict, disposition=VramDisposition.DENY),
+        priced=replace(real_plan.priced, request=starved_request),
+    )
+    monkeypatch.setattr(scheduler_module, "decide_clearance_admit", lambda *args, **kwargs: denied)
+    scheduler._actuate_materialization_verdict = Mock(return_value=())  # type: ignore[method-assign]
+    scheduler._waiting_can_help_staged_waiter = Mock(return_value=False)  # type: ignore[method-assign]
+    replaced = Mock()
+    scheduler._process_lifecycle._replace_inference_process = replaced  # type: ignore[method-assign]
+
+    assert scheduler.clearance_admit_process(0) is False
+
+    replaced.assert_called_once()
+    assert replaced.call_args.args[0] is waiter
+    assert replaced.call_args.kwargs["intentional_reason"]
+    assert replaced.call_args.kwargs["resource_fault_reason"]

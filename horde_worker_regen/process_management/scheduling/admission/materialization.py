@@ -187,6 +187,7 @@ def build_materialization_request(
         own_dispatch_unmaterialized_mb=own_dispatch_mb,
         is_head_of_queue=is_head_of_queue,
         head_job_id=job_id,
+        wddm_paging_active=snapshot.ledgers.retention.wddm_paging_active,
         measured_attempt_in_progress=device_index in job.measured_attempt_devices,
         measured_attempt_already_spent=device_index in job.measured_attempt_spent_devices,
         head_outstanding_mb=head_outstanding_mb,

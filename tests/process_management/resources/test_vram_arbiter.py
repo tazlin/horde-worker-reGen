@@ -1327,6 +1327,15 @@ class TestCeilingMeasuredAttempt:
         assert verdict.measured.fits is False
         assert arbiter.measured_attempts == 1
 
+    def test_a_paging_card_grants_no_attempt(self) -> None:
+        """With the driver paging the worker's allocations, the card's reading cannot grade the attempt: DENY."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+        verdict = arbiter.evaluate(self._head(wddm_paging_active=True))
+        assert verdict.disposition == VramDisposition.DENY
+        assert verdict.measured_attempt is False
+        assert arbiter.measured_attempts == 0
+
     def test_attempt_needs_no_starvation_wait(self) -> None:
         """The ceiling trigger fires immediately: a DENY is terminal, so no starvation can ever accrue."""
         arbiter = VramArbiter()
