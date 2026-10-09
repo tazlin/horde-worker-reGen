@@ -24,9 +24,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import (
     HordeProcessType,
     WorkerCapability,
 )
-from horde_worker_regen.process_management.models.component_residency_map import (
-    CHECKPOINT_KIND,
-)
+from horde_worker_regen.process_management.models.component_residency_map import holds_model
 
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
@@ -838,14 +836,14 @@ class HordeProcessInfo:
         return self.loaded_horde_model_name is not None and self.loaded_horde_model_name != model_name
 
     def holds_model_in_ram(self, model_name: str) -> bool:
-        """Whether the slot's last memory report lists ``model_name`` as a RAM-resident checkpoint.
+        """Whether the slot's last memory report lists ``model_name``'s diffusion weights as RAM-resident.
 
         A lane can hold a VRAM resident and a RAM-staged checkpoint at once, so :meth:`holds_different_model`
         alone does not show that the slot has let go of ``model_name``.
         """
         if not self.held_components:
             return False
-        return any(held.kind == CHECKPOINT_KIND and held.identity == model_name for held in self.held_components)
+        return holds_model(self.held_components, model_name)
 
     def progress_fraction(self) -> float:
         """Denoise progress in ``[0.0, 1.0]`` from the last reported step, else the last heartbeat percentage.

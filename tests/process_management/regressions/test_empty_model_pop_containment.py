@@ -297,6 +297,23 @@ class TestChildSurvivesABadPreloadArgument:
         assert proc._end_process is False
         assert proc._active_model_name == "Krea2-Turbo_fp8"
 
+    def test_a_warm_of_a_split_files_model_held_as_its_unet_is_kept(self) -> None:
+        """A split-files model is preloaded under its diffusion-model entry, so a warm of it is a cache hit."""
+        from hordelib.api import ComponentSlotKind
+        from hordelib.pipeline.families.image_gen.baselines import UNET_FILE_TYPE
+
+        proc = _PreloadStubProcess.build(preload_error=None)
+        proc._horde.preload_model = Mock()  # pyrefly: ignore
+        proc._active_model_name = "Krea2-Turbo_fp8"
+        proc._active_model_diffusion_model_only = True
+        held = Mock(kind=ComponentSlotKind.UNET, identity=f"Krea2-Turbo_fp8:{UNET_FILE_TYPE}")
+        proc._collect_held_components = Mock(return_value=[held])  # pyrefly: ignore
+
+        proc.warm_model("Krea2-Turbo_fp8")
+
+        proc._horde.preload_model.assert_called_once()  # pyrefly: ignore
+        assert proc._horde.preload_model.call_args.args == ("Krea2-Turbo_fp8",)  # pyrefly: ignore
+
     def test_a_genuine_preload_failure_still_ends_the_process(self) -> None:
         """Containment is scoped: a failure part-way through a real load still replaces the slot."""
         proc = _PreloadStubProcess.build(preload_error=RuntimeError("CUDA error: an illegal memory access"))

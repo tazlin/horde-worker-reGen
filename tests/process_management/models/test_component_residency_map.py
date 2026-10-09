@@ -7,12 +7,47 @@ stale-launch rejection, and query behaviour.
 
 from __future__ import annotations
 
+from hordelib.execution.component_cache import ComponentSlotKind
+from hordelib.pipeline.families.image_gen.baselines import UNET_FILE_TYPE
+
 from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot
-from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
+from horde_worker_regen.process_management.models.component_residency_map import (
+    CHECKPOINT_KIND,
+    UNET_KIND,
+    ComponentResidencyMap,
+    holds_model,
+)
 
 
 def _snapshot(kind: str, identity: str, approx_ram_mb: float = 100.0) -> HeldComponentSnapshot:
     return HeldComponentSnapshot(kind=kind, identity=identity, approx_ram_mb=approx_ram_mb)
+
+
+class TestModelIdentity:
+    """The worker's kind strings and model identity rule agree with hordelib's component cache keys."""
+
+    def test_kinds_match_hordelib(self) -> None:
+        """The parent never imports hordelib's pipeline, so its copies are pinned to hordelib's values here."""
+        assert CHECKPOINT_KIND == ComponentSlotKind.CHECKPOINT
+        assert UNET_KIND == ComponentSlotKind.UNET
+        assert UNET_KIND == UNET_FILE_TYPE
+
+    def test_a_split_files_unet_entry_holds_its_model(self) -> None:
+        """Hordelib keys a split-files diffusion model as ``<model name>:<file type>``."""
+        held = [_snapshot(UNET_KIND, f"Krea2-Turbo_fp8:{UNET_FILE_TYPE}")]
+        assert holds_model(held, "Krea2-Turbo_fp8") is True
+        assert holds_model(held, "Qwen-Image_fp8") is False
+
+    def test_a_checkpoint_entry_holds_its_model(self) -> None:
+        """A whole-checkpoint entry's identity is the bare model name."""
+        held = [_snapshot(CHECKPOINT_KIND, "ModelA")]
+        assert holds_model(held, "ModelA") is True
+        assert holds_model(held, "ModelB") is False
+
+    def test_other_kinds_do_not_hold_a_model(self) -> None:
+        """A text encoder or VAE entry never stands for the model, whatever its identity."""
+        held = [_snapshot("clip", "ModelA:unet"), _snapshot("vae", "ModelA")]
+        assert holds_model(held, "ModelA") is False
 
 
 class TestUpdateAndQuery:

@@ -14,7 +14,7 @@ one shared structure the message dispatcher updates and the process lifecycle ex
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 
 from loguru import logger
@@ -23,6 +23,28 @@ from horde_worker_regen.process_management.ipc.messages import HeldComponentSnap
 
 CHECKPOINT_KIND = "checkpoint"
 """The component kind whose identity is the bare horde model name, so it is the staged-model set."""
+
+UNET_KIND = "unet"
+"""The component kind of a bare diffusion model, and the file type hordelib suffixes a split-files identity with.
+
+hordelib uses one value for both (``ComponentSlotKind.UNET`` and the baselines module's ``UNET_FILE_TYPE``).
+The parent never imports hordelib's pipeline, so the value is copied here and pinned by a test against both.
+"""
+
+
+def holds_model(held: Iterable[HeldComponentSnapshot], model_name: str) -> bool:
+    """Whether ``held`` includes an entry that loads ``model_name``'s diffusion weights.
+
+    That is the whole-checkpoint entry, keyed by the bare model name, or a split-files model's bare diffusion
+    model, which hordelib keys as ``<model name>:<file type>``. A split-files preload leaves only the latter, so
+    a check for the checkpoint entry alone reads such a slot as empty.
+    """
+    unet_identity = f"{model_name}:{UNET_KIND}"
+    return any(
+        (component.kind == CHECKPOINT_KIND and component.identity == model_name)
+        or (component.kind == UNET_KIND and component.identity == unet_identity)
+        for component in held
+    )
 
 
 @dataclass(frozen=True)

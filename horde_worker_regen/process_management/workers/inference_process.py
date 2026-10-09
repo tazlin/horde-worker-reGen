@@ -53,6 +53,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     SampleSliceResult,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
+from horde_worker_regen.process_management.models.component_residency_map import holds_model
 from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceLeaseProxy
 from horde_worker_regen.utils.private_memory import PrivateRamPeakSampler
 
@@ -916,14 +917,8 @@ class HordeInferenceProcess(HordeProcess):
             return
 
         if not self._dry_run_skip_inference:
-            from hordelib.api import ComponentSlotKind
-
             held = self._collect_held_components()
-            checkpoint_held = held is not None and any(
-                component.kind == ComponentSlotKind.CHECKPOINT and component.identity == horde_model_name
-                for component in held
-            )
-            if not checkpoint_held:
+            if held is None or not holds_model(held, horde_model_name):
                 logger.debug(f"Ignoring a warm of {horde_model_name}: its checkpoint is not in the component cache")
                 return
             try:

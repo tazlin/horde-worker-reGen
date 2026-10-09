@@ -2,8 +2,37 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot, HordeProcessState
+from horde_worker_regen.process_management.models.component_residency_map import CHECKPOINT_KIND, UNET_KIND
 from tests.process_management.conftest import make_job_pop_response, make_mock_process_info
+
+
+class TestHoldsModelInRam:
+    """Tests for HordeProcessInfo.holds_model_in_ram over the slot's reported component cache."""
+
+    def test_a_split_files_unet_entry_holds_its_model(self) -> None:
+        """A split-files model is preloaded under its diffusion-model entry, so that entry holds the model."""
+        proc = make_mock_process_info(0)
+        proc.held_components = [
+            HeldComponentSnapshot(kind=UNET_KIND, identity="Krea2-Turbo_fp8:unet", approx_ram_mb=9000.0),
+        ]
+        assert proc.holds_model_in_ram("Krea2-Turbo_fp8") is True
+
+    def test_a_checkpoint_entry_holds_its_model(self) -> None:
+        """A whole-checkpoint entry's identity is the bare model name."""
+        proc = make_mock_process_info(0)
+        proc.held_components = [
+            HeldComponentSnapshot(kind=CHECKPOINT_KIND, identity="Krea2-Turbo_fp8", approx_ram_mb=9000.0),
+        ]
+        assert proc.holds_model_in_ram("Krea2-Turbo_fp8") is True
+
+    def test_another_models_unet_entry_does_not_hold_the_model(self) -> None:
+        """The diffusion-model entry of a different model says nothing about this one."""
+        proc = make_mock_process_info(0)
+        proc.held_components = [
+            HeldComponentSnapshot(kind=UNET_KIND, identity="Qwen-Image_fp8:unet", approx_ram_mb=9000.0),
+        ]
+        assert proc.holds_model_in_ram("Krea2-Turbo_fp8") is False
 
 
 class TestIsProcessAlive:
