@@ -188,6 +188,13 @@ def build_materialization_request(
         is_head_of_queue=is_head_of_queue,
         head_job_id=job_id,
         wddm_paging_active=snapshot.ledgers.retention.wddm_paging_active,
+        candidate_measured=pricing.sampling_peak_measured(
+            snapshot,
+            payload,
+            baseline,
+            process_id=process_id,
+            disaggregated=job.disaggregation_class_eligible,
+        ),
         measured_attempt_in_progress=device_index in job.measured_attempt_devices,
         measured_attempt_already_spent=device_index in job.measured_attempt_spent_devices,
         head_outstanding_mb=head_outstanding_mb,

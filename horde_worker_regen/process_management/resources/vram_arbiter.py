@@ -402,6 +402,11 @@ class VramRequest:
     execution attempt. Unlike the arbiter's in-memory emission set, this fact is owned by the job tracker and
     therefore survives arbiter replacement. An active continuation takes precedence; otherwise a spent
     job/device pair falls through to the ordinary denial or deferral path."""
+    candidate_measured: bool = False
+    """Whether the candidate carries a trusted measurement of this job's sampling peak (the learned key has
+    enough observations). A job the hardware has demonstrated at that peak misses the instantaneous reading
+    by the room its own staged encoder holds and the backend will evict, not by an unseen tenant, so its one
+    real load waits the card's probe delay rather than the starvation horizon a larger shortfall implies."""
     wddm_paging_active: bool = False
     """Whether the driver is demand-paging the worker's own allocations on this card. A measured attempt is
     judged by what the card reports, and a paging card reports free memory it does not have, so an attempt
@@ -1232,7 +1237,7 @@ class VramArbiter:
         """
         headroom = measured.headroom_mb
         shortfall_mb = -headroom if headroom is not None else float("inf")
-        if shortfall_mb <= _MEASURED_ATTEMPT_BAND_MB:
+        if shortfall_mb <= _MEASURED_ATTEMPT_BAND_MB or request.candidate_measured:
             delay_seconds = request.probe_after_seconds
         else:
             delay_seconds = max(request.probe_after_seconds, _STARVATION_DIAGNOSTIC_SECONDS)

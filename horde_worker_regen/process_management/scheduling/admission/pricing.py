@@ -344,6 +344,27 @@ def prices_sampler_only_on_card(
     return prices_sampler_only_beside(size_tier(snapshot, job.model), co_tenant_tiers)
 
 
+def sampling_peak_measured(
+    snapshot: SchedulingSnapshot,
+    job: ImageGenerateJobPopResponse,
+    baseline: str | None,
+    *,
+    process_id: int | None,
+    disaggregated: bool,
+) -> bool:
+    """Whether the key :func:`candidate_delta_mb` prices this job under carries a trusted measured peak."""
+    store = snapshot.services.footprint_store
+    if store is None:
+        return False
+    slot = snapshot.slots.get(process_id) if process_id is not None else None
+    device_index = snapshot.routing_device_index(slot) if slot is not None else None
+    sampler_only = disaggregated or prices_sampler_only_on_card(snapshot, job, device_index)
+    key = sampling_footprint_key(
+        job, baseline, stage=FootprintStage.SAMPLE_ISOLATED if sampler_only else FootprintStage.SAMPLE
+    )
+    return key is not None and store.measured_estimate_mb(key) is not None
+
+
 def candidate_delta_mb(
     snapshot: SchedulingSnapshot,
     job: ImageGenerateJobPopResponse,

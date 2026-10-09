@@ -1224,6 +1224,28 @@ class TestMeasuredAttemptEscapeHatch:
         assert verdict.measured_attempt is True
         assert arbiter.measured_attempts == 1
 
+    def test_a_measured_candidate_beyond_the_band_waits_only_the_probe_delay(self) -> None:
+        """A trusted measured peak is the evidence the starvation horizon waits for, so the shorter delay applies.
+
+        Beyond the band an unmeasured candidate waits the diagnostic horizon (an unseen tenant is the likelier
+        cause); a candidate the hardware has demonstrated at that peak misses by the room its own staged encoder
+        holds, and waits the card's probe delay alone.
+        """
+        arbiter = VramArbiter()
+        early_seconds = _FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0
+        assert early_seconds < _STARVATION_DIAGNOSTIC_SECONDS
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        unmeasured = self._starved_head(candidate_delta_mb=14356.0 + 1100.0, starved_seconds=early_seconds)
+        assert arbiter.evaluate(unmeasured).measured_attempt is False
+
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        measured = self._starved_head(
+            candidate_delta_mb=14356.0 + 1100.0, starved_seconds=early_seconds, candidate_measured=True
+        )
+        verdict = arbiter.evaluate(measured)
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured_attempt is True
+
     def test_beyond_the_ceiling_allowance_still_denies(self) -> None:
         """Past the ceiling by more than prediction error can explain, the candidate DENIES with no attempt.
 
