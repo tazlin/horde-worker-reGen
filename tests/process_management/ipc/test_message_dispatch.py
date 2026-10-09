@@ -803,6 +803,8 @@ class TestHandleInferenceResult:
         msg.sdk_api_job_info = job
         msg.time_elapsed = 5.0
         msg.info = "faulted"
+        msg.cuda_context_fault = False
+        msg.host_commit_refused = False
         msg.state = GENERATION_STATE.faulted
         msg.job_image_results = None
         msg.faults_count = 1
@@ -1410,6 +1412,7 @@ class TestInferenceLaneOutcomeRouting:
         msg.time_elapsed = 5.0
         msg.info = info
         msg.cuda_context_fault = cuda_context_fault
+        msg.host_commit_refused = False
         if faulted:
             msg.state = GENERATION_STATE.faulted
             msg.job_image_results = None
@@ -1470,6 +1473,109 @@ class TestInferenceLaneOutcomeRouting:
 
         assert len(outcomes) == 1
         assert outcomes[0].faulted is False
+
+
+class TestHostCommitRefusalRequeue:
+    """A host commit refusal inside a running job is a capacity result, requeued up to a cap and never a fault."""
+
+    _MODEL = "Anima-Turbo-v1.1"
+    _REFUSAL_INFO = (
+        "RuntimeError: Pipeline failed to run - declared output node(s) ['output_image'] produced no results. "
+        "Model: Anima-Turbo-v1.1. Error: CheckpointLoaderSimple: hordelib.execution.zero_copy_load.HostCommitError: "
+        "the host refused to commit the checkpoint mapping"
+    )
+
+    async def _setup(self) -> tuple[MessageDispatcher, JobTracker, ImageGenerateJobPopResponse]:
+        process_info = make_mock_process_info(2)
+        process_info.process_launch_identifier = 4
+        job_tracker = JobTracker()
+        # One attempt: any refusal that consumed an inference attempt would fault the job on the spot.
+        job_tracker.set_retry_policy(max_inference_attempts=1)
+        job = make_job_pop_response(model=self._MODEL)
+        await job_tracker.record_popped_job(job)
+        dispatcher = _make_dispatcher(process_map=ProcessMap({2: process_info}), job_tracker=job_tracker)
+        return dispatcher, job_tracker, job
+
+    async def _refuse(
+        self,
+        dispatcher: MessageDispatcher,
+        job_tracker: JobTracker,
+        job: ImageGenerateJobPopResponse,
+    ) -> None:
+        """Dispatch the job and deliver one faulted result carrying the host-commit mark."""
+        await mark_job_in_progress_async(job_tracker, job)
+        msg = Mock(spec=HordeInferenceResultMessage)
+        msg.process_id = 2
+        msg.process_launch_identifier = 4
+        msg.sdk_api_job_info = job
+        msg.time_elapsed = 5.0
+        msg.info = self._REFUSAL_INFO
+        msg.cuda_context_fault = False
+        msg.host_commit_refused = True
+        msg.state = GENERATION_STATE.faulted
+        msg.job_image_results = None
+        msg.faults_count = 1
+        _enqueue(dispatcher, msg)
+        await dispatcher.receive_and_handle_process_messages()
+
+    async def test_a_refusal_requeues_the_job_and_counts_no_fault(self) -> None:
+        """The job returns to pending for the RAM admission to re-judge, and nothing records a fault."""
+        dispatcher, job_tracker, job = await self._setup()
+        outcomes: list[InferenceLaneOutcome] = []
+        dispatcher.set_inference_lane_outcome_handler(outcomes.append)
+        breaker_models: list[str | None] = []
+        job_tracker.set_terminal_fault_observer(breaker_models.append)
+
+        with _capture_levels() as records:
+            await self._refuse(dispatcher, job_tracker, job)
+
+        assert job.id_ is not None
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
+        tracked = job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.inference_attempts == 0
+        assert tracked.needs_degraded_dispatch is False
+        assert outcomes == []
+        assert breaker_models == []
+        assert job_tracker.count_recent_resource_faults(600.0) == 0
+        assert job_tracker.get_model_overbudget_fault_count(self._MODEL) == 0
+        assert job_tracker.num_jobs_faulted == 0
+        requeue_lines = [message for level, message in records if level == "WARNING" and "host" in message]
+        assert len(requeue_lines) == 1
+        assert str(job.id_) in requeue_lines[0]
+        assert self._MODEL in requeue_lines[0]
+
+    async def test_the_refusal_past_the_cap_faults_the_job_for_reissue(self) -> None:
+        """A job that can never be committed goes back to the horde, still with no model or lane verdict."""
+        from horde_worker_regen.process_management.jobs.job_tracker import MAX_HOST_COMMIT_REQUEUES
+
+        dispatcher, job_tracker, job = await self._setup()
+        outcomes: list[InferenceLaneOutcome] = []
+        dispatcher.set_inference_lane_outcome_handler(outcomes.append)
+        breaker_models: list[str | None] = []
+        job_tracker.set_terminal_fault_observer(breaker_models.append)
+        assert job.id_ is not None
+
+        for _ in range(MAX_HOST_COMMIT_REQUEUES):
+            await self._refuse(dispatcher, job_tracker, job)
+            assert job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
+        assert job_tracker.num_jobs_faulted == 0
+
+        with _capture_levels() as records:
+            await self._refuse(dispatcher, job_tracker, job)
+
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+        tracked = job_tracker.get_tracked_job(job.id_)
+        assert tracked is not None
+        assert tracked.fault_reason is not None
+        assert "host" in tracked.fault_reason
+        assert job_tracker.num_jobs_faulted == 1
+        # The horde counts the reissue as a dropped job, so the fault-rate breaker sees it.
+        assert breaker_models == [self._MODEL]
+        assert outcomes == []
+        assert job_tracker.count_recent_resource_faults(600.0) == 0
+        assert job_tracker.get_model_overbudget_fault_count(self._MODEL) == 0
+        assert any(level in ("WARNING", "ERROR") and "host" in message for level, message in records)
 
 
 _FOLD_MODEL = "stable_diffusion"
@@ -1534,6 +1640,7 @@ class TestJobSamplingPeakFold:
         message.time_elapsed = 5.0
         message.info = "faulted" if faulted else "done"
         message.cuda_context_fault = False
+        message.host_commit_refused = False
         if faulted:
             message.state = GENERATION_STATE.faulted
             message.job_image_results = None

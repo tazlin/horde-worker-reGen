@@ -494,6 +494,12 @@ class HordeInferenceResultMessage(HordeProcessMessage):
 
     The child sets it from the exception's type. The parent replaces the process on the first such fault and counts
     it against neither the model nor the card's capacity."""
+    host_commit_refused: bool = False
+    """Whether the job failed because the host refused to commit a checkpoint mapping during the run.
+
+    The in-run counterpart of :data:`HOST_COMMIT_FAILED_INFO`. It is a typed field because a faulted result's
+    ``info`` carries the exception summary the parent logs. The child sets it from the exception's type, and the
+    parent requeues the job against host memory without counting a fault, up to a cap."""
 
     non_reportable_faults: ClassVar[set[METADATA_TYPE | str]] = {
         METADATA_TYPE.aesthetic_score,

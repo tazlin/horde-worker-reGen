@@ -2019,6 +2019,26 @@ class MessageDispatcher:
         """
         job_id = str(message.sdk_api_job_info.id_) if message.sdk_api_job_info.id_ is not None else None
 
+        # A host commit refusal is a capacity result, which the RAM admission re-judges on the requeue. It is no
+        # verdict on the model, the card or the process, so it reaches neither the resource-fault streaks nor the
+        # lane streak, and a requeue counts no fault anywhere.
+        if message.host_commit_refused:
+            resolution = await self._job_tracker.handle_host_commit_refusal(
+                message.sdk_api_job_info,
+                process_timeout=message.time_elapsed if message.time_elapsed is not None else 0.0,
+            )
+            if resolution is not InferenceFailureResolution.FAULTED:
+                self._action_ledger.record(
+                    LedgerEventType.INFERENCE_RETRIED,
+                    process_id=message.process_id,
+                    job_id=job_id,
+                    reason=message.info or HOST_COMMIT_FAILED_INFO,
+                    detail={"host_commit_refused": True},
+                )
+                return
+            await self._record_terminal_inference_fault(message, job_id, detail={"host_commit_refused": True})
+            return
+
         # A child that could not resolve a job's prefetched auxiliary files on disk faults it retryably
         # (:data:`AUX_RESOLVE_FAILED_INFO`). That is a local disk race, not a CivitAI download failure, so
         # it does not arm the LoRA-download backoff: the fault flows through the ordinary retryable path.
@@ -2065,6 +2085,16 @@ class MessageDispatcher:
             )
             return
 
+        await self._record_terminal_inference_fault(message, job_id, detail={"resource_failure": resource_failure})
+
+    async def _record_terminal_inference_fault(
+        self,
+        message: HordeInferenceResultMessage,
+        job_id: str | None,
+        *,
+        detail: dict[str, str | int | float | bool | None],
+    ) -> None:
+        """Emit the telemetry, audit and VRAM cleanup for a job the tracker has just faulted terminally."""
         # Terminal fault: the tracker has moved the job to PENDING_SUBMIT and counted it as terminal.
         jobs_faulted_counter.add(1)
         queue_depth_counter.add(-1)
@@ -2077,7 +2107,7 @@ class MessageDispatcher:
             process_id=message.process_id,
             job_id=job_id,
             reason=message.info or "inference failed",
-            detail={"resource_failure": resource_failure},
+            detail=detail,
         )
         # Log contract: analysis/log_signatures.py (job_faulted_on_process).
         logger.error(

@@ -77,6 +77,29 @@ raise on a surprising message. A result the child marks as a CUDA context fault
 is never a resource failure, whatever its text says. See
 [Lane fault replacement](#lane-fault-replacement).
 
+### Host commit refusals inside a job
+
+The backend's mapping guard raises `HostCommitError` when the host refuses to
+commit a checkpoint mapping, before any weight is adopted. At preload the child
+reports it under `HOST_COMMIT_FAILED_INFO` and stays up. Inside a running job the
+child recognises the same error by type (directly, or as the pipeline error that
+names it) and sets `host_commit_refused` on the faulted result. The child does not
+retry the job.
+
+The refusal is a capacity result, so the parent resolves it through
+[`JobTracker.handle_host_commit_refusal`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker.handle_host_commit_refusal]
+and never through `handle_job_fault`. The job returns to `PENDING_INFERENCE`
+without spending an inference attempt or its degraded retry, and the RAM
+admission re-judges it before the next dispatch. A requeue counts nothing against
+the fault-rate breaker, the resource-fault throttle, the model's over-budget
+streak or the lane-fault streak. Each requeue logs a WARNING naming the job, the
+model and the requeue count against `MAX_HOST_COMMIT_REQUEUES` (3).
+
+The refusal after the last requeue faults the job for the horde to reissue, with
+a fault reason naming the host commit. That fault feeds the
+[terminal-fault-rate breaker](#the-terminal-fault-rate-breaker), since the horde
+counts it as a dropped job, and it stays out of the model and lane streaks.
+
 ## Layer 2: slot replacement and crash-loop quarantine
 
 A single crashed or hung slot is handled by the

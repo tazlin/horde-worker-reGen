@@ -185,17 +185,26 @@ failure part-way through a real load leaves torch and the backend in an unknown 
 
 
 def _is_host_commit_error(error: BaseException) -> bool:
-    """Whether a preload failure is the host refusing to commit the checkpoint mapping.
+    """Whether a preload or inference failure is the host refusing to commit the checkpoint mapping.
 
     The backend's mapping guard raises before any weight is adopted, so the process holds nothing half-loaded
-    and may stay available. Imported lazily because the guard lives in the backend package, which a dry-run
-    process never imports.
+    and may stay available. Inside a job ComfyUI catches the node's exception, so the backend's pipeline error
+    carries the type by name, built the way ComfyUI builds it. Imported lazily because the guard lives in the
+    backend package, which a dry-run process never imports.
     """
     try:
         from hordelib.execution.zero_copy_load import HostCommitError
     except ImportError:
         return False
-    return isinstance(error, HostCommitError)
+    if isinstance(error, HostCommitError):
+        return True
+    try:
+        from hordelib.execution.interface import PipelineExecutionError
+    except ImportError:
+        return False
+    if not isinstance(error, PipelineExecutionError):
+        return False
+    return error.exception_type == f"{HostCommitError.__module__}.{HostCommitError.__qualname__}"
 
 
 def _is_cuda_context_fault(error: BaseException) -> bool:
@@ -978,6 +987,11 @@ class HordeInferenceProcess(HordeProcess):
     a faulted result carried only the empty rate string) and classify a resource/OOM failure for retry."""
     _last_inference_cuda_context_fault: bool = False
     """Whether the exception that failed the current job was a CUDA runtime error (see ``_is_cuda_context_fault``)."""
+    _last_inference_host_commit_refused: bool = False
+    """Whether the exception that failed the current job was the host refusing a checkpoint commit.
+
+    See ``_is_host_commit_error``. The parent requeues such a job against host memory, so the child never
+    retries it itself."""
 
     def _send_inference_memory_report(self) -> None:
         """Send a precise boundary VRAM report at a stage transition (sampling done, VAE decode).
@@ -1259,6 +1273,7 @@ class HordeInferenceProcess(HordeProcess):
         self._last_job_inference_rate = None
         self._last_inference_error = None
         self._last_inference_cuda_context_fault = False
+        self._last_inference_host_commit_refused = False
         self._last_progress_step_seen = None
         self._nonadvancing_progress_repeats = 0
 
@@ -1305,6 +1320,7 @@ class HordeInferenceProcess(HordeProcess):
             # preserved so torch's "CUDA out of memory" wording reaches the failure classifier intact.
             self._last_inference_error = f"{type(e).__name__}: {e}"
             self._last_inference_cuda_context_fault = _is_cuda_context_fault(e)
+            self._last_inference_host_commit_refused = _is_host_commit_error(e)
             logger.critical(f"Inference failed: {self._last_inference_error}")
             return None
         finally:
@@ -1717,6 +1733,7 @@ class HordeInferenceProcess(HordeProcess):
             job_image_results=all_image_results,
             sdk_api_job_info=job_info,
             cuda_context_fault=is_faulted and self._last_inference_cuda_context_fault,
+            host_commit_refused=is_faulted and self._last_inference_host_commit_refused,
         )
         self.process_message_queue.put(message)
 

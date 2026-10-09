@@ -223,6 +223,14 @@ _QUEUED_STAGES: tuple[JobStage, ...] = (
 """Stages counted by ``num_jobs_total`` (everything except ``DETACHED``)."""
 
 _POST_INFERENCE_FAULT_REF_PREFIX = "faulted after inference: "
+
+MAX_HOST_COMMIT_REQUEUES: int = 3
+"""How many times one job is requeued after the host refuses to commit a checkpoint mapping during its run.
+
+The refusal after the last requeue faults the job for the horde to reissue. A refusal costs one dispatch and a
+mapping attempt that fails before any weight is adopted, and the RAM admission re-judges the job before each
+redispatch. Three re-judgements let a transient commit peak (a sibling's load, another lane's decode) drain, and
+a job this host can never commit still leaves within four short attempts, well inside the horde's job timeout."""
 """Prefix of the metadata note :meth:`JobTracker.fault_post_inference_job` records.
 
 Matched by :meth:`JobTracker.readopt_post_inference_result` to withdraw the note when the work that was
@@ -318,6 +326,11 @@ class TrackedJob:
     job would otherwise have submitted."""
     degraded_retry_used: bool = False
     """Whether this job has already spent its one degraded (isolated) retry for a resource failure."""
+    host_commit_refusals: int = 0
+    """How many of this job's runs the host refused to commit a checkpoint mapping for.
+
+    Bounded by :data:`MAX_HOST_COMMIT_REQUEUES` and kept apart from ``inference_attempts``, since a refusal is a
+    host memory condition and no verdict on the job."""
     needs_degraded_dispatch: bool = False
     """Set when this job's next dispatch should run degraded/isolated (consumed by the scheduler)."""
     admitted_over_budget: bool = False
@@ -2522,6 +2535,81 @@ class JobTracker:
             was_disaggregated_structural_fault=was_disaggregated_structural_fault,
             deliberate_replacement_reason=deliberate_replacement_reason,
         )
+
+    async def handle_host_commit_refusal(
+        self,
+        faulted_job: ImageGenerateJobPopResponse,
+        *,
+        process_timeout: float = 0.0,
+    ) -> InferenceFailureResolution:
+        """Resolve a job whose run failed because the host refused to commit a checkpoint mapping.
+
+        A refusal is a capacity result. The job returns to ``PENDING_INFERENCE`` without spending an inference
+        attempt or a degraded retry, so the RAM admission re-judges it before the next dispatch. The refusal
+        after :data:`MAX_HOST_COMMIT_REQUEUES` requeues faults the job for the horde to reissue. That fault reaches
+        the terminal-fault observer because the horde counts it as a dropped job, and it never feeds the
+        resource-fault streaks, which judge whether a model fits a card.
+
+        Args:
+            faulted_job: The job whose run the host refused.
+            process_timeout: Seconds the failed run took, recorded on a terminal fault.
+
+        Returns:
+            ``RETRY`` when the job was requeued, ``FAULTED`` when it was faulted terminally.
+        """
+        tracked = self._tracked_for(faulted_job)
+
+        if tracked is None or tracked.job_info is None:
+            logger.error(f"Job {faulted_job.id_} not found in jobs_lookup")
+            return InferenceFailureResolution.FAULTED
+
+        if tracked.stage == JobStage.PENDING_SUBMIT:
+            logger.warning(f"Job {faulted_job.id_} already in completed_jobs")
+            return InferenceFailureResolution.FAULTED
+
+        # Released before deciding, as the ordinary fault path does: a requeue must not race the orchestrator's
+        # own re-dispatch of held disaggregation state, and a terminal fault must not leave that state behind.
+        if faulted_job.id_ is not None and self._inference_failure_release_observer is not None:
+            self._inference_failure_release_observer(faulted_job.id_)
+
+        # Any failed execution ends a measured attempt's continuation admit. The refusal says nothing about the
+        # card's VRAM ceiling, so no ceiling hold is armed.
+        if tracked.measured_attempt:
+            tracked.measured_attempt = False
+            tracked.measured_attempt_device_index = None
+
+        tracked.host_commit_refusals += 1
+        refusals = tracked.host_commit_refusals
+
+        can_requeue = tracked.time_popped is not None and refusals <= MAX_HOST_COMMIT_REQUEUES
+        requeued = can_requeue and (
+            tracked.stage is JobStage.PENDING_INFERENCE or self._set_stage(tracked, JobStage.PENDING_INFERENCE)
+        )
+        if requeued:
+            logger.warning(
+                f"Job {faulted_job.id_} ({faulted_job.model}): the host refused to commit the checkpoint mapping; "
+                f"requeued for host memory admission (requeue {refusals}/{MAX_HOST_COMMIT_REQUEUES}).",
+            )
+            return InferenceFailureResolution.RETRY
+
+        reason = f"host refused to commit the checkpoint mapping on {refusals} run(s)"
+        tracked.fault_origin = JobFaultOrigin.GENERATION
+        tracked.job_info.fault_job()
+        tracked.job_info.time_to_generate = process_timeout
+        self._record_fault_diagnostics(tracked, is_resource_failure=False, fault_reason=reason)
+
+        if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
+            # Counted here for the reason the ordinary terminal path gives: no later step counts a fault decided now.
+            self._total_num_completed_jobs += 1
+            self._count_job_faulted(tracked)
+
+        logger.error(
+            f"Job {faulted_job.id_} ({faulted_job.model}): the host refused to commit the checkpoint mapping after "
+            f"{MAX_HOST_COMMIT_REQUEUES} requeues, so it is faulted for the horde to reissue.",
+        )
+        if self._terminal_fault_observer is not None:
+            self._terminal_fault_observer(faulted_job.model)
+        return InferenceFailureResolution.FAULTED
 
     def handle_job_fault_now(
         self,
