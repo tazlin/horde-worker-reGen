@@ -2121,6 +2121,9 @@ class _DispatchWorld:
             self._receive_pipe_only_unloads(lane)
             if self.host_ram is not None and lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
                 self.host_ram.evict(lane.process_id)
+                # The child's unload report re-stamps the unload on the host clock the readings share. The world
+                # stands in for that report, so the stamp is on the world clock the lane's readings carry.
+                lane.last_ram_unload_requested_at = self.now
                 self._release_unloaded_lane(lane)
                 continue
             if lane.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
