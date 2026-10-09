@@ -41,6 +41,7 @@ from tests.process_management.conftest import (
     make_mock_process_info,
     make_test_card_runtimes,
     mark_job_in_progress_async,
+    mark_ram_unload_settled,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -723,4 +724,68 @@ class TestCommitAdmission:
         admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
 
         assert admission.commit_verdict is None
+        assert admission.fits is admission.verdict.fits
+
+
+class TestPageReuseCreditAgainstCommit:
+    """A retained-page credit lowers the physical-RAM charge and never the commit charge of a new mapping."""
+
+    _MAPPING_MB = 12533.0
+    _RETAINED_RSS_MB = 20000.0
+
+    @classmethod
+    async def _retaining_worker(
+        cls,
+        *,
+        available_commit_mb: float | None,
+        available_ram_mb: float = 65536.0,
+    ) -> tuple[InferenceScheduler, str]:
+        retaining = _slot(0, model=None)
+        retaining.ram_usage_bytes = int(cls._RETAINED_RSS_MB * 1024 * 1024)
+        mark_ram_unload_settled(retaining)
+        scheduler, jobs = await _worker(slots={0: retaining}, pending=["sd"], available_ram_mb=available_ram_mb)
+        scheduler._checkpoint_staging_charge_mb = lambda _job: cls._MAPPING_MB  # type: ignore[method-assign]
+        scheduler.set_available_commit_mb_provider(lambda: available_commit_mb)
+        return scheduler, str(jobs[0].id_)
+
+    async def test_a_commit_bound_host_charges_the_whole_mapping_and_defers(self) -> None:
+        """Committable memory short of the whole mapping defers the load, whatever pages the target retained."""
+        scheduler, job_id = await self._retaining_worker(available_commit_mb=9000.0)
+        snapshot = scheduler.snapshot()
+        assert snapshot.host_ram.commit_bound
+
+        admission = decide_ram_admission(snapshot, job_id, 0)
+
+        features_mb = snapshot.queue.jobs[job_id].feature_ram_mb
+        assert admission.kind is RamChargeKind.PAGE_REUSE
+        assert admission.verdict.reusable_credit_mb > 0.0, "physical RAM keeps the credit"
+        assert admission.commit_verdict is not None
+        assert admission.commit_verdict.reusable_credit_mb == 0.0
+        assert admission.commit_verdict.predicted_mb == self._MAPPING_MB + features_mb
+        assert admission.fits is False
+        assert "commit-bound" in admission.reason()
+
+    async def test_a_physical_bound_host_keeps_the_credit(self) -> None:
+        """Ample commit leaves the credited physical verdict in charge."""
+        scheduler, job_id = await self._retaining_worker(available_commit_mb=1_000_000.0)
+
+        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+
+        assert admission.kind is RamChargeKind.PAGE_REUSE
+        assert admission.verdict.reusable_credit_mb > 0.0
+        assert admission.commit_verdict is not None and admission.commit_verdict.fits
+        assert admission.fits is True
+
+    async def test_a_host_with_no_commit_figure_is_unchanged(self) -> None:
+        """No commit figure prices the credited physical verdict alone, the same verdict an ample-commit host gets."""
+        unreported, unreported_job = await self._retaining_worker(available_commit_mb=None)
+        ample, ample_job = await self._retaining_worker(available_commit_mb=1_000_000.0)
+
+        admission = decide_ram_admission(unreported.snapshot(), unreported_job, 0)
+        reference = decide_ram_admission(ample.snapshot(), ample_job, 0)
+
+        assert admission.commit_verdict is None
+        assert admission.kind is RamChargeKind.PAGE_REUSE
+        assert admission.verdict.predicted_mb == reference.verdict.predicted_mb
+        assert admission.verdict.reusable_credit_mb == reference.verdict.reusable_credit_mb
         assert admission.fits is admission.verdict.fits

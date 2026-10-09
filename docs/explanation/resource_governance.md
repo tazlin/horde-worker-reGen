@@ -79,6 +79,13 @@ The danger-floor verdict (`assess_ram_pressure`) carries both figures, and its r
 degrade response with its process reduction and over-ceiling reclaim, the shed restore headroom, the
 head-of-queue reclaim and the idle-lane warm's room all read the admissible figure. The preload
 admission prices the job's own mapping against commit separately, on the same measured commit figure.
+That commit charge is the whole checkpoint plus the job's features, with no retained-page or component
+credit, because a new mapping charges the whole file to commit whichever of its pages are cached. A
+retained-page credit therefore lowers only the physical-RAM charge, and the `RAM credit admitting` line
+says so beside the commit charge it left whole (or `commit not priced` where the host reports no commit
+figure or the target already holds the checkpoint). The credit counts a slot's retained pages only from
+a memory reading sampled at least one report interval after its last RAM unload. An earlier reading
+still includes the released model.
 
 Every requirement counts outstanding RAM: work already admitted whose allocation the available
 reading does not yet show. Preload requires `max(floor, reserve) + outstanding + incoming`, and

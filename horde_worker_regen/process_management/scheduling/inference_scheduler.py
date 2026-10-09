@@ -6593,22 +6593,37 @@ class InferenceScheduler:
         job: ImageGenerateJobPopResponse,
         target: HordeProcessInfo,
         verdict: BudgetVerdict,
+        *,
+        commit_verdict: BudgetVerdict | None,
     ) -> None:
         """Log a credited RAM admission (edge-triggered) and record it for the measured-truth reconciliation.
 
         Emitted once per distinct credited admission (target, model, rounded charge) so the sub-second loop
-        cannot spam an unchanged decision. The record lets :meth:`_reconcile_reuse_credit` later compare the
-        target's settled RSS growth to the charge the credit priced the swap at.
+        cannot spam an unchanged decision. The line names physical RAM as the test the credit lowered and
+        states the commit charge beside it, since a new mapping charges the whole file to commit whatever pages
+        the target retained. The record lets :meth:`_reconcile_reuse_credit` later compare the target's settled
+        RSS growth to the charge the credit priced the swap at.
         """
         retained_mb = staging_reuse_credit_mb(target)
         charge_key = int(verdict.predicted_mb) if verdict.predicted_mb is not None else 0
         if self._ram_reclaim.announce_admission((target.process_id, job.model, charge_key)):
             uncredited = verdict.uncredited_predicted_mb if verdict.uncredited_predicted_mb is not None else 0.0
+            commit_clause = "commit not priced"
+            if (
+                commit_verdict is not None
+                and commit_verdict.predicted_mb is not None
+                and commit_verdict.available_mb is not None
+            ):
+                commit_clause = (
+                    f"commit charged the whole mapping ~{commit_verdict.predicted_mb:.0f} MB "
+                    f"of {commit_verdict.available_mb:.0f} MB committable"
+                )
             logger.opt(colors=True).info(
                 "<fg #8fd6a0>RAM credit admitting preload of {} "
                 f"onto process {target.process_id}: "
-                f"predicted ~{uncredited:.0f} MB, credit {verdict.reusable_credit_mb:.0f} MB "
-                f"(retained reusable {retained_mb:.0f} MB), effective charge ~{charge_key:.0f} MB.</>",
+                f"predicted ~{uncredited:.0f} MB, credit {verdict.reusable_credit_mb:.0f} MB applied to physical RAM "
+                f"(retained reusable {retained_mb:.0f} MB), effective charge ~{charge_key:.0f} MB, "
+                f"{commit_clause}.</>",
                 job.model,
             )
         if job.model is not None:
@@ -6904,7 +6919,12 @@ class InferenceScheduler:
             if admission.kind is RamChargeKind.COMPONENT:
                 self._note_component_admission(job, available_process, ram_verdict)
             elif admission.kind is RamChargeKind.PAGE_REUSE:
-                self._note_credited_admission(job, available_process, ram_verdict)
+                self._note_credited_admission(
+                    job,
+                    available_process,
+                    ram_verdict,
+                    commit_verdict=admission.commit_verdict,
+                )
             elif job.model is not None and ram_verdict.predicted_mb is not None:
                 self._record_load_for_learning(job, available_process, ram_verdict, ReuseCreditKind.WHOLE)
             self._resolve_head_ram_defer(job, reason="admitted")

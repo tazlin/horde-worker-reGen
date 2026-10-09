@@ -103,6 +103,80 @@ class TestStagingReuseCredit:
         fresh.ram_usage_bytes = int((FRESH_INFERENCE_CHILD_BASELINE_MB - 200.0) * _MB)
         assert staging_reuse_credit_mb(fresh) == 0.0
 
+    def test_a_reading_older_than_the_unload_earns_no_credit(self) -> None:
+        """A reading sampled before the RAM unload still holds the released model, so it is no evidence of reuse."""
+        unsettled = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        unsettled.ram_usage_bytes = int(17000.0 * _MB)
+        unsettled.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+        unsettled.last_ram_unload_requested_at = time.time()
+        unsettled.report_sampled_at = unsettled.last_ram_unload_requested_at - 1.0
+        assert staging_reuse_credit_mb(unsettled) == 0.0
+
+        mark_ram_unload_settled(unsettled)
+        assert staging_reuse_credit_mb(unsettled) == pytest.approx(17000.0 - FRESH_INFERENCE_CHILD_BASELINE_MB)
+
+
+_MAPPING_MB = 12533.0
+"""A checkpoint mapping larger than the committable memory the commit-bound rows leave."""
+
+
+def _credit_lines(messages: list[str]) -> list[str]:
+    return [message for message in messages if "RAM credit admitting" in message]
+
+
+class TestCreditAgainstCommit:
+    """The retained-page credit prices physical RAM only, and its log line says which test it lowered."""
+
+    @staticmethod
+    async def _admit(
+        *,
+        available_commit_mb: float | None,
+    ) -> tuple[InferenceScheduler, bool, list[str], float]:
+        target = _retaining_target(rss_mb=20000.0)
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: target}))
+        scheduler._measured_available_ram_mb = lambda: 60000.0  # type: ignore[method-assign]
+        scheduler._ram_danger_floor_mb = lambda: 4800.0  # type: ignore[method-assign]
+        scheduler._checkpoint_staging_charge_mb = lambda _job: _MAPPING_MB  # type: ignore[method-assign]
+        scheduler.set_available_commit_mb_provider(lambda: available_commit_mb)
+        job = make_job_pop_response("head_model")
+        await track_popped_job_async(scheduler._job_tracker, job)
+        features_mb = scheduler.snapshot().queue.jobs[str(job.id_)].feature_ram_mb
+        messages: list[str] = []
+        sink_id = logger.add(lambda record: messages.append(str(record)), level="INFO")
+        try:
+            admitted = scheduler._apply_ram_verdict(job, target, is_head_blocker=False, no_live_resource_consumer=True)
+        finally:
+            logger.remove(sink_id)
+        return scheduler, admitted, messages, features_mb
+
+    async def test_a_commit_bound_host_defers_the_mapping_the_credit_would_admit(self) -> None:
+        """Committable memory short of the whole mapping defers the load and records no credited admission."""
+        scheduler, admitted, messages, _ = await self._admit(available_commit_mb=9000.0)
+
+        assert admitted is False
+        assert 0 not in scheduler.ram_reclaim.pending_reuse_credits
+        assert _credit_lines(messages) == []
+        assert any("commit-bound: 9000 MB committable" in message for message in messages)
+
+    async def test_the_credit_line_names_physical_ram_and_the_whole_commit_charge(self) -> None:
+        """An admitted credit reads as a physical-RAM credit beside the uncredited commit charge."""
+        _, admitted, messages, features_mb = await self._admit(available_commit_mb=1_000_000.0)
+
+        assert admitted is True
+        (line,) = _credit_lines(messages)
+        assert "applied to physical RAM" in line
+        assert f"commit charged the whole mapping ~{_MAPPING_MB + features_mb:.0f} MB" in line
+
+    async def test_the_credit_line_without_a_commit_figure_says_commit_is_not_priced(self) -> None:
+        """A host with no commit figure admits as before, and the line says commit was not priced."""
+        scheduler, admitted, messages, _ = await self._admit(available_commit_mb=None)
+
+        assert admitted is True
+        assert 0 in scheduler.ram_reclaim.pending_reuse_credits
+        (line,) = _credit_lines(messages)
+        assert "applied to physical RAM" in line
+        assert "commit not priced" in line
+
 
 class TestCreditedAdmission:
     """A retaining target admits a swap the cold-load charge would defer, and the admission is recorded."""

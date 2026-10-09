@@ -149,9 +149,12 @@ def staging_reuse_credit_mb(target: HordeProcessInfo) -> float:
     """The retained, reusable resident RSS (MB) a preload onto ``target`` can reuse instead of allocating.
 
     A busy target's pages are in live use and earn no credit; a fresh slot at baseline yields zero, which
-    collapses the verdict to the ordinary full charge.
+    collapses the verdict to the ordinary full charge. After a RAM unload the credit waits for a reading that
+    postdates it, because an earlier reading still counts the released model's pages as retained.
     """
     if target.is_process_busy():
+        return 0.0
+    if target.last_ram_unload_requested_at is not None and not target.ram_reading_postdates_unload():
         return 0.0
     target_rss_mb = max(0, target.ram_usage_bytes) / (1024 * 1024)
     return max(0.0, target_rss_mb - FRESH_INFERENCE_CHILD_BASELINE_MB)
