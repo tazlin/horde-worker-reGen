@@ -164,6 +164,39 @@ class TestCommittedReserveLedger:
         assert ledger.effective_planned_vram_mb({3: 5200.0}) == 0.0
         assert ledger.effective_planned_vram_mb({3: 9999.0}) == 0.0
 
+    def test_planned_overlay_counts_only_the_named_card_processes(self) -> None:
+        """A card's overlay carries only the charges that will land on that card's processes."""
+        ledger = CommittedReserveLedger()
+        ledger.set_planned("preload", "job-0", vram_mb=5000.0, target_process_id=3, reserved_at_admit_mb=0.0)
+        ledger.set_planned("post_process", "job-1", vram_mb=2000.0, target_process_id=7, reserved_at_admit_mb=0.0)
+
+        assert ledger.effective_planned_vram_mb({}, target_process_ids={3}) == 5000.0
+        assert ledger.effective_planned_vram_mb({}, target_process_ids={7}) == 2000.0
+        assert ledger.effective_planned_vram_mb({}) == 7000.0
+        assert ledger.effective_planned_vram_mb_for_flow("post_process", {}, target_process_ids={3}) == 0.0
+        assert ledger.effective_planned_vram_mb_for_flow("post_process", {}, target_process_ids={7}) == 2000.0
+
+    def test_a_booked_post_process_chain_is_a_planned_charge_on_its_lane(self) -> None:
+        """The chain is subtracted by the admission overlay from the moment it is booked, and released with it."""
+        from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
+        from horde_worker_regen.process_management.workers.post_process_orchestrator import (
+            book_post_process_chain,
+        )
+        from tests.process_management.conftest import make_mock_process_info
+
+        ledger = CommittedReserveLedger()
+        lane = make_mock_process_info(9, model_name=None)
+        lane.process_reserved_mb = 300
+
+        book_post_process_chain(ledger, job_id="job-9", reserve_vram_mb=4600.0, ram_mb=1200.0, lane=lane)
+
+        assert ledger.total_vram_mb() == 4600.0
+        assert ledger.effective_planned_vram_mb({9: 300.0}) == 4600.0
+        assert ledger.effective_planned_vram_mb({9: 2300.0}) == 2600.0
+        ledger.release(POST_PROCESS_RESERVE_FLOW, "job-9")
+        assert ledger.total_vram_mb() == 0.0
+        assert ledger.effective_planned_vram_mb({}) == 0.0
+
     def test_release_drops_planned_charge(self) -> None:
         """Releasing a unit self-heals its planned charge as well as its flat reserve."""
         ledger = CommittedReserveLedger()

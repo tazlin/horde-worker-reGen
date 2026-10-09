@@ -119,6 +119,8 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
+from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
+from horde_worker_regen.process_management.workers import post_process_orchestrator
 from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -425,6 +427,27 @@ class _StagedPrefetch:
     """The disk read the checkpoint needed when the prefetch began."""
     staged_at: float | None
     """When a job was staged on the lane; None while an idle lane's warm waits for its dispatch."""
+
+
+@dataclass
+class _PostProcessChain:
+    """One chain the modelled post-processing lane took, from its dispatch to the release of its card charge.
+
+    A chain's allocations reach the device-free reading some time after it is dispatched, so its charge lands
+    on the card a configured number of ticks after the lane takes it. Until then the parent sees the chain only
+    through what was booked for it at dispatch.
+    """
+
+    job_id: str
+    job_info: HordeJobInfo
+    dispatched_tick: int
+    dispatched_at: float
+    """The world clock when the lane took the chain, comparable with a job window's instants."""
+    charge_at_tick: int
+    charged_tick: int | None = None
+    """The tick the chain's peak landed on the card; None while its allocations are still to come."""
+    released_tick: int | None = None
+    """The tick the chain completed and its charge and reserve came off; None while it runs."""
 
 
 @dataclass
@@ -762,6 +785,9 @@ class _DispatchWorld:
         safety_card_index: int = 0,
         post_process_card_index: int = 0,
         post_processing_chain_ticks: int = 0,
+        post_process_chain_peak_mb: float | None = None,
+        post_process_chain_allocation_lag_ticks: int = 0,
+        post_process_chain_hold_ticks: int = 1,
         preload_ends_dispatch: bool = False,
         extra_model_classes: tuple[_ModelClass, ...] = (),
         host_ram: HostRamLedger | None = None,
@@ -942,6 +968,14 @@ class _DispatchWorld:
                 pending queue before the hand-driven lane takes it. Zero drains every chain on the tick it
                 arrives, which is what a row not about the lane's queue wants; a positive value is a lane with
                 a real backlog, which is the only state in which a pending chain is owed a drain window.
+            post_process_chain_peak_mb: The VRAM (MB) a chain on the post-processing lane allocates. None keeps the
+                lane hand-driven and free of any charge, the shape every row not about the lane's memory runs
+                against. Set, it needs ``service_contexts`` (the lane is a service process): the lane takes one
+                chain at a time, books it through production's ``book_post_process_chain``, charges this peak to
+                its card after the allocation lag, and releases charge and reserve after the hold.
+            post_process_chain_allocation_lag_ticks: Ticks between the lane taking a chain and the chain's peak
+                landing on the card, the delay before a real chain's allocations reach the device-free reading.
+            post_process_chain_hold_ticks: Ticks the chain's peak stays on the card once it has landed.
             preload_ends_dispatch: Whether a sent preload ends the tick before any dispatch is attempted. The
                 cycle shape a worker had before preload and dispatch were separated; kept as an opt-in so a
                 row can state what it costs, and off everywhere else because it is not what the control loop
@@ -966,6 +1000,10 @@ class _DispatchWorld:
             raise ValueError("a staged prefetch and the tail overlap both act on staged lanes, so they need the lease")
         if idle_lane_warm and not clearance_lease:
             raise ValueError("an idle lane's warm is credited at its job's clearance, so it needs the lease")
+        if post_process_chain_peak_mb is not None and not service_contexts:
+            raise ValueError("a modelled post-processing chain runs on the post-processing lane, a service context")
+        if post_process_chain_hold_ticks < 1:
+            raise ValueError("a modelled post-processing chain holds the card for at least one tick")
         self.staged_lane_prefetch = staged_lane_prefetch
         self.staged_encode_mb_by_model: Mapping[str, float] = dict(staged_encode_mb_by_model or {})
         self.idle_lane_warm = idle_lane_warm
@@ -1185,6 +1223,19 @@ class _DispatchWorld:
         """Whether a sent preload ends the tick, the cycle shape from before the two stages were separated."""
         self._chain_ready_at: dict[str, int] = {}
         """The tick each pending chain becomes drainable, so a backlog persists across ticks."""
+        self.post_process_chain_peak_mb = post_process_chain_peak_mb
+        """What a modelled chain allocates on the lane's card, or None when the lane is hand-driven and free."""
+        self.post_process_chain_allocation_lag_ticks = post_process_chain_allocation_lag_ticks
+        self.post_process_chain_hold_ticks = post_process_chain_hold_ticks
+        self._post_process_chain_mb: dict[int, float] = {}
+        """Per lane, a modelled chain's peak while it is on the card. Only the post-processing lane holds one."""
+        self.post_process_chains: list[_PostProcessChain] = []
+        """Every chain the modelled lane took, in order, kept after it completes."""
+        self.card_overcommits: list[tuple[int, int, float]] = []
+        """Every observation of a card whose tenants exceeded its total, as (tick, card, MB over).
+
+        The truthful reading clamps at zero, so a card committed past its total reads exactly as a full one; this
+        is where the difference, which a driver pays for by paging, is kept."""
         card_indices = sorted(card_max_pixels) if card_max_pixels else [0]
         self._card_totals: dict[int, float] = dict.fromkeys(card_indices, card.total_mb)
         """The conserved ledger, one entry per card: what that card's total is, and therefore what its free
@@ -1686,6 +1737,25 @@ class _DispatchWorld:
         """What the lifecycle reports one placement flip costs, floored the way the real manager floors it."""
         return max(self.safety_readiness_seconds, SAFETY_READINESS_LATENCY_FLOOR_SECONDS)
 
+    def card_committed_mb(self, device_index: int) -> float:
+        """Everything charged to one card: its contexts, weights, activation and any post-processing chain.
+
+        Unclamped, so a card committed past its total reports by how much.
+        """
+        held = sum(
+            charge_mb
+            for charges in (
+                self._resident_mb,
+                self._transient_mb,
+                self._held_component_mb,
+                self._encode_staging_mb,
+                self._post_process_chain_mb,
+            )
+            for lane_id, charge_mb in charges.items()
+            if self._card_of(lane_id) == device_index
+        )
+        return self._context_charge_mb(device_index) + held
+
     def card_free_mb(self, device_index: int) -> float:
         """The truthful device-free reading for one card: its total less its contexts, weights and activation.
 
@@ -1694,13 +1764,14 @@ class _DispatchWorld:
         and it is the sum of the two across concurrent slots that reaches a paging cliff. Only the tenants
         charged to this card count, so work on a sibling card neither consumes this card's room nor excuses it.
         """
-        held = sum(
-            charge_mb
-            for charges in (self._resident_mb, self._transient_mb, self._held_component_mb, self._encode_staging_mb)
-            for lane_id, charge_mb in charges.items()
-            if self._card_of(lane_id) == device_index
-        )
-        return max(0.0, self._card_totals[device_index] - self._context_charge_mb(device_index) - held)
+        return max(0.0, self._card_totals[device_index] - self.card_committed_mb(device_index))
+
+    def _sample_card_overcommit(self) -> None:
+        """Record every card whose tenants exceed its total at this instant."""
+        for device_index, total_mb in self._card_totals.items():
+            over_mb = self.card_committed_mb(device_index) - total_mb
+            if over_mb > 0.0:
+                self.card_overcommits.append((self.tick, device_index, over_mb))
 
     def device_free_mb(self, device_index: int | None = None) -> float:
         """The truthful device-free reading for ``device_index``, or the tightest card's when none is named.
@@ -1737,12 +1808,13 @@ class _DispatchWorld:
         return None
 
     def _lane_charge_mb(self, lane_id: int) -> float:
-        """What one lane holds on the card: weights, live activation, components, and any staged encode."""
+        """What one lane holds on the card: weights, live activation, components, any staged encode or chain."""
         return (
             self._resident_mb.get(lane_id, 0.0)
             + self._transient_mb.get(lane_id, 0.0)
             + self._held_component_mb.get(lane_id, 0.0)
             + self._encode_staging_mb.get(lane_id, 0.0)
+            + self._post_process_chain_mb.get(lane_id, 0.0)
         )
 
     def _child_believed_free_mb(self, lane_id: int, job_id: str) -> float:
@@ -2524,7 +2596,12 @@ class _DispatchWorld:
 
         A chain waits ``post_processing_chain_ticks`` before the lane takes it, so a row can hold a real
         backlog against the lane's card. At the default of zero every chain drains on the tick it arrives.
+        With ``post_process_chain_peak_mb`` set the lane's chain is modelled instead
+        (:meth:`_advance_post_process_chain`).
         """
+        if self.post_process_chain_peak_mb is not None:
+            await self._advance_post_process_chain(self.post_process_chain_peak_mb)
+            return
         for job_info in list(self._job_tracker.jobs_pending_post_processing):
             job_id = str(job_info.sdk_api_job_info.id_)
             ready_at = self._chain_ready_at.setdefault(job_id, self.tick + self.post_processing_chain_ticks)
@@ -2533,6 +2610,77 @@ class _DispatchWorld:
             self._chain_ready_at.pop(job_id, None)
             await self._job_tracker.begin_post_processing(job_info, process_id=-1, process_launch_identifier=1)
             await self._job_tracker.queue_for_safety_post_processed(job_info)
+
+    async def _advance_post_process_chain(self, peak_mb: float) -> None:
+        """Release the lane's finished chain, take the next pending one, and land a chain's charge when due.
+
+        The lane takes one chain at a time and books it through production's ``book_post_process_chain``, so
+        until the chain's peak lands ``post_process_chain_allocation_lag_ticks`` later the parent sees it only
+        through that booking, as a real chain's allocations reach the device-free reading seconds after its
+        dispatch. The landed peak raises the lane's reported reservation, which decays the booking's planned
+        share. After ``post_process_chain_hold_ticks`` the peak comes off the card, the reserve is released as
+        the parent's result path releases it, and the job moves on to safety.
+        """
+        lane = self._process_map[_POST_PROCESS_LANE_ID]
+        chain = self._post_process_chain_running()
+        chain_finished = (
+            chain is not None
+            and chain.charged_tick is not None
+            and self.tick >= chain.charged_tick + self.post_process_chain_hold_ticks
+        )
+        if chain is not None and chain_finished:
+            self._post_process_chain_mb.pop(lane.process_id, None)
+            self._reserve_ledger.release(POST_PROCESS_RESERVE_FLOW, chain.job_id)
+            chain.released_tick = self.tick
+            lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+            await self._job_tracker.queue_for_safety_post_processed(chain.job_info)
+            self._sync_reported_vram()
+            chain = None
+        if chain is None:
+            chain = await self._take_post_process_chain(lane, peak_mb)
+        if chain is not None and chain.charged_tick is None and self.tick >= chain.charge_at_tick:
+            self._post_process_chain_mb[lane.process_id] = peak_mb
+            chain.charged_tick = self.tick
+            self._sync_reported_vram()
+            self._sample_card_overcommit()
+
+    def _post_process_chain_running(self) -> _PostProcessChain | None:
+        """The chain the modelled lane holds, or None when it is free."""
+        if self.post_process_chains and self.post_process_chains[-1].released_tick is None:
+            return self.post_process_chains[-1]
+        return None
+
+    async def _take_post_process_chain(self, lane: HordeProcessInfo, peak_mb: float) -> _PostProcessChain | None:
+        """Dispatch the oldest drainable pending chain to the modelled lane and book it, or return None."""
+        for job_info in self._job_tracker.jobs_pending_post_processing:
+            job_id = str(job_info.sdk_api_job_info.id_)
+            ready_at = self._chain_ready_at.setdefault(job_id, self.tick + self.post_processing_chain_ticks)
+            if self.tick < ready_at:
+                continue
+            self._chain_ready_at.pop(job_id, None)
+            post_process_orchestrator.book_post_process_chain(
+                self._reserve_ledger,
+                job_id=job_id,
+                reserve_vram_mb=peak_mb,
+                ram_mb=0.0,
+                lane=lane,
+            )
+            lane.last_process_state = HordeProcessState.POST_PROCESSING
+            await self._job_tracker.begin_post_processing(
+                job_info,
+                process_id=lane.process_id,
+                process_launch_identifier=lane.process_launch_identifier,
+            )
+            chain = _PostProcessChain(
+                job_id=job_id,
+                job_info=job_info,
+                dispatched_tick=self.tick,
+                dispatched_at=self.now,
+                charge_at_tick=self.tick + self.post_process_chain_allocation_lag_ticks,
+            )
+            self.post_process_chains.append(chain)
+            return chain
+        return None
 
     def _pending_jobs_that_could_be_seated(self) -> set[str]:
         """The pending jobs that have a lane they could start on right now, by job id.
@@ -3696,6 +3844,7 @@ class _DispatchWorld:
                 self.min_card_free_mb[device_index],
                 self.card_free_mb(device_index),
             )
+        self._sample_card_overcommit()
         self._sample_retained_resident_divergence()
         self.offers[self.tick] = self.advertised_models()
         claim = self._scheduler.whole_card_pop_claim()

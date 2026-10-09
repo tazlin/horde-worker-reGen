@@ -87,6 +87,31 @@ def _round_or_none(value: float | None) -> float | None:
     return None if value is None else round(value, 1)
 
 
+def book_post_process_chain(
+    reserve_ledger: CommittedReserveLedger,
+    *,
+    job_id: str,
+    reserve_vram_mb: float,
+    ram_mb: float,
+    lane: HordeProcessInfo,
+) -> None:
+    """Book a dispatched chain's reserve: the flat entry and a planned charge on the lane it runs on.
+
+    The flat entry is what the co-residency mutex and the stream forecast read. The planned charge is what every
+    arbiter admission subtracts, and a chain's allocations reach the device-free reading only seconds after it is
+    dispatched, so without it an admission priced in the same control-loop pass sees the chain's room as free.
+    The charge decays as the lane's reported reservation grows and is dropped with the flat entry on release.
+    """
+    reserve_ledger.set(POST_PROCESS_RESERVE_FLOW, job_id, vram_mb=reserve_vram_mb, ram_mb=ram_mb)
+    reserve_ledger.set_planned(
+        POST_PROCESS_RESERVE_FLOW,
+        job_id,
+        vram_mb=reserve_vram_mb,
+        target_process_id=lane.process_id,
+        reserved_at_admit_mb=float(lane.process_reserved_mb or 0.0),
+    )
+
+
 @dataclass
 class _DeferralRecord:
     """Bookkeeping for one job the admission gate could not immediately dispatch.
@@ -885,11 +910,12 @@ class PostProcessOrchestrator:
             post_process_process.process_id,
             completed_job_info.sdk_api_job_info,
         )
-        self._reserve_ledger.set(
-            POST_PROCESS_RESERVE_FLOW,
-            str(completed_job_info.sdk_api_job_info.id_),
-            vram_mb=reserve_vram_mb,
+        book_post_process_chain(
+            self._reserve_ledger,
+            job_id=str(completed_job_info.sdk_api_job_info.id_),
+            reserve_vram_mb=reserve_vram_mb,
             ram_mb=self._estimate_post_processing_ram_mb(completed_job_info),
+            lane=post_process_process,
         )
         await self._job_tracker.begin_post_processing(
             completed_job_info,

@@ -4254,6 +4254,16 @@ class InferenceScheduler:
         hold = self._slot_duty_current_hold
         return self._slot_duty.totals(), self._slot_duty.capacity, str(hold) if hold is not None else None
 
+    def _process_ids_on_card(self, device_index: int | None) -> frozenset[int] | None:
+        """The ids of the processes on ``device_index``, or None for the worker-wide single-card answer."""
+        if device_index is None:
+            return None
+        return frozenset(
+            process_info.process_id
+            for process_info in self._process_map.values()
+            if process_info.device_index == device_index
+        )
+
     def _measured_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
         """Return the most conservative measured free VRAM (MB), or None when not yet reported.
 
@@ -5153,10 +5163,15 @@ class InferenceScheduler:
         self._reserve_ledger.reconcile_planned(PRELOAD_ADMISSION_FLOW, self._in_flight_admitted_planned_units())
         self._reserve_ledger.reconcile_planned(DISPATCH_ADMISSION_FLOW, self._in_flight_dispatch_units(device_index))
         per_process_reserved = self._process_map.reserved_by_pid(device_index)
-        planned_mb = self._reserve_ledger.effective_planned_vram_mb(per_process_reserved)
+        card_process_ids = self._process_ids_on_card(device_index)
+        planned_mb = self._reserve_ledger.effective_planned_vram_mb(
+            per_process_reserved,
+            target_process_ids=card_process_ids,
+        )
         preload_planned_mb = self._reserve_ledger.effective_planned_vram_mb_for_flow(
             PRELOAD_ADMISSION_FLOW,
             per_process_reserved,
+            target_process_ids=card_process_ids,
         )
         noise_buffer_mb = self._admission_margin_mb(device_index, raw_total_mb)
         self._head_admission.note_admission_headroom(
@@ -10756,8 +10771,13 @@ class InferenceScheduler:
                 next_job,
                 static_affordable=affordable,
                 sampling_peak_mb=sampling_peak_mb,
-                # The active chain has already allocated, so the measured free reflects it: charge no extra.
-                pending_pp_reserve_mb=0.0,
+                # The measured free reflects only what the chain has allocated so far, so charge the part of
+                # its planned reserve that has not yet materialised.
+                pending_pp_reserve_mb=self._reserve_ledger.effective_planned_vram_mb_for_flow(
+                    POST_PROCESS_RESERVE_FLOW,
+                    self._process_map.reserved_by_pid(device_index),
+                    target_process_ids=self._process_ids_on_card(device_index),
+                ),
                 device_index=device_index,
                 static_hold_message=(
                     f"Holding dispatch of {next_job.model}: an in-flight post-processing chain "

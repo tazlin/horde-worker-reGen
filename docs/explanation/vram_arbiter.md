@@ -332,6 +332,16 @@ excludes ended and missing processes from the in-flight set it reconciles the ov
 then released by omission, the same self-healing path a finished load takes, with no death-path delete to keep
 in sync.
 
+A dispatched post-processing chain is an anchor too. `book_post_process_chain` books it as a flat entry, which
+the co-residency mutex and the stream forecast read, and as a planned charge on the post-processing lane, which
+every arbiter admission subtracts. A chain's allocations reach the device-free reading seconds after dispatch,
+and the control loop dispatches post-processing ahead of the clearance step in the same pass, so without the
+anchor a clearance priced in that pass sees the chain's room as free. The charge decays as the lane's reported
+reservation grows. Under WDDM a lane under-reports its working memory, so in practice the charge stands for most
+of the chain's run, a conservative bias. The in-flight co-residency check charges the same outstanding share in
+place of assuming the chain has already allocated. Each card's overlay sums only the anchors whose target
+process is on that card, so a chain on one card never narrows another card's admissions.
+
 A request's own footprint counts at most once in the identity. Two adjustments enforce this so a head can
 never wedge on state it alone produced. First, the request nets its own target process's outstanding planned
 charge out of the overlay before the inequality: that charge is the same load the candidate delta already

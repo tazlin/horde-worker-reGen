@@ -31,7 +31,7 @@ from loguru import logger
 from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Collection, Iterable, Mapping
 
     from hordelib.feature_impact import FEATURE_KIND, BaselineBurden, BurdenEstimate
 
@@ -1674,7 +1674,12 @@ class CommittedReserveLedger:
             growth_baseline_mb=max(0.0, reserved_at_admit_mb),
         )
 
-    def effective_planned_vram_mb(self, process_reserved_by_pid: dict[int, float]) -> float:
+    def effective_planned_vram_mb(
+        self,
+        process_reserved_by_pid: dict[int, float],
+        *,
+        target_process_ids: Collection[int] | None = None,
+    ) -> float:
         """Return the combined planned VRAM (MB) still outstanding, each entry decayed by what has materialised.
 
         For each planned entry the materialised amount is the high-water mark of
@@ -1694,9 +1699,14 @@ class CommittedReserveLedger:
         Args:
             process_reserved_by_pid: Current measured allocator reservation (MB) keyed by process id; a target
                 absent from the map has shown no growth (nothing has materialised for it yet).
+            target_process_ids: When given, only entries landing on these processes are summed (and observed),
+                so a card's overlay carries only the charges that will materialise on that card. None sums every
+                entry, the single-card answer.
         """
         total = 0.0
         for entry in self._planned.values():
+            if target_process_ids is not None and entry.target_process_id not in target_process_ids:
+                continue
             entry.observe(process_reserved_by_pid)
             total += max(0.0, entry.vram_mb - entry.materialized_watermark_mb)
         return total
@@ -1721,7 +1731,13 @@ class CommittedReserveLedger:
             return 0.0
         return max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
 
-    def effective_planned_vram_mb_for_flow(self, flow: str, process_reserved_by_pid: dict[int, float]) -> float:
+    def effective_planned_vram_mb_for_flow(
+        self,
+        flow: str,
+        process_reserved_by_pid: dict[int, float],
+        *,
+        target_process_ids: Collection[int] | None = None,
+    ) -> float:
         """Return one flow's planned VRAM (MB) still outstanding, each entry decayed by what has materialised.
 
         The per-flow counterpart of :meth:`effective_planned_vram_mb`, letting an admission consumer price a
@@ -1735,10 +1751,14 @@ class CommittedReserveLedger:
             flow: The workload flow namespace whose planned charges are summed.
             process_reserved_by_pid: Current measured allocator reservation (MB) keyed by process id; a target
                 absent from the map has shown no growth.
+            target_process_ids: When given, only entries landing on these processes are summed, as in
+                :meth:`effective_planned_vram_mb`.
         """
         total = 0.0
         for (entry_flow, _unit), entry in self._planned.items():
             if entry_flow != flow:
+                continue
+            if target_process_ids is not None and entry.target_process_id not in target_process_ids:
                 continue
             total += max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
         return total

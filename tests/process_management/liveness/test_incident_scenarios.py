@@ -135,6 +135,12 @@ The failures encoded here:
   selection as "nothing more can start" and ended. Every other card's already-resident, already-seatable work
   then sat out the cycle, with no line logged and nothing in the queue to explain it. That is the ``held
   head`` scenario, and its reinjection is the loop ending on the first withheld dispatch.
+- **A post-processing chain the clearance that followed it could not see.** A finished job's chain was booked
+  only as a flat reserve, which the admission identity does not subtract, and its allocations reach the
+  device-free reading seconds after its dispatch. A staged job cleared in the same control-loop pass was
+  therefore priced against a reading with the chain's room still in it, its load and the chain's upscale then
+  shared a card that could hold either alone, and the card overcommitted. That is the ``post-processing
+  chain`` scenario, and its reinjection books the chain as the flat entry alone.
 
 The last scenario is not one failure but all of them at once: the ``bundle-shaped fleet`` row runs the
 multi-card rules together over the workload shape they were diagnosed from, eight cards of two lanes serving
@@ -184,6 +190,7 @@ from horde_worker_regen.process_management.resources import reclaim_ladder as re
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
 from horde_worker_regen.process_management.resources.resource_budget import (
+    CommittedReserveLedger,
     predict_job_decode_spike_mb,
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
@@ -228,6 +235,8 @@ from horde_worker_regen.process_management.scheduling.ledgers.safety_placement i
     SAFETY_BACKLOG_PRIORITY_DEPTH,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
+from horde_worker_regen.process_management.workers import post_process_orchestrator
 from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness._dispatch_world import (
     _CARD_10GB,
@@ -6006,4 +6015,210 @@ async def test_y_defect_reinjection_staging_behind_a_long_sample_samples_unprice
     assert [job_id for _tick, _lane, job_id in world.clearance_timeouts] == [str(candidate.id_)], (
         "the queued job must reach its denoise loop through the lease-acquire timeout once the duration term is "
         f"gone; the run recorded {world.clearance_timeouts}. {world.state_dump()}"
+    )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Post-processing chain: a chain dispatched in the same pass as a clearance step is priced by that clearance
+# --------------------------------------------------------------------------------------------------------
+
+_PP_CHAIN_JOB_SHAPE = (1024, 1024)
+
+_PP_CHAIN_PEAK_MB = 8192.0
+"""What the finished job's chain (a face fix and a 4x upscale) allocates on the card.
+
+Sized against this row's card and staged job: the chain alone fits the emptied card, the staged job alone fits
+it, and the two together exceed it by about a gigabyte. The row asserts that arithmetic from the world's own
+readings before it reads anything else."""
+
+_PP_CHAIN_ALLOCATION_LAG_TICKS = 2
+"""Ticks between the lane taking the chain and its allocations reaching the device-free reading."""
+
+_PP_CHAIN_HOLD_TICKS = 5
+"""Ticks the chain's peak stays on the card."""
+
+_PP_CHAIN_FINISHER_STEPS = 150
+"""Steps of the job that finishes into the chain: a sample long enough for the next job to be preloaded and
+staged beside it, so that job is waiting for clearance when the chain is dispatched."""
+
+_PP_CHAIN_MAX_TICKS = 60
+"""Ticks the row may take to submit all three jobs. The staged job waits out the finisher's sample and the
+chain's lag and hold, which the lease-acquire timeout comfortably covers at this tick."""
+
+
+@dataclass(frozen=True)
+class _PostProcessChainRun:
+    """Represents one run of the post-processing chain row and the readings its assertions need."""
+
+    world: _DispatchWorld
+    staged_job: ImageGenerateJobPopResponse
+    empty_card_free_mb: float
+    """The card's free reading with every context up and nothing else on it."""
+    staged_job_need_mb: float
+    """The staged job's whole peak, encode working set included."""
+
+
+async def _run_post_process_chain_beside_staged_job() -> _PostProcessChainRun:
+    """Finish a job into a heavy chain while the next job waits staged for clearance on the same card.
+
+    One 16 GB card, two inference lanes, one sampling lease slot and the post-processing lane, with the modelled
+    chain on. A warm job first measures a weight load, without which a staged job's wait for clearance has no
+    bound and nothing stages beside a sample. Idle weights are released eagerly, so the finisher's copy leaves
+    the card and the chain and the staged job are the only claims on the emptied card.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        whole_card_enabled=False,
+        unload_models_from_vram_often=True,
+        service_contexts=True,
+        closed_loop=True,
+        clearance_lease=True,
+        gpu_sampling_lease_slots=1,
+        tick_seconds=_TICK_SECONDS,
+        post_process_chain_peak_mb=_PP_CHAIN_PEAK_MB,
+        post_process_chain_allocation_lag_ticks=_PP_CHAIN_ALLOCATION_LAG_TICKS,
+        post_process_chain_hold_ticks=_PP_CHAIN_HOLD_TICKS,
+    )
+    empty_card_free_mb = world.card_free_mb(0)
+    width, height = _PP_CHAIN_JOB_SHAPE
+    staged_job = make_job_pop_response(_SD15_OTHER.name, width=width, height=height, ddim_steps=20)
+    staged_job_need_mb = predict_job_sampling_vram_mb(
+        staged_job, world.scheduler._model_metadata.get_baseline(_SD15_OTHER.name)
+    )
+    assert staged_job_need_mb is not None
+    assert staged_job_need_mb < empty_card_free_mb and empty_card_free_mb > _PP_CHAIN_PEAK_MB, (
+        f"precondition: the staged job ({staged_job_need_mb:.0f}MB) and the chain ({_PP_CHAIN_PEAK_MB:.0f}MB) must "
+        f"each fit the emptied card ({empty_card_free_mb:.0f}MB free). {world.state_dump()}"
+    )
+    assert staged_job_need_mb + _PP_CHAIN_PEAK_MB > empty_card_free_mb, (
+        f"precondition: the staged job and the chain together must exceed the emptied card "
+        f"({staged_job_need_mb:.0f}MB + {_PP_CHAIN_PEAK_MB:.0f}MB against {empty_card_free_mb:.0f}MB free), or "
+        f"this row says nothing about pricing one against the other. {world.state_dump()}"
+    )
+
+    await world.pop(make_job_pop_response(_SD15.name, width=width, height=height, ddim_steps=20))
+    for _ in range(_PP_CHAIN_MAX_TICKS):
+        await world.step()
+        if world.submitted_jobs >= 1:
+            break
+    assert world.submitted_jobs == 1, f"the warm job never completed. {world.state_dump()}"
+
+    finisher = make_job_pop_response(
+        _SD15.name,
+        width=width,
+        height=height,
+        ddim_steps=_PP_CHAIN_FINISHER_STEPS,
+        post_processing=["GFPGAN", "RealESRGAN_x4plus"],
+    )
+    await world.pop(finisher)
+    await world.pop(staged_job)
+    for _ in range(_PP_CHAIN_MAX_TICKS):
+        await world.step()
+        if world.submitted_jobs >= 3:
+            break
+
+    assert len(world.post_process_chains) == 1, (
+        f"the finisher's result must reach the post-processing lane as one chain; the run recorded "
+        f"{world.post_process_chains}. {world.state_dump()}"
+    )
+    chain = world.post_process_chains[0]
+    staged_window = world.job_windows.get(str(staged_job.id_))
+    assert staged_window is not None and staged_window.dispatched_at <= chain.dispatched_at, (
+        f"precondition: the staged job must already be waiting for clearance when the chain is dispatched, so the "
+        f"two are priced in one pass ({staged_window}, chain dispatched at {chain.dispatched_at:.1f}s). "
+        f"{world.state_dump()}"
+    )
+    return _PostProcessChainRun(
+        world=world,
+        staged_job=staged_job,
+        empty_card_free_mb=empty_card_free_mb,
+        staged_job_need_mb=staged_job_need_mb,
+    )
+
+
+def _grant_tick(world: _DispatchWorld, job: ImageGenerateJobPopResponse) -> int | None:
+    """The tick clearance granted ``job`` its load-and-sample window, or None when it never did."""
+    return next((tick for tick, _lane, job_id in world.clearance_grants if job_id == str(job.id_)), None)
+
+
+async def test_pp_chain_a_chain_dispatched_in_a_clearance_pass_is_priced_by_that_clearance() -> None:
+    """A staged job is not cleared onto a card a just-dispatched chain will fill, and is cleared once it releases.
+
+    The failure this encodes: a finished job's chain was booked only as a flat reserve, which the arbiter's
+    admission identity does not subtract, and its allocations reach the device-free reading seconds after its
+    dispatch. A staged job cleared in the same control-loop pass was priced against a reading with the chain's
+    room still in it; its load and the chain's upscale then shared a card that holds either alone, the card
+    saturated and paged, and the reclaim ladder's last rung killed the staged job's lane.
+
+    The chain is now also booked as a planned charge on the post-processing lane, which every admission
+    subtracts and which decays as the lane's reported reservation grows, so clearance prices the chain from the
+    pass it is dispatched in. Read as one statement: the card's tenants never exceed its total. Its consequence
+    here, where the two cannot share the card, is that the staged job is cleared only once the chain releases,
+    and still through clearance rather than its lease-acquire timeout.
+    """
+    run = await _run_post_process_chain_beside_staged_job()
+    world = run.world
+
+    context = "a post-processing chain dispatched beside a staged job"
+    chain = world.post_process_chains[0]
+    assert not world.card_overcommits, (
+        f"{context}: the card was committed past its total at {world.card_overcommits} (tick, card, MB over); the "
+        f"staged job's {run.staged_job_need_mb:.0f}MB and the chain's {_PP_CHAIN_PEAK_MB:.0f}MB were both let onto "
+        f"a card with {run.empty_card_free_mb:.0f}MB free. {world.state_dump()}"
+    )
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, unpriced. "
+        f"{world.state_dump()}"
+    )
+    grant_tick = _grant_tick(world, run.staged_job)
+    assert grant_tick is not None, f"{context}: the staged job was never cleared. {world.state_dump()}"
+    assert chain.released_tick is not None and grant_tick >= chain.released_tick, (
+        f"{context}: the staged job was cleared on tick {grant_tick}, while the chain dispatched on tick "
+        f"{chain.dispatched_tick} still held its reserve (released on tick {chain.released_tick}). "
+        f"{world.state_dump()}"
+    )
+    assert world.submitted_jobs == 3, (
+        f"{context}: {world.submitted_jobs} of 3 jobs were submitted. {world.state_dump()}"
+    )
+
+
+async def test_pp_chain_defect_reinjection_a_flat_reserve_lets_clearance_overcommit_the_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the chain booked as the flat entry alone, clearance admits the staged job inside the allocation lag.
+
+    Reinjected at the booking alone: the same card, jobs and chain, and the only difference is that the chain
+    carries no planned charge. The admission identity then reads the device-free figure taken before the chain
+    allocated, clears the staged job against it, and the chain's allocations land on a card the job's load has
+    already taken.
+    """
+
+    def book_flat_reserve_only(
+        reserve_ledger: CommittedReserveLedger,
+        *,
+        job_id: str,
+        reserve_vram_mb: float,
+        ram_mb: float,
+        lane: HordeProcessInfo,
+    ) -> None:
+        reserve_ledger.set(POST_PROCESS_RESERVE_FLOW, job_id, vram_mb=reserve_vram_mb, ram_mb=ram_mb)
+
+    monkeypatch.setattr(post_process_orchestrator, "book_post_process_chain", book_flat_reserve_only)
+
+    run = await _run_post_process_chain_beside_staged_job()
+    world = run.world
+
+    chain = world.post_process_chains[0]
+    grant_tick = _grant_tick(world, run.staged_job)
+    assert grant_tick is not None and chain.charged_tick is not None and grant_tick < chain.charged_tick, (
+        "a chain booked as a flat reserve is invisible to clearance until its allocations land, so the staged job "
+        f"must be cleared inside that lag (chain dispatched on tick {chain.dispatched_tick}, charged on tick "
+        f"{chain.charged_tick}); it was cleared on tick {grant_tick}. {world.state_dump()}"
+    )
+    assert world.card_overcommits, (
+        "the staged job's load and the chain's allocations must overcommit the card once both land; the run "
+        f"recorded no overcommit. {world.state_dump()}"
     )
