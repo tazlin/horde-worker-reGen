@@ -6441,7 +6441,7 @@ class HordeWorkerProcessManager:
             except Exception as e:
                 logger.warning(f"Failed to apply supervisor command {command.command.name}: {e}")
         if self._supervisor.closed:
-            self._supervisor = None
+            self._drop_closed_supervisor()
 
     def _apply_supervisor_command(self, command: SupervisorControlMessage) -> None:
         """Dispatch one supervisor command onto the worker's existing control mechanisms."""
@@ -6738,7 +6738,20 @@ class HordeWorkerProcessManager:
             logger.debug(f"Failed to build supervisor snapshot: {e}")
             return
         if not self._supervisor.send_snapshot(snapshot):
-            self._supervisor = None
+            self._drop_closed_supervisor()
+
+    def _drop_closed_supervisor(self) -> None:
+        """Stop using a supervisor channel whose transport has died, saying so once.
+
+        Without the line a lost channel is invisible in the worker's log, while the supervisor reads the silence
+        that follows as a frozen control loop.
+        """
+        # Log contract: analysis/log_signatures.py (supervisor_channel_dropped).
+        logger.warning(
+            "The supervisor channel closed. The worker keeps running without reporting liveness or state to its "
+            "supervisor.",
+        )
+        self._supervisor = None
 
     def _safe_model_baseline(self, model_name: str | None) -> str | None:
         """Resolve a model's baseline as a plain string for the wire, swallowing lookup misses.

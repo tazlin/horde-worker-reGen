@@ -6,9 +6,12 @@ import multiprocessing
 import pickle
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -464,7 +467,7 @@ class _GatedConnection:
             self.release.wait(5.0)
             self._gate_passed = True
         elif self._fail_after_gate:
-            raise OSError("pipe is gone")
+            raise BrokenPipeError("pipe is gone")
         self.sent.append(obj)
 
     def poll(self, timeout: float | None = None) -> bool:
@@ -472,7 +475,7 @@ class _GatedConnection:
         return False
 
     def recv(self) -> object:
-        """Never called; the stand-in carries no inbound traffic."""
+        """Never called. The stand-in carries no inbound traffic."""
         raise EOFError
 
     def close(self) -> None:
@@ -552,6 +555,174 @@ def test_a_failing_final_flush_neither_hangs_nor_raises(monkeypatch: pytest.Monk
     assert not channel._sender.is_alive()
     assert not any(isinstance(frame, WorkerStateSnapshot) for frame in connection.sent)
     assert channel.closed is True
+
+
+class _FlakyConnection:
+    """A connection stand-in that raises queued failures on sends of one frame type, then delivers normally.
+
+    Each send of a ``fail_frame_type`` frame raises the next queued failure until the queue is empty. Every
+    other send is recorded in :attr:`sent`.
+    """
+
+    def __init__(self, failures: list[BaseException], *, fail_frame_type: type = object) -> None:
+        self.sent: list[object] = []
+        self._failures = list(failures)
+        self._fail_frame_type = fail_frame_type
+        self._lock = threading.Lock()
+
+    def send(self, obj: object) -> None:
+        """Raise the next queued failure for a matching frame, otherwise record the frame."""
+        with self._lock:
+            if self._failures and isinstance(obj, self._fail_frame_type):
+                raise self._failures.pop(0)
+            self.sent.append(obj)
+
+    def frames_of(self, frame_type: type) -> list[object]:
+        """Return the recorded frames of ``frame_type``."""
+        with self._lock:
+            return [frame for frame in self.sent if isinstance(frame, frame_type)]
+
+    def poll(self, timeout: float | None = None) -> bool:
+        """No commands ever arrive on this stand-in."""
+        return False
+
+    def recv(self) -> object:
+        """Never called. The stand-in carries no inbound traffic."""
+        raise EOFError
+
+    def close(self) -> None:
+        """No resources to release."""
+
+
+@contextmanager
+def _capture_levels() -> Iterator[list[tuple[str, str]]]:
+    """Capture ``(level name, message)`` pairs for loguru records emitted inside the block."""
+    records: list[tuple[str, str]] = []
+    handler_id = logger.add(
+        lambda m: records.append((m.record["level"].name, m.record["message"])),
+        level="TRACE",
+    )
+    try:
+        yield records
+    finally:
+        logger.remove(handler_id)
+
+
+def _wait_for(condition: object, *, timeout: float = 5.0) -> bool:
+    """Poll ``condition`` until it holds or ``timeout`` elapses."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():  # type: ignore[operator]
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _os_error_with_winerror(winerror: int) -> OSError:
+    """Build a plain OSError carrying ``winerror``, as a failed Windows pipe write raises it."""
+    error = OSError(f"winerror {winerror}")
+    error.winerror = winerror  # pyrefly: ignore
+    return error
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(MemoryError(), id="memory_error"),
+        pytest.param(_os_error_with_winerror(1455), id="paging_file_too_small"),
+        pytest.param(pickle.PicklingError("cannot pickle"), id="pickling_error"),
+    ],
+)
+def test_a_transient_send_failure_keeps_the_channel_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    """A send that fails for a reason other than a dead pipe skips that frame and keeps the liveness stream.
+
+    The launcher kills a worker whose frames stop, so closing on a transient failure (host memory
+    exhaustion makes pickling or the pipe write fail for a while) would cost a healthy worker its life.
+    """
+    monkeypatch.setattr(SupervisorChannel, "_LIVENESS_INTERVAL", 0.01)
+    connection = _FlakyConnection([failure], fail_frame_type=WorkerLivenessFrame)
+    with _capture_levels() as records:
+        channel = SupervisorChannel(connection)  # pyrefly: ignore
+        try:
+            assert _wait_for(lambda: len(connection.frames_of(WorkerLivenessFrame)) >= 1)
+            assert channel.closed is False
+            assert channel._sender.is_alive()
+        finally:
+            channel.close()
+            channel._sender.join(5.0)
+
+    warnings = [message for level, message in records if level == "WARNING"]
+    assert any(type(failure).__name__ in message for message in warnings)
+    assert any("recovered" in message for level, message in records)
+
+
+def test_a_sustained_transient_failure_warns_once_and_reports_the_skipped_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated transient failures produce one warning, and the recovery line counts every skipped frame."""
+    monkeypatch.setattr(SupervisorChannel, "_LIVENESS_INTERVAL", 0.01)
+    connection = _FlakyConnection([MemoryError() for _ in range(5)], fail_frame_type=WorkerLivenessFrame)
+    with _capture_levels() as records:
+        channel = SupervisorChannel(connection)  # pyrefly: ignore
+        try:
+            assert _wait_for(lambda: len(connection.frames_of(WorkerLivenessFrame)) >= 1)
+        finally:
+            channel.close()
+            channel._sender.join(5.0)
+
+    failure_warnings = [m for level, m in records if level == "WARNING" and "MemoryError" in m]
+    assert len(failure_warnings) == 1
+    recovery_lines = [m for _, m in records if "recovered" in m]
+    assert len(recovery_lines) == 1
+    assert "5" in recovery_lines[0]
+
+
+def test_a_snapshot_lost_to_a_transient_failure_is_followed_by_the_next(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a snapshot send fails transiently, the channel still accepts and delivers the next snapshot."""
+    monkeypatch.setattr(SupervisorChannel, "_LIVENESS_INTERVAL", 0.01)
+    connection = _FlakyConnection([MemoryError()], fail_frame_type=WorkerStateSnapshot)
+    channel = SupervisorChannel(connection)  # pyrefly: ignore
+    try:
+        assert channel.send_snapshot(_make_snapshot()) is True
+        assert _wait_for(lambda: not connection._failures)
+        assert channel.send_snapshot(_make_snapshot()) is True
+        assert _wait_for(lambda: len(connection.frames_of(WorkerStateSnapshot)) >= 1)
+        assert channel.closed is False
+    finally:
+        channel.close()
+        channel._sender.join(5.0)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(BrokenPipeError("pipe is gone"), id="broken_pipe"),
+        pytest.param(_os_error_with_winerror(232), id="pipe_being_closed"),
+        pytest.param(_os_error_with_winerror(109), id="pipe_ended"),
+        pytest.param(EOFError(), id="eof"),
+    ],
+)
+def test_a_dead_pipe_closes_the_channel_and_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    """A dead transport closes the channel, ends the sender thread and logs the close once."""
+    monkeypatch.setattr(SupervisorChannel, "_LIVENESS_INTERVAL", 0.01)
+    connection = _FlakyConnection([failure], fail_frame_type=WorkerLivenessFrame)
+    with _capture_levels() as records:
+        channel = SupervisorChannel(connection)  # pyrefly: ignore
+        channel._sender.join(5.0)
+        assert not channel._sender.is_alive()
+        assert channel.closed is True
+        assert channel.send_snapshot(_make_snapshot()) is False
+        channel.close()
+
+    close_warnings = [m for level, m in records if level == "WARNING" and "receives no more frames" in m]
+    assert len(close_warnings) == 1
+    assert type(failure).__name__ in close_warnings[0]
 
 
 def test_scheduling_governance_survives_json_roundtrip() -> None:

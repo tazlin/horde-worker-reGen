@@ -18,6 +18,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
@@ -1980,8 +1981,10 @@ class SupervisorChannel:
     Snapshots are sent on a daemon thread from a single latest-only slot: :meth:`send_snapshot` only
     updates the slot and returns immediately, so the worker's control loop never blocks on a slow or
     hung supervisor (it just sends the freshest state once the consumer catches up). :meth:`drain_commands`
-    is non-blocking and skips a tick rather than wait if the sender thread is mid-send. A dead pipe is
-    caught and marks the channel closed.
+    is non-blocking and skips a tick rather than wait if the sender thread is mid-send. A dead pipe
+    marks the channel closed. Any other send failure skips that one frame and keeps the channel open,
+    because the launcher kills a worker whose frames stop, and a transient failure such as host commit
+    exhaustion failing a pickle or a pipe write would otherwise cost a healthy worker its liveness stream.
 
     Send and receive on the one duplex connection are serialized by a lock, so the sender thread and
     the control loop never touch the connection concurrently.
@@ -1989,6 +1992,21 @@ class SupervisorChannel:
 
     _LIVENESS_INTERVAL = 1.0
     """How often the sender thread emits a :class:`WorkerLivenessFrame` (seconds)."""
+
+    _DEAD_PIPE_WINERRORS: frozenset[int] = frozenset({109, 232})
+    """Windows errors that mean the pipe's far end is gone: ERROR_BROKEN_PIPE (109) and ERROR_NO_DATA (232,
+    the pipe is being closed)."""
+
+    _DEAD_PIPE_ERROR_TYPES: tuple[type[BaseException], ...] = (
+        BrokenPipeError,
+        ConnectionResetError,
+        ConnectionAbortedError,
+        EOFError,
+    )
+    """Exception types that mean the transport is dead whatever their error code."""
+
+    _SEND_FAILURE_REPORT_INTERVAL = 60.0
+    """Minimum seconds between warnings while transient send failures persist (seconds)."""
 
     def __init__(self, connection: Connection) -> None:
         """Wrap the worker-side pipe connection and start the snapshot sender thread."""
@@ -2007,6 +2025,11 @@ class SupervisorChannel:
         float shared one-writer/one-reader (atomic under the GIL), so no lock is needed; a stale read
         only means a slightly older liveness timestamp, which is harmless."""
         self._last_liveness_monotonic = 0.0
+        self._skipped_frame_count = 0
+        """Frames skipped by transient send failures since the last successful send. Sender thread only."""
+        self._skipped_frames_reported = 0
+        """How many of :attr:`_skipped_frame_count` the last warning covered. Sender thread only."""
+        self._last_send_failure_report_monotonic = 0.0
         self._sender = threading.Thread(
             target=self._send_loop,
             name="supervisor-snapshot-sender",
@@ -2045,7 +2068,8 @@ class SupervisorChannel:
             now = time.monotonic()
             if now - self._last_liveness_monotonic >= self._LIVENESS_INTERVAL:
                 self._last_liveness_monotonic = now
-                if not self._send_frame(WorkerLivenessFrame(loop_alive_wall_time=self._loop_alive_wall_time)):
+                self._send_frame(WorkerLivenessFrame(loop_alive_wall_time=self._loop_alive_wall_time))
+                if self._closed:
                     return
 
             if not got_pending:
@@ -2060,7 +2084,9 @@ class SupervisorChannel:
 
         The unsent flag is cleared before the frame is read: a producer racing this method then leaves the
         flag set for a frame that just went out, costing one redundant resend, whereas the reverse order
-        would mark a frame sent that never was and drop it.
+        would mark a frame sent that never was and drop it. A transient failure sets the flag again without
+        waking the sender, so the freshest snapshot goes out on the next attempt and a sustained failure
+        does not spin.
         """
         self._pending.clear()
         if not self._latest_unsent:
@@ -2069,19 +2095,94 @@ class SupervisorChannel:
         snapshot = self._latest
         if snapshot is None:
             return True
-        return self._send_frame(snapshot)
+        if self._send_frame(snapshot):
+            return True
+        if self._closed:
+            return False
+        self._latest_unsent = True
+        return True
 
     def _send_frame(self, frame: WorkerStateSnapshot | WorkerLivenessFrame) -> bool:
-        """Send one frame under the connection lock. Returns False once the channel is closed/dead."""
+        """Send one frame under the connection lock. Returns whether the frame was sent.
+
+        The catch is broad because pickling a frame can raise nearly any exception. Every failure other than a
+        dead pipe is transient, and the caller tells the two apart by :attr:`closed`.
+        """
         with self._lock:
             if self._closed:
                 return False
             try:
                 self._connection.send(frame)
-            except Exception:
-                self._closed = True
-                return False
+            except Exception as error:
+                if self._is_dead_pipe_error(error):
+                    self._close_on_dead_transport(error)
+                    return False
+                send_error: Exception | None = error
+            else:
+                send_error = None
+        if send_error is not None:
+            self._note_skipped_frame(frame, send_error)
+            return False
+        self._note_send_succeeded()
         return True
+
+    @classmethod
+    def _is_dead_pipe_error(cls, error: BaseException) -> bool:
+        """Return whether ``error`` means the far end of the pipe is gone for good."""
+        if isinstance(error, cls._DEAD_PIPE_ERROR_TYPES):
+            return True
+        # ``winerror`` exists on OSError only under Windows.
+        return isinstance(error, OSError) and getattr(error, "winerror", None) in cls._DEAD_PIPE_WINERRORS
+
+    def _close_on_dead_transport(self, error: BaseException) -> None:
+        """Mark the channel closed and log the close once. Call with :attr:`_lock` held."""
+        if self._closed:
+            return
+        self._closed = True
+        logger.warning(
+            f"Supervisor channel closed on a dead pipe ({type(error).__name__}: {error}). "
+            "The supervisor receives no more frames from this worker.",
+        )
+
+    def _note_skipped_frame(self, frame: WorkerStateSnapshot | WorkerLivenessFrame, error: Exception) -> None:
+        """Count a frame lost to a transient send failure, warning on the first and then at most periodically.
+
+        The liveness frame fires every interval, so an unthrottled warning would flood the log for as long as
+        the condition lasts.
+        """
+        self._skipped_frame_count += 1
+        now = time.monotonic()
+        is_first_skip = self._skipped_frame_count == 1
+        report_due = now - self._last_send_failure_report_monotonic >= self._SEND_FAILURE_REPORT_INTERVAL
+        if not (is_first_skip or report_due):
+            logger.trace(f"Supervisor channel skipped a {type(frame).__name__} frame ({type(error).__name__}).")
+            return
+        suppressed_count = self._skipped_frame_count - self._skipped_frames_reported - 1
+        self._skipped_frames_reported = self._skipped_frame_count
+        self._last_send_failure_report_monotonic = now
+        if is_first_skip:
+            logger.warning(
+                f"Supervisor channel skipped a {type(frame).__name__} frame on a send failure "
+                f"({type(error).__name__}: {error}). The channel stays open and sends the next frame.",
+            )
+            return
+        logger.warning(
+            f"Supervisor channel send failures persist ({type(error).__name__}: {error}). "
+            f"{self._skipped_frame_count} frame(s) skipped so far, {suppressed_count} suppressed since the "
+            "last warning.",
+        )
+
+    def _note_send_succeeded(self) -> None:
+        """Log once that sends resumed after transient failures, with how many frames were skipped."""
+        if self._skipped_frame_count == 0:
+            return
+        logger.info(
+            f"Supervisor channel recovered after skipping {self._skipped_frame_count} frame(s) "
+            "to transient send failures.",
+        )
+        self._skipped_frame_count = 0
+        self._skipped_frames_reported = 0
+        self._last_send_failure_report_monotonic = 0.0
 
     def drain_commands(self) -> list[SupervisorControlMessage]:
         """Return all control messages currently waiting, without blocking (skips if a send is in progress)."""
@@ -2095,8 +2196,8 @@ class SupervisorChannel:
                 message = self._connection.recv()
                 if isinstance(message, SupervisorControlMessage):
                     commands.append(message)
-        except (EOFError, OSError):
-            self._closed = True
+        except (EOFError, OSError) as error:
+            self._close_on_dead_transport(error)
         finally:
             self._lock.release()
         return commands
