@@ -844,6 +844,63 @@ async def test_an_extra_large_job_over_the_ceiling_is_admitted_at_its_partial_lo
     assert plan.verdict.measured_attempt is False
 
 
+def _add_idle_siblings_holding_host_ram_checkpoints(scheduler: InferenceScheduler) -> None:
+    """Two idle lanes that last unloaded their SDXL checkpoints from VRAM and keep them only in host RAM."""
+    from horde_worker_regen.process_management.ipc.messages import HeldComponentSnapshot
+
+    for process_id in (1, 2):
+        sibling = make_mock_process_info(process_id, model_name=f"sdxl-{process_id}")
+        sibling.total_vram_mb = _SIXTEEN_GB_MB
+        sibling.process_reserved_mb = 60
+        sibling.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        sibling.held_components = [
+            HeldComponentSnapshot(kind="checkpoint", identity=f"sdxl-{process_id}", approx_ram_mb=6800.0),
+        ]
+        scheduler._process_map[process_id] = sibling
+
+
+async def test_idle_siblings_holding_host_ram_checkpoints_do_not_hold_off_the_seat() -> None:
+    """Checkpoints parked in host RAM return no VRAM, so the card still reads converged-empty for the seat.
+
+    The failure this encodes: every idle lane holding a component cache entry counted as card tenancy the head
+    could still reclaim, so the seat was refused on a card whose idle lanes held nothing on the device, and the
+    child waited out its lease-acquire timeout to make the same partial load unpriced.
+    """
+    scheduler, _job, _waiter = await _krea2_staged_waiter()
+    _add_idle_siblings_holding_host_ram_checkpoints(scheduler)
+
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None and plan.verdict is not None
+    assert plan.priced.request.has_reclaimable_idle_tenancy is False
+    assert plan.decision is ClearanceDecision.ADMIT
+    assert plan.verdict.partial_seat is True
+
+
+async def test_counting_host_ram_checkpoints_as_tenancy_refuses_the_seat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect reinjection: with host-RAM components counted as card tenancy, the same waiter is held."""
+
+    def ram_counting_tenancy(snapshot, head_model, target_process_id, *, device_index):  # noqa: ANN001, ANN202
+        for slot in pricing.card_slots(snapshot, device_index):
+            if slot.process_type is not HordeProcessType.INFERENCE or slot.process_id == target_process_id:
+                continue
+            if head_model is not None and slot.model == head_model:
+                continue
+            if slot.held_component_count > 0 or slot.parked_preload:
+                return True
+        return False
+
+    monkeypatch.setattr(pricing, "has_reclaimable_idle_tenancy", ram_counting_tenancy)
+    scheduler, _job, _waiter = await _krea2_staged_waiter()
+    _add_idle_siblings_holding_host_ram_checkpoints(scheduler)
+
+    plan = _decide(scheduler, 0)
+
+    assert plan.verdict is not None
+    assert plan.decision is ClearanceDecision.HOLD
+    assert plan.verdict.partial_seat is False
+
+
 async def test_a_seat_admit_books_no_more_than_the_room_the_child_was_granted() -> None:
     """The cleared job is booked the room it may load into, which decays to nothing once it reaches its peak.
 

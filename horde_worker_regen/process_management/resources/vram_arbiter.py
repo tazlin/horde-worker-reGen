@@ -469,9 +469,10 @@ class VramRequest:
     has_reclaimable_idle_model: bool = False
     """True when an idle resident model on the card could be evicted to reclaim its weights for this request."""
     has_reclaimable_idle_tenancy: bool = False
-    """Whether an idle lane on the card holds tenancy the parent can unload but the arbiter cannot name as a
-    resident model: warm components held between jobs, or a slot parked on a preload whose dispatch never
-    came. The scheduler reclaims it through its own actuator once the head's hold stands; while it exists the
+    """Whether an idle lane on the card holds tenancy with weights on the device that the parent can unload but
+    the arbiter cannot name as a resident model: warm components held between jobs, or a slot parked on a preload
+    whose dispatch never came. Tenancy that lives only in host RAM does not count, since unloading it returns no
+    VRAM. The scheduler reclaims it through its own actuator once the head's hold stands; while it exists the
     card is not converged-empty, so the measured-load probe waits for that reclaim rather than loading over
     it."""
     can_reduce_live_contexts: bool = False

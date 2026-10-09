@@ -14,7 +14,7 @@ import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -335,6 +335,21 @@ class TestReclaimPredicates:
         assert pricing.teardownable_idle_context_returns_mb(snapshot, 0, device_index=None) == [
             800.0 + pricing.marginal_or_seed_mb(snapshot, None),
         ]
+        # Slot 2's components live in host RAM (no weights on the device), so they are not card tenancy.
+        assert pricing.has_reclaimable_idle_tenancy(snapshot, "head", 0, device_index=None) is False
+
+    async def test_idle_tenancy_counts_only_with_weights_on_the_device(self) -> None:
+        """Warm components hold the card only while their weights are in VRAM; host-RAM caches return no VRAM."""
+        warm = _slot(2, model="warm")
+        warm.held_components = [Mock()]  # type: ignore[attr-defined]
+        scheduler, _jobs = await _worker(slots={0: _slot(0, model="head"), 2: warm}, pending=["head"])
+
+        assert pricing.has_reclaimable_idle_tenancy(scheduler.snapshot(), "head", 0, device_index=None) is False
+
+        scheduler._horde_model_map.update_entry("warm", load_state=ModelLoadState.LOADED_IN_VRAM, process_id=2)
+
+        snapshot = scheduler.snapshot()
+        assert snapshot.slots[2].resident_weight_models == frozenset({"warm"})
         assert pricing.has_reclaimable_idle_tenancy(snapshot, "head", 0, device_index=None) is True
         assert pricing.has_reclaimable_idle_tenancy(snapshot, "head", 2, device_index=None) is False
 

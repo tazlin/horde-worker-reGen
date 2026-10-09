@@ -770,13 +770,19 @@ def has_reclaimable_idle_tenancy(
     *,
     device_index: int | None,
 ) -> bool:
-    """Whether a lane holds warm components or a parked preload the head could ask the card back from."""
+    """Whether a lane holds warm components or a parked preload on the device that the head could ask back.
+
+    Only tenancy with weights on the card counts (``resident_weight_models``). A lane whose held components and
+    parked preload live in host RAM returns no VRAM when it is unloaded, so counting it would keep the card from
+    reading converged-empty for room the card does not have: the waiter's partial-load seat and measured attempt
+    would wait out the lease-acquire timeout and load the same way unpriced.
+    """
     for slot in card_slots(snapshot, device_index):
         if slot.process_type is not HordeProcessType.INFERENCE or slot.process_id == target_process_id:
             continue
         if head_model is not None and slot.model == head_model:
             continue
-        if slot.held_component_count > 0 or slot.parked_preload:
+        if (slot.held_component_count > 0 or slot.parked_preload) and slot.resident_weight_models:
             return True
     return False
 
