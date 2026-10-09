@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import BoundedSemaphore as BoundedSemaphore_MultiProcessing
@@ -149,6 +149,23 @@ each restart costs a model (re)load and starves the worker. Past this count the 
 (left out of the pool) and the lost capacity is surfaced as a severity signal for the higher-level
 recovery supervisor rather than papered over by an unbounded respawn loop.
 """
+
+INFERENCE_LANE_FAULT_STREAK_THRESHOLD: int = 3
+"""Consecutive faulted jobs on one launch of an inference process before it is replaced.
+
+A process that fails jobs whatever model it runs is itself faulty. The per-model systems (the load quarantine, the
+unservable holdback) cannot see it, because each model's share of the evidence stays small. Three replaces the
+process before the worker-wide fault-rate breaker pauses intake on three terminal faults, since a faulty process can
+also fail the retries of the jobs it faulted."""
+
+INFERENCE_LANE_FAULT_STREAK_MIN_MODELS: int = 2
+"""Distinct models a fault streak must span before it replaces the process.
+
+A single model failing on every attempt is evidence against the model, which the per-model systems act on. Requiring
+a second model keeps those systems and the lane streak from acting on the same evidence."""
+
+INFERENCE_LANE_CUDA_CONTEXT_FAULT_REASON: str = "CUDA context fault"
+"""Replacement reason for a process whose job failed with a CUDA runtime error."""
 
 CRASH_LOOP_MAX_START_FAILURES: int = 3
 """Consecutive replacements while still in ``PROCESS_STARTING`` before a slot is quarantined.
@@ -362,6 +379,38 @@ class ModelIncident(NamedTuple):
     """The job in flight at the time, where the recording site knows it."""
 
 
+class InferenceLaneOutcome(NamedTuple):
+    """How one inference job ended on the process that ran it, as the lane-fault streak reads it."""
+
+    process_id: int
+    """The slot that ran the job."""
+
+    launch_identifier: int
+    """The launch of that slot, so a streak never carries over to its replacement."""
+
+    model: str | None
+    """The job's model."""
+
+    faulted: bool
+    """Whether the job failed. A success clears the streak."""
+
+    cuda_context_fault: bool
+    """Whether the failure was a CUDA runtime error, which replaces the process at once."""
+
+    resource_failure: bool
+    """Whether the failure was classified as a resource/OOM fault, for the replacement's log line."""
+
+
+@dataclass
+class _InferenceLaneFaultStreak:
+    """Consecutive faulted jobs on one launch of an inference slot since its last success."""
+
+    launch_identifier: int
+    faults: int = 0
+    resource_faults: int = 0
+    models: set[str] = field(default_factory=set)
+
+
 def count_model_incidents(incidents: Iterable[ModelIncident], kind: ModelIncidentKind) -> int:
     """Count the incidents of ``kind`` that the quarantine threshold for that kind is judged against.
 
@@ -567,6 +616,9 @@ class ProcessLifecycleManager:
     _hung_processes_detected_time: float
     _slot_recovery_history: dict[int, list[float]]
     _slot_consecutive_start_failures: dict[int, int]
+    _inference_lane_fault_streaks: dict[int, _InferenceLaneFaultStreak]
+    _inference_lanes_due_replacement: dict[int, tuple[int, str]]
+    """Slots flagged by the lane-fault streak, as process id to (launch identifier, replacement reason)."""
     _quarantined_inference_slots: set[int]
     _num_slots_quarantined: int
     _retired_inference_slots_by_device: dict[int, int]
@@ -894,6 +946,8 @@ class ProcessLifecycleManager:
         self._model_incident_history = {}
         self._quarantined_models = set()
         self._recent_load_failure_by_process = {}
+        self._inference_lane_fault_streaks = {}
+        self._inference_lanes_due_replacement = {}
         self._on_model_quarantined = None
         self._blank_model_identity_warned = False
         self._pending_gpu_starts: dict[tuple[HordeProcessType, int], _PendingGpuStart] = {}
@@ -4568,6 +4622,71 @@ class ProcessLifecycleManager:
             return None
         return model_name
 
+    def record_inference_lane_outcome(self, outcome: InferenceLaneOutcome) -> None:
+        """Fold one finished job into its process's fault streak, and flag the process when the streak trips.
+
+        A CUDA context fault flags the process at once. Other faults flag it at
+        ``INFERENCE_LANE_FAULT_STREAK_THRESHOLD`` consecutive faults spanning
+        ``INFERENCE_LANE_FAULT_STREAK_MIN_MODELS`` models, and a success clears the streak. The replacement runs
+        from :meth:`replace_hung_processes`, which the control loop calls after draining child messages and before
+        the next dispatch, so no job reaches a flagged process.
+        """
+        streak = self._inference_lane_fault_streaks.get(outcome.process_id)
+        if streak is None or streak.launch_identifier != outcome.launch_identifier:
+            streak = _InferenceLaneFaultStreak(launch_identifier=outcome.launch_identifier)
+            self._inference_lane_fault_streaks[outcome.process_id] = streak
+        if not outcome.faulted:
+            streak.faults = 0
+            streak.resource_faults = 0
+            streak.models.clear()
+            return
+
+        streak.faults += 1
+        if outcome.resource_failure:
+            streak.resource_faults += 1
+        if outcome.model:
+            streak.models.add(outcome.model)
+        if outcome.process_id in self._inference_lanes_due_replacement:
+            return
+
+        if outcome.cuda_context_fault:
+            reason = INFERENCE_LANE_CUDA_CONTEXT_FAULT_REASON
+            # Log contract: analysis/log_signatures.py (inference_lane_cuda_context_fault).
+            logger.warning(
+                f"Inference process {outcome.process_id} failed a job on {outcome.model} with a CUDA runtime error "
+                "and will be replaced.",
+            )
+        elif (
+            streak.faults >= INFERENCE_LANE_FAULT_STREAK_THRESHOLD
+            and len(streak.models) >= INFERENCE_LANE_FAULT_STREAK_MIN_MODELS
+        ):
+            reason = f"fault streak: {streak.faults} consecutive faults across {len(streak.models)} models"
+            # Log contract: analysis/log_signatures.py (inference_lane_fault_streak).
+            logger.warning(
+                f"Inference process {outcome.process_id} faulted {streak.faults} jobs in a row across "
+                f"{len(streak.models)} models ({', '.join(sorted(streak.models))}), {streak.resource_faults} of them "
+                "resource/OOM faults, and will be replaced.",
+            )
+        else:
+            return
+        self._inference_lanes_due_replacement[outcome.process_id] = (outcome.launch_identifier, reason)
+
+    def _replace_faulting_inference_lanes(self) -> bool:
+        """Replace each slot the lane-fault streak flagged while that launch is still live, and say whether any was."""
+        replaced = False
+        for process_id, (launch_identifier, reason) in list(self._inference_lanes_due_replacement.items()):
+            del self._inference_lanes_due_replacement[process_id]
+            process_info = self._process_map.get(process_id)
+            if (
+                process_info is None
+                or process_info.process_type != HordeProcessType.INFERENCE
+                or process_info.process_launch_identifier != launch_identifier
+            ):
+                continue
+            self._replace_inference_process(process_info, lane_fault_reason=reason)
+            replaced = True
+        return replaced
+
     def _record_slot_recovery(self, process_id: int) -> int:
         """Record a replacement of the given slot and return how many happened within the window."""
         now = time.time()
@@ -4771,6 +4890,7 @@ class ProcessLifecycleManager:
         allow_while_recovery_parked: bool = False,
         preload_deadline_exceeded: bool = False,
         sampler_overtime_reap: bool = False,
+        lane_fault_reason: str | None = None,
     ) -> None:
         """Replace an inference process (because it crashed, hung, timed out, or by deliberate request).
 
@@ -4818,6 +4938,10 @@ class ProcessLifecycleManager:
                 second burn only shadows the queue until the job misses the horde's dispatch deadline
                 anyway. Faulting immediately hands it back for reissue on another worker. Only the
                 overtime branch sets this; a mid-run stuck-step reap keeps the ordinary retry.
+            lane_fault_reason: When set, the lane-fault streak flagged this live slot (a CUDA context fault, or
+                consecutive faults across models). It takes the full recovery bookkeeping, crash-loop breaker
+                included, so a slot that keeps breaking is quarantined like one that keeps crashing, and the
+                recovery is labelled with this reason.
         """
         if self._automatic_replacement_is_parked() and not allow_while_recovery_parked:
             return
@@ -4915,6 +5039,9 @@ class ProcessLifecycleManager:
             return
 
         failed_model = self._take_recent_load_failure_for_process(process_info.process_id)
+        if lane_fault_reason is not None:
+            # A slot flagged by its own job results is itself faulty, whatever load failure it reported earlier.
+            failed_model = None
         if failed_model is not None:
             # The slot reported it could not load this model, then exited cleanly (its backend may be in an
             # indeterminate state). The fault belongs to the *model*, not the slot, so this is labelled a
@@ -4957,7 +5084,11 @@ class ProcessLifecycleManager:
             will_quarantine = crash_looped or crash_on_start
             if not will_quarantine:
                 quarantine_reason = ""
-                recovery_reason = "inference process replaced (crashed or hung)"
+                recovery_reason = (
+                    f"inference process replaced ({lane_fault_reason})"
+                    if lane_fault_reason is not None
+                    else "inference process replaced (crashed or hung)"
+                )
             elif crash_on_start:
                 quarantine_reason = (
                     f"crash on start: {consecutive_start_failures} consecutive failures before reaching readiness"
@@ -5469,6 +5600,10 @@ class ProcessLifecycleManager:
         for process_info in list(self._process_map.values()):
             if self._reap_if_crashed(process_info):
                 any_replaced = True
+        # A slot flagged by the lane-fault streak is replaced as definitively as a crashed one, ahead of the
+        # recovery debounce: the evidence is already in hand, and a fresh process is the only remedy.
+        if self._replace_faulting_inference_lanes():
+            any_replaced = True
 
         if any_replaced:
             self._recently_recovered = True

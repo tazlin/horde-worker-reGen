@@ -198,6 +198,28 @@ def _is_host_commit_error(error: BaseException) -> bool:
     return isinstance(error, HostCommitError)
 
 
+def _is_cuda_context_fault(error: BaseException) -> bool:
+    """Whether an inference failure is a CUDA runtime error, which leaves the process's CUDA context in doubt.
+
+    After one, later kernels in the same process can keep failing while other processes on the card run normally.
+    ComfyUI catches a node's exception inside its executor, so the backend's pipeline error carries the type by name,
+    built the way ComfyUI builds it. Imported lazily because a dry-run process never imports torch or the backend.
+    """
+    try:
+        from torch import AcceleratorError
+    except ImportError:
+        return False
+    if isinstance(error, AcceleratorError):
+        return True
+    try:
+        from hordelib.execution.interface import PipelineExecutionError
+    except ImportError:
+        return False
+    if not isinstance(error, PipelineExecutionError):
+        return False
+    return error.exception_type == f"{AcceleratorError.__module__}.{AcceleratorError.__qualname__}"
+
+
 def _is_model_unavailable_error(error: BaseException) -> bool:
     """Whether a preload failure is the backend rejecting the requested model name as unknown.
 
@@ -950,6 +972,8 @@ class HordeInferenceProcess(HordeProcess):
 
     Surfaced as the faulted result's ``info`` so the main process can both log a real reason (previously
     a faulted result carried only the empty rate string) and classify a resource/OOM failure for retry."""
+    _last_inference_cuda_context_fault: bool = False
+    """Whether the exception that failed the current job was a CUDA runtime error (see ``_is_cuda_context_fault``)."""
 
     def _send_inference_memory_report(self) -> None:
         """Send a precise boundary VRAM report at a stage transition (lease wait, sampling done, VAE decode).
@@ -1222,6 +1246,7 @@ class HordeInferenceProcess(HordeProcess):
         self._retained_weights_evicted = False
         self._last_job_inference_rate = None
         self._last_inference_error = None
+        self._last_inference_cuda_context_fault = False
         self._last_progress_step_seen = None
         self._nonadvancing_progress_repeats = 0
 
@@ -1267,6 +1292,7 @@ class HordeInferenceProcess(HordeProcess):
             # resource/OOM failure (which earns a degraded retry) from this text. The full message is
             # preserved so torch's "CUDA out of memory" wording reaches the failure classifier intact.
             self._last_inference_error = f"{type(e).__name__}: {e}"
+            self._last_inference_cuda_context_fault = _is_cuda_context_fault(e)
             logger.critical(f"Inference failed: {self._last_inference_error}")
             return None
         finally:
@@ -1678,6 +1704,7 @@ class HordeInferenceProcess(HordeProcess):
             time_elapsed=time_elapsed,
             job_image_results=all_image_results,
             sdk_api_job_info=job_info,
+            cuda_context_fault=is_faulted and self._last_inference_cuda_context_fault,
         )
         self.process_message_queue.put(message)
 

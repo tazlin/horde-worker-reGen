@@ -484,6 +484,11 @@ class HordeInferenceResultMessage(HordeProcessMessage):
     state: GENERATION_STATE
     """The state of the job to be sent to the API."""
     sdk_api_job_info: ImageGenerateJobPopResponse
+    cuda_context_fault: bool = False
+    """Whether the job failed with a CUDA runtime error, after which the process's CUDA context is not trusted.
+
+    The child sets it from the exception's type. The parent replaces the process on the first such fault and counts
+    it against neither the model nor the card's capacity."""
 
     non_reportable_faults: ClassVar[set[METADATA_TYPE | str]] = {
         METADATA_TYPE.aesthetic_score,

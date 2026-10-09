@@ -3033,3 +3033,133 @@ class TestStructuralInferenceStartShortfall:
         assert lifecycle.has_pending_inference_starts() is True
         assert lifecycle.num_inference_slots_retired == 0
         assert _retirement_events(lifecycle) == []
+
+
+class TestInferenceLaneFaultStreak:
+    """A process whose jobs keep failing is replaced, while a model failing everywhere stays with the model systems.
+
+    A process can be left with a CUDA context that fails every job it runs while its sibling on the same card
+    succeeds. The per-model breakers never see it, because the failures spread across whichever models the process
+    is given, so the process has to be judged on its own results.
+    """
+
+    @staticmethod
+    def _outcome(
+        model: str | None,
+        *,
+        faulted: bool = True,
+        cuda_context_fault: bool = False,
+        resource_failure: bool = False,
+        process_id: int = 2,
+        launch_identifier: int = 0,
+    ) -> process_lifecycle_module.InferenceLaneOutcome:
+        return process_lifecycle_module.InferenceLaneOutcome(
+            process_id=process_id,
+            launch_identifier=launch_identifier,
+            model=model,
+            faulted=faulted,
+            cuda_context_fault=cuda_context_fault,
+            resource_failure=resource_failure,
+        )
+
+    @staticmethod
+    def _lane_plm() -> tuple[ProcessLifecycleManager, HordeProcessInfo, list[str]]:
+        lane = make_mock_process_info(2, model_name="Anima-Turbo-v1.1")
+        plm = _make_plm(process_map=ProcessMap({2: lane}))
+        plm._end_inference_process = Mock()  # type: ignore[method-assign]
+        plm._start_inference_process = Mock()  # type: ignore[method-assign]
+        reasons: list[str] = []
+        plm.set_process_recovery_observer(lambda _info, reason: reasons.append(reason))
+        return plm, lane, reasons
+
+    def test_a_cuda_context_fault_replaces_the_process_on_its_first_occurrence(self) -> None:
+        """One CUDA runtime error flags the process, and the replacement feeds the crash-loop history."""
+        plm, _lane, reasons = self._lane_plm()
+
+        plm.record_inference_lane_outcome(self._outcome("Anima-Turbo-v1.1", cuda_context_fault=True))
+        assert plm._replace_faulting_inference_lanes() is True
+
+        assert reasons == ["inference process replaced (CUDA context fault)"]
+        assert len(plm._slot_recovery_history.get(2, [])) == 1
+
+    def test_consecutive_faults_across_models_replace_the_process(self) -> None:
+        """Faults across two models reach the threshold and replace the process, labelled with the streak."""
+        plm, _lane, reasons = self._lane_plm()
+        threshold = process_lifecycle_module.INFERENCE_LANE_FAULT_STREAK_THRESHOLD
+
+        for index in range(threshold - 1):
+            plm.record_inference_lane_outcome(self._outcome(f"model_{index % 2}", resource_failure=True))
+            assert plm._replace_faulting_inference_lanes() is False
+        plm.record_inference_lane_outcome(self._outcome("model_0", resource_failure=True))
+
+        assert plm._replace_faulting_inference_lanes() is True
+        assert reasons == [
+            f"inference process replaced (fault streak: {threshold} consecutive faults across 2 models)"
+        ]
+
+    def test_one_model_failing_repeatedly_is_left_to_the_model_systems(self) -> None:
+        """A streak on a single model never replaces the process, however long it runs."""
+        plm, _lane, _reasons = self._lane_plm()
+
+        for _ in range(process_lifecycle_module.INFERENCE_LANE_FAULT_STREAK_THRESHOLD * 2):
+            plm.record_inference_lane_outcome(self._outcome("Krea2-Turbo_fp8"))
+
+        assert plm._replace_faulting_inference_lanes() is False
+
+    def test_a_success_clears_the_streak(self) -> None:
+        """A completed job between faults resets the count, so scattered faults never add up."""
+        plm, _lane, _reasons = self._lane_plm()
+        threshold = process_lifecycle_module.INFERENCE_LANE_FAULT_STREAK_THRESHOLD
+
+        for index in range(threshold - 1):
+            plm.record_inference_lane_outcome(self._outcome(f"model_{index}"))
+        plm.record_inference_lane_outcome(self._outcome("model_ok", faulted=False))
+        plm.record_inference_lane_outcome(self._outcome("model_9"))
+
+        assert plm._replace_faulting_inference_lanes() is False
+
+    def test_a_replacement_launch_starts_a_fresh_streak(self) -> None:
+        """Faults recorded against an earlier launch of the slot do not count toward its replacement."""
+        plm, _lane, _reasons = self._lane_plm()
+        threshold = process_lifecycle_module.INFERENCE_LANE_FAULT_STREAK_THRESHOLD
+
+        for index in range(threshold - 1):
+            plm.record_inference_lane_outcome(self._outcome(f"model_{index}", launch_identifier=0))
+        plm.record_inference_lane_outcome(self._outcome("model_9", launch_identifier=1))
+
+        assert plm._inference_lanes_due_replacement == {}
+
+    def test_a_flag_for_a_launch_that_is_gone_replaces_nothing(self) -> None:
+        """A slot already replaced for another reason is not replaced a second time on a stale flag."""
+        plm, lane, reasons = self._lane_plm()
+        plm.record_inference_lane_outcome(self._outcome("Anima-Turbo-v1.1", cuda_context_fault=True))
+        lane.process_launch_identifier = 1
+
+        assert plm._replace_faulting_inference_lanes() is False
+        assert reasons == []
+
+    def test_repeated_context_faults_quarantine_the_slot(self) -> None:
+        """Context-fault replacements count toward the crash-loop breaker like any other slot failure."""
+        plm, _lane, reasons = self._lane_plm()
+
+        for launch in range(process_lifecycle_module.CRASH_LOOP_MAX_REPLACEMENTS + 1):
+            lane = make_mock_process_info(2, model_name="Anima-Turbo-v1.1")
+            lane.process_launch_identifier = launch
+            plm._process_map[2] = lane
+            plm.record_inference_lane_outcome(
+                self._outcome("Anima-Turbo-v1.1", cuda_context_fault=True, launch_identifier=launch),
+            )
+            plm._replace_faulting_inference_lanes()
+
+        assert 2 in plm._quarantined_inference_slots
+        assert reasons[-1].startswith("inference slot quarantined (crash loop:")
+
+    def test_the_hung_process_sweep_replaces_a_flagged_process(self) -> None:
+        """The control loop's per-tick sweep is where a flagged process is replaced."""
+        plm, lane, _reasons = self._lane_plm()
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        plm.record_inference_lane_outcome(self._outcome("Anima-Turbo-v1.1", cuda_context_fault=True))
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_called_once_with(lane, lane_fault_reason="CUDA context fault")

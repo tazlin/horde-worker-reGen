@@ -56,6 +56,7 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import InferenceFailureResolution, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import InferenceLaneOutcome
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap, RetiredProcessLaunch
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -210,6 +211,7 @@ class MessageDispatcher:
     _on_aux_prefetch_result: Callable[[HordeAuxPrefetchResultMessage], None] | None = None
     """Invoked when the download process reports per-entry ad-hoc LoRA/TI prefetch outcomes."""
     _on_model_load_failure: Callable[[int, str], None] | None = None
+    _on_inference_lane_outcome: Callable[[InferenceLaneOutcome], None] | None = None
     """Invoked as ``(process_id, horde_model_name)`` when a child reports it failed to load a model."""
     _on_inference_step: Callable[[int], None] | None = None
     """Invoked as ``(process_id)`` on each INFERENCE_STEP heartbeat, so the parent's per-step floor can grade
@@ -479,6 +481,31 @@ class MessageDispatcher:
         quarantine a deterministically-unloadable model instead of churning the process pool.
         """
         self._on_model_load_failure = handler
+
+    def set_inference_lane_outcome_handler(self, handler: Callable[[InferenceLaneOutcome], None]) -> None:
+        """Register the callback told how each inference job ended on its process, for the lane-fault streak."""
+        self._on_inference_lane_outcome = handler
+
+    def _report_inference_lane_outcome(
+        self,
+        message: HordeInferenceResultMessage,
+        *,
+        faulted: bool,
+        resource_failure: bool,
+    ) -> None:
+        """Tell the lane-fault streak how a job ended on the process that ran it."""
+        if self._on_inference_lane_outcome is None:
+            return
+        self._on_inference_lane_outcome(
+            InferenceLaneOutcome(
+                process_id=message.process_id,
+                launch_identifier=message.process_launch_identifier,
+                model=message.sdk_api_job_info.model,
+                faulted=faulted,
+                cuda_context_fault=faulted and message.cuda_context_fault,
+                resource_failure=resource_failure,
+            ),
+        )
 
     def set_inference_step_observer(self, handler: Callable[[int], None]) -> None:
         """Register the callback invoked with ``(process_id)`` on each INFERENCE_STEP heartbeat.
@@ -1681,6 +1708,9 @@ class MessageDispatcher:
             )
             return
 
+        if not is_disaggregated_completion:
+            self._report_inference_lane_outcome(message, faulted=False, resource_failure=False)
+
         released = await self._job_tracker.release_in_progress(message.sdk_api_job_info)
         # A disaggregated completion never sits in INFERENCE_IN_PROGRESS at this point: the sampler slot was
         # released (and the job moved to the disaggregation-decoding stage) the moment sampling finished, so a
@@ -1903,7 +1933,17 @@ class MessageDispatcher:
         # cache the preparation was derived from has been contradicted by the disk).
         if message.info == AUX_RESOLVE_FAILED_INFO:
             self._job_tracker.invalidate_job_aux_preparation(message.sdk_api_job_info)
-        resource_failure = is_resource_failure(message.info)
+        # A CUDA context fault is a verdict on the process, which is replaced for it. Its "out of memory" wording
+        # must not earn the degraded retry or count against the model and the card the way an allocator OOM does.
+        resource_failure = is_resource_failure(message.info) and not message.cuda_context_fault
+        # Faults the worker already attributes elsewhere stay out of the lane streak: a missing auxiliary file is a
+        # disk race, a disaggregated stage fault is about the pipeline's shape, and a measured attempt's failure is
+        # the card's ceiling. Read before the tracker resolves the fault, which ends the measured attempt.
+        counts_against_lane = (
+            message.info != AUX_RESOLVE_FAILED_INFO
+            and not is_disaggregated_completion
+            and not self._job_tracker.is_measured_attempt(message.sdk_api_job_info)
+        )
 
         resolution = await self._job_tracker.handle_job_fault(
             message.sdk_api_job_info,
@@ -1912,6 +1952,8 @@ class MessageDispatcher:
             retryable=True,
             was_disaggregated_structural_fault=is_disaggregated_completion,
         )
+        if counts_against_lane:
+            self._report_inference_lane_outcome(message, faulted=True, resource_failure=resource_failure)
 
         if resolution is not InferenceFailureResolution.FAULTED:
             degraded = resolution is InferenceFailureResolution.RETRY_DEGRADED

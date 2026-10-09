@@ -31,6 +31,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerE
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import InferenceLaneOutcome
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
@@ -1341,3 +1342,100 @@ class TestRefusedVramUnload:
 
         assert process_info.vram_unload_refused is False
         assert process_info.last_control_flag is None
+
+
+class TestInferenceLaneOutcomeRouting:
+    """Each finished job reaches the lane-fault streak, classified so it and the model systems never overlap."""
+
+    _CONTEXT_FAULT_INFO = (
+        "RuntimeError: Pipeline failed to run - declared output node(s) ['output_image'] produced no results. "
+        "Model: Anima-Turbo-v1.1. Error: sampler (KSampler): torch.AcceleratorError: CUDA error: out of memory"
+    )
+
+    async def _deliver(
+        self,
+        *,
+        info: str,
+        faulted: bool,
+        cuda_context_fault: bool = False,
+    ) -> tuple[list[InferenceLaneOutcome], JobTracker]:
+        """Deliver one inference result for an in-progress job and return the outcomes the handler received."""
+        from horde_sdk.ai_horde_api import GENERATION_STATE
+
+        process_info = make_mock_process_info(2)
+        process_info.process_launch_identifier = 4
+        job_tracker = JobTracker()
+        job = make_job_pop_response(model="Anima-Turbo-v1.1")
+        await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
+        dispatcher = _make_dispatcher(process_map=ProcessMap({2: process_info}), job_tracker=job_tracker)
+        outcomes: list[InferenceLaneOutcome] = []
+        dispatcher.set_inference_lane_outcome_handler(outcomes.append)
+
+        msg = Mock(spec=HordeInferenceResultMessage)
+        msg.process_id = 2
+        msg.process_launch_identifier = 4
+        msg.sdk_api_job_info = job
+        msg.time_elapsed = 5.0
+        msg.info = info
+        msg.cuda_context_fault = cuda_context_fault
+        if faulted:
+            msg.state = GENERATION_STATE.faulted
+            msg.job_image_results = None
+            msg.faults_count = 1
+        else:
+            msg.state = Mock()
+            msg.state.__eq__ = lambda self, other: False  # pyrefly: ignore - a non-faulted state is all that matters
+            msg.job_image_results = [Mock()]
+            msg.faults_count = 0
+
+        _enqueue(dispatcher, msg)
+        await dispatcher.receive_and_handle_process_messages()
+        return outcomes, job_tracker
+
+    async def test_a_cuda_context_fault_reaches_the_streak_and_is_not_a_resource_failure(self) -> None:
+        """The context fault flags the process. Its OOM wording counts against neither the model nor the card."""
+        outcomes, job_tracker = await self._deliver(
+            info=self._CONTEXT_FAULT_INFO,
+            faulted=True,
+            cuda_context_fault=True,
+        )
+
+        assert outcomes == [
+            InferenceLaneOutcome(
+                process_id=2,
+                launch_identifier=4,
+                model="Anima-Turbo-v1.1",
+                faulted=True,
+                cuda_context_fault=True,
+                resource_failure=False,
+            ),
+        ]
+        assert job_tracker.count_recent_resource_faults(600.0) == 0
+
+    async def test_an_allocator_oom_reaches_the_streak_as_a_resource_failure(self) -> None:
+        """An ordinary out-of-memory fault counts toward the streak and still counts as a resource fault."""
+        outcomes, job_tracker = await self._deliver(
+            info="RuntimeError: sampler (KSampler): torch.OutOfMemoryError: CUDA out of memory.",
+            faulted=True,
+        )
+
+        assert len(outcomes) == 1
+        assert outcomes[0].resource_failure is True
+        assert outcomes[0].cuda_context_fault is False
+        assert job_tracker.count_recent_resource_faults(600.0) == 1
+
+    async def test_an_unresolved_auxiliary_file_does_not_count_against_the_process(self) -> None:
+        """A missing LoRA file is a disk race the prefetch sweep repairs, so it says nothing about the process."""
+        from horde_worker_regen.process_management.ipc.messages import AUX_RESOLVE_FAILED_INFO
+
+        outcomes, _job_tracker = await self._deliver(info=AUX_RESOLVE_FAILED_INFO, faulted=True)
+
+        assert outcomes == []
+
+    async def test_a_completed_job_reaches_the_streak_as_a_success(self) -> None:
+        """A success is reported so it can clear the process's streak."""
+        outcomes, _job_tracker = await self._deliver(info="50%", faulted=False)
+
+        assert len(outcomes) == 1
+        assert outcomes[0].faulted is False

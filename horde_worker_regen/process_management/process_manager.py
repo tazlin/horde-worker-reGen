@@ -1735,6 +1735,9 @@ class HordeWorkerProcessManager:
         self._message_dispatcher.set_download_availability_handler(self._download_coordinator.on_download_availability)
         self._message_dispatcher.set_aux_prefetch_result_handler(self._aux_prefetch_coordinator.on_prefetch_result)
         self._message_dispatcher.set_model_load_failure_handler(self._on_model_load_failure)
+        self._message_dispatcher.set_inference_lane_outcome_handler(
+            self._process_lifecycle.record_inference_lane_outcome,
+        )
         self._message_dispatcher.set_inference_step_observer(self._observe_inference_step)
         self._job_tracker.set_finalize_observer(self._on_job_finalized)
         self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)

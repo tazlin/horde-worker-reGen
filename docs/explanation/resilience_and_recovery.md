@@ -73,7 +73,9 @@ the horde. `JobTracker` resolves the fault via `handle_job_fault` /
 decides resource-vs-other by substring-matching the faulted result's `info`
 string (it recognises both real allocator messages and the chaos harness's
 injected OOM marker). It is deliberately dependency-free so it cannot itself
-raise on a surprising message.
+raise on a surprising message. A result the child marks as a CUDA context fault
+is never a resource failure, whatever its text says. See
+[Lane fault replacement](#lane-fault-replacement).
 
 ## Layer 2: slot replacement and crash-loop quarantine
 
@@ -98,6 +100,38 @@ A slot that **crash-loops** (repeatedly dies shortly after being replaced) is
 always OOMs on load, say) stops consuming respawn churn. A merely slow,
 replacing, or model-loading slot is **not** quarantined; only repeated fast
 crashes trip the breaker.
+
+### Lane fault replacement
+
+A slot can stay alive while its CUDA context is broken. Every job it runs fails,
+its sibling on the same card succeeds, and the card has room. The per-model
+systems below cannot see this, because the failures spread across whichever
+models the slot is given, and the crash-loop breaker counts only deaths. The
+lifecycle manager therefore judges each inference slot on its own job results
+(`record_inference_lane_outcome`), and replaces it in two cases:
+
+- **A CUDA runtime error.** The child recognises it by type: torch raises
+  `AcceleratorError` for a CUDA runtime error code, and hordelib's
+  `PipelineExecutionError` carries the failing node's exception type. The
+  child sets `cuda_context_fault` on the faulted result, and the slot is
+  replaced on the first one. The allocator's `OutOfMemoryError` leaves the
+  context usable, so it does not count. A context fault does not count as a resource
+  failure for the job, so it earns no degraded retry and is not counted against
+  the model or the card.
+- **A fault streak.** Three consecutive faulted jobs on one launch of the slot,
+  spanning at least two models, with no success between them. Allocator
+  out-of-memory faults count, because the parent cannot tell a transient
+  shortage from a structural one. A single model failing on every attempt stays
+  with the model systems. Faults already explained elsewhere do not count: an
+  unresolved auxiliary file, a disaggregated stage fault, and a measured
+  attempt's failure.
+
+The replacement runs from `replace_hung_processes`, which the control loop calls
+after draining child messages and before the next dispatch, so no job reaches a
+flagged slot. It takes the full recovery bookkeeping, crash-loop breaker
+included, so a slot that keeps breaking is quarantined like one that keeps
+crashing. The worker-wide fault-rate breaker is independent of it: the streak
+replaces a faulty slot before three terminal faults accumulate.
 
 ### The safety pool's breakers
 
