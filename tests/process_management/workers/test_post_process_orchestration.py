@@ -23,7 +23,12 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
-from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    ActuatorCommand,
+    ActuatorCommandKind,
+    DeviceVramState,
+    MeasuredVramSnapshot,
+)
 from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceController, GrantState
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
@@ -263,6 +268,34 @@ class TestStartPostProcessing:
         assert job_info in process_manager._job_tracker.jobs_pending_submit
         assert job_info.state == GENERATION_STATE.faulted
         assert job_info.job_image_results is None
+
+    async def test_a_deficit_lane_pause_names_the_chains_job_as_its_beneficiary(self) -> None:
+        """A lane pause the chain's plan takes is booked for the chain's job, so the ladder holds it for the chain.
+
+        Booked with no beneficiary, the HEALTHY unwind restores the lane on the next sample, which the pause
+        itself produces, a lane cold start per deferral.
+        """
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        orchestrator = process_manager._post_process_orchestrator
+        engine = process_manager._reclaim_ladder
+        engine.record_lane_pause = Mock(wraps=engine.record_lane_pause)  # type: ignore[method-assign]
+        orchestrator._vram_actuator = Mock(pause_utilities_lane=Mock(return_value=True))
+        verdict = Mock(
+            required_actuations=(ActuatorCommand(kind=ActuatorCommandKind.PAUSE_UTILITIES_LANE, device_index=0),),
+        )
+
+        acted = orchestrator._execute_next_actuation(
+            verdict=verdict,
+            applied=set(),
+            post_process_process=lane,
+            now=0.0,
+            job_id="job-pp",
+        )
+
+        assert acted is not None and acted.kind is ActuatorCommandKind.PAUSE_UTILITIES_LANE
+        engine.record_lane_pause.assert_called_once()
+        assert engine.record_lane_pause.call_args.kwargs["beneficiary"] == "job-pp"
 
     async def test_chain_waits_while_sampling_holds_a_tight_card(self) -> None:
         """With sampling in progress and co-residency unaffordable, the chain is not dispatched.

@@ -1166,6 +1166,18 @@ class JobTracker:
         """How many jobs are waiting for or on the dedicated post-processing lane."""
         return len(self.jobs_pending_post_processing) + len(self.jobs_being_post_processed)
 
+    def job_awaits_post_processing(self, job_id: str) -> bool:
+        """Whether a job is waiting for or on the dedicated post-processing lane.
+
+        The restore evidence for a lane pause booked for that job's chain: the paused lane's context and the
+        chain do not fit together on a card the arbiter had to clear, and the pause is owed back once the chain
+        has left the lane, which is when the job leaves these two stages.
+        """
+        return any(
+            str(job_info.sdk_api_job_info.id_) == job_id
+            for job_info in (*self.jobs_pending_post_processing, *self.jobs_being_post_processed)
+        )
+
     @property
     def jobs_pending_submit(self) -> tuple[HordeJobInfo, ...]:
         """Return the `HordeJobInfo` objects for jobs pending submit."""

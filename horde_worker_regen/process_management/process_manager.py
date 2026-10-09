@@ -3758,8 +3758,9 @@ class HordeWorkerProcessManager:
                 # underneath the head re-adds the context the pause removed, and the next cycle pauses it again.
                 lane_restore_ready=not self._inference_scheduler.head_of_queue_is_parked(),
                 # A lane paused for a staged clearance waiter stays down until that job starts or leaves: the
-                # waiter counts as inference in progress, so the parked-head reading above cannot see it.
-                beneficiary_waiting=self._inference_scheduler.job_awaits_admission,
+                # waiter counts as inference in progress, so the parked-head reading above cannot see it. A lane
+                # paused for a post-processing chain stays down until that chain has left the lane.
+                beneficiary_waiting=self._beneficiary_waiting,
             )
 
             # Defence in depth: restore a reclaim-ladder service-lane pause that has lost its restore owner (no
@@ -4288,6 +4289,16 @@ class HordeWorkerProcessManager:
         controller = self._clearance_controllers.get(device_index)
         if controller is not None:
             controller.register(process_id, proxy)
+
+    def _beneficiary_waiting(self, job_id: str) -> bool:
+        """Whether the job a reclaim obligation was booked for still needs the room it bought.
+
+        An inference beneficiary waits until its sample ends, and a post-processing beneficiary until its chain
+        leaves the lane. One reading covers both, since the ladder records a job id without its kind.
+        """
+        return self._inference_scheduler.job_awaits_admission(job_id) or self._job_tracker.job_awaits_post_processing(
+            job_id
+        )
 
     def _lane_holds_clearance(self, process_info: HordeProcessInfo) -> bool:
         """Whether an inference lane has been cleared to materialise its job, or is sampling it.

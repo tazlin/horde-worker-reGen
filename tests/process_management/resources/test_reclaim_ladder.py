@@ -1156,7 +1156,7 @@ class TestStarvedHeadLanePauseObligation:
     def test_a_utilities_pause_the_arbiter_path_actuates_is_unwound_once_when_healthy(self) -> None:
         """A pause the per-cycle path takes, re-asked every cycle, is one obligation the HEALTHY unwind restores.
 
-        The post-processing path names no head, so nothing holds the restore past the card reading HEALTHY.
+        Booked with no head, so nothing holds the restore past the card reading HEALTHY.
         """
         engine = VerifiedReclaimLadder()
         for _ in range(3):

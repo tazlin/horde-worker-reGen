@@ -37,6 +37,7 @@ from horde_worker_regen.process_management.resources.run_metrics import (
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
     ActuatorCommandKind,
+    HeadReclaimContext,
     VramActuator,
     VramArbiter,
     VramRequest,
@@ -365,6 +366,7 @@ class PostProcessOrchestrator:
         applied: set[ActuatorCommand],
         post_process_process: HordeProcessInfo,
         now: float,
+        job_id: str | None = None,
     ) -> ActuatorCommand | None:
         """Mutate ``applied`` by running the plan's next untried rungs until one acts; return that one, or None.
 
@@ -380,11 +382,25 @@ class PostProcessOrchestrator:
             if command in applied:
                 continue
             applied.add(command)
+            # The chain's job is named as the beneficiary of any lane pause the plan takes, so the ladder holds
+            # the lane down until the chain has left the lane rather than restoring it on the next HEALTHY
+            # sample, which the pause itself produces, and paying a lane cold start per deferral.
+            head = (
+                None
+                if job_id is None
+                else HeadReclaimContext(
+                    model=None,
+                    target_process_id=post_process_process.process_id,
+                    max_resident=None,
+                    beneficiary=job_id,
+                )
+            )
             acted = self._reclaim_ladder.execute_arbiter_commands(
                 (command,),
                 self._vram_actuator,
                 device_index=post_process_process.device_index,
                 for_head_of_queue=True,
+                head=head,
             )
             if not acted:
                 continue
@@ -431,6 +447,7 @@ class PostProcessOrchestrator:
                     applied=record.applied_actuations,
                     post_process_process=post_process_process,
                     now=now,
+                    job_id=str(job_id),
                 )
                 if acted is not None:
                     record.last_step_at = now
@@ -728,6 +745,7 @@ class PostProcessOrchestrator:
                         applied=set(),
                         post_process_process=post_process_process,
                         now=now,
+                        job_id=str(completed_job_info.sdk_api_job_info.id_),
                     )
                 self._deferrals.pop(str(completed_job_info.sdk_api_job_info.id_), None)
                 return await self._dispatch(
