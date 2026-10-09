@@ -920,6 +920,15 @@ The room is also what the other frames read, so they cannot disagree with the ve
   the rest once the governor calls the card healthy and that job is served. The VAE and component pauses the
   post-processing drain borrows are not booked there; the drain returns them. `starved_head_lane_reclaim` withholds the rungs; `starved_head_utilities_pause`
   withholds the last one.
+- **Lane rungs are spaced by their grade.** The first lane rung of a starvation episode waits the teardown
+  grace from the head's first hold. Applying a rung stops a staged waiter's clearance clock, so clearance
+  records the rung (`StarvedLaneRungEpisode` in `scheduling/admission/clearance.py`) and passes its grade on
+  the request as `VramRequest.lane_rung_grade`. A rung is graded once every process of its lane present at the
+  pause has left the process map (safety returns under a new launch) and a later evaluation has read the card.
+  The next rung is offered on that evaluation without a second grace. A lane that never exits is graded at
+  `teardown_verification_settle_seconds()`, the verified ladder's teardown budget base, on whatever the card
+  then reports. The episode ends wherever the clock is stopped for anything other than the head's own reclaim
+  (a grant, another lane's work on the card, a pending eviction), and the next rung then waits the grace again.
 - **The measured-load probe** fires once the ladder is empty and the head has starved `measured_load_probe_seconds`
   (the teardown grace by default). It never pre-empts a rung that could close the deficit, and a shortfall
   larger than the measured-attempt band keeps the longer diagnostic horizon: a big miss on a card the worker

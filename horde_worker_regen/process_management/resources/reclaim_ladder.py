@@ -130,6 +130,15 @@ def verification_settle_seconds() -> float:
     return _VERIFICATION_BASE_SECONDS
 
 
+def teardown_verification_settle_seconds() -> float:
+    """Return how long a lane teardown taken outside this engine gets before it is judged on the card's reading.
+
+    The teardown rungs' fixed budget, so a lane stopped by another reclaim path that never exits is graded
+    after the same process-exit allowance the ladder gives its own lane pauses.
+    """
+    return _TEARDOWN_VERIFICATION_BASE_SECONDS
+
+
 class ReclaimRungKind(enum.StrEnum):
     """The kind of pressure-relief action one ladder rung performs."""
 

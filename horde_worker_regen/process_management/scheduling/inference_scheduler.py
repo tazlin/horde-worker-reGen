@@ -114,8 +114,10 @@ from horde_worker_regen.process_management.resources.run_metrics import (
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
+    ActuatorCommandKind,
     DeviceVramState,
     HeadReclaimContext,
+    LaneRungGrade,
     MeasuredVramSnapshot,
     VramArbiter,
     VramDisposition,
@@ -137,6 +139,7 @@ from horde_worker_regen.process_management.scheduling.admission.clearance import
     ClearanceDecision,
     ClearancePlan,
     StagedWaiterClock,
+    StarvedLaneRungEpisode,
     decide_clearance_admit,
 )
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob
@@ -355,6 +358,18 @@ Each reduction costs the cold start of the process it stops plus the cold start 
 it, and the head whose peak was rejected asks again every scheduling cycle. Rate-limiting the relief keeps a
 head that cannot be admitted from buying one teardown per cycle; it does not change what the reduction does
 when it is taken. Paired with the restore dwell, so a reduction and its regrowth cannot chase each other."""
+
+
+_LANE_RUNG_PROCESS_TYPES: dict[ActuatorCommandKind, HordeProcessType] = {
+    ActuatorCommandKind.PAUSE_POST_PROCESS_LANE: HordeProcessType.POST_PROCESS,
+    ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU: HordeProcessType.SAFETY,
+    ActuatorCommandKind.PAUSE_UTILITIES_LANE: HordeProcessType.UTILITIES,
+}
+"""The process type whose exit grades each starved-head lane rung.
+
+Each pause ends every process of its lane through the lane's replacement state machine, safety included (it
+comes back as a CPU process under a new launch), so the rung's memory has returned once none of the launches
+present at the pause is active."""
 
 
 class VaeLanePauseRequester(enum.StrEnum):
@@ -630,6 +645,10 @@ class InferenceScheduler:
         # other grant on its card, no reclaim in flight). Absent while either holds. It times the waiter's
         # measured-load probe, which must come before the child's lease-acquire timeout samples it unpriced.
         self._clearance_starved_since: dict[str, float] = {}
+        # The lane rung last applied per staged job in its current starvation episode. Applying a rung stops the
+        # clearance clock, so the next rung is spaced by this rung's grade. It ends with the episode, wherever
+        # the clock is stopped for anything other than the job's own reclaim.
+        self._lane_rung_episodes: dict[str, StarvedLaneRungEpisode] = {}
 
         # When the exclusive-admit dispatch hold last disclosed itself, per card scope. The hold is re-evaluated
         # every dispatch selection, so the notice is throttled to keep a sustained hold from repeating a line
@@ -5966,7 +5985,7 @@ class InferenceScheduler:
             process_id,
             arbiter=self._ensure_preload_arbiter(),
             post_processing_deferred=deferred,
-            waiter_clock=self._staged_waiter_clock(process_info, job),
+            waiter_clock=self._staged_waiter_clock(process_info, job, lane_rung_grade=self._grade_lane_rung(job)),
         )
         if process_info is None or job is None or plan.decision is ClearanceDecision.UNPRICED:
             self._stop_staged_waiter_clock(job)
@@ -6000,7 +6019,10 @@ class InferenceScheduler:
             plan.verdict,
             is_head_of_queue=True,
         )
-        if applied or self._waiting_can_help_staged_waiter(process_info):
+        if applied:
+            self._note_lane_rung_applied(job, applied)
+            self._clearance_starved_since.pop(str(job.id_), None)
+        elif self._waiting_can_help_staged_waiter(process_info):
             self._stop_staged_waiter_clock(job)
         elif (terminal_evidence := self._terminal_refusal_evidence(plan, job.model)) is not None:
             # A refusal past the waiter's attempt deadline leaves the child one exit, sampling unpriced at its
@@ -6067,8 +6089,10 @@ class InferenceScheduler:
         self,
         process_info: HordeProcessInfo | None,
         job: ImageGenerateJobPopResponse | None,
+        *,
+        lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG,
     ) -> StagedWaiterClock:
-        """Return the staged job's clearance clock and its card's measured load seconds."""
+        """Return the staged job's clearance clock, its card's measured load seconds and its lane-rung grade."""
         since = self._clearance_starved_since.get(str(job.id_)) if job is not None and job.id_ is not None else None
         return StagedWaiterClock(
             starved_seconds=0.0 if since is None else max(0.0, self._clock() - since),
@@ -6077,12 +6101,53 @@ class InferenceScheduler:
                 if process_info is not None
                 else None
             ),
+            lane_rung_grade=lane_rung_grade,
         )
 
     def _stop_staged_waiter_clock(self, job: ImageGenerateJobPopResponse | None) -> None:
-        """Stop the staged job's clearance clock; the next hold where waiting cannot help restarts it."""
+        """Stop the staged job's clearance clock and end its starvation episode.
+
+        The next hold where waiting cannot help restarts the clock, and a lane rung then waits the grace again.
+        """
         if job is not None and job.id_ is not None:
             self._clearance_starved_since.pop(str(job.id_), None)
+            self._lane_rung_episodes.pop(str(job.id_), None)
+
+    def _note_lane_rung_applied(
+        self,
+        job: ImageGenerateJobPopResponse,
+        applied: tuple[ActuatorCommand, ...],
+    ) -> None:
+        """Start grading a starved-head lane rung just applied for ``job``, recording the launches it ends."""
+        lane_types = [_LANE_RUNG_PROCESS_TYPES[c.kind] for c in applied if c.kind in _LANE_RUNG_PROCESS_TYPES]
+        if not lane_types or job.id_ is None:
+            return
+        self._lane_rung_episodes[str(job.id_)] = StarvedLaneRungEpisode(
+            applied_at=self._clock(),
+            lane_launches=frozenset(
+                (process_info.process_id, process_info.process_launch_identifier)
+                for process_info in self._process_map.values()
+                if process_info.process_type == lane_types[-1]
+            ),
+        )
+
+    def _grade_lane_rung(self, job: ImageGenerateJobPopResponse | None) -> LaneRungGrade:
+        """Advance the grade of the lane rung last applied for ``job`` by one evaluation and return it."""
+        episode = self._lane_rung_episodes.get(str(job.id_)) if job is not None and job.id_ is not None else None
+        if episode is None:
+            return LaneRungGrade.NO_RUNG
+        was_graded = episode.graded
+        lane_exited = not any(
+            self._process_map.is_launch_active(process_id, launch) for process_id, launch in episode.lane_launches
+        )
+        grade = episode.grade(now=self._clock(), lane_exited=lane_exited)
+        if not was_graded and episode.graded_at_bound and job is not None:
+            logger.info(
+                f"A service lane paused for staged job {job.id_} ({job.model}) has not exited after "
+                f"{self._clock() - episode.applied_at:.1f}s. Its rung is graded on the card's current free VRAM, "
+                "so a lane that never exits cannot hold the head.",
+            )
+        return grade
 
     def _waiting_can_help_staged_waiter(self, process_info: HordeProcessInfo) -> bool:
         """Whether something on the waiter's card may still change its fit without a load of its own.
@@ -6110,6 +6175,8 @@ class InferenceScheduler:
         in_progress_ids = {str(job.id_) for job in self._job_tracker.jobs_in_progress if job.id_ is not None}
         for job_id in [job_id for job_id in self._clearance_starved_since if job_id not in in_progress_ids]:
             del self._clearance_starved_since[job_id]
+        for job_id in [job_id for job_id in self._lane_rung_episodes if job_id not in in_progress_ids]:
+            del self._lane_rung_episodes[job_id]
         for process_info in self._process_map.values():
             if process_info.device_index != device_index:
                 continue

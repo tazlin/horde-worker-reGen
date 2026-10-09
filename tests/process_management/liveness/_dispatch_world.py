@@ -253,6 +253,7 @@ _KNOWN_MODEL_CLASSES = (
 
 _SAFETY_PROCESS_ID = 100
 _POST_PROCESS_LANE_ID = 200
+_UTILITIES_LANE_ID = 300
 """Ids for the service processes, kept well clear of the inference lane ids so pool growth (which allocates
 the next free inference id) can never collide with one."""
 
@@ -763,6 +764,7 @@ class _DispatchWorld:
         ram_pause_percent: float = 90.0,
         ram_report_interval_seconds: float = 0.0,
         staged_encode_mb_by_model: Mapping[str, float] | None = None,
+        service_lane_exit_seconds: float | None = None,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -796,6 +798,14 @@ class _DispatchWorld:
                 a context. Both are device commitments that stopping idle *inference* siblings cannot
                 reclaim, so they are what a card's structural floor is squeezed by without any inference
                 context being the cause.
+            service_lane_exit_seconds: How long a paused service lane's process takes to exit, in world time.
+                None keeps the post-processing lane an unpausable tenant and returns safety's charge the moment
+                it is paused, the shape every row about the governor ladder was written against. Set, with
+                ``service_contexts``, an image-utilities lane joins the service processes, the post-processing
+                and utilities lanes can be paused, and safety reports its whole footprint as its reservation.
+                A paused lane's process keeps its context on the card until this long has passed, and then
+                leaves the process map (safety is replaced under a new launch), as the lane's replacement state
+                machine ends it.
             disaggregated: Whether the row's jobs are disaggregation-class, so a sampler is priced for the
                 UNet it holds alone rather than for a whole job.
             closed_loop: Whether to close the loop between policy and the card: the device-free governor and
@@ -1154,6 +1164,16 @@ class _DispatchWorld:
         """What each tick looked like to the verdicts that judge whether the card was earning."""
 
         self._service_contexts = service_contexts
+        self.service_lane_exit_seconds = service_lane_exit_seconds
+        """How long a paused service lane's process takes to exit, or None when lanes are not modelled exiting."""
+        self._service_lane_exits_at: dict[int, float] = {}
+        """When each paused service lane's process exits, by process id, while its exit is still to come."""
+        self.service_lane_exits: list[tuple[int, float, int]] = []
+        """Every service lane process exit, as (tick, world clock, process id)."""
+        self.service_lane_pauses: list[tuple[int, float, int, PauseOwner]] = []
+        """Every post-processing or utilities lane pause, as (tick, world clock, process id, owner)."""
+        self._retired_service_lanes: dict[int, HordeProcessInfo] = {}
+        """Paused lanes' process records while they are out of the map, so a restore brings the same lane back."""
         self.post_processing_chain_ticks = post_processing_chain_ticks
         """How long a finished job's chain sits pending before the hand-driven lane takes it."""
         self.preload_ends_dispatch = preload_ends_dispatch
@@ -1195,6 +1215,14 @@ class _DispatchWorld:
                     post_process_card_index if post_process_card_index in self._card_totals else card_indices[0]
                 ),
             )
+            if service_lane_exit_seconds is not None:
+                processes[_UTILITIES_LANE_ID] = make_mock_process_info(
+                    _UTILITIES_LANE_ID,
+                    model_name=None,
+                    process_type=HordeProcessType.UTILITIES,
+                    state=HordeProcessState.WAITING_FOR_JOB,
+                    device_index=processes[_POST_PROCESS_LANE_ID].device_index,
+                )
         self._process_map = ProcessMap(processes)
         self._model_map = HordeModelMap(root={})
         self._job_tracker = JobTracker(clock=lambda: self.now)
@@ -1280,6 +1308,12 @@ class _DispatchWorld:
         self._card_runtimes: dict[int, CardRuntime] | None = card_runtimes or None
         self._lane_ceiling = lane_count
         self._lifecycle = _make_mock_lifecycle(self)
+        if service_lane_exit_seconds is not None:
+            self._lifecycle.is_utilities_gpu_paused = False
+            self._lifecycle.pause_post_process_off_gpu = self._pause_post_process_lane
+            self._lifecycle.restore_post_process_off_gpu = self._restore_post_process_lane
+            self._lifecycle.pause_utilities_off_gpu = self._pause_utilities_lane
+            self._lifecycle.restore_utilities_off_gpu = self._restore_utilities_lane
         worker_state = WorkerState()
         runtime_config = make_test_runtime_config(bridge_data=bridge_data)
         model_metadata = make_test_model_metadata(reference)
@@ -1495,9 +1529,13 @@ class _DispatchWorld:
         lanes = max(1, sum(1 for lane in self._inference_lanes() if lane.device_index == device_index))
         charge = _FIRST_CONTEXT_MB + _MARGINAL_CONTEXT_MB * (lanes - 1)
         if self._service_contexts:
-            if self._card_of(_POST_PROCESS_LANE_ID) == device_index:
+            if self._card_of(_POST_PROCESS_LANE_ID) == device_index and self._service_lane_on_card(
+                _POST_PROCESS_LANE_ID
+            ):
                 charge += _MARGINAL_CONTEXT_MB
-            if self._safety_card_index == device_index and not self.safety_is_off_gpu():
+            if _UTILITIES_LANE_ID in self._process_map and self._card_of(_UTILITIES_LANE_ID) == device_index:
+                charge += _MARGINAL_CONTEXT_MB
+            if self._safety_card_index == device_index and self._safety_context_on_card():
                 charge += SAFETY_GPU_LOAD_CHARGE_MB
                 if self._safety_transition_until is not None:
                     # A restore is still materialising: the classifier weights are being read and copied, so the
@@ -1508,6 +1546,88 @@ class _DispatchWorld:
     def safety_is_off_gpu(self) -> bool:
         """Whether the safety context is currently paused off the card."""
         return bool(self._lifecycle.is_safety_gpu_paused)
+
+    def _safety_context_on_card(self) -> bool:
+        """Whether safety's context still holds the card: on it, or paused with its process yet to exit."""
+        if self.service_lane_exit_seconds is None:
+            return not self.safety_is_off_gpu()
+        return not self.safety_is_off_gpu() or _SAFETY_PROCESS_ID in self._service_lane_exits_at
+
+    def _service_lane_on_card(self, process_id: int) -> bool:
+        """Whether a pausable service lane's process still holds its context on the card."""
+        return self.service_lane_exit_seconds is None or process_id in self._process_map
+
+    def _schedule_service_lane_exit(self, process_id: int) -> None:
+        """Start a paused lane's process exit, which lands ``service_lane_exit_seconds`` from now."""
+        assert self.service_lane_exit_seconds is not None
+        self._service_lane_exits_at[process_id] = self.now + self.service_lane_exit_seconds
+
+    def _advance_service_lane_exits(self) -> None:
+        """Land every paused lane's process exit that is due, returning its context to the card.
+
+        The post-processing and utilities lanes leave the process map. Safety is replaced under a new launch,
+        the CPU process the lifecycle brings up in its place.
+        """
+        due = [pid for pid, exits_at in self._service_lane_exits_at.items() if exits_at <= self.now]
+        for process_id in sorted(due):
+            del self._service_lane_exits_at[process_id]
+            process_info = self._process_map.get(process_id)
+            if process_info is None:
+                continue
+            if process_id == _SAFETY_PROCESS_ID:
+                process_info.process_launch_identifier += 1
+            else:
+                self._retired_service_lanes[process_id] = process_info
+                del self._process_map[process_id]
+            self.service_lane_exits.append((self.tick, self.now, process_id))
+        if due:
+            self._sync_reported_vram()
+
+    def _begin_service_lane_pause(self, process_id: int, owner: PauseOwner) -> None:
+        """Record a lane pause the lifecycle just took and start its process exit."""
+        self.service_lane_pauses.append((self.tick, self.now, process_id, owner))
+        self._schedule_service_lane_exit(process_id)
+
+    def _bring_service_lane_back(self, process_id: int) -> None:
+        """Return a restored lane's process to the map under a new launch, as the lifecycle's restart does."""
+        self._service_lane_exits_at.pop(process_id, None)
+        retired = self._retired_service_lanes.pop(process_id, None)
+        if retired is not None:
+            retired.process_launch_identifier += 1
+            self._process_map[process_id] = retired
+        self._sync_reported_vram()
+
+    def _pause_post_process_lane(self, *, owner: PauseOwner) -> bool:
+        """The lifecycle's post-processing pause over this world's lane."""
+        if self._lifecycle.is_post_process_gpu_paused is True or _POST_PROCESS_LANE_ID not in self._process_map:
+            return False
+        self._lifecycle.is_post_process_gpu_paused = True
+        self._begin_service_lane_pause(_POST_PROCESS_LANE_ID, owner)
+        return True
+
+    def _restore_post_process_lane(self, *, owner: PauseOwner) -> bool:
+        """The lifecycle's post-processing restore over this world's lane."""
+        if self._lifecycle.is_post_process_gpu_paused is not True:
+            return False
+        self._lifecycle.is_post_process_gpu_paused = False
+        self._bring_service_lane_back(_POST_PROCESS_LANE_ID)
+        return True
+
+    def _pause_utilities_lane(self, *, owner: PauseOwner) -> bool:
+        """The lifecycle's image-utilities pause over this world's lane."""
+        if self._lifecycle.is_utilities_gpu_paused is True or _UTILITIES_LANE_ID not in self._process_map:
+            return False
+        self._lifecycle.is_utilities_gpu_paused = True
+        self._begin_service_lane_pause(_UTILITIES_LANE_ID, owner)
+        return True
+
+    def _restore_utilities_lane(self, *, owner: PauseOwner) -> bool:
+        """The lifecycle's image-utilities restore over this world's lane."""
+        if self._lifecycle.is_utilities_gpu_paused is not True:
+            return False
+        self._lifecycle.is_utilities_gpu_paused = False
+        self._bring_service_lane_back(_UTILITIES_LANE_ID)
+        return True
 
     def pause_safety_on_gpu(self, *, owner: PauseOwner) -> bool:
         """Take the safety context off the card for ``owner``, returning whether this call did it.
@@ -1520,6 +1640,8 @@ class _DispatchWorld:
         self._lifecycle.is_safety_gpu_paused = True
         self._lifecycle.safety_pause_owner = owner
         self.safety_pause_events.append((self.tick, self.now, owner))
+        if self.service_lane_exit_seconds is not None:
+            self._schedule_service_lane_exit(_SAFETY_PROCESS_ID)
         self._begin_safety_placement_transition()
         self._sync_reported_vram()
         return True
@@ -1533,6 +1655,7 @@ class _DispatchWorld:
         self._lifecycle.is_safety_gpu_paused = False
         self._lifecycle.safety_pause_owner = None
         self.safety_restore_events.append((self.tick, self.now))
+        self._service_lane_exits_at.pop(_SAFETY_PROCESS_ID, None)
         self._begin_safety_placement_transition()
         self._sync_reported_vram()
         return True
@@ -1799,6 +1922,13 @@ class _DispatchWorld:
             lane.total_vram_mb = int(total_mb)
             lane.vram_usage_mb = int(total_mb - self.card_free_mb(lane.device_index))
             reported_mb = self._lane_charge_mb(lane.process_id)
+            if (
+                lane.process_id == _SAFETY_PROCESS_ID
+                and self.service_lane_exit_seconds is not None
+                and self._safety_context_on_card()
+            ):
+                # Safety's classifier weights sit beside its context, and a live safety child reports them.
+                reported_mb += SAFETY_GPU_LOAD_CHARGE_MB - _MARGINAL_CONTEXT_MB
             lane.process_reserved_mb = int(max(0.0, reported_mb))
             self._lane_peak_mb[lane.process_id] = max(self._lane_peak_mb.get(lane.process_id, 0.0), reported_mb)
         if self.host_ram is not None and publish_ram:
@@ -2092,7 +2222,12 @@ class _DispatchWorld:
         lane.held_components = None
         self._granted_resident_evicted.discard(lane.process_id)
         lane.loaded_horde_model_name = None
-        lane.last_control_flag = None
+        if self.service_lane_exit_seconds is None or lane.process_type == HordeProcessType.INFERENCE:
+            lane.last_control_flag = None
+        else:
+            # The parent retires an outstanding unload only when the slot materialises VRAM again, and a service
+            # lane holding no model never does, so its flag keeps it out of the eviction mirror.
+            lane.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
         lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
         # A model gone from the device can no longer be a retained resident, exactly as the process
         # map's own eviction bookkeeping records it.
@@ -3479,6 +3614,7 @@ class _DispatchWorld:
             self.host_ram.trim_cache()
             self._touch_staged_prefetches()
         self._advance_safety_placement_transition()
+        self._advance_service_lane_exits()
         self._apply_control_flags()
         self._materialise_preloads()
         self._advance_encode_windows()

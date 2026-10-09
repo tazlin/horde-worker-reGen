@@ -188,6 +188,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
 )
+from horde_worker_regen.process_management.resources.vram_arbiter import _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
 from horde_worker_regen.process_management.resources.vram_footprints import (
     _MIN_OBSERVATIONS_FOR_MEASURED,
     FootprintKey,
@@ -231,7 +232,9 @@ from tests.process_management.liveness._dispatch_world import (
     _DECODE_SECONDS_PER_MEGAPIXEL,
     _FILLER_MODEL_CLASSES,
     _FLUX,
+    _POST_PROCESS_LANE_ID,
     _ROTATION_MODEL_CLASSES,
+    _SAFETY_PROCESS_ID,
     _SAME_BASELINE_MODEL_CLASSES,
     _SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL,
     _SD15,
@@ -247,6 +250,7 @@ from tests.process_management.liveness._dispatch_world import (
     _SDXL_C,
     _SDXL_OTHER,
     _SIM_LOAD_PEAK_OVER_SETTLED_MB,
+    _UTILITIES_LANE_ID,
     _CardClass,
     _DispatchWorld,
     _model_by_name,
@@ -3078,6 +3082,91 @@ async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has()
     assert [job_id for _tick, _lane, job_id in world.clearance_grants] == [str(job.id_)], (
         f"{context}: the job entered its load-and-sample window without a grant "
         f"({world.clearance_grants}), so nothing here was decided by the clearance gate at all. "
+        f"{world.state_dump()}"
+    )
+
+
+_LANE_STARVED_CARD = _CardClass("lane_starved", 10200.0)
+"""A card on which the staged SDXL head is short by more than any two service lanes return.
+
+Beside the head's own context and staged encode sit the post-processing lane's context, safety's whole
+footprint and the image-utilities lane's context. The head's remaining charge exceeds the measured free by more
+than the post-processing lane and safety return together, and by less than all three lanes return, so it clears
+only once every lane is off the card."""
+
+_LANE_EXIT_SECONDS = 0.1
+"""How long a paused lane's process takes to exit, about what a lane's replacement state machine takes."""
+
+_LANE_RUNG_TICK_SECONDS = 0.5
+"""A control-loop cadence fine enough that a lane's exit and the reading after it are separate evaluations."""
+
+
+async def test_r_a_head_starved_by_three_lanes_waits_one_grace_not_three() -> None:
+    """A staged head short by three service lanes waits out the grace once and then takes each lane as it exits.
+
+    The failure this encodes: applying a lane rung stopped the waiter's clearance clock and the next hold
+    restarted it, so each rung waited a fresh teardown grace though each lane's process exited within a fraction
+    of a second. A head that needed the post-processing lane, safety and the utilities lane off the card sat
+    on an idle card for three graces.
+
+    Each rung is now graded on its lane's exit and a reading taken after it, as the verified ladder grades its own
+    teardowns, and the next rung is offered once the grade lands. The first rung still waits the grace from the
+    head's first hold. Every rung after it lands within a lane exit and two evaluations of the one before, and
+    the head is cleared once the last lane is gone, with no lane reaching its lease-acquire timeout.
+    """
+    world = _DispatchWorld(
+        card=_LANE_STARVED_CARD,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        tick_seconds=_LANE_RUNG_TICK_SECONDS,
+        service_contexts=True,
+        safety_off_gpu_allowed=True,
+        service_lane_exit_seconds=_LANE_EXIT_SECONDS,
+    )
+    width, height = _CLEARANCE_JOB_SHAPE
+    job = make_job_pop_response(_SDXL.name, width=width, height=height, ddim_steps=20)
+    started_at = world.now
+    await world.pop(job)
+    for _ in range(int(CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS / _LANE_RUNG_TICK_SECONDS) + 10):
+        await world.step()
+        if world.dispatch_tick(job) is not None:
+            break
+
+    context = "graded lane rungs"
+    rungs = sorted(
+        [(now, process_id) for _tick, now, process_id, _owner in world.service_lane_pauses]
+        + [(now, _SAFETY_PROCESS_ID) for _tick, now, _owner in world.safety_pause_events],
+    )
+    assert [process_id for _now, process_id in rungs] == [
+        _POST_PROCESS_LANE_ID,
+        _SAFETY_PROCESS_ID,
+        _UTILITIES_LANE_ID,
+    ], f"{context}: the lanes were not taken cheapest first, one each ({rungs}). {world.state_dump()}"
+    assert rungs[0][0] - started_at >= _FIRST_PARTY_TEARDOWN_GRACE_SECONDS, (
+        f"{context}: the first lane was paused {rungs[0][0] - started_at:.1f}s after the job arrived, inside the "
+        f"{_FIRST_PARTY_TEARDOWN_GRACE_SECONDS:.0f}s grace a head waits out before its first lane rung. "
+        f"{world.state_dump()}"
+    )
+    rung_spacing_ceiling = _LANE_EXIT_SECONDS + 2 * _LANE_RUNG_TICK_SECONDS
+    for (earlier, earlier_lane), (later, later_lane) in itertools.pairwise(rungs):
+        assert later - earlier <= rung_spacing_ceiling, (
+            f"{context}: lane {later_lane} was paused {later - earlier:.1f}s after lane {earlier_lane}, past the "
+            f"{rung_spacing_ceiling:.1f}s a lane exit and the reading after it take. The rung waited on a clock, "
+            f"not on the previous rung's grade. {world.state_dump()}"
+        )
+    grant = next((tick for tick, _lane, job_id in world.clearance_grants if job_id == str(job.id_)), None)
+    assert grant is not None, f"{context}: the head was never cleared. {world.state_dump()}"
+    granted_at = started_at + grant * _LANE_RUNG_TICK_SECONDS
+    assert granted_at - rungs[-1][0] <= rung_spacing_ceiling, (
+        f"{context}: the head was cleared {granted_at - rungs[-1][0]:.1f}s after the last lane was paused, past "
+        f"the {rung_spacing_ceiling:.1f}s its exit takes. {world.state_dump()}"
+    )
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout. "
         f"{world.state_dump()}"
     )
 

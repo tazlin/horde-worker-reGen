@@ -12,11 +12,17 @@ from dataclasses import dataclass
 
 from strenum import StrEnum
 
+from horde_worker_regen.process_management.resources.reclaim_ladder import teardown_verification_settle_seconds
 from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_weight_mb,
     predict_model_weight_mb,
 )
-from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, VramArbiter, VramVerdict
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    ActuatorCommand,
+    LaneRungGrade,
+    VramArbiter,
+    VramVerdict,
+)
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.materialization import (
     MaterializationRequest,
@@ -95,6 +101,50 @@ class StagedWaiterClock:
     reclaim in flight. Zero while either holds."""
     load_seconds: float | None
     """The card's measured RAM-to-VRAM load seconds, or None when none is measured yet."""
+    lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG
+    """Where the waiter's starvation episode stands with the service-lane rungs applied for it."""
+
+
+@dataclass
+class StarvedLaneRungEpisode:
+    """The service-lane rung last applied for one staged waiter, graded as the verified ladder grades a teardown.
+
+    A rung is graded once its lane's processes have exited and the card has been read after that exit. The
+    evaluation that first sees the exit priced a reading the snapshot may have frozen before it, so the grade
+    lands on the evaluation after. A lane that never exits is graded at the teardown verification bound on
+    whatever the card then reports, so a lane that never answers cannot hold the head.
+    """
+
+    applied_at: float
+    """The scheduler-clock instant the rung was applied."""
+    lane_launches: frozenset[tuple[int, int]]
+    """The (process id, launch identifier) of every process of the paused lane when the rung was applied."""
+    exit_observed: bool = False
+    """Whether an evaluation has seen every one of those launches gone."""
+    graded: bool = False
+    """Whether the rung is graded. It stays graded for the rest of the episode."""
+    graded_at_bound: bool = False
+    """Whether the grade came from the bound with the lane still present."""
+
+    def grade(self, *, now: float, lane_exited: bool) -> LaneRungGrade:
+        """Advance the rung's grade by one evaluation and return it.
+
+        Args:
+            now: The scheduler-clock instant of this evaluation.
+            lane_exited: Whether none of :attr:`lane_launches` is still active in the process map.
+        """
+        if self.graded:
+            return LaneRungGrade.GRADED
+        if self.exit_observed:
+            self.graded = True
+            return LaneRungGrade.GRADED
+        if now - self.applied_at >= teardown_verification_settle_seconds():
+            self.graded = True
+            self.graded_at_bound = not lane_exited
+            return LaneRungGrade.GRADED
+        if lane_exited:
+            self.exit_observed = True
+        return LaneRungGrade.AWAITING_GRADE
 
 
 _UNTIMED_WAITER = StagedWaiterClock(starved_seconds=0.0, load_seconds=None)
@@ -266,6 +316,7 @@ def decide_clearance_admit(
                 probe_after_seconds=float(config.measured_load_probe_seconds),
                 load_seconds=waiter_clock.load_seconds,
             ),
+            lane_rung_grade=waiter_clock.lane_rung_grade,
         ),
         nets_own_dispatch_reservation=True,
         sibling_staging_relief_mb=sibling_staging_relief_mb(snapshot, job_id, process_id),

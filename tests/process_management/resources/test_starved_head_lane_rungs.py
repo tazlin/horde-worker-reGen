@@ -3,8 +3,10 @@
 A whole-card head on a card at its edge was refused by the measured identity for room the service lanes'
 contexts held, and the ladder had no rung that named them: it emptied, the hold reclaimed nothing, and the
 head waited on a fit nothing produced. The lanes now enter the ladder for a starved head, cheapest first and
-one per evaluation, only past the teardown grace, only when the permitted rungs would close the deficit, and
-never when policy withholds lane reclaim.
+one per evaluation, only when the permitted rungs would close the deficit, and never when policy withholds
+lane reclaim. The first waits out the teardown grace. Each later rung of the same starvation episode is offered
+once the previous one is graded on its lane's exit and a reading taken after it, or at the teardown
+verification bound when the lane never answers.
 
 A post-processing job's lane moves answer to the same closability test: offered only when no eviction or
 demotion is on the ladder, the idle utilities lane before the safety cycle, each only when its return alone
@@ -16,16 +18,19 @@ from __future__ import annotations
 from dataclasses import replace
 
 from horde_worker_regen.process_management.resources.admission_identity import TenantLane
+from horde_worker_regen.process_management.resources.reclaim_ladder import teardown_verification_settle_seconds
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     ActuatorCommandKind,
     DeviceVramState,
+    LaneRungGrade,
     MeasuredVramSnapshot,
     VramArbiter,
     VramDisposition,
     VramRequest,
     VramRequestKind,
 )
+from horde_worker_regen.process_management.scheduling.admission.clearance import StarvedLaneRungEpisode
 
 _TOTAL_MB = 24074.0
 _NOISE_MB = 1203.7
@@ -124,6 +129,46 @@ def test_the_rungs_are_cheapest_first_and_one_per_evaluation() -> None:
 
     only_utilities = _lane_state(post_process=False, safety=False, utilities=True)
     assert _kinds(_verdict(only_utilities, _head())) == [ActuatorCommandKind.PAUSE_UTILITIES_LANE]
+
+
+def test_a_graded_rung_offers_the_next_lane_without_a_second_grace() -> None:
+    """Once the post-processing lane's rung is graded, safety is offered on the next evaluation.
+
+    The waiter's clock restarted when the first rung was applied, so it reads well inside the grace. The grade
+    stands for the rest of the episode, which already waited the grace once.
+    """
+    pp_gone = _lane_state(post_process=False, safety=True, utilities=True)
+    request = _head(starved_seconds=0.5, lane_rung_grade=LaneRungGrade.GRADED)
+
+    assert _kinds(_verdict(pp_gone, request)) == [ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU]
+
+
+def test_a_rung_awaiting_its_grade_offers_no_further_lane() -> None:
+    """The next lane waits for the previous one's grade, however long the head has starved."""
+    pp_paused = _lane_state(post_process=False, safety=True, utilities=True)
+    request = _head(lane_rung_grade=LaneRungGrade.AWAITING_GRADE)
+
+    assert _kinds(_verdict(pp_paused, request)) == []
+
+
+def test_a_rung_is_graded_on_the_lanes_exit_and_a_later_reading() -> None:
+    """The evaluation that sees the lane gone still prices a reading from before it, so the next one grades."""
+    episode = StarvedLaneRungEpisode(applied_at=100.0, lane_launches=frozenset({(200, 0)}))
+
+    assert episode.grade(now=100.5, lane_exited=False) is LaneRungGrade.AWAITING_GRADE
+    assert episode.grade(now=100.6, lane_exited=True) is LaneRungGrade.AWAITING_GRADE
+    assert episode.grade(now=100.7, lane_exited=True) is LaneRungGrade.GRADED
+    assert not episode.graded_at_bound
+
+
+def test_a_rung_the_lane_never_answers_is_graded_at_the_bound() -> None:
+    """A lane that never exits cannot hold the head: the rung is graded on whatever the card then reports."""
+    bound = teardown_verification_settle_seconds()
+    episode = StarvedLaneRungEpisode(applied_at=100.0, lane_launches=frozenset({(200, 0)}))
+
+    assert episode.grade(now=100.0 + bound - 0.1, lane_exited=False) is LaneRungGrade.AWAITING_GRADE
+    assert episode.grade(now=100.0 + bound, lane_exited=False) is LaneRungGrade.GRADED
+    assert episode.graded_at_bound
 
 
 def test_a_deficit_the_lanes_cannot_close_offers_nothing() -> None:

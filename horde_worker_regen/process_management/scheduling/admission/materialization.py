@@ -14,7 +14,12 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     effective_inference_reserve_mb,
     predict_job_weight_mb,
 )
-from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter, VramRequest, VramRequestKind
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    LaneRungGrade,
+    VramArbiter,
+    VramRequest,
+    VramRequestKind,
+)
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot
 from horde_worker_regen.process_management.scheduling.workload_flow import (
@@ -59,6 +64,8 @@ class StagedWaiterTerms:
     """The clearance clock: seconds the waiter has been held where waiting could not help."""
     attempt_deadline_seconds: float
     """The clock reading by which its measured-load probe must be eligible."""
+    lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG
+    """Where the waiter's starvation episode stands with the service-lane rungs applied for it."""
 
 
 def head_starved_seconds(snapshot: SchedulingSnapshot, job_id: str) -> float:
@@ -206,6 +213,7 @@ def build_materialization_request(
         ),
         probe_after_seconds=float(config.measured_load_probe_seconds),
         attempt_deadline_seconds=staged_waiter.attempt_deadline_seconds if staged_waiter is not None else None,
+        lane_rung_grade=staged_waiter.lane_rung_grade if staged_waiter is not None else LaneRungGrade.NO_RUNG,
         has_reclaimable_idle_tenancy=pricing.has_reclaimable_idle_tenancy(
             snapshot,
             job.model,

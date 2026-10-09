@@ -190,6 +190,17 @@ class VramRequestKind(StrEnum):
     """A safety-model load onto the GPU safety context."""
 
 
+class LaneRungGrade(StrEnum):
+    """Where a starved head's starvation episode stands with the service-lane rungs it has been given."""
+
+    NO_RUNG = "no_rung"
+    """No lane rung has been applied for the head in this episode, so the first waits out the teardown grace."""
+    AWAITING_GRADE = "awaiting_grade"
+    """A lane rung was applied and its lane has not yet been seen to exit with the card read afterwards."""
+    GRADED = "graded"
+    """The last applied lane rung is graded, so the next is offered without waiting the grace again."""
+
+
 class VramDisposition(StrEnum):
     """The outcome class of a verdict."""
 
@@ -474,6 +485,12 @@ class VramRequest:
     """Whether policy lets a starved head stop an idle service lane (post-processing, safety off-GPU, the
     utilities lane) once weight reclaim and idle-context teardown have nothing left. The operator's out for
     the lane rungs; the per-lane flags on the device state still decide whether each lane is pausable now."""
+    lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG
+    """How far the head's starvation episode has got with its lane rungs. Only clearance sets it.
+
+    Applying a rung stops the waiter's clock, so the clock cannot space later rungs. A lane process exits
+    within a fraction of a second of its pause, and a fresh grace per rung would leave the card idle for the
+    whole of each one."""
 
 
 @dataclass(frozen=True)
@@ -1436,15 +1453,22 @@ class VramArbiter:
         refused on, and each has an owner-guarded pause with a restore, so a head short by what a lane holds
         has a real remedy the ladder can name. Cheapest first: the post-processing lane, safety off the card,
         the utilities lane; one per evaluation, so the card gives lanes up one at a time and the next
-        evaluation prices the result. Offered only past the teardown grace (the same clock the idle-context
-        teardown waits out), only when the permitted rungs together would close the deficit (a lane paused
-        for a head that still cannot fit is churn), and never when policy withholds lane reclaim.
+        evaluation prices the result. The first rung of a starvation episode waits out the teardown grace
+        (the same clock the idle-context teardown waits out). A later rung waits only for the previous one's
+        grade (:attr:`VramRequest.lane_rung_grade`), since the episode has already waited the grace once.
+        Offered only when the permitted rungs together would close the deficit (a lane paused for a head that
+        still cannot fit is churn), and never when policy withholds lane reclaim.
         """
         if request.kind not in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH):
             return None
         if not request.is_head_of_queue or not request.lane_reclaim_permitted:
             return None
-        if request.starved_seconds < _FIRST_PARTY_TEARDOWN_GRACE_SECONDS:
+        if request.lane_rung_grade is LaneRungGrade.AWAITING_GRADE:
+            return None
+        if (
+            request.lane_rung_grade is LaneRungGrade.NO_RUNG
+            and request.starved_seconds < _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
+        ):
             return None
         measured = self._measured(request, state)
         room = self._room(request, state, measured)
