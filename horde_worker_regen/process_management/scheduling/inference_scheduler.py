@@ -5440,7 +5440,12 @@ class InferenceScheduler:
 
         Under the clearance lease the dispatch only stages the job, so it is priced at the staging charge while
         clearance is expected inside the lease-acquire timeout (:func:`pricing.overlap_staging_charge_mb`).
-        Past that bound the staged child would sample unpriced, so the full price stands.
+        Past that bound the staged child would sample unpriced, so the full price stands. The duration term
+        assumes clearance comes once the running samplers retire; a candidate whose peak fails the static
+        retention fit (:meth:`_fits_beside_retained_residents`) gets no clearance then either, since the card
+        cannot hold it beside the sibling contexts and retained weights, and the timeout would release it to
+        sample unpriced on a card it cannot fit. Such a candidate is priced at its full delta, which the
+        arbiter withholds, and the idle lane waits for a job that fits.
         """
         if not self._budget_active():
             return None
@@ -5462,6 +5467,18 @@ class InferenceScheduler:
         baseline = self._model_metadata.get_baseline(candidate_job.model)
         resident_model_info = self._horde_model_map.root.get(candidate_job.model)
         resident_pid = resident_model_info.process_id if resident_model_info is not None else None
+        if staging_charge_mb is not None and resident_pid is not None:
+            target = self._process_map.get(resident_pid)
+            if target is not None and (
+                self._fits_beside_retained_residents(
+                    candidate_job,
+                    target=target,
+                    device_index=target_device_index,
+                    include_target_retained=False,
+                )
+                is False
+            ):
+                staging_charge_mb = None
         own_planned_mb = (
             0.0
             if resident_pid is None

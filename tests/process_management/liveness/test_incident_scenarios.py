@@ -155,6 +155,7 @@ from __future__ import annotations
 import itertools
 import random
 import statistics
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -188,8 +189,11 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_sampling_vram_mb,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    _MIN_OBSERVATIONS_FOR_MEASURED,
+    FootprintKey,
     FootprintStage,
     plausible_activation_ceiling_mb,
+    sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission import clearance as clearance_mod
 from horde_worker_regen.process_management.scheduling.admission import preload as preload_mod
@@ -5452,6 +5456,8 @@ _STAGING_UNMEASURED_JOBS = 2
 the second is dispatched before any job has reported a weight load, so the wait for clearance has no bound."""
 
 _LONG_SAMPLE_STEPS = 500
+_MEASURED_FLUX_SAMPLE_PEAK_MB = 12500.0
+"""A measured FLUX sampling peak (MB) that, margined, clears a 16 GB card alone but not beside a sibling context."""
 """Steps that put an SDXL megapixel sample well past the lease-acquire timeout once the overlap headway lets
 the next job in."""
 
@@ -5605,6 +5611,97 @@ async def test_y_a_job_behind_a_long_sample_stages_only_when_clearance_comes_bef
         f"{context}: the queued job was dispatched at {candidate_window.dispatched_at:.1f}s, after the long sample "
         f"ended at {long_window.sample_until:.1f}s, so it never staged in the sample's tail. {world.state_dump()}"
     )
+
+
+async def test_y_a_job_the_card_cannot_hold_beside_the_sibling_never_stages_behind_its_sample() -> None:
+    """A job whose peak fails the static fit beside the sibling's context and retained weights is never staged.
+
+    The staging charge assumes clearance comes once the running sample retires. For a job the card cannot hold
+    beside the sibling lane even then, clearance never comes, and the staged child would sample unpriced through
+    the lease-acquire timeout on a card it does not fit. The overlap gate prices such a job at its full delta,
+    the arbiter withholds it, and the idle lane runs it only once the card can hold it.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=_STAGING_LANES,
+        max_threads=_STAGING_LANES,
+        queue_depth=_STAGING_LANES,
+        closed_loop=True,
+        clearance_lease=True,
+        tail_overlap=True,
+        tick_seconds=_STAGING_TICK_SECONDS,
+    )
+    world.seed_resident(0, _SDXL, in_vram=False)
+    world.seed_resident(1, _FLUX, in_vram=False)
+    # The candidate's model has run here and measured its resident cost at its weights, below the seed, which
+    # retires its whole-card intent: a later job reaches the overlap gate rather than a sibling teardown.
+    world.job_tracker.record_model_inference_success(_FLUX.name)
+    flux_resident_key = FootprintKey(
+        model_baseline=str(_FLUX.baseline),
+        resolution_bucket=None,
+        platform=sys.platform,
+        stage=FootprintStage.RESIDENT,
+        checkpoint=_FLUX.name,
+    )
+    for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
+        world.footprint_store.observe_peak(flux_resident_key, _FLUX.weights_mb)
+    # Its measured sampling peak sits below the seed, so clearance (which prices the learned figure) can land
+    # once the card is the candidate's alone, while the static fit (which prices the seed) still denies the
+    # candidate beside a sibling context. The gap between the two pricers is what puts a job that fits the
+    # card alone onto the overlap gate beside a sampler it cannot share the card with.
+    candidate = _staging_job(_FLUX)
+    flux_sample_key = sampling_footprint_key(candidate, str(_FLUX.baseline), stage=FootprintStage.SAMPLE)
+    assert flux_sample_key is not None
+    for _ in range(_MIN_OBSERVATIONS_FOR_MEASURED):
+        world.footprint_store.observe_peak(flux_sample_key, _MEASURED_FLUX_SAMPLE_PEAK_MB)
+    flux_forecast = world.scheduler._forecast_streaming(_staging_job(_FLUX), str(_FLUX.baseline))
+    assert flux_forecast.measured_retires_whole_card_intent, (
+        f"precondition: the seeded measurement must retire the candidate's whole-card intent "
+        f"({flux_forecast}). {world.state_dump()}"
+    )
+    # The card measures a weight load for the staging duration term.
+    warm = _staging_job(_SDXL)
+    await world.pop(warm)
+    for _ in range(_STAGING_MAX_TICKS):
+        await world.step()
+        if world.completed_jobs >= 1:
+            break
+    assert world.completed_jobs == 1, world.state_dump()
+    sample = _staging_job(_SDXL, steps=_LONG_SAMPLE_STEPS)
+    # The candidate's seed peak fails the static fit beside the sibling's context whether or not the sibling's
+    # weights are evicted, so the retained-resident dispatch hold does not apply and only the overlap gate's
+    # price stands between the job and the card.
+    fit = world.scheduler._judged_retention_fit(
+        candidate,
+        target=world._process_map[1],
+        device_index=world._process_map[1].device_index,
+        include_target_retained=False,
+    )
+    assert fit is not None and not fit.granted and not fit.retained_residents_decide, (
+        f"precondition: the candidate must fail the static fit beside the sibling lane with or without its "
+        f"retained weights, or this row says nothing about a job clearance can never admit "
+        f"({fit.describe() if fit else 'unjudged'}). {world.state_dump()}"
+    )
+    await world.pop(sample)
+    await world.pop(candidate)
+    for _ in range(_STAGING_MAX_TICKS):
+        await world.step()
+        if world.completed_jobs >= 3:
+            break
+
+    context = "a job the card cannot hold beside the sibling lane, queued behind its sample"
+    sample_window = world.job_windows[str(sample.id_)]
+    candidate_window = world.job_windows.get(str(candidate.id_))
+    assert sample_window.sample_until is not None, world.state_dump()
+    assert candidate_window is None or candidate_window.dispatched_at >= sample_window.sample_until, (
+        f"{context}: the candidate was dispatched at {candidate_window.dispatched_at:.1f}s, inside the sibling "
+        f"sample that ended at {sample_window.sample_until:.1f}s. {world.state_dump()}"
+    )
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, so a job the "
+        f"card cannot hold was staged beside a sample on the strength of the duration term. {world.state_dump()}"
+    )
+    assert world.completed_jobs == 3, world.state_dump()
 
 
 async def test_y_defect_reinjection_staging_behind_a_long_sample_samples_unpriced(
