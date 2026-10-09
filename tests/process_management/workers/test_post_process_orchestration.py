@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import Pa
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
 from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
+from horde_worker_regen.process_management.scheduling.clearance_lease import ClearanceController, GrantState
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers import post_process_orchestrator as post_process_orchestrator_module
@@ -361,6 +362,60 @@ class TestStartPostProcessing:
         await process_manager.start_post_processing()
 
         assert job_info in process_manager._job_tracker.jobs_being_post_processed
+
+    @staticmethod
+    async def _chain_behind_a_dispatched_job(grant: GrantState) -> tuple[HordeWorkerProcessManager, HordeJobInfo]:
+        """A card that cannot hold the chain beside any sampling peak, one dispatched job, one pending chain.
+
+        The dispatched job's lane is registered with the card's clearance controller in ``grant``: IDLE is a
+        staged child waiting for clearance, CLEARED or SAMPLING a child the parent has released onto the card.
+        """
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        sampler = make_mock_process_info(
+            3, model_name="AlbedoBase XL (SDXL)", state=HordeProcessState.INFERENCE_PRIMED
+        )
+        process_manager._process_map.clear()
+        process_manager._process_map.update({3: sampler, 7: lane})
+        controller = ClearanceController(device_index=0, slot_cap=1, tail_overlap=False)
+        # The grant table is the controller's own state; a registered child reaches CLEARED only through a
+        # clearance step this row does not drive.
+        controller._grant_state[3] = grant
+        process_manager._clearance_controllers = {0: controller}
+        # The static card arithmetic admits on a card with no reported total; this row's card can hold the
+        # chain beside nothing but an idle lane.
+        process_manager._inference_scheduler.pp_sampling_coresidency_affordable = (  # type: ignore[method-assign]
+            lambda *, sampling_peak_mb, pp_reserve_mb, device_index=None: sampling_peak_mb is None
+        )
+        dispatched_job = make_job_pop_response(model="AlbedoBase XL (SDXL)")
+        await track_popped_job_async(process_manager._job_tracker, dispatched_job)
+        await process_manager._job_tracker.mark_inference_started(dispatched_job, device_index=None)
+        sampler.record_inference_ownership(dispatched_job, attempt_ordinal=1)
+        job_info = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+        return process_manager, job_info
+
+    async def test_a_chain_is_not_held_behind_a_staged_job_awaiting_clearance(self) -> None:
+        """A dispatched job whose lane holds no clearance grant does not price its peak against the chain.
+
+        Under the clearance lease that job's clearance waits for the pending chain to drain, so holding the
+        chain behind the job's sampling peak is a wait neither side ends until the child's lease-acquire
+        timeout samples unpriced. The chain runs first and the card is the job's once it finishes.
+        """
+        process_manager, job_info = await self._chain_behind_a_dispatched_job(GrantState.IDLE)
+
+        await process_manager.start_post_processing()
+
+        assert job_info in process_manager._job_tracker.jobs_being_post_processed
+
+    async def test_a_chain_is_held_behind_a_cleared_job(self) -> None:
+        """A dispatched job whose lane has been cleared holds the chain, as a sampling one does."""
+        process_manager, job_info = await self._chain_behind_a_dispatched_job(GrantState.CLEARED)
+
+        await process_manager.start_post_processing()
+
+        assert job_info in process_manager._job_tracker.jobs_pending_post_processing
+        assert str(job_info.sdk_api_job_info.id_) in process_manager._post_process_orchestrator._deferrals
 
     async def test_successful_dispatch_moves_job_and_sends_operations(self) -> None:
         """A successful dispatch moves the job to being-post-processed and sends images plus operations."""

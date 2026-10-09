@@ -246,6 +246,7 @@ from horde_worker_regen.process_management.scheduling import pool_ranker
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceController,
     ClearanceLeaseProxy,
+    GrantState,
     TailOverlapDenialReason,
     format_tail_overlap_tally,
 )
@@ -1873,7 +1874,9 @@ class HordeWorkerProcessManager:
             vram_actuator=self._inference_scheduler,
             sampling_coresidency_check=(
                 lambda pp_reserve_mb: self._inference_scheduler.pp_sampling_coresidency_affordable(
-                    sampling_peak_mb=self._inference_scheduler.max_in_progress_sampling_peak_mb(),
+                    sampling_peak_mb=self._inference_scheduler.max_in_progress_sampling_peak_mb(
+                        lane_holds_clearance=self._lane_holds_clearance,
+                    ),
                     pp_reserve_mb=pp_reserve_mb,
                 )
             ),
@@ -4285,6 +4288,18 @@ class HordeWorkerProcessManager:
         controller = self._clearance_controllers.get(device_index)
         if controller is not None:
             controller.register(process_id, proxy)
+
+    def _lane_holds_clearance(self, process_info: HordeProcessInfo) -> bool:
+        """Whether an inference lane has been cleared to materialise its job, or is sampling it.
+
+        Read from the card's clearance controller: a registered child holds a grant once cleared and keeps it
+        through its denoise loop. A card with no controller (the lease disabled or disarmed) materialises at
+        dispatch, so every dispatched lane holds the card there.
+        """
+        controller = self._clearance_controllers.get(process_info.device_index)
+        if controller is None:
+            return True
+        return controller.grant_state(process_info.process_id) is not GrantState.IDLE
 
     def _note_clearance_child_replaced(self, device_index: int, process_id: int) -> None:
         """Notify a card's clearance controller that an inference child was replaced or died.

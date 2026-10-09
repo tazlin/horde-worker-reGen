@@ -10097,17 +10097,33 @@ class InferenceScheduler:
             >= 0
         )
 
-    def max_in_progress_sampling_peak_mb(self) -> float | None:
+    def max_in_progress_sampling_peak_mb(
+        self,
+        *,
+        lane_holds_clearance: Callable[[HordeProcessInfo], bool] | None = None,
+    ) -> float | None:
         """The largest sampling peak (MB) among jobs currently in progress, or None when idle.
 
         Each job's static sampling peak is raised by any learned SAMPLE-stage watermark for its footprint before
         the maximum is taken, so the post-processing co-residency gate this feeds prices in-flight sampling from
         measured activation high-waters, not a seed the hardware has already overshot.
+
+        ``lane_holds_clearance`` says whether a job's lane has been cleared to materialise. A dispatched job
+        whose lane holds no clearance has only its encode working set on the card, and its clearance waits for
+        any pending post-processing chain to drain first, so charging its full peak here would hold that chain
+        behind a sample that cannot start until the chain is done: a wait neither side ends, which the child's
+        lease-acquire timeout breaks by sampling unpriced. Such a job contributes nothing; the measured
+        admission the chain takes next prices what the staged child actually holds. None charges every
+        in-progress job, the reading for a worker without the clearance lease.
         """
         peaks: list[float] = []
         for job in self._job_tracker.jobs_in_progress:
             if job.model is None:
                 continue
+            if lane_holds_clearance is not None:
+                lane = self._process_map.process_running_job(job)
+                if lane is not None and not lane_holds_clearance(lane):
+                    continue
             baseline = self._model_metadata.get_baseline(job.model)
             static_peak_mb = predict_job_sampling_vram_mb(job, baseline)
             if static_peak_mb is None:
