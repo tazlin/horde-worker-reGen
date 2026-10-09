@@ -1153,3 +1153,28 @@ async def test_an_idle_lane_holding_components_is_charged_as_a_tenant() -> None:
     assert (
         scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
     )
+
+
+async def test_retains_the_model_a_held_whole_card_residency_advertises() -> None:
+    """Under a held residency for the model, retention needs neither repeat evidence nor the static seed fit.
+
+    The residency advertises the model alone, so the slot's next job is that model by construction, and the job
+    that just ran on the whole card is the fit; refusing would re-upload a card-sized checkpoint before every job.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model="a-whole-card-model")
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    ), "control: with no residency and no repeat evidence the grant is refused"
+
+    scheduler._whole_card_ledger.record_grant(
+        None, model="a-whole-card-model", forecast=None, cooldown_until=0.0, now=0.0
+    )
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )

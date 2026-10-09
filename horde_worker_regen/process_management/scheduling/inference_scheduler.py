@@ -9581,7 +9581,18 @@ class InferenceScheduler:
                 RetentionDenialReason.GOVERNOR_STATE,
                 f"governor: card {governor_state.value} (the reclaim ladder holds priority over new residents)",
             )
-        if not self._retention.slot_has_repeat_evidence(process_with_model.process_id, model):
+        held, holder_device = self._whole_card_ledger.holder_for_model(model)
+        residency_names_model = held and (
+            holder_device is None or device_index is None or holder_device == device_index
+        )
+        # A held residency advertises this model alone, so the slot's next job is this model by construction:
+        # that is the repeat evidence, from the first job. The static fit still applies, since a checkpoint
+        # whose encoders and weights together exceed the card is not helped by keeping its weights: the
+        # encoder then runs offloaded and the backend evicts part of the retained copy to seat it, which costs
+        # more than the re-upload the grant would save.
+        if not residency_names_model and not self._retention.slot_has_repeat_evidence(
+            process_with_model.process_id, model
+        ):
             return self._deny_retention(
                 model,
                 process_with_model,
