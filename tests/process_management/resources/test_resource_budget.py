@@ -176,6 +176,18 @@ class TestCommittedReserveLedger:
         assert ledger.effective_planned_vram_mb_for_flow("post_process", {}, target_process_ids={3}) == 0.0
         assert ledger.effective_planned_vram_mb_for_flow("post_process", {}, target_process_ids={7}) == 2000.0
 
+    def test_outstanding_planned_units_name_each_booking_behind_the_overlay(self) -> None:
+        """The overlay's breakdown lists each unit still outstanding on the named card, read-only."""
+        ledger = CommittedReserveLedger()
+        ledger.set_planned("dispatch", "job-a", vram_mb=4000.0, target_process_id=3, reserved_at_admit_mb=1000.0)
+        ledger.set_planned("dispatch", "job-b", vram_mb=2000.0, target_process_id=4, reserved_at_admit_mb=0.0)
+        ledger.set_planned("preload", "job-c", vram_mb=1000.0, target_process_id=9, reserved_at_admit_mb=0.0)
+
+        rows = ledger.outstanding_planned_units({3: 2500.0, 4: 2500.0}, target_process_ids={3, 4})
+
+        assert rows == [("dispatch", "job-a", 3, 2500.0)]
+        assert ledger.effective_planned_vram_mb({3: 1000.0, 4: 0.0, 9: 0.0}) == 7000.0
+
     def test_a_booked_post_process_chain_is_a_planned_charge_on_its_lane(self) -> None:
         """The chain is subtracted by the admission overlay from the moment it is booked, and released with it."""
         from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW

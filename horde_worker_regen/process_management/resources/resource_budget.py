@@ -1763,6 +1763,26 @@ class CommittedReserveLedger:
             total += max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
         return total
 
+    def outstanding_planned_units(
+        self,
+        process_reserved_by_pid: dict[int, float],
+        *,
+        target_process_ids: Collection[int] | None = None,
+    ) -> list[tuple[str, str, int, float]]:
+        """Each planned unit still outstanding, as ``(flow, unit, target process, outstanding MB)``.
+
+        The breakdown of :meth:`effective_planned_vram_mb`, read-only like :meth:`planned_charge_for_unit`, so a
+        refusal can name which bookings make up the overlay it was priced against.
+        """
+        rows: list[tuple[str, str, int, float]] = []
+        for (flow, unit), entry in self._planned.items():
+            if target_process_ids is not None and entry.target_process_id not in target_process_ids:
+                continue
+            outstanding = max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
+            if outstanding > 0.0:
+                rows.append((flow, unit, entry.target_process_id, outstanding))
+        return rows
+
     def set_planned_ram(
         self,
         flow: str,

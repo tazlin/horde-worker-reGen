@@ -6269,11 +6269,27 @@ class InferenceScheduler:
             staged = process_info.process_reserved_mb if process_info is not None else None
             staged_note = "unreported" if staged is None else f"{staged:.0f}MB"
             reclaim = ", ".join(command.kind.value for command in actuations) or "none"
+            device_index = process_info.device_index if process_info is not None else None
+            # Each booking behind the outstanding figure, with its target's latest reported reservation, so a
+            # charge still standing beside an allocation it should have decayed against is visible.
+            reserved_by_pid = self._process_map.reserved_by_pid(device_index)
+            units = self._reserve_ledger.outstanding_planned_units(
+                reserved_by_pid,
+                target_process_ids=self._process_ids_on_card(device_index),
+            )
+            composition = (
+                ", ".join(
+                    f"{flow}:{unit[:8]}@p{target} {mb:.0f}MB (reports {reserved_by_pid.get(target, 0.0):.0f}MB)"
+                    for flow, unit, target, mb in units
+                )
+                or "none"
+            )
             detail = (
                 f"candidate {candidate} (child already holds {staged_note}) vs device free {free}, "
                 f"available {avail}, reserve {self._vram_budget.reserve_mb:.0f}MB, "
                 f"outstanding reservations {measured.outstanding_reservations_mb:.0f}MB, "
-                f"noise buffer {measured.noise_buffer_mb:.0f}MB; reclaim run: {reclaim}"
+                f"noise buffer {measured.noise_buffer_mb:.0f}MB; reclaim run: {reclaim}; "
+                f"outstanding by unit: {composition}"
             )
         else:
             detail = "post-processing co-residency mutex held the card for an in-flight or pending chain"
