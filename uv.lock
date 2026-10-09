@@ -693,7 +693,7 @@ name = "cuda-bindings"
 version = "13.4.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-pathfinder" },
+    { name = "cuda-pathfinder", marker = "extra == 'extra-18-horde-worker-regen-cu130' or extra == 'extra-18-horde-worker-regen-cu132' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra != 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu126')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/65/11/1293429c1c3a3e19b551275e65efddd122a905bbe7e368816a59f3ef2a41/cuda_bindings-13.4.3-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:bfbd3f7d4ac04dd41dc49121b9e408c8283992f47124c2290ecb79bbbadcca8e", size = 6488226, upload-time = "2026-09-23T02:22:00.578Z" },
@@ -1177,7 +1177,7 @@ wheels = [
 
 [[package]]
 name = "horde-engine"
-version = "7.9.0"
+version = "7.10.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1243,9 +1243,9 @@ dependencies = [
     { name = "yapf" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/21/72/1faa384936ed0548f9a650015560bb33d1efa3e19db8ba03f04e4744a8c1/horde_engine-7.9.0.tar.gz", hash = "sha256:4d76dce8bab35e9c8bfb4ad332d7385070d239b438f454dd314e4909f7e4d23f", size = 617695, upload-time = "2026-10-06T04:12:51.571Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/83/21/e091fa5b698205b2bc1c95a91cc11bb357f80a9afbd921f58d864f3cd3d0/horde_engine-7.10.1.tar.gz", hash = "sha256:d7df03c902f1d349001241b8c3e0661ce0cd057cce123f37f4f35499595b19a2", size = 632166, upload-time = "2026-10-09T22:10:19.877Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f4/f3/524186b7ff9131cf550153e80916a1ad7a51323111d9db30db53b4807552/horde_engine-7.9.0-py3-none-any.whl", hash = "sha256:7076f74d40f40092e1e4205d48b12990728e4cf28e3134fedf16f9a3b006666d", size = 764229, upload-time = "2026-10-06T04:12:49.684Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/ec/6000330959c36547edac3c90c355de0f7b5640fc4d440f3898db87e7a650/horde_engine-7.10.1-py3-none-any.whl", hash = "sha256:5db4432efc8002a6810e169e88c99a1ae34c86cd558a3a7cfb82badfe1f5dcfe", size = 778949, upload-time = "2026-10-09T22:10:17.684Z" },
 ]
 
 [package.optional-dependencies]
@@ -1462,7 +1462,7 @@ requires-dist = [
     { name = "blurhash", specifier = ">=1.1.5" },
     { name = "certifi" },
     { name = "horde-engine", extras = ["controlnet"], marker = "extra == 'controlnet'" },
-    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=7.9.0,<8.0.0" },
+    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=7.10.1,<8.0.0" },
     { name = "horde-engine", extras = ["rembg"], marker = "extra == 'post-processing'" },
     { name = "horde-image-utilities", specifier = "~=0.3.2" },
     { name = "horde-model-reference", specifier = ">=8.5.3,<9.0.0" },
@@ -2609,7 +2609,7 @@ name = "nvidia-cufft"
 version = "12.0.0.61"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink" },
+    { name = "nvidia-nvjitlink", marker = "extra == 'extra-18-horde-worker-regen-cu130' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132') or (extra != 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu126' and extra != 'extra-18-horde-worker-regen-cu132')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8b/ae/f417a75c0259e85c1d2f83ca4e960289a5f814ed0cea74d18c353d3e989d/nvidia_cufft-12.0.0.61-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:2708c852ef8cd89d1d2068bdbece0aa188813a0c934db3779b9b1faa8442e5f5", size = 214053554, upload-time = "2025-09-04T08:31:38.196Z" },
@@ -2709,9 +2709,9 @@ name = "nvidia-cusolver"
 version = "12.0.4.66"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas", version = "13.1.1.3", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-cusparse", version = "12.6.3.3", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-nvjitlink" },
+    { name = "nvidia-cublas", version = "13.1.1.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-18-horde-worker-regen-cu130' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132') or (extra != 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu126' and extra != 'extra-18-horde-worker-regen-cu132')" },
+    { name = "nvidia-cusparse", version = "12.6.3.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-18-horde-worker-regen-cu130' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132') or (extra != 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu126' and extra != 'extra-18-horde-worker-regen-cu132')" },
+    { name = "nvidia-nvjitlink", marker = "extra == 'extra-18-horde-worker-regen-cu130' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132') or (extra != 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu126' and extra != 'extra-18-horde-worker-regen-cu132')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/c3/b30c9e935fc01e3da443ec0116ed1b2a009bb867f5324d3f2d7e533e776b/nvidia_cusolver-12.0.4.66-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:02c2457eaa9e39de20f880f4bd8820e6a1cfb9f9a34f820eb12a155aa5bc92d2", size = 223467760, upload-time = "2025-09-04T08:33:04.222Z" },
@@ -2756,7 +2756,7 @@ name = "nvidia-cusparse"
 version = "12.6.3.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink" },
+    { name = "nvidia-nvjitlink", marker = "extra == 'extra-18-horde-worker-regen-cu130' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132') or (extra != 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu126' and extra != 'extra-18-horde-worker-regen-cu132')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f8/94/5c26f33738ae35276672f12615a64bd008ed5be6d1ebcb23579285d960a9/nvidia_cusparse-12.6.3.3-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:80bcc4662f23f1054ee334a15c72b8940402975e0eab63178fc7e670aa59472c", size = 162155568, upload-time = "2025-09-04T08:33:42.864Z" },
@@ -3524,7 +3524,7 @@ name = "pyobjc-framework-cocoa"
 version = "12.2.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core" },
+    { name = "pyobjc-core", marker = "extra == 'extra-18-horde-worker-regen-cu126' or extra == 'extra-18-horde-worker-regen-cu130' or extra == 'extra-18-horde-worker-regen-cu132' or extra != 'extra-18-horde-worker-regen-cpu'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/75/76/49c6da2c6a831020b4854ba20079d5a1030474bffc776b7b73c2eeff8c15/pyobjc_framework_cocoa-12.2.2.tar.gz", hash = "sha256:c96c0ef69a71afbbb0e6a7d594b455c5fe47d62e0db376ee7a2b4b828c16ace9", size = 3132831, upload-time = "2026-08-11T19:44:02.288Z" }
 wheels = [
@@ -3536,8 +3536,8 @@ name = "pyobjc-framework-quartz"
 version = "12.2.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core" },
-    { name = "pyobjc-framework-cocoa" },
+    { name = "pyobjc-core", marker = "extra == 'extra-18-horde-worker-regen-cu126' or extra == 'extra-18-horde-worker-regen-cu130' or extra == 'extra-18-horde-worker-regen-cu132' or extra != 'extra-18-horde-worker-regen-cpu'" },
+    { name = "pyobjc-framework-cocoa", marker = "extra == 'extra-18-horde-worker-regen-cu126' or extra == 'extra-18-horde-worker-regen-cu130' or extra == 'extra-18-horde-worker-regen-cu132' or extra != 'extra-18-horde-worker-regen-cpu'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/35/b1/426a37c7ae37280b3ffca2571fb48f211946aee2f4ca31a603ed1943c4a7/pyobjc_framework_quartz-12.2.2.tar.gz", hash = "sha256:810f97b210cfd93704d240860286dfd6df09f9f1c52525fc5c2166723aea3f9e", size = 3218295, upload-time = "2026-08-11T19:45:15.189Z" }
 wheels = [
@@ -3595,10 +3595,10 @@ name = "pystray"
 version = "0.19.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pillow" },
-    { name = "pyobjc-framework-quartz", marker = "sys_platform == 'darwin' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132')" },
+    { name = "pillow", marker = "sys_platform != 'darwin' or extra != 'extra-18-horde-worker-regen-cpu' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu132')" },
+    { name = "pyobjc-framework-quartz", marker = "(sys_platform == 'darwin' and extra != 'extra-18-horde-worker-regen-cpu') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu132')" },
     { name = "python-xlib", marker = "sys_platform == 'linux' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132')" },
-    { name = "six" },
+    { name = "six", marker = "sys_platform != 'darwin' or extra != 'extra-18-horde-worker-regen-cpu' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu132')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5c/64/927a4b9024196a4799eba0180e0ca31568426f258a4a5c90f87a97f51d28/pystray-0.19.5-py2.py3-none-any.whl", hash = "sha256:a0c2229d02cf87207297c22d86ffc57c86c227517b038c0d3c59df79295ac617", size = 49068, upload-time = "2023-09-17T13:44:26.872Z" },
@@ -3710,7 +3710,7 @@ name = "python-xlib"
 version = "0.33"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "six" },
+    { name = "six", marker = "sys_platform != 'darwin' or extra != 'extra-18-horde-worker-regen-cpu' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu132')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/86/f5/8c0653e5bb54e0cbdfe27bf32d41f27bc4e12faa8742778c17f2a71be2c0/python-xlib-0.33.tar.gz", hash = "sha256:55af7906a2c75ce6cb280a584776080602444f75815a7aff4d287bb2d7018b32", size = 269068, upload-time = "2022-12-25T18:53:00.824Z" }
 wheels = [
