@@ -8557,6 +8557,15 @@ class InferenceScheduler:
         The priority tiers the selection loops honour are not bypassed: a job filtered by quarantine, auxiliary
         preparation, degraded-retry isolation, or in-progress status is never a candidate, so a reorder can only
         promote a job that was already eligible to be placed.
+
+        A job for the model a held whole-card residency is for is a candidate on any free slot holding that model,
+        retained or only staged in RAM (:meth:`_residency_reorder_resident`). Serving the head there first unloads
+        the residency's model between two of its own jobs, so the next one pays a full reload and a second
+        teardown. Such a job skips the free-win test, which the residency fails by construction (its teardown
+        leaves the head no other lane), and is bounded instead by the head's ttl: it is promoted only while the
+        head would still start within the anti-starvation share of its ttl after the expected sampling of every
+        job promoted ahead of it. A job with no expected sampling time is not promoted, since its cost to the
+        head cannot be foreseen.
         """
         if head_job is None or head_job.model is None:
             return []
@@ -8577,6 +8586,7 @@ class InferenceScheduler:
         in_progress = self._job_tracker.jobs_in_progress
         candidates: list[tuple[ImageGenerateJobPopResponse, HordeProcessInfo]] = []
         rejections: list[str] = []
+        residency_promoted_seconds = 0.0
         for job in self._job_tracker.jobs_pending_inference:
             if job is head_job or job.model is None or job.model == head_job.model:
                 rejections.append(f"{job.model}: head/same-model")
@@ -8590,6 +8600,18 @@ class InferenceScheduler:
                 continue
             if self._process_lifecycle.is_model_load_quarantined(job.model):
                 rejections.append(f"{job.model}: quarantined")
+                continue
+            residency_resident = self._residency_reorder_resident(job)
+            if residency_resident is not None:
+                expected_seconds = self._expected_sampling_seconds(job, self._model_metadata.get_baseline(job.model))
+                if expected_seconds is None:
+                    rejections.append(f"{job.model}: residency reorder has no expected sampling time")
+                    continue
+                if not self._head_starts_within_ttl_share(head_job, residency_promoted_seconds + expected_seconds):
+                    rejections.append(f"{job.model}: residency reorder would start the head past its ttl share")
+                    continue
+                residency_promoted_seconds += expected_seconds
+                candidates.append((job, residency_resident))
                 continue
             resident = self.resident_process_for_job(job, include_reserved=True)
             if resident is None or resident.retained_resident_model != job.model:
@@ -8613,6 +8635,35 @@ class InferenceScheduler:
         if not candidates and rejections:
             self._trace_empty_affinity_scan("; ".join(rejections), head_job)
         return candidates
+
+    def _residency_reorder_resident(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
+        """The free slot on a held whole-card residency's card that holds ``job``'s model, or None.
+
+        None unless a residency is held for ``job``'s model, so only that model's own queued jobs qualify.
+        """
+        found, residency_device = self._whole_card_ledger.holder_for_model(job.model)
+        if not found:
+            return None
+        resident = self.resident_process_for_job(job, include_reserved=True)
+        if resident is None or not resident.can_accept_job():
+            return None
+        if residency_device is not None and resident.device_index != residency_device:
+            return None
+        return resident
+
+    def _head_starts_within_ttl_share(self, head_job: ImageGenerateJobPopResponse, promoted_seconds: float) -> bool:
+        """Whether ``head_job`` still starts inside the anti-starvation share of its ttl after ``promoted_seconds``.
+
+        The same bound :meth:`_head_aged_past_anti_starvation` applies to the head's age now, applied to the age
+        it would have once the promoted jobs have sampled.
+        """
+        tracked = self._job_tracker.get_tracked_job(head_job.id_) if head_job.id_ is not None else None
+        return not head_aged_past_anti_starvation(
+            now=self._clock() + promoted_seconds,
+            popped_at=tracked.time_popped if tracked is not None else None,
+            ttl=float(head_job.ttl) if head_job.ttl is not None else None,
+            fallback_ttl=self._state.recent_job_ttl,
+        )
 
     def _reorder_is_pareto_admissible(
         self,

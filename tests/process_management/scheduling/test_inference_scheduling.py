@@ -49,6 +49,7 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
 )
 from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
     _AFFINITY_MAX_SKIPS,
+    ANTI_STARVATION_TTL_FRACTION,
     AffinitySkipState,
     record_affinity_skip,
 )
@@ -2819,6 +2820,87 @@ def _large_and_small_cards() -> dict[int, CardRuntime]:
         **make_test_card_runtimes(device_indices=(0,), config=_per_card_config(max_pixels=4_194_304)),
         **make_test_card_runtimes(device_indices=(1,), config=_per_card_config(max_pixels=262_144)),
     }
+
+
+class TestWholeCardResidencyPlacement:
+    """A held whole-card residency's queued jobs are placed ahead of a head for another model, within its ttl.
+
+    Swapping the residency's model out for a foreign head between two of its own jobs pays a full reload and a
+    second teardown for the next one. The head's ttl is on the job, so the reorder is taken only where the head
+    still starts inside the anti-starvation share of it after the promoted jobs' expected sampling.
+    """
+
+    _TTL_SECONDS = 150.0
+    _EXPECTED_SAMPLING_SECONDS = 10.0
+
+    async def _worker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        residency_held: bool = True,
+        expected_seconds: float | None = _EXPECTED_SAMPLING_SECONDS,
+        head_age_seconds: float = 0.0,
+    ) -> tuple[InferenceScheduler, dict[int, HordeProcessInfo], JobTracker]:
+        """Lane 1, the residency's only lane, holds its model in RAM with no retention grant and no work running.
+
+        That is the card between two of the residency's jobs: its siblings were stopped, so the cold head can
+        only load onto the lane the residency's next job is about to run on.
+        """
+        fixture = TestRetentionPlacementProtection()
+        scheduler, processes, tracker = await fixture._worker(spare_lane=False, cap_spent=False, retain=False)
+        if residency_held:
+            scheduler._whole_card_ledger.state_for(None).model = TestRetentionPlacementProtection._RETAINED_MODEL
+        scheduler._state.recent_job_ttl = self._TTL_SECONDS
+        monkeypatch.setattr(scheduler, "_expected_sampling_seconds", lambda _job, _baseline: expected_seconds)
+        head = tracker.jobs_pending_inference[0]
+        assert head.id_ is not None
+        tracked = tracker.get_tracked_job(head.id_)
+        assert tracked is not None and tracked.time_popped is not None
+        tracked.time_popped -= head_age_seconds
+        return scheduler, processes, tracker
+
+    async def test_the_residency_job_is_placed_ahead_and_its_lane_is_not_loaded_over(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The residency's queued job goes first, so the head's load does not evict the model it is about to run."""
+        scheduler, processes, _tracker = await self._worker(monkeypatch)
+
+        assert scheduler.pending_inference_in_placement_order()[0].model == (
+            TestRetentionPlacementProtection._RETAINED_MODEL
+        )
+        scheduler.preload_models()
+        assert processes[1].last_control_flag != HordeControlFlag.PRELOAD_MODEL, (
+            "the head's load was sent over the lane holding the residency's model"
+        )
+
+    async def test_a_head_that_would_start_past_its_ttl_share_keeps_its_place(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A head young enough to pass the age check, but not with the promoted job's sampling added, goes first."""
+        bound_seconds = ANTI_STARVATION_TTL_FRACTION * self._TTL_SECONDS
+        scheduler, _processes, _tracker = await self._worker(
+            monkeypatch,
+            head_age_seconds=bound_seconds - self._EXPECTED_SAMPLING_SECONDS / 2,
+        )
+
+        head_model = TestRetentionPlacementProtection._HEAD_MODEL
+        assert scheduler.pending_inference_in_placement_order()[0].model == head_model
+
+    async def test_an_unforeseeable_job_is_not_promoted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without an expected sampling time the reorder's cost to the head cannot be foreseen, so none is taken."""
+        scheduler, _processes, _tracker = await self._worker(monkeypatch, expected_seconds=None)
+
+        head_model = TestRetentionPlacementProtection._HEAD_MODEL
+        assert scheduler.pending_inference_in_placement_order()[0].model == head_model
+
+    async def test_without_a_residency_a_ram_held_model_is_not_promoted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Outside a whole-card residency the strict-priority rule for an unretained lane is unchanged."""
+        scheduler, _processes, _tracker = await self._worker(monkeypatch, residency_held=False)
+
+        head_model = TestRetentionPlacementProtection._HEAD_MODEL
+        assert scheduler.pending_inference_in_placement_order()[0].model == head_model
 
 
 class TestCardAwareResidencyGate:

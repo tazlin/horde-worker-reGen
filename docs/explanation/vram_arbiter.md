@@ -1309,6 +1309,17 @@ refusals are counted in `_retention_reorder_pareto_vetoes`. The gate is delibera
 worker whose retainer is the one idle lane, which is where line-skipping would risk job aging for the least
 benefit; the win belongs to pools wide enough to stage the head's load elsewhere.
 
+A held whole-card residency is the exception. Its teardown stops the siblings, so the residency's lane is the
+head's only target by construction and the free-win test can never pass, while serving a foreign head between
+two of the residency's own jobs unloads its model and makes the next one pay a full reload and a second
+teardown. `_retention_affinity_candidates` therefore promotes a queued job for the residency's model on any
+free slot holding that model, retained or only staged in RAM (`_residency_reorder_resident`), and bounds it by
+the head's own ttl in place of the free-win test. The ttl is the one the horde attached to the job, else the most
+recent ttl the worker saw. `_head_starts_within_ttl_share` applies the anti-starvation bound
+(`ANTI_STARVATION_TTL_FRACTION` of the ttl) to the age the head would have once every job promoted ahead of it has
+sampled for its expected time, and a job with no expected sampling time is not promoted, since its cost to the
+head cannot be foreseen. The skip ceiling and the head's current-age check still apply.
+
 Candidacy locates the retainer with `include_reserved=True`. A disaggregation-pinned sampler lane is a lane no
 job may be dispatched onto *yet*, and it is still a lane carrying weights: the pin is taken when a job is
 registered on the lane and released when its sampling ends, and for much of that the lane sits idle awaiting its
