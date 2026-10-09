@@ -3361,3 +3361,455 @@ class TestModelEconomics:
     def test_no_submitted_job_emits_nothing(self, tmp_path: Path) -> None:
         """A session that sent nothing back has no table to show."""
         assert "model_economics" not in _diagnose(tmp_path, _o2_log())
+
+
+_LIFECYCLE_SITE = "horde_worker_regen.process_management.lifecycle.process_lifecycle"
+_DISPATCHER_SITE = "horde_worker_regen.process_management.ipc.message_dispatcher"
+
+
+def _session_start() -> str:
+    return f"2026-06-24 18:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}"
+
+
+def _lane_context_fault(ts: str, *, process: int = 2, model: str = "Anima-Turbo-v1.1") -> str:
+    """process_lifecycle.record_inference_lane_outcome: a CUDA runtime error flagging its process."""
+    return (
+        f"2026-06-24 {ts} | WARNING  | {_LIFECYCLE_SITE}:record_inference_lane_outcome:4655 - "
+        f"Inference process {process} failed a job on {model} with a CUDA runtime error and will be replaced."
+    )
+
+
+def _lane_fault_streak(ts: str, *, process: int = 2, resource_faults: int = 2) -> str:
+    """process_lifecycle.record_inference_lane_outcome: a fault streak across several models."""
+    return (
+        f"2026-06-24 {ts} | WARNING  | {_LIFECYCLE_SITE}:record_inference_lane_outcome:4665 - "
+        f"Inference process {process} faulted 3 jobs in a row across 2 models (AbsoluteReality, Flux.1-Schnell fp8 "
+        f"(Compact)), {resource_faults} of them resource/OOM faults, and will be replaced."
+    )
+
+
+def _slot_quarantined(ts: str, *, slot: int = 2, reason: str = "crash loop: 4 replacements within 300s") -> str:
+    """process_lifecycle._quarantine_inference_slot: an inference slot taken out of the pool."""
+    return (
+        f"2026-06-24 {ts} | CRITICAL | {_LIFECYCLE_SITE}:_quarantine_inference_slot:4756 - "
+        f"Inference slot {slot} quarantined ({reason}); not respawning it."
+    )
+
+
+def _commit_exhausted(ts: str) -> str:
+    """executor.execute_governance_actions: the RAM governor pausing intake on a commit-bound host."""
+    return (
+        f"2026-06-24 {ts} | WARNING  | horde_worker_regen.process_management.scheduling.admission.executor:"
+        "execute_governance_actions:231 - System RAM below the danger floor (available 3739 MB (commit-bound; "
+        "physical 6097 MB) below danger floor 4582 MB); pausing job pops for 30s and shedding idle footprint so the "
+        "host is not driven into an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers."
+    )
+
+
+def _supervisor_dropped(ts: str) -> str:
+    """process_manager._drop_closed_supervisor: the parent dropping a closed supervisor channel."""
+    return (
+        f"2026-06-24 {ts} | WARNING  | horde_worker_regen.process_management.process_manager:"
+        "_drop_closed_supervisor:6750 - The supervisor channel closed. The worker keeps running without reporting "
+        "liveness or state to its supervisor."
+    )
+
+
+def _oom_fault(ts: str, *, process: int, runtime_error: bool = True, model: str = "Anima-Turbo-v1.1") -> str:
+    """message_dispatcher._handle_faulted_inference_result: an out-of-memory fault on a named process."""
+    error = (
+        "torch.AcceleratorError: CUDA error: out of memory"
+        if runtime_error
+        else "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 30.00 MiB."
+    )
+    return (
+        f"2026-06-24 {ts} | ERROR    | {_DISPATCHER_SITE}:_handle_faulted_inference_result:1990 - "
+        f"Job c0d7c4c8-c1fd-4082-b295-6dbb345f3e45 faulted on process {process}: RuntimeError: Pipeline failed to "
+        f"run - declared output node(s) ['output_image'] produced no results. Model: {model}. Error: sampler "
+        f"(KSampler): {error}"
+    )
+
+
+def _job_finished(ts: str, *, process: int) -> str:
+    """message_dispatcher._handle_inference_result: a process completing a generation."""
+    return (
+        f"2026-06-24 {ts} | INFO     | {_DISPATCHER_SITE}:_handle_inference_result:1709 - Inference finished for "
+        f"job 7c9bb27c (Anima-Turbo-v1.1) on process {process}. It took 13.62 seconds, finishing at 1.21 "
+        "iterations per second and reported 1 faults."
+    )
+
+
+def _replaced(ts: str, pid: int, cause: str) -> str:
+    """The parent's recovery diagnostic for an inference process replaced for ``cause``."""
+    return _recovery(ts, pid, reason=f"inference process replaced ({cause})", last_state="WAITING_FOR_JOB")
+
+
+def _lane_log(*lines: str) -> str:
+    return "\n".join([_session_start(), *lines])
+
+
+class TestInferenceLaneReplaced:
+    """Image processes replaced for a CUDA runtime error or a fault streak."""
+
+    def test_a_context_fault_right_after_commit_ran_out_is_the_host_condition(self, tmp_path: Path) -> None:
+        """The worker recovered on its own, so the reader is not sent to report it."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(_commit_exhausted("18:10:00.000"), _lane_context_fault("18:10:20.000")),
+        )
+        finding = findings["inference_lane_replaced"]
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == "The worker replaced image process 2 once after a CUDA error."
+        assert "recovered on its own" in finding.action
+        assert "horde-log bundle" not in finding.action
+        assert any(line.startswith("host commit ran out 20s before") for line in finding.evidence)
+
+    def test_a_context_fault_without_memory_pressure_is_a_defect(self, tmp_path: Path) -> None:
+        """A commit exhaustion more than a minute earlier does not explain the error."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(_commit_exhausted("18:10:00.000"), _lane_context_fault("18:12:00.000")),
+        )
+        finding = findings["inference_lane_replaced"]
+        assert "worker or driver defect" in finding.action
+        assert "`horde-log bundle`" in finding.action
+        assert any(line.startswith("no host commit exhaustion") for line in finding.evidence)
+
+    def test_repeated_context_faults_are_a_defect_even_after_commit_ran_out(self, tmp_path: Path) -> None:
+        """One process breaking twice is not a one-off host condition."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _commit_exhausted("18:10:00.000"),
+                _lane_context_fault("18:10:10.000"),
+                _commit_exhausted("18:20:00.000"),
+                _lane_context_fault("18:20:10.000"),
+            ),
+        )
+        finding = findings["inference_lane_replaced"]
+        assert finding.headline == "The worker replaced image process 2 2 times after a CUDA error."
+        assert "worker or driver defect" in finding.action
+
+    def test_a_fault_streak_names_the_process_as_the_common_cause(self, tmp_path: Path) -> None:
+        """A streak across models points at the process and asks for a bundle."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(_lane_fault_streak("18:10:00.000", process=3), _lane_context_fault("18:11:00.000")),
+        )
+        finding = findings["inference_lane_replaced"]
+        assert finding.headline == (
+            "The worker replaced image processes 2 and 3 once after a CUDA error and once after failing jobs on "
+            "several models."
+        )
+        assert "common cause" in finding.action
+        assert finding.action.endswith("Report it with `horde-log bundle`.")
+
+    def test_silent_without_a_replacement_line(self, tmp_path: Path) -> None:
+        """A plain crash recovery is the crash findings' business."""
+        findings = _diagnose(tmp_path, _lane_log(_replaced("18:10:00.000", 2, "crashed or hung")))
+        assert "inference_lane_replaced" not in findings
+
+
+class TestInferenceSlotQuarantined:
+    """A slot taken out of service, with the replacements that led there."""
+
+    def test_a_crash_loop_driven_by_lane_replacements_asks_for_a_bundle(self, tmp_path: Path) -> None:
+        """The replacement reasons in the window name the CUDA errors behind the crash loop."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _lane_context_fault("18:10:00.000"),
+                _replaced("18:10:01.000", 2, "CUDA context fault"),
+                _lane_fault_streak("18:11:00.000", resource_faults=0),
+                _replaced("18:11:01.000", 2, "fault streak: 3 consecutive faults across 2 models"),
+                _lane_context_fault("18:12:00.000"),
+                _recovery(
+                    "18:12:01.000",
+                    2,
+                    reason="inference slot quarantined (crash loop: 4 replacements within 300s)",
+                    last_state="WAITING_FOR_JOB",
+                ),
+                _slot_quarantined("18:12:01.500"),
+            ),
+        )
+        finding = findings["inference_slot_quarantined"]
+        assert finding.severity is Severity.CRITICAL
+        assert finding.headline == (
+            'Image process 2 was taken out of service for "crash loop: 4 replacements within 300s".'
+        )
+        assert "replacement of process 2: inference process replaced (CUDA context fault)" in finding.evidence
+        assert "`horde-log bundle`" in finding.action
+        assert "lane_fault_rule_misfire" not in findings
+
+    def test_a_quarantine_with_only_crash_reasons_fires_without_the_misfire(self, tmp_path: Path) -> None:
+        """Plain crashes fill the window, so neither the bundle request nor the trade-off finding follows."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _commit_exhausted("18:09:50.000"),
+                _replaced("18:10:00.000", 2, "crashed or hung"),
+                _replaced("18:11:00.000", 2, "crashed or hung"),
+                _slot_quarantined("18:12:00.000"),
+            ),
+        )
+        finding = findings["inference_slot_quarantined"]
+        assert "horde-log bundle" not in finding.action
+        assert "lane_fault_rule_misfire" not in findings
+
+    def test_replacements_outside_the_window_are_not_listed(self, tmp_path: Path) -> None:
+        """A replacement more than five minutes before the quarantine did not count toward it."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(_replaced("18:00:30.000", 2, "CUDA context fault"), _slot_quarantined("18:12:00.000")),
+        )
+        finding = findings["inference_slot_quarantined"]
+        assert not any("CUDA context fault" in line for line in finding.evidence)
+        assert "horde-log bundle" not in finding.action
+
+
+class TestLaneFaultRuleMisfire:
+    """The two lane-replacement trade-offs a maintainer wants operator reports to reveal."""
+
+    def test_a_resource_streak_whose_process_faults_again_fires(self, tmp_path: Path) -> None:
+        """Mostly out-of-memory faults and a fresh fault after the replacement read as card pressure."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _lane_fault_streak("18:10:00.000", resource_faults=2),
+                _replaced("18:10:01.000", 2, "fault streak: 3 consecutive faults across 2 models"),
+                _oom_fault("18:14:00.000", process=2, runtime_error=False),
+            ),
+        )
+        finding = findings["lane_fault_rule_misfire"]
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "Image process 2 was replaced for mostly out-of-memory faults and failed again afterwards."
+        )
+        assert "`horde-log bundle`" in finding.action
+        assert any(line.startswith("failed again afterwards") for line in finding.evidence)
+
+    def test_a_streak_of_other_faults_does_not_fire(self, tmp_path: Path) -> None:
+        """A streak with no resource faults is the process's own failure, whatever follows."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _lane_fault_streak("18:10:00.000", resource_faults=0),
+                _replaced("18:10:01.000", 2, "fault streak: 3 consecutive faults across 2 models"),
+                _oom_fault("18:14:00.000", process=2, runtime_error=False),
+            ),
+        )
+        assert "inference_lane_replaced" in findings
+        assert "lane_fault_rule_misfire" not in findings
+
+    def test_a_resource_streak_that_stays_fixed_does_not_fire(self, tmp_path: Path) -> None:
+        """The fault that tripped the streak precedes the replacement, and nothing fails within ten minutes."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _lane_fault_streak("18:10:00.000", resource_faults=3),
+                _oom_fault("18:10:00.500", process=2, runtime_error=False),
+                _replaced("18:10:01.000", 2, "fault streak: 3 consecutive faults across 2 models"),
+                _oom_fault("18:25:00.000", process=2, runtime_error=False),
+            ),
+        )
+        assert "lane_fault_rule_misfire" not in findings
+
+    def test_a_quarantine_after_a_host_caused_context_fault_fires(self, tmp_path: Path) -> None:
+        """A context fault within a minute of commit running out took a slot out of service."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _replaced("18:10:00.000", 2, "crashed or hung"),
+                _replaced("18:11:00.000", 2, "crashed or hung"),
+                _commit_exhausted("18:11:40.000"),
+                _lane_context_fault("18:12:00.000"),
+                _slot_quarantined("18:12:01.000"),
+            ),
+        )
+        finding = findings["lane_fault_rule_misfire"]
+        assert finding.headline == (
+            "Image process 2 was taken out of service after a CUDA error that followed system memory running out."
+        )
+        assert any(line.startswith("host commit ran out 20s before") for line in finding.evidence)
+        assert "`horde-log bundle`" in findings["inference_slot_quarantined"].action
+
+    def test_a_context_fault_long_after_commit_ran_out_does_not_fire(self, tmp_path: Path) -> None:
+        """Two minutes is too long for the host condition to explain the error."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _commit_exhausted("18:10:00.000"),
+                _lane_context_fault("18:12:00.000"),
+                _slot_quarantined("18:12:01.000"),
+            ),
+        )
+        assert "inference_slot_quarantined" in findings
+        assert "lane_fault_rule_misfire" not in findings
+
+
+class TestSupervisorChannelLost:
+    """The worker's link to its supervisor closing."""
+
+    def test_a_drop_right_after_commit_ran_out_says_so(self, tmp_path: Path) -> None:
+        """A commit exhaustion within the minute before the drop is named in the headline."""
+        findings = _diagnose(
+            tmp_path, _lane_log(_commit_exhausted("18:10:00.000"), _supervisor_dropped("18:10:12.000"))
+        )
+        finding = findings["supervisor_channel_lost"]
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "The worker lost its link to its supervisor at 18:10:12, 12 seconds after system memory ran out."
+        )
+
+    def test_a_drop_without_memory_pressure_states_the_time(self, tmp_path: Path) -> None:
+        """With no memory shortage the headline gives the time alone and the evidence says none was seen."""
+        findings = _diagnose(tmp_path, _lane_log(_supervisor_dropped("18:10:12.000")))
+        finding = findings["supervisor_channel_lost"]
+        assert finding.headline == "The worker lost its link to its supervisor at 18:10:12."
+        assert finding.evidence[-1].startswith("no host commit exhaustion")
+
+    def test_repeated_drops_are_counted(self, tmp_path: Path) -> None:
+        """Several drops read as a count and the first time."""
+        findings = _diagnose(
+            tmp_path, _lane_log(_supervisor_dropped("18:10:12.000"), _supervisor_dropped("18:30:00.000"))
+        )
+        assert findings["supervisor_channel_lost"].headline == (
+            "The worker lost its link to its supervisor 2 times, first at 18:10:12."
+        )
+
+
+class TestOutOfMemoryCause:
+    """The out-of-memory finding telling a broken process apart from a full card."""
+
+    def test_faults_on_one_process_beside_a_working_sibling_name_that_process(self, tmp_path: Path) -> None:
+        """Three runtime errors on process 2 while process 1 finishes jobs: the process is broken."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _oom_fault("18:10:00.000", process=2),
+                _job_finished("18:10:30.000", process=1),
+                _oom_fault("18:11:00.000", process=2),
+                _job_finished("18:11:30.000", process=1),
+                _oom_fault("18:12:00.000", process=2),
+            ),
+        )
+        finding = findings["oom"]
+        assert finding.headline == (
+            "Process 2 had 3 of 3 out-of-memory faults while process 1 finished 2 jobs in the same time."
+        )
+        assert "comes from a failed CUDA call" in finding.action
+        assert "`horde-log bundle`" in finding.action
+        assert "`max_threads`" not in finding.action
+
+    def test_allocator_faults_on_one_process_still_name_it(self, tmp_path: Path) -> None:
+        """Without the runtime error the advice names the broken process in plain terms."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                *(_oom_fault(f"18:1{i}:00.000", process=2, runtime_error=False) for i in range(3)),
+                _job_finished("18:11:30.000", process=1),
+            ),
+        )
+        finding = findings["oom"]
+        assert "one process failed while others worked" in finding.action
+        assert "CUDA runtime error" not in finding.action
+
+    def test_faults_spread_across_processes_keep_the_full_card_advice(self, tmp_path: Path) -> None:
+        """Two processes failing alike is the card, even with a third finishing jobs."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                _oom_fault("18:10:00.000", process=2, runtime_error=False),
+                _oom_fault("18:11:00.000", process=3, runtime_error=False),
+                _job_finished("18:11:30.000", process=1),
+                _oom_fault("18:12:00.000", process=2, runtime_error=False),
+                _oom_fault("18:13:00.000", process=3, runtime_error=False),
+            ),
+        )
+        finding = findings["oom"]
+        assert finding.headline.startswith("4 out-of-memory faults")
+        assert "favours too much work on the card" in finding.action
+        assert "`max_threads`" in finding.action
+
+    def test_concentrated_faults_with_no_working_sibling_keep_the_full_card_advice(self, tmp_path: Path) -> None:
+        """Nothing else finished, so a full card is not ruled out. The runtime error is still named."""
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(*(_oom_fault(f"18:1{i}:00.000", process=2) for i in range(3))),
+        )
+        finding = findings["oom"]
+        assert finding.headline.startswith("3 out-of-memory faults")
+        assert "favours a full card" in finding.action
+        assert "can also mean a broken process" in finding.action
+        assert "`max_threads`" in finding.action
+
+    def test_the_headline_counts_each_fault_once_and_caps_the_model_list(self, tmp_path: Path) -> None:
+        """The drained child message and the per-job line are one fault. Five models read as three and a count."""
+        drained = (
+            f"2026-06-24 18:09:59.000 | DEBUG    | {_DISPATCHER_SITE}:_dispatch_buffered_message:630 - Received "
+            "HordeInferenceResultMessage from process 2: RuntimeError: Pipeline failed to run - declared output "
+            "node(s) ['output_image'] produced no results. Model: A. Error: sampler (KSampler): "
+            "torch.OutOfMemoryError: CUDA out of memory."
+        )
+        findings = _diagnose(
+            tmp_path,
+            _lane_log(
+                drained,
+                *(
+                    _oom_fault(f"18:1{i}:00.000", process=2 + i % 2, runtime_error=False, model=model)
+                    for i, model in enumerate("ABCDE")
+                ),
+            ),
+        )
+        assert findings["oom"].headline == (
+            '5 out-of-memory faults on "A", "B", "C" and 2 more models in processes 2 and 3.'
+        )
+
+
+def test_the_lane_finding_copy_follows_the_guide(tmp_path: Path) -> None:
+    """Every variant these findings word per emit reads as the copy guide asks, beyond the one golden fixture."""
+    from tests.analysis.test_finding_copy_style import _emit_problems
+
+    logs = [
+        _lane_log(_commit_exhausted("18:10:00.000"), _lane_context_fault("18:10:20.000")),
+        _lane_log(
+            _lane_fault_streak("18:10:00.000", process=3),
+            _lane_context_fault("18:11:00.000"),
+            _lane_context_fault("18:12:00.000"),
+        ),
+        _lane_log(
+            _lane_context_fault("18:10:00.000"),
+            _lane_fault_streak("18:11:00.000", resource_faults=2),
+            _oom_fault("18:12:00.000", process=2),
+            _commit_exhausted("18:12:30.000"),
+            _lane_context_fault("18:12:40.000"),
+            _slot_quarantined("18:12:41.000"),
+            _slot_quarantined("18:13:41.000", slot=3, reason="crash on start: 3 consecutive failures"),
+            _supervisor_dropped("18:14:00.000"),
+            _supervisor_dropped("18:15:00.000"),
+        ),
+        _lane_log(
+            *(_oom_fault(f"18:1{i}:00.000", process=2) for i in range(3)), _job_finished("18:11:00.000", process=1)
+        ),
+        _lane_log(
+            *(_oom_fault(f"18:1{i}:00.000", process=2, runtime_error=False) for i in range(3)),
+            _job_finished("18:11:00.000", process=1),
+            _job_finished("18:11:10.000", process=3),
+        ),
+        _lane_log(*(_oom_fault(f"18:1{i}:00.000", process=2 + i % 2) for i in range(4))),
+    ]
+    kinds = {
+        FindingKind.OOM,
+        FindingKind.INFERENCE_LANE_REPLACED,
+        FindingKind.INFERENCE_SLOT_QUARANTINED,
+        FindingKind.LANE_FAULT_RULE_MISFIRE,
+        FindingKind.SUPERVISOR_CHANNEL_LOST,
+    }
+    problems: list[str] = []
+    for index, log in enumerate(logs):
+        session_dir = tmp_path / str(index)
+        session_dir.mkdir()
+        for finding in _diagnose(session_dir, log).values():
+            if finding.kind in kinds:
+                problems.extend(f"log {index} {finding.id}: {problem}" for problem in _emit_problems(finding))
+    assert not problems, "\n".join(problems)

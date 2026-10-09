@@ -509,6 +509,71 @@ _SIGNATURE_LIST: list[LogSignature] = [
         ),
         dry_run_reason=_NO_FAULT,
     ),
+    # --- Inference process replacement ---
+    _signature(
+        "inference_lane_cuda_context_fault",
+        r"Inference process (?P<process>\d+) failed a job on (?P<model>.*?) with a CUDA runtime error and will be "
+        r"replaced\.",
+        emitter="process_management.lifecycle.process_lifecycle:record_inference_lane_outcome",
+        sample=(
+            "Inference process 2 failed a job on Anima-Turbo-v1.1 with a CUDA runtime error and will be replaced."
+        ),
+        dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
+        "inference_lane_fault_streak",
+        r"Inference process (?P<process>\d+) faulted (?P<faults>\d+) jobs in a row across (?P<models>\d+) models "
+        r"\((?P<model_names>.*)\), (?P<resource_faults>\d+) of them resource/OOM faults, and will be replaced\.",
+        emitter="process_management.lifecycle.process_lifecycle:record_inference_lane_outcome",
+        sample=(
+            "Inference process 2 faulted 3 jobs in a row across 2 models (AbsoluteReality, Flux.1-Schnell fp8 "
+            "(Compact)), 2 of them resource/OOM faults, and will be replaced."
+        ),
+        dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
+        "inference_slot_quarantined",
+        r"Inference slot (?P<slot>\d+) quarantined \((?P<reason>.+)\); not respawning it\.",
+        emitter="process_management.lifecycle.process_lifecycle:_quarantine_inference_slot",
+        sample="Inference slot 2 quarantined (crash loop: 4 replacements within 300s); not respawning it.",
+        dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
+        "cuda_runtime_out_of_memory",
+        r"AcceleratorError: CUDA error: out of memory",
+        emitter="process_management.ipc.message_dispatcher:_handle_faulted_inference_result",
+        sample=(
+            "Job c0d7c4c8-c1fd-4082-b295-6dbb345f3e45 faulted on process 2 (RuntimeError: Pipeline failed to run - "
+            "declared output node(s) ['output_image'] produced no results. Model: Anima-Turbo-v1.1. Error: sampler "
+            "(KSampler): torch.AcceleratorError: CUDA error: out of memory"
+        ),
+        dry_run_reason=_NO_FAULT,
+        field_of="job_faulted_on_process",
+    ),
+    _signature(
+        "ram_danger_floor_pause",
+        r"System RAM below the danger floor \(available (?P<available>[\d.]+) MB "
+        r"(?:\(commit-bound; physical (?P<physical>[\d.]+) MB\) )?below danger floor (?P<floor>[\d.]+) MB\); "
+        r"pausing job pops",
+        emitter="process_management.scheduling.admission.executor:execute_governance_actions",
+        sample=(
+            "System RAM below the danger floor (available 3739 MB (commit-bound; physical 6097 MB) below danger "
+            "floor 4582 MB); pausing job pops for 30s and shedding idle footprint so the host is not driven into an "
+            "OS OOM kill. In-flight jobs finish; pops resume once RAM recovers."
+        ),
+        dry_run_reason=_RAM_NOT_EXERCISED,
+    ),
+    _signature(
+        "supervisor_channel_dropped",
+        r"The supervisor channel closed\. The worker keeps running without reporting liveness or state to its "
+        r"supervisor\.",
+        emitter="process_management.process_manager:_drop_closed_supervisor",
+        sample=(
+            "The supervisor channel closed. The worker keeps running without reporting liveness or state to its "
+            "supervisor."
+        ),
+        dry_run_reason="a dry run's supervisor channel stays open until the run shuts down",
+    ),
     # --- Per-job faults ---
     _signature(
         "faulted_on_process",

@@ -37,6 +37,7 @@ from tests.analysis.test_detectors import (
     _TRACEBACK,
     _blank_model_quarantine,
     _blank_preload,
+    _commit_exhausted,
     _consecutive_pause,
     _diagnose,
     _dispatch_stall,
@@ -45,9 +46,13 @@ from tests.analysis.test_detectors import (
     _full_queue_frozen,
     _give_up,
     _inference_start_retired,
+    _job_finished,
+    _lane_context_fault,
+    _lane_fault_streak,
     _load_failure_recovery,
     _maintenance_pop,
     _managed_text_backend_charged,
+    _oom_fault,
     _pop_api_error,
     _pop_claim_engaged,
     _pop_claim_released,
@@ -58,8 +63,10 @@ from tests.analysis.test_detectors import (
     _safety_start_escalated,
     _sample_stage_fault,
     _server_slow_abort,
+    _slot_quarantined,
     _soft_reset,
     _starvation_diagnostic,
+    _supervisor_dropped,
     _text_wedge_hold,
     _whole_card_reserve,
 )
@@ -554,6 +561,26 @@ CONTRACTS: dict[str, Contract] = {
     "detect_oom": Contract(
         bridge=_bridge(_oom("18:00:10.000")),
         severity=Severity.CRITICAL,
+    ),
+    "detect_inference_lane_replaced": Contract(
+        bridge=_bridge(_commit_exhausted("18:40:00.000"), _lane_context_fault("18:40:20.000")),
+        severity=Severity.WARNING,
+    ),
+    "detect_inference_slot_quarantined": Contract(
+        bridge=_bridge(_lane_context_fault("18:42:00.000"), _slot_quarantined("18:42:01.000")),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_lane_fault_rule_misfire": Contract(
+        bridge=_bridge(
+            _lane_fault_streak("18:40:00.000", resource_faults=2),
+            _oom_fault("18:44:00.000", process=2, runtime_error=False),
+            _job_finished("18:44:30.000", process=1),
+        ),
+        severity=Severity.WARNING,
+    ),
+    "detect_supervisor_channel_lost": Contract(
+        bridge=_bridge(_commit_exhausted("18:40:00.000"), _supervisor_dropped("18:40:12.000")),
+        severity=Severity.WARNING,
     ),
     "detect_file_descriptor_exhaustion": Contract(
         bridge=_bridge(_fd_exhaustion("20:09:24.000")),

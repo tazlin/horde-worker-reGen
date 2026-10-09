@@ -80,6 +80,9 @@ class FindingKind(enum.StrEnum):
     ORPHAN_WEDGE = "orphan_wedge"
     INFERENCE_SLOT_RETIRED = "inference_slot_retired"
     SAFETY_START_ESCALATED_TO_CPU = "safety_start_escalated_to_cpu"
+    INFERENCE_LANE_REPLACED = "inference_lane_replaced"
+    INFERENCE_SLOT_QUARANTINED = "inference_slot_quarantined"
+    LANE_FAULT_RULE_MISFIRE = "lane_fault_rule_misfire"
 
     OOM = "oom"
     SWALLOWED_OOM = "swallowed_oom"
@@ -107,6 +110,7 @@ class FindingKind(enum.StrEnum):
     PARENT_LOOP_STALL = "parent_loop_stall"
     LANE_PLACEMENT = "lane_placement"
     UTILITIES_LANE_BRINGUP_TIMEOUT = "utilities_lane_bringup_timeout"
+    SUPERVISOR_CHANNEL_LOST = "supervisor_channel_lost"
 
     FORCED_MAINTENANCE = "forced_maintenance"
     CONSECUTIVE_FAILURE_PAUSE = "consecutive_failure_pause"
@@ -355,19 +359,65 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         see_also=FindingKind.SAFETY_STAGE_STALL,
         reference_page="docs/explanation/process_lifecycle.md",
     ),
+    FindingSpec(
+        kind=FindingKind.INFERENCE_LANE_REPLACED,
+        title="The worker replaced an image process that kept failing jobs",
+        detail=(
+            "An image process is replaced at once when a job fails with a CUDA runtime error, because the GPU "
+            "state it holds can no longer be trusted. It is also replaced after a few failed jobs in a row across "
+            "more than one model. Each replacement counts toward the limit that takes a process out of service "
+            "when it is replaced too often. A CUDA error right after Windows ran out of memory to commit is the "
+            "host condition. The evidence says whether that happened before each CUDA error."
+        ),
+        see_also=FindingKind.INFERENCE_SLOT_QUARANTINED,
+        reference_page="docs/explanation/resilience_and_recovery.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.INFERENCE_SLOT_QUARANTINED,
+        title="An image process was taken out of service",
+        action=(
+            "The worker runs with one fewer image process until it rebuilds its processes or restarts. "
+            "Fix the cause the replacement reasons below name."
+        ),
+        detail=(
+            "When one image process is replaced too often in a few minutes, or fails to start several times "
+            "in a row, the worker stops starting it (a quarantined inference slot). The card then serves "
+            "with the rest. Replacements for CUDA errors and for failed jobs count toward that limit. The "
+            "evidence lists the replacements that led up to it."
+        ),
+        see_also=FindingKind.INFERENCE_LANE_REPLACED,
+        reference_page="docs/explanation/resilience_and_recovery.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.LANE_FAULT_RULE_MISFIRE,
+        title="A process replacement may not have helped",
+        action=(
+            "This finding exists so the worker maintainers can judge whether the rules for replacing a failing "
+            "process need to change. Send the log with `horde-log bundle` to the worker maintainers."
+        ),
+        detail=(
+            "The worker replaces an image process that fails several jobs in a row on different models. An "
+            "out-of-memory fault on a card with too much work counts toward that, so a healthy process can be "
+            "replaced because the card was too full. The sign is the same process failing again soon after. A CUDA "
+            "error caused by Windows running out of memory to commit also counts. It can take a process out of "
+            "service for a host condition."
+        ),
+        see_also=FindingKind.INFERENCE_LANE_REPLACED,
+        reference_page="docs/explanation/resilience_and_recovery.md",
+    ),
     # --- Memory and residency ---
     FindingSpec(
         kind=FindingKind.OOM,
-        title="The card ran out of memory",
-        action=(
-            "Lower `max_threads` or `queue_size`, or turn on the VRAM budget. If several processes were "
-            "sharing the card with almost nothing free, fewer models at once is the fix, not a smaller model."
-        ),
+        title="Jobs failed with out-of-memory errors",
+        action="Out-of-memory faults come from too much work on the card or from a broken process.",
         detail=(
             "The allocator's own message names the model that faulted and the other processes holding "
             "memory on the card at that moment. Many processes with near-zero free memory means too many "
             "models were admitted onto one card. One process with plenty free elsewhere means that model "
-            "alone is too large for the card."
+            "alone is too large for the card. When nearly every fault comes from one process while another "
+            "keeps finishing jobs, that process is broken and the card still has room. "
+            '"torch.AcceleratorError: CUDA error: out of memory" comes from a failed CUDA call and can leave the '
+            "process unusable."
         ),
     ),
     FindingSpec(
@@ -695,6 +745,20 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "a reboot and quick once those files are cached. When the wait runs out the worker stops it and "
             "starts a new one, losing the loading already done. Control map and background removal jobs "
             "cannot run until it answers."
+        ),
+    ),
+    FindingSpec(
+        kind=FindingKind.SUPERVISOR_CHANNEL_LOST,
+        title="The worker lost its link to its supervisor",
+        action=(
+            "The supervisor is the dashboard or the attach runner that started the worker. It may now restart "
+            "this worker as frozen even though it is healthy. Report it with `horde-log bundle` if it repeats."
+        ),
+        detail=(
+            "A supervisor watches the worker through a local channel and restarts it if it stops reporting. "
+            "Once that channel closes, the worker keeps serving jobs but sends no more reports. A supervisor "
+            "still waiting for reports then sees a frozen worker. The evidence says whether system memory had "
+            "run out just before."
         ),
     ),
     # --- Pops, faults, and the horde ---

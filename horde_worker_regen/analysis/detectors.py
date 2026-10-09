@@ -112,6 +112,28 @@ _NO_IMAGES_RE = pattern_for("no_images")
 # than using the words "orphaned in-progress", so the watchdog tag is the signature that actually
 # matches the emitted text; the other alternatives stay for forward-compatibility and the ledger reason.
 _ORPHAN_RE = pattern_for("orphaned_job_punt")
+# The lane fault rules flagging an inference process for replacement: at once on a CUDA runtime error, or after a
+# streak of faults across several models. Producer: ``process_lifecycle.record_inference_lane_outcome``.
+_LANE_CUDA_CONTEXT_FAULT_RE = pattern_for("inference_lane_cuda_context_fault")
+_LANE_FAULT_STREAK_RE = pattern_for("inference_lane_fault_streak")
+_LANE_FAULT_REASON_MARKERS: tuple[str, ...] = ("(CUDA context fault)", "(fault streak:")
+"""Recovery-reason fragments of a lane fault rule replacement. A plain crash or hang reads "(crashed or hung)".
+
+Producer: ``process_lifecycle._replace_inference_process``, which wraps the rule's reason in the recovery reason."""
+# Any inference slot quarantine, crash loop or crash on start. Producer:
+# ``process_lifecycle._quarantine_inference_slot``.
+_SLOT_QUARANTINED_RE = pattern_for("inference_slot_quarantined")
+# The RAM governor pausing intake under its danger floor. The commit-bound form means the host ran out of commit.
+# Producer: ``executor.execute_governance_actions``.
+_RAM_DANGER_PAUSE_RE = pattern_for("ram_danger_floor_pause")
+# The parent dropping its supervisor channel after it closed. Producer: ``process_manager._drop_closed_supervisor``.
+_SUPERVISOR_CHANNEL_DROPPED_RE = pattern_for("supervisor_channel_dropped")
+# A lane reporting a completed generation, which attributes a successful job to its process. Producer:
+# ``message_dispatcher._handle_inference_result``.
+_INFERENCE_FINISHED_RE = pattern_for("inference_finished")
+# The CUDA runtime error torch raises for a failed CUDA call, which shares the "out of memory" wording with the
+# allocator's own error but can leave the whole CUDA context unusable.
+_CUDA_RUNTIME_OOM_RE = pattern_for("cuda_runtime_out_of_memory")
 # The horde rejecting a pop because it forced the worker into maintenance, and the (server-supplied)
 # reason it gives. "dropping too many jobs" is the worker's own fault and the actionable case; any other
 # maintenance (operator-set, key issue) is informational.
@@ -385,6 +407,19 @@ _POP_CLAIM_CAP_MONOPOLY_THRESHOLD = 2
 _SOFT_RESET_FLAP_THRESHOLD = 2
 # A recovery count at or above this is a storm worth surfacing on its own.
 _RECOVERY_STORM_THRESHOLD = 5
+
+# Out-of-memory faults single out one process when at least this share of them, and this many, came from it.
+_OOM_CONCENTRATION_FRACTION = 0.8
+_OOM_CONCENTRATION_MIN_FAULTS = 3
+# The out-of-memory headline names this many models and counts the rest, so a session failing every model it
+# serves still reads as one sentence.
+_OOM_HEADLINE_MODELS = 3
+# A host commit exhaustion this close before a CUDA error or a dropped channel is taken as its likely cause.
+_HOST_COMMIT_LOOKBACK = timedelta(seconds=60)
+# A fault streak with at least this many resource faults, whose process fails again within the refault window
+# after its replacement, points to card pressure on a healthy process.
+_MISFIRE_MIN_RESOURCE_FAULTS = 2
+_REFAULT_WINDOW = timedelta(seconds=600)
 
 
 _RAM_HOLD_RE = pattern_for("host_ram_pop_hold")
@@ -1398,6 +1433,55 @@ def _clause_join(items: list[str]) -> str:
     return f"{', '.join(items[:-1])} and {items[-1]}"
 
 
+@dataclass(frozen=True)
+class _BrokenProcessVerdict:
+    """Out-of-memory faults concentrated on one process while other processes kept finishing jobs."""
+
+    process_id: int
+    faults: int
+    own_finishes: int
+    """Jobs the faulting process itself finished between its first and last fault."""
+    other_finishes: dict[int, int]
+    """Jobs each other inference process finished in that same span, by process id."""
+
+
+def _broken_process_verdict(records: list[LogRecord], faults: list[LogRecord]) -> _BrokenProcessVerdict | None:
+    """Return the process the out-of-memory faults single out, when the rest of the card kept working.
+
+    A card that is genuinely full fails jobs on whichever processes run on it. A process whose CUDA context is
+    broken fails every job while its siblings succeed beside it, so concentration alone is not the signal: the
+    siblings' finished jobs over the same span are what rule out a full card.
+    """
+    by_process: dict[int, list[LogRecord]] = {}
+    for record in faults:
+        if (match := _FAULTED_ON_PROCESS_RE.search(record.message)) is not None:
+            by_process.setdefault(int(match.group("pid")), []).append(record)
+    attributed = sum(len(process_faults) for process_faults in by_process.values())
+    if attributed < _OOM_CONCENTRATION_MIN_FAULTS:
+        return None
+    process_id, process_faults = max(by_process.items(), key=lambda item: len(item[1]))
+    if len(process_faults) / attributed < _OOM_CONCENTRATION_FRACTION:
+        return None
+    stamped = [record.timestamp for record in process_faults if record.timestamp is not None]
+    if not stamped:
+        return None
+    first, last = min(stamped), max(stamped)
+    finishes: dict[int, int] = {}
+    for record in _records_in_window(records, first, last):
+        if (finished := _INFERENCE_FINISHED_RE.search(record.message)) is not None:
+            finisher = int(finished.group("process"))
+            finishes[finisher] = finishes.get(finisher, 0) + 1
+    own_finishes = finishes.pop(process_id, 0)
+    if not finishes:
+        return None
+    return _BrokenProcessVerdict(
+        process_id=process_id,
+        faults=len(process_faults),
+        own_finishes=own_finishes,
+        other_finishes=finishes,
+    )
+
+
 def detect_oom(context: SessionContext) -> list[Finding]:
     """Out-of-memory faults (explicit CUDA OOM), naming the faulting model and the card's co-residency.
 
@@ -1406,20 +1490,72 @@ def detect_oom(context: SessionContext) -> list[Finding]:
     faulted, and the sibling processes holding memory with almost nothing free. Naming them turns a plain
     count into a finding that identifies the faulting model and whether the card was over-committed (many
     processes co-resident with near-zero free VRAM), which points at the fix.
+
+    The same wording also comes from a process whose CUDA context broke, which fails every job it runs while
+    the card has room. When the faults single one process out and its siblings kept finishing jobs, the
+    finding names that process instead of advising less work on the card. A CUDA runtime error
+    (``torch.AcceleratorError``) is named as a failed CUDA call.
     """
     oom = _matching(context.session.records, _OOM_RE)
     if not oom:
         return []
 
-    models = _faulting_models(oom)
-    slots = _affected_slots(oom)
-    free_vrams = [float(m.group(1)) for r in oom if (m := _OOM_FREE_VRAM_RE.search(r.message))]
-    sibling_counts = [len(_OOM_SIBLING_RE.findall(r.message)) for r in oom]
+    # The dispatcher logs each fault twice, once as the drained child message and once as the per-job fault line.
+    # Counting the per-job lines alone counts each fault once. A log with no per-job line falls back to every match.
+    faults = [record for record in oom if _FAULTED_ON_PROCESS_RE.search(record.message)] or oom
+    runtime_errors = sum(1 for record in faults if _CUDA_RUNTIME_OOM_RE.search(record.message))
+    broken = _broken_process_verdict(context.session.records, faults)
+
+    models = _faulting_models(faults)
+    model_names = [f'"{model}"' for model in models[:_OOM_HEADLINE_MODELS]]
+    if len(models) > _OOM_HEADLINE_MODELS:
+        model_names.append(f"{len(models) - _OOM_HEADLINE_MODELS} more models")
+
+    if broken is not None:
+        others = sorted(broken.other_finishes)
+        finished = sum(broken.other_finishes.values())
+        noun = "process" if len(others) == 1 else "processes"
+        verdict = (
+            f"Process {broken.process_id} had {broken.faults} of {len(faults)} out-of-memory faults while "
+            f"{noun} {_clause_join([str(other) for other in others])} finished {finished} jobs in the same time."
+        )
+        if runtime_errors:
+            addendum = (
+                '"CUDA error: out of memory" comes from a failed CUDA call and can leave a process failing every '
+                "job. Report it with `horde-log bundle`, and restart an older worker, which "
+                "cannot replace the process by itself."
+            )
+        else:
+            addendum = (
+                "Here one process failed while others worked, so that process was broken. Report it with "
+                "`horde-log bundle`, and restart an older worker, which cannot replace the process by itself."
+            )
+        evidence = [
+            f"process {broken.process_id} finished {broken.own_finishes} jobs between its first and last fault",
+            *(
+                f"process {other} finished {count} jobs over the same span"
+                for other, count in sorted(broken.other_finishes.items())
+            ),
+            *(_evidence(record) for record in faults[:4]),
+        ]
+        return [
+            Finding(
+                kind=FindingKind.OOM,
+                severity=Severity.CRITICAL,
+                headline=verdict,
+                action_addendum=addendum,
+                evidence=evidence,
+            ),
+        ]
+
+    slots = _affected_slots(faults)
+    free_vrams = [float(m.group(1)) for r in faults if (m := _OOM_FREE_VRAM_RE.search(r.message))]
+    sibling_counts = [len(_OOM_SIBLING_RE.findall(r.message)) for r in faults]
     max_siblings = max(sibling_counts, default=0)
 
-    verdict = f"{len(oom)} out-of-memory faults"
-    if models:
-        verdict += f" on {_clause_join([f'"{m}"' for m in models])}"
+    verdict = f"{len(faults)} out-of-memory faults"
+    if model_names:
+        verdict += f" on {_clause_join(model_names)}"
     if slots:
         verdict += f" in processes {_clause_join([str(s) for s in slots])}"
     if free_vrams:
@@ -1430,12 +1566,22 @@ def detect_oom(context: SessionContext) -> list[Finding]:
             verdict += f" and {max_siblings + 1} processes sharing the card"
     verdict += "."
 
+    if runtime_errors:
+        likelier = (
+            'The evidence favours a full card, though a "CUDA error: out of memory" can also mean a broken process.'
+        )
+    else:
+        likelier = "The evidence favours too much work on the card over a broken process."
     return [
         Finding(
             kind=FindingKind.OOM,
             severity=Severity.CRITICAL,
             headline=verdict,
-            evidence=[_evidence(r) for r in oom[:4]],
+            action_addendum=(
+                f"{likelier} Lower `max_threads` or `queue_size`, or turn on the VRAM budget, and run fewer models "
+                "when several share a full card."
+            ),
+            evidence=[_evidence(r) for r in faults[:4]],
         ),
     ]
 
@@ -1571,6 +1717,431 @@ def detect_orphan_wedge(context: SessionContext) -> list[Finding]:
             severity=Severity.WARNING,
             headline=f"{len(orphans)} jobs were dropped because the process running each one had disappeared.",
             evidence=[_evidence(r) for r in orphans[:4]],
+        ),
+    ]
+
+
+@dataclass(frozen=True)
+class _LaneReplacement:
+    """One inference process the worker flagged for replacement after its own failed jobs."""
+
+    record: LogRecord
+    process_id: int
+    cuda_context_fault: bool
+    """Whether a CUDA runtime error replaced it at once. Otherwise a fault streak across several models did."""
+    resource_faults: int = 0
+    """How many of the streak's faults were resource or out-of-memory faults (zero for a context fault)."""
+
+
+@dataclass(frozen=True)
+class _CommitExhaustion:
+    """The RAM governor's commit-bound pauses, the moments the host ran out of committable memory."""
+
+    records: list[LogRecord]
+    timestamps: list[datetime]
+
+    def before(self, moment: datetime | None) -> LogRecord | None:
+        """Return the latest commit exhaustion within the lookback before ``moment``, or None."""
+        if moment is None:
+            return None
+        index = bisect.bisect_right(self.timestamps, moment)
+        if index == 0:
+            return None
+        latest = self.records[index - 1]
+        return latest if moment - self.timestamps[index - 1] <= _HOST_COMMIT_LOOKBACK else None
+
+
+def _commit_exhaustion(records: list[LogRecord]) -> _CommitExhaustion:
+    """Collect the commit-bound danger-floor pauses, in time order.
+
+    Only the commit-bound form counts: a physical-RAM shortfall leaves committable memory, so it cannot fail a
+    CUDA allocation or a channel write the way running out of commit can.
+    """
+    exhausted = sorted(
+        (
+            record
+            for record in records
+            if record.timestamp is not None
+            and (match := _RAM_DANGER_PAUSE_RE.search(record.message)) is not None
+            and match.group("physical") is not None
+        ),
+        key=_window_key,
+    )
+    return _CommitExhaustion(records=exhausted, timestamps=[_window_key(record) for record in exhausted])
+
+
+def _lane_replacements(records: list[LogRecord]) -> list[_LaneReplacement]:
+    """Every replacement the lane fault rules flagged, in log order."""
+    replacements: list[_LaneReplacement] = []
+    for record in records:
+        if (context_fault := _LANE_CUDA_CONTEXT_FAULT_RE.search(record.message)) is not None:
+            replacements.append(
+                _LaneReplacement(
+                    record=record,
+                    process_id=int(context_fault.group("process")),
+                    cuda_context_fault=True,
+                ),
+            )
+        elif (streak := _LANE_FAULT_STREAK_RE.search(record.message)) is not None:
+            replacements.append(
+                _LaneReplacement(
+                    record=record,
+                    process_id=int(streak.group("process")),
+                    cuda_context_fault=False,
+                    resource_faults=int(streak.group("resource_faults")),
+                ),
+            )
+    return replacements
+
+
+def _seconds_before(earlier: LogRecord, later: LogRecord) -> float:
+    """Seconds from ``earlier`` to ``later``. The callers that pair them timestamp both."""
+    return (_window_key(later) - _window_key(earlier)).total_seconds()
+
+
+def detect_inference_lane_replaced(context: SessionContext) -> list[Finding]:
+    """Image processes the worker replaced after a CUDA runtime error or a fault streak.
+
+    A CUDA runtime error is a verdict on the process, but its cause may sit outside it: Windows running out of
+    commit can fail the allocation that raised it. The finding checks each context fault against the RAM
+    governor's commit-bound pauses so the reader can tell a host condition the worker recovered from apart from a
+    worker or driver defect.
+    """
+    replacements = _lane_replacements(context.session.records)
+    if not replacements:
+        return []
+
+    exhaustion = _commit_exhaustion(context.session.records)
+    context_faults = [replacement for replacement in replacements if replacement.cuda_context_fault]
+    streaks = [replacement for replacement in replacements if not replacement.cuda_context_fault]
+    process_ids = sorted({replacement.process_id for replacement in replacements})
+
+    causes: list[str] = []
+    if context_faults:
+        times = "once" if len(context_faults) == 1 else f"{len(context_faults)} times"
+        causes.append(f"{times} after a CUDA error")
+    if streaks:
+        times = "once" if len(streaks) == 1 else f"{len(streaks)} times"
+        causes.append(f"{times} after failing jobs on several models")
+    noun = "process" if len(process_ids) == 1 else "processes"
+    headline = (
+        f"The worker replaced image {noun} {_clause_join([str(pid) for pid in process_ids])} {_clause_join(causes)}."
+    )
+
+    evidence: list[str] = []
+    host_explained = 0
+    context_faults_per_process: dict[int, int] = {}
+    for replacement in replacements:
+        evidence.append(_evidence(replacement.record))
+        if not replacement.cuda_context_fault:
+            continue
+        context_faults_per_process[replacement.process_id] = (
+            context_faults_per_process.get(replacement.process_id, 0) + 1
+        )
+        exhausted = exhaustion.before(replacement.record.timestamp)
+        if exhausted is None:
+            evidence.append(
+                f"no host commit exhaustion in the {_HOST_COMMIT_LOOKBACK.total_seconds():.0f}s before the CUDA "
+                f"error on process {replacement.process_id}",
+            )
+            continue
+        host_explained += 1
+        evidence.append(
+            f"host commit ran out {_seconds_before(exhausted, replacement.record):.0f}s before the CUDA error on "
+            f"process {replacement.process_id}: {_evidence(exhausted)}",
+        )
+
+    sentences: list[str] = []
+    repeated = any(count > 1 for count in context_faults_per_process.values())
+    defect = False
+    if context_faults:
+        if host_explained == len(context_faults) and not repeated:
+            sentences.append(
+                "Each CUDA error came right after system memory ran out, and the worker recovered on its own.",
+            )
+        else:
+            sentences.append(
+                "A CUDA error without a system memory shortage, or one that repeats, is a worker or driver defect.",
+            )
+            defect = True
+    if streaks:
+        sentences.append("A process that fails jobs on several models is itself the common cause.")
+        defect = True
+    if defect:
+        sentences.append("Report it with `horde-log bundle`.")
+
+    return [
+        Finding(
+            kind=FindingKind.INFERENCE_LANE_REPLACED,
+            severity=Severity.WARNING,
+            headline=headline,
+            action_addendum=" ".join(sentences),
+            evidence=evidence[:12],
+        ),
+    ]
+
+
+@dataclass(frozen=True)
+class _SlotQuarantine:
+    """One quarantined inference slot and the replacements of it that led there."""
+
+    record: LogRecord
+    slot: int
+    reason: str
+    recoveries: list[RecoveryDiagnostic]
+    """Parent recovery diagnostics for the slot in the crash-loop window, the quarantining one included."""
+    lane_replacements: list[_LaneReplacement]
+    """Lane fault rule replacements of the slot in the same window, which name the cause the last one lost."""
+
+
+def _slot_quarantines(context: SessionContext) -> list[_SlotQuarantine]:
+    """Every inference slot quarantine in the session, with the slot's replacements over the crash-loop window.
+
+    The quarantining replacement's recovery reason names only the breaker, so the lane fault lines in the window are
+    read alongside the recovery diagnostics to find the cause.
+    """
+    from horde_worker_regen.process_management.lifecycle.process_lifecycle import CRASH_LOOP_WINDOW_SECONDS
+
+    window = timedelta(seconds=CRASH_LOOP_WINDOW_SECONDS)
+    lane_replacements = _lane_replacements(context.session.records)
+    quarantines: list[_SlotQuarantine] = []
+    for record in context.session.records:
+        match = _SLOT_QUARANTINED_RE.search(record.message)
+        if match is None or record.timestamp is None:
+            continue
+        slot = int(match.group("slot"))
+        end = record.timestamp
+        start = end - window
+        quarantines.append(
+            _SlotQuarantine(
+                record=record,
+                slot=slot,
+                reason=match.group("reason"),
+                recoveries=[
+                    recovery
+                    for recovery in context.recoveries
+                    if recovery.process_id == slot
+                    and recovery.timestamp is not None
+                    and start <= recovery.timestamp <= end
+                ],
+                lane_replacements=[
+                    replacement
+                    for replacement in lane_replacements
+                    if replacement.process_id == slot
+                    and replacement.record.timestamp is not None
+                    and start <= replacement.record.timestamp <= end
+                ],
+            ),
+        )
+    return quarantines
+
+
+def detect_inference_slot_quarantined(context: SessionContext) -> list[Finding]:
+    """Inference slots the worker stopped respawning, crash loop or crash on start, with what drove them there.
+
+    Lane replacements count toward the crash-loop breaker, so a process replaced for CUDA errors or fault streaks
+    can end out of service. The replacement reasons in the window say whether that, or a plain crash, drove it.
+    """
+    quarantines = _slot_quarantines(context)
+    if not quarantines:
+        return []
+
+    if len(quarantines) == 1:
+        only = quarantines[0]
+        headline = f'Image process {only.slot} was taken out of service for "{only.reason}".'
+    else:
+        slots = _clause_join([str(slot) for slot in sorted({quarantine.slot for quarantine in quarantines})])
+        headline = f"Image processes {slots} were taken out of service {len(quarantines)} times."
+
+    lane_driven = any(
+        quarantine.lane_replacements
+        or any(
+            marker in recovery.reason for recovery in quarantine.recoveries for marker in _LANE_FAULT_REASON_MARKERS
+        )
+        for quarantine in quarantines
+    )
+    evidence: list[str] = []
+    for quarantine in quarantines:
+        evidence.append(_evidence(quarantine.record))
+        evidence.extend(
+            f"replacement of process {quarantine.slot}: {recovery.reason}"
+            for recovery in quarantine.recoveries
+            if recovery.record is not quarantine.record
+        )
+        evidence.extend(_evidence(replacement.record) for replacement in quarantine.lane_replacements)
+
+    return [
+        Finding(
+            kind=FindingKind.INFERENCE_SLOT_QUARANTINED,
+            severity=Severity.CRITICAL,
+            headline=headline,
+            action_addendum=(
+                "The reasons name CUDA errors or repeated failed jobs, so report it with `horde-log bundle`."
+                if lane_driven
+                else None
+            ),
+            evidence=evidence[:12],
+        ),
+    ]
+
+
+def detect_lane_fault_rule_misfire(context: SessionContext) -> list[Finding]:
+    """Lane replacements whose evidence says the process was not the problem.
+
+    Two trade-offs in the lane fault rules can replace a healthy process. An allocator OOM counts toward the fault
+    streak, so on an over-committed card the streak trips on card pressure. The same process faulting again soon
+    after its replacement shows the replacement did not help. And a CUDA context fault counts toward the crash-loop
+    breaker even when Windows commit exhaustion caused it, so a host condition can quarantine a slot. Surfacing both
+    lets maintainers judge from operator reports whether the rules need changing.
+    """
+    records = context.session.records
+    lane_replacements = _lane_replacements(records)
+    faults_by_process: dict[int, list[LogRecord]] = {}
+    for record in records:
+        if record.timestamp is not None and (match := _FAULTED_ON_PROCESS_RE.search(record.message)) is not None:
+            faults_by_process.setdefault(int(match.group("pid")), []).append(record)
+
+    evidence: list[str] = []
+    pressure_streaks: list[_LaneReplacement] = []
+    for replacement in lane_replacements:
+        moment = replacement.record.timestamp
+        if replacement.cuda_context_fault or replacement.resource_faults < _MISFIRE_MIN_RESOURCE_FAULTS:
+            continue
+        if moment is None:
+            continue
+        # The tripping job's own fault line follows the streak line, so faults count only after the replacement.
+        replaced_at = next(
+            (
+                recovery.timestamp
+                for recovery in context.recoveries
+                if recovery.process_id == replacement.process_id
+                and recovery.timestamp is not None
+                and recovery.timestamp >= moment
+            ),
+            moment,
+        )
+        refault = next(
+            (
+                record
+                for record in faults_by_process.get(replacement.process_id, [])
+                if replaced_at < _window_key(record) <= replaced_at + _REFAULT_WINDOW
+            ),
+            None,
+        )
+        later_streak = next(
+            (
+                other.record
+                for other in lane_replacements
+                if other.process_id == replacement.process_id
+                and not other.cuda_context_fault
+                and other.record.timestamp is not None
+                and other.record.timestamp > moment
+            ),
+            None,
+        )
+        follow_up = refault or later_streak
+        if follow_up is None:
+            continue
+        pressure_streaks.append(replacement)
+        evidence.extend([_evidence(replacement.record), f"failed again afterwards: {_evidence(follow_up)}"])
+
+    exhaustion = _commit_exhaustion(records)
+    host_quarantines: list[_SlotQuarantine] = []
+    for quarantine in _slot_quarantines(context):
+        explained = [
+            (replacement, exhausted)
+            for replacement in quarantine.lane_replacements
+            if replacement.cuda_context_fault
+            and (exhausted := exhaustion.before(replacement.record.timestamp)) is not None
+        ]
+        if not explained:
+            continue
+        host_quarantines.append(quarantine)
+        evidence.append(_evidence(quarantine.record))
+        for replacement, exhausted in explained:
+            evidence.extend(
+                [
+                    _evidence(replacement.record),
+                    f"host commit ran out {_seconds_before(exhausted, replacement.record):.0f}s before: "
+                    f"{_evidence(exhausted)}",
+                ],
+            )
+
+    if not pressure_streaks and not host_quarantines:
+        return []
+
+    if pressure_streaks and host_quarantines:
+        replaced_times = "once" if len(pressure_streaks) == 1 else f"{len(pressure_streaks)} times"
+        removed_times = "once" if len(host_quarantines) == 1 else f"{len(host_quarantines)} times"
+        headline = (
+            f"Image processes were replaced {replaced_times} for out-of-memory faults and taken out of service "
+            f"{removed_times} after system memory ran out."
+        )
+    elif pressure_streaks:
+        process_ids = sorted({replacement.process_id for replacement in pressure_streaks})
+        noun = "process" if len(process_ids) == 1 else "processes"
+        verb = "was" if len(process_ids) == 1 else "were"
+        headline = (
+            f"Image {noun} {_clause_join([str(pid) for pid in process_ids])} {verb} replaced for mostly "
+            "out-of-memory faults and failed again afterwards."
+        )
+    else:
+        slots = sorted({quarantine.slot for quarantine in host_quarantines})
+        noun = "process" if len(slots) == 1 else "processes"
+        verb = "was" if len(slots) == 1 else "were"
+        headline = (
+            f"Image {noun} {_clause_join([str(slot) for slot in slots])} {verb} taken out of service after a CUDA "
+            "error that followed system memory running out."
+        )
+
+    return [
+        Finding(
+            kind=FindingKind.LANE_FAULT_RULE_MISFIRE,
+            severity=Severity.WARNING,
+            headline=headline,
+            evidence=evidence[:12],
+        ),
+    ]
+
+
+def detect_supervisor_channel_lost(context: SessionContext) -> list[Finding]:
+    """The worker's channel to its supervisor closed, so the supervisor may judge a healthy worker frozen.
+
+    The channel's own write can fail under the same commit exhaustion that breaks a CUDA context, so each drop is
+    checked against the RAM governor's commit-bound pauses.
+    """
+    drops = _matching(context.session.records, _SUPERVISOR_CHANNEL_DROPPED_RE)
+    if not drops:
+        return []
+    exhaustion = _commit_exhaustion(context.session.records)
+    first = drops[0]
+    first_time = first.timestamp.strftime("%H:%M:%S") if first.timestamp is not None else "an unknown time"
+    if len(drops) == 1:
+        exhausted = exhaustion.before(first.timestamp)
+        memory_clause = (
+            f", {_seconds_before(exhausted, first):.0f} seconds after system memory ran out"
+            if exhausted is not None
+            else ""
+        )
+        headline = f"The worker lost its link to its supervisor at {first_time}{memory_clause}."
+    else:
+        headline = f"The worker lost its link to its supervisor {len(drops)} times, first at {first_time}."
+
+    evidence: list[str] = []
+    for drop in drops[:4]:
+        evidence.append(_evidence(drop))
+        exhausted = exhaustion.before(drop.timestamp)
+        evidence.append(
+            f"host commit ran out {_seconds_before(exhausted, drop):.0f}s before: {_evidence(exhausted)}"
+            if exhausted is not None
+            else f"no host commit exhaustion in the {_HOST_COMMIT_LOOKBACK.total_seconds():.0f}s before"
+        )
+    return [
+        Finding(
+            kind=FindingKind.SUPERVISOR_CHANNEL_LOST,
+            severity=Severity.WARNING,
+            headline=headline,
+            evidence=evidence,
         ),
     ]
 
@@ -4398,6 +4969,10 @@ DETECTORS: list[Detector] = [
     detect_utilities_lane_bringup_timeout,
     detect_inference_slot_retired,
     detect_safety_start_escalated_to_cpu,
+    detect_inference_slot_quarantined,
+    detect_inference_lane_replaced,
+    detect_lane_fault_rule_misfire,
+    detect_supervisor_channel_lost,
     detect_safety_stage_stall,
     detect_safety_stage_capacity,
     detect_whole_card_convergence_wedge,
