@@ -42,10 +42,15 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, 
 from horde_worker_regen.process_management.jobs.job_tracker import JobFaultOrigin, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import (
     ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES,
+    MEMORY_REPORT_INTERVAL_SECONDS,
     HordeProcessType,
 )
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
+    PENDING_GPU_START_PROGRESS_EPSILON_MB,
+    PauseOwner,
+    ProcessLifecycleManager,
+)
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, StaleEntryReason
@@ -2812,7 +2817,7 @@ class InferenceScheduler:
                 device_index=device_index,
                 model=state.model,
             ),
-            drain_backstop_elapsed=self._whole_card_drain_backstop_elapsed(device_index),
+            drain_backstop_elapsed=self._whole_card_drain_settled(device_index),
             resident_context_charge_mb=self._resident_safety_charge_mb(device_index),
             device_index=device_index,
             now=self._clock(),
@@ -2854,16 +2859,19 @@ class InferenceScheduler:
             for process_info in self._process_map.values()
         )
 
-    def _whole_card_drain_backstop_elapsed(self, device_index: int | None) -> bool:
-        """Whether the bounded drain-settle window has run since the teardown's structural legs first all held.
+    def _whole_card_drain_settled(self, device_index: int | None) -> bool:
+        """Whether the card's free reading has stopped rising since the teardown's structural legs first all held.
 
-        Measured from that moment so a slow establishment does not spend the backstop before the sole-residency
-        guarantee it admits the head against exists.
+        The spacing is one child memory-report interval, so the two readings compared are never the same stale
+        report, and a rise counts at the same threshold as a deferred GPU start's drain progress.
         """
-        return self._whole_card_ledger.drain_backstop_elapsed(
+        return self._whole_card_ledger.drain_settled(
             device_index,
             now=self._clock(),
-            settle_seconds=WHOLE_CARD_DRAIN_SETTLE_SECONDS,
+            free_mb=self._measured_free_vram_mb(device_index=device_index),
+            spacing_seconds=MEMORY_REPORT_INTERVAL_SECONDS,
+            progress_epsilon_mb=PENDING_GPU_START_PROGRESS_EPSILON_MB,
+            upper_bound_seconds=WHOLE_CARD_DRAIN_SETTLE_SECONDS,
         )
 
     def _residency_can_never_converge(

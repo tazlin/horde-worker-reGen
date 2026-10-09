@@ -468,6 +468,15 @@ and the head would load into a card that had not yet cleared. The machine latche
 the readiness question, since that is where the structural legs are computed, and clears the latch on every
 fresh grant so a re-established residency starts its own backstop rather than inheriting a spent one.
 
+Past that moment the head waits for the drain to settle, never for a fixed window
+(`WholeCardResidencyLedger.drain_settled`). A stopped context's memory returns to the driver some time after
+its process exits, so the gate compares free readings one child memory-report interval apart and releases the
+head once the reading has stopped rising by more than a deferred GPU start's progress threshold; a rise moves
+the reference forward. On a card whose structure is already clear the readings are flat and the head goes
+within one report interval. Releasing the head hands any shortfall still on the card to clearance, which
+re-prices the load against the live reading and, for an extra-large model, admits it at its partial-load seat.
+`WHOLE_CARD_DRAIN_SETTLE_SECONDS` is the upper bound for a reading that never settles or never arrives.
+
 ### Bounding residency churn
 
 Entering and leaving sole residency are both expensive: the establishment stops sibling inference processes

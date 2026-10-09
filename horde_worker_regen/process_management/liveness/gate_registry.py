@@ -869,10 +869,11 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
             "service lanes clear of the card"
         ),
         bound_seconds=None,
-        bound_source="the drain settle window measured from structural completion",
+        bound_source="the drain settle upper bound measured from structural completion",
         backstop=(
             "WholeCardResidencyLedger.drain_backstop_elapsed, which admits the head on the forecast's "
-            "sole-residency guarantee once the structural teardown has held for the settle window"
+            "sole-residency guarantee once the free reading stops rising after the structural teardown, or at "
+            "the settle upper bound"
         ),
         observable_at=_DISPATCH_STALL_OBSERVABLE,
     ),

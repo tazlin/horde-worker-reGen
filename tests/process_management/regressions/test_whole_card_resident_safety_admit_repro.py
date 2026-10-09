@@ -27,6 +27,7 @@ import time
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import MEMORY_REPORT_INTERVAL_SECONDS
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
@@ -147,8 +148,8 @@ class TestResidentSafetyBlocksTheBackstopAdmit:
         assert scheduler._whole_card_weights_fit_live(forecast) is False, (
             "precondition: the live reading does not hold the weights while safety keeps its context"
         )
-        assert scheduler._whole_card_drain_backstop_elapsed(None) is True, (
-            "precondition: the bounded drain window has been spent, so only the fallback can release the head"
+        assert scheduler._whole_card_drain_settled(None) is True, (
+            "precondition: the drain upper bound has been spent, so only the fallback can release the head"
         )
 
         assert scheduler._whole_card_teardown_exhausted(forecast) is False, (
@@ -195,3 +196,33 @@ class TestSafetyPauseGateStillHoldsAndReleases:
 
         assert scheduler._whole_card_weights_fit_live(forecast) is True
         assert scheduler._whole_card_teardown_exhausted(forecast) is True
+
+
+class TestSettledDrainReleasesTheHead:
+    """A teardown whose free reading has stopped rising releases the head within one report interval."""
+
+    def test_a_flat_reading_releases_the_head_long_before_the_upper_bound(self) -> None:
+        """The live reading never holds the weights, yet a flat reading settles the drain and the head goes."""
+        scheduler = _residency_scheduler(
+            safety_off_gpu_configured=True,
+            safety_paused=True,
+            measured_free_mb=_FREE_WITH_SAFETY_RESIDENT_MB,
+        )
+        forecast = _whole_card_forecast()
+        now = [time.time()]
+        scheduler._clock = lambda: now[0]
+        structural_at = now[0]
+        scheduler._whole_card_ledger.state_for(None).structural_complete_at = structural_at
+
+        assert scheduler._whole_card_weights_fit_live(forecast) is False, (
+            "precondition: the live reading does not hold the weights, so only the drain can release the head"
+        )
+        assert scheduler._whole_card_teardown_exhausted(forecast) is False, (
+            "the first reading after the structural teardown is the reference, so it cannot settle the drain"
+        )
+
+        now[0] += MEMORY_REPORT_INTERVAL_SECONDS
+        assert scheduler._whole_card_teardown_exhausted(forecast) is True, (
+            "a reading that has not risen across one report interval settles the drain"
+        )
+        assert now[0] - structural_at < WHOLE_CARD_DRAIN_SETTLE_SECONDS

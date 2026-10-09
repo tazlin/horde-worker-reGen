@@ -22,6 +22,9 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
 _NOW = 1_000_000.0
 _ESTABLISH_GRACE = 90.0
 _RESTORE_GRACE = 30.0
+_SETTLE_SPACING = 5.0
+_SETTLE_EPSILON_MB = 128.0
+_SETTLE_UPPER_BOUND = 20.0
 
 
 def _granted_ledger(
@@ -158,6 +161,67 @@ class TestGraceWindows:
         assert not ledger.drain_backstop_elapsed(0, now=_NOW + 505.0, settle_seconds=20.0)
         assert ledger.drain_backstop_elapsed(0, now=_NOW + 525.0, settle_seconds=20.0)
         assert not ledger.drain_backstop_elapsed(1, now=_NOW + 525.0, settle_seconds=20.0)
+
+    def _settled(self, ledger: WholeCardResidencyLedger, at: float, free_mb: float | None) -> bool:
+        return ledger.drain_settled(
+            0,
+            now=_NOW + at,
+            free_mb=free_mb,
+            spacing_seconds=_SETTLE_SPACING,
+            progress_epsilon_mb=_SETTLE_EPSILON_MB,
+            upper_bound_seconds=_SETTLE_UPPER_BOUND,
+        )
+
+    def test_the_drain_is_not_judged_before_structural_completion(self) -> None:
+        """Before the structural legs hold there is no sole residency whose drain could settle."""
+        ledger = _granted_ledger(0)
+        assert not self._settled(ledger, 100.0, 9000.0)
+        assert not self._settled(ledger, 200.0, 9000.0)
+
+    def test_a_flat_reading_settles_after_one_report_interval(self) -> None:
+        """A reading that has not risen across the spacing settles the drain well inside the upper bound."""
+        ledger = _granted_ledger(0)
+        ledger.state_for(0).structural_complete_at = _NOW + 100.0
+        assert not self._settled(ledger, 100.5, 13000.0)
+        assert not self._settled(ledger, 103.0, 13050.0)
+        assert self._settled(ledger, 105.5, 13050.0)
+
+    def test_a_rising_reading_restarts_the_spacing(self) -> None:
+        """Memory still returning to the driver moves the reference, so the head waits for the climb to stop."""
+        ledger = _granted_ledger(0)
+        ledger.state_for(0).structural_complete_at = _NOW + 100.0
+        assert not self._settled(ledger, 100.5, 11000.0)
+        assert not self._settled(ledger, 105.5, 12500.0)
+        assert not self._settled(ledger, 109.0, 12500.0)
+        assert self._settled(ledger, 110.5, 12500.0)
+
+    def test_a_missing_reading_waits_for_the_upper_bound(self) -> None:
+        """With no reading the drain cannot be judged, so only the upper bound releases the head."""
+        ledger = _granted_ledger(0)
+        ledger.state_for(0).structural_complete_at = _NOW + 100.0
+        assert not self._settled(ledger, 110.0, None)
+        assert self._settled(ledger, 100.0 + _SETTLE_UPPER_BOUND, None)
+
+    def test_a_reading_that_never_stops_rising_is_released_at_the_upper_bound(self) -> None:
+        """A climb that outlasts the upper bound still releases the head, which clearance then prices."""
+        ledger = _granted_ledger(0)
+        ledger.state_for(0).structural_complete_at = _NOW + 100.0
+        free_mb = 8000.0
+        for step in range(int(_SETTLE_UPPER_BOUND)):
+            free_mb += 1000.0
+            assert not self._settled(ledger, 100.0 + step, free_mb)
+        assert self._settled(ledger, 100.0 + _SETTLE_UPPER_BOUND, free_mb + 1000.0)
+
+    def test_a_re_established_residency_starts_a_fresh_reference(self) -> None:
+        """A new teardown judges its own drain, never a reference taken during the previous one."""
+        ledger = _granted_ledger(0)
+        ledger.state_for(0).structural_complete_at = _NOW + 100.0
+        assert not self._settled(ledger, 100.5, 13000.0)
+        ledger.record_restore(0, now=_NOW + 102.0)
+        ledger.record_grant(0, model="heavy-model", forecast=None, cooldown_until=_NOW + 400.0, now=_NOW + 103.0)
+        ledger.state_for(0).structural_complete_at = _NOW + 104.0
+        assert not self._settled(ledger, 106.0, 13000.0)
+        assert self._settled(ledger, 111.0, 13000.0)
 
 
 class TestMinHold:

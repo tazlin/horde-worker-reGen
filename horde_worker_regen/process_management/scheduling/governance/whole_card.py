@@ -73,9 +73,10 @@ a multi-GB load) before the recovery supervisor reads it as a structural wedge. 
 loads still trips the supervisor."""
 
 WHOLE_CARD_DRAIN_SETTLE_SECONDS = 20.0
-"""How long after a teardown reaches sole residency the head waits for the live free reading to confirm the
-drain before loading on the structural fits-alone guarantee. Kept under the establish grace so the head always
-dispatches before the supervisor would act."""
+"""The longest a teardown at sole residency holds the head for its drain to settle
+(:meth:`WholeCardResidencyLedger.drain_settled`) before loading on the structural fits-alone guarantee. An upper
+bound for a reading that never settles or never arrives; a settled reading releases the head sooner. Kept under
+the establish grace so the head always dispatches before the supervisor would act."""
 
 WHOLE_CARD_RESTORE_GRACE_SECONDS = 60.0
 """How long after a residency is restored the supervisor keeps ignoring a queue wedge: respawning siblings and
@@ -289,6 +290,13 @@ class WholeCardResidency:
     The drain backstop measures from here rather than from ``established_at`` so a slow teardown cannot burn
     the backstop before there is anything to back off from: until the structure is complete there is no
     sole-residency guarantee for the backstop to admit the head against. 0.0 while incomplete."""
+    drain_reference_at: float = 0.0
+    """When the free reading the drain is judged against was taken; 0.0 before the first post-structural reading.
+
+    :meth:`WholeCardResidencyLedger.drain_settled` moves it forward whenever the reading rises, so the drain is
+    settled once a later reading shows no rise across the spacing."""
+    drain_reference_mb: float = 0.0
+    """The free reading (MB) taken at ``drain_reference_at``."""
     grace_charges: deque[tuple[float, float]] = field(default_factory=deque)
     """``(granted_at, seconds)`` for each grace window this card has been granted, newest last.
 
@@ -441,6 +449,8 @@ class WholeCardResidencyLedger:
             state.established_at = now
             state.min_hold_until = now + _MIN_HOLD_SECONDS
             state.structural_complete_at = 0.0
+            state.drain_reference_at = 0.0
+            state.drain_reference_mb = 0.0
             state.pop_claim_released_at = 0.0
             state.establishments.append(now)
             if establish_grace_seconds > 0.0:
@@ -473,6 +483,8 @@ class WholeCardResidencyLedger:
         state.established_at = 0.0
         state.min_hold_until = 0.0
         state.structural_complete_at = 0.0
+        state.drain_reference_at = 0.0
+        state.drain_reference_mb = 0.0
         state.prestage_process_id = None
         state.pop_claim_empty_pops = 0
         state.pop_claim_empty_pop_since = 0.0
@@ -832,6 +844,37 @@ class WholeCardResidencyLedger:
             return False
         return (now - state.structural_complete_at) >= settle_seconds
 
+    def drain_settled(
+        self,
+        device_index: int | None,
+        *,
+        now: float,
+        free_mb: float | None,
+        spacing_seconds: float,
+        progress_epsilon_mb: float,
+        upper_bound_seconds: float,
+    ) -> bool:
+        """Return whether the card's free reading has stopped rising since the teardown became structural.
+
+        A stopped context's memory returns to the driver some time after its process exits, so the head waits
+        for the free reading to stop climbing, never a fixed window that outlasts the drain: the drain is
+        settled once a reading ``spacing_seconds`` after the reference shows no rise beyond
+        ``progress_epsilon_mb``, and a larger rise moves the reference forward. Releasing the head hands any
+        shortfall left on the card to clearance, which re-prices the load against the live reading.
+        ``upper_bound_seconds`` (:meth:`drain_backstop_elapsed`) releases the head on a reading that never
+        settles or never arrives.
+        """
+        if self.drain_backstop_elapsed(device_index, now=now, settle_seconds=upper_bound_seconds):
+            return True
+        state = self._residencies.get(device_index)
+        if state is None or state.structural_complete_at == 0.0 or free_mb is None:
+            return False
+        if state.drain_reference_at == 0.0 or free_mb > state.drain_reference_mb + progress_epsilon_mb:
+            state.drain_reference_at = now
+            state.drain_reference_mb = free_mb
+            return False
+        return (now - state.drain_reference_at) >= spacing_seconds
+
 
 class WholeCardResidencyMachine(WholeCardResidencyLedger):
     """Whole-card residency state machine plus pure transition queries.
@@ -986,8 +1029,9 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         leaves too little room and streams the weights.
 
         Once the structural checks hold, a live free-VRAM reading that holds the weights releases the head
-        immediately; otherwise the bounded drain backstop releases it on the forecast's sole-residency
-        guarantee. That guarantee describes a card every other context has left, so ``resident_context_charge_mb``
+        immediately; otherwise a settled drain (``drain_backstop_elapsed``, which the caller derives from
+        :meth:`drain_settled`) releases it on the forecast's sole-residency guarantee. That guarantee describes a
+        card every other context has left, so ``resident_context_charge_mb``
         prices back in whatever the residency is leaving on the card (the safety context, where the
         configuration forbids moving it off-GPU). The caller supplies the figure because which contexts stay
         is a configuration and lifecycle fact, not residency state; zero (nothing stays) is the plain
