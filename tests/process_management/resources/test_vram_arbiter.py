@@ -1141,6 +1141,80 @@ class TestForeignAwareImpossibility:
         assert arbiter.any_other_device_can_seat(request, exclude_device_index=0) is False
 
 
+class TestPartialSeatUnderTheCeiling:
+    """A seat-carrying dispatch whose full charge is under the ceiling but over the reading takes its seat.
+
+    With nothing left to reclaim, the room the full charge waits for only arrives if some other tenant happens to
+    free it, while ComfyUI serves the job by loading a share of its weights either way.
+    """
+
+    _TOTAL_MB = 16375.0
+    _FULL_MB = 12558.0
+    _SEAT_MB = 9000.0
+
+    def _card(self, **overrides: object) -> DeviceVramState:
+        """A 16 GB card whose reading is short of the full charge and well above the seat."""
+        defaults: dict[str, object] = {"total_vram_mb": self._TOTAL_MB, "device_free_mb": 12800.0}
+        defaults.update(overrides)
+        return _roomy_state(**defaults)
+
+    def _dispatch(self, **overrides: object) -> VramRequest:
+        """A fresh head-of-queue extra-large dispatch carrying a partial-load seat."""
+        defaults: dict[str, object] = {
+            "kind": VramRequestKind.MONOLITHIC_DISPATCH,
+            "candidate_delta_mb": self._FULL_MB,
+            "partial_seat_mb": self._SEAT_MB,
+            "is_head_of_queue": True,
+            "head_job_id": "job-1",
+        }
+        defaults.update(overrides)
+        return _preload(**defaults)
+
+    def test_a_converged_card_admits_at_the_seat(self) -> None:
+        """The full charge misses the reading, the card has nothing to reclaim, and the seat fits: FITS at the seat."""
+        arbiter = VramArbiter()
+        state = self._card()
+        arbiter.begin_cycle(_snapshot(state))
+        ceiling_mb = state.achievable_ceiling_mb()
+        assert ceiling_mb is not None and ceiling_mb > self._FULL_MB
+
+        verdict = arbiter.evaluate(self._dispatch())
+
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.partial_seat is True
+        assert verdict.measured_attempt is False
+
+    def test_a_card_with_reclaim_left_keeps_the_full_charge(self) -> None:
+        """While an idle resident could still be evicted, the request defers so the ladder frees room first."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card()))
+
+        verdict = arbiter.evaluate(self._dispatch(has_reclaimable_idle_model=True))
+
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.partial_seat is False
+
+    def test_a_seat_that_misses_the_reading_does_not_admit(self) -> None:
+        """A seat above the reading is no admit, so the request defers as before."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card(device_free_mb=8000.0)))
+
+        verdict = arbiter.evaluate(self._dispatch())
+
+        assert verdict.partial_seat is False
+        assert verdict.admits is False
+
+    def test_a_full_fit_is_preferred_over_the_seat(self) -> None:
+        """When the full charge fits the reading, the job is admitted whole."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card(device_free_mb=15500.0)))
+
+        verdict = arbiter.evaluate(self._dispatch())
+
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.partial_seat is False
+
+
 class TestMeasuredAttemptEscapeHatch:
     """The measured-load escape hatch: a starved head at a converged-empty card gets one real load attempt.
 

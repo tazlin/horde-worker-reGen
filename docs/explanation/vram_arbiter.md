@@ -1000,12 +1000,14 @@ seat = f x weights + max(activation, ComfyUI inference reserve)
   to 65536 MB/s, prices the 0.5 fallback. The fallback is also the ceiling: a seat is only taken on a card
   with nothing left to reclaim, where a refusal leaves the child to sample at its timeout with whatever fits,
   so a larger share would only delay the same load.
-- **When it admits.** Only where the full need exceeds the achievable ceiling, and only on a converged-empty
-  card. Before convergence the request keeps its full charge, so the ladder and the whole-card teardown run
-  toward the most room the card can give, and `_ceiling_attempt_pending_convergence` keeps the verdict at
-  DEFER while reclaim remains. On a converged card the seat's outstanding part (net of what
-  the job holds) is priced against the reading ahead of the measured attempt, so a qualifying job never spends
-  or needs the one-shot. A seat that does not fit falls through to the ceiling attempt and the DENY unchanged.
+- **When it admits.** Only where the full charge does not fit the reading, and only on a converged-empty
+  card. The full need may sit above or below the achievable ceiling: below it, the room the full charge waits
+  for on a converged card only arrives if another tenant happens to free it, while ComfyUI loads such a model
+  partially either way. Before convergence the request keeps its full charge, so the ladder and the whole-card
+  teardown run toward the most room the card can give, and `_ceiling_attempt_pending_convergence` keeps the
+  verdict at DEFER while reclaim remains. On a converged card the seat's outstanding part (net of what the job
+  holds) is priced against the reading ahead of the measured attempt, so a qualifying job never spends or needs
+  the one-shot. A seat that does not fit falls through to the ceiling attempt and the DENY unchanged.
 - **Grant and booking.** The grant is unchanged: it carries the measured device free the admission priced
   against, and hordelib rebases ComfyUI's clamp on it, so the child loads every weight that fits after
   ComfyUI's own holdback, at least the seat's share. The verdict carries `partial_seat`, and

@@ -188,7 +188,12 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
 )
-from horde_worker_regen.process_management.resources.vram_arbiter import _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
+    VramArbiter,
+    VramRequest,
+    VramVerdict,
+)
 from horde_worker_regen.process_management.resources.vram_footprints import (
     _MIN_OBSERVATIONS_FOR_MEASURED,
     FootprintKey,
@@ -3633,7 +3638,9 @@ _CREDIT_TICKS = 10
 clearance the price admitted, never the timeout's unpriced sampling."""
 
 
-async def test_u_a_staged_job_is_not_credited_with_weights_it_has_not_loaded() -> None:
+async def test_u_a_staged_job_is_not_credited_with_weights_it_has_not_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A job staged under the lease is priced at its full peak at clearance, not at its activation alone.
 
     The failure this encodes: dispatch under the lease stages a job with its weights in host RAM, and the child
@@ -3643,14 +3650,28 @@ async def test_u_a_staged_job_is_not_credited_with_weights_it_has_not_loaded() -
     the card out of memory.
 
     Read as one statement: weights count as resident when they are on the card, and a primed lane's are not.
-    Its consequence is that the staged head is not granted clearance while the sibling's weights still occupy
-    the room its full peak needs, whatever the map says about the model being in use.
+    Its consequence is that the staged head's full peak never fits while the sibling's weights still occupy the
+    room it needs, whatever the map says about the model being in use. The card has nothing left to reclaim, so
+    an extra-large head may still be granted at its partial-load seat, which prices a share of its weights
+    against the reading; a full-price admit is only reachable through the credit.
     """
     world = _staged_heavy_world_beside_its_sibling()
     # The sibling's unload returns nothing, so no eviction can make the room; a grant would have to come from
     # the price.
     world.child_unload_leaks_mb = _SDXL.weights_mb
     head = make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=20)
+    head_verdicts: list[VramVerdict] = []
+    evaluate = VramArbiter.evaluate
+
+    def recording_evaluate(self: VramArbiter, request: VramRequest) -> VramVerdict:
+        verdict = evaluate(self, request)
+        # Clearance alone prices a seat, so a seat-carrying request is the head's clearance re-price, never the
+        # staging admit its dispatch made earlier.
+        if request.head_job_id == str(head.id_) and request.partial_seat_mb is not None:
+            head_verdicts.append(verdict)
+        return verdict
+
+    monkeypatch.setattr(VramArbiter, "evaluate", recording_evaluate)
     await world.pop(head)
 
     for _ in range(_CREDIT_TICKS):
@@ -3658,13 +3679,13 @@ async def test_u_a_staged_job_is_not_credited_with_weights_it_has_not_loaded() -
 
     context = "staged head credited with unloaded weights"
     assert head in world.job_tracker.jobs_in_progress, f"{context}: the head was never staged. {world.state_dump()}"
-    granted = [grant for grant in world.clearance_grants if grant[2] == str(head.id_)]
-    assert granted == [], (
-        f"{context}: the head was cleared on tick {granted[0][0]} with the sibling's {_SDXL.weights_mb:.0f} MB "
+    assert head_verdicts, f"{context}: clearance never priced the head at a seat. {world.state_dump()}"
+    full_price_admits = [verdict for verdict in head_verdicts if verdict.admits and not verdict.partial_seat]
+    assert full_price_admits == [], (
+        f"{context}: the head was admitted at its full price with the sibling's {_SDXL.weights_mb:.0f} MB "
         f"still on a {_CARD_16GB.total_mb:.0f} MB card, which only a credit for weights in host RAM prices as "
-        f"fitting. {world.state_dump()}"
+        f"fitting: {full_price_admits[0].detail}. {world.state_dump()}"
     )
-    assert world.dispatch_tick(head) is None, f"{context}: the head sampled without a grant. {world.state_dump()}"
 
 
 # --------------------------------------------------------------------------------------------------------

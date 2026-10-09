@@ -46,10 +46,11 @@ does or does not fit:
   REDUCE_LIVE_CONTEXTS actuation and re-asks once the room frees.
 - A candidate that cannot fit an even fully-cleared card DENIES: no escalation on this card could seat it,
   unless it clears the achievable ceiling by so little that the prediction is the likelier explanation (see
-  :data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION`), where one real load settles it instead. A staged job that
-  carries a partial-load seat (:attr:`VramRequest.partial_seat_mb`) FITS at that seat first, once the card
-  has nothing left to reclaim and the seat fits the reading, since ComfyUI serves it by loading a share of its
-  weights.
+  :data:`_CEILING_ATTEMPT_OVERSHOOT_FRACTION`), where one real load settles it instead.
+- A staged job that carries a partial-load seat (:attr:`VramRequest.partial_seat_mb`) and does not fit at its
+  full charge FITS at that seat ahead of every other non-fitting path, once the card has nothing left to
+  reclaim and the seat fits the reading, whether or not the full charge is under the ceiling. ComfyUI serves it
+  by loading a share of its weights, and room beyond a converged card only arrives if another tenant frees it.
 - A card with no device-free reading yet DEFERS with a throttled diagnostic: the primary admission input is
   absent, so the arbiter neither denies nor fabricates a fictional free figure; it waits for the next reading.
 
@@ -436,8 +437,8 @@ class VramRequest:
     """The job's whole need (MB) when ComfyUI loads its checkpoint partially, or None when the job has no such
     seat. Set by clearance alone, for an extra-large job without LoRAs off a paging card.
 
-    Consulted only where the full need exceeds the achievable ceiling: there the partial load is the only way
-    the card serves the job, and it admits once the card has nothing left to reclaim and the seat fits."""
+    Consulted only where the full need does not fit the reading: the seat admits once the card has nothing left
+    to reclaim and the seat fits, since past that point the full need only fits if another tenant frees room."""
     head_outstanding_mb: float | None = None
     """For a non-head request, the true head of queue's priced outstanding demand (MB) on this device, or None
     when unknown or when this request is itself the head. Head protection: a non-head request that fits is still
@@ -933,11 +934,10 @@ class VramArbiter:
         # Otherwise it DEFERS: a starved head whose deficit is its own idle sibling contexts escalates to a
         # verified teardown, every other non-fitting demand rides the per-cycle reclaim ladder and re-asks once
         # the room frees.
+        partial_seat_verdict = self._partial_seat_admission(request, measured, state)
+        if partial_seat_verdict is not None:
+            return partial_seat_verdict
         structurally_impossible = self._structurally_impossible(request, state)
-        if structurally_impossible:
-            partial_seat_verdict = self._partial_seat_admission(request, measured, state)
-            if partial_seat_verdict is not None:
-                return partial_seat_verdict
         measured_attempt = self._measured_attempt(request, measured, state, impossible=structurally_impossible)
         if measured_attempt is not None:
             return measured_attempt
@@ -1247,8 +1247,8 @@ class VramArbiter:
             request_kind=request.kind,
             device_index=request.device_index,
             reason=(
-                "partial-load seat: the full charge exceeds this card's achievable ceiling, and the share of the "
-                "weights ComfyUI loads beside the job's activation fits the emptied card"
+                "partial-load seat: the full charge does not fit a card with nothing left to reclaim, and the "
+                "share of the weights ComfyUI loads beside the job's activation fits the reading"
             ),
             measured=seat_measured,
             detail=seat_measured.reason(),
