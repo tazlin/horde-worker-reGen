@@ -386,7 +386,11 @@ scheduler and the lifecycle manager:
 1. **Scheduler** picks a job, determines the required model, finds a free
    process via `ProcessMap.get_first_available_inference_process`.
 2. **Scheduler** sends `PRELOAD_MODEL` to that process via its pipe.
-3. **Scheduler** marks the model `LOADING` in `HordeModelMap`.
+3. **Scheduler** marks the model `LOADING` in `HordeModelMap`, only once the send succeeds. A preload
+   the VRAM arbiter or the RAM budget defers is never sent and leaves no entry. Dispatch runs the
+   missing-model recovery (`_handle_process_missing`) only for a model with a settled entry that no
+   process holds, so a deferred head is left to the arbiter's starvation diagnostic and the
+   structural-wedge reroute.
 4. **Child process** downloads the model (if needed), loads it into RAM, then
    into VRAM, sending `ModelLoadState` change messages at each step.
 5. **Message dispatcher** updates `HordeModelMap` as each

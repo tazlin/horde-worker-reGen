@@ -9140,10 +9140,10 @@ class InferenceScheduler:
     async def _handle_process_missing(self, job: ImageGenerateJobPopResponse) -> None:
         """Recover when the head's model was expected resident but no process holds it.
 
-        Reached only when the model map claims the model is loaded and no process is tagged with it, so the
-        map entry is the stale half: it is expired and the job is released from in-progress so a fresh preload
-        can be scheduled. Guarded by the missing-model latch so the recovery runs at most once per preload
-        budget.
+        Reached only when the model map holds a settled entry for the model and no process is tagged with it
+        (dispatch skips a model with no entry or a LOADING one), so the map entry is the stale half: it is
+        expired and the job is released from in-progress so a fresh preload can be scheduled. Guarded by the
+        missing-model latch so the recovery runs at most once per preload budget.
         """
         if self._missing_model_recovery_latched():
             return
@@ -9424,8 +9424,12 @@ class InferenceScheduler:
                 if self._resident_only_on_ineligible_cards(next_job):
                     return cross_card_selection
 
+                # The model map records only loads that were sent. No entry means no preload went out (one the
+                # budget deferred, or none yet), so nothing is stale to expire; a deferred head belongs to the
+                # arbiter's starvation diagnostic and the structural-wedge reroute, which a latch would hide.
                 if (
                     self._preload_delay_notified
+                    or next_job_model not in self._horde_model_map.root
                     or self._horde_model_map.is_model_loading(next_job_model)
                     or information_only
                 ):

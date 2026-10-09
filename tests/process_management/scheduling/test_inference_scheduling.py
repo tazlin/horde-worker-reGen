@@ -11,6 +11,7 @@ import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
+from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
@@ -2968,6 +2969,36 @@ class TestIneligibleCardResidencyIsNotAMissingModel:
         assert await scheduler.get_next_job_and_process(information_only=False) is None
         assert scheduler._horde_model_map.is_model_loaded("stable_diffusion") is False
         assert scheduler.head_admission.model_recently_missing is True
+
+
+class TestDeferredPreloadIsNotAMissingModel:
+    """A preload the budget defers was never sent, so dispatch must not run the missing-model recovery for it."""
+
+    async def test_a_deferred_head_leaves_no_entry_warning_or_latch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The model map holds only sent loads; with no entry, nothing is stale and the recovery stays idle."""
+        monkeypatch.setattr(
+            InferenceScheduler,
+            "_admit_preload_under_budget",
+            lambda self, job, available_process, **kwargs: False,
+        )
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name=None)})
+        scheduler = _make_inference_scheduler(process_map=process_map, horde_model_map=HordeModelMap(root={}))
+        scheduler._budget_active = Mock(return_value=True)  # type: ignore[method-assign]
+        job = make_job_pop_response(model="Deliberate 3.0")
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        warnings: list[str] = []
+        sink_id = logger.add(lambda message: warnings.append(str(message)), level="WARNING")
+        try:
+            assert scheduler.preload_models() is False
+            assert "Deliberate 3.0" not in scheduler._horde_model_map.root
+            assert await scheduler.get_next_job_and_process(information_only=False) is None
+        finally:
+            logger.remove(sink_id)
+
+        assert not any("Expected to find a process with model" in line for line in warnings)
+        assert scheduler.head_admission.model_recently_missing is False
+        assert scheduler.head_model_materializing() is False
 
 
 class TestMissingModelLatchBound:
