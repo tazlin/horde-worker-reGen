@@ -1500,6 +1500,20 @@ class TestHeadOfQueueMakeRoom:
         assert sched.unload_models(under_pressure=True) is False
         assert sched.unload_models(under_pressure=True, for_head_of_queue=True) is True
 
+    async def test_ram_escalation_spares_a_resident_copy_a_starving_queued_job_waits_on(self) -> None:
+        """The head escalation leaves a resident model alone when the queued job needing it is past anti-starvation.
+
+        That job runs on the copy the moment the lane is free; evicting it buys the head a load now and the
+        queued job a cold reload later. The head keeps deferring or is admitted best-effort beside the copy.
+        """
+        sched, holder = await self._scheduler_with_head_blocked()
+        job_tracker = sched._job_tracker
+        aged = make_job_pop_response("queued_b").model_copy(update={"ttl": 100})
+        await track_popped_job_async(job_tracker, aged, time_popped=time.time() - 60.0)
+
+        assert sched.unload_models(under_pressure=True, for_head_of_queue=True) is False
+        assert holder.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+
     async def test_vram_escalation_overrides_next_model_guard_and_reports(self) -> None:
         """Gentle VRAM reclaim spares the next-up model; the head escalation reclaims it and reports."""
         sched, holder = await self._scheduler_with_head_blocked()

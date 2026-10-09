@@ -12299,7 +12299,8 @@ class InferenceScheduler:
         ``for_head_of_queue`` is the last-resort escalation when the head-of-queue job cannot be loaded
         and gentle reclaim freed nothing because every idle resident copy is another *queued* job's
         model: it additionally overrides the still-needed-by-a-pending-job guard so the head can be
-        given room. It never evicts an in-progress (live) model or targets a slot that owns a dispatched job.
+        given room. It never evicts an in-progress (live) model, a resident copy a queued job past its
+        anti-starvation age is waiting to run on, or a slot that owns a dispatched job.
         """
         bridge_data = self._runtime_config.bridge_data
 
@@ -12319,6 +12320,15 @@ class InferenceScheduler:
 
         wanted_models = self._compute_wanted_models()
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
+        starving_pending_models = (
+            {
+                job.model
+                for job in self._job_tracker.jobs_pending_inference
+                if job.model is not None and self._head_aged_past_anti_starvation(job)
+            }
+            if for_head_of_queue
+            else set()
+        )
 
         eligible: list[HordeProcessInfo] = []
         for process_info in self._process_map.values():
@@ -12356,6 +12366,12 @@ class InferenceScheduler:
                     }
                     if process_info.loaded_horde_model_name in pending_models:
                         continue
+                elif process_info.loaded_horde_model_name in starving_pending_models:
+                    # The head's priority for room does not reach a resident copy another queued job has waited
+                    # as long for: that job runs on these weights the moment the lane is free, while evicting
+                    # them buys the head a load now and that job a cold reload of a far larger checkpoint
+                    # later. The head keeps deferring, or is admitted best-effort beside the copy.
+                    continue
 
                 if not for_head_of_queue and self._residency_protects_from_unload(
                     process_info.loaded_horde_model_name,
