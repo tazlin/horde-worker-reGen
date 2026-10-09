@@ -714,12 +714,15 @@ free-VRAM read): a `FITS` admits, a `DEFER` or `DENY` holds the chain and the la
 bookkeeping (each newly available reclaim plan at most once, throttled warning, patience age-out) remains
 bounded. The orchestrator retains
 the verdict rather than reducing it to a boolean, and executes its reclaim commands through the same shared
-reclaim owner as preload and dispatch admission. For a post-processing head this plan may move safety off-GPU
-when `whole_card_residency_safety_off_gpu` permits it, and only when no idle-model eviction or safety weight
-demotion is on the plan and moving safety alone covers the measured deficit (the same room breakdown the
-starved-head lane rungs test closability against). A deficit the demotion or an eviction may close is priced
-again on the next evaluation before safety is moved; a deficit larger than safety's footprint never moves it.
-The reserve bypass is
+reclaim owner as preload and dispatch admission. When no idle-model eviction, safety weight demotion or
+service-lane borrow is on the plan, a post-processing head is offered one lane move whose return alone covers
+the measured deficit (the same room breakdown the starved-head lane rungs test closability against). The idle
+image-utilities lane comes first: it shares the service pool with post-processing, so it is idle while
+post-processing runs, and pausing it leaves safety on the card. Safety off-GPU follows when
+`whole_card_residency_safety_off_gpu` permits it; it costs a process rebuild and puts every safety check on the
+CPU until the restore. The reclaim ladder books the utilities pause as a restore obligation and restarts the
+lane once the card reads `HEALTHY`. A deficit the demotion or an eviction may close is priced again on the next
+evaluation before a lane is moved; a deficit larger than a lane's return never moves it. The reserve bypass is
 preserved: a disabled VRAM budget or a zero-peak chain always admits. The lane's non-memory guards (the
 allocator-guard cap fault and sampling co-residency hold) stay.
 
@@ -807,6 +810,12 @@ with the same forecast dwell (the memory that pause returned is part of what the
 A **whole-card residency** pause does not: it ends when its own model drains, and holding it to a memory
 forecast would leave a card that hosts one heavy resident without an on-GPU safety process for the session.
 
+A shallow safety backlog (one or two checks, `SAFETY_BACKLOG_PRIORITY_DEPTH`) holds a placement-owned restore
+off, so the off-GPU process drains it rather than paying a rebuild for it. A **reclaim-ladder** pause is exempt:
+a CPU check takes many times its GPU time, so a backlog of one or two is the steady state of a CPU placement, and
+the veto would keep a pause the ladder took for a starved head in place for as long as images keep arriving. The
+ladder's restore still waits out the forecast dwell and any unready placement rebuild.
+
 A deferred safety GPU start that makes no headroom progress for the no-progress window is started on the CPU by
 the lifecycle manager (see [deferred GPU starts](process_lifecycle.md#process-replacement)) and recorded under
 this policy's own pause owner. A start whose requirement exceeds its card's achievable ceiling is escalated on the
@@ -880,9 +889,11 @@ The room is also what the other frames read, so they cannot disagree with the ve
   retirement.
 - **The service lanes enter the ladder** for a starved head once weight reclaim, cache release and the
   idle-context teardown have nothing left: the post-processing lane, then safety off the card, then the
-  utilities lane, one per evaluation and only when the permitted rungs would close the deficit. Each pause is
-  booked with the reclaim ladder as a restore obligation, so the lane comes back LIFO with the rest once the
-  governor calls the card healthy. `starved_head_lane_reclaim` withholds the rungs; `starved_head_utilities_pause`
+  utilities lane, one per evaluation and only when the permitted rungs would close the deficit. The reclaim
+  ladder books each post-processing or utilities pause it actuates through `execute_arbiter_commands` as a
+  restore obligation, held for the job the head's `HeadReclaimContext` names, so the lane comes back LIFO with
+  the rest once the governor calls the card healthy and that job is served. The VAE and component pauses the
+  post-processing drain borrows are not booked there; the drain returns them. `starved_head_lane_reclaim` withholds the rungs; `starved_head_utilities_pause`
   withholds the last one.
 - **The measured-load probe** fires once the ladder is empty and the head has starved `measured_load_probe_seconds`
   (the teardown grace by default). It never pre-empts a rung that could close the deficit, and a shortfall

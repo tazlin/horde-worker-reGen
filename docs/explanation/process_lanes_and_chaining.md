@@ -164,8 +164,8 @@ the one loan), and returned once no job has been actively post-processed for a b
 jobs remain queued. A loan released this way is not re-borrowed for the same stalled episode (so the lane is
 not thrashed), and re-borrowing is re-enabled once the queue fully drains.
 
-A pause the scheduler books for a job that cannot be admitted records that job as its **beneficiary**
-(`ReclaimLadder.record_lane_pause`). The ladder restores the lane only once every recorded beneficiary has
+A lane pause the reclaim ladder actuates for a job that cannot be admitted records that job, named in the
+head's `HeadReclaimContext`, as its **beneficiary** (`ReclaimLadder.record_lane_pause`). The ladder restores the lane only once every recorded beneficiary has
 finished sampling or left the queue (`InferenceScheduler.job_awaits_admission`), as well as the card reading
 `HEALTHY` and no head being parked. The first denoise step is too early: the head's component keeps
 materialising through the sample, and on a card the arbiter had to clear the paused lanes' contexts and that

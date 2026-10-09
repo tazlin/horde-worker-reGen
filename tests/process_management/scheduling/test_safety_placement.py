@@ -942,6 +942,53 @@ class TestSafetyBacklogPriority:
         harness.lifecycle.pause_safety_on_gpu.assert_not_called()
         assert harness.scheduler.safety_placement.pressure_since is None
 
+    async def test_a_shallow_backlog_does_not_hold_off_a_ladder_restore(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A ladder-owned pause returns on proven headroom while one check waits.
+
+        Each check takes many times longer on the CPU than on the card, so a backlog of one or two is the
+        steady state of a CPU placement and would otherwise hold the restore off for as long as images arrive.
+        """
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RECLAIM_LADDER)
+        _pin_evidence(harness, headroom_fits=True)
+        await _queue_safety_backlog(harness.scheduler, depth=1)
+
+        harness.reconcile_over(harness.restore_dwell_seconds + 4.0)
+
+        harness.lifecycle.restore_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RECLAIM_LADDER)
+
+    async def test_a_ladder_restore_still_waits_for_a_pending_rebuild(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Lifting the shallow-backlog veto for the ladder never lets a restore chain onto an unready rebuild."""
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RECLAIM_LADDER)
+        harness.lifecycle.safety_placement_transition_pending = True
+        _pin_evidence(harness, headroom_fits=True)
+        await _queue_safety_backlog(harness.scheduler, depth=1)
+
+        harness.reconcile_over(harness.restore_dwell_seconds * 3.0)
+
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
+
+    async def test_a_shallow_backlog_still_holds_off_a_placement_restore(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The placement policy's own pause keeps its placement inertia while a shallow backlog drains."""
+        harness = _placement_harness(monkeypatch)
+        harness.pause_and_settle(PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        _pin_evidence(harness, headroom_fits=True)
+        await _queue_safety_backlog(harness.scheduler, depth=1)
+
+        harness.reconcile_over(harness.restore_dwell_seconds + 4.0)
+
+        harness.lifecycle.restore_safety_on_gpu.assert_not_called()
+
 
 class TestFixedMultiGpuSafetyResidency:
     """A pinned safety process on a multi-card worker stays resident and gets a backlog relief valve."""

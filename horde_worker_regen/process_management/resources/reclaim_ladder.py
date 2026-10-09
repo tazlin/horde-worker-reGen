@@ -179,6 +179,13 @@ _PAUSED_LANE_NAMES: dict[ReclaimRungKind, str] = {
 """The lane each pause rung stops, as the log lines about that lane call it."""
 
 
+_ARBITER_LANE_PAUSE_BOOKINGS: dict[ActuatorCommandKind, tuple[ReclaimRungKind, str]] = {
+    ActuatorCommandKind.PAUSE_POST_PROCESS_LANE: (ReclaimRungKind.PAUSE_PP_LANE, "post_process_lane"),
+    ActuatorCommandKind.PAUSE_UTILITIES_LANE: (ReclaimRungKind.PAUSE_UTILITIES_LANE, "utilities_lane"),
+}
+"""The arbiter lane pauses the ladder books as restore obligations, with the rung kind and lane label each books."""
+
+
 def _paused_lane_name(kind: ReclaimRungKind) -> str:
     """The lane a pause rung stops, in words; the rung kind's own value for a kind that stops no lane."""
     return _PAUSED_LANE_NAMES.get(kind, kind.value)
@@ -725,9 +732,10 @@ class VerifiedReclaimLadder:
         promised_mb: float,
         beneficiary: str | None = None,
     ) -> None:
-        """Book a lane pause the per-cycle admission path issued for a starved head as a restore obligation.
+        """Book a lane pause the per-cycle path issued as a restore obligation.
 
-        The arbiter's ladder can stop a service lane for a head whose deficit nothing cheaper closes; that
+        The arbiter's ladder can stop a service lane for a head or post-processing job whose deficit nothing
+        cheaper closes (:meth:`execute_arbiter_commands` books each such pause it actuates); that
         pause is taken outside any saturation episode, so without a record nothing would bring the lane back.
         Booking it here puts the restart on the same footing as a ladder-issued pause: unwound LIFO with the
         rest once the governor calls the card HEALTHY, through the owner-guarded restore path. Idempotent per
@@ -1140,4 +1148,32 @@ class VerifiedReclaimLadder:
                 acted = False
             if acted:
                 applied.append(command)
+                self._book_arbiter_lane_pause(command, device_index=device_index, head=head)
         return tuple(applied)
+
+    def _book_arbiter_lane_pause(
+        self,
+        command: ActuatorCommand,
+        *,
+        device_index: int | None,
+        head: HeadReclaimContext | None,
+    ) -> None:
+        """Book a lane pause the per-cycle path just actuated as this ladder's restore obligation.
+
+        The ladder owns every lane restore, so a pause taken outside a saturation episode is unwound with the
+        rest once the card is HEALTHY, held for the head's job when the caller names one. The VAE and component
+        lanes are not booked: the post-processing drain borrows them and holds the loan while a job uses it, and
+        a HEALTHY unwind would end that loan under the job.
+        """
+        booking = _ARBITER_LANE_PAUSE_BOOKINGS.get(command.kind)
+        if booking is None:
+            return
+        rung_kind, tenant_label = booking
+        # The per-cycle verdict prices no per-lane return, and an unwound obligation reads none.
+        self.record_lane_pause(
+            device_index,
+            rung_kind,
+            tenant_label=tenant_label,
+            promised_mb=0.0,
+            beneficiary=head.beneficiary if head is not None else None,
+        )

@@ -114,7 +114,6 @@ from horde_worker_regen.process_management.resources.run_metrics import (
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     ActuatorCommand,
-    ActuatorCommandKind,
     DeviceVramState,
     HeadReclaimContext,
     MeasuredVramSnapshot,
@@ -1860,14 +1859,19 @@ class InferenceScheduler:
                 return
             if requested_owner is not None or residency_veto:
                 return
-            if 0 < safety_backlog_depth <= SAFETY_BACKLOG_PRIORITY_DEPTH:
+            pause_owner = self._process_lifecycle.safety_pause_owner
+            if pause_owner is None:
+                return
+            shallow_backlog = 0 < safety_backlog_depth <= SAFETY_BACKLOG_PRIORITY_DEPTH
+            if shallow_backlog and pause_owner is not PauseOwner.RECLAIM_LADDER:
+                # Placement inertia: the off-GPU process is left to drain a shallow backlog rather than paying a
+                # rebuild for it. A ladder pause is exempt because it was taken for a head, not for the backlog,
+                # and a CPU check takes many times its GPU time, so a backlog of one or two is the steady state
+                # of that placement and would hold the restore off for as long as images keep arriving.
                 return
             if ledger.post_processing_defers_restore(pp_backlog_depth):
                 return
             if self.is_vram_growth_held(safety_card):
-                return
-            pause_owner = self._process_lifecycle.safety_pause_owner
-            if pause_owner is None:
                 return
             if pause_owner in MEMORY_PRESSURE_PAUSE_OWNERS and not ledger.dwell_met(
                 ledger.headroom_since,
@@ -6896,7 +6900,7 @@ class InferenceScheduler:
                 f"Reclaiming idle VRAM.{suppressed_suffix(suppressed)}</>",
                 job.model,
             )
-        applied_actuations = self._executor.execute_actuations(
+        self._executor.execute_actuations(
             verdict.required_actuations,
             device_index=target_device_index,
             for_head_of_queue=is_head_blocker,
@@ -6904,10 +6908,8 @@ class InferenceScheduler:
                 model=job.model,
                 target_process_id=available_process.process_id,
                 max_resident=max_resident,
+                beneficiary=str(job.id_),
             ),
-        )
-        self._book_starved_head_lane_pauses(
-            applied_actuations, device_index=target_device_index, beneficiary=str(job.id_)
         )
         return False
 
@@ -7294,42 +7296,6 @@ class InferenceScheduler:
     def _starved_head_utilities_pause_permitted(self, device_index: int | None) -> bool:
         """Whether the image-utilities lane is among the lanes a starved head may stop on ``device_index``."""
         return bool(self._card_bridge_data(device_index).starved_head_utilities_pause)
-
-    def _book_starved_head_lane_pauses(
-        self,
-        applied: tuple[ActuatorCommand, ...],
-        *,
-        device_index: int | None,
-        beneficiary: str,
-    ) -> None:
-        """Book each lane pause the head path just actuated as a reclaim-ladder restore obligation.
-
-        The arbiter's starved-head rungs stop a service lane outside any saturation episode; the reclaim
-        ladder owns every restore, so the pause is recorded with it and comes back LIFO with the rest once the
-        card is healthy. Safety is not booked: its restore is the runtime placement policy, as for every other
-        safety-off rung.
-        """
-        if self._reclaim_ladder is None:
-            return
-        for command in applied:
-            if command.kind is ActuatorCommandKind.PAUSE_POST_PROCESS_LANE:
-                self._reclaim_ladder.record_lane_pause(
-                    device_index,
-                    ReclaimRungKind.PAUSE_PP_LANE,
-                    tenant_label="post_process_lane",
-                    promised_mb=self._marginal_process_overhead_mb(device_index)
-                    or _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
-                    beneficiary=beneficiary,
-                )
-            elif command.kind is ActuatorCommandKind.PAUSE_UTILITIES_LANE:
-                self._reclaim_ladder.record_lane_pause(
-                    device_index,
-                    ReclaimRungKind.PAUSE_UTILITIES_LANE,
-                    tenant_label="utilities_lane",
-                    promised_mb=self._marginal_process_overhead_mb(device_index)
-                    or _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
-                    beneficiary=beneficiary,
-                )
 
     def release_cache(self, process_id: int) -> bool:
         """Return an idle lane's cached allocator reservation to the device (:class:`VramActuator`)."""
@@ -11349,11 +11315,11 @@ class InferenceScheduler:
     ) -> tuple[ActuatorCommand, ...]:
         """Run a non-admitting materialisation verdict's evictions through the single reclaim owner.
 
-        The head's own target slot is spared, and each lane pause the starved-head rungs actuate is booked as
-        a reclaim-ladder restore obligation. The caller holds (dispatch or clearance) and re-asks next pass,
-        releasing once the arbiter verdicts FITS on the reclaimed room.
+        The head's own target slot is spared, and the ladder books each lane pause the starved-head rungs
+        actuate as a restore obligation held for this job. The caller holds (dispatch or clearance) and re-asks
+        next pass, releasing once the arbiter verdicts FITS on the reclaimed room.
         """
-        applied = self._executor.execute_actuations(
+        return self._executor.execute_actuations(
             verdict.required_actuations,
             device_index=priced.device_index,
             for_head_of_queue=is_head_of_queue,
@@ -11361,10 +11327,9 @@ class InferenceScheduler:
                 model=job.model,
                 target_process_id=process_with_model.process_id,
                 max_resident=priced.max_resident,
+                beneficiary=str(job.id_),
             ),
         )
-        self._book_starved_head_lane_pauses(applied, device_index=priced.device_index, beneficiary=str(job.id_))
-        return applied
 
     def head_of_queue_is_parked(self) -> bool:
         """Whether the queue has stopped moving behind a head that is not dispatching.

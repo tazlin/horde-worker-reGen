@@ -251,6 +251,9 @@ class HeadReclaimContext:
     model: str | None
     target_process_id: int
     max_resident: int | None
+    beneficiary: str | None = None
+    """The id of the job a lane pause taken for this head serves; the reclaim ladder keeps the lane down until
+    that job is served or gone. None books the pause with no beneficiary."""
 
 
 class VramActuator(Protocol):
@@ -1336,10 +1339,12 @@ class VramArbiter:
         busy lane is never a target, and the request's own target slot is never asked to release the cache it
         is about to load into); EVICT_IDLE_MODEL is emitted only when an idle resident model exists to evict,
         and a PP_JOB takes the single-step EVICT_COLDEST_IDLE_MODEL in its place;
-        REDUCE_LIVE_CONTEXTS only when a warranted context reduction is available. A PP_JOB is offered
-        CYCLE_SAFETY_OFF_GPU only when no eviction or safety demotion is on the ladder and moving safety alone
-        covers the deficit: the process rebuild is the dearest rung, so it waits for the cheaper rungs to be priced
-        on an earlier evaluation and is never spent on a deficit it cannot close. An empty ladder therefore
+        REDUCE_LIVE_CONTEXTS only when a warranted context reduction is available. A PP_JOB with no eviction,
+        safety demotion or service-lane borrow on the ladder is offered one lane move whose return alone covers
+        the deficit: PAUSE_UTILITIES_LANE first, since that lane shares the service pool with post-processing and
+        so is idle while it runs, then CYCLE_SAFETY_OFF_GPU, which costs a process rebuild and leaves every safety
+        check on the CPU until the restore. Both wait for the cheaper rungs to be priced on an earlier evaluation
+        and neither is spent on a deficit it cannot close. An empty ladder therefore
         means the arbiter's own per-cycle reclamation is structurally exhausted: nothing the caller could run
         this cycle would free memory. The commands are described for the caller to execute; the arbiter runs
         none of them.
@@ -1382,15 +1387,19 @@ class VramArbiter:
             elif state.component_lane_context_count > 0 and state.component_lane_reclaim_allowed:
                 commands.append(ActuatorCommand(kind=ActuatorCommandKind.PAUSE_COMPONENT_LANE, device_index=None))
                 service_lane_added = True
-        if (
-            request.kind is VramRequestKind.PP_JOB
-            and not service_lane_added
-            and not weight_reclaim_offered
-            and state.safety_context_count > 0
-            and state.safety_reclaim_allowed
-            and self._safety_move_closes_deficit(state, request)
-        ):
-            commands.append(ActuatorCommand(kind=ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU, device_index=None))
+        if request.kind is VramRequestKind.PP_JOB and not service_lane_added and not weight_reclaim_offered:
+            if (
+                state.utilities_context_count > 0
+                and state.utilities_reclaim_allowed
+                and self._lane_move_closes_deficit(state, request, RoomRungKind.UTILITIES_LANE)
+            ):
+                commands.append(ActuatorCommand(kind=ActuatorCommandKind.PAUSE_UTILITIES_LANE, device_index=None))
+            elif (
+                state.safety_context_count > 0
+                and state.safety_reclaim_allowed
+                and self._lane_move_closes_deficit(state, request, RoomRungKind.SAFETY_OFF_GPU)
+            ):
+                commands.append(ActuatorCommand(kind=ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU, device_index=None))
         if not commands:
             lane_rung = self._starved_head_lane_rung(state, request)
             if lane_rung is not None:
@@ -1427,10 +1436,15 @@ class VramArbiter:
             return ActuatorCommand(kind=ActuatorCommandKind.PAUSE_UTILITIES_LANE, device_index=None)
         return None
 
-    def _safety_move_closes_deficit(self, state: DeviceVramState, request: VramRequest) -> bool:
-        """Whether moving safety off the card alone would cover this request's measured deficit.
+    def _lane_move_closes_deficit(
+        self,
+        state: DeviceVramState,
+        request: VramRequest,
+        rung_kind: RoomRungKind,
+    ) -> bool:
+        """Whether the permitted ``rung_kind`` rung alone would cover this request's measured deficit.
 
-        Reads the room breakdown the verdict is priced from, so the deficit and safety's promised return are the
+        Reads the room breakdown the verdict is priced from, so the deficit and the lane's promised return are the
         same figures the starved-head closability test uses. A fixed safety residency lists no rung and so never
         qualifies.
         """
@@ -1438,8 +1452,7 @@ class VramArbiter:
         if room is None or room.deficit_mb <= 0:
             return False
         return any(
-            rung.kind is RoomRungKind.SAFETY_OFF_GPU and rung.permitted and rung.promised_mb >= room.deficit_mb
-            for rung in room.rungs
+            rung.kind is rung_kind and rung.permitted and rung.promised_mb >= room.deficit_mb for rung in room.rungs
         )
 
     @staticmethod

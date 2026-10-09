@@ -6,8 +6,9 @@ head waited on a fit nothing produced. The lanes now enter the ladder for a star
 one per evaluation, only past the teardown grace, only when the permitted rungs would close the deficit, and
 never when policy withholds lane reclaim.
 
-A post-processing job's safety cycle answers to the same closability test: offered only when no eviction or
-demotion is on the ladder and moving safety alone covers the deficit.
+A post-processing job's lane moves answer to the same closability test: offered only when no eviction or
+demotion is on the ladder, the idle utilities lane before the safety cycle, each only when its return alone
+covers the deficit.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ def _lane_state(
     post_process: bool = True,
     safety: bool = False,
     utilities: bool = False,
+    utilities_reserved_mb: float = 554.0,
     device_free_mb: float = 20157.0,
 ) -> DeviceVramState:
     """The head's own context beside the service lanes named, with no idle sibling and no idle model."""
@@ -47,7 +49,7 @@ def _lane_state(
         reserved[1] = 808.0
     if utilities:
         lanes[4] = TenantLane.UTILITIES
-        reserved[4] = 554.0
+        reserved[4] = utilities_reserved_mb
     if safety:
         lanes[0] = TenantLane.SAFETY
     return DeviceVramState(
@@ -150,11 +152,21 @@ def test_a_non_head_and_a_post_processing_request_never_reach_the_lane_rungs() -
 _PP_CANDIDATE_MB = 8000.0
 
 
-def _pp_job_short_by(deficit_mb: float, **overrides: object) -> tuple[DeviceVramState, VramRequest]:
-    """A post-processing job on its own lane, short of room by ``deficit_mb``, beside an on-card safety."""
+def _pp_job_short_by(
+    deficit_mb: float,
+    *,
+    utilities_reserved_mb: float | None = None,
+    **overrides: object,
+) -> tuple[DeviceVramState, VramRequest]:
+    """A post-processing job on its own lane, short of room by ``deficit_mb``, beside an on-card safety.
+
+    ``utilities_reserved_mb`` adds an idle image-utilities lane holding that reservation.
+    """
     state = _lane_state(
         post_process=True,
         safety=True,
+        utilities=utilities_reserved_mb is not None,
+        utilities_reserved_mb=utilities_reserved_mb or 0.0,
         device_free_mb=_PP_CANDIDATE_MB + _NOISE_MB - deficit_mb,
     )
     request = _head(
@@ -194,3 +206,20 @@ def test_a_post_processing_job_with_an_evictable_resident_is_not_offered_the_saf
     state, request = _pp_job_short_by(2000.0, has_reclaimable_idle_model=True)
 
     assert _kinds(_verdict(state, request)) == [ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL]
+
+
+def test_a_post_processing_deficit_the_idle_utilities_lane_closes_is_offered_that_lane() -> None:
+    """The utilities lane shares the service pool, so it is idle while post-processing runs and costs no rebuild.
+
+    Pausing it keeps safety on the card, where a check takes a fraction of the time it takes on the CPU.
+    """
+    state, request = _pp_job_short_by(2000.0, utilities_reserved_mb=2700.0)
+
+    assert _kinds(_verdict(state, request)) == [ActuatorCommandKind.PAUSE_UTILITIES_LANE]
+
+
+def test_a_post_processing_deficit_the_utilities_lane_cannot_close_is_offered_the_safety_cycle() -> None:
+    """A utilities lane holding less than the deficit is churn; safety, which covers it, is moved instead."""
+    state, request = _pp_job_short_by(2000.0, utilities_reserved_mb=554.0)
+
+    assert _kinds(_verdict(state, request)) == [ActuatorCommandKind.CYCLE_SAFETY_OFF_GPU]

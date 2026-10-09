@@ -20,7 +20,11 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import (
     build_reclaim_ladder,
     execute_reclaim_rung,
 )
-from horde_worker_regen.process_management.resources.vram_arbiter import ActuatorCommand, ActuatorCommandKind
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    ActuatorCommand,
+    ActuatorCommandKind,
+    HeadReclaimContext,
+)
 
 
 class _FakeActuator:
@@ -1128,6 +1132,102 @@ class TestStarvedHeadLanePauseObligation:
         )
         assert actuator.calls == [("restore_pp", None)]
         assert engine.episode_holds_paused_lane(0) is False
+
+    @staticmethod
+    def _pause_through_the_arbiter_path(
+        engine: VerifiedReclaimLadder,
+        kind: ActuatorCommandKind,
+        *,
+        head: HeadReclaimContext | None = None,
+    ) -> tuple[ActuatorCommand, ...]:
+        actuator = Mock()
+        actuator.pause_post_process_lane.return_value = True
+        actuator.pause_utilities_lane.return_value = True
+        actuator.pause_vae_lane.return_value = True
+        actuator.pause_component_lane.return_value = True
+        return engine.execute_arbiter_commands(
+            (ActuatorCommand(kind=kind, device_index=None),),
+            actuator,
+            device_index=0,
+            for_head_of_queue=True,
+            head=head,
+        )
+
+    def test_a_utilities_pause_the_arbiter_path_actuates_is_unwound_once_when_healthy(self) -> None:
+        """A pause the per-cycle path takes, re-asked every cycle, is one obligation the HEALTHY unwind restores.
+
+        The post-processing path names no head, so nothing holds the restore past the card reading HEALTHY.
+        """
+        engine = VerifiedReclaimLadder()
+        for _ in range(3):
+            applied = self._pause_through_the_arbiter_path(engine, ActuatorCommandKind.PAUSE_UTILITIES_LANE)
+            assert [command.kind for command in applied] == [ActuatorCommandKind.PAUSE_UTILITIES_LANE]
+        assert engine.episode_holds_paused_lane(0) is True
+
+        actuator = _FakeActuator()
+        engine.on_tick(
+            0, saturated=False, healthy=True, device_free_mb=9000.0, actuator=actuator, ladder_builder=tuple
+        )
+
+        assert actuator.calls == [("restore_utilities", None)]
+        assert engine.episode_holds_paused_lane(0) is False
+
+    def test_a_head_pause_is_held_for_the_beneficiary_the_head_names(self) -> None:
+        """The head's job id travels with its reclaim context, so its lane stays down until it is served."""
+        engine = VerifiedReclaimLadder()
+        head = HeadReclaimContext(model="m", target_process_id=2, max_resident=None, beneficiary="job-a")
+        self._pause_through_the_arbiter_path(engine, ActuatorCommandKind.PAUSE_POST_PROCESS_LANE, head=head)
+        waiting = {"job-a"}
+        actuator = _FakeActuator()
+        tick = {
+            "saturated": False,
+            "healthy": True,
+            "device_free_mb": 9000.0,
+            "actuator": actuator,
+            "ladder_builder": tuple,
+            "lane_beneficiary_waiting": waiting.__contains__,
+        }
+
+        engine.on_tick(0, **tick)
+        assert actuator.calls == []
+
+        waiting.clear()
+        engine.on_tick(0, **tick)
+        assert actuator.calls == [("restore_pp", None)]
+
+    def test_a_disaggregation_lane_borrow_is_left_to_the_post_processing_drain(self) -> None:
+        """The drain holds a VAE or component loan while a job uses it; a HEALTHY unwind would end the loan early."""
+        engine = VerifiedReclaimLadder()
+        self._pause_through_the_arbiter_path(engine, ActuatorCommandKind.PAUSE_VAE_LANE)
+        self._pause_through_the_arbiter_path(engine, ActuatorCommandKind.PAUSE_COMPONENT_LANE)
+
+        assert engine.episode_holds_paused_lane(0) is False
+
+    def test_the_head_path_books_its_lane_pause_once_through_the_ladder(self) -> None:
+        """A materialisation head's lane pause is booked by the ladder alone, carrying the head's job id."""
+        from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
+
+        scheduler = _make_inference_scheduler()
+        engine = VerifiedReclaimLadder()
+        engine.record_lane_pause = Mock(wraps=engine.record_lane_pause)  # type: ignore[method-assign]
+        scheduler.set_reclaim_ladder(engine)
+        scheduler.pause_utilities_lane = Mock(return_value=True)  # type: ignore[method-assign]
+        job = Mock(model="m", id_="job-a")
+        verdict = Mock(
+            required_actuations=(ActuatorCommand(kind=ActuatorCommandKind.PAUSE_UTILITIES_LANE, device_index=None),),
+        )
+
+        applied = scheduler._actuate_materialization_verdict(
+            job,
+            Mock(process_id=2),
+            Mock(device_index=0, max_resident=None),
+            verdict,
+            is_head_of_queue=True,
+        )
+
+        assert [command.kind for command in applied] == [ActuatorCommandKind.PAUSE_UTILITIES_LANE]
+        engine.record_lane_pause.assert_called_once()
+        assert engine.record_lane_pause.call_args.kwargs["beneficiary"] == "job-a"
 
 
 class TestArbiterCommandExecution:
