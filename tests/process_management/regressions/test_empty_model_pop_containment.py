@@ -261,6 +261,26 @@ class TestChildSurvivesABadPreloadArgument:
             ModelLoadState.LOADED_IN_RAM,
         ) in proc.reported_states()
 
+    def test_a_host_commit_refusal_is_reported_under_its_marker_without_ending_the_process(self) -> None:
+        """The host refusing the checkpoint mapping leaves the slot alive and names the cause for the parent."""
+        from hordelib.execution.zero_copy_load import HostCommitError
+
+        from horde_worker_regen.process_management.ipc.messages import HOST_COMMIT_FAILED_INFO
+
+        proc = _PreloadStubProcess.build(preload_error=HostCommitError("The host could not commit a mapping"))
+
+        proc._control_inbox.put(_preload_message("Krea2-Turbo_fp8"))
+        proc.receive_and_handle_control_messages()
+
+        assert proc._end_process is False
+        assert (
+            HordeProcessState.PRELOADING_FAILED,
+            "Krea2-Turbo_fp8",
+            ModelLoadState.FAILED,
+        ) in proc.reported_states()
+        infos = [call.kwargs.get("info") for call in proc.on_horde_model_state_change.call_args_list]  # pyrefly: ignore
+        assert HOST_COMMIT_FAILED_INFO in infos
+
     def test_a_genuine_preload_failure_still_ends_the_process(self) -> None:
         """Containment is scoped: a failure part-way through a real load still replaces the slot."""
         proc = _PreloadStubProcess.build(preload_error=RuntimeError("CUDA error: an illegal memory access"))

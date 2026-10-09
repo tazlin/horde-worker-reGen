@@ -244,6 +244,41 @@ class TestReceiveAndHandleProcessMessages:
             hmm.root.get("Z-Image-Turbo") is None or not hmm.root["Z-Image-Turbo"].horde_model_load_state.is_active()
         )
 
+    async def test_host_commit_refusal_is_not_counted_against_the_model(self) -> None:
+        """A FAILED load the host refused to commit expires the entry and never reaches the failure handler."""
+        from horde_worker_regen.process_management.ipc.messages import (
+            HOST_COMMIT_FAILED_INFO,
+            HordeModelStateChangeMessage,
+            ModelLoadState,
+        )
+
+        process_info = make_mock_process_info(0, model_name="Krea2-Turbo_fp8")
+        process_info.process_launch_identifier = 0
+        process_map = ProcessMap({0: process_info})
+        hmm = HordeModelMap(root={})
+        hmm.update_entry(horde_model_name="Krea2-Turbo_fp8", load_state=ModelLoadState.LOADING, process_id=0)
+
+        message_dispatcher = _make_dispatcher(process_map=process_map, horde_model_map=hmm)
+        seen: list[tuple[int, str]] = []
+        message_dispatcher.set_model_load_failure_handler(lambda pid, model: seen.append((pid, model)))
+
+        msg = Mock(spec=HordeModelStateChangeMessage)
+        msg.process_id = 0
+        msg.process_launch_identifier = 0
+        msg.horde_model_name = "Krea2-Turbo_fp8"
+        msg.horde_model_state = ModelLoadState.FAILED
+        msg.process_state = HordeProcessState.PRELOADING_FAILED
+        msg.info = HOST_COMMIT_FAILED_INFO
+        msg.time_elapsed = None
+        msg.vram_unload_refused = False
+
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert seen == []
+        entry = hmm.root.get("Krea2-Turbo_fp8")
+        assert entry is None or not entry.horde_model_load_state.is_active()
+
     async def test_torch_gpu_incompatible_latches_worker_state_flag(self) -> None:
         """A TORCH_GPU_INCOMPATIBLE report latches the sticky stop-popping flag and stores its reason."""
         process_info = make_mock_process_info(0)

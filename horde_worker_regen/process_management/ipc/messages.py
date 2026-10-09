@@ -23,6 +23,12 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import Downloa
 from horde_worker_regen.process_management.models.download_scheduler import DownloadPriorityPolicy
 from horde_worker_regen.utils.image_utils import ImageEncoding
 
+HOST_COMMIT_FAILED_INFO = "host-commit-failed"
+"""Marker placed in a failed model-load report's ``info`` when the host refused to commit the checkpoint mapping.
+
+It is a host memory condition at map time. The parent neither counts it
+against the model nor replaces the process, which holds nothing half-loaded."""
+
 AUX_RESOLVE_FAILED_INFO = "aux-resolve-failed"
 """Marker placed in a faulted inference result's ``info`` when a child cannot resolve a job's auxiliary files.
 

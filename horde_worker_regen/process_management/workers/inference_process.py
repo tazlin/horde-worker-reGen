@@ -27,6 +27,7 @@ from horde_worker_regen.consts import SamplerTruncationRecord, sampler_truncatio
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AUX_RESOLVE_FAILED_INFO,
+    HOST_COMMIT_FAILED_INFO,
     AuxModelKind,
     AuxModelRef,
     HordeControlFlag,
@@ -181,6 +182,20 @@ Deliberately narrow. The backend raises this while resolving the requested name 
 before it opens or maps a single weight file, which is what makes the failure safe to survive: the process
 holds no half-initialised state afterwards. Every other preload failure keeps ending the process, because a
 failure part-way through a real load leaves torch and the backend in an unknown condition."""
+
+
+def _is_host_commit_error(error: BaseException) -> bool:
+    """Whether a preload failure is the host refusing to commit the checkpoint mapping.
+
+    The backend's mapping guard raises before any weight is adopted, so the process holds nothing half-loaded
+    and may stay available. Imported lazily because the guard lives in the backend package, which a dry-run
+    process never imports.
+    """
+    try:
+        from hordelib.execution.zero_copy_load import HostCommitError
+    except ImportError:
+        return False
+    return isinstance(error, HostCommitError)
 
 
 def _is_model_unavailable_error(error: BaseException) -> bool:
@@ -553,6 +568,7 @@ class HordeInferenceProcess(HordeProcess):
         horde_model_state: ModelLoadState,
         time_elapsed: float | None = None,
         vram_unload_refused: bool = False,
+        info: str | None = None,
     ) -> None:
         """Update the main process with the current process state and model state.
 
@@ -564,12 +580,14 @@ class HordeInferenceProcess(HordeProcess):
                 Defaults to None.
             vram_unload_refused (bool, optional): Whether the device refused this VRAM unload, so the
                 parent keeps the slot recorded as VRAM-resident. Defaults to False.
+            info (str | None, optional): A marker the parent reads for the cause of a failed load
+                (:data:`HOST_COMMIT_FAILED_INFO`). None sends the descriptive default.
         """
         model_update_message = HordeModelStateChangeMessage(
             process_state=process_state,
             process_id=self.process_id,
             process_launch_identifier=self.process_launch_identifier,
-            info=f"Model {horde_model_name} {horde_model_state.name}",
+            info=f"Model {horde_model_name} {horde_model_state.name}" if info is None else info,
             horde_model_name=horde_model_name,
             horde_model_state=horde_model_state,
             time_elapsed=time_elapsed,
@@ -801,6 +819,18 @@ class HordeInferenceProcess(HordeProcess):
                     logger.error(
                         f"Failed to preload model {horde_model_name}: {type(preload_error).__name__} {preload_error}",
                     )
+                    if _is_host_commit_error(preload_error):
+                        # The host refused the checkpoint mapping before a weight was adopted, which is a
+                        # memory condition of the moment. Reported under its own marker so the parent counts
+                        # nothing against the model, and the slot stays available for the next load the
+                        # admission lets through.
+                        self.on_horde_model_state_change(
+                            process_state=HordeProcessState.PRELOADING_FAILED,
+                            horde_model_name=horde_model_name,
+                            horde_model_state=ModelLoadState.FAILED,
+                            info=HOST_COMMIT_FAILED_INFO,
+                        )
+                        return
                     self.on_horde_model_state_change(
                         process_state=HordeProcessState.PRELOADING_FAILED,
                         horde_model_name=horde_model_name,

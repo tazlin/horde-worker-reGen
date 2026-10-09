@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.config.worker_state import WorkerStat
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.messages import (
     AUX_RESOLVE_FAILED_INFO,
+    HOST_COMMIT_FAILED_INFO,
     HordeAlchemyResultMessage,
     HordeAnnotationResultMessage,
     HordeAnnotatorAvailabilityMessage,
@@ -1498,10 +1499,19 @@ class MessageDispatcher:
             # this process held for it (left by the PRELOADING_MODEL message moments earlier) so the model is
             # not pinned to a slot that never actually loaded it, then hand the failure to the manager so it
             # can track repeated failures and quarantine the model.
+            self._horde_model_map.expire_entry(message.horde_model_name)
+            if message.info == HOST_COMMIT_FAILED_INFO:
+                # The host refused the checkpoint mapping: a memory condition at map time, which the RAM
+                # admission re-judges on the next pass. The model is not implicated and the slot stays up, so
+                # nothing is counted against either.
+                logger.warning(
+                    f"Process {message.process_id} could not map {message.horde_model_name} because the host refused "
+                    "to commit the checkpoint mapping. The load will be re-admitted against host memory.",
+                )
+                return
             logger.error(
                 f"Process {message.process_id} failed to load model {message.horde_model_name}",
             )
-            self._horde_model_map.expire_entry(message.horde_model_name)
             if self._on_model_load_failure is not None:
                 self._on_model_load_failure(message.process_id, message.horde_model_name)
             return
