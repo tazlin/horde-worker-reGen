@@ -1557,8 +1557,34 @@ class _PlannedReserve:
     """The process the charge will materialise on."""
     reserved_at_admit_mb: float
     """The target's measured allocator reservation (MB) when the charge was admitted."""
+    growth_baseline_mb: float
+    """The lowest reservation (MB) the target has reported since admission, which growth is measured from.
+
+    A lane can release memory after the charge is booked, as a dispatch's own lane does when it unloads its
+    previous model. Measured from the admit-time reading, what the lane then allocates for the charge reads as
+    no growth, and the charge stays outstanding beside the allocation it describes."""
     materialized_watermark_mb: float = 0.0
-    """The greatest reserved-growth (MB) past admit ever observed for this entry; ratchets up, never down."""
+    """The greatest reserved-growth (MB) past the baseline ever observed for this entry. It only ever rises."""
+
+    def materialised_mb(self, process_reserved_by_pid: Mapping[int, float]) -> float:
+        """Return how much of the charge has materialised against these readings, without recording anything.
+
+        A target absent from the readings has shown no growth and leaves the baseline where it was.
+        """
+        current_reserved = process_reserved_by_pid.get(self.target_process_id)
+        if current_reserved is None:
+            return self.materialized_watermark_mb
+        return max(self.materialized_watermark_mb, max(0.0, current_reserved - self.growth_baseline_mb))
+
+    def observe(self, process_reserved_by_pid: Mapping[int, float]) -> None:
+        """Ratchet the watermark up by any new growth, then lower the baseline to a lower present reading.
+
+        The watermark is taken first, so growth already seen stays consumed whatever the baseline becomes.
+        """
+        self.materialized_watermark_mb = self.materialised_mb(process_reserved_by_pid)
+        current_reserved = process_reserved_by_pid.get(self.target_process_id)
+        if current_reserved is not None:
+            self.growth_baseline_mb = min(self.growth_baseline_mb, max(0.0, current_reserved))
 
 
 @dataclass
@@ -1638,22 +1664,25 @@ class CommittedReserveLedger:
             vram_mb: The planned charge (MB); stored as zero when non-positive.
             target_process_id: The process the charge will materialise on, whose measured reservation decays it.
             reserved_at_admit_mb: The target's measured allocator reservation (MB) at admit time; growth beyond
-                this figure is treated as the planned charge materialising.
+                this figure, or beyond any lower reading the target reports later, is treated as the planned
+                charge materialising.
         """
         self._planned[(flow, unit)] = _PlannedReserve(
             vram_mb=max(0.0, vram_mb),
             target_process_id=target_process_id,
             reserved_at_admit_mb=max(0.0, reserved_at_admit_mb),
+            growth_baseline_mb=max(0.0, reserved_at_admit_mb),
         )
 
     def effective_planned_vram_mb(self, process_reserved_by_pid: dict[int, float]) -> float:
         """Return the combined planned VRAM (MB) still outstanding, each entry decayed by what has materialised.
 
         For each planned entry the materialised amount is the high-water mark of
-        ``max(0, current_reserved - reserved_at_admit)`` seen for its target process, and the entry's
-        outstanding charge is ``max(0, planned - materialised)``. Summing these gives the planned overlay the
-        admission identity adds on top of the measured committed floor without double-counting a load that is
-        partway into VRAM.
+        ``max(0, current_reserved - baseline)`` seen for its target process, the baseline being the lowest
+        reservation the target has reported since admission, and the entry's outstanding charge is
+        ``max(0, planned - materialised)``. Summing these gives the planned overlay the admission identity adds on
+        top of the measured committed floor without double-counting a load that is partway into VRAM. This
+        per-cycle call is the one that records each entry's watermark and baseline.
 
         Consumption is monotonic: each call ratchets the entry's watermark up by any newly-observed growth and
         never lowers it. This is what stops a materialised-then-evicted anchor from resurrecting: once the
@@ -1664,14 +1693,11 @@ class CommittedReserveLedger:
 
         Args:
             process_reserved_by_pid: Current measured allocator reservation (MB) keyed by process id; a target
-                absent from the map is treated as holding zero (nothing has materialised for it yet).
+                absent from the map has shown no growth (nothing has materialised for it yet).
         """
         total = 0.0
         for entry in self._planned.values():
-            current_reserved = process_reserved_by_pid.get(entry.target_process_id, 0.0)
-            materialised = max(0.0, current_reserved - entry.reserved_at_admit_mb)
-            if materialised > entry.materialized_watermark_mb:
-                entry.materialized_watermark_mb = materialised
+            entry.observe(process_reserved_by_pid)
             total += max(0.0, entry.vram_mb - entry.materialized_watermark_mb)
         return total
 
@@ -1688,14 +1714,12 @@ class CommittedReserveLedger:
             flow: The workload flow namespace the unit lives under.
             unit: The unit-of-work key within the flow.
             process_reserved_by_pid: Current measured allocator reservation (MB) keyed by process id; a target
-                absent from the map is treated as holding zero.
+                absent from the map has shown no growth.
         """
         entry = self._planned.get((flow, unit))
         if entry is None:
             return 0.0
-        current_reserved = process_reserved_by_pid.get(entry.target_process_id, 0.0)
-        materialised = max(entry.materialized_watermark_mb, max(0.0, current_reserved - entry.reserved_at_admit_mb))
-        return max(0.0, entry.vram_mb - materialised)
+        return max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
 
     def effective_planned_vram_mb_for_flow(self, flow: str, process_reserved_by_pid: dict[int, float]) -> float:
         """Return one flow's planned VRAM (MB) still outstanding, each entry decayed by what has materialised.
@@ -1710,18 +1734,13 @@ class CommittedReserveLedger:
         Args:
             flow: The workload flow namespace whose planned charges are summed.
             process_reserved_by_pid: Current measured allocator reservation (MB) keyed by process id; a target
-                absent from the map is treated as holding zero.
+                absent from the map has shown no growth.
         """
         total = 0.0
         for (entry_flow, _unit), entry in self._planned.items():
             if entry_flow != flow:
                 continue
-            current_reserved = process_reserved_by_pid.get(entry.target_process_id, 0.0)
-            materialised = max(
-                entry.materialized_watermark_mb,
-                max(0.0, current_reserved - entry.reserved_at_admit_mb),
-            )
-            total += max(0.0, entry.vram_mb - materialised)
+            total += max(0.0, entry.vram_mb - entry.materialised_mb(process_reserved_by_pid))
         return total
 
     def set_planned_ram(

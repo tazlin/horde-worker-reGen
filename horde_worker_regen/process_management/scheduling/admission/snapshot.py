@@ -105,6 +105,12 @@ class SlotSnapshot:
     """The retained, reusable resident RSS (MB) a preload onto this slot can reuse instead of allocating."""
     checkpoint_models_held: frozenset[str]
     """Checkpoints staged in the slot's RAM component cache, by bare model name."""
+    staged_short_of_sampling: bool = False
+    """Whether the slot owns a dispatched job it has not started sampling: a clearance waiter or one cleared
+    and still loading."""
+    clearance_wait_entered: bool = False
+    """Whether the slot is staged and its child has entered its clearance wait for the job it owns, so its
+    encode is done and the device-free reading already holds everything it will hold until cleared."""
 
 
 @dataclass(frozen=True)
@@ -273,6 +279,8 @@ class DispatchHoldView:
     reclaim_requested: frozenset[str]
     pp_defer_holds: frozenset[str]
     clearance_hold_ids: frozenset[str]
+    clearance_granted_ids: frozenset[str] = frozenset()
+    """In-progress jobs the clearance gate has granted their load-and-sample window."""
 
 
 @dataclass(frozen=True)
@@ -449,6 +457,8 @@ def snapshot_slot(
         reserved_for_disaggregation=reserved_for_disaggregation,
         reuse_credit_mb=staging_reuse_credit_mb(process_info),
         checkpoint_models_held=checkpoint_models_held,
+        staged_short_of_sampling=process_info.is_staged_short_of_sampling(),
+        clearance_wait_entered=process_info.is_waiting_on_clearance(),
     )
 
 
@@ -477,6 +487,7 @@ def snapshot_ledgers(
             reclaim_requested=frozenset(dispatch_holds.reclaim_requested),
             pp_defer_holds=frozenset(dispatch_holds.pp_defer_holds),
             clearance_hold_ids=frozenset(dispatch_holds.clearance_hold_ids),
+            clearance_granted_ids=frozenset(dispatch_holds.clearance_granted_ids),
         ),
         retention=RetentionView(
             wddm_paging_active=retention.wddm_paging_active,

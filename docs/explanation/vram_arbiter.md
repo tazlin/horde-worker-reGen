@@ -305,7 +305,11 @@ The planned overlay carries each admitted-but-not-yet-materialised preload as an
 target process's measured reservation grows to cover it. Consumption is monotonic: an anchor is measured
 against the greatest growth ever seen for it, so once a preload has materialised, a later eviction that
 returns its VRAM to the card cannot resurrect the charge. A materialised anchor never re-charges; only a
-genuinely new admission on that process charges again. An anchor whose target process dies or ends before the
+genuinely new admission on that process charges again. Growth is measured from the lowest reservation the
+target has reported since admission. A lane that releases memory after the charge is booked, as a dispatched
+lane does when it unloads its previous model, would otherwise show no growth for what it then allocates, and the
+charge would stand beside the allocation it describes. A target with no reading leaves that baseline where it
+was. An anchor whose target process dies or ends before the
 load materialises decays by neither route (a dead target's reservation never grows), so the scheduler
 excludes ended and missing processes from the in-flight set it reconciles the overlay against: the charge is
 then released by omission, the same self-healing path a finished load takes, with no death-path delete to keep
@@ -336,6 +340,17 @@ releases those holdings too, so the achievable-ceiling test compares the outstan
 job's whole need, with what the emptied card offers. Every test against the card as it stands reads the
 outstanding charge alone. Without the held figure a job whose whole need exceeds the emptied card reads as
 possible on it, defers against a reading that never moves, and samples unpriced at its lease-acquire timeout.
+The clearance re-price also nets the part of other staged waiters' staging charges that describes nothing still
+to come (`sibling_staging_relief_mb`). A staging charge stands for the encode a staged job has yet to allocate.
+A waiter whose child has entered its clearance wait has finished its encode: the child marks the memory report
+it sends at that moment (`clearance_wait_entry`), and the parent stamps it on the slot, valid only at or after
+the slot's current ownership. Everything such a waiter holds is already inside the device-free reading, so its
+whole outstanding charge is netted. A waiter still encoding stays charged the staging charge less what it
+already holds. The primed state cannot stand in for the wait entry, because a child reports it on receiving the
+job, before the encode runs. A waiter the clearance gate has granted keeps its charge, since it is about to load
+its weights, and so does a slot past its staging. Charged the flat staging charge, a light sibling staged behind
+the head made the head read short by room the card already had, and both lanes waited for reclaim or their
+lease-acquire timeout.
 Second,
 a candidate whose weights already occupy VRAM on the target process is admitted directly as a no-op: dispatching
 (or preloading) onto an already-resident idle model materialises nothing, its weights are already in the

@@ -152,6 +152,7 @@ class TestReceiveAndHandleProcessMessages:
         msg.process_aimdo_mb = 10000
         msg.sampled_at = 1234.5
         msg.held_components = None
+        msg.clearance_wait_entry = False
         msg.info = "memory"
 
         _enqueue(message_dispatcher, msg)
@@ -536,6 +537,23 @@ class TestReceiveAndHandleProcessMessages:
         assert current.ram_usage_bytes == 32
         assert current.vram_usage_mb == 64
         assert current.total_vram_mb == 128
+
+    async def test_a_clearance_wait_entry_report_stamps_the_slot_at_its_sample_time(self) -> None:
+        """Only the report a child sends as its clearance wait begins stamps the wait, at the child's sample time."""
+        process_info = make_mock_process_info(0, state=HordeProcessState.INFERENCE_PRIMED)
+        process_info.process_launch_identifier = 0
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}))
+
+        _enqueue(message_dispatcher, _make_memory_message(0, ram_usage_bytes=1024))
+        await message_dispatcher.receive_and_handle_process_messages()
+        assert process_info.clearance_wait_entered_at is None
+
+        wait_entry = _make_memory_message(0, ram_usage_bytes=1024)
+        wait_entry.sampled_at = 1_234.5
+        wait_entry.clearance_wait_entry = True
+        _enqueue(message_dispatcher, wait_entry)
+        await message_dispatcher.receive_and_handle_process_messages()
+        assert process_info.clearance_wait_entered_at == 1_234.5
 
     async def test_process_ending_calls_on_process_ending(self) -> None:
         """When a process is ending, the process map's on_process_ending callback is called."""

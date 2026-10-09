@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.scheduling.admission.materialization 
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
+from horde_worker_regen.process_management.scheduling.workload_flow import DISPATCH_ADMISSION_FLOW
 
 
 class ClearanceDecision(StrEnum):
@@ -172,6 +173,43 @@ def staged_held_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -
     return peak_and_holdings[1] if peak_and_holdings is not None else 0.0
 
 
+def sibling_staging_relief_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float:
+    """The part (MB) of other staged waiters' staging charges on the card that pricing ``job_id`` nets out.
+
+    A staged waiter not yet cleared on the same card is charged only what its encode can still allocate. One
+    that has entered its clearance wait has finished its encode, so everything it holds is already inside the
+    device-free reading and its whole outstanding charge is netted. One still encoding stays charged the
+    staging charge less what it holds, never more than its outstanding charge. A cleared waiter is about to
+    load its weights and keeps its charge, as does a slot past its staging.
+    """
+    slot = snapshot.slots[process_id]
+    device_index = snapshot.routing_device_index(slot)
+    reserved_by_pid = dict(snapshot.card(device_index).reserved_by_pid)
+    ledger = snapshot.services.reserve_ledger
+    granted = snapshot.ledgers.dispatch_holds.clearance_granted_ids
+    relief_mb = 0.0
+    for sibling in snapshot.slots.values():
+        sibling_job_id = sibling.current_job_id
+        if (
+            sibling.process_id == process_id
+            or sibling_job_id is None
+            or sibling_job_id == job_id
+            or sibling_job_id in granted
+            or not sibling.staged_short_of_sampling
+            or sibling_job_id not in snapshot.queue.jobs
+            or snapshot.routing_device_index(sibling) != device_index
+        ):
+            continue
+        outstanding_mb = ledger.planned_charge_for_unit(DISPATCH_ADMISSION_FLOW, sibling_job_id, reserved_by_pid)
+        if sibling.clearance_wait_entered:
+            still_to_allocate_mb = 0.0
+        else:
+            held_mb = staged_held_mb(snapshot, sibling_job_id, sibling.process_id)
+            still_to_allocate_mb = max(0.0, pricing.STAGING_ENCODE_VRAM_MB - held_mb)
+        relief_mb += max(0.0, outstanding_mb - still_to_allocate_mb)
+    return relief_mb
+
+
 def _other_models_weights_mb(snapshot: SchedulingSnapshot, process_id: int, model: str) -> float:
     """The predicted weights (MB) of every model other than ``model`` whose weights the slot holds on the card."""
     metadata = snapshot.services.model_metadata
@@ -196,8 +234,10 @@ def decide_clearance_admit(
     because that predicate still logs and latches on the scheduler; it is consulted only for a priceable job.
     ``waiter_clock`` is the caller's clearance clock for the child, which times its measured-load probe in
     place of the head-starvation clock. A priced decision nets the job's own outstanding staging reservation
-    out of the overlay, since the full peak priced here already covers it, presents what the job already holds
-    so the ceiling test sees its whole need, and evaluates against the one frozen measurement the snapshot saw.
+    out of the overlay, since the full peak priced here already covers it, nets the part of other staged
+    waiters' staging charges they will not allocate (:func:`sibling_staging_relief_mb`), presents what the job
+    already holds so the ceiling test sees its whole need, and evaluates against the one frozen measurement the
+    snapshot saw.
     """
     slot = snapshot.slots.get(process_id)
     if slot is None:
@@ -228,6 +268,7 @@ def decide_clearance_admit(
             ),
         ),
         nets_own_dispatch_reservation=True,
+        sibling_staging_relief_mb=sibling_staging_relief_mb(snapshot, job_id, process_id),
     )
     verdict = arbiter.evaluate(priced.request)
     decision = ClearanceDecision.ADMIT if verdict.admits else ClearanceDecision.HOLD

@@ -240,6 +240,28 @@ class TestCommittedReserveLedger:
         # Reservation collapses: outstanding stays at the watermarked 3158, it does not climb back to 6158.
         assert ledger.effective_planned_vram_mb({3: 0.0}) == pytest.approx(3158.0)
 
+    def test_growth_is_measured_from_the_lowest_reading_since_admission(self) -> None:
+        """A target whose reading falls after admission is charged only for what it grew from that low reading.
+
+        Measured from the admit-time reading instead, a lane that unloads its previous model after dispatch shows
+        no growth however much it then allocates, so its whole charge stays outstanding beside what it holds.
+        """
+        ledger = CommittedReserveLedger()
+        ledger.set_planned("dispatch", "job-1", vram_mb=2048.0, target_process_id=3, reserved_at_admit_mb=2702.0)
+        # The previous model leaves the device: nothing of this charge has materialised.
+        assert ledger.effective_planned_vram_mb({3: 44.0}) == 2048.0
+        # The encode then allocates 510 MB from that floor.
+        assert ledger.planned_charge_for_unit("dispatch", "job-1", {3: 554.0}) == 1538.0
+        assert ledger.effective_planned_vram_mb({3: 554.0}) == 1538.0
+        assert ledger.effective_planned_vram_mb_for_flow("dispatch", {3: 554.0}) == 1538.0
+
+    def test_a_missing_reading_does_not_lower_the_growth_baseline(self) -> None:
+        """A target absent from the readings leaves the baseline where it was, so a later report is not all growth."""
+        ledger = CommittedReserveLedger()
+        ledger.set_planned("dispatch", "job-1", vram_mb=2048.0, target_process_id=3, reserved_at_admit_mb=2702.0)
+        assert ledger.effective_planned_vram_mb({}) == 2048.0
+        assert ledger.effective_planned_vram_mb({3: 3202.0}) == 1548.0
+
     def test_re_registering_a_unit_resets_the_watermark(self) -> None:
         """A genuinely new admission on the same unit charges in full again (a fresh entry, fresh watermark)."""
         ledger = CommittedReserveLedger()

@@ -520,8 +520,8 @@ class FakeInferenceProcess(HordeProcess):
             self._gpu_sampling_lease.begin_job()
 
     def _send_wait_entry_memory_report(self) -> None:
-        """Report memory as a job's clearance wait begins, as the real child's wait-entry callback does."""
-        self.send_memory_report_message(include_vram=True)
+        """Report memory as a job's clearance wait begins, marked as the real child's wait-entry report is."""
+        self.send_memory_report_message(include_vram=True, clearance_wait_entry=True)
 
     def _await_clearance(self) -> None:
         """Block where hordelib blocks the real child: at the sample call, until the parent grants clearance.

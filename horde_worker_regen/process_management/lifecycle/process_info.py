@@ -213,6 +213,12 @@ class HordeProcessInfo:
     """The job that requested the current preload, which is not evidence that inference started."""
     inference_ownership: InferenceExecutionOwnership | None
     """The job attempt this exact process launch owns after successful dispatch."""
+    clearance_wait_entered_at: float | None
+    """Wall-clock time the child last began waiting on its clearance permit, or None if it never has.
+
+    The child reports it as its encode finishes and its first acquire is about to block, which is the only
+    point at which the parent can tell a staged child that still allocates from one that holds all it will
+    until cleared: the primed state is reported on receipt of the job, before the encode runs."""
 
     current_inference_started_at: float | None
     """Epoch time inference was dispatched to this slot for its current job, or None when not inferring.
@@ -453,6 +459,7 @@ class HordeProcessInfo:
 
         self.preload_job_intent = None
         self.inference_ownership = None
+        self.clearance_wait_entered_at = None
         self.current_inference_started_at = None
         self.current_first_step_at = None
         self.current_job_expected_sampling_seconds = None
@@ -595,6 +602,22 @@ class HordeProcessInfo:
         if ownership.disaggregated:
             return state_follows_ownership and self.last_process_state == HordeProcessState.INFERENCE_PRIMED
         return not (state_follows_ownership and self.last_process_state in _INFERENCE_ACTIVE_STATES)
+
+    def note_clearance_wait_entered(self, entered_at: float) -> None:
+        """Record that the child began waiting on its clearance permit at wall-clock ``entered_at``."""
+        self.clearance_wait_entered_at = entered_at
+
+    def is_waiting_on_clearance(self) -> bool:
+        """Return whether this slot is staged short of sampling and its child has entered its clearance wait.
+
+        A wait entry counts only at or after the current ownership was recorded. An older one belongs to
+        an earlier job.
+        """
+        ownership = self.inference_ownership
+        entered_at = self.clearance_wait_entered_at
+        if ownership is None or entered_at is None or entered_at < ownership.recorded_at:
+            return False
+        return self.is_staged_short_of_sampling()
 
     def retire_inference_ownership(self, job: ImageGenerateJobPopResponse) -> bool:
         """Retire matching execution ownership while retaining resident-model attribution.

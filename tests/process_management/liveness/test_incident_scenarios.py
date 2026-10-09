@@ -3082,6 +3082,92 @@ async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has()
     )
 
 
+_SIBLING_ENCODE_MB = 554.0
+"""What the light sibling's encode holds on the card: about a quarter of the staging charge booked for it."""
+
+_SIBLING_CHARGE_CARD = _CardClass("sibling_charge", 11000.0)
+"""A card on which the clearance head fits beside its primed sibling only when the sibling is charged what it holds.
+
+When the outgoing sampler finishes the head has 6276 MB of measured free against a 550 MB noise buffer and a
+4927 MB remaining charge. The 1494 MB of the sibling's staging charge its encode never used would leave 4232 MB
+available, short of the head, and nothing on the card changes while two staged lanes wait."""
+
+
+async def test_r_a_primed_sibling_behind_the_clearance_head_is_charged_what_it_holds() -> None:
+    """A light sibling staged behind the clearance head does not hold the head off with its unused staging charge.
+
+    The failure this encodes: a staged waiter's dispatch books the flat encode staging charge, and the head
+    was priced against that charge for every other staged waiter. A sibling whose encode is done holds only
+    what the device-free reading already shows, so the rest of its charge described nothing on the card, and
+    the head read short by it. Slot order keeps the sibling from clearing first and nothing frees room while
+    both wait, so the head waited on lane reclaim or its lease-acquire timeout.
+
+    Three light lanes and one sampling slot: an outgoing sampler, then a large head and a small sibling staged
+    together as it finishes, the sibling's encode holding about a quarter of its charge. The head is cleared on
+    the tick after its staging, ahead of the sibling, with no reclaim rung and no lane reaching its
+    lease-acquire timeout.
+    """
+    world = _DispatchWorld(
+        card=_SIBLING_CHARGE_CARD,
+        lane_count=3,
+        max_threads=3,
+        queue_depth=3,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        gpu_sampling_lease_slots=1,
+        tick_seconds=_TICK_SECONDS,
+        staged_encode_mb_by_model={_SD15.name: _SIBLING_ENCODE_MB},
+    )
+    world.seed_resident(0, _SD15_C, in_vram=False)
+    world.seed_resident(1, _SD15_OTHER, in_vram=False)
+    world.seed_resident(2, _SD15, in_vram=False)
+    outgoing = make_job_pop_response(_SD15_C.name, width=512, height=512, ddim_steps=150)
+    head = make_job_pop_response(_SD15_OTHER.name, width=2048, height=2048, ddim_steps=20)
+    sibling = make_job_pop_response(_SD15.name, width=512, height=512, ddim_steps=20)
+    await world.pop(outgoing)
+    await world.step()
+    await world.pop(head)
+    await world.step()
+    await world.pop(sibling)
+    for _ in range(_CLEARANCE_TICKS):
+        await world.step()
+        if world.dispatch_tick(head) is not None and world.dispatch_tick(sibling) is not None:
+            break
+
+    context = "sibling staging charge"
+    grants = {job_id: tick for tick, _lane, job_id in world.clearance_grants}
+    head_window = world.job_windows.get(str(head.id_))
+    sibling_window = world.job_windows.get(str(sibling.id_))
+    assert head_window is not None and sibling_window is not None, (
+        f"{context}: both jobs must have been staged. {world.state_dump()}"
+    )
+    assert sibling_window.dispatched_at <= head_window.dispatched_at, (
+        f"{context}: precondition: the sibling must be staged by the head's first clearance pass, or the head is "
+        f"priced without it. {world.state_dump()}"
+    )
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, so the head was "
+        f"held for room the card already had. {world.state_dump()}"
+    )
+    assert str(head.id_) in grants and str(sibling.id_) in grants, (
+        f"{context}: both staged jobs must be cleared, the head first ({world.clearance_grants}). {world.state_dump()}"
+    )
+    assert grants[str(head.id_)] < grants[str(sibling.id_)], (
+        f"{context}: slot order clears the head before its sibling ({world.clearance_grants}). {world.state_dump()}"
+    )
+    assert (
+        head_window.cleared_at is not None and head_window.cleared_at <= head_window.dispatched_at + _TICK_SECONDS
+    ), (
+        f"{context}: the head was staged at {head_window.dispatched_at} and cleared at {head_window.cleared_at}, "
+        f"past the first clearance pass after its staging. {world.state_dump()}"
+    )
+    assert not world.ladder_actuations, (
+        f"{context}: the reclaim ladder ran {world.ladder_actuations} for a head that fit the card as it stood. "
+        f"{world.state_dump()}"
+    )
+
+
 async def test_r_defect_reinjection_a_waiter_whose_holdings_are_not_presented_waits_for_its_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

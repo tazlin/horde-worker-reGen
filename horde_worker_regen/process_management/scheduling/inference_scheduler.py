@@ -5970,6 +5970,8 @@ class InferenceScheduler:
         )
         if process_info is None or job is None or plan.decision is ClearanceDecision.UNPRICED:
             self._stop_staged_waiter_clock(job)
+            if plan.grants:
+                self._note_clearance_granted(job)
             return plan.grants
         if plan.decision is ClearanceDecision.HOLD_POST_PROCESSING:
             self._stop_staged_waiter_clock(job)
@@ -5979,6 +5981,7 @@ class InferenceScheduler:
         if plan.decision is ClearanceDecision.BUDGET_INACTIVE:
             self._stop_staged_waiter_clock(job)
             self._resolve_clearance_hold(job)
+            self._note_clearance_granted(job)
             return True
         assert plan.priced is not None and plan.verdict is not None and job.model is not None
         if plan.decision is ClearanceDecision.ADMIT:
@@ -5986,6 +5989,7 @@ class InferenceScheduler:
             if plan.verdict.measured_attempt:
                 self._mark_measured_attempt(job, plan.priced.request, device_index=plan.priced.device_index)
             self._resolve_clearance_hold(job)
+            self._note_clearance_granted(job)
             self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.candidate_delta_mb)
             return True
 
@@ -6166,6 +6170,11 @@ class InferenceScheduler:
         """
         if job.id_ is not None:
             self._dispatch_holds.note_clearance_hold(str(job.id_))
+
+    def _note_clearance_granted(self, job: ImageGenerateJobPopResponse | None) -> None:
+        """Record that ``job`` was granted its load-and-sample window, so its charges stand in full beside a head."""
+        if job is not None and job.id_ is not None:
+            self._dispatch_holds.note_clearance_granted(str(job.id_))
 
     def _resolve_clearance_hold(self, job: ImageGenerateJobPopResponse) -> None:
         """Clear any clearance hold on ``job`` now that its materialisation fits (idempotent)."""

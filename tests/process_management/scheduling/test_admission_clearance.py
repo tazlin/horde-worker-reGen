@@ -626,3 +626,132 @@ async def test_a_prior_native_crash_of_the_jobs_model_makes_the_refusal_terminal
     replaced.assert_called_once()
     assert replaced.call_args.args[0] is waiter
     assert replaced.call_args.kwargs["resource_fault_reason"]
+
+
+_SIBLING_HOLDS_MB = 554
+"""What a light staged sibling holds on the card once its encode is done: far below the staging charge."""
+
+
+async def _head_beside_staged_sibling(
+    *, device_free_mb: float
+) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse, HordeProcessInfo]:
+    """The clearance head on process 0 and, behind it in slot order, a primed sibling on process 1.
+
+    The sibling's staging charge is booked against the reading it already shows, so the whole charge stands
+    outstanding whatever its encode turns out to hold.
+    """
+    scheduler, job, _head = await _staged_waiter(device_free_mb=device_free_mb)
+    sibling = make_mock_process_info(1, model_name=_JOB_MODEL, state=HordeProcessState.INFERENCE_PRIMED)
+    sibling.total_vram_mb = 16000
+    sibling.process_reserved_mb = _SIBLING_HOLDS_MB
+    scheduler._process_map[1] = sibling
+    sibling_job = make_job_pop_response(_JOB_MODEL)
+    await track_popped_job_async(scheduler._job_tracker, sibling_job)  # type: ignore[attr-defined]
+    await mark_job_in_progress_async(scheduler._job_tracker, sibling_job)  # type: ignore[attr-defined]
+    sibling.last_job_referenced = sibling_job
+    scheduler._record_dispatch_reservation(sibling_job, sibling, baseline=None, staging_only=True)  # type: ignore[attr-defined]
+    return scheduler, job, sibling_job, sibling
+
+
+async def _free_that_fits_the_head_only_without_the_sibling_charge() -> float:
+    """A device-free reading the head fits within by less than the staging charge.
+
+    Read off the head priced alone, so the figure follows the head's own price and the card's noise buffer.
+    """
+    scheduler, _job, _waiter = await _staged_waiter(device_free_mb=24000.0)
+    plan = _decide(scheduler, 0)
+    assert plan.verdict is not None and plan.candidate_delta_mb is not None
+    noise_mb = plan.verdict.measured.noise_buffer_mb
+    assert noise_mb is not None
+    margin_mb = pricing.STAGING_ENCODE_VRAM_MB / 2
+    return plan.candidate_delta_mb + noise_mb + margin_mb
+
+
+async def test_a_head_beside_a_sibling_waiting_on_clearance_is_not_charged_its_staging() -> None:
+    """A sibling that has entered its clearance wait is charged nothing beyond what the card already shows.
+
+    Its encode is done, so everything it holds is inside the device-free reading. Charged the staging charge
+    as well, the head reads short by room the card already has and waits on lane reclaim that cannot help.
+    """
+    device_free_mb = await _free_that_fits_the_head_only_without_the_sibling_charge()
+    scheduler, _job, sibling_job, sibling = await _head_beside_staged_sibling(device_free_mb=device_free_mb)
+    sibling.note_clearance_wait_entered(time.time())
+    snapshot = scheduler.snapshot()
+    outstanding_mb = snapshot.services.reserve_ledger.planned_charge_for_unit(
+        DISPATCH_ADMISSION_FLOW, str(sibling_job.id_), dict(snapshot.card(None).reserved_by_pid)
+    )
+    assert outstanding_mb == pricing.STAGING_ENCODE_VRAM_MB
+
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None and plan.verdict is not None
+    assert plan.priced.request.sibling_staging_relief_mb == outstanding_mb
+    assert plan.verdict.measured.outstanding_reservations_mb == 0.0
+    assert plan.decision is ClearanceDecision.ADMIT
+
+
+async def test_a_head_beside_a_sibling_still_encoding_keeps_the_staging_charge_less_its_holding() -> None:
+    """A sibling whose encode is not done stays charged the staging charge less what it already holds."""
+    device_free_mb = await _free_that_fits_the_head_only_without_the_sibling_charge()
+    scheduler, _job, _sibling_job, _sibling = await _head_beside_staged_sibling(device_free_mb=device_free_mb)
+
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None and plan.verdict is not None
+    assert plan.priced.request.sibling_staging_relief_mb == _SIBLING_HOLDS_MB
+    assert plan.verdict.measured.outstanding_reservations_mb == pricing.STAGING_ENCODE_VRAM_MB - _SIBLING_HOLDS_MB
+    assert plan.decision is ClearanceDecision.HOLD
+
+
+async def test_a_wait_entry_older_than_the_siblings_dispatch_is_no_evidence_its_encode_is_done() -> None:
+    """A wait entry stamped before the sibling took its job belongs to an earlier job and earns no relief."""
+    device_free_mb = await _free_that_fits_the_head_only_without_the_sibling_charge()
+    scheduler, _job, _sibling_job, sibling = await _head_beside_staged_sibling(device_free_mb=device_free_mb)
+    ownership = sibling.inference_ownership
+    assert ownership is not None
+    sibling.note_clearance_wait_entered(ownership.recorded_at - 1.0)
+
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None
+    assert plan.priced.request.sibling_staging_relief_mb == _SIBLING_HOLDS_MB
+    assert plan.decision is ClearanceDecision.HOLD
+
+
+async def test_a_cleared_sibling_keeps_its_whole_charge() -> None:
+    """A sibling already granted clearance is about to load its weights, so nothing it is charged is waived."""
+    device_free_mb = await _free_that_fits_the_head_only_without_the_sibling_charge()
+    scheduler, _job, sibling_job, sibling = await _head_beside_staged_sibling(device_free_mb=device_free_mb)
+    sibling.note_clearance_wait_entered(time.time())
+    scheduler._dispatch_holds.note_clearance_granted(str(sibling_job.id_))  # type: ignore[attr-defined]
+
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None and plan.verdict is not None
+    assert plan.priced.request.sibling_staging_relief_mb == 0.0
+    assert plan.verdict.measured.outstanding_reservations_mb == pricing.STAGING_ENCODE_VRAM_MB
+    assert plan.decision is ClearanceDecision.HOLD
+
+
+async def test_a_sampling_sibling_keeps_its_whole_charge() -> None:
+    """A sibling past its staging (sampling, here unpriced after its acquire timed out) is not a staged waiter."""
+    device_free_mb = await _free_that_fits_the_head_only_without_the_sibling_charge()
+    scheduler, _job, _sibling_job, sibling = await _head_beside_staged_sibling(device_free_mb=device_free_mb)
+    sibling.note_clearance_wait_entered(time.time())
+    sibling.last_process_state = HordeProcessState.INFERENCE_STARTING
+    sibling.last_process_state_started_at = time.time()
+
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None
+    assert plan.priced.request.sibling_staging_relief_mb == 0.0
+    assert plan.decision is ClearanceDecision.HOLD
+
+
+async def test_a_grant_is_recorded_for_the_cleared_job() -> None:
+    """The scheduler records each job it grants clearance, which is what keeps a cleared sibling charged."""
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=24000.0)
+
+    assert scheduler.clearance_admit_process(0) is True
+
+    assert str(job.id_) in scheduler.snapshot().ledgers.dispatch_holds.clearance_granted_ids

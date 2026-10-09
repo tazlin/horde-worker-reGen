@@ -86,6 +86,7 @@ def build_materialization_request(
     candidate_delta_override_mb: float | None = None,
     staged_waiter: StagedWaiterTerms | None = None,
     nets_own_dispatch_reservation: bool = False,
+    sibling_staging_relief_mb: float = 0.0,
     kind: VramRequestKind = VramRequestKind.MONOLITHIC_DISPATCH,
     context_reduction: ContextReduction | None = None,
     forecast: StreamForecast | None = None,
@@ -97,7 +98,8 @@ def build_materialization_request(
     materialisation at clearance, the staging-capped charge of a preload under the lease); ``staged_waiter``
     carries clearance's held figure and clock for that staged child, in place of the head-starvation clock;
     ``nets_own_dispatch_reservation`` nets the job's own outstanding dispatch reservation out of the overlay,
-    for the clearance re-price of an already-dispatched job. ``context_reduction`` supplies a depth already sized
+    for the clearance re-price of an already-dispatched job; ``sibling_staging_relief_mb`` is the part of other
+    staged waiters' staging charges that re-price nets out. ``context_reduction`` supplies a depth already sized
     by the caller (the preload's, from the predictive peak); without it the depth is sized from the candidate
     delta and the live-context reduction is never offered. ``prepared_head_reprices_activation`` is the dispatch
     rule that an aux-prepared job beside live work on the card re-prices its activation even where its weights
@@ -185,6 +187,7 @@ def build_materialization_request(
             dict(card.reserved_by_pid),
         ),
         own_dispatch_unmaterialized_mb=own_dispatch_mb,
+        sibling_staging_relief_mb=sibling_staging_relief_mb,
         is_head_of_queue=is_head_of_queue,
         head_job_id=job_id,
         wddm_paging_active=snapshot.ledgers.retention.wddm_paging_active,

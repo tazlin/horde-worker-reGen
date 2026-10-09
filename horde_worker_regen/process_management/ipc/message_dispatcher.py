@@ -1095,9 +1095,22 @@ class MessageDispatcher:
             report_sampled_at=message.sampled_at,
             held_components=message.held_components,
         )
+        if message.clearance_wait_entry:
+            self._note_clearance_wait_entered(message)
         self._observe_footprint_peak(message)
         self._observe_resident_footprint(message)
         self._observe_safety_footprint(message)
+
+    def _note_clearance_wait_entered(self, message: HordeProcessMemoryMessage) -> None:
+        """Stamp the child's clearance wait entry on its record, at the instant the child sampled the report.
+
+        The child's sample time is compared against the parent's ownership stamp on the same host clock. The
+        receipt time would lag by however long the report sat in the queue.
+        """
+        process_info = self._process_map.get(message.process_id)
+        if process_info is None:
+            return
+        process_info.note_clearance_wait_entered(message.sampled_at if message.sampled_at is not None else time.time())
 
     def _observe_footprint_peak(self, message: HordeProcessMemoryMessage) -> None:
         """Record a reported VRAM peak into the learned-footprint store, if cleanly attributable.

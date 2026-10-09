@@ -117,6 +117,8 @@ class DispatchHoldLedger:
         """Per job: accumulated held seconds from closed clearance-hold spans, and the live span's start or
         None. Closed spans are kept until the job leaves the in-progress set so a resolved hold still widens
         the liveness grace it already consumed."""
+        self.clearance_granted_ids: set[str] = set()
+        """In-progress job ids the clearance gate has granted their load-and-sample window."""
         self.cycle_declines: dict[str, DispatchDecline] = {}
         """The jobs a dispatch gate withheld during the scheduling cycle now running, keyed by job id. Scoped
         to the cycle and discarded at its start, so it states what this pass decided and never a stale verdict
@@ -233,6 +235,10 @@ class DispatchHoldLedger:
             if live_since is not None:
                 self.clearance_hold_spans[job_id] = (accumulated + max(0.0, self._clock() - live_since), None)
 
+    def note_clearance_granted(self, job_id: str) -> None:
+        """Record that ``job_id`` was granted its load-and-sample window."""
+        self.clearance_granted_ids.add(job_id)
+
     def clearance_held_seconds(self, job_id: str) -> float:
         """Total seconds the clearance gate has withheld ``job_id``: closed spans plus any live one."""
         span = self.clearance_hold_spans.get(job_id)
@@ -247,5 +253,6 @@ class DispatchHoldLedger:
         """Drop clearance records for jobs no longer in progress, so the maps self-heal."""
         live = set(live_job_ids)
         self.clearance_hold_ids.intersection_update(live)
+        self.clearance_granted_ids.intersection_update(live)
         for job_id in [job_id for job_id in self.clearance_hold_spans if job_id not in live]:
             del self.clearance_hold_spans[job_id]

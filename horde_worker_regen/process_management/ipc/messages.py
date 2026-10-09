@@ -325,6 +325,11 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
 
     The weights return to host RAM, so this is what the component stopped claiming on the card rather
     than memory handed back to the system; the card only sees it once the allocator cache is released."""
+    clearance_wait_entry: bool = False
+    """Whether this report was sent as the child began waiting on its clearance permit.
+
+    The child's encode is done by then, so the reservation this report carries is all the staged job holds
+    until it is cleared. An additive field: an older child never sets it."""
 
 
 class HordeHeartbeatType(enum.Enum):

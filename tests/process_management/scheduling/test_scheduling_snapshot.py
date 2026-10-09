@@ -75,6 +75,24 @@ class TestSlotSnapshot:
         assert slot.capabilities == process_info.capabilities
         assert slot.reserved_for_disaggregation is False
         assert slot.reuse_credit_mb == 0.0 and slot.checkpoint_models_held == frozenset()
+        assert slot.staged_short_of_sampling is False and slot.clearance_wait_entered is False
+
+    def test_a_staged_slot_is_waiting_on_clearance_only_from_a_wait_entry_after_its_dispatch(self) -> None:
+        """The slot's staged phase and its clearance wait mirror the record, read against the job's ownership."""
+        process_info = make_mock_process_info(3, model_name="sd", state=HordeProcessState.INFERENCE_PRIMED)
+        process_info.last_job_referenced = make_job_pop_response(model="sd")
+        ownership = process_info.inference_ownership
+        assert ownership is not None
+        model_map = HordeModelMap(root={})
+
+        slot = snapshot_slot(process_info, model_map, now=1_000.0)
+        assert slot.staged_short_of_sampling is True and slot.clearance_wait_entered is False
+
+        process_info.note_clearance_wait_entered(ownership.recorded_at - 1.0)
+        assert snapshot_slot(process_info, model_map, now=1_000.0).clearance_wait_entered is False
+
+        process_info.note_clearance_wait_entered(ownership.recorded_at + 1.0)
+        assert snapshot_slot(process_info, model_map, now=1_000.0).clearance_wait_entered is True
 
     def test_a_pinned_sampler_is_marked_reserved(self) -> None:
         """The disaggregation pin is read from the process map, not the record."""
@@ -153,6 +171,7 @@ class TestSchedulingSnapshot:
 
         assert snapshot.ledgers.retention.wddm_paging_active is False
         assert snapshot.ledgers.dispatch_holds.hold_since == {}
+        assert snapshot.ledgers.dispatch_holds.clearance_granted_ids == frozenset()
         assert snapshot.ledgers.head_admission.barrier_job_id is None
         assert snapshot.host_ram.total_mb > 0.0
         assert snapshot.now == 1_000.0

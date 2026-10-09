@@ -365,7 +365,7 @@ class HordeInferenceProcess(HordeProcess):
                 )
                 # A staged child blocks holding its encode working set, and clearance prices the job net of the
                 # child's last reported reservation; a report as the wait begins keeps that reading current.
-                gpu_sampling_lease.set_wait_entry_callback(self._send_inference_memory_report)
+                gpu_sampling_lease.set_wait_entry_callback(self._send_clearance_wait_entry_report)
                 logger.info("Registered GPU denoise clearance proxy for cross-process pipelining")
 
             # Subprocesses never download model references: the parent process owns downloading and
@@ -559,6 +559,8 @@ class HordeInferenceProcess(HordeProcess):
         self,
         include_vram: bool = False,
         ram_private_peak_bytes: int | None = None,
+        *,
+        clearance_wait_entry: bool = False,
     ) -> bool:
         """Send a memory report message to the main process.
 
@@ -568,6 +570,7 @@ class HordeInferenceProcess(HordeProcess):
         Args:
             include_vram (bool, optional): Whether or not to include VRAM usage in the report. Defaults to False.
             ram_private_peak_bytes (int | None, optional): A load peak to report instead of the pending one.
+            clearance_wait_entry (bool, optional): Whether the report marks the start of a clearance wait.
 
         Returns:
             bool: Whether or not the message was sent successfully.
@@ -577,6 +580,7 @@ class HordeInferenceProcess(HordeProcess):
         if not super().send_memory_report_message(
             include_vram=include_vram,
             ram_private_peak_bytes=ram_private_peak_bytes,
+            clearance_wait_entry=clearance_wait_entry,
         ):
             self._end_process = True
 
@@ -976,12 +980,20 @@ class HordeInferenceProcess(HordeProcess):
     """Whether the exception that failed the current job was a CUDA runtime error (see ``_is_cuda_context_fault``)."""
 
     def _send_inference_memory_report(self) -> None:
-        """Send a precise boundary VRAM report at a stage transition (lease wait, sampling done, VAE decode).
+        """Send a precise boundary VRAM report at a stage transition (sampling done, VAE decode).
 
         These stage-boundary reports carry the working set at a known moment and complement the reporter
         thread's interval sampling, which runs independently while the main loop is blocked in the GPU op.
         """
         self.send_memory_report_message(include_vram=True)
+
+    def _send_clearance_wait_entry_report(self) -> None:
+        """Send the boundary VRAM report as a clearance wait begins, marked as that report.
+
+        The parent prices a staged sibling beside the clearance head by whether its encode is done, and this
+        is the one report that says so.
+        """
+        self.send_memory_report_message(include_vram=True, clearance_wait_entry=True)
 
     def _release_inference_slot(self) -> None:
         """Release this job's sampling-concurrency slot, at most once per job.

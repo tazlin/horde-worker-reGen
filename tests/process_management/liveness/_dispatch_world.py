@@ -39,6 +39,8 @@ from __future__ import annotations
 import math
 import multiprocessing
 import queue
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from multiprocessing import synchronize
 from pathlib import Path
@@ -760,6 +762,7 @@ class _DispatchWorld:
         ram_reserve_mb: float = 8192.0,
         ram_pause_percent: float = 90.0,
         ram_report_interval_seconds: float = 0.0,
+        staged_encode_mb_by_model: Mapping[str, float] | None = None,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -931,6 +934,10 @@ class _DispatchWorld:
             extra_model_classes: Classes this row serves beyond the default pool, so a row needing more
                 distinct models than the pool holds can have them without widening every other row's
                 advertised and served sets. Empty is the pool every other row runs on.
+            staged_encode_mb_by_model: The encode working set (MB) a staged job of each named model holds on
+                the card under the lease. A model it does not name holds the staging charge, so the charge and the
+                encode agree and nothing a staged job holds is ever priced twice. A smaller figure is a real
+                encode that leaves part of its staging charge describing nothing on the card.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -945,6 +952,7 @@ class _DispatchWorld:
         if idle_lane_warm and not clearance_lease:
             raise ValueError("an idle lane's warm is credited at its job's clearance, so it needs the lease")
         self.staged_lane_prefetch = staged_lane_prefetch
+        self.staged_encode_mb_by_model: Mapping[str, float] = dict(staged_encode_mb_by_model or {})
         self.idle_lane_warm = idle_lane_warm
         self.tail_overlap = tail_overlap
         self.child_free_view_lie_mb = child_free_view_lie_mb
@@ -2519,8 +2527,14 @@ class _DispatchWorld:
                 # Under the lease a dispatch only stages the job: the lane holds its encode working set and
                 # nothing else, and the weights land when the parent clears it. The slot stays in the primed
                 # state production stamped on it at dispatch, which is what makes it a clearance waiter.
-                self._encode_staging_mb[lanes[0]] = STAGING_ENCODE_VRAM_MB
+                self._encode_staging_mb[lanes[0]] = self.staged_encode_mb_by_model.get(
+                    admitted.model or "", STAGING_ENCODE_VRAM_MB
+                )
                 self._clearance_waiting_since[job_id] = self.now
+                # The world's encode lands with the dispatch, so the child begins its clearance wait at once and
+                # its wait-entry report reaches the parent's record as the production dispatcher stamps it, on
+                # the wall clock the ownership stamp uses.
+                self._process_map[lanes[0]].note_clearance_wait_entered(time.time())
                 proxy = self._clearance_proxies.get(lanes[0])
                 if proxy is not None:
                     proxy.begin_job()
