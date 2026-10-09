@@ -7993,7 +7993,15 @@ class InferenceScheduler:
         return True
 
     def restore_post_process_lane(self, device_index: int | None) -> bool:
-        """Restart a ladder-paused post-processing lane once the card has recovered (reclaim-ladder actuator)."""
+        """Restart a ladder-paused post-processing lane once the card has recovered (reclaim-ladder actuator).
+
+        Stands down while a whole-card residency holds the card, as :meth:`restore_live_contexts` does: the
+        residency advertises its model alone, so the next job is another whole-card job on the same lane, and a
+        lane context restored between two of them is reclaimed again before the next can clear. The ladder keeps
+        the obligation and restores the lane once the residency has drained.
+        """
+        if self._whole_card_ledger.any_held():
+            return False
         return self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 
     def restore_vae_lane(self, device_index: int | None) -> bool:
@@ -8009,7 +8017,12 @@ class InferenceScheduler:
         return self._note_lane_cycle(self._process_lifecycle.pause_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER))
 
     def restore_utilities_lane(self, device_index: int | None) -> bool:
-        """Restart a ladder-paused image-utilities lane once the card has recovered (reclaim-ladder actuator)."""
+        """Restart a ladder-paused image-utilities lane once the card has recovered (reclaim-ladder actuator).
+
+        Stands down under a held whole-card residency for the reason :meth:`restore_post_process_lane` gives.
+        """
+        if self._whole_card_ledger.any_held():
+            return False
         return self._process_lifecycle.restore_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 
     def record_calibration_event(self, rung: ReclaimRung, *, promised_mb: float, realized_mb: float) -> None:

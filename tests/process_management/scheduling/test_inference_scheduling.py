@@ -3373,3 +3373,26 @@ class TestACycleBothPreloadsAndDispatches:
         assert peeked is not None
         assert started is True
         assert [str(job.id_) for job in newly_started] == [str(peeked.next_job.id_)]
+
+
+class TestLadderLaneRestoreUnderWholeCard:
+    """A ladder-paused service lane is not restored while a whole-card residency holds the card."""
+
+    @pytest.mark.parametrize("restore", ["restore_utilities_lane", "restore_post_process_lane"])
+    def test_lane_restore_stands_down_while_a_residency_is_held(self, restore: str) -> None:
+        """A lane context returned between two of the residency's jobs is reclaimed again before the next clears."""
+        sched = _make_inference_scheduler()
+        lifecycle_restore = Mock(return_value=True)
+        lifecycle_name = {
+            "restore_utilities_lane": "restore_utilities_off_gpu",
+            "restore_post_process_lane": "restore_post_process_off_gpu",
+        }[restore]
+        setattr(sched._process_lifecycle, lifecycle_name, lifecycle_restore)
+        sched._whole_card_ledger.any_held = Mock(return_value=True)  # type: ignore[method-assign]
+
+        assert getattr(sched, restore)(0) is False
+        lifecycle_restore.assert_not_called()
+
+        sched._whole_card_ledger.any_held = Mock(return_value=False)  # type: ignore[method-assign]
+        assert getattr(sched, restore)(0) is True
+        lifecycle_restore.assert_called_once()
