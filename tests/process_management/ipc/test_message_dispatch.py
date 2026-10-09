@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import queue
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest
+from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
@@ -34,11 +38,19 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import InferenceLaneOutcome
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    FootprintKey,
+    FootprintStage,
+    LearnedFootprintStore,
+    ResolutionBucket,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_job,
+    make_mock_model_reference_record,
     make_mock_process_info,
     make_test_model_metadata,
     make_test_runtime_config,
@@ -55,6 +67,7 @@ def _make_dispatcher(
     job_tracker: JobTracker | None = None,
     bridge_data: Mock | None = None,
     process_message_queue: ProcessQueue | None = None,
+    model_metadata: ModelMetadata | None = None,
 ) -> MessageDispatcher:
     """Build a MessageDispatcher with mostly-mocked dependencies."""
     if state is None:
@@ -76,7 +89,7 @@ def _make_dispatcher(
         job_tracker=job_tracker,
         process_message_queue=process_message_queue,
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
-        model_metadata=make_test_model_metadata(),
+        model_metadata=model_metadata if model_metadata is not None else make_test_model_metadata(),
         action_ledger=ActionLedger(),
         reserve_ledger=CommittedReserveLedger(),
         on_unload_vram=Mock(),
@@ -1457,3 +1470,147 @@ class TestInferenceLaneOutcomeRouting:
 
         assert len(outcomes) == 1
         assert outcomes[0].faulted is False
+
+
+_FOLD_MODEL = "stable_diffusion"
+_FOLD_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+
+
+class TestJobSamplingPeakFold:
+    """A monolithic job's sampling readings fold into the store once, as the job's maximum, when it ends."""
+
+    _KEY = FootprintKey(
+        model_baseline=str(_FOLD_BASELINE),
+        resolution_bucket=ResolutionBucket.LE_512,
+        platform=sys.platform,
+        stage=FootprintStage.SAMPLE,
+    )
+
+    async def _running_job(
+        self,
+        *,
+        width: int = 512,
+        height: int = 512,
+    ) -> tuple[MessageDispatcher, LearnedFootprintStore, JobTracker, ImageGenerateJobPopResponse]:
+        """A dispatcher with a store and one job in progress on inference process 0, past its first step."""
+        process_info = make_mock_process_info(0, model_name=_FOLD_MODEL)
+        process_info.process_launch_identifier = 0
+        job = make_job_pop_response(model=_FOLD_MODEL, width=width, height=height)
+        process_info.record_inference_ownership(job, attempt_ordinal=1)
+        job_tracker = JobTracker()
+        await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
+        dispatcher = _make_dispatcher(
+            process_map=ProcessMap({0: process_info}),
+            job_tracker=job_tracker,
+            model_metadata=make_test_model_metadata(
+                {_FOLD_MODEL: make_mock_model_reference_record(_FOLD_MODEL, baseline=_FOLD_BASELINE)},
+            ),
+        )
+        store = LearnedFootprintStore()
+        dispatcher.set_footprint_store(store)
+        return dispatcher, store, job_tracker, job
+
+    @staticmethod
+    def _report(process_id: int, peak_mb: int, *, total_mb: int | None = None) -> HordeProcessMemoryMessage:
+        message = HordeProcessMemoryMessage(
+            process_id=process_id,
+            process_launch_identifier=0,
+            info="Memory report",
+            ram_usage_bytes=1024,
+            vram_usage_mb=0,
+            process_peak_reserved_mb=peak_mb,
+        )
+        if total_mb is not None:
+            message.vram_total_mb = total_mb
+        return message
+
+    @staticmethod
+    async def _finish(dispatcher: MessageDispatcher, job: ImageGenerateJobPopResponse, *, faulted: bool) -> None:
+        message = Mock(spec=HordeInferenceResultMessage)
+        message.process_id = 0
+        message.process_launch_identifier = 0
+        message.sdk_api_job_info = job
+        message.time_elapsed = 5.0
+        message.info = "faulted" if faulted else "done"
+        message.cuda_context_fault = False
+        if faulted:
+            message.state = GENERATION_STATE.faulted
+            message.job_image_results = None
+            message.faults_count = 1
+        else:
+            message.state = Mock()
+            message.state.__eq__ = lambda self, other: False  # pyrefly: ignore - a non-faulted state is all that matters
+            message.job_image_results = [Mock()]
+            message.faults_count = 0
+        _enqueue(dispatcher, message)
+        await dispatcher.receive_and_handle_process_messages()
+
+    async def test_several_readings_of_one_job_commit_one_figure_at_completion(self) -> None:
+        """Readings accumulate while the job runs, and its result commits their maximum as one observation."""
+        dispatcher, store, _job_tracker, job = await self._running_job()
+
+        for peak_mb in (9000, 11000, 10000):
+            dispatcher._handle_memory_report(self._report(0, peak_mb))
+        assert store.get_observation(self._KEY) is None
+
+        await self._finish(dispatcher, job, faulted=False)
+
+        observation = store.get_observation(self._KEY)
+        assert observation is not None
+        assert observation.observation_count == 1
+        assert observation.recent_mb == [11000.0]
+        assert observation.watermark_mb == 11000.0
+
+    async def test_a_faulted_job_commits_its_figure(self) -> None:
+        """A fault ends the job's readings too, and they are evidence about what the key costs."""
+        dispatcher, store, _job_tracker, job = await self._running_job()
+
+        for peak_mb in (9000, 12000):
+            dispatcher._handle_memory_report(self._report(0, peak_mb))
+        await self._finish(dispatcher, job, faulted=True)
+
+        observation = store.get_observation(self._KEY)
+        assert observation is not None
+        assert observation.observation_count == 1
+        assert observation.watermark_mb == 12000.0
+
+    async def test_a_job_without_readings_commits_nothing(self) -> None:
+        """A job that ends before any attributable reading adds nothing to the store."""
+        dispatcher, store, _job_tracker, job = await self._running_job()
+
+        await self._finish(dispatcher, job, faulted=False)
+
+        assert len(store) == 0
+
+    async def test_a_job_that_leaves_progress_without_a_result_commits_on_the_next_report(self) -> None:
+        """A job ended elsewhere (a replaced process) commits once the next report finds it out of progress."""
+        dispatcher, store, job_tracker, job = await self._running_job()
+
+        dispatcher._handle_memory_report(self._report(0, 10500))
+        await job_tracker.release_in_progress(job)
+        dispatcher._handle_memory_report(self._report(0, 3000))
+
+        observation = store.get_observation(self._KEY)
+        assert observation is not None
+        assert observation.observation_count == 1
+        assert observation.watermark_mb == 10500.0
+
+    async def test_a_reading_above_the_plausible_bound_does_not_set_the_job_figure(self) -> None:
+        """A card-sized reading is dropped at the seam, and the job's plausible readings still commit."""
+        dispatcher, store, _job_tracker, job = await self._running_job(width=1088, height=1088)
+
+        dispatcher._handle_memory_report(self._report(0, 23604, total_mb=24576))
+        dispatcher._handle_memory_report(self._report(0, 10654, total_mb=24576))
+        await self._finish(dispatcher, job, faulted=False)
+
+        key = FootprintKey(
+            model_baseline=str(_FOLD_BASELINE),
+            resolution_bucket=ResolutionBucket.GT_1024,
+            platform=sys.platform,
+            stage=FootprintStage.SAMPLE,
+        )
+        observation = store.get_observation(key)
+        assert observation is not None
+        assert observation.observation_count == 1
+        assert observation.watermark_mb == 10654.0

@@ -141,6 +141,18 @@ transient activation on top of them, which belongs to the sampling stages and wo
 the resident watermark if folded into it."""
 
 
+@dataclass
+class _JobSamplingPeak:
+    """Represents the highest sampling reading attributed to one in-progress job, held until the job ends."""
+
+    key: FootprintKey
+    """The SAMPLE key the job's readings belong to."""
+    peak_mb: float
+    """The highest plausible reading seen for the job so far (MB)."""
+    plausible_max_mb: float | None
+    """The bound the highest reading was checked against, passed on to the store at commit."""
+
+
 def _no_aux_holds() -> set[GenerationID]:
     """Default aux-hold provider: report no jobs holding a lane open for prefetch (dispatcher wired alone)."""
     return set()
@@ -395,6 +407,12 @@ class MessageDispatcher:
         failure the child reports passes through it, which is the transition that moves a slot's allocator
         reservation. A slot with no entry has never confirmed a residency, so it is never observed.
         """
+        self._job_sampling_peaks: dict[GenerationID, _JobSamplingPeak] = {}
+        """The running maximum of each in-progress monolithic job's sampling readings, keyed by job id.
+
+        A child reports several readings per job, and the store's recent window prices jobs, so each job's
+        readings are folded here and committed to the store once when the job ends.
+        """
 
     def take_safety_verdicts_known_lost(self) -> set[GenerationID]:
         """Return and clear the jobs whose safety verdict was dropped with their launch retired."""
@@ -522,9 +540,10 @@ class MessageDispatcher:
         """Register the learned-footprint store to observe measured device footprints into (shadow-only).
 
         Once set, each memory report is offered to the store under whichever footprint it cleanly attributes
-        to: a running inference job's sampling peak, an idle slot's resident weights, or the safety process's
-        at-rest residency. Reports that attribute to none of those are left unrecorded. The store feeds no
-        decision path; this is measurement for the future arbiter.
+        to: a running inference job's sampling peak (folded into one figure per job, committed when the job
+        ends), an idle slot's resident weights, or the safety process's at-rest residency. Reports that
+        attribute to none of those are left unrecorded. The store feeds no decision path. This is measurement
+        for the future arbiter.
         """
         self._footprint_store = store
 
@@ -1113,7 +1132,13 @@ class MessageDispatcher:
         process_info.note_clearance_wait_entered(message.sampled_at if message.sampled_at is not None else time.time())
 
     def _observe_footprint_peak(self, message: HordeProcessMemoryMessage) -> None:
-        """Record a reported VRAM peak into the learned-footprint store, if cleanly attributable.
+        """Fold a reported VRAM peak into its running job's sampling figure, if cleanly attributable.
+
+        The store's SAMPLE window counts jobs, so a reading is not an observation on its own. Each reading
+        attributed to a job raises that job's running maximum, and the maximum is committed once when the
+        job ends (:meth:`_commit_job_sampling_peak`). Readings after the backend's end-of-run unload stay in
+        the fold: the child resets its high-water at each read, so the report sent after the unload still
+        carries the sampling interval before it, and a lower reading cannot raise a maximum anyway.
 
         The measured peaks recorded here raise admission pricing of sampling work (the scheduler reads the
         same store when pricing a job's sampling peak). Only the unambiguous case is wired here: a monolithic
@@ -1125,9 +1150,9 @@ class MessageDispatcher:
         baseline are left unattributed rather than guessed: the parent cannot reliably bind those peaks to one
         stage/job at this seam.
         """
-        store = self._footprint_store
-        if store is None:
+        if self._footprint_store is None:
             return
+        self._commit_ended_job_sampling_peaks()
 
         peak_mb = message.process_peak_reserved_mb
         if peak_mb is None or peak_mb <= 0:
@@ -1139,7 +1164,7 @@ class MessageDispatcher:
 
         model_name = process_info.loaded_horde_model_name
         job = process_info.current_inference_job()
-        if model_name is None or job is None:
+        if model_name is None or job is None or job.id_ is None:
             return
 
         # Bind the peak to a genuinely-running job: the slot's referenced job must be in progress, which
@@ -1170,15 +1195,44 @@ class MessageDispatcher:
         # The reading is the process's allocator high-water, not the job's. A process that cached another
         # checkpoint, or overflowed, reports a figure near the size of the card against this job's key, and the
         # watermark only rises, so the reading is bounded by what a job in this key's band can plausibly need.
-        store.observe_peak(
+        # The bound is applied per reading so one implausible reading never costs the job its plausible ones.
+        plausible_max_mb = plausible_sampling_peak_mb(
             key,
-            float(peak_mb),
-            plausible_max_mb=plausible_sampling_peak_mb(
-                key,
-                self._process_map.get_reported_total_vram_mb(device_index=process_info.device_index),
-                batch=job.payload.n_iter or 1,
-            ),
+            self._process_map.get_reported_total_vram_mb(device_index=process_info.device_index),
+            batch=job.payload.n_iter or 1,
         )
+        if plausible_max_mb is not None and peak_mb > plausible_max_mb:
+            logger.trace(
+                f"Learned footprint {key.stage}/{key.model_baseline}: dropping {peak_mb:.0f} MB above the "
+                f"plausible ceiling {plausible_max_mb:.0f} MB.",
+            )
+            return
+        running = self._job_sampling_peaks.get(job.id_)
+        if running is None or peak_mb > running.peak_mb:
+            self._job_sampling_peaks[job.id_] = _JobSamplingPeak(
+                key=key,
+                peak_mb=float(peak_mb),
+                plausible_max_mb=plausible_max_mb,
+            )
+
+    def _commit_job_sampling_peak(self, job_id: GenerationID) -> None:
+        """Commit ``job_id``'s highest sampling reading to the store as one observation, if it has one."""
+        running = self._job_sampling_peaks.pop(job_id, None)
+        if running is None or self._footprint_store is None:
+            return
+        self._footprint_store.observe_peak(running.key, running.peak_mb, plausible_max_mb=running.plausible_max_mb)
+
+    def _commit_ended_job_sampling_peaks(self) -> None:
+        """Commit the figure of every folded job that has left progress without a result reaching this handler.
+
+        A job ends here on its result, but a replaced or ended process takes its job out of progress
+        elsewhere. Committing on the next report keeps those readings and keeps the fold from growing.
+        """
+        if not self._job_sampling_peaks:
+            return
+        in_progress_ids = {job.id_ for job in self._job_tracker.jobs_in_progress}
+        for job_id in [job_id for job_id in self._job_sampling_peaks if job_id not in in_progress_ids]:
+            self._commit_job_sampling_peak(job_id)
 
     def _observe_job_footprint(self, message: HordeJobMetricsMessage) -> None:
         """Record a child's measured per-job VRAM footprint into the learned-footprint store.
@@ -1666,6 +1720,9 @@ class MessageDispatcher:
         completion: the synthetic result carries raw decoded images, so a job requesting post-processing is
         queued for the dedicated post-processing lane.
         """
+        # A result ends the job's sampling readings whatever its outcome, so a fault commits its figure too.
+        if message.sdk_api_job_info.id_ is not None:
+            self._commit_job_sampling_peak(message.sdk_api_job_info.id_)
         # A result (success, fault, or even one for a job we no longer track) means the slot is no longer
         # sampling, so retire its in-flight timestamps first: before the graded-slowdown monitor can read
         # them against a finished job, and before any early-return below. A dropped result (job gone from

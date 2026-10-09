@@ -23,6 +23,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+from horde_worker_regen.process_management.resources.resource_budget import platform_context_constant_mb
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     DeviceVramState,
     MeasuredVramSnapshot,
@@ -32,6 +33,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramRequestKind,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    _MEASURED_ESTIMATE_MARGIN,
     FootprintKey,
     FootprintStage,
     ResolutionBucket,
@@ -554,6 +556,28 @@ class TestMeasuredLoweringPricing:
         priced = scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
         assert priced == pytest.approx(expected)
         assert priced is not None and priced < 17000.0
+
+    def test_a_lone_outlier_job_does_not_price_the_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One job far above its siblings leaves the measured price at the second-highest job, on both pricers."""
+        self._pin_inflated_seed(monkeypatch, seed_mb=17000.0, weight_mb=12600.0)
+        pm = _make_manager()
+        scheduler = pm._inference_scheduler
+        job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+        self._observe_sample_peaks(pm, 13000.0, count=4)
+        self._observe_sample_peaks(pm, 14260.0, count=1)
+        pm._job_tracker._models_with_results.add(_MODEL)
+
+        expected = (
+            13000.0 * _MEASURED_ESTIMATE_MARGIN
+            + platform_context_constant_mb(platform=sys.platform)
+            - scheduler.resolved_context_constant_mb()
+        )
+        priced = scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
+        assert priced == pytest.approx(expected)
+        assert scheduler._learned_sampling_peak_mb(
+            job, baseline, static_seed_mb=17000.0, stage=FootprintStage.SAMPLE
+        ) == pytest.approx(expected)
 
     def test_model_without_a_result_is_priced_from_its_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A model's first job after a start is priced from its key's measurements, not held to the seed."""

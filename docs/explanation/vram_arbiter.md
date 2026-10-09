@@ -158,21 +158,27 @@ The arbiter keeps four concerns deliberately separate:
   whole-job monolithic peak and a disaggregated UNet-only sampler peak are physically different quantities
   and are kept under distinct stages (`SAMPLE` vs `SAMPLE_ISOLATED`), so a single monolithic peak never
   over-prices the isolated sampler and forfeits the second concurrent sampler (mixed operation is designed:
-  a stage fault re-routes a disaggregated job monolithic). Monolithic peaks are observed from child memory
+  a stage fault re-routes a disaggregated job monolithic). Monolithic peaks are read from child memory
   reports once the lane has reached its first step. A lane still `INFERENCE_PRIMED` holds its encode working
   set alone under the clearance lease, or a partial load otherwise, and enough of those readings would make a
-  trusted measurement that lowers the job's price toward them. Isolated-sampler peaks come from the
-  disaggregation orchestrator at sample completion. A cold key
+  trusted measurement that lowers the job's price toward them. A child sends several reports per job, so the
+  message dispatcher keeps each job's highest reading and commits that one figure to the store when the job
+  ends: on its result, success or fault, or on the next report after the job has left progress some other
+  way (a replaced process). A job with no attributable reading commits nothing. Isolated-sampler peaks come
+  from the disaggregation orchestrator at sample completion, also once per job. A cold key
   prices at the static seed unchanged, so a first-of-kind job and small-resolution buckets keep their
   smaller peaks and their concurrency.
 
-    The raise-only overlay is the *under-observed* policy, not the only one. Once a key carries at least
-    `_MIN_OBSERVATIONS_FOR_MEASURED` (5) observations, `measured_estimate_mb` answers from the measurements
+    The raise-only overlay is the policy for an *under-observed* key. Once a key's recent window holds
+    at least `_MIN_OBSERVATIONS_FOR_MEASURED` (5) entries, `measured_estimate_mb` answers from the measurements
     alone and may sit well below the seed. The seeds are wrong in both directions: a Flux fp8 checkpoint
     seeded at 16.4GB measures 13.5GB device-used on the card that was reserving itself entirely for it. The
-    measured answer is the maximum of a bounded recent window (so a genuine downward shift eventually lands
-    while one high job still counts), times a single explicit margin `_MEASURED_ESTIMATE_MARGIN` (1.10), plus
-    the platform's context charge. That margin is the whole of the conservatism and it is one constant at one
+    window holds the last `_RECENT_WINDOW_SIZE` (20) entries, so a genuine downward shift eventually lands. For
+    the two activation stages (`SAMPLE`, `SAMPLE_ISOLATED`) an entry is one job and the measured answer is
+    the second-highest job in the window: one outlier job, such as a high figure inherited from an earlier
+    run, cannot price the whole key, while two high jobs still do. The at-rest stages keep one entry per
+    reading and answer with the window's maximum. Either figure is multiplied by a single explicit margin
+    `_MEASURED_ESTIMATE_MARGIN` (1.10), and the platform's context charge is added. That margin is the whole of the conservatism and it is one constant at one
     seam: an under-estimate is punished asymmetrically (the Linux OOM killer, WDDM paging to host RAM), which
     is why the margin exists, but smearing that fear across the seeds is what produced the over-statement in
     the first place.
@@ -194,8 +200,12 @@ The arbiter keeps four concerns deliberately separate:
     (`pricing.lora_feature_delta_mb`, read from hordelib's feature impact table).
     A backend that reports no footprint (an older one, or a dry run) leaves the memory-report path as the
     only source for every key. The store persists to `.horde_worker_regen/vram_footprints.json` (schema-versioned,
-    atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration
-    instead of re-learning it; a missing, corrupt, or older-schema file starts cold.
+    atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration.
+    A missing, corrupt, or older-schema file starts cold. The one exception is a
+    file of the schema whose `SAMPLE` windows held one entry per memory report
+    (`_PER_READING_SAMPLE_SCHEMA_VERSION`): it loads with those windows emptied and their watermark, EWMA and
+    count kept, so the raise-only price survives and the measured price returns once five jobs refill the
+    window. Its readings are never read back as jobs.
 
     Every feeder reads a per-process allocator counter, and a process can hold things its key does not
     describe, so each reading is bounds-checked before the store accepts it (the `plausible_min_mb` and

@@ -12,6 +12,7 @@ from horde_worker_regen.process_management.resources.resource_budget import plat
 from horde_worker_regen.process_management.resources.vram_footprints import (
     _MEASURED_ESTIMATE_MARGIN,
     _MIN_OBSERVATIONS_FOR_MEASURED,
+    _PER_READING_SAMPLE_SCHEMA_VERSION,
     _PERSIST_EVERY_N_OBSERVATIONS,
     _RECENT_WINDOW_SIZE,
     FOOTPRINT_STORE_SCHEMA_VERSION,
@@ -391,6 +392,47 @@ class TestMeasuredEstimate:
         assert store.measured_estimate_mb(key) == pytest.approx(expected)
         assert store.estimate_mb(key, static_seed_mb=0.0) == pytest.approx(20000.0)
 
+    def test_a_lone_outlier_job_does_not_set_the_sampling_price(self) -> None:
+        """A sampling key prices at its second-highest job, so one inherited high job cannot price the key."""
+        store = LearnedFootprintStore()
+        key = _key(platform="win32")
+        self._observe(store, key, _MIN_OBSERVATIONS_FOR_MEASURED - 1, mb=13000.0)
+        store.observe_peak(key, 14260.0)
+
+        expected = (13000.0 * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(platform="win32")
+        assert store.measured_estimate_mb(key) == pytest.approx(expected)
+        assert store.estimate_mb(key, static_seed_mb=0.0) == pytest.approx(14260.0)
+
+    def test_two_high_jobs_set_the_sampling_price(self) -> None:
+        """A high figure that repeats is the key's cost, so the second-highest carries it."""
+        store = LearnedFootprintStore()
+        key = _key(stage=FootprintStage.SAMPLE_ISOLATED)
+        self._observe(store, key, _MIN_OBSERVATIONS_FOR_MEASURED - 2, mb=9000.0)
+        self._observe(store, key, 2, mb=11000.0)
+
+        expected = (11000.0 * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(platform="linux")
+        assert store.measured_estimate_mb(key) == pytest.approx(expected)
+
+    def test_below_the_minimum_the_outlier_keeps_the_raise_only_price(self) -> None:
+        """Too few jobs to tell an outlier from the norm, so the watermark (outlier included) governs."""
+        store = LearnedFootprintStore()
+        key = _key()
+        self._observe(store, key, _MIN_OBSERVATIONS_FOR_MEASURED - 2, mb=13000.0)
+        store.observe_peak(key, 14260.0)
+
+        assert store.measured_estimate_mb(key) is None
+        assert store.estimate_mb(key, static_seed_mb=6158.0) == pytest.approx(14260.0)
+
+    def test_a_resident_key_keeps_the_maximum_of_its_window(self) -> None:
+        """Resident readings are one entry per at-rest reading, so the window's maximum still prices them."""
+        store = LearnedFootprintStore()
+        key = _resident_key()
+        self._observe(store, key, _MIN_OBSERVATIONS_FOR_MEASURED - 1, mb=7000.0)
+        store.observe_peak(key, 7400.0)
+
+        expected = (7400.0 * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(platform="linux")
+        assert store.measured_estimate_mb(key) == pytest.approx(expected)
+
     def test_observation_count_is_reported(self) -> None:
         """The count is readable so a decision made on measurement can be logged with its evidence."""
         store = LearnedFootprintStore()
@@ -473,6 +515,68 @@ class TestPersistence:
         store = LearnedFootprintStore(path=path)
         assert len(store) == 1
         assert store.get_observation(good) is not None
+
+    def test_a_per_reading_file_rebuilds_its_sampling_windows_from_jobs(self, tmp_path: Path) -> None:
+        """A file whose SAMPLE windows hold per-report readings loads with those windows empty.
+
+        Its watermark, EWMA and count are kept, so the raise-only price survives the upgrade. Its readings are
+        not jobs, so the measured price waits for the window to refill with job figures.
+        """
+        path = tmp_path / "vram_footprints.json"
+        sample = _key()
+        isolated = _key(stage=FootprintStage.SAMPLE_ISOLATED)
+        resident = _resident_key()
+        readings = [9000.0, 14260.0, 9100.0, 9050.0, 9200.0, 9000.0]
+
+        def _entry(key: FootprintKey) -> dict[str, object]:
+            return {
+                "key": key.model_dump(mode="json"),
+                "observation": {
+                    "ewma_mb": 9500.0,
+                    "watermark_mb": 14260.0,
+                    "observation_count": len(readings),
+                    "recent_mb": readings,
+                },
+            }
+
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": _PER_READING_SAMPLE_SCHEMA_VERSION,
+                    "observations": [_entry(sample), _entry(isolated), _entry(resident)],
+                },
+            ),
+            encoding="utf-8",
+        )
+
+        store = LearnedFootprintStore(path=path)
+
+        loaded_sample = store.get_observation(sample)
+        assert loaded_sample is not None
+        assert loaded_sample.recent_mb == []
+        assert loaded_sample.watermark_mb == pytest.approx(14260.0)
+        assert loaded_sample.ewma_mb == pytest.approx(9500.0)
+        assert loaded_sample.observation_count == len(readings)
+        assert store.measured_estimate_mb(sample) is None
+        assert store.estimate_mb(sample, static_seed_mb=6158.0) == pytest.approx(14260.0)
+        # The isolated sampler was always fed once per job, and resident windows hold readings by design.
+        for kept in (isolated, resident):
+            loaded = store.get_observation(kept)
+            assert loaded is not None
+            assert loaded.recent_mb == pytest.approx(readings)
+
+    def test_a_saved_store_is_read_back_as_per_job_windows(self, tmp_path: Path) -> None:
+        """A file this build writes keeps its SAMPLE windows on reload, since they already hold jobs."""
+        path = tmp_path / "vram_footprints.json"
+        store = LearnedFootprintStore(path=path)
+        for mb in (11000.0, 12000.0):
+            store.observe_peak(_key(), mb)
+        store.save()
+
+        assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] != _PER_READING_SAMPLE_SCHEMA_VERSION
+        reloaded = LearnedFootprintStore(path=path).get_observation(_key())
+        assert reloaded is not None
+        assert reloaded.recent_mb == pytest.approx([11000.0, 12000.0])
 
     def test_a_pathless_store_never_writes(self, tmp_path: Path) -> None:
         """The in-memory construction (tests, and any consumer that wants no file) writes nothing."""

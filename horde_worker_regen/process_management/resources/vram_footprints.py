@@ -12,8 +12,9 @@ raises the priced peak above the seed and never below it. A whole-job monolithic
 UNet-only sampler peak are physically different quantities and are kept under distinct stages
 (:attr:`FootprintStage.SAMPLE` vs :attr:`FootprintStage.SAMPLE_ISOLATED`) so a monolithic peak never
 over-prices an isolated sampler (mixed operation is designed: a stage fault re-routes a disaggregated job
-monolithic). Monolithic peaks are observed from child memory reports; isolated-sampler peaks are observed
-from the disaggregation orchestrator at sample completion.
+monolithic). Monolithic peaks are folded from child memory reports as one figure per job, the job's highest
+reading, committed when the job ends. Isolated-sampler peaks are observed from the disaggregation orchestrator
+at sample completion, also once per job.
 
 Not every stage is an activation peak. :attr:`FootprintStage.RESIDENT` and :attr:`FootprintStage.SAFETY`
 record steady device charges (a loaded checkpoint's weights, the safety process's residency) observed while
@@ -22,8 +23,8 @@ pricing "what does this already cost the card" reads them exactly as it reads a 
 
 Two estimate policies live here and are deliberately kept apart. :meth:`LearnedFootprintStore.estimate_mb`
 is the raise-only overlay described above, used wherever undershooting is the only failure that matters.
-:meth:`LearnedFootprintStore.measured_estimate_mb` is bidirectional: once a key carries at least
-:data:`_MIN_OBSERVATIONS_FOR_MEASURED` observations it answers from the measurements alone, so a seed that
+:meth:`LearnedFootprintStore.measured_estimate_mb` is bidirectional: once a key's recent window holds at least
+:data:`_MIN_OBSERVATIONS_FOR_MEASURED` entries it answers from the measurements alone, so a seed that
 over-states the hardware (a Flux fp8 seed of 16.4 GB against a measured 13.5 GB device-used median) stops
 denying co-residency the card physically holds. Its conservatism is one explicit knob,
 :data:`_MEASURED_ESTIMATE_MARGIN` plus the platform context floor, rather than being smeared across the
@@ -181,12 +182,21 @@ class MeasuredJobFootprint(Protocol):
         """``whole_job`` for a monolithic run, ``sample_stage`` for a disaggregated sampler stage."""
 
 
-FOOTPRINT_STORE_SCHEMA_VERSION = 2
+FOOTPRINT_STORE_SCHEMA_VERSION = 3
 """Bumped when the file format changes, or when observations written by an older build can no longer be trusted.
-A file with another version is discarded on read. Version 2 drops files written before observations were
-bounds-checked (see :meth:`LearnedFootprintStore.observe_peak`): those can hold activation watermarks at the
-size of the card and resident figures smaller than the checkpoint's weights, and since watermarks only ever
-rise, the store would price from them forever."""
+A file with another version is discarded on read, except :data:`_PER_READING_SAMPLE_SCHEMA_VERSION`. Version 2
+drops files written before observations were bounds-checked (see :meth:`LearnedFootprintStore.observe_peak`):
+those can hold activation watermarks at the size of the card and resident figures smaller than the checkpoint's
+weights, and since watermarks only ever rise, the store would price from them forever. Version 3 marks
+:attr:`FootprintStage.SAMPLE` windows that hold one figure per job."""
+
+_PER_READING_SAMPLE_SCHEMA_VERSION = 2
+"""The last schema whose :attr:`FootprintStage.SAMPLE` windows hold one entry per memory report.
+
+Such a file is still loaded, with those windows emptied: several readings of one job are not several jobs, and
+priced as jobs they would let one job's readings stand for a key's whole recent traffic. The watermark, EWMA
+and count are kept, so the raise-only price survives and the measured price returns once jobs refill the
+window."""
 
 FOOTPRINT_STORE_FILENAME = "vram_footprints.json"
 """Name of the persisted store inside the worker's app-state directory (beside ``perf_model.json``)."""
@@ -360,6 +370,8 @@ class _FootprintObservation(BaseModel):
     recent_mb: list[float] = Field(default_factory=list)
     """The most recent observations, oldest first, capped at :data:`_RECENT_WINDOW_SIZE`.
 
+    A stage in :data:`_PER_JOB_STAGES` holds one figure per job. An at-rest stage holds one per reading.
+
     The basis of :meth:`LearnedFootprintStore.measured_estimate_mb`. A bounded window rather than the
     all-time watermark because the measured estimate is allowed to fall: a driver update, a quantisation
     change, or a different checkpoint of the same baseline can genuinely lower what the hardware needs,
@@ -367,17 +379,24 @@ class _FootprintObservation(BaseModel):
 
 
 _RECENT_WINDOW_SIZE = 20
-"""How many recent observations back the measured estimate.
+"""How many recent observations back the measured estimate: jobs for a per-job stage, readings otherwise.
 
-Wide enough that one anomalous job cannot dominate the window's maximum for long, narrow enough that a
-genuine change in what a key costs works its way through within a few minutes of ordinary traffic."""
+Wide enough that one anomalous job cannot dominate the window for long, narrow enough that a genuine change in
+what a key costs works its way through within a few minutes of ordinary traffic."""
 
 _MIN_OBSERVATIONS_FOR_MEASURED = 5
-"""Observations a key needs before :meth:`LearnedFootprintStore.measured_estimate_mb` answers at all.
+"""Window entries a key needs before :meth:`LearnedFootprintStore.measured_estimate_mb` answers at all.
 
 Below this the key keeps the raise-only :meth:`LearnedFootprintStore.estimate_mb` contract, so a single
 unrepresentative run (a job that faulted mid-sample, a slot that never finished loading) can never talk a
-consumer into planning below the static seed."""
+consumer into planning below the static seed. A per-job window prices at its second-highest job, and with five
+jobs that figure is matched or exceeded by two of them, which a lone outlier cannot do."""
+
+_PER_JOB_STAGES = frozenset({FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED})
+"""Stages whose window holds one figure per job, priced at the window's second-highest entry.
+
+Both activation stages are fed once per job. The at-rest stages are fed a reading per report and keep the
+window's maximum, since their entries are repeated readings of one steady state."""
 
 _MEASURED_ESTIMATE_MARGIN = 1.10
 """The single conservatism knob applied to a measured estimate.
@@ -385,7 +404,7 @@ _MEASURED_ESTIMATE_MARGIN = 1.10
 The measurements carry no safety margin of their own (a footprint is one observation of real hardware, not a
 budget), and the two failure modes of an under-estimate are severe and asymmetric: on
 Linux the OOM killer takes the process, on Windows/WDDM the driver pages to host RAM and the step rate
-collapses. Ten percent over the recent watermark buys headroom for the run-to-run variation the window
+collapses. Ten percent over the window's priced figure buys headroom for the run-to-run variation the window
 already shows, without re-introducing the seed's multi-gigabyte over-statement. It is deliberately one
 constant applied at one seam rather than a fudge folded into every seed."""
 
@@ -636,17 +655,19 @@ class LearnedFootprintStore:
         13.5 GB device-used median is the case in point: the seed reserved the whole card and bought
         nothing.
 
-        The figure is the maximum of the recent window (:data:`_RECENT_WINDOW_SIZE` observations, so a
-        genuine downward shift eventually lands while one high job still counts), times
-        :data:`_MEASURED_ESTIMATE_MARGIN`, plus the platform's per-process context charge. The margin and
+        The figure is drawn from the recent window (:data:`_RECENT_WINDOW_SIZE` entries, so a genuine downward
+        shift eventually lands). A per-job stage (:data:`_PER_JOB_STAGES`) prices at the window's second-highest
+        job, so one outlier job cannot set the key's price while two high jobs still do. An at-rest stage prices
+        at the window's maximum. The figure is multiplied by :data:`_MEASURED_ESTIMATE_MARGIN` and the platform's
+        per-process context charge is added. The margin and
         the floor are the whole of the conservatism, held here rather than folded into the estimate's
         basis, so a reader can see and change what the worker is paying for safety. The floor is the same
         charge the reserve prices a CUDA context at: a consumer sizing a device against this figure must
         cover the context of the process holding it, and where an observation already carries its context
         it is additional margin in the direction this store exists to fail in.
 
-        Returns None below :data:`_MIN_OBSERVATIONS_FOR_MEASURED` observations, which leaves the caller on
-        the raise-only path with the static seed intact.
+        Returns None while the window holds fewer than :data:`_MIN_OBSERVATIONS_FOR_MEASURED` entries, which
+        leaves the caller on the raise-only path with the static seed intact.
 
         Args:
             key (FootprintKey): The footprint identity to estimate for.
@@ -655,13 +676,13 @@ class LearnedFootprintStore:
             float | None: The margined measured estimate (MB), or None for an under-observed key.
         """
         observation = self._observations.get(key)
-        if observation is None or observation.observation_count < _MIN_OBSERVATIONS_FOR_MEASURED:
+        if observation is None or len(observation.recent_mb) < _MIN_OBSERVATIONS_FOR_MEASURED:
             return None
-        if not observation.recent_mb:
-            return None
-        return (max(observation.recent_mb) * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(
-            platform=key.platform,
-        )
+        if key.stage in _PER_JOB_STAGES:
+            basis_mb = sorted(observation.recent_mb, reverse=True)[1]
+        else:
+            basis_mb = max(observation.recent_mb)
+        return (basis_mb * _MEASURED_ESTIMATE_MARGIN) + platform_context_constant_mb(platform=key.platform)
 
     def get_observation(self, key: FootprintKey) -> _FootprintObservation | None:
         """Return the raw running statistics for ``key`` (EWMA, watermark, count), or None if cold.
@@ -710,7 +731,8 @@ class LearnedFootprintStore:
         """Load previously persisted observations, tolerating a missing, unreadable, or corrupt file.
 
         A file the current build cannot parse is discarded rather than repaired: the store re-learns from
-        live traffic within a handful of jobs, so nothing is worth failing a worker start over.
+        live traffic within a handful of jobs, so nothing is worth failing a worker start over. A file of
+        :data:`_PER_READING_SAMPLE_SCHEMA_VERSION` loads with its :attr:`FootprintStage.SAMPLE` windows emptied.
         """
         if self._path is None or not self._path.exists():
             return
@@ -720,8 +742,12 @@ class LearnedFootprintStore:
             logger.debug(f"Could not read learned VRAM footprints at {self._path} ({read_error}); starting cold.")
             return
 
-        if not isinstance(raw, dict) or raw.get("schema_version") != FOOTPRINT_STORE_SCHEMA_VERSION:
+        if not isinstance(raw, dict):
             return
+        schema_version = raw.get("schema_version")
+        if schema_version not in (FOOTPRINT_STORE_SCHEMA_VERSION, _PER_READING_SAMPLE_SCHEMA_VERSION):
+            return
+        windows_hold_readings = schema_version == _PER_READING_SAMPLE_SCHEMA_VERSION
         entries = raw.get("observations")
         if not isinstance(entries, list):
             return
@@ -734,6 +760,8 @@ class LearnedFootprintStore:
                 observation = _FootprintObservation.model_validate(entry.get("observation"))
             except ValueError:
                 continue
+            if windows_hold_readings and key.stage is FootprintStage.SAMPLE:
+                observation = observation.model_copy(update={"recent_mb": []})
             self._observations[key] = observation
 
     # endregion

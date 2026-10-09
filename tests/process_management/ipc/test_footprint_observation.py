@@ -155,6 +155,9 @@ async def test_running_inference_peak_is_recorded_with_the_right_key() -> None:
     dispatcher = _dispatcher_with_store(process_map=process_map, job_tracker=job_tracker, store=store)
 
     dispatcher._handle_memory_report(_memory_message(1, peak_mb=11000))
+    assert len(store) == 0
+    assert job.id_ is not None
+    dispatcher._commit_job_sampling_peak(job.id_)
 
     expected_key = FootprintKey(
         model_baseline=str(_BASELINE),
@@ -188,6 +191,8 @@ async def test_a_primed_lanes_peak_is_not_attributed_until_its_first_step() -> N
 
     process_info.last_process_state = HordeProcessState.INFERENCE_STARTING
     dispatcher._handle_memory_report(_memory_message(1, peak_mb=11000))
+    assert job.id_ is not None
+    dispatcher._commit_job_sampling_peak(job.id_)
 
     key = FootprintKey(
         model_baseline=str(_BASELINE),
@@ -643,4 +648,6 @@ async def test_a_sampling_peak_at_the_card_size_is_not_attributed() -> None:
     plausible = _memory_message(1, peak_mb=10654)
     plausible.vram_total_mb = 24576
     dispatcher._handle_memory_report(plausible)
+    assert job.id_ is not None
+    dispatcher._commit_job_sampling_peak(job.id_)
     assert len(store) == 1
