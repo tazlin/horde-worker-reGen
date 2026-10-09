@@ -500,3 +500,28 @@ async def test_a_grant_survives_the_staged_childs_preload_reports(primed_tick_ob
 
     assert controller.grant_state(0) is GrantState.IDLE
     assert controller.grants_issued == 1
+
+
+async def test_a_pinned_disaggregated_sampler_waits_on_clearance_only_from_its_sample_prime() -> None:
+    """A sampler pinned to a disaggregated job is not a clearance waiter during the encode, only once it primes.
+
+    The pin binds the sampler at admission, before the encode runs on another lane, so the slot owns the job
+    while it sits idle. A grant issued then would hold a clearance slot through the whole encode.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    waiter.record_inference_ownership(job, attempt_ordinal=1, disaggregated=True)
+    ownership = waiter.inference_ownership
+    assert ownership is not None
+
+    def staged_waiter_ids() -> list[int]:
+        return [staged.process_id for staged in scheduler.build_clearance_inputs(device_index=0).staged_waiters]
+
+    waiter.last_process_state = HordeProcessState.WAITING_FOR_JOB
+    waiter.last_process_state_started_at = ownership.recorded_at + 1.0
+    assert waiter.is_staged_short_of_sampling() is False
+    assert staged_waiter_ids() == [], "a pinned sampler is not a waiter while its encode runs elsewhere"
+
+    waiter.last_process_state = HordeProcessState.INFERENCE_PRIMED
+    waiter.last_process_state_started_at = ownership.recorded_at + 2.0
+    assert waiter.is_staged_short_of_sampling() is True
+    assert staged_waiter_ids() == [0], "the sample stage's prime makes the pinned sampler a waiter"

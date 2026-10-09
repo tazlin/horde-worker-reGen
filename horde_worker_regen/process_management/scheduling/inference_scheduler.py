@@ -2293,8 +2293,6 @@ class InferenceScheduler:
         self._job_tracker.mark_admitted_exclusive(job, device_index=target_device_index)
         if self._should_prestage_whole_card_head(
             job,
-            baseline,
-            forecast,
             available_process,
             device_index=target_device_index,
         ):
@@ -2346,8 +2344,6 @@ class InferenceScheduler:
     def _should_prestage_whole_card_head(
         self,
         job: ImageGenerateJobPopResponse,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        forecast: StreamForecast,
         available_process: HordeProcessInfo,
         *,
         device_index: int | None = None,
@@ -2355,8 +2351,9 @@ class InferenceScheduler:
         """Whether a whole-card head should preload into a spare's RAM while a live job still holds the device.
 
         A preload is RAM-only, so the multi-GB disk read overlaps the in-flight job instead of starting after the
-        drain. Worthwhile only when a live job holds the card, the head is not already resident or loading, an idle
-        spare exists, and system RAM can hold the weights beside the in-flight job.
+        drain. Worthwhile only when a live job holds the card, the head is not already resident or loading, and an
+        idle spare exists. Host RAM is not judged here: the RAM preload admission the pre-stage passes before it is
+        sent is the one RAM test, and its deferral leaves the residency recorded for the head to re-ask.
         """
         if device_index is None:
             live_jobs_on_device = len(self._job_tracker.jobs_in_progress)
@@ -2366,9 +2363,7 @@ class InferenceScheduler:
             return False
         if self._is_model_forecast_to_load(job.model):
             return False
-        if available_process.is_process_busy():
-            return False
-        return self._prestage_weights_fit_ram(job, baseline, forecast)
+        return not available_process.is_process_busy()
 
     def _begin_whole_card_residency(
         self,
@@ -3421,41 +3416,6 @@ class InferenceScheduler:
             protected_model=protected_model,
             spared_process_id=spared_process_id,
         )
-
-    def _prestage_weights_fit_ram(
-        self,
-        job: ImageGenerateJobPopResponse,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        forecast: StreamForecast,
-    ) -> bool:
-        """Whether system RAM can hold the head's *weights* alongside the in-flight job.
-
-        A RAM preload materialises only the model's weights on the CPU offload device; the activation working
-        set that inflates the full :func:`predict_job_ram_mb` burden lives in VRAM at sampling time, not in
-        RAM. Gating the pre-stage on that full burden over-rejects a head whose weights comfortably fit (a Flux
-        fp8 head's ~11.5GB of weights versus its ~24GB activation-inclusive estimate), which is what forces the
-        worker to tear every idle sibling down instead of staging. Worse, the establish path it then falls back
-        to loads those same weights into RAM with no hard gate at all, so the burden gate held the pre-stage to
-        a stricter standard than the path it defers to. So gate on the weight footprint (the forecast's
-        ``weights_mb``, the persistent RAM cost of a preload) plus the configured RAM reserve.
-
-        When the weight estimate is unavailable (it should not be once ``needs_exclusive_residency`` is True,
-        which requires known weights) fall back to the conservative full-burden RAM budget, so a head whose
-        footprint cannot be sized is never force-staged onto a RAM-pressured host.
-        """
-        available_ram_mb = self._measured_available_ram_mb()
-        weights_mb = forecast.weights_mb
-        committed_ram_mb = self._reserve_ledger.total_ram_mb()
-        staging = self._whole_job_ram_charge_mb(job)
-        return self._ram_budget.check_job(
-            job,
-            baseline,
-            available_ram_mb,
-            committed_reserve_mb=committed_ram_mb,
-            staging_charge_mb=staging if staging is not None else weights_mb,
-            danger_floor_mb=self._ram_danger_floor_mb(),
-            outstanding_planned_mb=self._outstanding_planned_ram_mb(),
-        ).fits
 
     def _resident_safety_charge_mb(self, device_index: int | None) -> float:
         """The device charge of a safety context this card's residency is leaving where it is.
@@ -10726,6 +10686,7 @@ class InferenceScheduler:
         process_with_model.record_inference_ownership(
             next_job,
             attempt_ordinal=(tracked.inference_attempts + 1) if tracked is not None else 1,
+            disaggregated=True,
         )
         # The pinned sampler is now executing, the same as a monolithic START_INFERENCE. Without this the slot
         # keeps whatever control flag it last carried; a slot the ladder once told to unload would keep reading

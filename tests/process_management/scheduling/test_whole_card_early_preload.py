@@ -464,26 +464,48 @@ class TestLiveLogRamGateRegression:
             "the worker must not tear the idle siblings down when the head can be pre-staged"
         )
 
-    async def test_falls_back_to_teardown_when_even_weights_do_not_fit_ram(
+    async def test_prestage_is_chosen_and_the_ram_admission_defers_it_when_weights_do_not_fit(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Guard: when RAM cannot hold even the weights, decline the pre-stage and use the establish path."""
+        """With physical RAM short of the weights, the pre-stage is still chosen and the RAM admission defers it.
+
+        The RAM preload admission is the one RAM test a pre-stage passes, so a shortfall defers the preload with
+        the admission's physical line and leaves the residency recorded for a re-ask, instead of switching the
+        whole-card path to the teardown.
+        """
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 14000.0)
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 24000.0)
 
         # Below the weights (~11.5GB) + reserve (4GB): a RAM preload genuinely would not fit.
         scheduler, job_tracker, idle = _live_log_overlap_scheduler(available_ram_mb=14000.0)
+        checkpoint = Mock()
+        checkpoint.stat.return_value.st_size = int(_FLUX_WEIGHTS_MB * 1024 * 1024)
+        monkeypatch.setattr(scheduler, "_resolve_checkpoint_path", lambda _model: checkpoint)
         sdxl_in_progress = make_job_pop_response(_RESIDENT_SDXL)
         await track_popped_job_async(job_tracker, sdxl_in_progress)
         await mark_job_in_progress_async(job_tracker, sdxl_in_progress)
         flux = make_job_pop_response(_FLUX_MODEL, width=1024, height=1024)
         await track_popped_job_async(job_tracker, flux)
 
-        scheduler.preload_models()
+        messages: list[str] = []
+        sink_id = logger.add(lambda record: messages.append(str(record)), level="DEBUG")
+        try:
+            admitted = scheduler.preload_models()
+        finally:
+            logger.remove(sink_id)
 
+        assert any("Pre-staging whole-card head" in message for message in messages), "the pre-stage was chosen"
         assert _idle_preloading_flux(idle) == [], "must not stage when the weights cannot fit RAM"
+        assert admitted is False
+        assert any(
+            "RAM budget deferring preload of" in message and "commit-bound" not in message for message in messages
+        ), "the deferral is the RAM admission's physical line"
+        assert cast(Mock, scheduler._process_lifecycle.scale_inference_processes).called is False, (
+            "a deferred pre-stage keeps the idle siblings; the teardown is not its fallback"
+        )
+        assert job_tracker.is_admitted_exclusive(flux) is True, "the residency stays recorded for a re-ask"
 
 
 def _staged_flux_scheduler(

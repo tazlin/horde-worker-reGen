@@ -598,9 +598,11 @@ is governed instead by the device-free governor and the verified reclaim ladder 
 **Preloads.** The scheduler's preload adapter consults the whole-card residency state machine first (which
 stays external, pre-staging or deferring a whole-card head), then prices the preload through the arbiter and
 acts on the single verdict: a `FITS` admits and runs the marginal RAM verdict, and a `DEFER` runs the
-described actuations and re-asks. A whole-card pre-stage skips the arbiter, since the head is not meant to fit
-co-resident, but runs the same marginal RAM verdict (commit included) before its preload is sent; a RAM
-deferral leaves the residency recorded and the head re-asks next cycle. There is no second, parallel admission arithmetic: the
+described actuations and re-asks. A whole-card pre-stage is chosen whenever a live job holds the card, the head
+is not already loading and an idle spare exists; the choice makes no RAM test of its own. The pre-stage skips the
+arbiter, since the head is not meant to fit co-resident, but runs the same marginal RAM verdict (commit included)
+before its preload is sent. A RAM deferral, physical or commit-bound, leaves the residency recorded and the head
+re-asks next cycle; a RAM shortfall never switches the head to the teardown path. There is no second, parallel admission arithmetic: the
 ledger-driven identity is the only gate. Because the reserve is a sampling-headroom term and never a
 load-feasibility floor, a preload is never denied by `vram_reserve_mb`; a model whose weights fit the drained
 card admits even when the operator's reserve would have read it as unloadable. Under the clearance lease a

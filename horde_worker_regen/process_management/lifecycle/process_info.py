@@ -118,6 +118,11 @@ class InferenceExecutionOwnership:
     is re-bound inside the previous job's sample-result tick). Readers that close a job on an idle report
     compare the report's state start against this instant so a report older than the ownership is not read as
     the new job's slot having gone idle."""
+    disaggregated: bool = False
+    """Whether the attempt binds this slot as a disaggregated job's pinned sampler.
+
+    The pin is taken at admission, before the job's encode runs on another lane, so the slot owns the job
+    through a window in which it has nothing of its own to stage."""
 
 
 class HordeProcessInfo:
@@ -539,13 +544,26 @@ class HordeProcessInfo:
         """Attribute model preparation to ``job`` without granting it execution ownership."""
         self.preload_job_intent = PreloadJobIntent(job, self.process_launch_identifier)
 
-    def record_inference_ownership(self, job: ImageGenerateJobPopResponse, *, attempt_ordinal: int) -> None:
-        """Record that this exact launch owns a successfully dispatched inference attempt."""
+    def record_inference_ownership(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        attempt_ordinal: int,
+        disaggregated: bool = False,
+    ) -> None:
+        """Record that this exact launch owns a successfully dispatched inference attempt.
+
+        Args:
+            job: The dispatched job.
+            attempt_ordinal: The attempt's ordinal among the job's inference attempts.
+            disaggregated: Whether the slot is bound as a disaggregated job's pinned sampler.
+        """
         self.inference_ownership = InferenceExecutionOwnership(
             job=job,
             process_launch_identifier=self.process_launch_identifier,
             attempt_ordinal=attempt_ordinal,
             recorded_at=time.time(),
+            disaggregated=disaggregated,
         )
         if self.preload_job_intent is not None and self.preload_job_intent.job == job:
             self.preload_job_intent = None
@@ -565,11 +583,17 @@ class HordeProcessInfo:
         that began after it. A child sent its job with a preload reports the preload's states before it primes,
         and a re-bound slot can still report its previous job's sampling or completion. The first-step stamp
         cannot mark the boundary because a completion report clears it while the job is still owned.
+
+        A disaggregated job's pinned sampler is the one exception: it is staged only while it reports
+        ``INFERENCE_PRIMED`` after the ownership. The pin binds the slot before the job's encode runs on another
+        lane, so until its sample stage primes the slot has nothing to load and is not waiting on clearance.
         """
         ownership = self.inference_ownership
         if ownership is None or self.current_inference_job() is None:
             return False
         state_follows_ownership = self.last_process_state_started_at >= ownership.recorded_at
+        if ownership.disaggregated:
+            return state_follows_ownership and self.last_process_state == HordeProcessState.INFERENCE_PRIMED
         return not (state_follows_ownership and self.last_process_state in _INFERENCE_ACTIVE_STATES)
 
     def retire_inference_ownership(self, job: ImageGenerateJobPopResponse) -> bool:
