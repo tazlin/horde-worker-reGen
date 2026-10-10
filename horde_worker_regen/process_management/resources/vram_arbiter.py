@@ -462,8 +462,8 @@ class VramRequest:
     eligible, so it comes before the child's lease-acquire timeout makes the same load unpriced. None for a head
     with no lease timeout."""
     lease_wait_seconds: float | None = None
-    """For a staged waiter, seconds since clearance first held it, the clock its child's lease-acquire timeout runs
-    on. A reclaim leaves it running, where it stops :attr:`starved_seconds`. None outside clearance."""
+    """For a staged waiter, seconds since its child first asked for clearance, the clock its lease-acquire timeout
+    runs on. A reclaim leaves it running, where it stops :attr:`starved_seconds`. None outside clearance."""
     sampling_peak_mb: float | None = None
     active_sampling_peaks_total_mb: float | None = None
     """The live sum (MB) of the in-flight disaggregated sampling peaks at the moment of this request, for

@@ -975,8 +975,8 @@ The room is also what the other frames read, so they cannot disagree with the ve
   evidenced, a hold that ran reclaim, a grant and a post-processing hold each stop it, and the next hold where
   nothing helps starts it again. A staged waiter takes `measured_load_probe_seconds` at any shortfall, without
   the longer horizon. At its lease-acquire timeout its child makes the same load unpriced, so the horizon would
-  only idle the card for the same outcome. The scheduler also keeps the waiter's lease wait, seconds since
-  clearance first held it, which no reclaim stops. Once that reaches the lease-acquire timeout less the longer
+  only idle the card for the same outcome. The scheduler also keeps the waiter's lease wait, seconds since its
+  child first asked for clearance, which no reclaim stops. Once that reaches the lease-acquire timeout less the longer
   of the probe delay and the card's measured load seconds, the probe is due while the waiter is starved, however
   often a rung restarted its clearance clock. Reclaim keeps its turn, since the probe still needs a converged
   card with no rung left that could close the deficit.

@@ -65,7 +65,7 @@ class StagedWaiterTerms:
     attempt_deadline_seconds: float
     """The lease-wait reading by which its measured-load probe must be eligible."""
     lease_wait_seconds: float | None = None
-    """Seconds since clearance first held the waiter, never stopped by a reclaim, or None when untimed."""
+    """Seconds since the waiter's child first asked for clearance, never stopped by a reclaim, or None untimed."""
     lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG
     """Where the waiter's starvation episode stands with the service-lane rungs applied for it."""
     seat_weight_fraction: float = pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION

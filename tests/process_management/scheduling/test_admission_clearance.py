@@ -980,3 +980,67 @@ async def test_the_waiter_clock_carries_the_cards_measured_upload_rate() -> None
     )
     clock = scheduler._staged_waiter_clock(waiter, job)  # type: ignore[attr-defined]
     assert clock.upload_mb_per_second == pytest.approx(2000.0)
+
+
+def _clearance_records(sink: Mock) -> list[dict[str, object]]:
+    """The keyword arguments of every clearance record the sink received, in order."""
+    from horde_worker_regen.process_management.resources.run_metrics import DecisionKind
+
+    return [call.kwargs for call in sink.call_args_list if call.kwargs.get("decision_kind") is DecisionKind.CLEARANCE]
+
+
+async def test_a_clearance_hold_records_the_figures_and_clocks_it_was_held_on() -> None:
+    """A held waiter's record carries its price, the reading, both clocks and their limits.
+
+    The failure this encodes: a large model was held at clearance for its whole lease-acquire timeout with
+    nothing sampling, and the stats stream carried no record of the hold, so a bundle could not say which of the
+    price, the starved clock, the deadline or the card's convergence had held it.
+    """
+    from horde_worker_regen.process_management.resources.run_metrics import DecisionVerdict
+
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=100.0)
+    sink = Mock()
+    scheduler._decision_sink = sink  # type: ignore[attr-defined]
+
+    assert scheduler.clearance_admit_process(0) is False
+    assert scheduler.clearance_admit_process(0) is False
+
+    records = _clearance_records(sink)
+    assert len(records) == 2
+    first, second = records
+    assert first["subject"] == str(job.id_)
+    assert first["verdict"] in (DecisionVerdict.DEFER, DecisionVerdict.DENY)
+    inputs = first["inputs"]
+    assert isinstance(inputs, dict)
+    for key in (
+        "candidate_delta_mb",
+        "available_mb",
+        "device_free_mb",
+        "starved_seconds",
+        "lease_wait_seconds",
+        "attempt_deadline_seconds",
+        "probe_after_seconds",
+        "waiting_can_help",
+        "idle_contexts_teardownable",
+    ):
+        assert key in inputs, key
+    second_inputs = second["inputs"]
+    assert isinstance(second_inputs, dict)
+    assert second_inputs["lease_wait_seconds"] is not None
+    assert second_inputs["lease_wait_seconds"] >= inputs["lease_wait_seconds"]  # type: ignore[operator]
+
+
+async def test_a_clearance_grant_records_how_the_job_was_granted() -> None:
+    """A grant closes the waiter's record with the way it was admitted."""
+    from horde_worker_regen.process_management.resources.run_metrics import DecisionVerdict
+
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=24000.0)
+    sink = Mock()
+    scheduler._decision_sink = sink  # type: ignore[attr-defined]
+
+    assert scheduler.clearance_admit_process(0) is True
+
+    records = _clearance_records(sink)
+    assert [(record["subject"], record["verdict"], record["reason"]) for record in records] == [
+        (str(job.id_), DecisionVerdict.ADMIT, "granted by price"),
+    ]

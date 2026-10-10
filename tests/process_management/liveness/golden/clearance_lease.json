@@ -44,6 +44,32 @@
       "decisions": [
         {
           "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 11778.8,
+            "candidate_delta_mb": 6210.0,
+            "candidate_held_mb": 2048.0,
+            "device_free_mb": 12598.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 0.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaimable_idle_model": false,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "granted by price",
+          "subject": "job-1",
+          "verdict": "admit"
+        },
+        {
+          "inputs": {
             "decision": "already_loaded",
             "model": "sdxl-checkpoint",
             "process_id": null
@@ -121,6 +147,34 @@
       "tick": 9
     },
     {
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 11778.8,
+            "candidate_delta_mb": 6210.0,
+            "candidate_held_mb": 2048.0,
+            "device_free_mb": 12598.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 0.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaimable_idle_model": false,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "granted by price",
+          "subject": "job-2",
+          "verdict": "admit"
+        }
+      ],
       "dispatches": [
         {
           "lane": 0,
@@ -158,6 +212,32 @@
     },
     {
       "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 11778.8,
+            "candidate_delta_mb": 6210.0,
+            "candidate_held_mb": 2048.0,
+            "device_free_mb": 12598.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 0.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint-b",
+            "noise_buffer_mb": 819.2,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 1,
+            "reclaimable_idle_model": false,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "granted by price",
+          "subject": "job-3",
+          "verdict": "admit"
+        },
         {
           "inputs": {
             "decision": "already_loaded",

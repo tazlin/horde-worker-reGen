@@ -124,7 +124,7 @@ class StagedWaiterClock:
     upload_mb_per_second: float | None = None
     """The rate (MB/s) the card has measured jobs putting their weights on it, or None when none is measured."""
     lease_wait_seconds: float | None = None
-    """Seconds since clearance first held the waiter. A reclaim leaves it running, since the child's
+    """Seconds since the waiter's child first asked for clearance. A reclaim leaves it running, since the child's
     lease-acquire timeout counts from the start of its wait. None for a waiter the caller does not time."""
 
 

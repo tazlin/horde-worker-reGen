@@ -122,10 +122,21 @@ same line many times per second. The exporter therefore **coalesces** a decision
 So a sustained hold reads as one opening record, occasional heartbeats, and one resolution, not a flood.
 `first_seen_ts` marks when the current unresolved condition first appeared.
 
-`decision_kind` is one of `vram_admission`, `inference_dispatch`, `pp_deferral`, `reclaim_rung`, or
-`image_utilities_routing`; `verdict` is one of `admit`, `defer`, `deny`, `withhold`, `freed`, or `no_op` (the
+`decision_kind` is one of `vram_admission`, `inference_dispatch`, `pp_deferral`, `reclaim_rung`,
+`image_utilities_routing`, or `clearance`; `verdict` is one of `admit`, `defer`, `deny`, `withhold`, `freed`, or `no_op` (the
 last three of which are *resolving*). Preload admission records under `vram_admission`, carrying the gate's
 decision and its reason, so a head that never loads can be attributed offline without a log.
+
+A `clearance` record is one staged job's pass at the clearance lease, the moment its weights would load. A hold
+(`defer`, or `deny` past its deadline on evidence of a native crash) carries the price and the reading it was
+judged on (`candidate_delta_mb`, `candidate_held_mb`, `partial_seat_mb`, `device_free_mb`, `available_mb`,
+`outstanding_reservations_mb`, `noise_buffer_mb`), both clocks against their limits (`starved_seconds` against
+`probe_after_seconds`, `lease_wait_seconds` against `attempt_deadline_seconds`), whether the card still reads as
+having something to reclaim (`reclaimable_idle_model`, `reclaimable_idle_tenancy`, `idle_contexts_teardownable`),
+`measured_attempt_spent`, `waiting_can_help` (other work on the card can still free room), any
+`reclaim_applied_kinds`, and the same `room_*`, `tenancy_*` and `rung_*` fields as a dispatch deferral. The
+resolving `admit` names how the job was granted: by price, at its partial-load seat, as a measured load
+attempt, unpriced, or with the budget inactive.
 
 An `inference_dispatch` deferral (and every `dispatch_hold` record) carries the measured room the hold was
 judged against: `room_candidate_mb`, `room_available_mb`, `room_deficit_mb`, `room_reclaimable_mb`,

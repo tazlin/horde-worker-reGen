@@ -438,6 +438,11 @@ class _MaterializationOutcome:
     actuations_applied: tuple[ActuatorCommand, ...]
 
 
+def _round_or_none(value: float | None) -> float | None:
+    """``value`` rounded to one decimal for a decision record, or None when there is no figure."""
+    return None if value is None else round(value, 1)
+
+
 class InferenceScheduler:
     """Owns model preloading, inference start, and model unloading logic."""
 
@@ -653,8 +658,8 @@ class InferenceScheduler:
         # other grant on its card, no reclaim in flight). Absent while either holds. It times the waiter's
         # measured-load probe, which must come before the child's lease-acquire timeout samples it unpriced.
         self._clearance_starved_since: dict[str, float] = {}
-        # When clearance first held each staged job, which bounds the waiter's measured-load probe. A reclaim never
-        # stops it, since the child's lease-acquire timeout runs from the start of its wait.
+        # When each staged job's child first asked for clearance, which bounds the waiter's measured-load probe. A
+        # reclaim never stops it, since the child's lease-acquire timeout runs from the start of its wait.
         self._clearance_held_since: dict[str, float] = {}
         # The lane rung last applied per staged job in its current starvation episode. Applying a rung stops the
         # clearance clock, so the next rung is spaced by this rung's grade. It ends with the episode, wherever
@@ -6104,6 +6109,8 @@ class InferenceScheduler:
             and job.model is not None
             and self._should_defer_dispatch_for_post_processing(job, process_with_model=process_info)
         )
+        if job is not None and job.id_ is not None:
+            self._clearance_held_since.setdefault(str(job.id_), self._clock())
         plan = decide_clearance_admit(
             self.snapshot(),
             process_id,
@@ -6115,18 +6122,20 @@ class InferenceScheduler:
             self._stop_staged_waiter_clock(job)
             if plan.grants:
                 self._note_clearance_granted(job)
+                if job is not None:
+                    self._record_clearance_decision(job, plan, DecisionVerdict.ADMIT, "granted unpriced")
             return plan.grants
-        if not plan.grants and job.id_ is not None:
-            self._clearance_held_since.setdefault(str(job.id_), self._clock())
         if plan.decision is ClearanceDecision.HOLD_POST_PROCESSING:
             self._stop_staged_waiter_clock(job)
             self._note_clearance_hold(job, reclaim_applied=False)
             self._log_clearance_hold(process_id, job, reason=plan.reason, verdict=None)
+            self._record_clearance_decision(job, plan, DecisionVerdict.DEFER, "held beside a post-processing chain")
             return False
         if plan.decision is ClearanceDecision.BUDGET_INACTIVE:
             self._stop_staged_waiter_clock(job)
             self._resolve_clearance_hold(job)
             self._note_clearance_granted(job)
+            self._record_clearance_decision(job, plan, DecisionVerdict.ADMIT, "granted with the budget inactive")
             return True
         assert plan.priced is not None and plan.verdict is not None and job.model is not None
         if plan.decision is ClearanceDecision.ADMIT:
@@ -6136,6 +6145,13 @@ class InferenceScheduler:
             self._resolve_clearance_hold(job)
             self._note_clearance_granted(job)
             self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.booking_mb)
+            if plan.verdict.measured_attempt:
+                granted_as = "granted a measured load attempt"
+            elif plan.verdict.partial_seat:
+                granted_as = "granted at its partial-load seat"
+            else:
+                granted_as = "granted by price"
+            self._record_clearance_decision(job, plan, DecisionVerdict.ADMIT, granted_as)
             return True
 
         applied = self._actuate_materialization_verdict(
@@ -6145,10 +6161,11 @@ class InferenceScheduler:
             plan.verdict,
             is_head_of_queue=True,
         )
+        waiting_can_help = not applied and self._waiting_can_help_staged_waiter(process_info)
         if applied:
             self._note_lane_rung_applied(job, applied)
             self._clearance_starved_since.pop(str(job.id_), None)
-        elif self._waiting_can_help_staged_waiter(process_info):
+        elif waiting_can_help:
             self._stop_staged_waiter_clock(job)
         elif (terminal_evidence := self._terminal_refusal_evidence(plan, job.model)) is not None:
             # A refusal past the waiter's attempt deadline leaves the child one exit, sampling unpriced at its
@@ -6168,6 +6185,13 @@ class InferenceScheduler:
                 intentional_reason="clearance refused outright: the staged job cannot be held on this card",
                 resource_fault_reason=f"clearance refused outright: {plan.reason} ({terminal_evidence})",
             )
+            self._record_clearance_decision(
+                job,
+                plan,
+                DecisionVerdict.DENY,
+                f"refused outright: {terminal_evidence}",
+                applied=applied,
+            )
             return False
         elif job.id_ is not None:
             self._clearance_starved_since.setdefault(str(job.id_), self._clock())
@@ -6180,7 +6204,77 @@ class InferenceScheduler:
             candidate_mb=plan.candidate_delta_mb,
             actuations=applied,
         )
+        self._record_clearance_decision(
+            job,
+            plan,
+            DecisionVerdict.DENY if plan.verdict.disposition is VramDisposition.DENY else DecisionVerdict.DEFER,
+            plan.verdict.reason,
+            applied=applied,
+            waiting_can_help=waiting_can_help,
+        )
         return False
+
+    def _record_clearance_decision(
+        self,
+        job: ImageGenerateJobPopResponse,
+        plan: ClearancePlan,
+        verdict: DecisionVerdict,
+        reason: str,
+        *,
+        applied: tuple[ActuatorCommand, ...] = (),
+        waiting_can_help: bool | None = None,
+    ) -> None:
+        """Record one clearance pass for ``job`` with the figures and clocks it was decided on.
+
+        A held waiter idles the card while nothing samples, so a bundle has to be able to say which term held it:
+        the price against the room, the starved clock against the probe delay, the lease wait against the
+        deadline, or a card that still reads as having something to reclaim. Repeats of an unchanged hold coalesce
+        in the sink.
+        """
+        if self._decision_sink is None or job.id_ is None:
+            return
+        inputs: FlatScalarMap = {"model": str(job.model), "process_id": plan.process_id}
+        if waiting_can_help is not None:
+            inputs["waiting_can_help"] = waiting_can_help
+        if applied:
+            inputs["reclaim_applied_kinds"] = ",".join(command.kind.value for command in applied)
+        if plan.priced is not None:
+            request = plan.priced.request
+            inputs.update(
+                {
+                    "device_index": plan.priced.device_index,
+                    "candidate_delta_mb": _round_or_none(request.candidate_delta_mb),
+                    "candidate_held_mb": _round_or_none(request.candidate_held_mb),
+                    "partial_seat_mb": _round_or_none(request.partial_seat_mb),
+                    "starved_seconds": round(request.starved_seconds, 1),
+                    "lease_wait_seconds": _round_or_none(request.lease_wait_seconds),
+                    "attempt_deadline_seconds": _round_or_none(request.attempt_deadline_seconds),
+                    "probe_after_seconds": round(request.probe_after_seconds, 1),
+                    "measured_attempt_spent": request.measured_attempt_already_spent,
+                    "reclaimable_idle_model": request.has_reclaimable_idle_model,
+                    "reclaimable_idle_tenancy": request.has_reclaimable_idle_tenancy,
+                    "idle_contexts_teardownable": request.idle_contexts_teardownable,
+                },
+            )
+        if plan.verdict is not None:
+            measured = plan.verdict.measured
+            inputs.update(
+                {
+                    "device_free_mb": _round_or_none(measured.device_free_mb),
+                    "available_mb": _round_or_none(measured.available_mb),
+                    "outstanding_reservations_mb": round(measured.outstanding_reservations_mb, 1),
+                    "noise_buffer_mb": round(measured.noise_buffer_mb, 1),
+                },
+            )
+            if plan.verdict.room is not None:
+                inputs.update(plan.verdict.room.as_inputs())
+        self._decision_sink(
+            decision_kind=DecisionKind.CLEARANCE,
+            subject=str(job.id_),
+            verdict=verdict,
+            reason=reason,
+            inputs=inputs,
+        )
 
     def _terminal_refusal_evidence(self, plan: ClearancePlan, model: str) -> str | None:
         """Name why a refused staged waiter's unpriced sample would crash natively, or None to keep it held.

@@ -168,6 +168,8 @@ class DecisionKind(enum.StrEnum):
     IMAGE_UTILITIES_ROUTING = "image_utilities_routing"
     """How a job was routed through the out-of-venv image-utilities lane: control-map pre-annotation (and
     its in-graph fallthrough), a ``return_control_map`` delivery, or the background-strip tail."""
+    CLEARANCE = "clearance"
+    """Whether a staged job was granted its load-and-sample window, and with what clocks and room it was held."""
 
 
 class DecisionVerdict(enum.StrEnum):
