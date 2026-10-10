@@ -41,6 +41,58 @@ def _diagnose(tmp_path: Path, bridge_log: str, child_logs: dict[str, str] | None
 _STARTUP = "Setting up logger for main process"
 
 
+def _session_log(*lines: str) -> str:
+    """A single-session bridge log: the startup boundary followed by the given lines."""
+    return "\n".join(
+        [f"2026-06-24 17:59:00.000 | DEBUG    | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+    )
+
+
+def _driver_assert_fault(ts: str, *, slot: int = 6, model: str = "AMPonyXL") -> str:
+    """message_dispatcher._handle_faulted_inference_result: a job faulted by torch's NVML driver assert."""
+    return (
+        f"2026-06-24 {ts} | WARNING  | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_faulted_inference_result:892 - "
+        f"Job 0f231c1b-e704-41f1-a668-edc362571c79 faulted on process {slot} (PipelineExecutionError: Pipeline "
+        f"failed to run - declared output node(s) ['output_image'] produced no results. Model: {model}. Error: "
+        "negative_prompt (CLIPTextEncode): RuntimeError: NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() "
+        'INTERNAL ASSERT FAILED at "/__w/pytorch/pytorch/c10/cuda/PeerToPeerAccess.cpp":83, please report a bug '
+        "to PyTorch."
+    )
+
+
+def _accelerator_unusable(ts: str, *, slot: int = 3) -> str:
+    """message_dispatcher._handle_process_state_change: a child's start check found the device refuses work."""
+    return (
+        f"2026-06-24 {ts} | CRITICAL | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_process_state_change:1547 - "
+        f"Process {slot} reports the accelerator is unusable. The worker will stop popping jobs. The accelerator "
+        "(cuda:0) refused work at start (RuntimeError: NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() INTERNAL "
+        "ASSERT FAILED). This is a host driver fault. Reboot the host or reload its GPU driver modules, then "
+        "restart the worker. The worker will not pop jobs until then."
+    )
+
+
+def _nvml_mismatch(ts: str) -> str:
+    """hordelib.utils.nvml._nvml_module: the NVIDIA libraries do not match the loaded kernel module."""
+    return (
+        f"2026-06-24 {ts} | DEBUG    | hordelib.utils.nvml:_nvml_module:71 - NVML unavailable "
+        "(NVMLError_LibRmVersionMismatch: RM has detected an NVML/RM version mismatch.); NVIDIA telemetry disabled"
+    )
+
+
+def _device_reading_missing(ts: str, *, model: str = "Flux.1-Schnell fp8 (Compact)", card: int = 0) -> str:
+    """vram_arbiter._note_device_free_missing: a load deferred on a card the parent has no reading for."""
+    return (
+        f"2026-06-24 {ts} | WARNING  | horde_worker_regen.process_management.resources.vram_arbiter:_note_device_free_missing:1646 - "
+        f"VRAM admission for {model} deferred: no device-free reading for card {card} this cycle. Admission "
+        "neither denies nor fabricates a free figure on a missing measurement; it waits for the next NVML reading."
+    )
+
+
+def _device_reading_missing_run(count: int) -> list[str]:
+    """``count`` deferrals on a missing reading, one per second from 18:00:00."""
+    return [_device_reading_missing(f"18:{index // 60:02d}:{index % 60:02d}.000") for index in range(count)]
+
+
 def _recovery(ts: str, pid: int, *, reason: str, last_state: str = "PROCESS_STARTING") -> str:
     return (
         f"2026-06-24 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:_log_recovery_diagnostics:367 - "
@@ -139,6 +191,70 @@ class TestPagefileExhaustion:
         """A startup crash for another reason is the crash-on-start finding's business, not this one."""
         findings = _diagnose(tmp_path, self._bridge(), {"bridge_safety_0_startup.log": _TRACEBACK})
         assert "pagefile_exhaustion" not in findings
+
+
+class TestAcceleratorDriverFault:
+    """A device that raises on tensors is reported as a driver fault, by whichever line the worker logged."""
+
+    def test_jobs_failing_on_the_torch_assert_are_counted_once_each(self, tmp_path: Path) -> None:
+        """The parent logs a fault's reason twice, and the headline counts the job, not the lines."""
+        received = _driver_assert_fault("18:00:10.000").replace(
+            "Job 0f231c1b-e704-41f1-a668-edc362571c79 faulted on process 6 (",
+            "Received HordeInferenceResultMessage from process 6: (",
+        )
+        bridge = _session_log(
+            received,
+            _driver_assert_fault("18:00:10.100"),
+            _driver_assert_fault("18:00:14.000"),
+        )
+
+        finding = _diagnose(tmp_path, bridge)["accelerator_driver_fault"]
+
+        assert finding.severity is Severity.CRITICAL
+        assert "2 times" in finding.headline
+        assert "Restart the computer" in finding.action
+
+    def test_a_start_check_report_says_the_worker_stopped_taking_jobs(self, tmp_path: Path) -> None:
+        """A current worker reports the device unusable before any job runs, and the headline says so."""
+        finding = _diagnose(tmp_path, _session_log(_accelerator_unusable("18:00:05.000")))["accelerator_driver_fault"]
+
+        assert finding.severity is Severity.CRITICAL
+        assert "stopped taking jobs" in finding.headline
+
+    def test_a_library_mismatch_alone_is_a_warning(self, tmp_path: Path) -> None:
+        """The mismatch is logged at every start, before a job has failed, so alone it asks for a look."""
+        finding = _diagnose(tmp_path, _session_log(_nvml_mismatch("18:00:01.000")))["accelerator_driver_fault"]
+
+        assert finding.severity is Severity.WARNING
+        assert "do not match" in finding.headline
+
+    def test_stays_quiet_on_another_fault(self, tmp_path: Path) -> None:
+        """A job that faulted for another reason is not a driver fault."""
+        other = _driver_assert_fault("18:00:10.000").replace(
+            "NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() INTERNAL ASSERT FAILED",
+            "CUDA out of memory",
+        )
+
+        assert "accelerator_driver_fault" not in _diagnose(tmp_path, _session_log(other))
+
+
+class TestDeviceReadingMissing:
+    """Loads deferred all session for want of a memory reading are reported. A cold start's few are not."""
+
+    def test_a_session_of_deferrals_is_reported_with_its_card(self, tmp_path: Path) -> None:
+        """Past the cold-start count the finding names how often and on which card."""
+        finding = _diagnose(tmp_path, _session_log(*_device_reading_missing_run(75)))["device_reading_missing"]
+
+        assert finding.severity is Severity.CRITICAL
+        assert "75 times" in finding.headline
+        assert "card 0" in finding.headline
+        assert "Update the worker" in finding.action
+
+    def test_a_cold_start_is_not_reported(self, tmp_path: Path) -> None:
+        """A handful of deferrals while the first reading arrives is ordinary."""
+        findings = _diagnose(tmp_path, _session_log(*_device_reading_missing_run(12)))
+
+        assert "device_reading_missing" not in findings
 
 
 class TestDoomedPoolNoGiveup:

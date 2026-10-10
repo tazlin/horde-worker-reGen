@@ -39,8 +39,10 @@ from tests.analysis.test_detectors import (
     _blank_preload,
     _commit_exhausted,
     _consecutive_pause,
+    _device_reading_missing_run,
     _diagnose,
     _dispatch_stall,
+    _driver_assert_fault,
     _empty_model_pop,
     _fault_report,
     _full_queue_frozen,
@@ -52,6 +54,7 @@ from tests.analysis.test_detectors import (
     _load_failure_recovery,
     _maintenance_pop,
     _managed_text_backend_charged,
+    _nvml_mismatch,
     _oom_fault,
     _pop_api_error,
     _pop_claim_engaged,
@@ -589,6 +592,14 @@ CONTRACTS: dict[str, Contract] = {
     "detect_pagefile_exhaustion": Contract(
         bridge=_bridge(_recovery("18:40:00.000", 0, reason="seems to be stuck starting")),
         child_logs={"bridge_safety_0_startup.log": _pagefile_startup_crash("18:35:00.000")},
+        severity=Severity.CRITICAL,
+    ),
+    "detect_accelerator_driver_fault": Contract(
+        bridge=_bridge(_nvml_mismatch("18:00:01.000"), _driver_assert_fault("18:00:10.000")),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_device_reading_missing": Contract(
+        bridge=_bridge(*_device_reading_missing_run(60)),
         severity=Severity.CRITICAL,
     ),
     "detect_swallowed_oom": Contract(

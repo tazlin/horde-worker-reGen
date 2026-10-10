@@ -1543,8 +1543,9 @@ class MessageDispatcher:
             # torch and cannot test the device itself. Sticky for the session, since nothing the worker
             # restarts repairs a host driver.
             if not self._state.accelerator_unusable:
+                # Log contract: analysis/log_signatures.py (accelerator_unusable).
                 logger.critical(
-                    f"Process {message.process_id} reports the accelerator is unusable; the worker will stop "
+                    f"Process {message.process_id} reports the accelerator is unusable. The worker will stop "
                     f"popping jobs. {message.info}",
                 )
             self._state.accelerator_unusable = True

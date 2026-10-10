@@ -88,6 +88,8 @@ class FindingKind(enum.StrEnum):
     SWALLOWED_OOM = "swallowed_oom"
     FILE_DESCRIPTOR_EXHAUSTION = "file_descriptor_exhaustion"
     PAGEFILE_EXHAUSTION = "pagefile_exhaustion"
+    ACCELERATOR_DRIVER_FAULT = "accelerator_driver_fault"
+    DEVICE_READING_MISSING = "device_reading_missing"
     SCHEDULER_STARVATION_WEDGE = "scheduler_starvation_wedge"
     UNPRICED_SAMPLING_WINDOWS = "unpriced_sampling_windows"
     UNSATISFIABLE_HEAD_STARVATION = "unsatisfiable_head_starvation"
@@ -465,6 +467,37 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "jobs stop until memory is freed."
         ),
         see_also=FindingKind.CRASH_ON_START_LOOP,
+    ),
+    FindingSpec(
+        kind=FindingKind.ACCELERATOR_DRIVER_FAULT,
+        title="The GPU driver refused work",
+        action=(
+            "Restart the computer, or reload the GPU driver, then start the worker again. "
+            "Restarting the worker alone will not fix it."
+        ),
+        detail=(
+            "The graphics driver has two parts, a kernel module and the libraries programs load. After a driver "
+            "update with no restart they no longer match. The card can still be listed and its memory read, "
+            "yet every model moved onto it fails. Each job taken in that state fails and counts against the "
+            "worker. A current worker tests the card when an image process starts and stops taking jobs when "
+            "the test fails."
+        ),
+        see_also=FindingKind.DEVICE_READING_MISSING,
+    ),
+    FindingSpec(
+        kind=FindingKind.DEVICE_READING_MISSING,
+        title="Model loads waited on a memory reading that never came",
+        action=(
+            "Update the worker. A current worker reads the card's memory from its image processes when the "
+            "NVIDIA library gives no reading."
+        ),
+        detail=(
+            "The worker checks free GPU memory before it loads a model. Older workers took that reading from "
+            "the NVIDIA management library only (NVML). A card of another make has no such library, and a "
+            "broken NVIDIA driver stops it answering. Every load then waited for a reading, no job started, "
+            "and the worker dropped what it held."
+        ),
+        see_also=FindingKind.ACCELERATOR_DRIVER_FAULT,
     ),
     FindingSpec(
         kind=FindingKind.SCHEDULER_STARVATION_WEDGE,

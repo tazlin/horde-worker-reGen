@@ -1150,6 +1150,54 @@ _SIGNATURE_LIST: list[LogSignature] = [
         sample="OSError: Die Auslagerungsdatei ist zu klein, um diesen Vorgang durchzuführen. (os error 1455)",
         dry_run_reason="commit-charge exhaustion is a Windows memory condition the dry-run harness never produces",
     ),
+    _signature(
+        "accelerator_unusable",
+        r"reports the accelerator is unusable\. The worker will stop popping jobs",
+        emitter="process_management.ipc.message_dispatcher:_handle_process_state_change",
+        sample=(
+            "Process 3 reports the accelerator is unusable. The worker will stop popping jobs. The accelerator "
+            "(cuda:0) refused work at start (RuntimeError: NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() "
+            "INTERNAL ASSERT FAILED). This is a host driver fault. Reboot the host or reload its GPU driver "
+            "modules, then restart the worker. The worker will not pop jobs until then."
+        ),
+        dry_run_reason="a device that refuses a tensor is a host driver fault the dry-run harness never produces",
+    ),
+    _signature(
+        "torch_driver_assert",
+        r"NVML_SUCCESS == DriverAPI::get\(\)->nvmlInit_v2_\(\)",
+        # torch raises it on a tensor move when the NVIDIA libraries no longer match the kernel module. The
+        # worker records it in the faulted job's reason.
+        emitter="torch.c10.cuda:PeerToPeerAccess",
+        sample=(
+            "Job 0f231c1b-e704-41f1-a668-edc362571c79 faulted on process 6 (PipelineExecutionError: Pipeline "
+            "failed to run - declared output node(s) ['output_image'] produced no results. Model: AMPonyXL. "
+            "Error: negative_prompt (CLIPTextEncode): RuntimeError: NVML_SUCCESS == "
+            'DriverAPI::get()->nvmlInit_v2_() INTERNAL ASSERT FAILED at "/__w/pytorch/pytorch/c10/cuda/'
+            'PeerToPeerAccess.cpp":83, please report a bug to PyTorch.'
+        ),
+        dry_run_reason="the assert needs a mismatched NVIDIA driver, which the dry-run harness never has",
+    ),
+    _signature(
+        "nvml_driver_mismatch",
+        r"NVML unavailable \((?P<error>NVMLError_LibRmVersionMismatch)",
+        emitter="hordelib.utils.nvml:_nvml_module",
+        sample=(
+            "NVML unavailable (NVMLError_LibRmVersionMismatch: RM has detected an NVML/RM version mismatch.); "
+            "NVIDIA telemetry disabled"
+        ),
+        dry_run_reason="NVML initialisation is a host driver condition the dry-run harness never exercises",
+    ),
+    _signature(
+        "device_reading_missing_defer",
+        r"VRAM admission for .+ deferred: no device-free reading for card (?P<card>\d+)",
+        emitter="process_management.resources.vram_arbiter:_note_device_free_missing",
+        sample=(
+            "VRAM admission for Flux.1-Schnell fp8 (Compact) deferred: no device-free reading for card 0 this "
+            "cycle. Admission neither denies nor fabricates a free figure on a missing measurement; it waits "
+            "for the next device reading."
+        ),
+        dry_run_reason="the dry-run harness injects its device inventory, so every card has a reading",
+    ),
     # --- Stuck/stalled slots ---
     _signature(
         "stuck_step",

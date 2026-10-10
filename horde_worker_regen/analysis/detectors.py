@@ -107,6 +107,10 @@ _FD_RESOURCE_RE = re.compile(r"Too many open files: '(?P<path>[^']+)'|open file 
 # Windows commit-charge exhaustion ("the paging file is too small"), raised while a process maps a checkpoint
 # or loads a DLL. It reaches the logs inside a traceback, so it is matched against a record's full text.
 _PAGEFILE_EXHAUSTED_RE = pattern_for("pagefile_exhausted")
+_ACCELERATOR_UNUSABLE_RE = pattern_for("accelerator_unusable")
+_TORCH_DRIVER_ASSERT_RE = pattern_for("torch_driver_assert")
+_NVML_DRIVER_MISMATCH_RE = pattern_for("nvml_driver_mismatch")
+_DEVICE_READING_MISSING_RE = pattern_for("device_reading_missing_defer")
 _NO_IMAGES_RE = pattern_for("no_images")
 # The in-progress orphan watchdog names itself in its punt line ("...(orphaned-job watchdog).") rather
 # than using the words "orphaned in-progress", so the watchdog tag is the signature that actually
@@ -1687,6 +1691,82 @@ def detect_pagefile_exhaustion(context: SessionContext) -> list[Finding]:
             severity=Severity.CRITICAL,
             headline=f'Worker processes failed {times} because Windows reported "the paging file is too small".',
             evidence=[_evidence(record) for record in records[:6]],
+        ),
+    ]
+
+
+def detect_accelerator_driver_fault(context: SessionContext) -> list[Finding]:
+    """The device raised on tensors moved to it, which is a host driver fault and not a worker or model one.
+
+    Three lines say so. A current worker's start check reports the accelerator unusable and holds intake. An
+    older worker has no such check, and the fault shows as jobs failing with torch's NVML assert. The
+    management library's version-mismatch line names the usual cause, and is a warning by itself: it is
+    logged at every start, before any job has had the chance to fail.
+    """
+    records = context.session.records
+    reports = _matching(records, _ACCELERATOR_UNUSABLE_RE)
+    # The start check's report quotes the error it met, so the assert's text is inside that line too.
+    asserts = [
+        record
+        for record in _matching(records, _TORCH_DRIVER_ASSERT_RE)
+        if not _ACCELERATOR_UNUSABLE_RE.search(record.message)
+    ]
+    mismatch = _matching(records, _NVML_DRIVER_MISMATCH_RE)
+    if not reports and not asserts and not mismatch:
+        return []
+
+    # The parent logs a faulted job's reason twice, once as the received message and once as the fault.
+    faulted_jobs = [record for record in asserts if _FAULTED_ON_PROCESS_RE.search(record.message)]
+    counted = faulted_jobs or asserts
+    if counted:
+        times = "once" if len(counted) == 1 else f"{len(counted)} times"
+        headline = f"The GPU driver refused work, and jobs failed on it {times}."
+    elif reports:
+        headline = "The GPU driver refused work at start, and the worker stopped taking jobs."
+    else:
+        headline = "The NVIDIA libraries and the loaded GPU driver do not match."
+    evidence = [_evidence(record) for record in [*reports[:2], *counted[:3], *mismatch[:1]]]
+    return [
+        Finding(
+            kind=FindingKind.ACCELERATOR_DRIVER_FAULT,
+            severity=Severity.CRITICAL if reports or counted else Severity.WARNING,
+            headline=headline,
+            evidence=evidence,
+        ),
+    ]
+
+
+_DEVICE_READING_MISSING_MIN_DEFERS = 60
+"""Deferrals on a missing reading below which a session is a cold start, not a card with no reading.
+
+A worker logs the line once per scheduling cycle per card, several times a second, and a cold start waits a
+report interval or two. Sixty is past any cold start and well under one stalled minute."""
+
+
+def detect_device_reading_missing(context: SessionContext) -> list[Finding]:
+    """Model loads deferred for the whole session because the parent had no memory reading for the card.
+
+    A worker that took the reading from NVML alone deferred every load on a card NVML does not answer for:
+    a card of another vendor, or an NVIDIA card whose driver libraries no longer match its kernel module.
+    """
+    defers = _matching(context.session.records, _DEVICE_READING_MISSING_RE)
+    if len(defers) < _DEVICE_READING_MISSING_MIN_DEFERS:
+        return []
+
+    cards = _distinct_ordered(
+        [match.group("card") for record in defers if (match := _DEVICE_READING_MISSING_RE.search(record.message))],
+    )
+    card_clause = f"card {cards[0]}" if len(cards) == 1 else f"cards {_clause_join(cards)}"
+    mismatch = _matching(context.session.records, _NVML_DRIVER_MISMATCH_RE)
+    evidence = [_evidence(defers[0]), _evidence(defers[-1])]
+    if mismatch:
+        evidence.append(_evidence(mismatch[0]))
+    return [
+        Finding(
+            kind=FindingKind.DEVICE_READING_MISSING,
+            severity=Severity.CRITICAL,
+            headline=f"Model loads waited {len(defers)} times for a memory reading of {card_clause} that never came.",
+            evidence=evidence,
         ),
     ]
 
@@ -5000,6 +5080,8 @@ DETECTORS: list[Detector] = [
     detect_oom,
     detect_file_descriptor_exhaustion,
     detect_pagefile_exhaustion,
+    detect_accelerator_driver_fault,
+    detect_device_reading_missing,
     detect_swallowed_oom,
     detect_orphan_wedge,
     detect_model_economics,
