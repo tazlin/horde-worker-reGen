@@ -72,6 +72,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
+from horde_worker_regen.process_management.resources.device_memory_source import DeviceMemoryReading
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.text_backends import (
     TextBackend,
@@ -257,8 +258,8 @@ def _batched_context_note(spec: TextBackendLaunchSpec) -> str:
     )
 
 
-DeviceFreeTotalReader = Callable[[int], tuple[float, float] | None]
-"""Reads a device's ``(free_mb, total_mb)``; None when the reading is unavailable."""
+DeviceMemoryReader = Callable[[int], DeviceMemoryReading | None]
+"""Reads a device's memory reading. None when the reading is unavailable."""
 
 LaunchProcess = Callable[[TextBackendLaunchSpec], LaunchedProcess]
 """Starts the backend process described by a spec."""
@@ -301,7 +302,7 @@ class TextBackendSupervisor:
         backend_kind: TEXT_BACKENDS = TEXT_BACKENDS.koboldcpp,
         owned_registry: OwnedProcessRegistry | None = None,
         launch_process: LaunchProcess = default_launch_process,
-        read_device_free_total_mb: DeviceFreeTotalReader | None = None,
+        read_device_memory: DeviceMemoryReader | None = None,
         timings: TextBackendSupervisorTimings | None = None,
         first_launch_identifier: int = 0,
         sleep: Sleep = asyncio.sleep,
@@ -320,7 +321,8 @@ class TextBackendSupervisor:
                 one command line), so the kind is carried alongside it, for display only.
             owned_registry: Where launched PIDs are recorded for orphan reaping; None records nothing.
             launch_process: How a process is started; injected so tests never spawn anything.
-            read_device_free_total_mb: Card memory reader for the footprint delta; None disables it.
+            read_device_memory: Card memory reader for the footprint delta. None disables it. The delta is
+                taken only from a device-wide reading, since no other reading includes the backend's process.
             timings: Waits and patience.
             first_launch_identifier: The registry's launch identifier for the first launch; increments per
                 launch so a reaped PID can be attributed to its launch.
@@ -335,7 +337,7 @@ class TextBackendSupervisor:
         self._backend_kind = backend_kind
         self._owned_registry = owned_registry
         self._launch_process = launch_process
-        self._read_device_free_total_mb = read_device_free_total_mb
+        self._read_device_memory = read_device_memory
         self._timings = timings or TextBackendSupervisorTimings()
         self._next_launch_identifier = first_launch_identifier
         self._sleep = sleep
@@ -632,12 +634,12 @@ class TextBackendSupervisor:
         What the launch asked for is the larger of the measured footprint and the buffers the backend printed
         for the card, because a spilled allocation reads as a smaller free-VRAM delta than it is.
         """
-        if spec.parallel_requests <= 1 or spec.device_index is None or self._read_device_free_total_mb is None:
+        if spec.parallel_requests <= 1 or spec.device_index is None or self._read_device_memory is None:
             return
-        reading = self._read_device_free_total_mb(spec.device_index)
+        reading = self._read_device_memory(spec.device_index)
         if reading is None:
             return
-        card_total_mb = reading[1]
+        card_total_mb = reading.total_mb
         asked_candidates = [
             figure for figure in (self._footprint_mb, _card_buffer_mebibytes(backend_output)) if figure is not None
         ]
@@ -748,10 +750,12 @@ class TextBackendSupervisor:
         return max(0.0, self._backoff_seconds - (time.monotonic() - self._backoff_started_monotonic))
 
     def _read_free_mb(self, spec: TextBackendLaunchSpec) -> float | None:
-        if self._read_device_free_total_mb is None or spec.device_index is None:
+        if self._read_device_memory is None or spec.device_index is None:
             return None
-        reading = self._read_device_free_total_mb(spec.device_index)
-        return None if reading is None else reading[0]
+        reading = self._read_device_memory(spec.device_index)
+        if reading is None or not reading.is_device_wide:
+            return None
+        return reading.free_mb
 
     def _footprint_from(self, spec: TextBackendLaunchSpec, free_before_mb: float | None) -> float | None:
         free_after_mb = self._read_free_mb(spec)
@@ -878,7 +882,7 @@ def _kill_handle_quietly(process: LaunchedProcess) -> None:
 
 __all__ = [
     "TEXT_BACKEND_LOG_FILE_NAME",
-    "DeviceFreeTotalReader",
+    "DeviceMemoryReader",
     "LaunchProcess",
     "LaunchedProcess",
     "TextBackendBufferSizes",

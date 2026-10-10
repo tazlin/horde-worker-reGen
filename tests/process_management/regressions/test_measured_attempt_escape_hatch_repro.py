@@ -47,6 +47,7 @@ from horde_worker_regen.process_management.scheduling import inference_scheduler
 from horde_worker_regen.process_management.scheduling.admission import pricing as _pricing_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -137,7 +138,9 @@ class _World:
         # a fixed device-free reading (controlling available), decoupled so the converged-empty/within-band
         # regime is exact regardless of the harness's committed-footprint arithmetic.
         monkeypatch.setattr(self._scheduler, "_sustained_foreign_floor_mb", lambda *args, **kwargs: _FOREIGN_FLOOR_MB)
-        self._scheduler.set_device_free_mb_provider(lambda _device_index: _DEVICE_FREE_MB)
+        self._scheduler.set_device_reading_provider(
+            device_wide_reading_provider(lambda _device_index: _DEVICE_FREE_MB)
+        )
         # The ceiling-hold's live lift predicate reads the card's current achievable ceiling; wire it to the same
         # injected foreign floor the arbiter prices against, so the hold reflects the same measured picture rather
         # than the empty in-test foreign-floor tracker (which would read no floor and lift the hold at once).

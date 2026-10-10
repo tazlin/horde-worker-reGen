@@ -14,6 +14,11 @@ from unittest.mock import Mock
 from loguru import logger
 
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.device_memory_source import (
+    DeviceMemoryReading,
+    DeviceMemorySourceKind,
+    ReadingProvenance,
+)
 from horde_worker_regen.process_management.resources.foreign_vram_floor import (
     FOREIGN_FLOOR_WINDOW_SECONDS,
     ForeignVramFloorTracker,
@@ -23,6 +28,8 @@ from horde_worker_regen.process_management.resources.foreign_vram_floor import (
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.retention import RetentionFit
 from tests.process_management.conftest import (
+    device_wide_reading,
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -140,7 +147,7 @@ def _two_card_scheduler(
         device_free_mb=None,
     )
     if free_mb_by_device is not None:
-        scheduler.set_device_free_mb_provider(free_mb_by_device.get)
+        scheduler.set_device_reading_provider(device_wide_reading_provider(free_mb_by_device.get))
     tenant_box: list[ManagedVramTenant | None] = [None]
     scheduler.set_managed_tenant_provider(lambda: tenant_box[0])
     return scheduler, tenant_box
@@ -166,6 +173,48 @@ class TestFloorWithKnownTenant:
         assert floor_with_known_tenant_mb(600.0, _TENANT_MB) == _TENANT_MB
 
 
+class TestFloorSamplesOnlyADeviceWideReading:
+    """The floor is total less free less the worker's share, which only a device-wide figure can answer."""
+
+    @staticmethod
+    def _sampled_foreign_mb(provenance: ReadingProvenance) -> float | None:
+        """Return the foreign sample the tracker is handed for card 0 under a reading of ``provenance``."""
+        scheduler, _tenant_box = _two_card_scheduler()
+        scheduler._process_map[1].process_reserved_mb = 500  # type: ignore[index]
+        samples: list[float | None] = []
+        track = scheduler._foreign_vram_floor.update
+
+        def record(device_key: int, foreign_now_mb: float | None, *, now: float) -> float | None:
+            samples.append(foreign_now_mb)
+            return track(device_key, foreign_now_mb, now=now)
+
+        scheduler._foreign_vram_floor.update = record  # type: ignore[method-assign]
+        scheduler.build_vram_arbiter_device_state(
+            0,
+            device_reading=DeviceMemoryReading(
+                free_mb=600.0,
+                total_mb=_SMALL_CARD_MB,
+                source=DeviceMemorySourceKind.CHILD_REPORT,
+                provenance=provenance,
+            ),
+        )
+        # The build's reading is sampled first. Later reads in the same build go through the provider, which
+        # this scheduler does not have, and hand the tracker None whatever the provenance.
+        return samples[0]
+
+    def test_a_device_wide_reading_contributes_a_sample(self) -> None:
+        """Other programs are inside a device-wide figure, so what the worker does not hold is theirs."""
+        assert self._sampled_foreign_mb(ReadingProvenance.DEVICE_WIDE) is not None
+
+    def test_a_process_local_reading_contributes_none(self) -> None:
+        """A process-local figure does not include other programs, so it says nothing about what they hold."""
+        assert self._sampled_foreign_mb(ReadingProvenance.PROCESS_LOCAL) is None
+
+    def test_a_host_memory_reading_contributes_none(self) -> None:
+        """System RAM in use is no measure of what another program holds on the card."""
+        assert self._sampled_foreign_mb(ReadingProvenance.HOST_MEMORY) is None
+
+
 class TestManagedTenantIsChargedOnItsCard:
     """A serving managed text backend is a standing floor on its card, seen by every reader of the floor."""
 
@@ -181,7 +230,10 @@ class TestManagedTenantIsChargedOnItsCard:
         card_zero = scheduler.snapshot().card(0)
         assert card_zero.foreign_floor_mb is not None
         assert card_zero.foreign_floor_mb >= _TENANT_MB
-        device_state = scheduler.build_vram_arbiter_device_state(0, device_free_mb=600.0)
+        device_state = scheduler.build_vram_arbiter_device_state(
+            0,
+            device_reading=device_wide_reading(600.0, _SMALL_CARD_MB),
+        )
         assert device_state.foreign_floor_mb is not None
         assert device_state.foreign_floor_mb >= _TENANT_MB
         ceiling_mb = scheduler.achievable_ceiling_mb(0)

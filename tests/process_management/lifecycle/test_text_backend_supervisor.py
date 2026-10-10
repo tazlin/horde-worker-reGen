@@ -38,6 +38,10 @@ from horde_worker_regen.process_management.lifecycle.text_backend_supervisor imp
     parse_backend_buffer_sizes,
     port_is_free,
 )
+from horde_worker_regen.process_management.resources.device_memory_source import (
+    child_reported_reading,
+    nvml_reading,
+)
 from horde_worker_regen.text_backends import (
     KoboldApiTextBackend,
     TextBackendDescription,
@@ -227,14 +231,16 @@ async def test_ready_after_polls_makes_the_backend_serving_and_measures_the_foot
     launcher = Launcher([handle])
     backend = StubBackend(ready_results=[False, False, True])
     registry = OwnedProcessRegistry(tmp_path / "owned.json")
-    readings = iter([(10000.0, 16000.0), (7300.0, 16000.0)])
+    readings = iter(
+        [nvml_reading(free_mb=10000.0, total_mb=16000.0), nvml_reading(free_mb=7300.0, total_mb=16000.0)],
+    )
 
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=backend,
         owned_registry=registry,
         launch_process=launcher,
-        read_device_free_total_mb=lambda device_index: next(readings),
+        read_device_memory=lambda device_index: next(readings),
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -254,6 +260,39 @@ async def test_ready_after_polls_makes_the_backend_serving_and_measures_the_foot
     assert supervisor.state is TextBackendState.STOPPED
     assert supervisor.pids == ()
     assert registry._load() == []
+
+
+async def test_a_reading_that_is_not_device_wide_measures_no_footprint(tmp_path: Path) -> None:
+    """The backend is another process, so a process-local free figure cannot show what its launch took."""
+    launcher = Launcher([FakeLaunched(pid=424243)])
+    backend = StubBackend(ready_results=[True])
+    readings = iter(
+        [
+            child_reported_reading(
+                reported_free_mb=free_mb,
+                reported_total_mb=16000.0,
+                committed_mb=0.0,
+                platform="win32",
+            )
+            for free_mb in (10000.0, 7300.0)
+        ],
+    )
+
+    supervisor = TextBackendSupervisor(
+        launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
+        backend=backend,
+        owned_registry=OwnedProcessRegistry(tmp_path / "owned.json"),
+        launch_process=launcher,
+        read_device_memory=lambda device_index: next(readings, None),
+        timings=FAST,
+    )
+    task = asyncio.create_task(supervisor.run())
+
+    await wait_until(lambda: supervisor.is_serving)
+    assert supervisor.footprint_mb is None
+
+    await supervisor.stop()
+    await asyncio.wait_for(task, timeout=5.0)
 
 
 async def test_footprint_is_unmeasured_without_a_reader(tmp_path: Path) -> None:
@@ -639,14 +678,16 @@ async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_si
             max_length=512,
         ),
     )
-    readings = iter([(10000.0, 16000.0), (7300.0, 16000.0)])
+    readings = iter(
+        [nvml_reading(free_mb=10000.0, total_mb=16000.0), nvml_reading(free_mb=7300.0, total_mb=16000.0)],
+    )
     port = free_port()
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(port, tmp_path)),
         backend=backend,
         backend_kind=TEXT_BACKENDS.koboldcpp,
         launch_process=LoggingLauncher([handle], [BACKEND_LOAD_LOG]),
-        read_device_free_total_mb=lambda device_index: next(readings),
+        read_device_memory=lambda device_index: next(readings),
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -689,7 +730,9 @@ async def _ready_lines_for(spec: TextBackendLaunchSpec, *, card_total_mb: float)
     The backend prints the real load log, whose CUDA0 buffers sum to about 2673 MB, and the free-VRAM
     delta measures 1900 MB, as a card that spilled the rest to system memory would read.
     """
-    readings = iter([(1900.0, card_total_mb), (0.0, card_total_mb), (0.0, card_total_mb)])
+    readings = iter(
+        [nvml_reading(free_mb=free_mb, total_mb=card_total_mb) for free_mb in (1900.0, 0.0, 0.0)],
+    )
     logged: list[tuple[str, str]] = []
     sink_id = logger.add(lambda message: logged.append((message.record["level"].name, message.record["message"])))
     try:
@@ -697,7 +740,7 @@ async def _ready_lines_for(spec: TextBackendLaunchSpec, *, card_total_mb: float)
             launch_spec_factory=factory_for(spec),
             backend=StubBackend(ready_results=[True]),
             launch_process=LoggingLauncher([FakeLaunched(pid=72)], [BACKEND_LOAD_LOG]),
-            read_device_free_total_mb=lambda device_index: next(readings),
+            read_device_memory=lambda device_index: next(readings),
             timings=FAST,
         )
         task = asyncio.create_task(supervisor.run())

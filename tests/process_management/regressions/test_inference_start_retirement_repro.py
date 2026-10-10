@@ -46,7 +46,11 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
-from tests.process_management.conftest import make_test_card_runtimes, make_test_runtime_config
+from tests.process_management.conftest import (
+    device_wide_reading_provider,
+    make_test_card_runtimes,
+    make_test_runtime_config,
+)
 
 _CARD_TOTAL_MB = 10240.0
 """A 10 GB card on each device."""
@@ -203,8 +207,9 @@ def _lifecycle(
         directml=None,
         abort_callback=Mock(),
         state=WorkerState(),
-        device_free_mb_provider=lambda device_index: cards.free_mb.get(device_index),
-        device_total_vram_mb_provider=lambda _device_index: _CARD_TOTAL_MB,
+        device_reading_provider=device_wide_reading_provider(
+            lambda device_index: cards.free_mb.get(device_index), lambda _device_index: _CARD_TOTAL_MB
+        ),
         device_governor_state_provider=lambda device_index: cards.governor[device_index],
         gpu_start_context_mb_provider=lambda: 0.0,
     )

@@ -1722,11 +1722,11 @@ async def _observe_governor_trajectory(
             if previous is not None and previous != state.value:
                 trajectory.transitions.append(f"{device_index}:{previous}->{state.value}")
             last_state[device_index] = state.value
-        for device_index, free_mb in manager._last_device_free_mb_by_device.items():
+        for device_index, reading in manager._last_device_reading_by_device.items():
             current = trajectory.min_free_mb.get(device_index)
-            if current is None or free_mb < current:
-                trajectory.min_free_mb[device_index] = free_mb
-        trajectory.total_mb.update(manager._last_device_total_mb_by_device)
+            if current is None or reading.free_mb < current:
+                trajectory.min_free_mb[device_index] = reading.free_mb
+            trajectory.total_mb[device_index] = reading.total_mb
         await asyncio.sleep(interval_seconds)
 
 

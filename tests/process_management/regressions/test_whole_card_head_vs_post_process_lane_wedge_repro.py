@@ -41,6 +41,7 @@ from horde_worker_regen.process_management.process_manager import HordeWorkerPro
 from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
@@ -528,7 +529,9 @@ class TestReclaimBoundaries:
         assert pp_lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
         # The lane's modules have freed: the device now reports the after-evict room, and the lane is empty.
-        scheduler.set_device_free_mb_provider(lambda _device_index: _DEVICE_FREE_AFTER_PP_EVICT_MB)
+        scheduler.set_device_reading_provider(
+            device_wide_reading_provider(lambda _device_index: _DEVICE_FREE_AFTER_PP_EVICT_MB)
+        )
         pp_lane.vram_usage_mb = 0.0
         for pid in range(1, _NUM_INFERENCE_PROCESSES + 1):
             scheduler._process_map[pid].vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - _DEVICE_FREE_AFTER_PP_EVICT_MB

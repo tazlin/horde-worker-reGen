@@ -50,6 +50,7 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
 )
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import SAFETY_RECOVERY_HOLD_TTL_SECONDS
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_process_info,
     make_testable_process_manager,
@@ -62,7 +63,9 @@ _SATURATED_FREE_MB = 100.0
 
 def _saturate_safety_card(lifecycle: ProcessLifecycleManager) -> None:
     """Force the device-free governor to read the safety card as saturated, so a safety start defers."""
-    lifecycle._device_free_mb_provider = lambda _device_index: _SATURATED_FREE_MB  # type: ignore[method-assign]
+    lifecycle._device_reading_provider = device_wide_reading_provider(  # type: ignore[method-assign]
+        lambda _device_index: _SATURATED_FREE_MB
+    )
     lifecycle._device_governor_state_provider = lambda _device_index: GovernorState.SATURATED  # type: ignore[method-assign]
 
 

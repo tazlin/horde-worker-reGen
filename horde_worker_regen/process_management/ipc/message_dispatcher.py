@@ -61,6 +61,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.component_residency_map import ComponentResidencyMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.resources.device_memory_source import DeviceMemoryReading
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     platform_context_constant_mb,
@@ -279,7 +280,7 @@ class MessageDispatcher:
     only for an episode an operator actually saw reported."""
     _queue_deadlock_summary_logged: bool = False
     """Whether the current queue-deadlock episode has had its diagnostics logged."""
-    _device_free_mb_provider: Callable[[int], float | None] | None = None
+    _device_reading_provider: Callable[[int], DeviceMemoryReading | None] | None = None
     """The parent's device-level (NVML) free VRAM reading, or None when nothing injected one."""
     _deadlock_dispatch_progress_mark: tuple[int, int] | None = None
     """Cumulative (inference starts, completions) when the current queue deadlock was detected, else None.
@@ -2370,12 +2371,12 @@ class MessageDispatcher:
         logger.trace(f"horde_model_map: {self._horde_model_map}")
         logger.trace(f"process_map: {self._process_map}")
 
-    def set_device_free_mb_provider(self, provider: Callable[[int], float | None]) -> None:
-        """Inject the parent's device-level free VRAM reading, for the deadlock diagnostics.
+    def set_device_reading_provider(self, provider: Callable[[int], DeviceMemoryReading | None]) -> None:
+        """Inject the parent's device memory reading, for the deadlock diagnostics.
 
         Optional: with no provider the summary reports the child-derived figure alone, exactly as before.
         """
-        self._device_free_mb_provider = provider
+        self._device_reading_provider = provider
 
     def _deadlock_state_summary(self) -> str:
         """Compact one-line description of the outstanding work and slot states behind a deadlock condition.
@@ -2383,7 +2384,8 @@ class MessageDispatcher:
         Carries the parent's device reading beside the children's when one is available. A wedge is argued
         about in these terms, and the child view is the untrustworthy half of the pair on a paging card.
         """
-        measured_free_mb = None if self._device_free_mb_provider is None else self._device_free_mb_provider(0)
+        reading = None if self._device_reading_provider is None else self._device_reading_provider(0)
+        measured_free_mb = None if reading is None else reading.free_mb
         return (
             f"pending={len(self._job_tracker.jobs_pending_inference)} "
             f"in_progress={len(self._job_tracker.jobs_in_progress)} "

@@ -32,6 +32,7 @@ from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -90,7 +91,7 @@ def _scheduler(
         max_inference_processes=2,
         lru=LRUCache(2),
     )
-    scheduler.set_device_free_mb_provider(lambda _device_index: device_free_mb)
+    scheduler.set_device_reading_provider(device_wide_reading_provider(lambda _device_index: device_free_mb))
     scheduler.set_reclaim_ladder(VerifiedReclaimLadder())
     return scheduler
 
@@ -264,7 +265,7 @@ async def test_backfill_retries_after_measured_vram_recovers() -> None:
     # Below the backfill's priced SDXL sampling peak plus the admission noise buffer, so the hold is a
     # genuine refusal on the reading rather than one manufactured by an inflated per-baseline constant.
     free_mb = {"value": 7_500.0}
-    scheduler.set_device_free_mb_provider(lambda _device_index: free_mb["value"])
+    scheduler.set_device_reading_provider(device_wide_reading_provider(lambda _device_index: free_mb["value"]))
 
     # The gated head holds nothing; the backfill is the dispatch head but its sampling peak does not fit the
     # temporarily-held card, so it defers (holding no reservation) rather than over-committing.

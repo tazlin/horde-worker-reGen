@@ -23,7 +23,12 @@ from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
-from tests.process_management.conftest import make_job_pop_response, make_mock_process_info, track_popped_job_async
+from tests.process_management.conftest import (
+    device_wide_reading,
+    make_job_pop_response,
+    make_mock_process_info,
+    track_popped_job_async,
+)
 from tests.process_management.lifecycle.test_process_lifecycle import _make_plm
 from tests.process_management.liveness.test_bounded_dispatch_matrix import _CARD_8GB, _SDXL, _DispatchWorld
 
@@ -75,7 +80,9 @@ class TestAdvertisedSdxlHeadMustReachARealAttempt:
             process_id=None,
             disaggregated=False,
         )
-        snapshot = world.scheduler.build_vram_arbiter_snapshot(device_free_mb_by_device={0: world.device_free_mb()})
+        snapshot = world.scheduler.build_vram_arbiter_snapshot(
+            device_readings={0: device_wide_reading(world.device_free_mb())}
+        )
         state = snapshot.device(None)
         assert state is not None
         assert state.achievable_ceiling_mb() is not None

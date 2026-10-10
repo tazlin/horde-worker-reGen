@@ -29,7 +29,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.resources.vram_arbiter import _MEASURED_ATTEMPT_BAND_MB
-from tests.process_management.conftest import make_job_pop_response
+from tests.process_management.conftest import device_wide_reading, make_job_pop_response
 from tests.process_management.liveness.test_bounded_dispatch_matrix import (
     _CARD_8GB,
     _FLUX,
@@ -82,7 +82,9 @@ def _candidate_mb(world: _DispatchWorld, job: ImageGenerateJobPopResponse) -> fl
 
 def _ceiling_mb(world: _DispatchWorld) -> float:
     """Return the card's achievable ceiling, read from the same frozen snapshot the arbiter judges against."""
-    snapshot = world.scheduler.build_vram_arbiter_snapshot(device_free_mb_by_device={0: world.device_free_mb()})
+    snapshot = world.scheduler.build_vram_arbiter_snapshot(
+        device_readings={0: device_wide_reading(world.device_free_mb())}
+    )
     state = snapshot.device(None)
     assert state is not None
     ceiling_mb = state.achievable_ceiling_mb()
@@ -147,7 +149,9 @@ class TestConvergedEmptyHeadOutsideTheBand:
         job = make_job_pop_response(_SDXL.name, width=512, height=768, ddim_steps=12)
         candidate_mb = _candidate_mb(world, job)
         ceiling_mb = _ceiling_mb(world)
-        snapshot = world.scheduler.build_vram_arbiter_snapshot(device_free_mb_by_device={0: world.device_free_mb()})
+        snapshot = world.scheduler.build_vram_arbiter_snapshot(
+            device_readings={0: device_wide_reading(world.device_free_mb())}
+        )
         state = snapshot.device(None)
         assert state is not None
         assert state.device_free_mb is not None

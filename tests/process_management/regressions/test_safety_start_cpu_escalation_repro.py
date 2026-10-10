@@ -48,7 +48,11 @@ from horde_worker_regen.process_management.process_manager import HordeWorkerPro
 from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.foreign_vram_floor import ManagedVramTenant
-from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
+from tests.process_management.conftest import (
+    device_wide_reading,
+    make_mock_process_info,
+    make_testable_process_manager,
+)
 
 _CARD_TOTAL_MB = 10240.0
 """A 10 GB card, the size of the one the managed text backend filled."""
@@ -109,7 +113,7 @@ def captured_messages() -> Iterator[list[str]]:
 def _pressured_manager(fake_time: _AdvanceableTime) -> HordeWorkerProcessManager:
     """Build a single-card worker with safety permitted on-GPU and a card held at the pressure tier."""
     pm = make_testable_process_manager(safety_on_gpu=True, device_free_mb=_PRESSURED_FREE_MB)
-    pm._last_device_total_mb_by_device[0] = _CARD_TOTAL_MB
+    pm._last_device_reading_by_device[0] = device_wide_reading(_PRESSURED_FREE_MB, _CARD_TOTAL_MB)
     pm._governor_states_by_device[0] = GovernorState.PRESSURE
     pm._inference_scheduler._clock = fake_time.time
     pm._process_lifecycle._ctx.Pipe.return_value = (Mock(), Mock())  # pyrefly: ignore[missing-attribute]
@@ -119,7 +123,7 @@ def _pressured_manager(fake_time: _AdvanceableTime) -> HordeWorkerProcessManager
 
 def _set_card(pm: HordeWorkerProcessManager, *, free_mb: float, governor_state: GovernorState) -> None:
     """Set the parent's device reading for card 0."""
-    pm._last_device_free_mb_by_device[0] = free_mb
+    pm._last_device_reading_by_device[0] = device_wide_reading(free_mb, _CARD_TOTAL_MB)
     pm._governor_states_by_device[0] = governor_state
 
 

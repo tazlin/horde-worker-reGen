@@ -46,6 +46,7 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import DISPATCH_ADMISSION_FLOW
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -372,7 +373,9 @@ async def test_a_starved_waiter_beside_a_fresh_preload_is_offered_the_post_proce
     reservations_mb = ample.verdict.measured.outstanding_reservations_mb
     assert candidate_mb is not None
     # Short by less than the post-processing lane's reservation alone, so pausing it closes the deficit.
-    scheduler.set_device_free_mb_provider(lambda _device_index: candidate_mb + noise_mb + reservations_mb - 500.0)
+    scheduler.set_device_reading_provider(
+        device_wide_reading_provider(lambda _device_index: candidate_mb + noise_mb + reservations_mb - 500.0)
+    )
 
     arbiter = scheduler._ensure_preload_arbiter()  # type: ignore[attr-defined]
     plan = decide_clearance_admit(

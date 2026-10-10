@@ -86,7 +86,11 @@ from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.device_free_governor import DeviceFreeGovernor, GovernorState
-from horde_worker_regen.process_management.resources.device_memory_source import child_reported_free_total_mb
+from horde_worker_regen.process_management.resources.device_memory_source import (
+    DeviceMemoryReading,
+    child_reported_reading,
+    nvml_reading,
+)
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRung,
     ReclaimRungKind,
@@ -1436,7 +1440,7 @@ class _DispatchWorld:
             # Pinning it is what makes a row's jobs priced, admitted, and dispatched on the disaggregated
             # path without standing up the orchestrator's lanes, which these rows do not vary.
             self._scheduler._is_disaggregation_class_eligible = lambda _job: True  # type: ignore[method-assign]
-        self._scheduler.set_device_free_mb_provider(self.parent_device_free_mb)
+        self._scheduler.set_device_reading_provider(self.parent_reading)
         # The rows vary VRAM, never host RAM: pinning an ample reading keeps the RAM admission gates out of
         # the variation and stops a row's outcome depending on how much memory the machine running it has.
         self._scheduler.set_available_ram_mb_provider(lambda: _AMPLE_RAM_MB)
@@ -1821,15 +1825,20 @@ class _DispatchWorld:
         from the lanes' published reports for a card its device read never answers for, so a row with no
         device reading prices against the same figure a worker on such a card does.
         """
+        if device_index is None:
+            readings = [self.parent_reading(index) for index in self._card_totals]
+            known = [reading.free_mb for reading in readings if reading is not None]
+            return min(known) if known else None
+        reading = self.parent_reading(device_index)
+        return None if reading is None else reading.free_mb
+
+    def parent_reading(self, device_index: int) -> DeviceMemoryReading | None:
+        """The parent's memory reading of one card, with the provenance a worker on such a card records."""
         if self.parent_device_reading:
-            return self.device_free_mb(device_index)
+            return nvml_reading(free_mb=self.card_free_mb(device_index), total_mb=self._card_totals[device_index])
         if self.child_report_platform is None:
             return None
-        if device_index is None:
-            readings = [self.parent_device_free_mb(index) for index in self._card_totals]
-            known = [reading for reading in readings if reading is not None]
-            return min(known) if known else None
-        reading = child_reported_free_total_mb(
+        return child_reported_reading(
             reported_free_mb=self._process_map.get_free_vram_mb(device_index=device_index),
             reported_total_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
             committed_mb=self._process_map.committed_vram_mb(
@@ -1838,7 +1847,6 @@ class _DispatchWorld:
             ),
             platform=self.child_report_platform,
         )
-        return None if reading is None else reading[0]
 
     def _actual_charge_mb(self, predicted_mb: float) -> float:
         """What a charge the scheduler priced at ``predicted_mb`` really costs the card.
@@ -3765,10 +3773,8 @@ class _DispatchWorld:
         preload or dispatch admission happened to prime, which can be many ticks old.
         """
         self.snapshot = self._scheduler.build_vram_arbiter_snapshot(
-            device_free_mb_by_device={
-                index: reading
-                for index in self._card_totals
-                if (reading := self.parent_device_free_mb(index)) is not None
+            device_readings={
+                index: reading for index in self._card_totals if (reading := self.parent_reading(index)) is not None
             },
         )
         self._scheduler._ensure_preload_arbiter().begin_cycle(self.snapshot)

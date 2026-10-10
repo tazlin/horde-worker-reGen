@@ -33,6 +33,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     LearnedFootprintStore,
 )
 from tests.process_management.conftest import (
+    device_wide_reading,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_job,
@@ -1972,7 +1973,7 @@ class TestSchedulerReservationOverlay:
         loader = scheduler._process_map[0]  # type: ignore[index]
         device_free = 13200.0
 
-        before = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
+        before = scheduler.build_vram_arbiter_device_state(None, device_reading=device_wide_reading(device_free))  # type: ignore[attr-defined]
         assert before.planned_unmaterialized_mb == 0.0
         assert self._candidate_fits(before, candidate_mb=8000.0) is True
 
@@ -1980,7 +1981,7 @@ class TestSchedulerReservationOverlay:
         job_a = make_job_pop_response("model_a")
         assert scheduler._send_preload(job_a, loader, planned_charge_mb=8000.0) is True
 
-        after = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
+        after = scheduler.build_vram_arbiter_device_state(None, device_reading=device_wide_reading(device_free))  # type: ignore[attr-defined]
         assert after.planned_unmaterialized_mb == 8000.0
         assert self._candidate_fits(after, candidate_mb=8000.0) is False
 
@@ -2001,7 +2002,9 @@ class TestSchedulerReservationOverlay:
 
         job_a = make_job_pop_response("model_a")
         assert scheduler._send_preload(job_a, loader, planned_charge_mb=8000.0) is True
-        while_loading = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
+        while_loading = scheduler.build_vram_arbiter_device_state(
+            None, device_reading=device_wide_reading(device_free)
+        )  # type: ignore[attr-defined]
         assert while_loading.planned_unmaterialized_mb == 8000.0
         assert self._candidate_fits(while_loading, candidate_mb=8000.0) is False
 
@@ -2011,7 +2014,9 @@ class TestSchedulerReservationOverlay:
             load_state=ModelLoadState.LOADED_IN_VRAM,
             process_id=0,
         )
-        after_materialized = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
+        after_materialized = scheduler.build_vram_arbiter_device_state(
+            None, device_reading=device_wide_reading(device_free)
+        )  # type: ignore[attr-defined]
         assert after_materialized.planned_unmaterialized_mb == 0.0
         assert self._candidate_fits(after_materialized, candidate_mb=8000.0) is True
 
@@ -2025,7 +2030,7 @@ class TestSchedulerReservationOverlay:
 
         # Simulate the loader dying mid-load: its model map entry leaves the loading state (here, cleared).
         scheduler._horde_model_map.root.pop("model_a", None)  # type: ignore[attr-defined]
-        after_death = scheduler.build_vram_arbiter_device_state(None, device_free_mb=device_free)  # type: ignore[attr-defined]
+        after_death = scheduler.build_vram_arbiter_device_state(None, device_reading=device_wide_reading(device_free))  # type: ignore[attr-defined]
         assert after_death.planned_unmaterialized_mb == 0.0
         assert self._candidate_fits(after_death, candidate_mb=8000.0) is True
 

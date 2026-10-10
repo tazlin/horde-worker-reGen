@@ -44,6 +44,7 @@ from horde_worker_regen.process_management.scheduling import inference_scheduler
 from horde_worker_regen.process_management.scheduling.admission import materialization, pricing
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -151,7 +152,9 @@ class _World:
             context_constant_mb=self._scheduler.resolved_context_constant_mb(),
         )
         self._device_free_mb = _TOTAL_MB - _FOREIGN_MB - committed
-        self._scheduler.set_device_free_mb_provider(lambda _device_index: self._device_free_mb)
+        self._scheduler.set_device_reading_provider(
+            device_wide_reading_provider(lambda _device_index: self._device_free_mb)
+        )
 
     @property
     def scheduler(self) -> InferenceScheduler:

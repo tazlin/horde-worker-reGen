@@ -34,7 +34,11 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
-from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
+from tests.process_management.conftest import (
+    device_wide_reading,
+    make_mock_process_info,
+    make_testable_process_manager,
+)
 from tests.process_management.workers import test_post_process_orchestration as pp_tests
 
 _CARD_TOTAL_MB = 16_375
@@ -146,7 +150,7 @@ async def test_pp_drain_restores_only_its_borrowed_lane_after_work_drains(monkey
     assert manager._process_lifecycle.is_vae_lane_gpu_paused is True
 
     # Model the context exit becoming visible to NVML.  The next fresh snapshot admits and dispatches PP.
-    manager._last_device_free_mb_by_device[0] = 8_200.0
+    manager._last_device_reading_by_device[0] = device_wide_reading(8_200.0)
     manager._begin_vram_arbiter_cycle()
     await manager.start_post_processing()
     assert job_info in manager._job_tracker.jobs_being_post_processed

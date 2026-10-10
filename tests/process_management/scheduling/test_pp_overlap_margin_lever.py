@@ -9,6 +9,11 @@ lever leaves today's behavior intact.
 
 from __future__ import annotations
 
+from horde_worker_regen.process_management.resources.device_memory_source import (
+    DeviceMemoryReading,
+    DeviceMemorySourceKind,
+    ReadingProvenance,
+)
 from horde_worker_regen.process_management.scheduling.inference_scheduler import _PP_OVERLAP_MEASURED_MARGIN_MB
 from tests.process_management.conftest import make_job_pop_response, make_mock_bridge_data
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -46,3 +51,39 @@ class TestPpOverlapMarginLever:
         job = make_job_pop_response("stable_diffusion")
 
         assert scheduler._pp_overlap_margin_mb(job) == _PP_OVERLAP_MEASURED_MARGIN_MB
+
+
+class TestMeasuredOverlapNeedsADeviceWideReading:
+    """The measured second say spends room on the reading alone, so it is given only on a device-wide one."""
+
+    _FREE_MB = 20000.0
+    _TOTAL_MB = 24576.0
+
+    @classmethod
+    def _admits(cls, provenance: ReadingProvenance) -> bool:
+        scheduler = _make_inference_scheduler(bridge_data=make_mock_bridge_data())
+        reading = DeviceMemoryReading(
+            free_mb=cls._FREE_MB,
+            total_mb=cls._TOTAL_MB,
+            source=DeviceMemorySourceKind.CHILD_REPORT,
+            provenance=provenance,
+        )
+        scheduler.set_device_reading_provider(lambda _device_index: reading)
+        return scheduler._pp_overlap_measured_admits(
+            sampling_peak_mb=4000.0,
+            pending_pp_reserve_mb=0.0,
+            device_index=None,
+            margin_mb=_PP_OVERLAP_MEASURED_MARGIN_MB,
+        )
+
+    def test_a_device_wide_reading_with_room_admits(self) -> None:
+        """Ample device-wide free admits the overlap the static gate withheld."""
+        assert self._admits(ReadingProvenance.DEVICE_WIDE) is True
+
+    def test_the_same_figure_from_a_process_local_reading_does_not(self) -> None:
+        """A process-local figure can hide a sibling's memory, so the static verdict stands."""
+        assert self._admits(ReadingProvenance.PROCESS_LOCAL) is False
+
+    def test_the_same_figure_from_a_host_memory_reading_does_not(self) -> None:
+        """A host-memory figure is system RAM, so the static verdict stands."""
+        assert self._admits(ReadingProvenance.HOST_MEMORY) is False

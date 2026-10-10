@@ -43,6 +43,7 @@ from horde_worker_regen.process_management.process_manager import (
     SystemResources,
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.resources.device_memory_source import DeviceMemoryReading, nvml_reading
 from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -561,7 +562,7 @@ def make_testable_process_manager(
         stable_diffusion_reference=stable_diffusion_reference,
     )
     if device_free_mb is not None:
-        process_manager._last_device_free_mb_by_device[0] = device_free_mb
+        process_manager._last_device_reading_by_device[0] = device_wide_reading(device_free_mb)
     # Pin the RAM admission gates to an ample host, mirroring the device-free seeding above: an unpinned
     # scheduler reads the suite machine's real free RAM through psutil, so a scenario admitting a heavy
     # model would pass on a large dev box and defer on a small CI runner regardless of the scenario's own
@@ -570,6 +571,40 @@ def make_testable_process_manager(
     process_manager._inference_scheduler.set_available_ram_mb_provider(lambda: 65536.0)
     process_manager._inference_scheduler.set_available_commit_mb_provider(lambda: None)
     return process_manager
+
+
+_DEFAULT_READING_TOTAL_MB = 24576.0
+"""The card total a test reading carries when the test states only a free figure."""
+
+
+def device_wide_reading(free_mb: float, total_mb: float | None = None) -> DeviceMemoryReading:
+    """Return the reading an NVML-read card gives: ``free_mb`` free, device-wide.
+
+    ``total_mb`` defaults to a 24 GB card, raised to ``free_mb`` where a test states more free than that.
+    """
+    return nvml_reading(
+        free_mb=free_mb,
+        total_mb=max(free_mb, _DEFAULT_READING_TOTAL_MB) if total_mb is None else total_mb,
+    )
+
+
+def device_wide_reading_provider(
+    free_mb: Callable[[int], float | None],
+    total_mb: Callable[[int], float | None] | None = None,
+) -> Callable[[int], DeviceMemoryReading | None]:
+    """Return a reading provider over a per-card free figure, for a test that states the card as a number.
+
+    A card whose ``free_mb`` is None has no reading. ``total_mb`` supplies each card's total where the test
+    states one.
+    """
+
+    def provider(device_index: int) -> DeviceMemoryReading | None:
+        free = free_mb(device_index)
+        if free is None:
+            return None
+        return device_wide_reading(free, None if total_mb is None else total_mb(device_index))
+
+    return provider
 
 
 def make_mock_process_info(

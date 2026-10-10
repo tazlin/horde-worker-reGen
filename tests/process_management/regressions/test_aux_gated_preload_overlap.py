@@ -33,6 +33,7 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -84,7 +85,7 @@ def _scheduler(
         max_inference_processes=2,
         lru=LRUCache(2),
     )
-    scheduler.set_device_free_mb_provider(lambda _device_index: device_free_mb)
+    scheduler.set_device_reading_provider(device_wide_reading_provider(lambda _device_index: device_free_mb))
     return scheduler
 
 

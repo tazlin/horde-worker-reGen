@@ -36,6 +36,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     FakeClock,
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -180,7 +181,7 @@ async def _build_scenario(
         device_free_mb=None,
         clock=FakeClock(1000.0),
     )
-    scheduler.set_device_free_mb_provider(device)
+    scheduler.set_device_reading_provider(device_wide_reading_provider(device))
     lifecycle = Mock()
     lifecycle.get_processes_with_model_for_queued_job = Mock(return_value=[])
     lifecycle.is_model_load_quarantined = Mock(return_value=False)

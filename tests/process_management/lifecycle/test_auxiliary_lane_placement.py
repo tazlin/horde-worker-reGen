@@ -26,7 +26,11 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
-from tests.process_management.conftest import make_test_card_runtimes, make_test_runtime_config
+from tests.process_management.conftest import (
+    device_wide_reading_provider,
+    make_test_card_runtimes,
+    make_test_runtime_config,
+)
 
 _SHARING_NOTICE_MARKER = "now share device"
 
@@ -151,8 +155,7 @@ def _make_placement_plm(
         abort_callback=Mock(),
         state=WorkerState(),
         entry_points=ProcessEntryPoints(utilities_adapter_factory=_utilities_factory),
-        device_free_mb_provider=_free_mb,
-        device_total_vram_mb_provider=lambda _device_index: 24576.0,
+        device_reading_provider=device_wide_reading_provider(_free_mb, lambda _device_index: 24576.0),
     )
 
 

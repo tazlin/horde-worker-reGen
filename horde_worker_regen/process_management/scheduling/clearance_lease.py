@@ -317,6 +317,10 @@ class ClearanceInputs:
     """The configured VRAM reserve (MB) held back from admission."""
     paging_active: bool
     """Whether the parent's WDDM demand-paging detector is flagging this worker's allocations."""
+    device_free_is_device_wide: bool = True
+    """Whether ``device_free_mb`` covers every tenant of the card. The tail-overlap handoff spends measured
+    headroom on the strength of the figure alone, so it is offered only on a device-wide one. The figure is
+    still passed to a cleared child whatever its provenance."""
     incoming_load_seconds: float | None = None
     """Measured RAM-to-VRAM weight-load seconds an incoming child is expected to pay, or None when unmeasured.
 
@@ -440,7 +444,11 @@ def _evaluate_tail_overlap(
             load_estimate_seconds=load_seconds,
         )
 
-    headroom_mb = None if inputs.device_free_mb is None else inputs.device_free_mb - inputs.vram_reserve_mb
+    headroom_mb = (
+        None
+        if inputs.device_free_mb is None or not inputs.device_free_is_device_wide
+        else inputs.device_free_mb - inputs.vram_reserve_mb
+    )
     if headroom_mb is None or headroom_mb < tail_overlap_margin_mb:
         return None, TailOverlapDenial(
             TailOverlapDenialReason.HEADROOM_SHORT,

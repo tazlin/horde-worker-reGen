@@ -29,6 +29,7 @@ from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
@@ -159,7 +160,9 @@ class TestBudgetStarvationWedge:
         # The eviction lands: the truthful reading recovers to the achievable floor and the next cycle
         # (mirroring the manager's per-tick refreeze) prices the head against it. The weights physically fit,
         # so the head admits rather than starving behind a reserve that is not a load-feasibility floor.
-        scheduler.set_device_free_mb_provider(lambda _device_index: _ACHIEVABLE_FREE_VRAM_MB)
+        scheduler.set_device_reading_provider(
+            device_wide_reading_provider(lambda _device_index: _ACHIEVABLE_FREE_VRAM_MB)
+        )
         assert scheduler._vram_arbiter is not None
         scheduler._vram_arbiter.begin_cycle(scheduler.build_vram_arbiter_snapshot())
         assert scheduler.preload_models() is True

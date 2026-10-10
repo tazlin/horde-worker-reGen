@@ -61,6 +61,7 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.models.model_sizing import any_offered_model_wants_whole_card
 from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, soft_floor_mb
+from horde_worker_regen.process_management.resources.device_memory_source import DeviceMemoryReading
 from horde_worker_regen.process_management.resources.resource_budget import ram_pressure_floor_mb
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
@@ -665,8 +666,7 @@ class ProcessLifecycleManager:
         wddm_paging_victims_provider: Callable[[float], dict[int, float]] | None = None,
         device_saturation_duration_provider: Callable[[int], float] | None = None,
         saturation_unresolved_provider: Callable[[int], bool] | None = None,
-        device_free_mb_provider: Callable[[int], float | None] | None = None,
-        device_total_vram_mb_provider: Callable[[int], float | None] | None = None,
+        device_reading_provider: Callable[[int], DeviceMemoryReading | None] | None = None,
         device_governor_state_provider: Callable[[int], GovernorState] | None = None,
         gpu_start_context_mb_provider: Callable[[], float] | None = None,
         clearance_proxy_registrar: Callable[[int, int, ClearanceLeaseProxy], None] | None = None,
@@ -744,13 +744,8 @@ class ProcessLifecycleManager:
             if saturation_unresolved_provider is not None
             else (lambda _device_index: False)
         )
-        self._device_free_mb_provider: Callable[[int], float | None] = (
-            device_free_mb_provider if device_free_mb_provider is not None else (lambda _device_index: None)
-        )
-        self._device_total_vram_mb_provider: Callable[[int], float | None] = (
-            device_total_vram_mb_provider
-            if device_total_vram_mb_provider is not None
-            else (lambda _device_index: None)
+        self._device_reading_provider: Callable[[int], DeviceMemoryReading | None] = (
+            device_reading_provider if device_reading_provider is not None else (lambda _device_index: None)
         )
         self._device_governor_state_provider: Callable[[int], GovernorState] = (
             device_governor_state_provider
@@ -1147,7 +1142,7 @@ class ProcessLifecycleManager:
 
     def _note_pending_gpu_start_sample(self, device_index: int, device_free_mb: float | None = None) -> None:
         """Track free-VRAM progress while starts are deferred on a device."""
-        free_mb = self._device_free_mb_provider(device_index) if device_free_mb is None else device_free_mb
+        free_mb = self._device_free_mb(device_index) if device_free_mb is None else device_free_mb
         if free_mb is None:
             return
         previous = self._pending_gpu_start_last_free_mb_by_device.get(device_index)
@@ -1155,9 +1150,19 @@ class ProcessLifecycleManager:
             self._pending_gpu_start_last_progress_at_by_device[device_index] = time.monotonic()
         self._pending_gpu_start_last_free_mb_by_device[device_index] = free_mb
 
+    def _device_free_mb(self, device_index: int) -> float | None:
+        """Return the card's free VRAM (MB) from its last memory reading, or None before the first.
+
+        Start gating and lane placement compare the figure with a context-sized requirement, which every
+        provenance of reading can answer, so the figure is taken as it stands.
+        """
+        reading = self._device_reading_provider(device_index)
+        return None if reading is None else reading.free_mb
+
     def _gpu_start_device_total_mb(self, device_index: int) -> float | None:
         """Return the card's measured total VRAM (MB), else its planned total, else None."""
-        total_mb = self._device_total_vram_mb_provider(device_index)
+        reading = self._device_reading_provider(device_index)
+        total_mb = None if reading is None else reading.total_mb
         if total_mb is None:
             card = self._card_runtimes.get(device_index)
             total_mb = card.total_vram_mb if card is not None else None
@@ -1188,7 +1193,7 @@ class ProcessLifecycleManager:
         """
         if cpu_only:
             return True, ""
-        free_mb = self._device_free_mb_provider(device_index)
+        free_mb = self._device_free_mb(device_index)
         if free_mb is None:
             return True, ""
         required_mb = self._gpu_start_required_free_mb(device_index) + extra_required_mb
@@ -1586,7 +1591,7 @@ class ProcessLifecycleManager:
             for pending in self._pending_gpu_starts.values()
         ):
             return False
-        free_mb = self._device_free_mb_provider(device_index)
+        free_mb = self._device_free_mb(device_index)
         if free_mb is None:
             return False
         if self._device_governor_state_provider(device_index) != GovernorState.HEALTHY:
@@ -1605,7 +1610,7 @@ class ProcessLifecycleManager:
         card_target = card.target_process_count + 1
         self._card_runtimes[device_index] = replace(card, target_process_count=card_target)
         self.refresh_max_inference_processes()
-        free_mb = self._device_free_mb_provider(device_index)
+        free_mb = self._device_free_mb(device_index)
         required_mb = self._gpu_start_required_free_mb(device_index)
         pid = self._allocate_inference_pid()
         self._action_ledger.record(
@@ -1887,9 +1892,7 @@ class ProcessLifecycleManager:
                 card for card in ordered_cards if card.device_index != safety_card_index
             ] or ordered_cards
 
-        free_mb_by_card = {
-            card.device_index: self._device_free_mb_provider(card.device_index) for card in eligible_cards
-        }
+        free_mb_by_card = {card.device_index: self._device_free_mb(card.device_index) for card in eligible_cards}
         if all(free_mb is None for free_mb in free_mb_by_card.values()):
             return eligible_cards[0]
 

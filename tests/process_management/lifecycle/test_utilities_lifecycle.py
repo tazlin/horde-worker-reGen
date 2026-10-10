@@ -18,7 +18,11 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
-from tests.process_management.conftest import make_test_card_runtimes, make_test_runtime_config
+from tests.process_management.conftest import (
+    device_wide_reading_provider,
+    make_test_card_runtimes,
+    make_test_runtime_config,
+)
 
 
 class _FakeHandle:
@@ -120,8 +124,11 @@ def _make_utilities_plm(
         abort_callback=Mock(),
         state=WorkerState(),
         entry_points=ProcessEntryPoints(utilities_adapter_factory=_factory),
-        device_free_mb_provider=device_free_mb_provider,
-        device_total_vram_mb_provider=device_total_vram_mb_provider,
+        device_reading_provider=(
+            None
+            if device_free_mb_provider is None
+            else device_wide_reading_provider(device_free_mb_provider, device_total_vram_mb_provider)
+        ),
     )
 
 

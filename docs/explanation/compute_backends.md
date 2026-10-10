@@ -60,9 +60,33 @@ processes have committed. The worker logs one WARNING per card when it starts re
 A card NVML has answered for keeps NVML as its only source. A missed NVML sample there leaves the card
 without a reading until the next one.
 
+Every reading is a
+[`DeviceMemoryReading`][horde_worker_regen.process_management.resources.device_memory_source.DeviceMemoryReading]
+that carries its source and its provenance with the figure, so a consumer cannot take the number without
+knowing what it describes.
+
+| Provenance | Where it comes from | What it describes |
+| ---------- | ------------------- | ----------------- |
+| `device_wide` | NVML, or process reports off Windows | Every tenant of the card |
+| `process_local` | Process reports on Windows | The reporting process's view, capped by the committed ledger |
+| `host_memory` | Process reports on an MPS or CPU device | System RAM the device shares with the host |
+
+Most consumers price against the figure whatever its provenance: VRAM admission, the reclaim ladder, the GPU
+start gate and the clamp sent to a cleared process. Four act only on a `device_wide` reading, because each
+spends measured room on the strength of the figure alone or reads other programs' usage out of it:
+
+- the sustained foreign-VRAM floor, which is total less free less the worker's share
+- the measured post-processing overlap path (`_pp_overlap_measured_admits`)
+- the clearance lease's tail-overlap handoff
+- the managed text backend's launch footprint, which is a free-figure delta across another process's load
+
+A `host_memory` card is recorded for admission and left out of the device-free governor. Its figure is system
+RAM, which the RAM governor already governs.
+
 The reported figure has limits. On a Windows card it does not see memory another program holds. The
 device-used reading behind the attribution drift check is still NVML-only. A card with no reporting process
-has no reading.
+has no reading. Treating process reports off Windows as device-wide is an assumption for ROCm and XPU that no
+hardware run has checked.
 
 Admission defers on a card with no reading, because at a cold start the first reading is at most one report
 interval away. A card still unread after three report intervals has no source that will answer. From then on

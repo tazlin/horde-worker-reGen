@@ -204,7 +204,13 @@ from horde_worker_regen.process_management.resources.device_free_governor import
     GovernorState,
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
-from horde_worker_regen.process_management.resources.device_memory_source import child_reported_free_total_mb
+from horde_worker_regen.process_management.resources.device_memory_source import (
+    DeviceMemoryReading,
+    DeviceMemorySourceKind,
+    ReadingProvenance,
+    child_reported_reading,
+    nvml_reading,
+)
 from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
 from horde_worker_regen.process_management.resources.foreign_vram_floor import ManagedVramTenant
 from horde_worker_regen.process_management.resources.model_serviceability import (
@@ -1541,10 +1547,7 @@ class HordeWorkerProcessManager:
             saturation_unresolved_provider=lambda device_index: self._reclaim_ladder.is_saturation_unresolved(
                 device_index,
             ),
-            device_free_mb_provider=lambda device_index: self.latest_device_free_mb(device_index),
-            device_total_vram_mb_provider=lambda device_index: self._last_device_total_mb_by_device.get(
-                device_index,
-            ),
+            device_reading_provider=lambda device_index: self.latest_device_reading(device_index),
             device_governor_state_provider=lambda device_index: self._governor_states_by_device.get(
                 device_index,
                 GovernorState.HEALTHY,
@@ -1603,8 +1606,8 @@ class HordeWorkerProcessManager:
         )
         # The deadlock diagnostics argue about how full the card is, so they read the same device-level
         # figure admission does rather than the children's paging-inflated view of it.
-        self._message_dispatcher.set_device_free_mb_provider(
-            lambda device_index: self.latest_device_free_mb(device_index)
+        self._message_dispatcher.set_device_reading_provider(
+            lambda device_index: self.latest_device_reading(device_index)
         )
         # A shared child-to-parent channel that has wedged a physical read (a torn frame, a stalled writer
         # lock) is unrecoverable in place because every child inherits the same queue; the only correct
@@ -1650,8 +1653,7 @@ class HordeWorkerProcessManager:
         # read returns None, so no card is ever governed).
         self._device_free_governor = DeviceFreeGovernor()
         self._governor_states_by_device: dict[int, GovernorState] = {}
-        self._last_device_free_mb_by_device: dict[int, float] = {}
-        self._last_device_total_mb_by_device: dict[int, float] = {}
+        self._last_device_reading_by_device: dict[int, DeviceMemoryReading] = {}
         self._nvml_answered_devices: set[int] = set()
         self._child_reported_memory_devices: set[int] = set()
 
@@ -1855,7 +1857,7 @@ class HordeWorkerProcessManager:
         self._inference_scheduler.set_reclaim_ladder(self._reclaim_ladder)
         # The measured-truth identity's primary input for any snapshot the scheduler self-primes outside the
         # manager-driven cycle; the per-tick cycle passes the same readings map explicitly.
-        self._inference_scheduler.set_device_free_mb_provider(self._last_device_free_mb_by_device.get)
+        self._inference_scheduler.set_device_reading_provider(self._last_device_reading_by_device.get)
         # The managed text backend is a known tenant of its card: its measured launch footprint is a standing
         # floor there from the moment it serves, before the learned foreign floor has observed it.
         self._inference_scheduler.set_managed_tenant_provider(self._managed_text_backend_tenant)
@@ -2749,7 +2751,7 @@ class HordeWorkerProcessManager:
         card to deny on, so both keep the offer open as every gate does on missing telemetry.
         """
         first_denial: VramVerdict | None = None
-        for device_index in sorted(self._last_device_free_mb_by_device):
+        for device_index in sorted(self._last_device_reading_by_device):
             verdict = self._vram_arbiter.evaluate(
                 self._post_process_orchestrator.build_offer_request(
                     device_index=device_index,
@@ -3653,8 +3655,8 @@ class HordeWorkerProcessManager:
                 inputs={"elevated_streak": self._wddm_elevated_streak},
             )
 
-    def _read_device_free_total_mb(self, device_index: int) -> tuple[float, float] | None:
-        """Return device ``index``'s ``(free_mb, total_mb)``, torch-free, or None when nothing has reported.
+    def _read_device_memory(self, device_index: int) -> DeviceMemoryReading | None:
+        """Return device ``index``'s memory reading, torch-free, or None when nothing has reported.
 
         Read from the parent (outside any CUDA workload) via NVML directly (never torch), so the figure is the
         device-wide truth and the orchestrator stays torch-free. On Windows/WDDM the device-level free figure
@@ -3674,31 +3676,46 @@ class HordeWorkerProcessManager:
             total_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
             if free_mb is None or total_mb is None:
                 return None
-            return free_mb, total_mb
-        nvml_reading = self._read_nvml_free_total_mb(device_index)
-        if nvml_reading is not None:
+            return DeviceMemoryReading(
+                free_mb=free_mb,
+                total_mb=total_mb,
+                source=DeviceMemorySourceKind.CHILD_REPORT,
+                provenance=ReadingProvenance.DEVICE_WIDE,
+            )
+        from_nvml = self._read_nvml_memory(device_index)
+        if from_nvml is not None:
             self._nvml_answered_devices.add(device_index)
-            return nvml_reading
+            return from_nvml
         if device_index in self._nvml_answered_devices:
             return None
-        reading = child_reported_free_total_mb(
+        reading = child_reported_reading(
             reported_free_mb=self._process_map.get_free_vram_mb(device_index=device_index),
             reported_total_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
             committed_mb=self._process_map.committed_vram_mb(
                 context_constant_mb=self._inference_scheduler.resolved_context_constant_mb(),
                 device_index=device_index,
             ),
+            host_memory=self._card_reports_host_memory(device_index),
         )
         if reading is not None and device_index not in self._child_reported_memory_devices:
             self._child_reported_memory_devices.add(device_index)
             logger.warning(
                 f"Device {device_index} has no device-level memory reading (NVML did not answer for it). VRAM "
-                "admission and the device-free governor are reading the figures its inference processes report.",
+                f"admission is reading the figures its inference processes report ({reading.provenance.value}).",
             )
         return reading
 
-    def _read_nvml_free_total_mb(self, device_index: int) -> tuple[float, float] | None:
-        """Return device ``index``'s ``(free_mb, total_mb)`` via NVML, or None when NVML does not answer."""
+    def _card_reports_host_memory(self, device_index: int) -> bool:
+        """Whether the card's backend reports system RAM as its memory (a unified-memory or CPU device)."""
+        device_info = self._device_map.root.get(device_index)
+        if device_info is None:
+            return False
+        from hordelib.utils.torch_memory import AcceleratorKind
+
+        return device_info.kind in (AcceleratorKind.mps.value, AcceleratorKind.cpu.value)
+
+    def _read_nvml_memory(self, device_index: int) -> DeviceMemoryReading | None:
+        """Return device ``index``'s reading via NVML, or None when NVML does not answer."""
         try:
             from hordelib.utils.nvml import get_device_memory_mb
         except Exception as e:  # noqa: BLE001 - "no NVML" is an expected environment, not a crash
@@ -3707,7 +3724,7 @@ class HordeWorkerProcessManager:
         memory = get_device_memory_mb(device_index)
         if memory is None:
             return None
-        return float(memory.free_mb), float(memory.total_mb)
+        return nvml_reading(free_mb=float(memory.free_mb), total_mb=float(memory.total_mb))
 
     def _evaluate_device_free_governor(self) -> None:
         """Sample NVML device free/total per driven card, debounce the governor, and act on its state.
@@ -3719,22 +3736,25 @@ class HordeWorkerProcessManager:
         to VRAM on a process that does not already hold it, no safety GPU restore, no paused-lane restart);
         in-flight sampling is untouched. On a card at SATURATED it clears the hold's precedence and drives one
         reclaim pass so the card gets room back on the same tick it crossed the cliff. HEALTHY lifts the hold.
-        A card with no NVML free reading is left ungoverned (the read returns None).
+        A card with no reading is left ungoverned (the read returns None). A card whose reading is host
+        memory is recorded for admission and left ungoverned too: its figure is system RAM, which the RAM
+        governor already governs, and a second governor on the same pool would act on it twice.
         """
         device_indices = {process_info.device_index for process_info in self._process_map.values()}
         for device_index in sorted(device_indices):
-            reading = self._read_device_free_total_mb(device_index)
+            reading = self._read_device_memory(device_index)
             if reading is None:
                 continue
-            device_free_mb, total_mb = reading
+            self._last_device_reading_by_device[device_index] = reading
+            if reading.provenance is ReadingProvenance.HOST_MEMORY:
+                continue
+            device_free_mb, total_mb = reading.free_mb, reading.total_mb
             sample = self._device_free_governor.observe(
                 device_index,
                 device_free_mb=device_free_mb,
                 total_vram_mb=total_mb if total_mb > 0 else None,
             )
             self._governor_states_by_device[device_index] = sample.state
-            self._last_device_free_mb_by_device[device_index] = device_free_mb
-            self._last_device_total_mb_by_device[device_index] = total_mb
 
             if sample.transitioned:
                 logger.warning(
@@ -3996,9 +4016,14 @@ class HordeWorkerProcessManager:
                 "worker served at reduced concurrency for as long as the pool stayed shrunk.",
             )
 
-    def latest_device_free_mb(self, device_index: int = 0) -> float | None:
-        """Return the last NVML device-level free VRAM (MB) the governor sampled for a card (calibration)."""
-        return self._last_device_free_mb_by_device.get(device_index)
+    def latest_device_reading(self, device_index: int = 0) -> DeviceMemoryReading | None:
+        """Return the last device memory reading the governor tick took for a card, or None before the first."""
+        return self._last_device_reading_by_device.get(device_index)
+
+    def _latest_device_free_mb_for_metrics(self) -> float | None:
+        """Return card 0's last free figure for the stats sample, whatever its provenance."""
+        reading = self.latest_device_reading()
+        return None if reading is None else reading.free_mb
 
     def _device_saturation_duration_seconds(self, device_index: int) -> float:
         """Return how long a card has been continuously SATURATED (seconds), or 0.0 when it is not.
@@ -4289,7 +4314,7 @@ class HordeWorkerProcessManager:
         snapshot = self._inference_scheduler.build_vram_arbiter_snapshot(
             active_sampling_peaks_total_mb=active_sampling_peaks_total_mb,
             governor_states=self._governor_states_by_device,
-            device_free_mb_by_device=self._last_device_free_mb_by_device,
+            device_readings=self._last_device_reading_by_device,
             reclaim_unresolved_by_device=reclaim_unresolved_by_device,
         )
         self._vram_arbiter.begin_cycle(snapshot)
@@ -6090,7 +6115,7 @@ class HordeWorkerProcessManager:
             admission_headroom_mb=self.latest_admission_headroom_mb(),
             admission_foreign_pressure_defers=self._vram_arbiter.admission_foreign_pressure_defers,
             starvation_diagnostics=self._vram_arbiter.starvation_diagnostics,
-            device_free_mb=self.latest_device_free_mb(),
+            device_free_mb=self._latest_device_free_mb_for_metrics(),
             governor_pressure_events=self._device_free_governor.total_pressure_events(),
             governor_saturation_events=self._device_free_governor.total_saturation_events(),
             ladder_rungs_issued=self._reclaim_ladder.rungs_issued,
@@ -8860,7 +8885,7 @@ class HordeWorkerProcessManager:
             backend=self._text_backend_for(kind),
             backend_kind=kind,
             owned_registry=self._owned_registry,
-            read_device_free_total_mb=self._read_device_free_total_mb,
+            read_device_memory=self._read_device_memory,
             on_event=self._run_metrics.record_event,
         )
         self._text_backend_supervisor = supervisor

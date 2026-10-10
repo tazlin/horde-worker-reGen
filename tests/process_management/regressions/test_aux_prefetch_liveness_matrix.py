@@ -59,6 +59,7 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -183,7 +184,7 @@ class _AuxLivenessWorld:
             max_inference_processes=max(2, len(process_map)),
             lru=LRUCache(max(2, len(process_map))),
         )
-        self._scheduler.set_device_free_mb_provider(lambda _device_index: _AMPLE_FREE_MB)
+        self._scheduler.set_device_reading_provider(device_wide_reading_provider(lambda _device_index: _AMPLE_FREE_MB))
         self._coordinator = AuxPrefetchCoordinator(
             job_tracker=self._job_tracker,
             state=WorkerState(),

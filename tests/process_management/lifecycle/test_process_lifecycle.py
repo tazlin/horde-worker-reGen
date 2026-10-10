@@ -45,6 +45,7 @@ from horde_worker_regen.process_management.resources.device_free_governor import
 from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
@@ -111,8 +112,14 @@ def _make_plm(
         directml=None,
         abort_callback=Mock(),
         state=WorkerState(),
-        device_free_mb_provider=device_free_mb_provider,  # type: ignore[arg-type]
-        device_total_vram_mb_provider=device_total_vram_mb_provider,  # type: ignore[arg-type]
+        device_reading_provider=(
+            None
+            if device_free_mb_provider is None
+            else device_wide_reading_provider(
+                device_free_mb_provider,  # type: ignore[arg-type]
+                device_total_vram_mb_provider,  # type: ignore[arg-type]
+            )
+        ),
         device_governor_state_provider=device_governor_state_provider,  # type: ignore[arg-type]
         gpu_start_context_mb_provider=gpu_start_context_mb_provider,  # type: ignore[arg-type]
     )

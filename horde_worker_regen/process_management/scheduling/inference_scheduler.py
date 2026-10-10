@@ -62,6 +62,7 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     admission_margin_mb,
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.device_memory_source import DeviceMemoryReading
 from horde_worker_regen.process_management.resources.foreign_vram_floor import (
     ForeignVramFloorTracker,
     ManagedVramTenant,
@@ -654,7 +655,7 @@ class InferenceScheduler:
         # the fallback for a self-primed snapshot (a scheduler consult before or outside a manager tick), so the
         # measured-truth identity keeps its primary input there too. None (unwired) leaves the reading absent,
         # and admission defers with the missing-reading diagnostic.
-        self._device_free_mb_provider: Callable[[int], float | None] | None = None
+        self._device_reading_provider: Callable[[int], DeviceMemoryReading | None] | None = None
         self._available_ram_mb_provider: Callable[[], float] | None = None
         self._available_commit_mb_provider: Callable[[], float | None] | None = None
         # The head-preload context the current deferred verdict's actuations act on, set immediately before the
@@ -4389,8 +4390,8 @@ class InferenceScheduler:
 
         A child's view of the card is process-local, and under WDDM it runs ahead of the device: memory the
         driver has not yet returned still reads as free, so admission priced on the child figure alone buys
-        headroom the card does not have. The parent's own device-level reading (see
-        :meth:`set_device_free_mb_provider`) is therefore taken as a ceiling on the answer whenever one exists
+        headroom the card does not have. The parent's device memory reading (see
+        :meth:`set_device_reading_provider`) is therefore taken as a ceiling on the answer whenever one exists
         for the card, leaving the more conservative of the two. Where the reading source is itself the child
         reports (a harness that injects the provider) the ceiling is a no-op, so nothing that prices against an
         injected device inventory changes.
@@ -4929,14 +4930,14 @@ class InferenceScheduler:
         """
         self._reclaim_ladder = reclaim_ladder
 
-    def set_device_free_mb_provider(self, provider: Callable[[int], float | None]) -> None:
-        """Inject the truthful per-card device-free reading source (the parent's NVML view).
+    def set_device_reading_provider(self, provider: Callable[[int], DeviceMemoryReading | None]) -> None:
+        """Inject the per-card device memory reading source (the parent's reading, with its provenance).
 
         The manager-driven cycle passes its explicit reading map into :meth:`build_vram_arbiter_snapshot`;
         this provider covers the self-primed path (a scheduler consult before or outside a manager tick), so
         the measured-truth admission identity keeps its primary input on every snapshot the scheduler builds.
         """
-        self._device_free_mb_provider = provider
+        self._device_reading_provider = provider
 
     def set_available_ram_mb_provider(self, provider: Callable[[], float]) -> None:
         """Inject the available-system-RAM reading source, replacing the live psutil read.
@@ -5236,7 +5237,7 @@ class InferenceScheduler:
         *,
         active_sampling_peaks_total_mb: float = 0.0,
         governor_state: GovernorState | None = None,
-        device_free_mb: float | None = None,
+        device_reading: DeviceMemoryReading | None = None,
         reclaim_unresolved: bool = False,
         device_free_unavailable: bool = False,
     ) -> DeviceVramState:
@@ -5255,17 +5256,21 @@ class InferenceScheduler:
         flow's share is also carried separately, so the arbiter can price drain-side requests (post-processing)
         net of RAM-staged loads whose VRAM claim waits on that very drain completing.
         """
+        device_free_mb = None if device_reading is None else device_reading.free_mb
         raw_total_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         baseline_mb = self._admission_baseline_mb(device_index)
         committed_mb = self._process_map.committed_vram_mb(
             context_constant_mb=self.resolved_context_constant_mb(),
             device_index=device_index,
         )
+        # The foreign floor is what other programs hold, read as total less free less the worker's share.
+        # Only a device-wide figure has other programs inside it, so no other reading feeds a sample.
+        device_wide_free_mb = device_free_mb if device_reading is not None and device_reading.is_device_wide else None
         foreign_floor_mb = floor_with_known_tenant_mb(
             self._sustained_foreign_floor_mb(
                 device_index,
                 total_vram_mb=raw_total_mb,
-                device_free_mb=device_free_mb,
+                device_free_mb=device_wide_free_mb,
                 worker_footprint_mb=committed_mb,
             ),
             self._managed_tenant_footprint_mb(device_index),
@@ -5372,6 +5377,7 @@ class InferenceScheduler:
             active_sampling_peaks_total_mb=active_sampling_peaks_total_mb,
             governor_state=governor_state,
             device_free_mb=device_free_mb,
+            device_free_provenance=None if device_reading is None else device_reading.provenance,
             device_free_unavailable=device_free_unavailable,
             foreign_floor_mb=foreign_floor_mb,
             reclaim_unresolved=reclaim_unresolved,
@@ -5572,19 +5578,19 @@ class InferenceScheduler:
         *,
         active_sampling_peaks_total_mb: float = 0.0,
         governor_states: Mapping[int, GovernorState] | None = None,
-        device_free_mb_by_device: Mapping[int, float] | None = None,
+        device_readings: Mapping[int, DeviceMemoryReading] | None = None,
         reclaim_unresolved_by_device: Mapping[int, bool] | None = None,
     ) -> MeasuredVramSnapshot:
         """Build the whole-worker frozen snapshot for one cycle, one entry per driven card.
 
         The single-GPU/worker-wide reading (device index None) is stored under card 0, matching how the
         scheduler keys its per-card admission counters, so a None-keyed request resolves to it. The parent
-        supplies ``governor_states`` (the device-free governor's committed state per card), the truthful NVML
-        ``device_free_mb_by_device`` reading, and ``reclaim_unresolved_by_device`` (whether the verified
+        supplies ``governor_states`` (the device-free governor's committed state per card), the
+        ``device_readings`` map, and ``reclaim_unresolved_by_device`` (whether the verified
         reclaim ladder has exhausted itself while SATURATED per card) so each device state carries the
-        admission inputs. A missing readings map falls back to the injected device-free provider (see
-        :meth:`set_device_free_mb_provider`) so a self-primed snapshot keeps the identity's primary input;
-        with neither source the reading is absent and admission defers on it.
+        admission inputs. A missing readings map falls back to the injected reading provider (see
+        :meth:`set_device_reading_provider`) so a self-primed snapshot keeps the identity's primary input.
+        With neither source the reading is absent and admission defers on it.
         """
         device_indices = {process_info.device_index for process_info in self._process_map.values()}
         if not device_indices:
@@ -5592,12 +5598,12 @@ class InferenceScheduler:
         devices: dict[int, DeviceVramState] = {}
         for device_index in sorted(device_indices):
             governor_state = governor_states.get(device_index) if governor_states is not None else None
-            if device_free_mb_by_device is not None:
-                device_free_mb = device_free_mb_by_device.get(device_index)
-            elif self._device_free_mb_provider is not None:
-                device_free_mb = self._device_free_mb_provider(device_index)
+            if device_readings is not None:
+                reading = device_readings.get(device_index)
+            elif self._device_reading_provider is not None:
+                reading = self._device_reading_provider(device_index)
             else:
-                device_free_mb = None
+                reading = None
             reclaim_unresolved = (
                 reclaim_unresolved_by_device.get(device_index, False)
                 if reclaim_unresolved_by_device is not None
@@ -5607,9 +5613,12 @@ class InferenceScheduler:
                 device_index if self._multi_gpu_routing_active else None,
                 active_sampling_peaks_total_mb=active_sampling_peaks_total_mb,
                 governor_state=governor_state,
-                device_free_mb=device_free_mb,
+                device_reading=reading,
                 reclaim_unresolved=reclaim_unresolved,
-                device_free_unavailable=self._device_free_reading_unavailable(device_index, device_free_mb),
+                device_free_unavailable=self._device_free_reading_unavailable(
+                    device_index,
+                    None if reading is None else reading.free_mb,
+                ),
             )
         return MeasuredVramSnapshot(devices=devices)
 
@@ -6119,6 +6128,7 @@ class InferenceScheduler:
             staged_waiters=tuple(waiters),
             active_grants=tuple(samplers),
             device_free_mb=self._measured_device_free_mb(device_index),
+            device_free_is_device_wide=self._device_wide_free_mb(device_index) is not None,
             vram_reserve_mb=self._vram_budget.reserve_mb,
             paging_active=self._retention.wddm_paging_active,
             incoming_load_seconds=self._process_map.recent_vram_load_seconds(device_index),
@@ -10886,9 +10896,26 @@ class InferenceScheduler:
         its per-card admission state. With no provider wired or no reading yet the answer is None, so the
         measured admission path is unavailable and the caller keeps the static verdict.
         """
-        if self._device_free_mb_provider is None:
+        reading = self._device_reading(device_index)
+        return None if reading is None else reading.free_mb
+
+    def _device_reading(self, device_index: int | None) -> DeviceMemoryReading | None:
+        """Return the parent's memory reading for this card, or None when unread. None resolves to card 0."""
+        if self._device_reading_provider is None:
             return None
-        return self._device_free_mb_provider(0 if device_index is None else device_index)
+        return self._device_reading_provider(0 if device_index is None else device_index)
+
+    def _device_wide_free_mb(self, device_index: int | None) -> float | None:
+        """Return the card's free VRAM (MB) only where the reading covers every tenant of the card.
+
+        A decision that spends measured room on the strength of the reading alone needs a figure another
+        process cannot be hiding inside. A process-local or host-memory figure is not that, so it answers
+        None here and the caller keeps its static verdict.
+        """
+        reading = self._device_reading(device_index)
+        if reading is None or not reading.is_device_wide:
+            return None
+        return reading.free_mb
 
     def measured_device_free_mb(self, device_index: int | None = None) -> float | None:
         """The parent's measured device-free VRAM (MB) for a card, for the stage dispatchers to pass on.
@@ -10934,7 +10961,7 @@ class InferenceScheduler:
 
         The path is unavailable (returns False, so the static fence stands) whenever the driver is
         demand-paging (its free figure is then untrustworthy, the exact regime the static gate guards), the
-        sampling peak is unpriceable, or no measured reading exists. ``pending_pp_reserve_mb`` is zero for an
+        sampling peak is unpriceable, or no device-wide reading exists. ``pending_pp_reserve_mb`` is zero for an
         active chain (whose allocations the measured free already reflects) and the predicted reserve for a
         pending chain (which has not allocated yet, so its cost must still be charged).
         """
@@ -10942,7 +10969,7 @@ class InferenceScheduler:
             return False
         if sampling_peak_mb is None:
             return False
-        device_free_mb = self._measured_device_free_mb(device_index)
+        device_free_mb = self._device_wide_free_mb(device_index)
         if device_free_mb is None:
             return False
         headroom_mb = device_free_mb - self._vram_budget.reserve_mb - sampling_peak_mb - pending_pp_reserve_mb

@@ -24,7 +24,7 @@ from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
-from tests.process_management.conftest import make_job_pop_response, make_testable_process_manager
+from tests.process_management.conftest import device_wide_reading, make_job_pop_response, make_testable_process_manager
 
 _LARGE_CARD_TOTAL_MB = 24000.0
 """A card whose achievable ceiling seats the post-processing peak, so the arbiter can only FITS or DEFER."""
@@ -63,10 +63,10 @@ def _tiny_card() -> DeviceVramState:
 def _install_cycle(manager: HordeWorkerProcessManager, devices: dict[int, DeviceVramState]) -> None:
     """Freeze ``devices`` into the manager's real arbiter and mirror their readings as the driven cards."""
     manager._vram_arbiter.begin_cycle(MeasuredVramSnapshot(devices=devices))
-    manager._last_device_free_mb_by_device.clear()
+    manager._last_device_reading_by_device.clear()
     for device_index, state in devices.items():
         assert state.device_free_mb is not None
-        manager._last_device_free_mb_by_device[device_index] = state.device_free_mb
+        manager._last_device_reading_by_device[device_index] = device_wide_reading(state.device_free_mb)
 
 
 @contextmanager

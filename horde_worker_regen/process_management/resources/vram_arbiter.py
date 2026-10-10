@@ -99,6 +99,7 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     evaluate_admission,
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.device_memory_source import ReadingProvenance
 
 _FIRST_PARTY_TEARDOWN_GRACE_SECONDS = 10.0
 """Age (seconds) a head must be the undispatched head of an idle device before its own idle sibling contexts
@@ -592,6 +593,9 @@ class DeviceVramState:
     admission input: a request FITS iff its candidate fits ``device_free_mb - outstanding_reservations -
     noise``. None yields a throttled-diagnostic DEFER, never a denial or a fabricated figure, until
     ``device_free_unavailable`` says no reading is coming."""
+    device_free_provenance: ReadingProvenance | None = None
+    """How far ``device_free_mb`` describes the card, or None with no reading. Carried so a verdict's reader
+    can tell a device-wide figure from a process-local or host-memory one."""
     device_free_unavailable: bool = False
     """True once this card has gone the snapshot builder's reading bound with no device-free reading.
     Admission then takes the predictive path, as it does with no cycle snapshot, because a reading that has

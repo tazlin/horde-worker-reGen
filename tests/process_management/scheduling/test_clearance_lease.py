@@ -235,11 +235,13 @@ def _inputs(
     reserve_mb: float = 2048.0,
     paging: bool = False,
     load_seconds: float | None = _LOAD_SECONDS,
+    device_wide: bool = True,
 ) -> ClearanceInputs:
     return ClearanceInputs(
         staged_waiters=staged,
         active_grants=active,
         device_free_mb=device_free_mb,
+        device_free_is_device_wide=device_wide,
         vram_reserve_mb=reserve_mb,
         paging_active=paging,
         incoming_load_seconds=load_seconds,
@@ -359,6 +361,18 @@ class TestDecideClearances:
         assert plan.tail_denial is not None
         assert plan.tail_denial.reason is TailOverlapDenialReason.HEADROOM_SHORT
         assert plan.tail_denial.headroom_shortfall_mb == 120.0
+
+    def test_tail_overlap_held_on_a_reading_that_is_not_device_wide(self) -> None:
+        """Ample free from a process-local or host-memory reading grants no handoff, as a short one does not."""
+        staged = (ClearanceWaiter(process_id=2, priority=1),)
+        plan = _decide(
+            _inputs(staged=staged, active=(_tailing(),), device_free_mb=20000.0, device_wide=False),
+            slot_cap=1,
+            tail=True,
+        )
+        assert plan.clear_process_ids == ()
+        assert plan.tail_denial is not None
+        assert plan.tail_denial.reason is TailOverlapDenialReason.HEADROOM_SHORT
 
     def test_tail_overlap_denied_when_no_waiter_is_staged(self) -> None:
         """With nobody staged there is no handoff to make; the denial names the missing waiter."""

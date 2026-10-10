@@ -68,6 +68,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.head_admission imp
     format_staging_defer_tally,
 )
 from tests.process_management.conftest import (
+    device_wide_reading_provider,
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_model_reference_record,
@@ -157,7 +158,7 @@ def _make_inference_scheduler(
     # arbiter actuations without it.
     scheduler.set_reclaim_ladder(VerifiedReclaimLadder())
     if device_free_mb is not None:
-        scheduler.set_device_free_mb_provider(lambda _device_index: device_free_mb)
+        scheduler.set_device_reading_provider(device_wide_reading_provider(lambda _device_index: device_free_mb))
     if available_ram_mb is not None:
         scheduler.set_available_ram_mb_provider(lambda: available_ram_mb)
         scheduler.set_available_commit_mb_provider(lambda: available_commit_mb)
@@ -1534,7 +1535,7 @@ class TestHeadOfQueueMakeRoom:
         sched._measured_free_vram_mb = Mock(return_value=1000.0)  # type: ignore[method-assign]
         # The truthful device-free reading models the same pressure the predictive gate reports, so admission
         # genuinely does not fit and the head's blocker escalates to the idle-resident eviction.
-        sched.set_device_free_mb_provider(lambda _device_index: 1000.0)
+        sched.set_device_reading_provider(device_wide_reading_provider(lambda _device_index: 1000.0))
         sched._vram_budget = Mock()
         sched._vram_budget.check_job.return_value = Mock(
             fits=False,
@@ -2166,7 +2167,7 @@ class TestPrivateArbiterCycleFreshness:
         process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         process_info.total_vram_mb = 16384
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: process_info}))
-        scheduler.set_device_free_mb_provider(lambda _device_index: free_mb[0])
+        scheduler.set_device_reading_provider(device_wide_reading_provider(lambda _device_index: free_mb[0]))
         return scheduler
 
     def test_private_arbiter_reprices_against_the_current_reading(self) -> None:
