@@ -141,6 +141,11 @@ The failures encoded here:
   therefore priced against a reading with the chain's room still in it, its load and the chain's upscale then
   shared a card that could hold either alone, and the card overcommitted. That is the ``post-processing
   chain`` scenario, and its reinjection books the chain as the flat entry alone.
+- **A band's batched peaks price its single images.** The learned sampling price was one window per baseline
+  and resolution band, priced at its second-highest job, so batched traffic in the band priced every
+  single-image job at a batched decode peak. Two single-image SDXL jobs a 24 GB card holds at once were never
+  admitted together and the lanes took turns. That is the ``job class`` scenario, and its reinjection prices
+  from the pooled window alone.
 
 The last scenario is not one failure but all of them at once: the ``bundle-shaped fleet`` row runs the
 multi-card rules together over the workload shape they were diagnosed from, eight cards of two lanes serving
@@ -205,6 +210,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     _MIN_OBSERVATIONS_FOR_MEASURED,
     FootprintKey,
     FootprintStage,
+    LearnedFootprintStore,
     plausible_activation_ceiling_mb,
     sampling_footprint_key,
 )
@@ -290,6 +296,7 @@ from tests.process_management.liveness._world_assertions import (
     duty_fraction,
     handoff_gaps_by_card,
     staging_overlap_share,
+    two_sampler_share,
 )
 
 pytestmark = pytest.mark.closed_loop
@@ -3555,6 +3562,94 @@ async def test_s_card_sized_child_peaks_do_not_price_the_next_job_at_the_card() 
     assert _sampled_count(polluted, polluted_jobs) == _sampled_count(truthful, truthful_jobs), (
         f"{context}: the polluted run sampled {_sampled_count(polluted, polluted_jobs)} jobs against the "
         f"truthful run's {_sampled_count(truthful, truthful_jobs)}. {polluted.state_dump()}"
+    )
+
+
+_JOB_CLASS_BATCHES = (4, 1, 1) * 8
+"""Batch sizes of the row's SDXL jobs in arrival order: one batched job to every two single images."""
+
+_JOB_CLASS_TICKS = 420
+"""Ticks the row runs: enough for every job to sample and for each class's window to pass its minimum."""
+
+_JOB_CLASS_TWO_SAMPLER_FLOOR = 0.05
+"""Share of sampling ticks on which two lanes must sample at once. Class pricing reaches about 0.12 on this
+workload and pooled pricing none, so the floor separates the two with room for scheduling noise."""
+
+
+async def _drive_job_class_mix() -> _DispatchWorld:
+    """Run two SDXL checkpoints on a 24 GB card over the batched and single-image mix, learning as they report."""
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        whole_card_enabled=False,
+        tick_seconds=1.0,
+        closed_loop=True,
+        clearance_lease=True,
+        tail_overlap=True,
+        learned_footprints=True,
+    )
+    # Both models have run here before, so the measured price has authority from the first job.
+    world.job_tracker._models_with_results.update({_SDXL.name, _SDXL_OTHER.name})
+    jobs: list[ImageGenerateJobPopResponse] = []
+    for _ in range(_JOB_CLASS_TICKS):
+        while len(world.job_tracker.jobs_pending_inference) < 2 and len(jobs) < len(_JOB_CLASS_BATCHES):
+            model = (_SDXL, _SDXL_OTHER)[len(jobs) % 2]
+            job = make_job_pop_response(
+                model.name, width=1024, height=1024, ddim_steps=30, n_iter=_JOB_CLASS_BATCHES[len(jobs)]
+            )
+            await world.pop(job)
+            jobs.append(job)
+        await world.step()
+    assert _sampled_count(world, jobs) == len(_JOB_CLASS_BATCHES), (
+        f"job class: {_sampled_count(world, jobs)} of {len(_JOB_CLASS_BATCHES)} jobs sampled. {world.state_dump()}"
+    )
+    return world
+
+
+async def test_s_single_images_are_priced_apart_from_their_bands_batched_jobs() -> None:
+    """Two single-image SDXL jobs the card holds at once sample together beside batched traffic in their band.
+
+    The failure this encodes: the learned sampling price was one window per baseline and resolution band, priced
+    at its second-highest job. Batched jobs peak gigabytes above a single image when they decode, so once two
+    were in the window every single-image job in the band was priced at a batched peak. On a 24 GB card that
+    priced a batch-1 SDXL job near 13 GB against the 7 GB it used. The overlap gate never had confirmed room and
+    clearance never seated a second job beside a running one, so two lanes took turns on a card that held both.
+
+    Read as one statement: a job is priced from what jobs of its own class have used. Its consequence here is
+    that the lanes sample two jobs at once on a meaningful share of the run, with no lane reaching its
+    lease-acquire timeout.
+    """
+    world = await _drive_job_class_mix()
+
+    context = "job class"
+    share = two_sampler_share(world)
+    assert share >= _JOB_CLASS_TWO_SAMPLER_FLOOR, (
+        f"{context}: two lanes sampled together on {share:.3f} of sampling ticks, under the "
+        f"{_JOB_CLASS_TWO_SAMPLER_FLOOR} floor. {world.state_dump()}"
+    )
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout. "
+        f"{world.state_dump()}"
+    )
+
+
+async def test_s_defect_reinjection_pooled_pricing_keeps_the_lanes_taking_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect reinjection: priced from the pooled window alone, the same workload never samples two jobs at once."""
+    monkeypatch.setattr(
+        LearnedFootprintStore,
+        "measured_job_estimate_net_of_context_mb",
+        lambda self, key, _class_key: self.measured_estimate_net_of_context_mb(key),
+    )
+    world = await _drive_job_class_mix()
+
+    share = two_sampler_share(world)
+    assert share < _JOB_CLASS_TWO_SAMPLER_FLOOR, (
+        f"pooled pricing: two lanes sampled together on {share:.3f} of sampling ticks, so this row no longer "
+        f"distinguishes class pricing from the defect. {world.state_dump()}"
     )
 
 

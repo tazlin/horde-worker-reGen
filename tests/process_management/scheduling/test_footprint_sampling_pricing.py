@@ -648,3 +648,99 @@ class TestMeasuredLoweringPricing:
             scheduler._measured_admission_candidate_delta_mb(job, baseline, process_id=None, disaggregated=False)
             == 18000.0
         )
+
+
+class TestJobClassPricing:
+    """A job is priced from the measured window of its own class, its batch size and hires-fix pass.
+
+    The failure this encodes: one SAMPLE window per resolution band held every class's peaks. Once batched
+    jobs were in the window its second-highest job was a batched decode peak, and every single-image job in the
+    band was priced at it. On a 24 GB card that priced a batch-1 SDXL job at about 13 GB against the 7 GB it
+    used, so a second SDXL job never cleared beside a running one.
+    """
+
+    _BATCHED_PEAK_MB = 12500.0
+    _SINGLE_PEAK_MB = 7500.0
+    _WEIGHT_MB = 6600.0
+
+    @classmethod
+    def _manager(cls, monkeypatch: pytest.MonkeyPatch) -> HordeWorkerProcessManager:
+        for module in (_sched_mod, pricing):
+            monkeypatch.setattr(module, "predict_job_sampling_vram_mb", lambda _job, _baseline: 17000.0)
+            monkeypatch.setattr(module, "predict_job_weight_mb", lambda _job, _baseline: cls._WEIGHT_MB)
+        pm = _make_manager()
+        pm._job_tracker._models_with_results.add(_MODEL)
+        return pm
+
+    @staticmethod
+    def _observe(pm: HordeWorkerProcessManager, peak_mb: float, *, batch: int, hires_fix: bool, count: int) -> None:
+        key = _sample_key(ResolutionBucket.LE_1024)
+        for _ in range(count):
+            pm._learned_footprint_store.observe_job_peak(
+                key, key.for_job_class(batch=batch, hires_fix=hires_fix), peak_mb
+            )
+
+    @staticmethod
+    def _measured_price_mb(pm: HordeWorkerProcessManager, peak_mb: float) -> float:
+        return (
+            peak_mb * _MEASURED_ESTIMATE_MARGIN
+            + platform_context_constant_mb(platform=sys.platform)
+            - pm._inference_scheduler.resolved_context_constant_mb()
+        )
+
+    @staticmethod
+    def _both_prices(pm: HordeWorkerProcessManager, job: object) -> tuple[float, float]:
+        scheduler = pm._inference_scheduler
+        baseline = scheduler._model_metadata.get_baseline(_MODEL)
+        scheduler_price = scheduler._learned_sampling_peak_mb(
+            job, baseline, static_seed_mb=17000.0, stage=FootprintStage.SAMPLE
+        )
+        pricing_price = pricing.learned_sampling_peak_mb(
+            scheduler.snapshot(),
+            job,
+            str(baseline),
+            static_seed_mb=17000.0,
+            stage=FootprintStage.SAMPLE,
+        )
+        return scheduler_price, pricing_price
+
+    def test_a_single_image_job_is_priced_from_its_class_beside_batched_traffic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Batch-4 and batch-1 jobs in one band each price at their own class's measured peak."""
+        pm = self._manager(monkeypatch)
+        self._observe(pm, self._BATCHED_PEAK_MB, batch=4, hires_fix=False, count=5)
+        self._observe(pm, self._SINGLE_PEAK_MB, batch=1, hires_fix=False, count=5)
+
+        single = make_job_pop_response(model=_MODEL, width=1024, height=1024, n_iter=1)
+        batched = make_job_pop_response(model=_MODEL, width=1024, height=1024, n_iter=4)
+
+        for price in self._both_prices(pm, single):
+            assert price == pytest.approx(self._measured_price_mb(pm, self._SINGLE_PEAK_MB))
+        for price in self._both_prices(pm, batched):
+            assert price == pytest.approx(self._measured_price_mb(pm, self._BATCHED_PEAK_MB))
+
+    def test_a_hires_job_is_its_own_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hires-fix pass at the same batch and band is kept apart from a plain job."""
+        pm = self._manager(monkeypatch)
+        self._observe(pm, self._BATCHED_PEAK_MB, batch=1, hires_fix=True, count=5)
+        self._observe(pm, self._SINGLE_PEAK_MB, batch=1, hires_fix=False, count=5)
+
+        plain = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+        hires = plain.model_copy(update={"payload": plain.payload.model_copy(update={"hires_fix": True})})
+
+        for price in self._both_prices(pm, plain):
+            assert price == pytest.approx(self._measured_price_mb(pm, self._SINGLE_PEAK_MB))
+        for price in self._both_prices(pm, hires):
+            assert price == pytest.approx(self._measured_price_mb(pm, self._BATCHED_PEAK_MB))
+
+    def test_a_lightly_observed_class_keeps_the_pooled_price(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A class with fewer jobs than the measured minimum is priced from the band's pooled window."""
+        pm = self._manager(monkeypatch)
+        self._observe(pm, self._SINGLE_PEAK_MB, batch=1, hires_fix=False, count=5)
+        self._observe(pm, self._BATCHED_PEAK_MB, batch=4, hires_fix=False, count=2)
+
+        batched = make_job_pop_response(model=_MODEL, width=1024, height=1024, n_iter=4)
+
+        for price in self._both_prices(pm, batched):
+            assert price == pytest.approx(self._measured_price_mb(pm, self._BATCHED_PEAK_MB))

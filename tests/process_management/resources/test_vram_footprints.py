@@ -14,6 +14,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     _MIN_OBSERVATIONS_FOR_MEASURED,
     _PER_READING_SAMPLE_SCHEMA_VERSION,
     _PERSIST_EVERY_N_OBSERVATIONS,
+    _POOLED_ONLY_SCHEMA_VERSION,
     _RECENT_WINDOW_SIZE,
     FOOTPRINT_STORE_SCHEMA_VERSION,
     SAFETY_PROCESS_BASELINE,
@@ -586,6 +587,58 @@ class TestPersistence:
         reloaded = LearnedFootprintStore(path=path).get_observation(_key())
         assert reloaded is not None
         assert reloaded.recent_mb == pytest.approx([11000.0, 12000.0])
+
+    def test_a_pooled_only_file_loads_unchanged(self, tmp_path: Path) -> None:
+        """A file from before job-class keys keeps its pooled windows, which price every class until it has its own."""
+        path = tmp_path / "vram_footprints.json"
+        pooled = _key()
+        readings = [9000.0, 12500.0, 9100.0, 12400.0, 9200.0]
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": _POOLED_ONLY_SCHEMA_VERSION,
+                    "observations": [
+                        {
+                            "key": pooled.model_dump(mode="json"),
+                            "observation": {
+                                "ewma_mb": 10000.0,
+                                "watermark_mb": 12500.0,
+                                "observation_count": len(readings),
+                                "recent_mb": readings,
+                            },
+                        },
+                    ],
+                },
+            ),
+            encoding="utf-8",
+        )
+
+        store = LearnedFootprintStore(path=path)
+
+        loaded = store.get_observation(pooled)
+        assert loaded is not None
+        assert loaded.recent_mb == pytest.approx(readings)
+        single = pooled.for_job_class(batch=1, hires_fix=False)
+        assert store.measured_job_estimate_net_of_context_mb(pooled, single) == pytest.approx(
+            store.measured_estimate_net_of_context_mb(pooled),
+        )
+
+    def test_job_class_keys_are_read_back_apart_from_their_pooled_key(self, tmp_path: Path) -> None:
+        """A saved class key reloads as its own key, never folded into the pooled key it narrows."""
+        path = tmp_path / "vram_footprints.json"
+        store = LearnedFootprintStore(path=path)
+        pooled = _key()
+        batched = pooled.for_job_class(batch=4, hires_fix=False)
+        store.observe_job_peak(pooled, batched, 12500.0)
+        store.observe_peak(pooled, 7500.0)
+        store.save()
+
+        reloaded = LearnedFootprintStore(path=path)
+        pooled_observation = reloaded.get_observation(pooled)
+        batched_observation = reloaded.get_observation(batched)
+        assert pooled_observation is not None and batched_observation is not None
+        assert pooled_observation.recent_mb == pytest.approx([12500.0, 7500.0])
+        assert batched_observation.recent_mb == pytest.approx([12500.0])
 
     def test_a_pathless_store_never_writes(self, tmp_path: Path) -> None:
         """The in-memory construction (tests, and any consumer that wants no file) writes nothing."""

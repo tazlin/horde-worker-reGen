@@ -106,10 +106,10 @@ class TestLearnedSamplingFootprints:
 
         output = render_learned_sampling_footprints(path, learned_sampling_footprints(path))
 
-        assert "stable_diffusion_xl le_1024 sample: watermark 15000MB, measured " in output
+        assert "stable_diffusion_xl le_1024 sample [all]: watermark 15000MB, measured " in output
         assert "activation watermark 6000MB" in output
         assert "over 2 checkpoints" in output
-        assert "flux_1 le_1024 sample: watermark 17000MB, measured n/a (1 in window)" in output
+        assert "flux_1 le_1024 sample [all]: watermark 17000MB, measured n/a (1 in window)" in output
 
     def test_missing_store_yields_no_rows(self, tmp_path: Path) -> None:
         """A path with no store lists nothing."""

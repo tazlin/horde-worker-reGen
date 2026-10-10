@@ -72,6 +72,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    job_class_key,
     plausible_sampling_peak_mb,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW, WorkloadKind
@@ -147,6 +148,8 @@ class _JobSamplingPeak:
 
     key: FootprintKey
     """The SAMPLE key the job's readings belong to."""
+    class_key: FootprintKey
+    """``key`` narrowed to the job's class (:func:`job_class_key`), recorded beside it at commit."""
     peak_mb: float
     """The highest plausible reading seen for the job so far (MB)."""
     plausible_max_mb: float | None
@@ -1213,6 +1216,7 @@ class MessageDispatcher:
         if running is None:
             self._job_sampling_peaks[job.id_] = _JobSamplingPeak(
                 key=key,
+                class_key=job_class_key(key, job),
                 peak_mb=float(peak_mb),
                 plausible_max_mb=plausible_max_mb,
             )
@@ -1229,12 +1233,18 @@ class MessageDispatcher:
         running = self._job_sampling_peaks.pop(job_id, None)
         if running is None or self._footprint_store is None:
             return
-        self._footprint_store.observe_peak(running.key, running.peak_mb, plausible_max_mb=running.plausible_max_mb)
+        self._footprint_store.observe_job_peak(
+            running.key,
+            running.class_key,
+            running.peak_mb,
+            plausible_max_mb=running.plausible_max_mb,
+        )
         if running.peak_resident_weights_mb is None:
             return
-        activation_key = running.key.model_copy(update={"stage": FootprintStage.SAMPLE_ACTIVATION})
-        self._footprint_store.observe_peak(
-            activation_key,
+        activation = {"stage": FootprintStage.SAMPLE_ACTIVATION}
+        self._footprint_store.observe_job_peak(
+            running.key.model_copy(update=activation),
+            running.class_key.model_copy(update=activation),
             running.peak_mb - running.peak_resident_weights_mb,
             plausible_max_mb=running.plausible_max_mb,
         )

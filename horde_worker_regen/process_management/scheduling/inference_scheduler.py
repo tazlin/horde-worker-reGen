@@ -137,6 +137,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    job_class_key,
     plausible_sampling_peak_mb,
     sampling_footprint_key,
 )
@@ -5026,15 +5027,16 @@ class InferenceScheduler:
 
         Authority is the key's own: once its baseline-and-resolution population is sufficiently observed it
         prices every model in the band, so a model's first job after a start is not held to an all-time
-        watermark. A light sibling's measurements cannot underprice a heavy checkpoint's weights, because the
-        caller floors the price at the job's own core weights. The platform context constant is netted out
-        because the store keeps whole-device charges while sampling prices are job-level (contexts are charged
-        separately).
+        watermark. The job's class (batch size, hires fix) prices from its own window once that is observed,
+        else from the band's pooled one. A light sibling's measurements cannot underprice a heavy checkpoint's
+        weights, because the caller floors the price at the job's own core weights. The platform context constant
+        is netted out because the store keeps whole-device charges while sampling prices are job-level (contexts
+        are charged separately).
         """
         store = self._footprint_store
         if store is None or job.model is None:
             return None
-        return store.measured_estimate_net_of_context_mb(key)
+        return store.measured_job_estimate_net_of_context_mb(key, job_class_key(key, job))
 
     def observe_disaggregated_sampling_peak(self, job_info: HordeJobInfo, peak_reserved_mb: float) -> None:
         """Fold a disaggregated sampler's measured peak into the store under this job's SAMPLE_ISOLATED key.
@@ -5064,8 +5066,9 @@ class InferenceScheduler:
         )
         if key is None:
             return
-        store.observe_peak(
+        store.observe_job_peak(
             key,
+            job_class_key(key, job),
             peak_reserved_mb,
             plausible_max_mb=plausible_sampling_peak_mb(
                 key,

@@ -144,7 +144,11 @@ def _confirm_model_loaded(dispatcher: MessageDispatcher, process_id: int, *, mod
 
 
 async def test_running_inference_peak_is_recorded_with_the_right_key() -> None:
-    """A monolithic inference slot's peak, with a running job and known baseline, lands under its key."""
+    """A monolithic inference slot's peak, with a running job and known baseline, lands under its key.
+
+    It lands under the pooled key and under that key narrowed to the job's class, one batch-1 image without a
+    hires-fix pass.
+    """
     process_info = make_mock_process_info(1, model_name=_MODEL)
     job = make_job_pop_response(model=_MODEL, width=512, height=512)
     process_info.record_inference_ownership(job, attempt_ordinal=1)
@@ -168,7 +172,10 @@ async def test_running_inference_peak_is_recorded_with_the_right_key() -> None:
     observation = store.get_observation(expected_key)
     assert observation is not None
     assert observation.watermark_mb == 11000.0
-    assert len(store) == 1
+    class_observation = store.get_observation(expected_key.for_job_class(batch=1, hires_fix=False))
+    assert class_observation is not None
+    assert class_observation.watermark_mb == 11000.0
+    assert len(store) == 2
 
 
 async def test_a_primed_lanes_peak_is_not_attributed_until_its_first_step() -> None:
@@ -650,7 +657,8 @@ async def test_a_sampling_peak_at_the_card_size_is_not_attributed() -> None:
     dispatcher._handle_memory_report(plausible)
     assert job.id_ is not None
     dispatcher._commit_job_sampling_peak(job.id_)
-    assert len(store) == 1
+    assert len(store) == 2
+    assert {observation.watermark_mb for observation in store._observations.values()} == {10654.0}
 
 
 def _job_metrics_message(job_id: str, *, peak_resident_weights_mb: float | None) -> HordeJobMetricsMessage:
@@ -724,4 +732,5 @@ async def test_a_job_without_a_measured_footprint_records_no_activation() -> Non
     dispatcher._commit_job_sampling_peak(job.id_)
 
     assert store.get_observation(_activation_key()) is None
-    assert len(store) == 1
+    assert store.get_observation(_activation_key().for_job_class(batch=1, hires_fix=False)) is None
+    assert len(store) == 2

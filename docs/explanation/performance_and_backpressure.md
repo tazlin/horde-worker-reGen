@@ -1292,7 +1292,7 @@ overhead probing is a hordelib-side follow-up.)
 > Static hordelib estimates remain the floor. The worker raises a checkpoint's resident footprint only from
 > an allocator report attributable to one idle resident model after its settle window; it never folds a
 > device-wide view into a per-model price. Sampling peaks are keyed separately by baseline, resolution band,
-> platform, and execution stage. The marginal additional-context cost remains platform-split and comes only
+> platform, and execution stage, and measured per job class (batch size, hires fix) within the band. The marginal additional-context cost remains platform-split and comes only
 > from its dedicated probe/clean-floor evidence, not by decomposing per-child device views.
 
 While a residency is held, the original forecast remains immutable for diagnostics and its admission

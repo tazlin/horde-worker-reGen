@@ -182,13 +182,18 @@ class MeasuredJobFootprint(Protocol):
         """``whole_job`` for a monolithic run, ``sample_stage`` for a disaggregated sampler stage."""
 
 
-FOOTPRINT_STORE_SCHEMA_VERSION = 3
+FOOTPRINT_STORE_SCHEMA_VERSION = 4
 """Bumped when the file format changes, or when observations written by an older build can no longer be trusted.
-A file with another version is discarded on read, except :data:`_PER_READING_SAMPLE_SCHEMA_VERSION`. Version 2
-drops files written before observations were bounds-checked (see :meth:`LearnedFootprintStore.observe_peak`):
-those can hold activation watermarks at the size of the card and resident figures smaller than the checkpoint's
-weights, and since watermarks only ever rise, the store would price from them forever. Version 3 marks
-:attr:`FootprintStage.SAMPLE` windows that hold one figure per job."""
+A file with another version is discarded on read, except :data:`_PER_READING_SAMPLE_SCHEMA_VERSION` and
+:data:`_POOLED_ONLY_SCHEMA_VERSION`. Version 2 drops files written before observations were bounds-checked (see
+:meth:`LearnedFootprintStore.observe_peak`): those can hold activation watermarks at the size of the card and
+resident figures smaller than the checkpoint's weights, and since watermarks only ever rise, the store would price
+from them forever. Version 3 marks :attr:`FootprintStage.SAMPLE` windows that hold one figure per job. Version 4
+adds job-class keys (:meth:`FootprintKey.for_job_class`). A build that predates them discards the file, since it
+would read a class key as its pooled key."""
+
+_POOLED_ONLY_SCHEMA_VERSION = 3
+"""The last schema without job-class keys. Its pooled windows are still valid and load unchanged."""
 
 _PER_READING_SAMPLE_SCHEMA_VERSION = 2
 """The last schema whose :attr:`FootprintStage.SAMPLE` windows hold one entry per memory report.
@@ -210,6 +215,8 @@ class ResolutionBucket(enum.StrEnum):
     key space small. Batch size is deliberately NOT folded into the bucket: peaks are observed per
     request exactly as the hardware reported them, so a batched request's larger peak is recorded
     against the same key as a single image and naturally raises the learned watermark for that band.
+    The job-class key (:meth:`FootprintKey.for_job_class`) carries the batch beside the bucket, so the
+    measured price of a single image is not its band's batched peak.
     """
 
     LE_512 = "le_512"
@@ -336,6 +343,19 @@ class FootprintKey(BaseModel):
     """The specific checkpoint the footprint belongs to, or None when the stage is baseline-keyed.
 
     Defaulted so a key that predates the distinction (every activation stage) is written unchanged."""
+    batch: int | None = None
+    """The job's batch size on a job-class key (:meth:`for_job_class`), None on the pooled key.
+
+    A batched job decodes every image at once, so its peak is gigabytes above a single image's in the same band.
+    In the pooled window that peak prices every single-image job."""
+    hires_fix: bool | None = None
+    """Whether the job runs a hires-fix pass, on a job-class key, and None on the pooled key.
+
+    The second pass samples and decodes at the upscaled size, above the band's base resolution."""
+
+    def for_job_class(self, *, batch: int, hires_fix: bool) -> FootprintKey:
+        """Return this pooled key narrowed to one job class: its batch size and whether it runs hires fix."""
+        return self.model_copy(update={"batch": max(1, batch), "hires_fix": hires_fix})
 
 
 def sampling_footprint_key(
@@ -362,6 +382,11 @@ def sampling_footprint_key(
         platform=sys.platform,
         stage=stage,
     )
+
+
+def job_class_key(key: FootprintKey, job: ImageGenerateJobPopResponse) -> FootprintKey:
+    """Return the pooled per-job ``key`` narrowed to ``job``'s class: its batch size and hires-fix pass."""
+    return key.for_job_class(batch=job.payload.n_iter or 1, hires_fix=bool(job.payload.hires_fix))
 
 
 class _FootprintObservation(BaseModel):
@@ -536,6 +561,22 @@ class LearnedFootprintStore:
         if self._observations_since_save >= _PERSIST_EVERY_N_OBSERVATIONS:
             self.save()
 
+    def observe_job_peak(
+        self,
+        key: FootprintKey,
+        class_key: FootprintKey,
+        peak_reserved_mb: float,
+        *,
+        plausible_max_mb: float | None = None,
+    ) -> None:
+        """Fold one job's peak into its pooled per-job ``key`` and into ``class_key``, the key of its job class.
+
+        The pooled window stays the price of a class too lightly observed to have its own
+        (:meth:`measured_job_estimate_net_of_context_mb`).
+        """
+        self.observe_peak(key, peak_reserved_mb, plausible_max_mb=plausible_max_mb)
+        self.observe_peak(class_key, peak_reserved_mb, plausible_max_mb=plausible_max_mb)
+
     def observe_job_footprint(
         self,
         footprint: MeasuredJobFootprint,
@@ -703,6 +744,17 @@ class LearnedFootprintStore:
             return None
         return max(0.0, measured_mb - platform_context_constant_mb(platform=key.platform))
 
+    def measured_job_estimate_net_of_context_mb(self, key: FootprintKey, class_key: FootprintKey) -> float | None:
+        """Return the measured price net of context of the job class ``class_key``, else of its pooled ``key``.
+
+        The class's own window prices it once it has :data:`_MIN_OBSERVATIONS_FOR_MEASURED` jobs. Until then the
+        pooled window prices it, as it prices every class in the band.
+        """
+        class_mb = self.measured_estimate_net_of_context_mb(class_key)
+        if class_mb is not None:
+            return class_mb
+        return self.measured_estimate_net_of_context_mb(key)
+
     def get_observation(self, key: FootprintKey) -> _FootprintObservation | None:
         """Return the raw running statistics for ``key`` (EWMA, watermark, count), or None if cold.
 
@@ -751,7 +803,8 @@ class LearnedFootprintStore:
 
         A file the current build cannot parse is discarded rather than repaired: the store re-learns from
         live traffic within a handful of jobs, so nothing is worth failing a worker start over. A file of
-        :data:`_PER_READING_SAMPLE_SCHEMA_VERSION` loads with its :attr:`FootprintStage.SAMPLE` windows emptied.
+        :data:`_PER_READING_SAMPLE_SCHEMA_VERSION` loads with its :attr:`FootprintStage.SAMPLE` windows emptied, and
+        one of :data:`_POOLED_ONLY_SCHEMA_VERSION` loads as written.
         """
         if self._path is None or not self._path.exists():
             return
@@ -764,7 +817,11 @@ class LearnedFootprintStore:
         if not isinstance(raw, dict):
             return
         schema_version = raw.get("schema_version")
-        if schema_version not in (FOOTPRINT_STORE_SCHEMA_VERSION, _PER_READING_SAMPLE_SCHEMA_VERSION):
+        if schema_version not in (
+            FOOTPRINT_STORE_SCHEMA_VERSION,
+            _POOLED_ONLY_SCHEMA_VERSION,
+            _PER_READING_SAMPLE_SCHEMA_VERSION,
+        ):
             return
         windows_hold_readings = schema_version == _PER_READING_SAMPLE_SCHEMA_VERSION
         entries = raw.get("observations")

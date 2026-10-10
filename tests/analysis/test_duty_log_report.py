@@ -371,7 +371,7 @@ class TestDutyReportCli:
         assert "This Session Model: 1 (defer 1)" in output
         assert "Earlier Session Model" not in output
         assert "== Learned footprints (" in output
-        assert "stable_diffusion_xl le_1024 sample: watermark 9000MB" in output
+        assert "stable_diffusion_xl le_1024 sample [all]: watermark 9000MB" in output
 
     def test_json_carries_the_clearance_digest(
         self,

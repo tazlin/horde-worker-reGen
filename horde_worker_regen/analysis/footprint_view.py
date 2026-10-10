@@ -53,6 +53,8 @@ class SamplingFootprintRow:
     baseline: str
     resolution_bucket: str | None
     stage: str
+    job_class: str
+    """``all`` for the pooled key, else ``b<batch>`` with `` hires`` appended for a hires-fix pass."""
     platform: str
     observation_count: int
     window_size: int
@@ -107,6 +109,7 @@ def learned_sampling_footprints(path: Path) -> list[SamplingFootprintRow]:
                 baseline=key.model_baseline,
                 resolution_bucket=None if key.resolution_bucket is None else key.resolution_bucket.value,
                 stage=key.stage.value,
+                job_class=_job_class_label(key),
                 platform=key.platform,
                 observation_count=observation.observation_count,
                 window_size=len(observation.recent_mb),
@@ -116,8 +119,14 @@ def learned_sampling_footprints(path: Path) -> list[SamplingFootprintRow]:
                 residents=_residents_for(store, keys, key),
             ),
         )
-    rows.sort(key=lambda row: (row.baseline, row.resolution_bucket or "", row.stage))
+    rows.sort(key=lambda row: (row.baseline, row.resolution_bucket or "", row.stage, row.job_class))
     return rows
+
+
+def _job_class_label(key: FootprintKey) -> str:
+    if key.batch is None:
+        return "all"
+    return f"b{key.batch}{' hires' if key.hires_fix else ''}"
 
 
 def render_learned_sampling_footprints(path: Path, rows: list[SamplingFootprintRow]) -> str:
@@ -137,7 +146,8 @@ def render_learned_sampling_footprints(path: Path, rows: list[SamplingFootprintR
         )
         activation = "n/a" if row.activation_watermark_mb is None else f"{row.activation_watermark_mb:.0f}MB"
         out.append(
-            f"   {row.baseline} {row.resolution_bucket or '-'} {row.stage}: watermark {row.watermark_mb:.0f}MB, "
+            f"   {row.baseline} {row.resolution_bucket or '-'} {row.stage} [{row.job_class}]: "
+            f"watermark {row.watermark_mb:.0f}MB, "
             f"{measured} ({row.observation_count} obs); activation watermark {activation}; "
             f"resident {_render_residents(row.residents)}"
         )

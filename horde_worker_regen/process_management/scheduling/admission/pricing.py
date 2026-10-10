@@ -34,6 +34,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import VramArb
 from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
+    job_class_key,
     sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot, SlotSnapshot
@@ -267,7 +268,7 @@ def learned_sampling_peak_mb(
     raised_mb = store.estimate_mb(key, static_seed_mb=static_seed_mb)
     measured_mb: float | None = None
     if job.model is not None:
-        net_mb = store.measured_estimate_net_of_context_mb(key)
+        net_mb = store.measured_job_estimate_net_of_context_mb(key, job_class_key(key, job))
         if net_mb is not None:
             measured_mb = net_mb + lora_feature_delta_mb(job, baseline)
     if measured_mb is None or measured_mb >= raised_mb:

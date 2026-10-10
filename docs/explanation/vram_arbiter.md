@@ -194,7 +194,13 @@ The arbiter keeps four concerns deliberately separate:
     observed enough, and never below the job's own core weights. That measured authority is key-wide: a
     model's first job after a start is priced from its baseline-and-resolution population rather than held
     to the all-time watermark, and the weight floor keeps a light sibling's readings from underpricing a
-    heavy checkpoint. The activation keys have no LoRA axis, so LoRA and plain jobs feed one population and
+    heavy checkpoint. Each job's figure is also recorded under its job-class key, the pooled key narrowed to
+    the job's batch size and whether it runs hires fix (`FootprintKey.for_job_class`). Batched and hires
+    jobs decode far more pixels than a single image, so a pooled window holding them prices every
+    single-image job at their peak. The measured price is the class's own once its window holds five jobs,
+    and the pooled window's until then (`measured_job_estimate_net_of_context_mb`). The raise-only watermark
+    stays pooled. The
+    activation keys have no LoRA axis, so LoRA and plain jobs feed one population and
     its measurement cannot see the LoRA patch transient of a job that faulted before reporting. A LoRA job
     priced from the measurement therefore carries the same LoRA feature delta the static seed charges
     (`pricing.lora_feature_delta_mb`, read from hordelib's feature impact table).
@@ -212,7 +218,9 @@ The arbiter keeps four concerns deliberately separate:
     file of the schema whose `SAMPLE` windows held one entry per memory report
     (`_PER_READING_SAMPLE_SCHEMA_VERSION`): it loads with those windows emptied and their watermark, EWMA and
     count kept, so the raise-only price survives and the measured price returns once five jobs refill the
-    window. Its readings are never read back as jobs.
+    window. Its readings are never read back as jobs. A file of the last schema without job-class keys
+    (`_POOLED_ONLY_SCHEMA_VERSION`) loads unchanged. A build that predates class keys discards a newer file,
+    since it would read a class key as its pooled key.
 
     Every feeder reads a per-process allocator counter, and a process can hold things its key does not
     describe, so each reading is bounds-checked before the store accepts it (the `plausible_min_mb` and
