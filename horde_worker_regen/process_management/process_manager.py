@@ -204,6 +204,7 @@ from horde_worker_regen.process_management.resources.device_free_governor import
     GovernorState,
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.resources.device_memory_source import child_reported_free_total_mb
 from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
 from horde_worker_regen.process_management.resources.foreign_vram_floor import ManagedVramTenant
 from horde_worker_regen.process_management.resources.model_serviceability import (
@@ -1651,6 +1652,8 @@ class HordeWorkerProcessManager:
         self._governor_states_by_device: dict[int, GovernorState] = {}
         self._last_device_free_mb_by_device: dict[int, float] = {}
         self._last_device_total_mb_by_device: dict[int, float] = {}
+        self._nvml_answered_devices: set[int] = set()
+        self._child_reported_memory_devices: set[int] = set()
 
         # The control types each image-utilities lane process can currently annotate, keyed by its process
         # id, learned from the lane's availability snapshots. The pre-annotation scan keys on the union of
@@ -3651,12 +3654,16 @@ class HordeWorkerProcessManager:
             )
 
     def _read_device_free_total_mb(self, device_index: int) -> tuple[float, float] | None:
-        """Return device ``index``'s ``(free_mb, total_mb)`` via NVML, torch-free, or None when unavailable.
+        """Return device ``index``'s ``(free_mb, total_mb)``, torch-free, or None when nothing has reported.
 
         Read from the parent (outside any CUDA workload) via NVML directly (never torch), so the figure is the
         device-wide truth and the orchestrator stays torch-free. On Windows/WDDM the device-level free figure
-        is the only signal that does not lie once the driver demotes an over-commit to system memory. None off
-        NVIDIA / when NVML is unavailable, so the governor simply governs no card on those hosts.
+        is the only signal that does not lie once the driver demotes an over-commit to system memory.
+
+        A card NVML has never answered for (a ROCm, XPU or MPS card, or an NVIDIA card whose NVML cannot
+        initialise) is read from its processes' reports instead, so admission, the governor and the
+        reclaim ladder have a reading on every backend. A card NVML has answered for keeps NVML as its only
+        source. A missed sample there returns None and the next sample fills the gap.
 
         When the device inventory was injected, the host's NVML reading describes different hardware. Use the
         child protocol's reported free/total pair instead; a simulation can therefore provide truthful device
@@ -3668,6 +3675,30 @@ class HordeWorkerProcessManager:
             if free_mb is None or total_mb is None:
                 return None
             return free_mb, total_mb
+        nvml_reading = self._read_nvml_free_total_mb(device_index)
+        if nvml_reading is not None:
+            self._nvml_answered_devices.add(device_index)
+            return nvml_reading
+        if device_index in self._nvml_answered_devices:
+            return None
+        reading = child_reported_free_total_mb(
+            reported_free_mb=self._process_map.get_free_vram_mb(device_index=device_index),
+            reported_total_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
+            committed_mb=self._process_map.committed_vram_mb(
+                context_constant_mb=self._inference_scheduler.resolved_context_constant_mb(),
+                device_index=device_index,
+            ),
+        )
+        if reading is not None and device_index not in self._child_reported_memory_devices:
+            self._child_reported_memory_devices.add(device_index)
+            logger.warning(
+                f"Device {device_index} has no device-level memory reading (NVML did not answer for it). VRAM "
+                "admission and the device-free governor are reading the figures its inference processes report.",
+            )
+        return reading
+
+    def _read_nvml_free_total_mb(self, device_index: int) -> tuple[float, float] | None:
+        """Return device ``index``'s ``(free_mb, total_mb)`` via NVML, or None when NVML does not answer."""
         try:
             from hordelib.utils.nvml import get_device_memory_mb
         except Exception as e:  # noqa: BLE001 - "no NVML" is an expected environment, not a crash

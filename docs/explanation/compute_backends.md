@@ -45,6 +45,25 @@ portable cross-backend torch equivalent, so this stays **NVIDIA-only and strictl
 NVML is absent the sampler collects nothing and reports `None`, and VRAM totals still come from the
 backend-agnostic path. A missing `nvidia-smi`/NVML never breaks startup.
 
+## Device memory readings without NVML
+
+VRAM admission, the device-free governor and the reclaim ladder all price against a per-card reading of
+free and total memory. On an NVIDIA card the parent takes it from NVML, which is device-wide. A ROCm, XPU or
+MPS card, and an NVIDIA card whose NVML cannot initialise, never answer that read. For a card NVML has never
+answered for, the parent reads the figures its inference processes report through the backend-agnostic
+accelerator calls
+([`child_reported_free_total_mb`][horde_worker_regen.process_management.resources.device_memory_source.child_reported_free_total_mb]).
+Off Windows a process reads the whole device, so the reported figure stands. On Windows each process reads
+a process-local view of the card, so the figure is capped at the card's total less what the worker's
+processes have committed. The worker logs one WARNING per card when it starts reading this way.
+
+A card NVML has answered for keeps NVML as its only source. A missed NVML sample there leaves the card
+without a reading until the next one.
+
+The reported figure has limits. On a Windows card it does not see memory another program holds. The
+device-used reading behind the attribution drift check is still NVML-only. A card with no reporting process
+has no reading.
+
 ## What still limits non-NVIDIA backends
 
 The remaining constraints are **packaging, not worker code** (see the README's "Why fewer GPU types

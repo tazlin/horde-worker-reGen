@@ -979,3 +979,55 @@ class TestInjectedInventorySuppressesHostDeviceReads:
         pm._process_map[0] = process  # type: ignore[index]
 
         assert pm._read_device_free_total_mb(0) == (14984.0, 16384.0)
+
+
+class TestDeviceFreeReadWithoutNvml:
+    """A card NVML never answers for is read from its processes' reports. A card NVML serves reads NVML only."""
+
+    @staticmethod
+    def _manager_with_one_reporting_process() -> HordeWorkerProcessManager:
+        pm = make_testable_process_manager()
+        pm._device_inventory_is_injected = False
+        pm._inference_scheduler.resolved_context_constant_mb = Mock(return_value=0.0)  # type: ignore[attr-defined]
+        process = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
+        process.device_index = 0
+        process.total_vram_mb = 16384
+        process.vram_usage_mb = 1400
+        process.process_reserved_mb = None
+        pm._process_map.clear()
+        pm._process_map[0] = process  # type: ignore[index]
+        return pm
+
+    def test_a_card_nvml_never_answers_for_reads_its_processes_reports(self) -> None:
+        """With no NVML reading ever, the reader answers from the reports and the governor has a figure."""
+        pm = self._manager_with_one_reporting_process()
+        pm._read_nvml_free_total_mb = Mock(return_value=None)  # type: ignore[method-assign]
+
+        assert pm._read_device_free_total_mb(0) == (14984.0, 16384.0)
+
+        pm._evaluate_device_free_governor()
+
+        assert pm._last_device_free_mb_by_device[0] == 14984.0
+
+    def test_a_card_with_no_report_yet_has_no_reading(self) -> None:
+        """Before any process reports, the reader has nothing to answer with and says so."""
+        pm = self._manager_with_one_reporting_process()
+        pm._process_map.clear()
+        pm._read_nvml_free_total_mb = Mock(return_value=None)  # type: ignore[method-assign]
+
+        assert pm._read_device_free_total_mb(0) is None
+
+    def test_a_card_nvml_answers_for_reads_nvml(self) -> None:
+        """NVML's device-wide figure is the reading wherever it answers."""
+        pm = self._manager_with_one_reporting_process()
+        pm._read_nvml_free_total_mb = Mock(return_value=(9000.0, 16376.0))  # type: ignore[method-assign]
+
+        assert pm._read_device_free_total_mb(0) == (9000.0, 16376.0)
+
+    def test_a_missed_nvml_sample_does_not_fall_back_to_the_reports(self) -> None:
+        """Once NVML has answered for a card, a missed sample is None and the process-local figure is not used."""
+        pm = self._manager_with_one_reporting_process()
+        pm._read_nvml_free_total_mb = Mock(side_effect=[(9000.0, 16376.0), None])  # type: ignore[method-assign]
+
+        assert pm._read_device_free_total_mb(0) == (9000.0, 16376.0)
+        assert pm._read_device_free_total_mb(0) is None
