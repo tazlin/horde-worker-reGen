@@ -169,6 +169,15 @@ class HordeProcessState(enum.Enum):
     prominently, all without importing torch (the invariant is that only the torch-bearing inference child
     ever touches torch; the parent and TUI learn of the problem through this torch-free signal)."""
 
+    ACCELERATOR_UNUSABLE = auto()
+    """The accelerator refused the first allocation an inference child made on it at start.
+
+    The torch build matches the card, and the device still raised when a tensor was moved to it. That is a
+    host driver fault, such as NVIDIA user-space libraries that no longer match the loaded kernel module. No
+    job can run on the device until the host is repaired, and nothing the worker restarts repairs it. The
+    child carries the error in ``info`` and exits. The orchestrator latches a worker-state flag from this and
+    stops popping jobs, without importing torch."""
+
     TORCH_BUILD_CPU_ONLY = auto()
     """The installed PyTorch is a CPU-only build, so image generation is disabled (reported by an inference child).
 

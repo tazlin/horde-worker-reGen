@@ -39,6 +39,7 @@ class _StubState:
     supervisor_paused = False
     self_throttle_paused = False
     gpu_torch_incompatible = False
+    accelerator_unusable = False
     workload_intake_paused = False
 
 

@@ -194,6 +194,24 @@ def test_gpu_torch_incompatible_is_degraded_error_and_names_the_reason() -> None
     assert any(check.status is HealthStatus.ERROR and "RTX 5070" in check.detail for check in report.checks)
 
 
+def test_an_unusable_accelerator_is_degraded_error_and_names_the_reason() -> None:
+    """A worker whose device refuses work surfaces as a DEGRADED/ERROR report carrying the reason."""
+    reason = "The accelerator (cuda:0) refused work at start (RuntimeError: nvmlInit_v2_). Reboot the host."
+    report = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            accelerator_unusable=True,
+            accelerator_unusable_reason=reason,
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    assert report.phase is WorkerPhase.DEGRADED
+    assert report.severity is HealthStatus.ERROR
+    assert reason in report.detail
+    assert any(check.status is HealthStatus.ERROR and "nvmlInit_v2_" in check.detail for check in report.checks)
+
+
 def test_gpu_torch_incompatible_beats_serving() -> None:
     """The hardware/build mismatch dominates even a (transient) inferencing process state."""
     report = derive(

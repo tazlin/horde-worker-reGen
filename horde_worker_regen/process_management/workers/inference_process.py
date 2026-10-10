@@ -353,6 +353,7 @@ class HordeInferenceProcess(HordeProcess):
                 sys.exit(1)
 
             self._verify_torch_supports_gpu()
+            self._verify_accelerator_accepts_work()
             self._report_if_cpu_only_build()
 
             if gpu_sampling_lease is not None:
@@ -546,6 +547,52 @@ class HordeInferenceProcess(HordeProcess):
             ),
         )
         sys.exit(1)
+
+    def _verify_accelerator_accepts_work(self) -> None:
+        """Stop at start, with the cause stated, when the device refuses the first tensor moved to it.
+
+        A host driver fault leaves torch able to enumerate the device and read its memory while every move of
+        a tensor onto it raises. NVIDIA user-space libraries that no longer match the loaded kernel module do
+        this. Without this check the slot reports ready, the worker pops, and each job faults at its first
+        weight load, which the horde counts as a drop. No restart of the worker repairs the host, so the
+        child reports ``ACCELERATOR_UNUSABLE`` for the parent to hold intake on, and exits.
+
+        The move is one element to the device the backend loads weights onto, released again before the slot
+        reports ready, so a working device is left as it was. A CPU device is skipped. An error finding the
+        device is logged and ignored, since this check must not be what stops a working process.
+        """
+        try:
+            import torch
+            from hordelib.comfy_horde import get_torch_device
+
+            device = get_torch_device()
+        except Exception as e:
+            logger.debug(f"Could not resolve the execution device for the accelerator check: {type(e).__name__} {e}")
+            return
+        if device.type == "cpu":
+            return
+
+        try:
+            probe = torch.zeros(1).to(device)
+            del probe
+        except Exception as error:
+            cause = f"{type(error).__name__}: {error}".strip()
+            logger.critical(
+                f"The accelerator ({device}) refused a one-element allocation at start: {cause} "
+                "The installed PyTorch matches this device, so the fault is in the host's driver. Every job "
+                "would fail at its first weight load. Reboot the host, or reload its GPU driver modules, then "
+                "restart the worker.",
+            )
+            # The info string is the operator-facing reason the parent relays verbatim to the TUI.
+            self.send_process_state_change_message(
+                process_state=HordeProcessState.ACCELERATOR_UNUSABLE,
+                info=(
+                    f"The accelerator ({device}) refused work at start ({cause[:300]}). This is a host driver "
+                    "fault. Reboot the host or reload its GPU driver modules, then restart the worker. The "
+                    "worker will not pop jobs until then."
+                ),
+            )
+            sys.exit(1)
 
     def _comfyui_callback(self, label: str, data: dict, _id: str) -> None:  # pyrefly: ignore[implicit-any-type-argument] - we don't control the type signature of this callback
         self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)

@@ -1654,6 +1654,14 @@ class WorkerStateSnapshot(BaseModel):
     gpu_torch_incompatible_reason: str | None = None
     """Operator-facing detail for ``gpu_torch_incompatible`` (device + remedy); None when not tripped."""
 
+    accelerator_unusable: bool = False
+    """The accelerator refused an inference child's first allocation, so the worker stopped popping.
+
+    A host driver fault, reported by a child at startup. Sticky for the session. The host is repaired by a
+    reboot or a driver module reload, and the worker is restarted after it."""
+    accelerator_unusable_reason: str | None = None
+    """Operator-facing detail for ``accelerator_unusable`` (the error and the remedy). None when not tripped."""
+
     torch_build_cpu_only: bool = False
     """The installed PyTorch is a CPU-only build, so image generation is disabled (alchemy still runs).
 

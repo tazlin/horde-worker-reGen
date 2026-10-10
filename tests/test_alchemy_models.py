@@ -941,6 +941,7 @@ class _StubState:
         supervisor_paused: bool = False,
         self_throttle_paused: bool = False,
         gpu_torch_incompatible: bool = False,
+        accelerator_unusable: bool = False,
         recovery_parked: bool = False,
         downloads_only_hold: bool = False,
     ) -> None:
@@ -948,6 +949,7 @@ class _StubState:
         self.supervisor_paused = supervisor_paused
         self.self_throttle_paused = self_throttle_paused
         self.gpu_torch_incompatible = gpu_torch_incompatible
+        self.accelerator_unusable = accelerator_unusable
         self.recovery_parked = recovery_parked
         self.downloads_only_hold = downloads_only_hold
 
@@ -1093,6 +1095,21 @@ class TestShouldPopPolicy:
             job_tracker=_StubJobTracker(pending=0),
         )
         assert coordinator._should_pop() is True
+
+    def test_an_unusable_accelerator_blocks_a_pop_that_was_allowed(self) -> None:
+        """A device that refuses work fails an alchemy form as it fails an image job, so no form is popped."""
+        bridge_data = self._bridge_data(alchemy_allow_concurrent=False)
+        process_map = _PolicyProcessMap(clip=object(), graph=object(), idle_image_lanes=2, free_vram_mb=8000.0)
+        coordinator = _make_policy_coordinator(
+            bridge_data=bridge_data,
+            process_map=process_map,
+            job_tracker=_StubJobTracker(pending=0),
+        )
+        assert coordinator._should_pop() is True
+
+        coordinator._state = _StubState(accelerator_unusable=True)  # type: ignore[assignment]
+
+        assert coordinator._should_pop() is False
 
     def test_concurrent_mode_allows_with_spare_lane_and_vram(self) -> None:
         """Concurrent mode pops alongside image work when a lane is spare and VRAM fits."""

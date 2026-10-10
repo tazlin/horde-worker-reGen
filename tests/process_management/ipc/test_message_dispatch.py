@@ -317,6 +317,29 @@ class TestReceiveAndHandleProcessMessages:
         assert state.gpu_torch_incompatible is True
         assert "RTX 5070" in state.gpu_torch_incompatible_reason
 
+    async def test_an_unusable_accelerator_report_latches_worker_state_flag(self) -> None:
+        """An ACCELERATOR_UNUSABLE report latches the sticky stop-popping flag and stores its reason."""
+        process_info = make_mock_process_info(0)
+        process_info.process_launch_identifier = 0
+        process_info.last_process_state = HordeProcessState.PROCESS_STARTING
+        state = WorkerState()
+
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}), state=state)
+
+        msg = Mock(spec=HordeProcessStateChangeMessage)
+        msg.process_id = 0
+        msg.process_launch_identifier = 0
+        msg.process_state = HordeProcessState.ACCELERATOR_UNUSABLE
+        msg.info = "The accelerator (cuda:0) refused work at start (RuntimeError: NVML_SUCCESS == nvmlInit_v2_())."
+        msg.time_elapsed = None
+
+        assert state.accelerator_unusable is False
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert state.accelerator_unusable is True
+        assert "nvmlInit_v2_" in state.accelerator_unusable_reason
+
     async def test_torch_build_cpu_only_latches_worker_state_flag(self) -> None:
         """A TORCH_BUILD_CPU_ONLY report latches the image-disable flag and stores its reason."""
         process_info = make_mock_process_info(0)

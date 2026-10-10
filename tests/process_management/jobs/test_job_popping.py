@@ -204,6 +204,16 @@ class TestApiJobPopGuardClauses:
         assert state.last_pop_no_jobs_available is False
         assert state.gpu_torch_incompatible is True
 
+    async def test_an_unusable_accelerator_blocks_pop_and_names_its_gate(self) -> None:
+        """The sticky accelerator-fault flag stops popping with a fully available pool and stamps its gate."""
+        state = WorkerState(accelerator_unusable=True, last_pop_no_jobs_available=True)
+        popper = _make_popper(state=state, process_map=_make_process_map_with_available_processes())
+
+        await popper.api_job_pop()
+
+        assert state.last_pop_no_jobs_available is False
+        assert state.last_pop_gate == str(PopGate.ACCELERATOR_FAULT)
+
     async def test_cpu_only_torch_build_blocks_image_pop(self) -> None:
         """A CPU-only torch build stops the image popper even with a fully available process pool.
 

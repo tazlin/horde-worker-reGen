@@ -32,6 +32,8 @@ class PopGate(enum.StrEnum):
     """The pre-floor host-RAM hold is set: system RAM is near its danger floor or a process is draining."""
     TORCH_UNUSABLE = "torch_unusable"
     """The installed torch build cannot serve image work on this host (no kernels for the GPU, or CPU-only)."""
+    ACCELERATOR_FAULT = "accelerator_fault"
+    """An inference child found the accelerator refuses work, which is a host driver fault."""
     CONSECUTIVE_FAILURE_PAUSE = "consecutive_failure_pause"
     """The consecutive-failure backoff is holding intake after a run of failed jobs."""
     QUEUE_FULL = "queue_full"
@@ -350,6 +352,19 @@ class WorkerState:
     gpu_torch_incompatible_reason: str = ""
     """Operator-facing explanation for ``gpu_torch_incompatible`` (the child's ``info`` string), relayed
     verbatim to the TUI. Empty until the flag latches."""
+
+    accelerator_unusable: bool = False
+    """Session-latched: an inference child reported the accelerator refused its first allocation.
+
+    Set from the child's ``ACCELERATOR_UNUSABLE`` report. The torch build matches the card and the device
+    still raises, so the fault is in the host's driver. While true the job and alchemy poppers stop popping,
+    because every job would fault at its first move to the device and the horde counts each as a drop. It
+    never clears at runtime. A reboot or a driver module reload repairs the host, and the worker is restarted
+    after it."""
+
+    accelerator_unusable_reason: str = ""
+    """Operator-facing explanation for ``accelerator_unusable`` (the child's ``info`` string). Empty until the
+    flag latches."""
 
     torch_build_cpu_only: bool = False
     """Session-latched: an inference child reported the installed PyTorch is a CPU-only build.

@@ -1538,6 +1538,18 @@ class MessageDispatcher:
             self._state.gpu_torch_incompatible = True
             self._state.gpu_torch_incompatible_reason = message.info
 
+        if message.process_state == HordeProcessState.ACCELERATOR_UNUSABLE:
+            # The device refused a child's first allocation. Latched here because the parent never imports
+            # torch and cannot test the device itself. Sticky for the session, since nothing the worker
+            # restarts repairs a host driver.
+            if not self._state.accelerator_unusable:
+                logger.critical(
+                    f"Process {message.process_id} reports the accelerator is unusable; the worker will stop "
+                    f"popping jobs. {message.info}",
+                )
+            self._state.accelerator_unusable = True
+            self._state.accelerator_unusable_reason = message.info
+
         if message.process_state == HordeProcessState.TORCH_BUILD_CPU_ONLY:
             # A torch-bearing inference child found the installed PyTorch is a CPU-only build. Latch it here
             # (the parent never imports torch) so the image popper stops popping while alchemy keeps running,

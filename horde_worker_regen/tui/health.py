@@ -301,6 +301,18 @@ def _derive_phase(
             checks,
             True,
         )
+    if snapshot.accelerator_unusable:
+        reason = snapshot.accelerator_unusable_reason or (
+            "The accelerator refused work at start, which is a host driver fault."
+        )
+        return HealthReport(
+            WorkerPhase.DEGRADED,
+            HealthStatus.ERROR,
+            "The GPU driver is refusing work",
+            f"{reason} The worker has stopped popping jobs until this is fixed.",
+            checks,
+            True,
+        )
     if _server_maintenance_active(snapshot, optimistic_server_maintenance=optimistic_server_maintenance):
         return HealthReport(
             WorkerPhase.MAINTENANCE,
@@ -609,6 +621,14 @@ def _build_checks(
                 "PyTorch/GPU",
                 HealthStatus.ERROR,
                 snapshot.gpu_torch_incompatible_reason or "Installed PyTorch has no kernels for this GPU.",
+            )
+        )
+    if snapshot.accelerator_unusable:
+        checks.append(
+            HealthCheck(
+                "GPU driver",
+                HealthStatus.ERROR,
+                snapshot.accelerator_unusable_reason or "The accelerator refused work at start.",
             )
         )
     checks.extend(_per_card_checks(snapshot))

@@ -8352,6 +8352,8 @@ class HordeWorkerProcessManager:
             too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,
             gpu_torch_incompatible=self._state.gpu_torch_incompatible,
             gpu_torch_incompatible_reason=(self._state.gpu_torch_incompatible_reason or None),
+            accelerator_unusable=self._state.accelerator_unusable,
+            accelerator_unusable_reason=(self._state.accelerator_unusable_reason or None),
             torch_build_cpu_only=self._state.torch_build_cpu_only,
             torch_build_cpu_only_reason=(self._state.torch_build_cpu_only_reason or None),
             post_processing_disabled=self._state.post_processing_disabled_by_breaker,

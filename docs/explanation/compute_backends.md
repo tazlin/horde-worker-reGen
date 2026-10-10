@@ -45,6 +45,26 @@ portable cross-backend torch equivalent, so this stays **NVIDIA-only and strictl
 NVML is absent the sampler collects nothing and reports `None`, and VRAM totals still come from the
 backend-agnostic path. A missing `nvidia-smi`/NVML never breaks startup.
 
+## A device that refuses work
+
+A host driver fault can leave torch able to enumerate the device and read its memory while every tensor moved
+onto it raises. NVIDIA user-space libraries that no longer match the loaded kernel module do this, usually
+after a driver package update with no reboot. NVML then fails with a version mismatch and torch raises
+`NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() INTERNAL ASSERT FAILED` on the first weight load.
+
+Each inference process checks for this at start, before it reports ready. It moves one element to the
+execution device (`HordeInferenceProcess._verify_accelerator_accepts_work`). If the device raises, the process
+reports `ACCELERATOR_UNUSABLE` with the error and exits. The parent latches `WorkerState.accelerator_unusable`,
+logs one CRITICAL line, and the image and alchemy poppers stop popping (pop gate `accelerator_fault`). The
+dashboard shows the reason.
+
+The hold is sticky for the session. No restart of the worker repairs a host driver, and each job popped
+meanwhile would fault and count against the worker on the horde. Reboot the host or reload its GPU driver
+modules, then restart the worker.
+
+An NVML failure alone does not hold intake. A card whose NVML cannot initialise and whose device still accepts
+work is served from process reports, as the next section describes.
+
 ## Device memory readings without NVML
 
 VRAM admission, the device-free governor and the reclaim ladder all price against a per-card reading of

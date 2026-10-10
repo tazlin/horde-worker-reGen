@@ -445,6 +445,24 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at="WorkerState.gpu_torch_incompatible / torch_build_cpu_only, and the last_pop_gate stamp",
     ),
     GateEntry(
+        key="accelerator_fault",
+        surface=GateSurface.POP_GATE,
+        kind=GateKind.HOLD,
+        subsystem="process_management.jobs.job_popper",
+        engaged_by="an inference child reports the accelerator refused its first allocation at start",
+        released_by=(
+            "nothing at runtime: the fault is in the host's driver and is deliberately sticky for the session, "
+            "since every popped job would fault at its first move to the device"
+        ),
+        bound_seconds=None,
+        bound_source="",
+        backstop=(
+            "none by design; the condition is disclosed once at the transition and the remedy is a reboot or "
+            "a driver module reload on the host, then a worker restart"
+        ),
+        observable_at="WorkerState.accelerator_unusable and the last_pop_gate stamp",
+    ),
+    GateEntry(
         key="consecutive_failure_pause",
         surface=GateSurface.POP_GATE,
         kind=GateKind.HOLD,

@@ -2014,6 +2014,13 @@ class JobPopper:
             self._note_pop_gate(PopGate.TORCH_UNUSABLE)
             return
 
+        if self._state.accelerator_unusable:
+            # The device refuses work, so every job would fault at its first move to it and the horde would
+            # count each as a drop. Sticky for the session, since the repair is on the host.
+            self._state.last_pop_no_jobs_available = False
+            self._note_pop_gate(PopGate.ACCELERATOR_FAULT)
+            return
+
         if self._state.torch_build_cpu_only:
             # CPU-only torch build: image generation is impractically slow and is disabled, so this (image)
             # popper never pops. Alchemy runs on its own loop and is unaffected. This is the runtime

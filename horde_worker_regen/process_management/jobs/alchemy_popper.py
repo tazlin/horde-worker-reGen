@@ -732,6 +732,9 @@ class AlchemyCoordinator:
         if self._state.gpu_torch_incompatible:
             # The installed PyTorch cannot run this GPU; alchemy forms would fail the same way. Don't pop.
             return False
+        if self._state.accelerator_unusable:
+            # The device refuses work, and an alchemy form reaches it the same way an image job does.
+            return False
         if len(self._pending_forms) + len(self._in_flight) >= max(bridge_data.queue_size, 1):
             return False
         if len(self._in_flight) >= max(bridge_data.alchemy_max_concurrency, 1):
