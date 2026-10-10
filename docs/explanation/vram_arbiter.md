@@ -345,10 +345,18 @@ the co-residency mutex and the stream forecast read, and as a planned charge on 
 every arbiter admission subtracts. A chain's allocations reach the device-free reading seconds after dispatch,
 and the control loop dispatches post-processing ahead of the clearance step in the same pass, so without the
 anchor a clearance priced in that pass sees the chain's room as free. The charge decays as the lane's reported
-reservation grows. Under WDDM a lane under-reports its working memory, so in practice the charge stands for most
-of the chain's run, a conservative bias. The in-flight co-residency check charges the same outstanding share in
+reservation grows. A face-fix and upscale chain's reservation steps up late, through the face fixers first and
+the upscaler last, so in practice the charge stands for most of the chain's run, a conservative bias. The in-flight co-residency check charges the same outstanding share in
 place of assuming the chain has already allocated. Each card's overlay sums only the anchors whose target
 process is on that card, so a chain on one card never narrows another card's admissions.
+
+The chain is booked at `learned_post_process_vram_mb`, which is hordelib's static estimate raised by the
+learned watermark and lowered to the measured figure once the store has five chains of the kind. Chains are recorded
+under `FootprintStage.POST_PROCESS`, keyed by the lane's operations (sorted, background removal excluded) and
+the band of the image the chain is given. The message dispatcher learns each chain as the lane's highest
+reported peak less its lowest reservation while the chain ran, the quantity the booking charges, and commits it
+on the lane's first report after the result, since each report's peak covers the time since the one before. The
+scheduler's dispatch-side post-processing charges read the same figure.
 
 A request's own footprint counts at most once in the identity. Two adjustments enforce this so a head can
 never wedge on state it alone produced. First, the request nets its own target process's outstanding planned

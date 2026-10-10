@@ -146,6 +146,10 @@ The failures encoded here:
   restarts that clock, so a waiter still short after its rungs waited past its lease-acquire timeout and
   loaded unpriced on an idle card. That is the ``waiter nothing can help`` scenario, and its reinjection restores
   the horizon and the starved-clock deadline.
+- **A chain's static estimate holds the card.** A post-processing chain was booked at hordelib's static
+  estimate, gigabytes above what the lane grew by, and the booking decays only as the lane's reservation grows.
+  The next job was held off a card that held it beside the chain. That is the ``learned chain`` scenario, and
+  its reinjection books every chain at the estimate.
 - **A band's batched peaks price its single images.** The learned sampling price was one window per baseline
   and resolution band, priced at its second-highest job, so batched traffic in the band priced every
   single-image job at a batched decode peak. Two single-image SDXL jobs a 24 GB card holds at once were never
@@ -6353,6 +6357,112 @@ async def _run_post_process_chain_beside_staged_job() -> _PostProcessChainRun:
         staged_job=staged_job,
         empty_card_free_mb=empty_card_free_mb,
         staged_job_need_mb=staged_job_need_mb,
+    )
+
+
+_LEARNED_CHAIN_PEAK_MB = 1500.0
+"""What each chain grows the post-processing lane by on the card."""
+
+_LEARNED_CHAIN_ESTIMATE_MB = 6400.0
+"""The static estimate the parent books a chain from, the estimate for a 4096-pixel face-fix and upscale chain,
+against a lane that grew by a fraction of it."""
+
+_LEARNED_CHAIN_JOBS = 16
+_LEARNED_CHAIN_SETTLED_AFTER = 8
+"""Submissions after which the store has seen enough chains to price them, so the stretch after it is timed."""
+
+_LEARNED_CHAIN_SLACK = 1.05
+"""How far the timed stretch may run over the same stretch of a parent that booked each chain at its true peak."""
+
+
+async def _learned_chain_stretch_ticks(estimate_mb: float | None) -> int:
+    """Run post-processed SDXL jobs over two lanes and one lease slot. Returns the ticks of the timed stretch.
+
+    ``estimate_mb`` None books each chain at its true peak, the parent that knows what the chain costs.
+    """
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        whole_card_enabled=False,
+        unload_models_from_vram_often=True,
+        service_contexts=True,
+        closed_loop=True,
+        clearance_lease=True,
+        gpu_sampling_lease_slots=1,
+        tick_seconds=1.0,
+        learned_footprints=True,
+        post_process_chain_peak_mb=_LEARNED_CHAIN_PEAK_MB,
+        post_process_chain_estimate_mb=estimate_mb,
+        post_process_chain_allocation_lag_ticks=1,
+        post_process_chain_hold_ticks=6,
+    )
+    popped = 0
+    settled_tick: int | None = None
+    for _ in range(600):
+        while len(world.job_tracker.jobs_pending_inference) < 2 and popped < _LEARNED_CHAIN_JOBS:
+            model = (_SDXL, _SDXL_OTHER)[popped % 2]
+            await world.pop(
+                make_job_pop_response(
+                    model.name,
+                    width=1024,
+                    height=1024,
+                    ddim_steps=20,
+                    post_processing=["GFPGAN", "RealESRGAN_x4plus"],
+                ),
+            )
+            popped += 1
+        await world.step()
+        if settled_tick is None and world.submitted_jobs >= _LEARNED_CHAIN_SETTLED_AFTER:
+            settled_tick = world.tick
+        if world.submitted_jobs >= _LEARNED_CHAIN_JOBS:
+            break
+    assert world.submitted_jobs == _LEARNED_CHAIN_JOBS and settled_tick is not None, (
+        f"learned chain: {world.submitted_jobs} of {_LEARNED_CHAIN_JOBS} jobs submitted. {world.state_dump()}"
+    )
+    assert not world.clearance_timeouts, (
+        f"learned chain: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout. "
+        f"{world.state_dump()}"
+    )
+    return world.tick - settled_tick
+
+
+async def test_pp_chain_a_learned_chain_price_serves_the_stream_as_its_true_peak_does() -> None:
+    """Once the store has seen the chains, post-processed jobs flow as if the parent knew each chain's true peak.
+
+    The failure this encodes: a chain was booked at hordelib's static estimate, which for a 4096-pixel face-fix
+    and upscale chain sat gigabytes above what the lane grew by. The booking decays only as the lane's
+    reservation grows, so its unreached part stood for the whole chain, and the next job was held off a card
+    that held it beside the chain. On a 24 GB card that held an SDXL job that fit the device-free reading by
+    several gigabytes.
+
+    Read as one statement: a chain is priced from what chains of its kind grew the lane by. Its consequence is
+    that the stretch after the store has learned the chain runs within a few percent of a parent that booked
+    each chain at its true peak.
+    """
+    learned = await _learned_chain_stretch_ticks(_LEARNED_CHAIN_ESTIMATE_MB)
+    true_peak = await _learned_chain_stretch_ticks(None)
+
+    assert learned <= true_peak * _LEARNED_CHAIN_SLACK, (
+        f"learned chain: the timed stretch took {learned} ticks against {true_peak} for a parent booking the "
+        f"true peak, past the {_LEARNED_CHAIN_SLACK} slack"
+    )
+
+
+async def test_pp_chain_defect_reinjection_a_static_chain_price_slows_the_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect reinjection: booked at the static estimate, the same stream runs well behind the true-peak parent."""
+    from tests.process_management.liveness import _dispatch_world as world_mod
+
+    monkeypatch.setattr(world_mod, "learned_post_process_vram_mb", lambda _store, _job, static_mb: static_mb)
+    static = await _learned_chain_stretch_ticks(_LEARNED_CHAIN_ESTIMATE_MB)
+    true_peak = await _learned_chain_stretch_ticks(None)
+
+    assert static > true_peak * _LEARNED_CHAIN_SLACK, (
+        f"static chain price: the timed stretch took {static} ticks against {true_peak}, so this row no longer "
+        "distinguishes a learned chain price from the defect"
     )
 
 

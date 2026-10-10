@@ -199,7 +199,8 @@ Three more views read what a support bundle carries:
   and how many holds ran each reclaim (`none` included). The worker logs a hold once per process and
   decision, so the count is distinct holds, not held time.
 - **Learned footprints.** Each sampling key in the footprint store, tagged `[all]` for the pooled key or with
-  its job class (`[b4]`, `[b1 hires]`), with the two terms admission prices it from: the raise-only watermark and the margined measured figure net of the context charge (`n/a` until the
+  its job class (`[b4]`, `[b1 hires]`), and each learned post-processing chain, tagged with its operations, with
+  the two terms admission prices it from: the raise-only watermark and the margined measured figure net of the context charge (`n/a` until the
   key's window holds enough jobs), beside the `sample_activation` watermark for the same band and the
   resident figures of the baseline's checkpoints. The text report prints figures only; the JSON output
   carries the sampling concurrency and the clearance holds, not the footprints.

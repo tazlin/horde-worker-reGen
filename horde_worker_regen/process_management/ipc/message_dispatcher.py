@@ -73,7 +73,9 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     LearnedFootprintStore,
     ResolutionBucket,
     job_class_key,
+    plausible_activation_ceiling_mb,
     plausible_sampling_peak_mb,
+    post_process_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW, WorkloadKind
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
@@ -156,6 +158,21 @@ class _JobSamplingPeak:
     """The bound the highest reading was checked against, passed on to the store at commit."""
     peak_resident_weights_mb: float | None = None
     """The weights the job held on the card at its peak, from its measured footprint, once its metrics arrive."""
+
+
+@dataclass
+class _ChainPeak:
+    """Represents what one post-processing chain's lane reported while it ran, held until its last report."""
+
+    job: ImageGenerateJobPopResponse
+    """The job whose chain the lane is running."""
+    floor_reserved_mb: float
+    """The lowest reservation the lane reported during the chain, which its growth is measured from."""
+    peak_reserved_mb: float = 0.0
+    """The highest reservation peak the lane reported during the chain."""
+    finished: bool = False
+    """Whether the chain's result has arrived. The lane's next report still carries the chain's last stretch,
+    since each report's peak covers the time since the one before."""
 
 
 def _no_aux_holds() -> set[GenerationID]:
@@ -412,6 +429,8 @@ class MessageDispatcher:
         failure the child reports passes through it, which is the transition that moves a slot's allocator
         reservation. A slot with no entry has never confirmed a residency, so it is never observed.
         """
+        self._chain_peaks: dict[int, _ChainPeak] = {}
+        """Each post-processing lane's running chain readings, keyed by the lane's process id."""
         self._job_sampling_peaks: dict[GenerationID, _JobSamplingPeak] = {}
         """The running maximum of each in-progress monolithic job's sampling readings, keyed by job id.
 
@@ -1059,6 +1078,60 @@ class MessageDispatcher:
         """Drop the active post-processing VRAM reserve for ``job_id``."""
         self._reserve_ledger.release(POST_PROCESS_RESERVE_FLOW, str(job_id))
 
+    def _observe_chain_peak(self, message: HordeProcessMemoryMessage) -> None:
+        """Fold a post-processing lane's report into the chain it is running, and commit a finished chain.
+
+        The figure learned is the growth of the lane's reservation over the chain, its highest peak less its lowest
+        reservation while the chain ran, which is the quantity a chain's booking charges. Each report's peak covers
+        the time since the report before, so a chain is committed on the first report after its result. The lane's
+        report at a chain's start covers the time before it and is read for its reservation alone.
+        """
+        if self._footprint_store is None:
+            return
+        process_info = self._process_map.get(message.process_id)
+        if process_info is None or process_info.process_type is not HordeProcessType.POST_PROCESS:
+            return
+        reserved_mb = message.process_reserved_mb
+        peak_mb = message.process_peak_reserved_mb
+        running = self._chain_peaks.get(message.process_id)
+        if running is not None and running.finished:
+            if peak_mb is not None:
+                running.peak_reserved_mb = max(running.peak_reserved_mb, float(peak_mb))
+            self._commit_chain_peak(running, total_vram_mb=message.vram_total_mb)
+            del self._chain_peaks[message.process_id]
+            running = None
+        job = process_info.last_job_referenced
+        if (
+            process_info.last_process_state is not HordeProcessState.POST_PROCESSING
+            or job is None
+            or reserved_mb is None
+        ):
+            return
+        if running is None or running.job.id_ != job.id_:
+            self._chain_peaks[message.process_id] = _ChainPeak(job=job, floor_reserved_mb=float(reserved_mb))
+            return
+        running.floor_reserved_mb = min(running.floor_reserved_mb, float(reserved_mb))
+        if peak_mb is not None:
+            running.peak_reserved_mb = max(running.peak_reserved_mb, float(peak_mb))
+
+    def _note_chain_finished(self, job_id: GenerationID) -> None:
+        """Mark the chain of ``job_id`` finished, so its lane's next report commits it."""
+        for running in self._chain_peaks.values():
+            if running.job.id_ == job_id:
+                running.finished = True
+
+    def _commit_chain_peak(self, running: _ChainPeak, *, total_vram_mb: int | None) -> None:
+        """Record one finished chain's growth under its post-processing key."""
+        key = post_process_footprint_key(running.job)
+        growth_mb = running.peak_reserved_mb - running.floor_reserved_mb
+        if self._footprint_store is None or key is None or growth_mb <= 0.0:
+            return
+        self._footprint_store.observe_peak(
+            key,
+            growth_mb,
+            plausible_max_mb=plausible_activation_ceiling_mb(total_vram_mb),
+        )
+
     def _handle_heartbeat(self, message: HordeProcessHeartbeatMessage) -> None:
         """Handle a heartbeat message from a child process."""
         self._process_map.on_heartbeat(
@@ -1122,6 +1195,7 @@ class MessageDispatcher:
         if message.clearance_wait_entry:
             self._note_clearance_wait_entered(message)
         self._observe_footprint_peak(message)
+        self._observe_chain_peak(message)
         self._observe_resident_footprint(message)
         self._observe_safety_footprint(message)
 
@@ -1921,6 +1995,7 @@ class MessageDispatcher:
         reissue the job to another worker instead.
         """
         self._release_post_process_reserve(message.job_id)
+        self._note_chain_finished(message.job_id)
 
         if message.time_elapsed is not None:
             if (

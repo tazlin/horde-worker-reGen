@@ -15,6 +15,7 @@ from horde_worker_regen.app_state import default_app_state_dir
 from horde_worker_regen.process_management.resources.resource_budget import platform_context_constant_mb
 from horde_worker_regen.process_management.resources.vram_footprints import (
     FOOTPRINT_STORE_FILENAME,
+    POST_PROCESS_CHAIN_BASELINE,
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
@@ -133,3 +134,27 @@ class TestDefaultFootprintStorePath:
 
         assert default_footprint_store_path(tmp_path / "stats") == expected
         assert default_footprint_store_path(None) == expected
+
+
+def test_a_post_processing_chain_is_listed_with_its_operations(tmp_path: Path) -> None:
+    """A learned chain is listed under the chain token with its operations as its class."""
+    path = tmp_path / FOOTPRINT_STORE_FILENAME
+    store = LearnedFootprintStore(path=path)
+    store.observe_peak(
+        FootprintKey(
+            model_baseline=POST_PROCESS_CHAIN_BASELINE,
+            resolution_bucket=ResolutionBucket.LE_1024,
+            platform=_PLATFORM,
+            stage=FootprintStage.POST_PROCESS,
+            checkpoint="GFPGAN+RealESRGAN_x4plus",
+        ),
+        1500.0,
+    )
+    store.save()
+
+    rows = learned_sampling_footprints(path)
+
+    assert [(row.baseline, row.stage, row.job_class) for row in rows] == [
+        (POST_PROCESS_CHAIN_BASELINE, "post_process", "GFPGAN+RealESRGAN_x4plus"),
+    ]
+    assert rows[0].watermark_mb == 1500.0

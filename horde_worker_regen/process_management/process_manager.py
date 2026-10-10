@@ -1862,6 +1862,7 @@ class HordeWorkerProcessManager:
         self._inference_scheduler.set_footprint_store(self._learned_footprint_store)
 
         self._post_process_orchestrator = PostProcessOrchestrator(
+            footprint_store=self._learned_footprint_store,
             process_map=self._process_map,
             job_tracker=self._job_tracker,
             process_lifecycle=self._process_lifecycle,

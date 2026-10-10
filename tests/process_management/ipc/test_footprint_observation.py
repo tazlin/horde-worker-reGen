@@ -49,6 +49,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    post_process_footprint_key,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -734,3 +735,52 @@ async def test_a_job_without_a_measured_footprint_records_no_activation() -> Non
     assert store.get_observation(_activation_key()) is None
     assert store.get_observation(_activation_key().for_job_class(batch=1, hires_fix=False)) is None
     assert len(store) == 2
+
+
+_CHAIN_FORMS = ["RealESRGAN_x4plus", "GFPGAN"]
+
+
+def _post_process_lane_running_chain() -> tuple[MessageDispatcher, LearnedFootprintStore, object]:
+    """A dispatcher whose post-processing lane is running one 1024-pixel job's face-fix and upscale chain."""
+    lane = make_mock_process_info(7, model_name=None, process_type=HordeProcessType.POST_PROCESS)
+    job = make_job_pop_response(model=_MODEL, width=1024, height=1024, post_processing=list(_CHAIN_FORMS))
+    lane.last_job_referenced = job
+    lane.last_process_state = HordeProcessState.POST_PROCESSING
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(process_map=ProcessMap({7: lane}), job_tracker=JobTracker(), store=store)
+    return dispatcher, store, job
+
+
+def test_a_chain_is_learned_as_the_lanes_growth_once_its_last_stretch_is_reported() -> None:
+    """A finished chain is recorded as the lane's highest peak less its lowest reservation, on the report after it.
+
+    Each report's peak covers the time since the report before, so the report after the chain's result still
+    carries its last stretch. The report at the chain's start covers the time before it and gives only the
+    reservation the growth is measured from.
+    """
+    dispatcher, store, job = _post_process_lane_running_chain()
+    key = post_process_footprint_key(job)  # type: ignore[arg-type]
+    assert key is not None
+
+    dispatcher._handle_memory_report(_memory_message(7, reserved_mb=800, peak_mb=9000))
+    dispatcher._handle_memory_report(_memory_message(7, reserved_mb=2100, peak_mb=2300))
+    dispatcher._note_chain_finished(job.id_)  # type: ignore[attr-defined]
+    assert store.get_observation(key) is None
+
+    dispatcher._process_map[7].last_process_state = HordeProcessState.WAITING_FOR_JOB
+    dispatcher._handle_memory_report(_memory_message(7, reserved_mb=900, peak_mb=2600))
+
+    observation = store.get_observation(key)
+    assert observation is not None
+    assert observation.recent_mb == pytest.approx([2600.0 - 800.0])
+
+
+def test_a_chain_without_a_result_is_not_learned() -> None:
+    """A chain whose result never arrived has no known end, so its readings are never committed."""
+    dispatcher, store, job = _post_process_lane_running_chain()
+    key = post_process_footprint_key(job)  # type: ignore[arg-type]
+
+    dispatcher._handle_memory_report(_memory_message(7, reserved_mb=800, peak_mb=900))
+    dispatcher._handle_memory_report(_memory_message(7, reserved_mb=2100, peak_mb=2300))
+
+    assert key is not None and store.get_observation(key) is None

@@ -44,6 +44,10 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     VramRequestKind,
     VramVerdict,
 )
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    LearnedFootprintStore,
+    learned_post_process_vram_mb,
+)
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
 
@@ -164,6 +168,7 @@ class PostProcessOrchestrator:
         sampling_coresidency_check: Callable[[float], bool] | None = None,
         whole_card_residency_active: Callable[[], bool] = lambda: False,
         decision_sink: DecisionSink | None = None,
+        footprint_store: LearnedFootprintStore | None = None,
     ) -> None:
         """Initialize the orchestrator with references to its dependencies.
 
@@ -186,6 +191,8 @@ class PostProcessOrchestrator:
             whole_card_residency_active: Whether a whole-card residency still owns the lane pause.
             decision_sink: Optional callback the manager injects to record the lane's admission decisions
                 (deferrals and their resolution) to the stats export. None in unit tests and until wired.
+            footprint_store: The shared learned-footprint store, whose measured chain peaks price a chain's
+                booking. None prices every chain at its static estimate.
         """
         self._process_map = process_map
         self._job_tracker = job_tracker
@@ -202,6 +209,7 @@ class PostProcessOrchestrator:
         # Injected by the manager: records the lane's admission decisions (deferrals and their resolution)
         # to the stats export, coalesced on the receiving side. None in unit tests and until wired.
         self._decision_sink = decision_sink
+        self._footprint_store = footprint_store
         # Overridable so the load simulator can drive the aging window off its virtual clock; monotonic
         # keeps the window immune to wall-clock jumps.
         self._clock = time.monotonic
@@ -331,7 +339,11 @@ class PostProcessOrchestrator:
         sdk_job = completed_job_info.sdk_api_job_info
         baseline = self._model_metadata.get_baseline(sdk_job.model) if sdk_job.model is not None else None
         baseline_name = str(getattr(baseline, "value", baseline)) if baseline is not None else None
-        estimate = predict_job_post_processing_vram_mb(sdk_job, baseline_name)
+        estimate = learned_post_process_vram_mb(
+            self._footprint_store,
+            sdk_job,
+            predict_job_post_processing_vram_mb(sdk_job, baseline_name),
+        )
         if estimate is None:
             return 0.0
         return max(0.0, estimate)

@@ -32,6 +32,9 @@ _BUNDLE_CONFIG_DIRNAME = "config"
 _SAMPLING_STAGES = (FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED)
 """The stages ``pricing.learned_sampling_peak_mb`` prices a sampling job from."""
 
+_LISTED_STAGES = (*_SAMPLING_STAGES, FootprintStage.POST_PROCESS)
+"""The stages listed, which are the sampling stages and the post-processing stage chains are booked from."""
+
 
 @dataclass
 class ResidentFootprint:
@@ -54,7 +57,8 @@ class SamplingFootprintRow:
     resolution_bucket: str | None
     stage: str
     job_class: str
-    """``all`` for the pooled key, else ``b<batch>`` with `` hires`` appended for a hires-fix pass."""
+    """``all`` for the pooled key, else ``b<batch>`` with `` hires`` appended for a hires-fix pass. A chain's
+    operations for a post-processing key."""
     platform: str
     observation_count: int
     window_size: int
@@ -99,7 +103,7 @@ def learned_sampling_footprints(path: Path) -> list[SamplingFootprintRow]:
     keys = [key for key in _persisted_keys(path) if store.get_observation(key) is not None]
     rows: list[SamplingFootprintRow] = []
     for key in keys:
-        if key.stage not in _SAMPLING_STAGES:
+        if key.stage not in _LISTED_STAGES:
             continue
         observation = store.get_observation(key)
         if observation is None:
@@ -124,6 +128,8 @@ def learned_sampling_footprints(path: Path) -> list[SamplingFootprintRow]:
 
 
 def _job_class_label(key: FootprintKey) -> str:
+    if key.stage is FootprintStage.POST_PROCESS:
+        return key.checkpoint or "?"
     if key.batch is None:
         return "all"
     return f"b{key.batch}{' hires' if key.hires_fix else ''}"

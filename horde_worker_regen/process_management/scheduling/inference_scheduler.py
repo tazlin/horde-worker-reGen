@@ -138,6 +138,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     job_class_key,
+    learned_post_process_vram_mb,
     plausible_sampling_peak_mb,
     sampling_footprint_key,
 )
@@ -10168,7 +10169,11 @@ class InferenceScheduler:
             charges_mb = sibling_contexts * per_context_mb
 
         if dispatched_job.payload.post_processing:
-            own_post_processing_mb = predict_job_post_processing_vram_mb(dispatched_job, baseline)
+            own_post_processing_mb = learned_post_process_vram_mb(
+                self._footprint_store,
+                dispatched_job,
+                predict_job_post_processing_vram_mb(dispatched_job, baseline),
+            )
             if own_post_processing_mb is not None:
                 charges_mb += max(0.0, own_post_processing_mb)
 
@@ -10667,7 +10672,11 @@ class InferenceScheduler:
             sdk_job = job_info.sdk_api_job_info
             baseline = self._model_metadata.get_baseline(sdk_job.model) if sdk_job.model is not None else None
             baseline_name = str(getattr(baseline, "value", baseline)) if baseline is not None else None
-            estimate = predict_job_post_processing_vram_mb(sdk_job, baseline_name)
+            estimate = learned_post_process_vram_mb(
+                self._footprint_store,
+                sdk_job,
+                predict_job_post_processing_vram_mb(sdk_job, baseline_name),
+            )
             if estimate is None or estimate <= 0:
                 continue
             estimates_mb.append(estimate)

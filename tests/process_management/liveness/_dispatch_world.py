@@ -107,7 +107,10 @@ from horde_worker_regen.process_management.resources.run_metrics import (
     ResourceStateKind,
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import MeasuredVramSnapshot
-from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    LearnedFootprintStore,
+    learned_post_process_vram_mb,
+)
 from horde_worker_regen.process_management.scheduling.admission.pricing import STAGING_ENCODE_VRAM_MB
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
@@ -786,6 +789,7 @@ class _DispatchWorld:
         post_process_card_index: int = 0,
         post_processing_chain_ticks: int = 0,
         post_process_chain_peak_mb: float | None = None,
+        post_process_chain_estimate_mb: float | None = None,
         post_process_chain_allocation_lag_ticks: int = 0,
         post_process_chain_hold_ticks: int = 1,
         preload_ends_dispatch: bool = False,
@@ -978,6 +982,10 @@ class _DispatchWorld:
                 against. Set, it needs ``service_contexts`` (the lane is a service process): the lane takes one
                 chain at a time, books it through production's ``book_post_process_chain``, charges this peak to
                 its card after the allocation lag, and releases charge and reserve after the hold.
+            post_process_chain_estimate_mb: The static estimate (MB) the parent books a chain from, priced through
+                production's ``learned_post_process_vram_mb`` against the learned store, while the card is charged
+                ``post_process_chain_peak_mb``. With ``learned_footprints`` the lane reports its reservation and
+                peak and the dispatcher learns each finished chain. None books the chain at its true peak.
             post_process_chain_allocation_lag_ticks: Ticks between the lane taking a chain and the chain's peak
                 landing on the card, the delay before a real chain's allocations reach the device-free reading.
             post_process_chain_hold_ticks: Ticks the chain's peak stays on the card once it has landed.
@@ -1232,6 +1240,7 @@ class _DispatchWorld:
         self._chain_ready_at: dict[str, int] = {}
         """The tick each pending chain becomes drainable, so a backlog persists across ticks."""
         self.post_process_chain_peak_mb = post_process_chain_peak_mb
+        self.post_process_chain_estimate_mb = post_process_chain_estimate_mb
         """What a modelled chain allocates on the lane's card, or None when the lane is hand-driven and free."""
         self.post_process_chain_allocation_lag_ticks = post_process_chain_allocation_lag_ticks
         self.post_process_chain_hold_ticks = post_process_chain_hold_ticks
@@ -2053,7 +2062,10 @@ class _DispatchWorld:
         if not self.learned_footprints:
             return
         for lane in self._process_map.values():
-            if lane.process_type is not HordeProcessType.INFERENCE:
+            reports_chain = (
+                lane.process_type is HordeProcessType.POST_PROCESS and self.post_process_chain_estimate_mb is not None
+            )
+            if lane.process_type is not HordeProcessType.INFERENCE and not reports_chain:
                 continue
             model_info = self._model_map.root.get(lane.loaded_horde_model_name or "")
             model_state = (lane.loaded_horde_model_name, model_info.horde_model_load_state if model_info else None)
@@ -2640,6 +2652,7 @@ class _DispatchWorld:
         if chain is not None and chain_finished:
             self._post_process_chain_mb.pop(lane.process_id, None)
             self._reserve_ledger.release(POST_PROCESS_RESERVE_FLOW, chain.job_id)
+            self._dispatcher._note_chain_finished(chain.job_info.sdk_api_job_info.id_)
             chain.released_tick = self.tick
             lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
             await self._job_tracker.queue_for_safety_post_processed(chain.job_info)
@@ -2667,14 +2680,25 @@ class _DispatchWorld:
             if self.tick < ready_at:
                 continue
             self._chain_ready_at.pop(job_id, None)
+            booked_mb = peak_mb
+            if self.post_process_chain_estimate_mb is not None:
+                booked_mb = (
+                    learned_post_process_vram_mb(
+                        self.footprint_store,
+                        job_info.sdk_api_job_info,
+                        self.post_process_chain_estimate_mb,
+                    )
+                    or 0.0
+                )
             post_process_orchestrator.book_post_process_chain(
                 self._reserve_ledger,
                 job_id=job_id,
-                reserve_vram_mb=peak_mb,
+                reserve_vram_mb=booked_mb,
                 ram_mb=0.0,
                 lane=lane,
             )
             lane.last_process_state = HordeProcessState.POST_PROCESSING
+            lane.last_job_referenced = job_info.sdk_api_job_info
             await self._job_tracker.begin_post_processing(
                 job_info,
                 process_id=lane.process_id,

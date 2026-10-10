@@ -22,8 +22,10 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintStage,
     LearnedFootprintStore,
     ResolutionBucket,
+    learned_post_process_vram_mb,
     plausible_activation_ceiling_mb,
     plausible_sampling_peak_mb,
+    post_process_footprint_key,
 )
 
 
@@ -765,3 +767,61 @@ class TestSanitizeSamplingObservations:
         store = LearnedFootprintStore()
         store.observe_peak(_key(), 9256.0)
         assert store.sanitize_sampling_observations(lambda key: plausible_sampling_peak_mb(key, None)) == []
+
+
+class TestPostProcessChainPricing:
+    """A chain is keyed by its lane operations and image size, and priced from what such chains grew the lane by."""
+
+    @staticmethod
+    def _job(forms: list[str], *, width: int = 1024, height: int = 1024):  # noqa: ANN205
+        from tests.process_management.conftest import make_job_pop_response
+
+        return make_job_pop_response(width=width, height=height, post_processing=forms)
+
+    def test_the_key_is_the_lane_operations_in_any_order(self) -> None:
+        """The same operations in another order are the same chain, and background removal runs on another lane."""
+        one = post_process_footprint_key(self._job(["RealESRGAN_x4plus", "GFPGAN"]))
+        other = post_process_footprint_key(self._job(["GFPGAN", "RealESRGAN_x4plus", "strip_background"]))
+        assert one is not None and one == other
+        assert one.stage is FootprintStage.POST_PROCESS
+        assert one.checkpoint == "GFPGAN+RealESRGAN_x4plus"
+        assert one.resolution_bucket is ResolutionBucket.LE_1024
+
+    def test_a_job_the_lane_runs_nothing_for_has_no_key(self) -> None:
+        """No lane operation, no chain to price."""
+        assert post_process_footprint_key(self._job([])) is None
+        assert post_process_footprint_key(self._job(["strip_background"])) is None
+
+    def test_a_cold_chain_keeps_the_static_estimate(self) -> None:
+        """Below the measured minimum the chain is booked at the static estimate."""
+        store = LearnedFootprintStore()
+        job = self._job(["GFPGAN", "RealESRGAN_x4plus"])
+        key = post_process_footprint_key(job)
+        assert key is not None
+        store.observe_peak(key, 1500.0)
+        assert learned_post_process_vram_mb(store, job, 6400.0) == pytest.approx(6400.0)
+
+    def test_a_measured_chain_lowers_the_static_estimate(self) -> None:
+        """Five chains price the next one at the margined second-highest growth, net of the context charge."""
+        store = LearnedFootprintStore()
+        job = self._job(["GFPGAN", "RealESRGAN_x4plus"])
+        key = post_process_footprint_key(job)
+        assert key is not None
+        for growth_mb in (1400.0, 1500.0, 1450.0, 1500.0, 1300.0):
+            store.observe_peak(key, growth_mb)
+        assert learned_post_process_vram_mb(store, job, 6400.0) == pytest.approx(1500.0 * _MEASURED_ESTIMATE_MARGIN)
+
+    def test_a_chain_above_its_estimate_is_raised_by_its_watermark(self) -> None:
+        """A chain that grew the lane past the estimate is never booked below what it was seen to use."""
+        store = LearnedFootprintStore()
+        job = self._job(["GFPGAN", "RealESRGAN_x4plus"])
+        key = post_process_footprint_key(job)
+        assert key is not None
+        store.observe_peak(key, 7000.0)
+        assert learned_post_process_vram_mb(store, job, 6400.0) == pytest.approx(7000.0)
+
+    def test_without_a_store_the_estimate_stands(self) -> None:
+        """A parent with no store books the static estimate, None included."""
+        job = self._job(["GFPGAN"])
+        assert learned_post_process_vram_mb(None, job, 6400.0) == 6400.0
+        assert learned_post_process_vram_mb(None, job, None) is None

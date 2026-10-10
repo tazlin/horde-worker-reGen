@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Protocol
 
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -304,6 +305,12 @@ SAFETY_PROCESS_BASELINE = "safety_process"
 The safety process holds classifier weights that belong to no generation baseline, so its footprint is
 recorded under this fixed token rather than against whatever model happens to be loaded elsewhere."""
 
+POST_PROCESS_CHAIN_BASELINE = "post_process_chain"
+"""The :attr:`FootprintKey.model_baseline` token used for :attr:`FootprintStage.POST_PROCESS` observations.
+
+A chain's cost follows its operations and the size of the image it is given, not the model that generated it, so
+every chain is recorded under this token, with its operations in :attr:`FootprintKey.checkpoint`."""
+
 
 class FootprintKey(BaseModel):
     """The identity a learned footprint is recorded under.
@@ -384,6 +391,46 @@ def sampling_footprint_key(
     )
 
 
+def post_process_footprint_key(job: ImageGenerateJobPopResponse) -> FootprintKey | None:
+    """The key a job's post-processing chain is recorded and priced under, or None when the lane runs nothing.
+
+    The operations are the ones the post-processing lane runs (background removal runs on another lane), sorted
+    so one set of operations is one key, and the band is the size of the generated image the chain is given.
+    """
+    forms = sorted(str(form) for form in (job.payload.post_processing or []) if not is_strip_background_form(form))
+    width = job.payload.width
+    height = job.payload.height
+    if not forms or width is None or height is None:
+        return None
+    return FootprintKey(
+        model_baseline=POST_PROCESS_CHAIN_BASELINE,
+        resolution_bucket=ResolutionBucket.from_dimensions(width, height),
+        platform=sys.platform,
+        stage=FootprintStage.POST_PROCESS,
+        checkpoint="+".join(forms),
+    )
+
+
+def learned_post_process_vram_mb(
+    store: LearnedFootprintStore | None,
+    job: ImageGenerateJobPopResponse,
+    static_mb: float | None,
+) -> float | None:
+    """Return a chain's VRAM charge (MB), the static estimate raised by its watermark and lowered by its measurement.
+
+    The figure is the growth of the lane's reservation over the chain, the quantity its booking charges. None when
+    neither the estimate nor the store can price the chain.
+    """
+    key = post_process_footprint_key(job) if store is not None else None
+    if store is None or key is None:
+        return static_mb
+    raised_mb = store.estimate_mb(key, static_seed_mb=static_mb or 0.0)
+    measured_mb = store.measured_estimate_net_of_context_mb(key)
+    if measured_mb is None or measured_mb >= raised_mb:
+        return raised_mb if raised_mb > 0.0 or static_mb is not None else None
+    return measured_mb
+
+
 def job_class_key(key: FootprintKey, job: ImageGenerateJobPopResponse) -> FootprintKey:
     """Return the pooled per-job ``key`` narrowed to ``job``'s class: its batch size and hires-fix pass."""
     return key.for_job_class(batch=job.payload.n_iter or 1, hires_fix=bool(job.payload.hires_fix))
@@ -424,7 +471,14 @@ unrepresentative run (a job that faulted mid-sample, a slot that never finished 
 consumer into planning below the static seed. A per-job window prices at its second-highest job, and with five
 jobs that figure is matched or exceeded by two of them, which a lone outlier cannot do."""
 
-_PER_JOB_STAGES = frozenset({FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED, FootprintStage.SAMPLE_ACTIVATION})
+_PER_JOB_STAGES = frozenset(
+    {
+        FootprintStage.SAMPLE,
+        FootprintStage.SAMPLE_ISOLATED,
+        FootprintStage.SAMPLE_ACTIVATION,
+        FootprintStage.POST_PROCESS,
+    },
+)
 """Stages whose window holds one figure per job, priced at the window's second-highest entry.
 
 The activation stages are fed once per job. The at-rest stages are fed a reading per report and keep the
