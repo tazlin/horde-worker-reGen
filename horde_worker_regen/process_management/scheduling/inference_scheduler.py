@@ -5628,9 +5628,10 @@ class InferenceScheduler:
         A reading is late at a cold start by up to one report interval, and admission defers on it. A card
         still unread after :data:`_DEVICE_FREE_READING_BOUND_SECONDS` has no source that will answer, and
         deferring on it would hold every load for as long as the worker runs. The first reading to arrive
-        clears the state.
+        clears the state. The bound runs only while a process on the card is up, since no source can answer
+        before one is.
         """
-        if device_free_mb is not None:
+        if device_free_mb is not None or not self._card_has_a_running_process(device_index):
             if self._device_free_missing_since.pop(device_index, None) is not None:
                 self._device_free_unavailable_announced.discard(device_index)
             return False
@@ -5646,6 +5647,27 @@ class InferenceScheduler:
                 "path until a reading arrives.",
             )
         return True
+
+    def _card_has_a_running_process(self, device_index: int) -> bool:
+        """Whether an inference process on the card has finished starting, so a reading of the card is due.
+
+        Every source of the reading needs a process on the card: the parent samples only cards its processes
+        are on, and a child reports its memory once it is up. While the pool is still downloading, scanning or
+        starting there is nothing to read and nothing to admit, so the wait for a reading has not begun. An
+        inference process reports its device memory as it becomes ready. A service lane that is up earlier
+        withholds the figure until it has a device context, so it does not start the wait.
+        """
+        return any(
+            process_info.device_index == device_index
+            and process_info.process_type == HordeProcessType.INFERENCE
+            and process_info.last_process_state
+            not in (
+                HordeProcessState.PROCESS_STARTING,
+                HordeProcessState.PROCESS_ENDING,
+                HordeProcessState.PROCESS_ENDED,
+            )
+            for process_info in self._process_map.values()
+        )
 
     def _overlap_memory_verdict(
         self,

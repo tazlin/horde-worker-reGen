@@ -6739,6 +6739,30 @@ async def test_a_reading_that_arrives_ends_the_unread_state_and_restarts_its_bou
     assert scheduler._device_free_reading_unavailable(0, None) is True
 
 
+async def test_the_reading_bound_does_not_run_before_a_process_on_the_card_is_up() -> None:
+    """While the pool is still starting nothing can read the card, so the wait for a reading has not begun."""
+    from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+        _DEVICE_FREE_READING_BOUND_SECONDS,
+    )
+
+    world = _DispatchWorld(card=_CARD_24GB, lane_count=1, max_threads=1, queue_depth=1, closed_loop=True)
+    scheduler = world.scheduler
+    lanes = list(scheduler._process_map.values())
+    running_states = {lane.process_id: lane.last_process_state for lane in lanes}
+    for lane in lanes:
+        lane.last_process_state = HordeProcessState.PROCESS_STARTING
+
+    assert scheduler._device_free_reading_unavailable(0, None) is False
+    world.now += 10 * _DEVICE_FREE_READING_BOUND_SECONDS
+    assert scheduler._device_free_reading_unavailable(0, None) is False, "the bound ran while the pool was starting"
+
+    for lane in lanes:
+        lane.last_process_state = running_states[lane.process_id]
+    assert scheduler._device_free_reading_unavailable(0, None) is False, "the bound must start when a process is up"
+    world.now += _DEVICE_FREE_READING_BOUND_SECONDS
+    assert scheduler._device_free_reading_unavailable(0, None) is True
+
+
 @pytest.mark.closed_loop
 async def test_a_process_local_view_that_overstates_free_still_serves_within_the_card() -> None:
     """A lane's free figure runs ahead of the card on Windows. Work flows and the card stays within its total."""
