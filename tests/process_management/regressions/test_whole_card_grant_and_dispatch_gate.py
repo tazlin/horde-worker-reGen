@@ -1285,6 +1285,9 @@ class TestReaskingAHeldResidencyIsANoOp:
             scheduler._job_tracker,
             make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4),
         )
+        # The card-filling head cannot fit beside safety, so its residency moves safety off; the mocked lifecycle
+        # never acts, so the move is stated as done for the teardown to settle.
+        scheduler._process_lifecycle.is_safety_gpu_paused = True  # type: ignore[attr-defined]
         self._ask(scheduler, head, available_process)
         state = scheduler._whole_card_ledger.state_for(None)
         assert state.structural_complete_at != 0.0, "precondition: the first ask's teardown settled"

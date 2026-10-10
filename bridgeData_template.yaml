@@ -800,7 +800,9 @@ whole_card_exclusive_residency: true
 
 # When a whole-card model claims the device, also move the safety process off-GPU (cpu_only) for the
 # job's duration, freeing its ~1GB CUDA context. On a 16GB card this is what lets Flux fit without
-# streaming. Restored after. Only used with enable_vram_budget and safety_on_gpu.
+# streaming. Restored after. Only used with enable_vram_budget and safety_on_gpu. When false, safety stays
+# on the GPU through a residency whose model fits beside it; a model that cannot fit beside safety still moves
+# it off for that residency, at once.
 whole_card_residency_safety_off_gpu: true
 
 # The VRAM admission margin (MB) subtracted from the measured free reading before a load or dispatch is

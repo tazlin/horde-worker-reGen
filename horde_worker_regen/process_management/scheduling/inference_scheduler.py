@@ -802,6 +802,9 @@ class InferenceScheduler:
         # A single-GPU worker uses exactly one entry under the None key, identical to the prior scalar fields.
         # All reads/writes go through the ledger (see WholeCardResidencyLedger; _residency_state delegates).
         self._whole_card_ledger = WholeCardResidencyMachine()
+        self._residencies_displacing_safety: set[int | None] = set()
+        """Cards whose held residency moves safety off although the operator keeps it on-GPU, latched per residency
+        (:meth:`_residency_cannot_fit_beside_safety`)."""
         # The per-tick resource governor: the process manager ticks it once per control-loop iteration via
         # run_governance_tick(), independent of queue depth, so governance never depends on a particular
         # scheduling path executing (or on the inference queue being non-empty). It owns the RAM governor's
@@ -2118,12 +2121,42 @@ class InferenceScheduler:
         A fixed safety residency (:meth:`_safety_residency_fixed`) outranks the operator's flag: the residency
         takes the card it can get, and a whole-card model that cannot fit beside safety's fixed charge is
         seated on a sibling card instead of evicting the classifier.
+
+        With the flag off, safety stays on the card unless the held residency's model cannot fit beside it
+        (:meth:`_residency_cannot_fit_beside_safety`). That residency would otherwise park its head until the
+        runtime safety placement moves safety after its sustained-pressure dwell, idling the card for the
+        dwell and then losing the GPU safety process all the same.
         """
-        if not self._whole_card_safety_off_gpu_enabled() or self._safety_residency_fixed_on(device_index):
+        if not self._safety_on_gpu_permitted or self._safety_residency_fixed_on(device_index):
+            return False
+        if not self._whole_card_safety_off_gpu_enabled() and not self._residency_cannot_fit_beside_safety(
+            device_index,
+        ):
             return False
         if device_index is None or not self._card_runtimes:
             return True
         return device_index == self._safety_gpu_card()
+
+    def _residency_cannot_fit_beside_safety(self, device_index: int | None) -> bool:
+        """Whether the residency held on this card is for a model that cannot fit beside safety's context.
+
+        It cannot when the forecast's sole-residency fit excludes safety's footprint and the live reading does not
+        already hold the weights with safety still on the card. The answer is latched for the residency: once
+        safety leaves, the live reading would say the model fits and bring safety straight back. False with no
+        residency or no forecast, so the operator's keep-safety-on-GPU choice stands wherever the model fits.
+        """
+        state = self._whole_card_ledger.state_for(device_index)
+        if state.model is None or state.forecast is None:
+            self._residencies_displacing_safety.discard(device_index)
+            return False
+        if device_index in self._residencies_displacing_safety:
+            return True
+        if state.forecast.fits_alone_beside(self._safety_footprint_mb()):
+            return False
+        if self._whole_card_weights_fit_live(state.forecast, device_index=device_index, model=state.model):
+            return False
+        self._residencies_displacing_safety.add(device_index)
+        return True
 
     def _safety_clear_of_residency_card(self, device_index: int | None) -> bool:
         """Whether safety satisfies this residency's card-local teardown leg.

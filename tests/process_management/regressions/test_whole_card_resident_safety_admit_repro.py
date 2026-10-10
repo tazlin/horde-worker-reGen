@@ -128,7 +128,12 @@ class TestResidentSafetyBlocksTheBackstopAdmit:
     """The drain backstop stands in only for a card the residency has actually cleared."""
 
     def test_backstop_does_not_admit_while_safety_keeps_its_context(self) -> None:
-        """With safety left on the card by configuration, the elapsed backstop must not release the head."""
+        """With safety still on the card, the elapsed backstop must not release a head that cannot fit beside it.
+
+        The configuration keeps safety on-GPU, but this head's residency cannot fit beside safety and the live
+        reading does not hold its weights, so the residency moves safety off rather than waiting out the runtime
+        placement's pressure dwell, and the head stays parked until safety has left.
+        """
         scheduler = _residency_scheduler(
             safety_off_gpu_configured=False,
             safety_paused=False,
@@ -139,8 +144,11 @@ class TestResidentSafetyBlocksTheBackstopAdmit:
         assert forecast.fits_alone is True, (
             "precondition: the head fits a card it has entirely to itself, which is what the backstop leans on"
         )
-        assert scheduler._residency_should_pause_safety(None) is False, (
-            "precondition: the configuration forbids moving safety off-GPU for this residency"
+        assert scheduler._whole_card_safety_off_gpu_enabled() is False, (
+            "precondition: the configuration keeps safety on-GPU for residencies"
+        )
+        assert scheduler._residency_should_pause_safety(None) is True, (
+            "a residency whose model cannot fit beside safety moves it off despite the configuration"
         )
         assert scheduler._process_lifecycle.is_safety_gpu_paused is False, (
             "precondition: safety is still holding its context on the card"
@@ -167,6 +175,9 @@ class TestResidentSafetyBlocksTheBackstopAdmit:
         forecast = _whole_card_forecast()
 
         assert scheduler._whole_card_weights_fit_live(forecast) is True
+        assert scheduler._residency_should_pause_safety(None) is False, (
+            "the weights fit beside safety on the live reading, so safety keeps its GPU context"
+        )
         assert scheduler._whole_card_teardown_exhausted(forecast) is True
 
 
@@ -226,3 +237,26 @@ class TestSettledDrainReleasesTheHead:
             "a reading that has not risen across one report interval settles the drain"
         )
         assert now[0] - structural_at < WHOLE_CARD_DRAIN_SETTLE_SECONDS
+
+
+class TestResidencySafetyMoveIsLatched:
+    """A residency that moves safety off keeps it off until the residency ends."""
+
+    def test_the_move_holds_once_safety_has_left(self) -> None:
+        """After safety leaves, the live reading holds the weights, yet the decision must not bring safety back."""
+        scheduler = _residency_scheduler(
+            safety_off_gpu_configured=False,
+            safety_paused=False,
+            measured_free_mb=_FREE_WITH_SAFETY_RESIDENT_MB,
+        )
+        assert scheduler._residency_should_pause_safety(None) is True
+
+        scheduler._process_lifecycle.is_safety_gpu_paused = True
+        for process_info in scheduler._process_map.values():
+            process_info.vram_usage_mb = int(_CARD_TOTAL_MB - _FREE_IF_ALONE_MB)
+        assert scheduler._residency_should_pause_safety(None) is True, (
+            "the move was undone by the room it freed, which would cycle safety on and off the card"
+        )
+
+        scheduler._whole_card_ledger.state_for(None).model = None
+        assert scheduler._residency_should_pause_safety(None) is False, "the latch outlived its residency"
