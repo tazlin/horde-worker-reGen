@@ -6638,3 +6638,95 @@ async def test_pp_chain_defect_reinjection_a_flat_reserve_lets_clearance_overcom
         "the staged job's load and the chain's allocations must overcommit the card once both land; the run "
         f"recorded no overcommit. {world.state_dump()}"
     )
+
+
+# A card the parent has no device-level reading for
+#
+# The parent reads a card's free memory through NVML. A ROCm, XPU or MPS card, and an NVIDIA card whose NVML
+# cannot initialise, never answer that read. Admission defers on a missing reading, so a worker with nothing
+# in its place admits no load for as long as it runs.
+
+_NO_DEVICE_READING_JOBS = 12
+
+
+async def _serve_without_a_device_reading(world: _DispatchWorld) -> None:
+    """Offer SDXL work to ``world`` until its jobs are served or the row's tick budget runs out."""
+    offered = 0
+    for _ in range(3000):
+        while offered < _NO_DEVICE_READING_JOBS and len(world.job_tracker.jobs_pending_inference) < 2:
+            model = _SDXL if offered % 2 else _SDXL_OTHER
+            if not await world.offer_job(make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=20)):
+                break
+            offered += 1
+        await world.step()
+        if world.submitted_jobs >= _NO_DEVICE_READING_JOBS:
+            return
+
+
+@pytest.mark.closed_loop
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+async def test_a_card_with_no_device_reading_serves_from_its_lanes_reports(platform: str) -> None:
+    """A card whose device read never answers is governed and served on the figures its lanes report."""
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        closed_loop=True,
+        parent_device_reading=False,
+        child_report_platform=platform,
+        tick_seconds=0.5,
+    )
+
+    await _serve_without_a_device_reading(world)
+
+    context = f"no device reading, {platform} reports"
+    assert world.submitted_jobs == _NO_DEVICE_READING_JOBS, f"{context}: work stopped flowing. {world.state_dump()}"
+    assert world.governor_states_by_card[0], f"{context}: the card was never governed"
+    assert world.card_overcommits == [], f"{context}: the card was committed past its total"
+
+
+@pytest.mark.closed_loop
+async def test_a_card_with_no_reading_of_any_kind_admits_no_load() -> None:
+    """With nothing in place of the device read, every admission defers and no job is served.
+
+    This is the state the lanes' reports exist to end, and the reason the row above is about the reading.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        closed_loop=True,
+        parent_device_reading=False,
+        child_report_platform=None,
+        tick_seconds=0.5,
+    )
+
+    await _serve_without_a_device_reading(world)
+
+    assert world.submitted_jobs == 0
+    assert world.preloads_commanded == []
+    assert world.governor_states_by_card[0] == []
+
+
+@pytest.mark.closed_loop
+async def test_a_process_local_view_that_overstates_free_still_serves_within_the_card() -> None:
+    """A lane's free figure runs ahead of the card on Windows. Work flows and the card stays within its total."""
+    world = _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        closed_loop=True,
+        parent_device_reading=False,
+        child_report_platform="win32",
+        child_free_view_lie_mb=6000.0,
+        tick_seconds=0.5,
+    )
+
+    await _serve_without_a_device_reading(world)
+
+    context = "process-local reports 6 GB ahead of the card"
+    assert world.submitted_jobs == _NO_DEVICE_READING_JOBS, f"{context}: work stopped flowing. {world.state_dump()}"
+    assert world.card_overcommits == [], f"{context}: admission bought room the card did not have"

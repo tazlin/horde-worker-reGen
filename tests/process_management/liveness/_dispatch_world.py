@@ -86,6 +86,7 @@ from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.device_free_governor import DeviceFreeGovernor, GovernorState
+from horde_worker_regen.process_management.resources.device_memory_source import child_reported_free_total_mb
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRung,
     ReclaimRungKind,
@@ -771,6 +772,8 @@ class _DispatchWorld:
         performance_model: bool = False,
         legacy_comfy_vram_unload: bool = False,
         child_free_view_lie_mb: float = 0.0,
+        parent_device_reading: bool = True,
+        child_report_platform: str | None = "linux",
         footprint_undershoot: float = 1.0,
         child_reports_card_sized_peaks: bool = False,
         phase_resident_components: bool = False,
@@ -895,6 +898,13 @@ class _DispatchWorld:
                 A child sees only its own allocations and, under WDDM, memory the driver has not returned still
                 reads as free, so its view runs ahead of the device. The gap is what makes the child's own
                 shortfall freeing under-free. Zero is a truthful child.
+            parent_device_reading: Whether the parent has a device-level reading of each card, as NVML gives an
+                NVIDIA card. Off, the governor, the arbiter snapshot and the scheduler's measured reading are
+                fed what the lanes report, through the production reading for such a card.
+            child_report_platform: The platform whose view the lanes' reports carry when the parent has no
+                device reading. ``"linux"`` reports the whole device. ``"win32"`` reports a view that runs
+                ``child_free_view_lie_mb`` ahead of the card, and the reading is bounded by the committed
+                ledger. None gives the parent no reading at all.
             footprint_undershoot: Multiplier from what the scheduler's static fit predicts a job costs the card
                 to what it actually costs. Above one, admission passes on a figure the load then exceeds, which
                 is the regime where the parent's own defenses have already been satisfied and only the child's
@@ -1022,6 +1032,8 @@ class _DispatchWorld:
         self.idle_lane_warm = idle_lane_warm
         self.tail_overlap = tail_overlap
         self.child_free_view_lie_mb = child_free_view_lie_mb
+        self.parent_device_reading = parent_device_reading
+        self.child_report_platform = child_report_platform
         self.footprint_undershoot = footprint_undershoot
         self.child_reports_card_sized_peaks = child_reports_card_sized_peaks
         self.phase_resident_components = phase_resident_components
@@ -1424,7 +1436,7 @@ class _DispatchWorld:
             # Pinning it is what makes a row's jobs priced, admitted, and dispatched on the disaggregated
             # path without standing up the orchestrator's lanes, which these rows do not vary.
             self._scheduler._is_disaggregation_class_eligible = lambda _job: True  # type: ignore[method-assign]
-        self._scheduler.set_device_free_mb_provider(self.device_free_mb)
+        self._scheduler.set_device_free_mb_provider(self.parent_device_free_mb)
         # The rows vary VRAM, never host RAM: pinning an ample reading keeps the RAM admission gates out of
         # the variation and stops a row's outcome depending on how much memory the machine running it has.
         self._scheduler.set_available_ram_mb_provider(lambda: _AMPLE_RAM_MB)
@@ -1802,6 +1814,32 @@ class _DispatchWorld:
             return min(self.card_free_mb(index) for index in self._card_totals)
         return self.card_free_mb(device_index)
 
+    def parent_device_free_mb(self, device_index: int | None = None) -> float | None:
+        """The parent's reading of a card's free VRAM, or None where it has none.
+
+        With a device reading this is the truthful figure. Without one it is what the manager's reader forms
+        from the lanes' published reports for a card its device read never answers for, so a row with no
+        device reading prices against the same figure a worker on such a card does.
+        """
+        if self.parent_device_reading:
+            return self.device_free_mb(device_index)
+        if self.child_report_platform is None:
+            return None
+        if device_index is None:
+            readings = [self.parent_device_free_mb(index) for index in self._card_totals]
+            known = [reading for reading in readings if reading is not None]
+            return min(known) if known else None
+        reading = child_reported_free_total_mb(
+            reported_free_mb=self._process_map.get_free_vram_mb(device_index=device_index),
+            reported_total_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
+            committed_mb=self._process_map.committed_vram_mb(
+                context_constant_mb=self._scheduler.resolved_context_constant_mb(),
+                device_index=device_index,
+            ),
+            platform=self.child_report_platform,
+        )
+        return None if reading is None else reading[0]
+
     def _actual_charge_mb(self, predicted_mb: float) -> float:
         """What a charge the scheduler priced at ``predicted_mb`` really costs the card.
 
@@ -2015,7 +2053,11 @@ class _DispatchWorld:
                 lane.held_components = self._ram_held_checkpoint_report(lane)
             total_mb = self._card_totals[lane.device_index]
             lane.total_vram_mb = int(total_mb)
-            lane.vram_usage_mb = int(total_mb - self.card_free_mb(lane.device_index))
+            reported_free_mb = self.card_free_mb(lane.device_index)
+            if not self.parent_device_reading and self.child_report_platform == "win32":
+                # A process-local view still counts memory the card no longer has as free.
+                reported_free_mb = min(total_mb, reported_free_mb + self.child_free_view_lie_mb)
+            lane.vram_usage_mb = int(total_mb - reported_free_mb)
             reported_mb = self._lane_charge_mb(lane.process_id)
             if (
                 lane.process_id == _SAFETY_PROCESS_ID
@@ -3723,7 +3765,11 @@ class _DispatchWorld:
         preload or dispatch admission happened to prime, which can be many ticks old.
         """
         self.snapshot = self._scheduler.build_vram_arbiter_snapshot(
-            device_free_mb_by_device={index: self.card_free_mb(index) for index in self._card_totals},
+            device_free_mb_by_device={
+                index: reading
+                for index in self._card_totals
+                if (reading := self.parent_device_free_mb(index)) is not None
+            },
         )
         self._scheduler._ensure_preload_arbiter().begin_cycle(self.snapshot)
 
@@ -3748,8 +3794,13 @@ class _DispatchWorld:
             self._evaluate_one_card_governor(device_index)
 
     def _evaluate_one_card_governor(self, device_index: int) -> None:
-        """Fold one card's reading through its governor and advance that card's reclaim episode."""
-        device_free_mb = self.card_free_mb(device_index)
+        """Fold one card's reading through its governor and advance that card's reclaim episode.
+
+        A card the parent has no reading for is left ungoverned, as the manager leaves it.
+        """
+        device_free_mb = self.parent_device_free_mb(device_index)
+        if device_free_mb is None:
+            return
         sample = self._governor.observe(
             device_index,
             device_free_mb=device_free_mb,
