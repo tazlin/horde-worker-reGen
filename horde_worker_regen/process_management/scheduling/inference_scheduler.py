@@ -652,6 +652,9 @@ class InferenceScheduler:
         # other grant on its card, no reclaim in flight). Absent while either holds. It times the waiter's
         # measured-load probe, which must come before the child's lease-acquire timeout samples it unpriced.
         self._clearance_starved_since: dict[str, float] = {}
+        # When clearance first held each staged job, which bounds the waiter's measured-load probe. A reclaim never
+        # stops it, since the child's lease-acquire timeout runs from the start of its wait.
+        self._clearance_held_since: dict[str, float] = {}
         # The lane rung last applied per staged job in its current starvation episode. Applying a rung stops the
         # clearance clock, so the next rung is spaced by this rung's grade. It ends with the episode, wherever
         # the clock is stopped for anything other than the job's own reclaim.
@@ -6049,6 +6052,8 @@ class InferenceScheduler:
             if plan.grants:
                 self._note_clearance_granted(job)
             return plan.grants
+        if not plan.grants and job.id_ is not None:
+            self._clearance_held_since.setdefault(str(job.id_), self._clock())
         if plan.decision is ClearanceDecision.HOLD_POST_PROCESSING:
             self._stop_staged_waiter_clock(job)
             self._note_clearance_hold(job, reclaim_applied=False)
@@ -6131,7 +6136,7 @@ class InferenceScheduler:
 
     @staticmethod
     def _staged_waiter_past_its_deadline(plan: ClearancePlan) -> bool:
-        """Whether a refused staged waiter has been starved past the deadline its one real load was bounded by.
+        """Whether a refused staged waiter has waited past the deadline its one real load was bounded by.
 
         The deadline sits inside the child's lease-acquire timeout by the card's probe and load seconds, so a
         waiter still refused at the deadline has no priced path left before the child samples on its own.
@@ -6140,7 +6145,8 @@ class InferenceScheduler:
             return False
         request = plan.priced.request
         deadline = request.attempt_deadline_seconds
-        return deadline is not None and request.starved_seconds >= deadline
+        lease_wait = request.lease_wait_seconds
+        return deadline is not None and lease_wait is not None and lease_wait >= deadline
 
     def _staged_waiter_clock(
         self,
@@ -6154,9 +6160,12 @@ class InferenceScheduler:
         The clock also carries the job's expected seconds per step and the card's measured weight-upload rate,
         which size the share of weights a partial-load seat must hold.
         """
-        since = self._clearance_starved_since.get(str(job.id_)) if job is not None and job.id_ is not None else None
+        job_id = str(job.id_) if job is not None and job.id_ is not None else None
+        since = self._clearance_starved_since.get(job_id) if job_id is not None else None
+        held_since = self._clearance_held_since.get(job_id) if job_id is not None else None
         return StagedWaiterClock(
             starved_seconds=0.0 if since is None else max(0.0, self._clock() - since),
+            lease_wait_seconds=None if held_since is None else max(0.0, self._clock() - held_since),
             load_seconds=(
                 self._process_map.recent_vram_load_seconds(process_info.device_index)
                 if process_info is not None
@@ -6243,14 +6252,20 @@ class InferenceScheduler:
         """Whether something on the waiter's card may still change its fit without a load of its own.
 
         Another inference lane past its own clearance (sampling, loading, decoding) frees or takes room as it
-        runs, and an eviction issued but not yet evidenced at the device frees room when it lands. A lane still
-        primed is another waiter, which changes nothing while it waits.
+        runs, a post-processing chain returns its room when it ends, and an eviction issued but not yet evidenced
+        at the device frees room when it lands. A lane still primed is another waiter, which changes nothing
+        while it waits.
         """
         pending_evictions = self._retention.pending_eviction_process_ids()
         for other in self._process_map.values():
             if other.process_id == process_info.process_id or other.device_index != process_info.device_index:
                 continue
             if other.process_id in pending_evictions:
+                return True
+            if (
+                other.process_type == HordeProcessType.POST_PROCESS
+                and other.last_process_state == HordeProcessState.POST_PROCESSING
+            ):
                 return True
             if other.process_type != HordeProcessType.INFERENCE:
                 continue
@@ -6265,6 +6280,8 @@ class InferenceScheduler:
         in_progress_ids = {str(job.id_) for job in self._job_tracker.jobs_in_progress if job.id_ is not None}
         for job_id in [job_id for job_id in self._clearance_starved_since if job_id not in in_progress_ids]:
             del self._clearance_starved_since[job_id]
+        for job_id in [job_id for job_id in self._clearance_held_since if job_id not in in_progress_ids]:
+            del self._clearance_held_since[job_id]
         for job_id in [job_id for job_id in self._lane_rung_episodes if job_id not in in_progress_ids]:
             del self._lane_rung_episodes[job_id]
         for process_info in self._process_map.values():
@@ -6345,9 +6362,13 @@ class InferenceScheduler:
             self._dispatch_holds.note_clearance_hold(str(job.id_))
 
     def _note_clearance_granted(self, job: ImageGenerateJobPopResponse | None) -> None:
-        """Record that ``job`` was granted its load-and-sample window, so its charges stand in full beside a head."""
+        """Record that ``job`` was granted its load-and-sample window, so its charges stand in full beside a head.
+
+        The job's lease wait ends with the grant, so a later staging of the same job starts a fresh one.
+        """
         if job is not None and job.id_ is not None:
             self._dispatch_holds.note_clearance_granted(str(job.id_))
+            self._clearance_held_since.pop(str(job.id_), None)
 
     def _resolve_clearance_hold(self, job: ImageGenerateJobPopResponse) -> None:
         """Clear any clearance hold on ``job`` now that its materialisation fits (idempotent)."""

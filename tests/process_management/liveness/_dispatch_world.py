@@ -796,6 +796,7 @@ class _DispatchWorld:
         ram_report_interval_seconds: float = 0.0,
         staged_encode_mb_by_model: Mapping[str, float] | None = None,
         service_lane_exit_seconds: float | None = None,
+        foreign_vram_mb_by_tick: Mapping[int, float] | None = None,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -837,6 +838,10 @@ class _DispatchWorld:
                 A paused lane's process keeps its context on the card until this long has passed, and then
                 leaves the process map (safety is replaced under a new launch), as the lane's replacement state
                 machine ends it.
+            foreign_vram_mb_by_tick: Device memory on the row's first card that no lane holds, set to the value
+                scripted for a tick from that tick on. It stands for a residue the parent cannot attribute, or for
+                another program.
+                It is in the device-free reading and in no lane's report. None keeps the card the lanes' alone.
             disaggregated: Whether the row's jobs are disaggregation-class, so a sampler is priced for the
                 UNet it holds alone rather than for a whole job.
             closed_loop: Whether to close the loop between policy and the card: the device-free governor and
@@ -1207,6 +1212,9 @@ class _DispatchWorld:
         """What each tick looked like to the verdicts that judge whether the card was earning."""
 
         self._service_contexts = service_contexts
+        self._foreign_vram_mb_by_tick = dict(foreign_vram_mb_by_tick or {})
+        self._foreign_vram_mb = 0.0
+        """The first card's device memory no lane holds, as last scripted."""
         self.service_lane_exit_seconds = service_lane_exit_seconds
         """How long a paused service lane's process takes to exit, or None when lanes are not modelled exiting."""
         self._service_lane_exits_at: dict[int, float] = {}
@@ -1754,7 +1762,8 @@ class _DispatchWorld:
             for lane_id, charge_mb in charges.items()
             if self._card_of(lane_id) == device_index
         )
-        return self._context_charge_mb(device_index) + held
+        foreign_mb = self._foreign_vram_mb if device_index == min(self._card_totals) else 0.0
+        return self._context_charge_mb(device_index) + held + foreign_mb
 
     def card_free_mb(self, device_index: int) -> float:
         """The truthful device-free reading for one card: its total less its contexts, weights and activation.
@@ -3764,6 +3773,7 @@ class _DispatchWorld:
         """Advance one scheduling tick, in the control loop's order."""
         self.tick += 1
         self.now += self.tick_seconds
+        self._foreign_vram_mb = self._foreign_vram_mb_by_tick.get(self.tick, self._foreign_vram_mb)
         if self.host_ram is not None:
             # Host pressure moves on its own clock, and the reclaim it forces lands before any child acts.
             self.host_ram.apply_foreign_script(self.tick)

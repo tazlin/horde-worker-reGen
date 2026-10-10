@@ -544,10 +544,11 @@ async def _refused_past_its_deadline(
     scheduler, job, waiter = await _staged_waiter(device_free_mb=100.0)
     real_plan = _decide(scheduler, 0)
     assert real_plan.verdict is not None and real_plan.priced is not None
-    # Refused, and starved past the deadline the one real load was bounded by.
+    # Refused, and waiting past the deadline the one real load was bounded by.
     starved_request = replace(
         real_plan.priced.request,
         starved_seconds=50.0,
+        lease_wait_seconds=50.0,
         attempt_deadline_seconds=40.0,
         wddm_paging_active=wddm_paging_active,
     )

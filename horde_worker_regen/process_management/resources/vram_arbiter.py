@@ -458,8 +458,12 @@ class VramRequest:
     The teardown grace by default (once the ladder is empty, waiting longer buys nothing); the scheduler sets
     it from the card's ``measured_load_probe_seconds``."""
     attempt_deadline_seconds: float | None = None
-    """For a staged waiter, the starved reading by which its measured-load probe must be eligible, so it comes
-    before the child's lease-acquire timeout makes the same load unpriced. None leaves the delay uncapped."""
+    """For a staged waiter, the :attr:`lease_wait_seconds` reading by which its measured-load probe must be
+    eligible, so it comes before the child's lease-acquire timeout makes the same load unpriced. None for a head
+    with no lease timeout."""
+    lease_wait_seconds: float | None = None
+    """For a staged waiter, seconds since clearance first held it, the clock its child's lease-acquire timeout runs
+    on. A reclaim leaves it running, where it stops :attr:`starved_seconds`. None outside clearance."""
     sampling_peak_mb: float | None = None
     active_sampling_peaks_total_mb: float | None = None
     """The live sum (MB) of the in-flight disaggregated sampling peaks at the moment of this request, for
@@ -1303,7 +1307,7 @@ class VramArbiter:
         from an impossible one; the band continues to describe the uncertainty the ceiling allowance is sized
         from (see :data:`_CEILING_ATTEMPT_OVERSHOOT_CAP_MB`).
         """
-        if request.starved_seconds < self._probe_delay_seconds(request, measured):
+        if not self._probe_due(request, measured):
             return False
         if measured.available_mb is None:
             return False
@@ -1314,29 +1318,45 @@ class VramArbiter:
         # speculative load waits for it (reclaim before speculation), so the probe never pre-empts a pause.
         return room is None or not room.closable
 
+    @classmethod
+    def _probe_due(cls, request: VramRequest, measured: AdmissionVerdict) -> bool:
+        """Whether the head has waited long enough for its one real load.
+
+        It has once it has starved for its probe delay. A staged waiter also has once its lease wait reaches
+        its deadline while it is starved, however often a reclaim has restarted its starved clock, because its
+        child's timeout counts from the start of the wait. A waiter whose starved clock is stopped is queued
+        behind work that can still free room, and the deadline does not admit it beside that work.
+        """
+        if request.starved_seconds >= cls._probe_delay_seconds(request, measured):
+            return True
+        deadline_seconds = request.attempt_deadline_seconds
+        lease_wait_seconds = request.lease_wait_seconds
+        if deadline_seconds is None or lease_wait_seconds is None:
+            return False
+        return request.starved_seconds > 0.0 and lease_wait_seconds >= deadline_seconds
+
     @staticmethod
     def _probe_delay_seconds(request: VramRequest, measured: AdmissionVerdict) -> float:
         """How long the head must have starved before its one real load, sized by how far it misses.
 
         A shortfall inside :data:`_MEASURED_ATTEMPT_BAND_MB` is the shape a conservative prediction makes, and
-        once the ladder is empty waiting on it buys nothing: the card's configured probe delay applies (the
+        once the ladder is empty waiting on it buys nothing, so the card's configured probe delay applies (the
         teardown grace by default). A larger shortfall on a card the worker reads as converged is likelier a
-        tenant the ledger cannot see (a child whose unload returned nothing, a foreign process), and admitting
-        a load into it is the one way this path can produce an out-of-memory; that keeps the long diagnostic
-        horizon, the same wait as before, so the reclaim and attribution machinery has its window first.
+        tenant the ledger cannot see (a child whose unload returned nothing, a foreign process). Admitting a
+        load into it is the one way this path can produce an out-of-memory, so the head keeps the long
+        diagnostic horizon and the reclaim and attribution machinery has its window first.
 
-        A staged waiter's delay never passes its :attr:`VramRequest.attempt_deadline_seconds`, because at its
-        lease-acquire timeout the child makes the same load anyway, unpriced and with no reclaim to wait for.
+        A staged waiter (one with an :attr:`VramRequest.attempt_deadline_seconds`) takes the probe delay at any
+        shortfall. At its lease-acquire timeout its child makes the same load unpriced, so a longer wait only
+        idles the card for the same outcome.
         """
+        if request.attempt_deadline_seconds is not None:
+            return request.probe_after_seconds
         headroom = measured.headroom_mb
         shortfall_mb = -headroom if headroom is not None else float("inf")
         if shortfall_mb <= _MEASURED_ATTEMPT_BAND_MB or request.candidate_measured:
-            delay_seconds = request.probe_after_seconds
-        else:
-            delay_seconds = max(request.probe_after_seconds, _STARVATION_DIAGNOSTIC_SECONDS)
-        if request.attempt_deadline_seconds is None:
-            return delay_seconds
-        return min(delay_seconds, max(0.0, request.attempt_deadline_seconds))
+            return request.probe_after_seconds
+        return max(request.probe_after_seconds, _STARVATION_DIAGNOSTIC_SECONDS)
 
     @staticmethod
     def _card_converged_empty(request: VramRequest, measured: AdmissionVerdict) -> bool:

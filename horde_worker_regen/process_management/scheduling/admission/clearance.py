@@ -123,6 +123,9 @@ class StagedWaiterClock:
     """The performance model's expected seconds per sampling step for the waiter's job, or None when unknown."""
     upload_mb_per_second: float | None = None
     """The rate (MB/s) the card has measured jobs putting their weights on it, or None when none is measured."""
+    lease_wait_seconds: float | None = None
+    """Seconds since clearance first held the waiter. A reclaim leaves it running, since the child's
+    lease-acquire timeout counts from the start of its wait. None for a waiter the caller does not time."""
 
 
 @dataclass
@@ -332,6 +335,7 @@ def decide_clearance_admit(
         staged_waiter=StagedWaiterTerms(
             held_mb=staged_held_mb(snapshot, job_id, process_id),
             starved_seconds=waiter_clock.starved_seconds,
+            lease_wait_seconds=waiter_clock.lease_wait_seconds,
             attempt_deadline_seconds=staged_attempt_deadline_seconds(
                 probe_after_seconds=float(config.measured_load_probe_seconds),
                 load_seconds=waiter_clock.load_seconds,

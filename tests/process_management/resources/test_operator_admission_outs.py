@@ -161,27 +161,69 @@ class TestProbeDelay:
         assert self._probes_at(short_by_gigabytes, _FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0, None) is False
         assert self._probes_at(short_by_gigabytes, _STARVATION_DIAGNOSTIC_SECONDS + 1.0, None) is True
 
-    def test_a_staged_waiters_delay_ends_at_its_deadline(self) -> None:
-        """A staged waiter probes by its deadline, past the band or inside it, so before its lease times out.
+    _DEADLINE_SECONDS = _STARVATION_DIAGNOSTIC_SECONDS - _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
 
-        Uncapped, the long horizon past the band equals the lease-acquire timeout, and the child loads unpriced
-        before the probe can fire.
+    def _staged_probes(
+        self,
+        device_free_mb: float,
+        *,
+        starved_seconds: float,
+        lease_wait_seconds: float,
+        probe_after_seconds: float = _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
+    ) -> bool:
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: self._state(device_free_mb)}))
+        request = replace(
+            self._head(starved_seconds, probe_after_seconds),
+            attempt_deadline_seconds=self._DEADLINE_SECONDS,
+            lease_wait_seconds=lease_wait_seconds,
+        )
+        return arbiter.evaluate(request).measured_attempt
+
+    def test_a_staged_waiter_takes_the_configured_delay_at_any_shortfall(self) -> None:
+        """Past the band a staged waiter still probes after the card's delay, not the diagnostic horizon.
+
+        Its child makes the same load unpriced at its lease-acquire timeout, so the long horizon would only idle
+        the card for the same outcome.
         """
         short_by_gigabytes = 20157.0 - 2 * _MEASURED_ATTEMPT_BAND_MB
-        deadline_seconds = _STARVATION_DIAGNOSTIC_SECONDS - _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
+        grace = _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
+        assert self._staged_probes(short_by_gigabytes, starved_seconds=grace - 1.0, lease_wait_seconds=grace) is False
+        assert self._staged_probes(short_by_gigabytes, starved_seconds=grace + 1.0, lease_wait_seconds=grace) is True
 
-        def probes(device_free_mb: float, starved_seconds: float, probe_after_seconds: float) -> bool:
-            arbiter = VramArbiter()
-            arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: self._state(device_free_mb)}))
-            request = replace(
-                self._head(starved_seconds, probe_after_seconds),
-                attempt_deadline_seconds=deadline_seconds,
+    def test_a_staged_waiters_lease_wait_brings_the_probe_by_its_deadline(self) -> None:
+        """A waiter whose starved clock a reclaim restarted still probes once its lease wait reaches the deadline.
+
+        The failure this encodes: the deadline was read on the starved clock, which each reclaim rung restarts,
+        while the child's lease-acquire timeout counts from the start of its wait. A rung applied after about ten
+        seconds pushed the probe past the timeout, and the child loaded unpriced on an idle card.
+        """
+        slow_probe = _STARVATION_DIAGNOSTIC_SECONDS + 10.0
+        deadline = self._DEADLINE_SECONDS
+        assert (
+            self._staged_probes(
+                20157.0, starved_seconds=5.0, lease_wait_seconds=deadline - 1.0, probe_after_seconds=slow_probe
             )
-            return arbiter.evaluate(request).measured_attempt
+            is False
+        )
+        assert (
+            self._staged_probes(
+                20157.0, starved_seconds=5.0, lease_wait_seconds=deadline + 1.0, probe_after_seconds=slow_probe
+            )
+            is True
+        )
 
-        assert probes(short_by_gigabytes, deadline_seconds - 1.0, _FIRST_PARTY_TEARDOWN_GRACE_SECONDS) is False
-        assert probes(short_by_gigabytes, deadline_seconds + 1.0, _FIRST_PARTY_TEARDOWN_GRACE_SECONDS) is True
-        assert probes(20157.0, deadline_seconds + 1.0, _STARVATION_DIAGNOSTIC_SECONDS + 10.0) is True
+    def test_a_waiter_behind_live_work_is_not_probed_at_its_deadline(self) -> None:
+        """A stopped starved clock means work on the card can still free room, so the deadline admits nothing."""
+        assert (
+            self._staged_probes(
+                20157.0,
+                starved_seconds=0.0,
+                lease_wait_seconds=self._DEADLINE_SECONDS + 1.0,
+                probe_after_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 10.0,
+            )
+            is False
+        )
 
 
 class TestWholeNeedCeiling:

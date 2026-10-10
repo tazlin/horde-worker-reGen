@@ -141,6 +141,11 @@ The failures encoded here:
   therefore priced against a reading with the chain's room still in it, its load and the chain's upscale then
   shared a card that could hold either alone, and the card overcommitted. That is the ``post-processing
   chain`` scenario, and its reinjection books the chain as the flat entry alone.
+- **A waiter nothing can help idles the card.** A staged waiter the ladder could not seat waited the
+  diagnostic horizon, clamped to a deadline read on its starved clock, before its one measured load. A lane rung
+  restarts that clock, so a waiter still short after its rungs waited past its lease-acquire timeout and
+  loaded unpriced on an idle card. That is the ``waiter nothing can help`` scenario, and its reinjection restores
+  the horizon and the starved-clock deadline.
 - **A band's batched peaks price its single images.** The learned sampling price was one window per baseline
   and resolution band, priced at its second-highest job, so batched traffic in the band priced every
   single-image job at a batched decode peak. Two single-image SDXL jobs a 24 GB card holds at once were never
@@ -3271,6 +3276,127 @@ async def test_r_a_head_starved_by_three_lanes_waits_one_grace_not_three() -> No
     )
 
 
+_UNSEEN_TENANT_MB = 900.0
+"""Device memory no lane holds that the row puts on the card. It stands for what an idle lane kept after its model
+left for host RAM, in the shortfall that held a large model for its whole lease-acquire timeout."""
+
+_UNSEEN_TENANT_SHAPES = {
+    "from_the_start": 1,
+    "after_the_first_lane_rung": int(13.0 / _LANE_RUNG_TICK_SECONDS),
+}
+"""When the unseen tenant arrives, as the tick it is scripted on. From the start, no lane rung can close the
+shortfall and none is taken. Just after the first rung (the post-processing lane, paused near 12 s), the rung
+returns its room and the head is still short."""
+
+_UNSEEN_TENANT_SLACK_SECONDS = 3.0
+"""Seconds past the probe delay the grant may land, enough for a lane exit and the readings after it."""
+
+
+def _unseen_tenant_world(arrival_tick: int) -> _DispatchWorld:
+    """The three-lane starved card with an unseen tenant scripted onto it at ``arrival_tick``."""
+    return _DispatchWorld(
+        card=_LANE_STARVED_CARD,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        tick_seconds=_LANE_RUNG_TICK_SECONDS,
+        service_contexts=True,
+        safety_off_gpu_allowed=True,
+        service_lane_exit_seconds=_LANE_EXIT_SECONDS,
+        foreign_vram_mb_by_tick={arrival_tick: _UNSEEN_TENANT_MB},
+    )
+
+
+async def _drive_unseen_tenant_waiter(world: _DispatchWorld) -> tuple[ImageGenerateJobPopResponse, float]:
+    """Queue one SDXL job and run the row past the lease-acquire timeout. Returns the job and its start instant."""
+    width, height = _CLEARANCE_JOB_SHAPE
+    job = make_job_pop_response(_SDXL.name, width=width, height=height, ddim_steps=20)
+    started_at = world.now
+    await world.pop(job)
+    for _ in range(int(CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS / _LANE_RUNG_TICK_SECONDS) + 20):
+        await world.step()
+        if world.dispatch_tick(job) is not None:
+            break
+    return job, started_at
+
+
+@pytest.mark.parametrize("arrival", sorted(_UNSEEN_TENANT_SHAPES))
+async def test_r_a_waiter_nothing_can_help_is_probed_one_delay_after_its_last_rung(arrival: str) -> None:
+    """A staged waiter short by a tenant no reclaim can free is probed a probe delay after its ladder is spent.
+
+    The failure this encodes: a staged waiter the ladder could not seat waited the diagnostic horizon before its
+    one measured load, clamped to a deadline read on its starved clock. The horizon gives reclaim a window before a
+    load goes into a tenant the ledger cannot see. The child makes that same load unpriced at its lease-acquire
+    timeout, so for a staged waiter the horizon only idled the card. A lane rung also restarts the
+    starved clock, so a waiter still short after its rungs reached its timeout first. On a 24 GB card a large
+    model short by 871 MB of an idle lane's residue held the card idle for its whole 60 s timeout.
+
+    Read as one statement: once nothing the worker does can seat a staged waiter, its one real load comes a
+    probe delay later. Its consequences are that the job is cleared by the measured load within a probe delay of
+    its last rung (or of its arrival when none is taken), and that no lane reaches its lease-acquire timeout.
+    """
+    world = _unseen_tenant_world(_UNSEEN_TENANT_SHAPES[arrival])
+
+    job, started_at = await _drive_unseen_tenant_waiter(world)
+
+    context = f"waiter nothing can help (tenant {arrival.replace('_', ' ')})"
+    lane_rungs = [now for _tick, now, _process_id, _owner in world.service_lane_pauses]
+    if arrival == "after_the_first_lane_rung":
+        assert lane_rungs, f"precondition: no lane rung was taken before the tenant arrived. {world.state_dump()}"
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout. "
+        f"{world.state_dump()}"
+    )
+    grant = next((tick for tick, _lane, job_id in world.clearance_grants if job_id == str(job.id_)), None)
+    assert grant is not None, f"{context}: the job was never cleared. {world.state_dump()}"
+    assert world.scheduler._ensure_preload_arbiter().measured_attempts == 1, (
+        f"{context}: the grant was not the measured load, so the tenant did not hold the job off the card. "
+        f"{world.state_dump()}"
+    )
+    spent_at = max(lane_rungs, default=started_at)
+    probe_delay = float(world.scheduler._runtime_config.bridge_data.measured_load_probe_seconds)
+    granted_after = started_at + grant * _LANE_RUNG_TICK_SECONDS - spent_at
+    assert granted_after <= probe_delay + _UNSEEN_TENANT_SLACK_SECONDS, (
+        f"{context}: the job was cleared {granted_after:.1f}s after the ladder was spent, past the "
+        f"{probe_delay:.0f}s probe delay. {world.state_dump()}"
+    )
+
+
+async def test_r_defect_reinjection_the_horizon_and_the_starved_deadline_time_out_a_waiter_after_its_rung(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect reinjection: with the long horizon and a deadline read on the starved clock, the waiter times out.
+
+    The rung near 12 s restarts the starved clock, and the deadline it is clamped to falls past the child's
+    lease-acquire timeout, so the job samples unpriced.
+    """
+    from horde_worker_regen.process_management.resources import vram_arbiter as arbiter_mod
+
+    def horizon_due(_cls: object, request: arbiter_mod.VramRequest, measured: object) -> bool:
+        headroom = measured.headroom_mb  # type: ignore[attr-defined]
+        shortfall_mb = -headroom if headroom is not None else float("inf")
+        if shortfall_mb <= arbiter_mod._MEASURED_ATTEMPT_BAND_MB or request.candidate_measured:
+            delay = request.probe_after_seconds
+        else:
+            delay = max(request.probe_after_seconds, arbiter_mod._STARVATION_DIAGNOSTIC_SECONDS)
+        if request.attempt_deadline_seconds is not None:
+            delay = min(delay, request.attempt_deadline_seconds)
+        return request.starved_seconds >= delay
+
+    monkeypatch.setattr(arbiter_mod.VramArbiter, "_probe_due", classmethod(horizon_due))
+    world = _unseen_tenant_world(_UNSEEN_TENANT_SHAPES["after_the_first_lane_rung"])
+
+    job, _started_at = await _drive_unseen_tenant_waiter(world)
+
+    assert [job_id for _tick, _lane, job_id in world.clearance_timeouts] == [str(job.id_)], (
+        "with the horizon and the starved-clock deadline the waiter must reach its lease-acquire timeout; the run "
+        f"recorded {world.clearance_timeouts}. {world.state_dump()}"
+    )
+
+
 _SIBLING_ENCODE_MB = 554.0
 """What the light sibling's encode holds on the card: about a quarter of the staging charge booked for it."""
 
@@ -3357,25 +3483,21 @@ async def test_r_a_primed_sibling_behind_the_clearance_head_is_charged_what_it_h
     )
 
 
-async def test_r_defect_reinjection_a_waiter_whose_holdings_are_not_presented_waits_for_its_deadline(
+async def test_r_defect_reinjection_a_waiter_whose_holdings_are_not_presented_waits_its_probe_delay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With clearance presenting none of what the staged job holds, the lone waiter is priced only at its deadline.
+    """With clearance presenting none of what the staged job holds, the lone waiter is priced only after its delay.
 
     Reinjected at the ceiling test alone: the same card, the same dispatch and the same staging reservation, and
     the only difference is that the job's whole need is read as its outstanding charge, under the card's
     achievable ceiling, so the card is never judged impossible and the ceiling attempt that clears the job
-    inside a few ticks never fires. What is left is the clearance clock: the measured attempt comes only at
-    the deadline it sets below the lease-acquire timeout, after most of a minute of dead card time.
+    inside a few ticks never fires. What is left is the clearance clock, and the measured attempt comes only
+    once the waiter has starved for the card's probe delay.
     """
     monkeypatch.setattr(clearance_mod, "staged_held_mb", lambda *_args: 0.0)
     world = _clearance_world()
-    deadline_ticks = int(
-        clearance_mod.staged_attempt_deadline_seconds(
-            probe_after_seconds=float(world._scheduler._runtime_config.bridge_data.measured_load_probe_seconds),
-            load_seconds=None,
-        )
-        / _TICK_SECONDS,
+    delay_ticks = int(
+        float(world._scheduler._runtime_config.bridge_data.measured_load_probe_seconds) / _TICK_SECONDS,
     )
 
     job = await _drive_lone_staged_waiter(world)
@@ -3385,10 +3507,10 @@ async def test_r_defect_reinjection_a_waiter_whose_holdings_are_not_presented_wa
         f"blind to its holdings; the run recorded {world.clearance_timeouts}. {world.state_dump()}"
     )
     dispatch_tick = world.dispatch_tick(job)
-    assert dispatch_tick is not None and dispatch_tick >= deadline_ticks, (
-        "a ceiling blind to the job's holdings cannot fire the ceiling attempt, so the job waits for the clock's "
-        f"deadline ({deadline_ticks} ticks); this run reached sampling on tick {dispatch_tick}. "
-        f"{world.state_dump()}"
+    assert dispatch_tick is not None and dispatch_tick > _CLEARANCE_TICK_CEILING and dispatch_tick >= delay_ticks, (
+        "a ceiling blind to the job's holdings cannot fire the ceiling attempt, so the job waits for the probe "
+        f"delay ({delay_ticks} ticks) past the {_CLEARANCE_TICK_CEILING} ticks the ceiling attempt takes; this run "
+        f"reached sampling on tick {dispatch_tick}. {world.state_dump()}"
     )
     assert dispatch_tick < _CLEARANCE_TIMEOUT_TICKS, (
         f"the deadline attempt must land inside the {CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f}s timeout; "

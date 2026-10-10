@@ -955,20 +955,23 @@ The room is also what the other frames read, so they cannot disagree with the ve
   then reports. The episode ends wherever the clock is stopped for anything other than the head's own reclaim
   (a grant, another lane's work on the card, a pending eviction), and the next rung then waits the grace again.
 - **The measured-load probe** fires once the ladder is empty and the head has starved `measured_load_probe_seconds`
-  (the teardown grace by default). It never pre-empts a rung that could close the deficit, and a shortfall
-  larger than the measured-attempt band keeps the longer diagnostic horizon: a big miss on a card the worker
-  reads as empty is likelier a tenant the ledger cannot see (a child whose unload returned nothing, a foreign
-  process) than arithmetic, and a load into it is the one way this path can produce an out-of-memory. A spent
-  probe is re-armed when the process that carried it goes away.
+  (the teardown grace by default). It never pre-empts a rung that could close the deficit. For an undispatched
+  head a shortfall larger than the measured-attempt band keeps the longer diagnostic horizon. A big miss on a card
+  the worker reads as empty is likelier a tenant the ledger cannot see (a child whose unload returned nothing, a
+  foreign process) than arithmetic, and a load into it is the one way this path can produce an out-of-memory. A
+  spent probe is re-armed when the process that carried it goes away.
 - **A staged waiter is timed by clearance.** The head-starvation clock times a job's wait for dispatch and
   never answers for a job in progress. At clearance the probe reads the scheduler's clearance clock instead:
   seconds the waiter has been held while waiting could not help. A sampler or any other lane past its own
-  clearance on the card, an eviction issued and not yet evidenced, a hold that ran reclaim, a grant and a
-  post-processing hold each stop it, and the next hold where nothing helps starts it again. The waiter's delay,
-  the longer horizon past the band included, ends by the lease-acquire timeout less the longer of
-  `measured_load_probe_seconds` and the card's measured load seconds, because at the timeout the child makes
-  the same load anyway, unpriced. Reclaim keeps its turn: the probe still needs a converged card with no rung
-  left that could close the deficit.
+  clearance on the card, a post-processing chain running on the card, an eviction issued and not yet
+  evidenced, a hold that ran reclaim, a grant and a post-processing hold each stop it, and the next hold where
+  nothing helps starts it again. A staged waiter takes `measured_load_probe_seconds` at any shortfall, without
+  the longer horizon. At its lease-acquire timeout its child makes the same load unpriced, so the horizon would
+  only idle the card for the same outcome. The scheduler also keeps the waiter's lease wait, seconds since
+  clearance first held it, which no reclaim stops. Once that reaches the lease-acquire timeout less the longer
+  of the probe delay and the card's measured load seconds, the probe is due while the waiter is starved, however
+  often a rung restarted its clearance clock. Reclaim keeps its turn, since the probe still needs a converged
+  card with no rung left that could close the deficit.
 - **A refusal past the deadline holds the waiter unless its sample is known to crash.** The unpriced sample
   at the lease-acquire timeout can succeed, since clearance prices the whole weights and ComfyUI can load
   a checkpoint partially. Two conditions make the refusal terminal: the driver paging the worker's

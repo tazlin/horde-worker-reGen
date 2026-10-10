@@ -63,7 +63,9 @@ class StagedWaiterTerms:
     starved_seconds: float
     """The clearance clock: seconds the waiter has been held where waiting could not help."""
     attempt_deadline_seconds: float
-    """The clock reading by which its measured-load probe must be eligible."""
+    """The lease-wait reading by which its measured-load probe must be eligible."""
+    lease_wait_seconds: float | None = None
+    """Seconds since clearance first held the waiter, never stopped by a reclaim, or None when untimed."""
     lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG
     """Where the waiter's starvation episode stands with the service-lane rungs applied for it."""
     seat_weight_fraction: float = pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION
@@ -230,6 +232,7 @@ def build_materialization_request(
         ),
         probe_after_seconds=float(config.measured_load_probe_seconds),
         attempt_deadline_seconds=staged_waiter.attempt_deadline_seconds if staged_waiter is not None else None,
+        lease_wait_seconds=staged_waiter.lease_wait_seconds if staged_waiter is not None else None,
         lane_rung_grade=staged_waiter.lane_rung_grade if staged_waiter is not None else LaneRungGrade.NO_RUNG,
         has_reclaimable_idle_tenancy=pricing.has_reclaimable_idle_tenancy(
             snapshot,
