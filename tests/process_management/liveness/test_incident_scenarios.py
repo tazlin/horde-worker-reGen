@@ -146,6 +146,10 @@ The failures encoded here:
   restarts that clock, so a waiter still short after its rungs waited past its lease-acquire timeout and
   loaded unpriced on an idle card. That is the ``waiter nothing can help`` scenario, and its reinjection restores
   the horizon and the starved-clock deadline.
+- **A residency kept safety beside a job it could not seat.** With safety held on the GPU by configuration, a
+  residency moved it off only when the model's weights could not fit beside it. A large LoRA job whose weights
+  fit beside safety but whose whole need did not was held at clearance with the card idle. That is the
+  ``residency safety`` scenario, and its reinjection decides on the weights alone.
 - **A chain's static estimate holds the card.** A post-processing chain was booked at hordelib's static
   estimate, gigabytes above what the lane grew by, and the booking decays only as the lane's reservation grows.
   The next job was held off a card that held it beside the chain. That is the ``learned chain`` scenario, and
@@ -3277,6 +3281,91 @@ async def test_r_a_head_starved_by_three_lanes_waits_one_grace_not_three() -> No
     assert not world.clearance_timeouts, (
         f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout. "
         f"{world.state_dump()}"
+    )
+
+
+_RESIDENCY_SAFETY_CARD = _CardClass("residency_safety", 21504.0)
+"""A card on which the extra-large model's weights fit beside safety and its LoRA job's whole need does not."""
+
+_RESIDENCY_SAFETY_GRANT_CEILING_SECONDS = 3.0
+"""Seconds from the job's arrival to its grant, enough for the residency's establishment and one clearance pass."""
+
+
+async def _drive_residency_safety_job(*, lora: bool) -> tuple[_DispatchWorld, ImageGenerateJobPopResponse, float]:
+    """One extra-large job on a card whose operator keeps safety on the GPU. Returns the world, job and start."""
+    from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
+
+    world = _DispatchWorld(
+        card=_RESIDENCY_SAFETY_CARD,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=1,
+        whole_card_enabled=True,
+        closed_loop=True,
+        clearance_lease=True,
+        service_contexts=True,
+        safety_off_gpu_allowed=False,
+        service_lane_exit_seconds=_LANE_EXIT_SECONDS,
+        tick_seconds=_LANE_RUNG_TICK_SECONDS,
+        extra_model_classes=(_KREA2,),
+    )
+    loras = [LorasPayloadEntry(name="some_lora", model=1.0, clip=1.0)] if lora else None
+    job = make_job_pop_response(_KREA2.name, width=1024, height=1024, ddim_steps=8, loras=loras)
+    started_at = world.now
+    await world.pop(job)
+    for _ in range(int(CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS / _LANE_RUNG_TICK_SECONDS) + 20):
+        await world.step()
+        if world.dispatch_tick(job) is not None:
+            break
+    return world, job, started_at
+
+
+@pytest.mark.parametrize("lora", [True, False], ids=["lora_job", "plain_job"])
+async def test_r_a_residency_moves_safety_only_for_a_job_clearance_cannot_seat_beside_it(lora: bool) -> None:
+    """A residency moves safety off at once for a job that cannot be seated beside it, and keeps it otherwise.
+
+    The failure this encodes: with safety held on the GPU by configuration, a residency moved safety off only when
+    its model's weights could not fit beside it. Clearance prices the job's whole need. A LoRA job of a large model
+    cannot be seated partially, so one whose weights fit beside safety and whose need did not was held at
+    clearance on an idle card until the runtime placement's sustained-pressure dwell moved safety anyway.
+
+    Read as one statement: the residency moves safety when clearance could not seat its job beside it. Its
+    consequences are that the LoRA job is granted at once by price, with safety moved at the residency's
+    establishment, and that the plain job, which clearance seats partially, is granted with safety left on the GPU.
+    """
+    world, job, _started_at = await _drive_residency_safety_job(lora=lora)
+
+    context = f"residency safety ({'LoRA' if lora else 'plain'} job)"
+    grant = next((tick for tick, _lane, job_id in world.clearance_grants if job_id == str(job.id_)), None)
+    assert grant is not None, f"{context}: the job was never cleared. {world.state_dump()}"
+    granted_after = grant * _LANE_RUNG_TICK_SECONDS
+    assert granted_after <= _RESIDENCY_SAFETY_GRANT_CEILING_SECONDS, (
+        f"{context}: the job was cleared {granted_after:.1f}s after it arrived, past the "
+        f"{_RESIDENCY_SAFETY_GRANT_CEILING_SECONDS:.0f}s an establishment and one clearance pass take. "
+        f"{world.state_dump()}"
+    )
+    assert world.scheduler._ensure_preload_arbiter().measured_attempts == 0, (
+        f"{context}: the job was cleared by a speculative load, not by price. {world.state_dump()}"
+    )
+    safety_moved = bool(world.safety_pause_events)
+    assert safety_moved is lora, (
+        f"{context}: safety {'was' if safety_moved else 'was not'} moved off the card "
+        f"({world.safety_pause_events}). {world.state_dump()}"
+    )
+
+
+async def test_r_defect_reinjection_a_weight_test_holds_a_lora_job_beside_safety(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect reinjection: deciding on the weights alone, the LoRA job is held beside safety and not priced in."""
+    monkeypatch.setattr(InferenceScheduler, "_residency_head_need_mb", lambda _self, _model, **_kwargs: None)
+    world, job, _started_at = await _drive_residency_safety_job(lora=True)
+
+    grant = next((tick for tick, _lane, job_id in world.clearance_grants if job_id == str(job.id_)), None)
+    assert not world.safety_pause_events, f"weights alone moved safety: {world.safety_pause_events}"
+    assert grant is None or grant * _LANE_RUNG_TICK_SECONDS > _RESIDENCY_SAFETY_GRANT_CEILING_SECONDS, (
+        f"the LoRA job was cleared at once beside safety with the weights deciding, so this row no longer "
+        f"distinguishes the job's need from the weights. {world.state_dump()}"
     )
 
 

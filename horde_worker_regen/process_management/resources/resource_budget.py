@@ -485,6 +485,17 @@ class StreamForecast:
             return 0.0
         return max(0.0, self.free_if_alone_mb - self.admission_noise_mb - self.unpausable_tenancy_mb)
 
+    def sole_residency_room_mb(self, resident_context_mb: float) -> float | None:
+        """The room (MB) a job has at sole residency with ``resident_context_mb`` still on the card, or None.
+
+        In the measured admission's frame (net of the noise buffer and the tenancy no teardown returns), so a
+        job's priced need compared with it is the comparison clearance makes on the emptied card. None when the
+        card is unsized.
+        """
+        if self.free_if_alone_mb is None:
+            return None
+        return max(0.0, self._free_if_alone_measured_mb - max(0.0, resident_context_mb))
+
     @property
     def _residency_is_intent_driven(self) -> bool:
         """Whether the sole-residency claim comes from the baseline's declared intent rather than its weights.

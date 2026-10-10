@@ -2143,12 +2143,17 @@ class InferenceScheduler:
         return device_index == self._safety_gpu_card()
 
     def _residency_cannot_fit_beside_safety(self, device_index: int | None) -> bool:
-        """Whether the residency held on this card is for a model that cannot fit beside safety's context.
+        """Whether the residency held on this card is for a job that cannot fit beside safety's context.
 
-        It cannot when the forecast's sole-residency fit excludes safety's footprint and the live reading does not
-        already hold the weights with safety still on the card. The answer is latched for the residency: once
-        safety leaves, the live reading would say the model fits and bring safety straight back. False with no
-        residency or no forecast, so the operator's keep-safety-on-GPU choice stands wherever the model fits.
+        The residency's jobs are priced at the need clearance admits them at (:meth:`_residency_head_need_mb`),
+        and the heaviest of them must fit the emptied card's room with safety's footprint still on it, or the
+        live reading net of the noise buffer. A residency is granted on its weights alone, since a model whose
+        weights fit the card can run there. Clearance holds a job whose need does not fit, so a test on the
+        weights kept safety on the card while clearance held the job for the room safety took. With no queued
+        job for the model, or an unsized card, the forecast's weight fit decides. The answer is latched for the
+        residency, since once safety leaves the live reading would say the job fits and bring safety straight
+        back. False with no residency or no forecast, so the operator's keep-safety-on-GPU choice stands wherever
+        the job fits.
         """
         state = self._whole_card_ledger.state_for(device_index)
         if state.model is None or state.forecast is None:
@@ -2156,12 +2161,70 @@ class InferenceScheduler:
             return False
         if device_index in self._residencies_displacing_safety:
             return True
-        if state.forecast.fits_alone_beside(self._safety_footprint_mb()):
-            return False
-        if self._whole_card_weights_fit_live(state.forecast, device_index=device_index, model=state.model):
-            return False
+        room_mb = state.forecast.sole_residency_room_mb(self._safety_footprint_mb())
+        need_mb = (
+            None
+            if room_mb is None
+            else self._residency_head_need_mb(state.model, room_mb=room_mb, device_index=device_index)
+        )
+        if room_mb is None or need_mb is None:
+            if state.forecast.fits_alone_beside(self._safety_footprint_mb()):
+                return False
+            if self._whole_card_weights_fit_live(state.forecast, device_index=device_index, model=state.model):
+                return False
+        else:
+            if need_mb <= room_mb:
+                return False
+            if self._residency_need_fits_live(state, need_mb, device_index=device_index):
+                return False
         self._residencies_displacing_safety.add(device_index)
         return True
+
+    def _residency_head_need_mb(self, model: str, *, room_mb: float, device_index: int | None) -> float | None:
+        """The need (MB) clearance admits the heaviest queued or running job of ``model`` at, or None with none.
+
+        A job is priced at its sampling need (:meth:`_sampling_peak_mb`). One whose need exceeds ``room_mb`` but
+        that clearance would seat partially (:func:`pricing.partial_seat_mb`, at the largest weight share a seat
+        asks) is priced at its seat, since clearance admits it there beside safety.
+        """
+        snapshot: SchedulingSnapshot | None = None
+        needs: list[float] = []
+        for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress):
+            if job.model != model:
+                continue
+            need_mb = self._sampling_peak_mb(job)
+            if need_mb is None:
+                continue
+            if need_mb > room_mb:
+                snapshot = snapshot if snapshot is not None else self.snapshot()
+                baseline = self._model_metadata.get_baseline(model)
+                seat_mb = pricing.partial_seat_mb(
+                    snapshot,
+                    job,
+                    str(baseline) if baseline is not None else None,
+                    device_index=device_index,
+                    weight_fraction=pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION,
+                )
+                if seat_mb is not None and seat_mb <= room_mb:
+                    need_mb = seat_mb
+            needs.append(need_mb)
+        return max(needs) if needs else None
+
+    def _residency_need_fits_live(
+        self, state: WholeCardResidency, need_mb: float, *, device_index: int | None
+    ) -> bool:
+        """Whether the live reading, net of the noise buffer, already holds the job with safety on the card.
+
+        Weights the model already has on the card are inside the reading, so they are netted out of the need.
+        """
+        assert state.model is not None and state.forecast is not None
+        free_now = self._measured_free_vram_mb(device_index=device_index)
+        if free_now is None:
+            return False
+        held_mb = 0.0
+        if self._whole_card_model_weights_resident(state.model, device_index=device_index):
+            held_mb = state.forecast.weights_mb or 0.0
+        return free_now - state.forecast.admission_noise_mb >= need_mb - held_mb
 
     def _safety_clear_of_residency_card(self, device_index: int | None) -> bool:
         """Whether safety satisfies this residency's card-local teardown leg.

@@ -26,6 +26,8 @@ from __future__ import annotations
 import time
 from unittest.mock import Mock
 
+import pytest
+
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import MEMORY_REPORT_INTERVAL_SECONDS
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -35,7 +37,12 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
-from tests.process_management.conftest import make_mock_bridge_data, make_mock_process_info
+from tests.process_management.conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_mock_process_info,
+    track_popped_job_async,
+)
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 _HEAD_MODEL = "Flux.1-Schnell fp8 (Compact)"
@@ -260,3 +267,99 @@ class TestResidencySafetyMoveIsLatched:
 
         scheduler._whole_card_ledger.state_for(None).model = None
         assert scheduler._residency_should_pause_safety(None) is False, "the latch outlived its residency"
+
+
+_LIGHT_WEIGHTS_MB = 7000.0
+"""Weights whose bounded reserve fits the emptied card beside safety, in the structural frame and the live one."""
+
+
+def _light_weights_forecast() -> StreamForecast:
+    """A residency forecast whose weights fit beside safety, so a weight test alone keeps safety on the card."""
+    return StreamForecast(
+        weights_mb=_LIGHT_WEIGHTS_MB,
+        reserve_mb=4646.0,
+        base_reserve_mb=_BASE_RESERVE_MB,
+        free_now_mb=_FREE_WITH_SAFETY_RESIDENT_MB,
+        free_if_alone_mb=_FREE_IF_ALONE_MB,
+        free_after_model_evict_mb=9605.0,
+        total_vram_mb=_CARD_TOTAL_MB,
+        per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+        marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+        wants_whole_card=True,
+    )
+
+
+async def _residency_with_queued_job(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    job_need_mb: float,
+    seat_mb: float | None = None,
+) -> InferenceScheduler:
+    """A residency whose weights fit beside safety, with one queued job of its model priced at ``job_need_mb``.
+
+    ``seat_mb`` is the job's partial-load seat, None for a job clearance cannot seat partially (a LoRA job).
+    """
+    from horde_worker_regen.process_management.scheduling import inference_scheduler as scheduler_module
+    from horde_worker_regen.process_management.scheduling.admission import pricing
+
+    monkeypatch.setattr(scheduler_module, "predict_job_sampling_vram_mb", lambda _job, _baseline: job_need_mb)
+    monkeypatch.setattr(pricing, "partial_seat_mb", lambda *_args, **_kwargs: seat_mb)
+    scheduler = _residency_scheduler(
+        safety_off_gpu_configured=False,
+        safety_paused=False,
+        measured_free_mb=_FREE_WITH_SAFETY_RESIDENT_MB,
+    )
+    monkeypatch.setattr(scheduler, "snapshot", Mock())
+    state = scheduler._whole_card_ledger.state_for(None)
+    state.forecast = _light_weights_forecast()
+    await track_popped_job_async(scheduler._job_tracker, make_job_pop_response(_HEAD_MODEL))  # type: ignore[attr-defined]
+    assert state.forecast.fits_alone_beside(scheduler._safety_footprint_mb()) is True, (
+        "precondition: the weights fit the emptied card beside safety"
+    )
+    assert scheduler._whole_card_weights_fit_live(state.forecast) is True, (
+        "precondition: the weights fit the live reading with safety on the card"
+    )
+    return scheduler
+
+
+class TestResidencySafetyMoveReadsTheJobsNeed:
+    """A residency moves safety off when its job's priced need, not its weights, cannot fit beside safety.
+
+    The failure this encodes: the move tested the residency's weights against the room beside safety, while
+    clearance prices the job's whole sampling need. A large model whose weights fit beside safety kept safety on
+    the card, clearance then held its job for the room safety took, and the card stood idle until the runtime
+    placement's sustained-pressure dwell moved safety anyway.
+    """
+
+    async def test_a_job_whose_need_cannot_fit_beside_safety_moves_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Weights that fit beside safety do not keep it there when the queued job's need does not."""
+        room_mb = _FREE_IF_ALONE_MB - SAFETY_GPU_LOAD_CHARGE_MB
+        scheduler = await _residency_with_queued_job(monkeypatch, job_need_mb=room_mb + 900.0)
+
+        assert scheduler._residency_should_pause_safety(None) is True
+
+    async def test_a_job_clearance_seats_partially_keeps_safety_on_the_gpu(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A job whose whole need does not fit but whose partial-load seat does is admitted beside safety."""
+        room_mb = _FREE_IF_ALONE_MB - SAFETY_GPU_LOAD_CHARGE_MB
+        scheduler = await _residency_with_queued_job(monkeypatch, job_need_mb=room_mb + 900.0, seat_mb=room_mb - 900.0)
+
+        assert scheduler._residency_should_pause_safety(None) is False
+
+    async def test_a_job_that_fits_beside_safety_keeps_it_on_the_gpu(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A queued job whose need fits beside safety leaves the operator's keep-safety-on-GPU choice standing."""
+        room_mb = _FREE_IF_ALONE_MB - SAFETY_GPU_LOAD_CHARGE_MB
+        scheduler = await _residency_with_queued_job(monkeypatch, job_need_mb=room_mb - 900.0)
+
+        assert scheduler._residency_should_pause_safety(None) is False
+
+    async def test_defect_reinjection_a_weight_test_keeps_safety_beside_a_job_it_starves(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defect reinjection: with the job's need unread, the weights decide and safety stays on the card."""
+        room_mb = _FREE_IF_ALONE_MB - SAFETY_GPU_LOAD_CHARGE_MB
+        scheduler = await _residency_with_queued_job(monkeypatch, job_need_mb=room_mb + 900.0)
+        monkeypatch.setattr(scheduler, "_residency_head_need_mb", lambda _model, **_kwargs: None)
+
+        assert scheduler._residency_should_pause_safety(None) is False

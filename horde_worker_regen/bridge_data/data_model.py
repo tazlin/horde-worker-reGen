@@ -1476,9 +1476,9 @@ class reGenBridgeData(CombinedHordeBridgeData):
     (the default), the scheduler pauses safety-on-GPU for the duration of a whole-card job and restores it
     after. Costs a brief safety-process restart at each end of a whole-card residency burst (batched by
     `whole_card_residency_cooldown_seconds`). Only used when `enable_vram_budget` and `safety_on_gpu` are
-    both true. When false, safety stays on the GPU through a residency whose model fits beside it; a model that
-    cannot fit beside safety still moves it off for that residency, at once, since it would otherwise be moved
-    after a sustained-pressure dwell with the card idle."""
+    both true. When false, safety stays on the GPU through a residency whose jobs can be admitted beside it. A
+    residency whose job cannot be (a LoRA job of a model too large to seat partially, for one) still moves it off
+    for that residency, at once, since clearance would otherwise hold the job with the card idle."""
 
     vram_admission_noise_mb: int | None = Field(default=None, ge=0)
     """The VRAM admission margin (MB) subtracted from the measured device-free reading before a load or
