@@ -64,6 +64,11 @@ The reported figure has limits. On a Windows card it does not see memory another
 device-used reading behind the attribution drift check is still NVML-only. A card with no reporting process
 has no reading.
 
+Admission defers on a card with no reading, because at a cold start the first reading is at most one report
+interval away. A card still unread after three report intervals has no source that will answer. From then on
+the arbiter admits its loads on the predictive path, the scheduler logs one WARNING for the card, and the
+device-free governor does not run on it. The first reading to arrive returns the card to measured admission.
+
 ## What still limits non-NVIDIA backends
 
 The remaining constraints are **packaging, not worker code** (see the README's "Why fewer GPU types

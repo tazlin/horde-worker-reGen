@@ -6687,11 +6687,18 @@ async def test_a_card_with_no_device_reading_serves_from_its_lanes_reports(platf
 
 
 @pytest.mark.closed_loop
-async def test_a_card_with_no_reading_of_any_kind_admits_no_load() -> None:
-    """With nothing in place of the device read, every admission defers and no job is served.
+async def test_a_card_with_no_reading_of_any_kind_is_served_after_the_reading_bound() -> None:
+    """With no reading from any source, admission defers for the reading bound and then stops waiting.
 
-    This is the state the lanes' reports exist to end, and the reason the row above is about the reading.
+    A missing reading at a cold start is filled within a report interval, so admission defers on it. A card
+    still unread after the bound has no source that will answer. Its loads are then admitted on the
+    predictive path, and the card stays ungoverned because the governor has nothing to sample.
     """
+    from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+        _DEVICE_FREE_READING_BOUND_SECONDS,
+    )
+
+    tick_seconds = 0.5
     world = _DispatchWorld(
         card=_CARD_24GB,
         lane_count=2,
@@ -6700,14 +6707,36 @@ async def test_a_card_with_no_reading_of_any_kind_admits_no_load() -> None:
         closed_loop=True,
         parent_device_reading=False,
         child_report_platform=None,
-        tick_seconds=0.5,
+        tick_seconds=tick_seconds,
     )
 
     await _serve_without_a_device_reading(world)
 
-    assert world.submitted_jobs == 0
-    assert world.preloads_commanded == []
+    assert world.submitted_jobs == _NO_DEVICE_READING_JOBS, f"work never flowed. {world.state_dump()}"
+    first_preload_tick = min(tick for tick, _lane, _model in world.preloads_commanded)
+    assert first_preload_tick * tick_seconds >= _DEVICE_FREE_READING_BOUND_SECONDS - tick_seconds, (
+        f"a load was admitted at tick {first_preload_tick}, before the reading bound had run"
+    )
     assert world.governor_states_by_card[0] == []
+
+
+async def test_a_reading_that_arrives_ends_the_unread_state_and_restarts_its_bound() -> None:
+    """The first reading clears the unread state, and a later gap is given the whole bound again."""
+    from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+        _DEVICE_FREE_READING_BOUND_SECONDS,
+    )
+
+    world = _DispatchWorld(card=_CARD_24GB, lane_count=1, max_threads=1, queue_depth=1, closed_loop=True)
+    scheduler = world.scheduler
+
+    assert scheduler._device_free_reading_unavailable(0, None) is False
+    world.now += _DEVICE_FREE_READING_BOUND_SECONDS
+    assert scheduler._device_free_reading_unavailable(0, None) is True
+
+    assert scheduler._device_free_reading_unavailable(0, 9000.0) is False
+    assert scheduler._device_free_reading_unavailable(0, None) is False
+    world.now += _DEVICE_FREE_READING_BOUND_SECONDS
+    assert scheduler._device_free_reading_unavailable(0, None) is True
 
 
 @pytest.mark.closed_loop

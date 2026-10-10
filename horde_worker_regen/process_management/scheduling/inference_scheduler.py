@@ -324,6 +324,13 @@ The scan runs every scheduling cycle and empty is its common answer; one line pe
 weights exist keeps the gate that empties the scan visible without flooding the log."""
 
 
+_DEVICE_FREE_READING_BOUND_SECONDS = 3 * MEMORY_REPORT_INTERVAL_SECONDS
+"""How long a card may go without a device-free reading before admission stops waiting on one.
+
+Every source of the reading answers within one child report interval of a process holding the card, so
+three intervals without one means no source will answer for this card."""
+
+
 _RESIDENCY_GRACE_SECONDS = 30.0
 """How long a model stays protected from RAM eviction after its last live demand, in the
 models-exceed-processes regime. Bridges the gap between a model's consecutive jobs so a
@@ -640,6 +647,8 @@ class InferenceScheduler:
         # ladder-issued pauses also owns growing the inference pool back when the card recovers. None until
         # wired (and in standalone unit tests), where a reduction is simply not booked.
         self._reclaim_ladder: VerifiedReclaimLadder | None = None
+        self._device_free_missing_since: dict[int, float] = {}
+        self._device_free_unavailable_announced: set[int] = set()
         # The truthful per-card device-free reading source, injected by the manager (parent NVML). The
         # manager-driven cycle passes its explicit reading map to build_vram_arbiter_snapshot; this provider is
         # the fallback for a self-primed snapshot (a scheduler consult before or outside a manager tick), so the
@@ -5229,6 +5238,7 @@ class InferenceScheduler:
         governor_state: GovernorState | None = None,
         device_free_mb: float | None = None,
         reclaim_unresolved: bool = False,
+        device_free_unavailable: bool = False,
     ) -> DeviceVramState:
         """Assemble the frozen per-device VRAM measurement the arbiter prices this cycle's requests against.
 
@@ -5362,6 +5372,7 @@ class InferenceScheduler:
             active_sampling_peaks_total_mb=active_sampling_peaks_total_mb,
             governor_state=governor_state,
             device_free_mb=device_free_mb,
+            device_free_unavailable=device_free_unavailable,
             foreign_floor_mb=foreign_floor_mb,
             reclaim_unresolved=reclaim_unresolved,
         )
@@ -5598,8 +5609,34 @@ class InferenceScheduler:
                 governor_state=governor_state,
                 device_free_mb=device_free_mb,
                 reclaim_unresolved=reclaim_unresolved,
+                device_free_unavailable=self._device_free_reading_unavailable(device_index, device_free_mb),
             )
         return MeasuredVramSnapshot(devices=devices)
+
+    def _device_free_reading_unavailable(self, device_index: int, device_free_mb: float | None) -> bool:
+        """Return whether a card has gone the reading bound with no device-free reading.
+
+        A reading is late at a cold start by up to one report interval, and admission defers on it. A card
+        still unread after :data:`_DEVICE_FREE_READING_BOUND_SECONDS` has no source that will answer, and
+        deferring on it would hold every load for as long as the worker runs. The first reading to arrive
+        clears the state.
+        """
+        if device_free_mb is not None:
+            if self._device_free_missing_since.pop(device_index, None) is not None:
+                self._device_free_unavailable_announced.discard(device_index)
+            return False
+        now = self._clock()
+        missing_since = self._device_free_missing_since.setdefault(device_index, now)
+        if now - missing_since < _DEVICE_FREE_READING_BOUND_SECONDS:
+            return False
+        if device_index not in self._device_free_unavailable_announced:
+            self._device_free_unavailable_announced.add(device_index)
+            logger.warning(
+                f"Device {device_index} has had no device memory reading for "
+                f"{_DEVICE_FREE_READING_BOUND_SECONDS:.0f}s. VRAM admission for it is taking the predictive "
+                "path until a reading arrives.",
+            )
+        return True
 
     def _overlap_memory_verdict(
         self,

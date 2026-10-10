@@ -588,9 +588,14 @@ class DeviceVramState:
     """The device-free governor's committed state for this card, or None when it has not sampled yet; carried
     for diagnostics and telemetry, not admission."""
     device_free_mb: float | None = None
-    """The truthful NVML device-level free VRAM (MB) for this card, or None before the first read. The primary
+    """The parent's device-level free VRAM (MB) for this card, or None before the first read. The primary
     admission input: a request FITS iff its candidate fits ``device_free_mb - outstanding_reservations -
-    noise``. None yields a throttled-diagnostic DEFER, never a denial or a fabricated figure."""
+    noise``. None yields a throttled-diagnostic DEFER, never a denial or a fabricated figure, until
+    ``device_free_unavailable`` says no reading is coming."""
+    device_free_unavailable: bool = False
+    """True once this card has gone the snapshot builder's reading bound with no device-free reading.
+    Admission then takes the predictive path, as it does with no cycle snapshot, because a reading that has
+    not arrived inside the bound is not a measurement the request can wait on."""
     foreign_floor_mb: float | None = None
     """The sustained minimum of measured non-worker (OS/desktop/other-process) VRAM usage (MB) on this card,
     or None when it has not yet been established (cold start, or fewer than a full observation window of
@@ -901,6 +906,17 @@ class VramArbiter:
                 reason="candidate already resident on the target process; no new VRAM",
                 measured=measured,
                 detail=measured.reason(),
+            )
+
+        if not measured.available_known and state.device_free_unavailable:
+            # No reading has arrived inside the bound, so none is expected. Deferring further would hold every
+            # load on this card for as long as the worker runs. The caller's predictive gate still applies.
+            return VramVerdict(
+                disposition=VramDisposition.FITS,
+                request_kind=request.kind,
+                device_index=request.device_index,
+                reason="no device-free reading within the reading bound; admitted on the predictive path",
+                measured=measured,
             )
 
         if not measured.available_known:
@@ -1633,9 +1649,9 @@ class VramArbiter:
     def _note_device_free_missing(self, request: VramRequest) -> None:
         """Emit the missing-device-free diagnostic, throttled per cycle per card, and advance its counter.
 
-        A card asked to admit with no NVML device-free reading yet cannot be priced by the primary identity, so
-        the request DEFERS. This records that gap so a persistent absence (a card the parent never reads) is
-        visible in the log and the counter without flooding either.
+        A card asked to admit with no device-free reading yet cannot be priced by the primary identity, so
+        the request DEFERS. This records that gap so an absence that lasts to the reading bound is visible in
+        the log and the counter without flooding either.
         """
         device_key = request.device_index if request.device_index is not None else 0
         self.device_free_missing_defers += 1
@@ -1645,7 +1661,7 @@ class VramArbiter:
         logger.warning(
             f"VRAM admission for {request.job_label} deferred: no device-free reading for card {device_key} "
             "this cycle. Admission neither denies nor fabricates a free figure on a missing measurement; it "
-            "waits for the next NVML reading.",
+            "waits for the next device reading.",
         )
 
     def _note_starvation_diagnostic(

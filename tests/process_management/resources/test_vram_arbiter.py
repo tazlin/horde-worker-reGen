@@ -285,6 +285,23 @@ class TestRelaxationAndMissingReading:
         assert verdict.measured.available_known is False
         assert arbiter.device_free_missing_defers == 1
 
+    def test_a_card_past_the_reading_bound_is_admitted_on_the_predictive_path(self) -> None:
+        """A card marked as having no reading coming is admitted and no longer counted as a missing-reading defer."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=None, device_free_unavailable=True)))
+        verdict = arbiter.evaluate(_preload(candidate_delta_mb=6000.0, is_head_of_queue=True))
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured.available_known is False
+        assert arbiter.device_free_missing_defers == 0
+
+    def test_a_reading_is_priced_whatever_the_unavailable_mark_says(self) -> None:
+        """With a reading present the identity decides, so a stale mark cannot admit what does not fit."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(_roomy_state(device_free_mb=1000.0, device_free_unavailable=True)))
+        verdict = arbiter.evaluate(_preload(candidate_delta_mb=6000.0))
+        assert verdict.disposition != VramDisposition.FITS
+        assert verdict.measured.available_known is True
+
     def test_missing_device_free_diagnostic_throttled_per_cycle(self) -> None:
         """Two evaluations in one frozen cycle count each defer but warn at most once per card."""
         arbiter = VramArbiter()
