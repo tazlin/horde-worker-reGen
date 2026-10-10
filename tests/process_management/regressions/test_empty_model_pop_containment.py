@@ -281,6 +281,25 @@ class TestChildSurvivesABadPreloadArgument:
         infos = [call.kwargs.get("info") for call in proc.on_horde_model_state_change.call_args_list]  # pyrefly: ignore
         assert HOST_COMMIT_FAILED_INFO in infos
 
+    def test_a_host_commit_refusal_ends_with_the_slot_reporting_idle(self) -> None:
+        """The parent offers loads only to an idle slot, so the refused load's last report is the idle one."""
+        from hordelib.execution.zero_copy_load import HostCommitError
+
+        from horde_worker_regen.process_management.ipc.messages import HordeProcessStateChangeMessage
+
+        proc = _PreloadStubProcess.build(preload_error=HostCommitError("The host could not commit a mapping"))
+        proc.process_message_queue = queue.Queue()  # pyrefly: ignore
+
+        proc._control_inbox.put(_preload_message("Krea2-Turbo_fp8"))
+        proc.receive_and_handle_control_messages()
+
+        sent = []
+        while not proc.process_message_queue.empty():
+            sent.append(proc.process_message_queue.get_nowait())
+        state_changes = [message for message in sent if isinstance(message, HordeProcessStateChangeMessage)]
+        assert state_changes, "the refused load reported no process state after its failure"
+        assert state_changes[-1].process_state is HordeProcessState.WAITING_FOR_JOB
+
     def test_a_warm_the_host_cannot_commit_is_skipped_without_ending_the_process(self) -> None:
         """A warm the host refuses to commit leaves the lane and its held weights as they were."""
         from hordelib.api import ComponentSlotKind

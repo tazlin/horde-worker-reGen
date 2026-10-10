@@ -859,12 +859,17 @@ class HordeInferenceProcess(HordeProcess):
                         # The host refused the checkpoint mapping before a weight was adopted, which is a
                         # memory condition of the moment. Reported under its own marker so the parent counts
                         # nothing against the model, and the slot stays available for the next load the
-                        # admission lets through.
+                        # admission lets through. The parent offers a load only to a slot reporting idle, and
+                        # no later message of this handler reports it, so the idle report follows here.
                         self.on_horde_model_state_change(
                             process_state=HordeProcessState.PRELOADING_FAILED,
                             horde_model_name=horde_model_name,
                             horde_model_state=ModelLoadState.FAILED,
                             info=HOST_COMMIT_FAILED_INFO,
+                        )
+                        self.send_process_state_change_message(
+                            process_state=HordeProcessState.WAITING_FOR_JOB,
+                            info="Waiting for job",
                         )
                         return
                     self.on_horde_model_state_change(
