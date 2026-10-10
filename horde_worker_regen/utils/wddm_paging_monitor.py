@@ -290,6 +290,19 @@ class WddmPagingMonitor:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
+    @property
+    def interval(self) -> float:
+        """Seconds between samples."""
+        return self._interval
+
+    def set_interval(self, interval_seconds: float) -> None:
+        """Change how often the counters are polled, from the next sample on.
+
+        The paging verdict is content with a coarse interval. A reader that prices admission from the adapter
+        counter needs the figure at the pace it acts, and asks for that here.
+        """
+        self._interval = interval_seconds
+
     def start(self) -> None:
         """Begin sampling on a background thread (a no-op when the counter source is unavailable)."""
         if self._read is None:

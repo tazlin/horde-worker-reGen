@@ -209,8 +209,10 @@ from horde_worker_regen.process_management.resources.device_memory_source import
     DeviceMemorySourceKind,
     DeviceReadingShadow,
     ReadingProvenance,
+    adapter_counter_reading,
     child_reported_reading,
     nvml_reading,
+    select_device_reading,
     shadow_free_figures,
 )
 from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
@@ -918,6 +920,15 @@ _DISAGGREGATION_V1_BASELINES: frozenset[str] = frozenset({"stable_diffusion_1", 
 Resolved from the worker's loaded model reference (never guessed from the model name). Any other family
 (SD2, Cascade, Flux, Qwen, Z-Image) stays on the monolithic path, whose whole-job VRAM charges apply."""
 
+_ADAPTER_COUNTER_SAMPLE_SECONDS = 0.5
+"""How often the Windows GPU counters are sampled while a card is priced from its adapter counter.
+
+Enumerating the counters costs tens of milliseconds, so it stays on the monitor's thread and coarser than
+the governor's tick. The source below it, a child's memory report, arrives every five seconds."""
+
+_ADAPTER_COUNTER_MAX_AGE_INTERVALS = 4
+"""How many of the monitor's intervals old a counter sample may be and still describe the card now."""
+
 _DOWNLOAD_RESTART_WINDOW_SECONDS = 600.0
 """Sliding window over which the background download process's automatic restarts are counted."""
 _DOWNLOAD_RESTART_MAX_IN_WINDOW = 3
@@ -1376,7 +1387,7 @@ class HordeWorkerProcessManager:
 
         # An injected inventory describes cards this host may not have (a simulated run states its own device
         # map and capacities), so this host's NVML readings do not describe them. The device-wide readers
-        # consult this before reporting a figure; see ``_read_device_used_mb``.
+        # consult this before reporting a figure; see ``_device_used_mb``.
         self._device_inventory_is_injected = system_resources is not None
         if system_resources is None:
             system_resources = SystemResources.detect()
@@ -1661,7 +1672,7 @@ class HordeWorkerProcessManager:
         self._governor_states_by_device: dict[int, GovernorState] = {}
         self._last_device_reading_by_device: dict[int, DeviceMemoryReading] = {}
         self._nvml_answered_devices: set[int] = set()
-        self._child_reported_memory_devices: set[int] = set()
+        self._reading_sources_announced: dict[int, set[DeviceMemorySourceKind]] = {}
 
         # The control types each image-utilities lane process can currently annotate, keyed by its process
         # id, learned from the lane's availability snapshots. The pre-annotation scan keys on the union of
@@ -3691,25 +3702,68 @@ class HordeWorkerProcessManager:
         from_nvml = self._read_nvml_memory(device_index)
         if from_nvml is not None:
             self._nvml_answered_devices.add(device_index)
-            return from_nvml
-        if device_index in self._nvml_answered_devices:
-            return None
-        reading = child_reported_reading(
-            reported_free_mb=self._process_map.get_free_vram_mb(device_index=device_index),
-            reported_total_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
-            committed_mb=self._process_map.committed_vram_mb(
-                context_constant_mb=self._inference_scheduler.resolved_context_constant_mb(),
-                device_index=device_index,
+        nvml_has_answered = device_index in self._nvml_answered_devices
+        host_memory = self._card_reports_host_memory(device_index)
+        reported_total_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        reading = select_device_reading(
+            from_nvml=from_nvml,
+            nvml_has_answered=nvml_has_answered,
+            from_adapter_counter=(
+                None
+                if nvml_has_answered or host_memory
+                else adapter_counter_reading(
+                    dedicated_used_mb=self._adapter_dedicated_used_mb(device_index),
+                    total_mb=reported_total_mb,
+                )
             ),
-            host_memory=self._card_reports_host_memory(device_index),
+            from_child_reports=child_reported_reading(
+                reported_free_mb=self._process_map.get_free_vram_mb(device_index=device_index),
+                reported_total_mb=reported_total_mb,
+                committed_mb=self._process_map.committed_vram_mb(
+                    context_constant_mb=self._inference_scheduler.resolved_context_constant_mb(),
+                    device_index=device_index,
+                ),
+                host_memory=host_memory,
+            ),
         )
-        if reading is not None and device_index not in self._child_reported_memory_devices:
-            self._child_reported_memory_devices.add(device_index)
-            logger.warning(
-                f"Device {device_index} has no device-level memory reading (NVML did not answer for it). VRAM "
-                f"admission is reading the figures its inference processes report ({reading.provenance.value}).",
-            )
+        if reading is not None and reading.source is not DeviceMemorySourceKind.NVML:
+            self._note_reading_without_nvml(device_index, reading)
         return reading
+
+    def _note_reading_without_nvml(self, device_index: int, reading: DeviceMemoryReading) -> None:
+        """Log once for each source a card without NVML is read from, and keep the adapter counter fresh.
+
+        The counter monitor samples slowly because its only other reader is the paging verdict. A card priced
+        from the adapter counter needs it at the governor's pace, so the monitor is asked for that.
+        """
+        if reading.source is DeviceMemorySourceKind.ADAPTER_COUNTER:
+            self._wddm_paging_monitor.set_interval(_ADAPTER_COUNTER_SAMPLE_SECONDS)
+        announced = self._reading_sources_announced.setdefault(device_index, set())
+        if reading.source in announced:
+            return
+        announced.add(reading.source)
+        logger.warning(
+            f"Device {device_index} has no NVML memory reading. VRAM admission is reading it from "
+            f"{reading.source.value} ({reading.provenance.value}).",
+        )
+
+    def _adapter_dedicated_used_mb(self, device_index: int) -> float | None:
+        """Return the dedicated memory Windows counts on the card's adapter, or None without a fresh figure.
+
+        The adapter is found from the worker processes pinned to the card. A sample older than a few of the
+        monitor's intervals says nothing about the card now, so it is not used.
+        """
+        counters = self._wddm_paging_monitor.latest()
+        if counters is None:
+            return None
+        if time.time() - counters.timestamp > _ADAPTER_COUNTER_MAX_AGE_INTERVALS * self._wddm_paging_monitor.interval:
+            return None
+        worker_pids = {
+            process_info.os_pid
+            for process_info in self._process_map.values()
+            if process_info.device_index == device_index and process_info.os_pid is not None
+        }
+        return adapter_dedicated_used_mb(counters, worker_pids)
 
     def _card_reports_host_memory(self, device_index: int) -> bool:
         """Whether the card's backend reports system RAM as its memory (a unified-memory or CPU device)."""
@@ -3730,7 +3784,11 @@ class HordeWorkerProcessManager:
         memory = get_device_memory_mb(device_index)
         if memory is None:
             return None
-        return nvml_reading(free_mb=float(memory.free_mb), total_mb=float(memory.total_mb))
+        return nvml_reading(
+            free_mb=float(memory.free_mb),
+            total_mb=float(memory.total_mb),
+            used_mb=float(memory.used_mb),
+        )
 
     def _evaluate_device_free_governor(self) -> None:
         """Sample NVML device free/total per driven card, debounce the governor, and act on its state.
@@ -4142,29 +4200,19 @@ class HordeWorkerProcessManager:
     _VRAM_ATTRIBUTION_INTERVAL_SECONDS = 5.0
     """Seconds between committed-VRAM ledger reconciliations (coarse: this is drift telemetry, not a gate)."""
 
-    def _read_device_used_mb(self, device_index: int) -> float | None:
-        """Return device ``index``'s device-wide used VRAM (MB) via NVML, torch-free, or None when unavailable.
+    def _device_used_mb(self, device_index: int) -> float | None:
+        """Return the memory in use on a card across every process, from its latest reading, or None.
 
-        NVML device-total-used is the only truthful device-wide figure on Windows/WDDM, where ``mem_get_info``
-        is a per-process view; it is read here from the *parent* (outside any CUDA workload) so the number is
-        not a per-process artefact, and via NVML directly (never torch) so the orchestrator stays torch-free.
-        None off NVIDIA / when NVML is unavailable, so the reconciliation degrades rather than raising.
-
-        Also None when the device inventory was injected: the reading would then describe this host's cards
-        rather than the ones the run drives, and it reaches admission through the baseline estimate, so a
-        simulated card's capacity would be charged for whatever else the host has on screen.
+        The figure is the one the governor's tick took with the card's free and total, so the device is
+        read once per tick. Only a device-wide reading that measures usage answers: process reports do
+        not measure it, and an injected inventory carries none, so a simulated card's capacity is never
+        charged for what the host running the suite has on screen. The reconciliation then degrades as
+        it does with no reading.
         """
-        if self._device_inventory_is_injected:
+        reading = self._last_device_reading_by_device.get(device_index)
+        if reading is None or not reading.is_device_wide:
             return None
-        try:
-            from hordelib.utils.nvml import get_device_memory_mb
-        except Exception as e:  # noqa: BLE001 - "no NVML" is an expected environment, not a crash
-            logger.debug(f"NVML device-used read unavailable (import failed): {e}")
-            return None
-        memory = get_device_memory_mb(device_index)
-        if memory is None:
-            return None
-        return float(memory.used_mb)
+        return reading.used_mb
 
     def _evaluate_vram_attribution_drift(self) -> None:
         """Reconcile the committed-VRAM ledger against device-used VRAM per card, warning on persistent drift.
@@ -4200,7 +4248,7 @@ class HordeWorkerProcessManager:
                 device_index=device_index,
             )
             committed_is_stale = oldest_report_age is not None and oldest_report_age > _REPORT_STALENESS_SECONDS
-            device_used_mb = self._read_device_used_mb(device_index)
+            device_used_mb = self._device_used_mb(device_index)
             any_model_resident = any(
                 process_info.device_index == device_index and process_info.loaded_horde_model_name is not None
                 for process_info in self._process_map.values()

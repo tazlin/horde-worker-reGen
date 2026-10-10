@@ -26,8 +26,11 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.device_memory_source import (
+    DeviceMemoryReading,
     DeviceMemorySourceKind,
     ReadingProvenance,
+    adapter_counter_reading,
+    child_reported_reading,
     nvml_reading,
 )
 from horde_worker_regen.process_management.resources.resource_budget import (
@@ -43,6 +46,7 @@ from horde_worker_regen.process_management.resources.vram_attribution import (
     DriftObservation,
     VramAttributionReconciler,
 )
+from horde_worker_regen.utils.wddm_paging_monitor import GpuProcessMemorySample
 from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
 
 
@@ -689,7 +693,7 @@ class TestManagerPhantomRecalibration:
         quiet.process_reserved_mb = None
         pm._process_map.clear()
         pm._process_map[0] = quiet  # type: ignore[index]
-        pm._read_device_used_mb = Mock(return_value=1499.0)  # type: ignore[attr-defined]
+        pm._device_used_mb = Mock(return_value=1499.0)  # type: ignore[attr-defined]
         pm._last_vram_attribution_time = 0.0
         pm._evaluate_vram_attribution_drift()
 
@@ -708,7 +712,7 @@ class TestManagerPhantomRecalibration:
         def phantom_tick() -> None:
             # committed = 243 ctx + 21683 reserved = 21926, while the device physically holds ~1288 (phantom).
             pm._process_map[0] = self._phantom_contributor(0, reserved_mb=21926 - 243)  # type: ignore[index]
-            pm._read_device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
+            pm._device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
             pm._last_vram_attribution_time = 0.0
             pm._evaluate_vram_attribution_drift()
 
@@ -732,14 +736,14 @@ class TestManagerPhantomRecalibration:
 
         for _ in range(2):
             pm._process_map[0] = self._phantom_contributor(0, reserved_mb=21926 - 243)  # type: ignore[index]
-            pm._read_device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
+            pm._device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
             pm._last_vram_attribution_time = 0.0
             pm._evaluate_vram_attribution_drift()
         assert recalibrate.call_count == 1
 
         # The recalibrated lane re-reports its true (near-zero) reservation: committed tracks device truth.
         pm._process_map[0] = self._phantom_contributor(0, reserved_mb=30)  # type: ignore[index]
-        pm._read_device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
+        pm._device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
         pm._last_vram_attribution_time = 0.0
         pm._evaluate_vram_attribution_drift()
 
@@ -775,7 +779,7 @@ class TestManagerPhantomRecalibration:
 
             for _ in range(2):
                 pm._process_map[0] = self._phantom_contributor(0, reserved_mb=reserved_mb)  # type: ignore[index]
-                pm._read_device_used_mb = Mock(return_value=float(device_used))  # type: ignore[attr-defined]
+                pm._device_used_mb = Mock(return_value=float(device_used))  # type: ignore[attr-defined]
                 pm._last_vram_attribution_time = 0.0
                 pm._evaluate_vram_attribution_drift()
 
@@ -805,14 +809,14 @@ class TestManagerPhysicalPressureUnload:
         quiet.process_reserved_mb = None
         pm._process_map.clear()
         pm._process_map[0] = quiet  # type: ignore[index]
-        pm._read_device_used_mb = Mock(return_value=1700.0)  # type: ignore[attr-defined]
+        pm._device_used_mb = Mock(return_value=1700.0)  # type: ignore[attr-defined]
         pm._last_vram_attribution_time = 0.0
         pm._evaluate_vram_attribution_drift()
 
         def over_commit_tick() -> None:
             # committed = 200 ctx + 15000 reserved = 15200; + baseline 1700 = 16900 > 16375 total.
             pm._process_map[0] = self._resident_contributor(0, reserved_mb=15000, sampled_at=time.time())  # type: ignore[index]
-            pm._read_device_used_mb = Mock(return_value=16900.0)  # type: ignore[attr-defined]
+            pm._device_used_mb = Mock(return_value=16900.0)  # type: ignore[attr-defined]
             pm._last_vram_attribution_time = 0.0
             pm._evaluate_vram_attribution_drift()
 
@@ -850,12 +854,12 @@ class TestManagerDriftReconciliation:
         quiet.process_reserved_mb = None
         pm._process_map.clear()
         pm._process_map[0] = quiet  # type: ignore[index]
-        pm._read_device_used_mb = Mock(return_value=1000.0)  # type: ignore[attr-defined]
+        pm._device_used_mb = Mock(return_value=1000.0)  # type: ignore[attr-defined]
         pm._last_vram_attribution_time = 0.0
         pm._evaluate_vram_attribution_drift()
 
         pm._process_map[0] = self._resident_contributor(0, reserved_mb=5000, sampled_at=time.time())  # type: ignore[index]
-        pm._read_device_used_mb = Mock(return_value=8000.0)  # type: ignore[attr-defined]
+        pm._device_used_mb = Mock(return_value=8000.0)  # type: ignore[attr-defined]
         pm._last_vram_attribution_time = 0.0
         pm._evaluate_vram_attribution_drift()
 
@@ -871,13 +875,13 @@ class TestManagerDriftReconciliation:
         quiet.process_reserved_mb = None
         pm._process_map.clear()
         pm._process_map[0] = quiet  # type: ignore[index]
-        pm._read_device_used_mb = Mock(return_value=1000.0)  # type: ignore[attr-defined]
+        pm._device_used_mb = Mock(return_value=1000.0)  # type: ignore[attr-defined]
         pm._last_vram_attribution_time = 0.0
         pm._evaluate_vram_attribution_drift()
 
         stale_sample = time.time() - (_REPORT_STALENESS_SECONDS + 5.0)
         pm._process_map[0] = self._resident_contributor(0, reserved_mb=5000, sampled_at=stale_sample)  # type: ignore[index]
-        pm._read_device_used_mb = Mock(return_value=8000.0)  # type: ignore[attr-defined]
+        pm._device_used_mb = Mock(return_value=8000.0)  # type: ignore[attr-defined]
         pm._last_vram_attribution_time = 0.0
         pm._evaluate_vram_attribution_drift()
 
@@ -928,7 +932,7 @@ class TestStaleDriftSkipLogThrottle:
         stale.report_sampled_at = time.time() - (_REPORT_STALENESS_SECONDS + 5.0)
         pm._process_map.clear()
         pm._process_map[0] = stale  # type: ignore[index]
-        pm._read_device_used_mb = Mock(return_value=8000.0)  # type: ignore[attr-defined]
+        pm._device_used_mb = Mock(return_value=8000.0)  # type: ignore[attr-defined]
         pm._last_vram_attribution_time = 0.0
         pm._evaluate_vram_attribution_drift()
 
@@ -960,7 +964,7 @@ class TestInjectedInventorySuppressesHostDeviceReads:
         pm = make_testable_process_manager()
 
         assert pm._device_inventory_is_injected is True
-        assert pm._read_device_used_mb(0) is None
+        assert pm._device_used_mb(0) is None
 
         pm._process_map.clear()
         pm._process_map[0] = make_mock_process_info(  # type: ignore[index]
@@ -1058,3 +1062,86 @@ class TestDeviceFreeReadWithoutNvml:
         assert reading.provenance is ReadingProvenance.HOST_MEMORY
         assert reading.free_mb == 14984.0
         assert 0 not in pm._governor_states_by_device
+
+    @staticmethod
+    def _counters(*, age_seconds: float = 0.0) -> GpuProcessMemorySample:
+        """Windows counters showing the worker's process on an adapter where 3240 MB is in use in all."""
+        adapter = "0x00000000_0x000165f8"
+        return GpuProcessMemorySample(
+            timestamp=time.time() - age_seconds,
+            local_mb_by_pid_and_adapter={(4242, adapter): 1264.0, (900, adapter): 950.0},
+            adapter_dedicated_mb={adapter: 3240.0},
+        )
+
+    def test_a_card_without_nvml_is_read_from_the_adapter_counter_when_it_answers(self) -> None:
+        """The device-wide Windows figure is taken before the process reports, and sampled faster from then on."""
+        pm = self._manager_with_one_reporting_process()
+        pm._process_map[0].os_pid = 4242  # type: ignore[index]
+        pm._read_nvml_memory = Mock(return_value=None)  # type: ignore[method-assign]
+        pm._wddm_paging_monitor.latest = Mock(return_value=self._counters())  # type: ignore[method-assign]
+
+        reading = pm._read_device_memory(0)
+
+        assert reading is not None
+        assert reading.source is DeviceMemorySourceKind.ADAPTER_COUNTER
+        assert reading.is_device_wide
+        assert (reading.free_mb, reading.used_mb) == (16384.0 - 3240.0, 3240.0)
+        assert pm._wddm_paging_monitor.interval == 0.5
+
+    def test_a_stale_counter_sample_is_not_the_reading(self) -> None:
+        """A sample several intervals old says nothing about the card now, so the process reports stand in."""
+        pm = self._manager_with_one_reporting_process()
+        pm._process_map[0].os_pid = 4242  # type: ignore[index]
+        pm._read_nvml_memory = Mock(return_value=None)  # type: ignore[method-assign]
+        pm._wddm_paging_monitor.latest = Mock(return_value=self._counters(age_seconds=60.0))  # type: ignore[method-assign]
+
+        reading = pm._read_device_memory(0)
+
+        assert reading is not None
+        assert reading.source is DeviceMemorySourceKind.CHILD_REPORT
+
+    def test_a_card_nvml_answers_for_never_reads_the_adapter_counter(self) -> None:
+        """NVML is the reading wherever it answers, with fresh counters on offer."""
+        pm = self._manager_with_one_reporting_process()
+        pm._process_map[0].os_pid = 4242  # type: ignore[index]
+        from_nvml = nvml_reading(free_mb=9000.0, total_mb=16376.0, used_mb=7063.0)
+        pm._read_nvml_memory = Mock(return_value=from_nvml)  # type: ignore[method-assign]
+        pm._wddm_paging_monitor.latest = Mock(return_value=self._counters())  # type: ignore[method-assign]
+
+        assert pm._read_device_memory(0) == from_nvml
+        assert pm._wddm_paging_monitor.interval == 2.0
+
+
+class TestDeviceUsedComesFromTheReading:
+    """The attribution tick takes the device's usage from the reading the governor took, with no second read."""
+
+    @staticmethod
+    def _manager_with_reading(reading: DeviceMemoryReading) -> HordeWorkerProcessManager:
+        pm = make_testable_process_manager()
+        pm._last_device_reading_by_device[0] = reading
+        return pm
+
+    def test_a_reading_that_measures_usage_answers_with_it(self) -> None:
+        """NVML and the adapter counter both measure usage across every process on the device."""
+        from_nvml = nvml_reading(free_mb=13135.0, total_mb=16376.0, used_mb=2928.0)
+        from_adapter = adapter_counter_reading(dedicated_used_mb=2936.0, total_mb=16375.0)
+        assert from_adapter is not None
+
+        assert self._manager_with_reading(from_nvml)._device_used_mb(0) == 2928.0
+        assert self._manager_with_reading(from_adapter)._device_used_mb(0) == 2936.0
+
+    def test_process_reports_do_not_answer(self) -> None:
+        """A process report measures no device-wide usage, on either platform's shape."""
+        for platform in ("win32", "linux"):
+            reported = child_reported_reading(
+                reported_free_mb=14000.0, reported_total_mb=16375.0, committed_mb=2000.0, platform=platform
+            )
+            assert reported is not None
+            assert self._manager_with_reading(reported)._device_used_mb(0) is None
+
+    def test_no_reading_answers_none(self) -> None:
+        """Before the first reading the reconciliation has nothing to anchor on."""
+        pm = make_testable_process_manager()
+        pm._last_device_reading_by_device.clear()
+
+        assert pm._device_used_mb(0) is None

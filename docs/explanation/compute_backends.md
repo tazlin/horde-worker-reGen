@@ -67,18 +67,30 @@ work is served from process reports, as the next section describes.
 
 ## Device memory readings without NVML
 
-VRAM admission, the device-free governor and the reclaim ladder all price against a per-card reading of
-free and total memory. On an NVIDIA card the parent takes it from NVML, which is device-wide. A ROCm, XPU or
-MPS card, and an NVIDIA card whose NVML cannot initialise, never answer that read. For a card NVML has never
-answered for, the parent reads the figures its inference processes report through the backend-agnostic
-accelerator calls
-([`child_reported_free_total_mb`][horde_worker_regen.process_management.resources.device_memory_source.child_reported_free_total_mb]).
-Off Windows a process reads the whole device, so the reported figure stands. On Windows each process reads
-a process-local view of the card, so the figure is capped at the card's total less what the worker's
-processes have committed. The worker logs one WARNING per card when it starts reading this way.
+VRAM admission, the device-free governor, the reclaim ladder and the attribution drift check all work from
+one per-card reading of free, total and used memory, taken once per governor tick. A ROCm, XPU or MPS card,
+and an NVIDIA card whose NVML cannot initialise, never answer the NVML read, so the reading has three sources.
+[`select_device_reading`][horde_worker_regen.process_management.resources.device_memory_source.select_device_reading]
+is the one place that orders them:
 
-A card NVML has answered for keeps NVML as its only source. A missed NVML sample there leaves the card
-without a reading until the next one.
+1. **NVML.** The reading wherever it answers. A card NVML has answered for takes no other source, so a missed
+   sample there leaves the card without a reading until the next one.
+2. **The Windows adapter counter** (`\GPU Adapter Memory(*)\Dedicated Usage`), for a card NVML has never
+   answered for. It counts dedicated memory across every process on the adapter and is vendor-neutral. The
+   card's adapter is found from the worker processes holding memory on it. The counters are sampled on the
+   paging monitor's thread, every half second once a card depends on them, and a sample more than four
+   intervals old is not used.
+3. **Process reports**, the figures a card's inference processes report through the backend-agnostic
+   accelerator calls. Off Windows a process reads the whole device, so the reported figure stands. On Windows
+   each process reads a process-local view of the card, so the figure is capped at the card's total less
+   what the worker's processes have committed.
+
+The worker logs one WARNING per card for each source other than NVML that it reads from.
+
+On an RTX 4070 Ti SUPER under SD 1.5 and SDXL load, the adapter counter read in the same instant as NVML
+was a constant 8 MB above NVML's used figure. NVML also holds back about 313 MB on that card that is neither
+used nor free, so the adapter reading's free figure sits that much above NVML's. The Windows admission margin
+covers it. The Windows process-report figure over-read free memory by a median 1500 MB in the same run.
 
 Every reading is a
 [`DeviceMemoryReading`][horde_worker_regen.process_management.resources.device_memory_source.DeviceMemoryReading]
@@ -87,7 +99,7 @@ knowing what it describes.
 
 | Provenance | Where it comes from | What it describes |
 | ---------- | ------------------- | ----------------- |
-| `device_wide` | NVML, or process reports off Windows | Every tenant of the card |
+| `device_wide` | NVML, the Windows adapter counter, or process reports off Windows | Every tenant of the card |
 | `process_local` | Process reports on Windows | The reporting process's view, capped by the committed ledger |
 | `host_memory` | Process reports on an MPS or CPU device | System RAM the device shares with the host |
 
@@ -103,10 +115,12 @@ spends measured room on the strength of the figure alone or reads other programs
 A `host_memory` card is recorded for admission and left out of the device-free governor. Its figure is system
 RAM, which the RAM governor already governs.
 
-The reported figure has limits. On a Windows card it does not see memory another program holds. The
-device-used reading behind the attribution drift check is still NVML-only. A card with no reporting process
-has no reading. Treating process reports off Windows as device-wide is an assumption for ROCm and XPU that no
-hardware run has checked.
+The process-report figure has limits. On a Windows card it does not see memory another program holds, which
+is why the adapter counter is taken first there. It measures no device-wide usage, so the attribution drift
+check runs only on an NVML or adapter-counter reading. A card with no reporting process has no reading from
+it. Treating process reports off Windows as device-wide is an assumption for ROCm and XPU that no hardware
+run has checked. The adapter counter's agreement with NVML was measured on one NVIDIA card and one driver,
+and AMD and Intel drivers are unmeasured.
 
 Admission defers on a card with no reading, because at a cold start the first reading is at most one report
 interval away. A card still unread after three report intervals has no source that will answer. From then on

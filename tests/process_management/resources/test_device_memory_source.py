@@ -7,8 +7,10 @@ import pytest
 from horde_worker_regen.process_management.resources.device_memory_source import (
     DeviceMemorySourceKind,
     ReadingProvenance,
+    adapter_counter_reading,
     child_reported_reading,
     nvml_reading,
+    select_device_reading,
     shadow_free_figures,
 )
 
@@ -140,6 +142,78 @@ def test_a_shadow_figure_with_no_input_is_none() -> None:
     assert unreported.adapter_counter_free_mb is None
     assert no_counter.adapter_counter_free_mb is None
     assert no_counter.ledger_capped_free_mb == 15009.0
+
+
+def test_an_adapter_counter_reading_is_device_wide_and_states_its_usage() -> None:
+    """The counter covers every process on the adapter, so free is the total less it and usage is the counter."""
+    reading = adapter_counter_reading(dedicated_used_mb=3240.0, total_mb=16375.0)
+
+    assert reading is not None
+    assert reading.source is DeviceMemorySourceKind.ADAPTER_COUNTER
+    assert reading.is_device_wide
+    assert (reading.free_mb, reading.total_mb, reading.used_mb) == (13135.0, 16375.0, 3240.0)
+
+
+@pytest.mark.parametrize(("used_mb", "total_mb"), [(None, 16375.0), (3240.0, None)])
+def test_an_adapter_counter_reading_needs_the_counter_and_the_total(
+    used_mb: float | None, total_mb: float | None
+) -> None:
+    """Without the adapter's figure or the card's total there is no reading from this source."""
+    assert adapter_counter_reading(dedicated_used_mb=used_mb, total_mb=total_mb) is None
+
+
+class TestSourceOrder:
+    """One function orders the sources, so every consumer is priced from the same choice."""
+
+    _NVML = nvml_reading(free_mb=9000.0, total_mb=16376.0, used_mb=7063.0)
+    _ADAPTER = adapter_counter_reading(dedicated_used_mb=7071.0, total_mb=16375.0)
+    _CHILD = child_reported_reading(
+        reported_free_mb=11000.0, reported_total_mb=16375.0, committed_mb=2000.0, platform="win32"
+    )
+
+    def test_nvml_is_the_reading_wherever_it_answers(self) -> None:
+        """A card NVML answers for is read from NVML whatever else is on offer."""
+        chosen = select_device_reading(
+            from_nvml=self._NVML,
+            nvml_has_answered=True,
+            from_adapter_counter=self._ADAPTER,
+            from_child_reports=self._CHILD,
+        )
+
+        assert chosen is self._NVML
+
+    def test_a_missed_nvml_sample_takes_no_other_source(self) -> None:
+        """Once NVML has answered for a card, a gap in it is None and the next sample fills it."""
+        chosen = select_device_reading(
+            from_nvml=None,
+            nvml_has_answered=True,
+            from_adapter_counter=self._ADAPTER,
+            from_child_reports=self._CHILD,
+        )
+
+        assert chosen is None
+
+    def test_the_adapter_counter_is_taken_before_process_reports(self) -> None:
+        """A card NVML never answers for takes the device-wide source when it has one."""
+        chosen = select_device_reading(
+            from_nvml=None,
+            nvml_has_answered=False,
+            from_adapter_counter=self._ADAPTER,
+            from_child_reports=self._CHILD,
+        )
+
+        assert chosen is self._ADAPTER
+
+    def test_process_reports_are_the_last_source(self) -> None:
+        """With neither NVML nor the adapter counter, the card is read from its processes."""
+        chosen = select_device_reading(
+            from_nvml=None,
+            nvml_has_answered=False,
+            from_adapter_counter=None,
+            from_child_reports=self._CHILD,
+        )
+
+        assert chosen is self._CHILD
 
 
 def test_an_nvml_reading_is_device_wide() -> None:

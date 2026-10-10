@@ -23,6 +23,8 @@ class DeviceMemorySourceKind(StrEnum):
 
     NVML = "nvml"
     """The parent's NVML read of the device."""
+    ADAPTER_COUNTER = "adapter_counter"
+    """The dedicated memory Windows counts on the card's adapter, across every process."""
     CHILD_REPORT = "child_report"
     """The figures the card's processes report through the accelerator layer."""
 
@@ -46,6 +48,10 @@ class DeviceMemoryReading:
     total_mb: float
     source: DeviceMemorySourceKind
     provenance: ReadingProvenance
+    used_mb: float | None = None
+    """Memory in use on the device across every process, where the source measures it. It is stated apart
+    from ``total_mb - free_mb`` because a driver holds some memory back that is neither. None from process
+    reports, which do not measure it."""
 
     @property
     def is_device_wide(self) -> bool:
@@ -88,25 +94,67 @@ def shadow_free_figures(
         platform="win32",
     )
     capped_mb = None if windows_fallback is None else windows_fallback.free_mb
-    if adapter_dedicated_used_mb is None or reported_total_mb is None:
-        adapter_free_mb = None
-    else:
-        adapter_free_mb = max(0.0, reported_total_mb - adapter_dedicated_used_mb)
+    from_adapter = adapter_counter_reading(dedicated_used_mb=adapter_dedicated_used_mb, total_mb=reported_total_mb)
     return DeviceReadingShadow(
         child_reported_free_mb=reported_free_mb,
         ledger_capped_free_mb=capped_mb,
-        adapter_counter_free_mb=adapter_free_mb,
+        adapter_counter_free_mb=None if from_adapter is None else from_adapter.free_mb,
     )
 
 
-def nvml_reading(*, free_mb: float, total_mb: float) -> DeviceMemoryReading:
+def nvml_reading(*, free_mb: float, total_mb: float, used_mb: float | None = None) -> DeviceMemoryReading:
     """Return the reading for a card NVML answered for, which is device-wide by construction."""
     return DeviceMemoryReading(
         free_mb=free_mb,
         total_mb=total_mb,
         source=DeviceMemorySourceKind.NVML,
         provenance=ReadingProvenance.DEVICE_WIDE,
+        used_mb=used_mb,
     )
+
+
+def adapter_counter_reading(*, dedicated_used_mb: float | None, total_mb: float | None) -> DeviceMemoryReading | None:
+    """Return a card's reading from the dedicated memory Windows counts on its adapter, or None without both.
+
+    The counter covers every process on the adapter, so the reading is device-wide. Free is the card's total
+    less that usage. A driver also holds back memory the counter does not show (a few hundred megabytes on an
+    NVIDIA card), so this free figure sits above the driver's by that amount, inside the admission margin.
+
+    Args:
+        dedicated_used_mb: The adapter's dedicated usage across every process.
+        total_mb: The card's total, as its processes report it.
+    """
+    if dedicated_used_mb is None or total_mb is None:
+        return None
+    return DeviceMemoryReading(
+        free_mb=max(0.0, total_mb - dedicated_used_mb),
+        total_mb=total_mb,
+        source=DeviceMemorySourceKind.ADAPTER_COUNTER,
+        provenance=ReadingProvenance.DEVICE_WIDE,
+        used_mb=dedicated_used_mb,
+    )
+
+
+def select_device_reading(
+    *,
+    from_nvml: DeviceMemoryReading | None,
+    nvml_has_answered: bool,
+    from_adapter_counter: DeviceMemoryReading | None,
+    from_child_reports: DeviceMemoryReading | None,
+) -> DeviceMemoryReading | None:
+    """Return the reading a card is priced against this sample, from the sources that answered.
+
+    NVML is the reading wherever it answers. A card NVML has answered for takes no other source, so a missed
+    sample there is None and the next one fills it. A card NVML has never answered for takes the Windows
+    adapter counter, which is device-wide, and failing that its processes' reports.
+    """
+    if from_nvml is not None:
+        return from_nvml
+    if nvml_has_answered:
+        return None
+    if from_adapter_counter is not None:
+        return from_adapter_counter
+    return from_child_reports
 
 
 def child_reported_reading(
