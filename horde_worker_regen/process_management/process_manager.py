@@ -207,9 +207,11 @@ from horde_worker_regen.process_management.resources.device_info import TorchDev
 from horde_worker_regen.process_management.resources.device_memory_source import (
     DeviceMemoryReading,
     DeviceMemorySourceKind,
+    DeviceReadingShadow,
     ReadingProvenance,
     child_reported_reading,
     nvml_reading,
+    shadow_free_figures,
 )
 from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
 from horde_worker_regen.process_management.resources.foreign_vram_floor import ManagedVramTenant
@@ -326,7 +328,11 @@ from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSamplers, mean_ac
 from horde_worker_regen.utils.image_utils import UPLOAD_IMAGE_ENCODING
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
-from horde_worker_regen.utils.wddm_paging_monitor import WddmPagingMonitor, assess_worker_paging
+from horde_worker_regen.utils.wddm_paging_monitor import (
+    WddmPagingMonitor,
+    adapter_dedicated_used_mb,
+    assess_worker_paging,
+)
 
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.ipc.messages import HordeJobMetricsMessage
@@ -4024,6 +4030,28 @@ class HordeWorkerProcessManager:
         """Return card 0's last free figure for the stats sample, whatever its provenance."""
         reading = self.latest_device_reading()
         return None if reading is None else reading.free_mb
+
+    def device_reading_shadow(self, device_index: int = 0) -> DeviceReadingShadow:
+        """Return what each other source reads as a card's free memory now, for comparison with the reading.
+
+        The stats sample records these beside the reading in use. Where NVML is the reading, the differences
+        are how far a card without NVML would be from its device figure under the same traffic.
+        """
+        worker_pids = {
+            process_info.os_pid
+            for process_info in self._process_map.values()
+            if process_info.device_index == device_index and process_info.os_pid is not None
+        }
+        counters = self._wddm_paging_monitor.latest()
+        return shadow_free_figures(
+            reported_free_mb=self._process_map.get_free_vram_mb(device_index=device_index),
+            reported_total_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
+            committed_mb=self._process_map.committed_vram_mb(
+                context_constant_mb=self._inference_scheduler.resolved_context_constant_mb(),
+                device_index=device_index,
+            ),
+            adapter_dedicated_used_mb=None if counters is None else adapter_dedicated_used_mb(counters, worker_pids),
+        )
 
     def _device_saturation_duration_seconds(self, device_index: int) -> float:
         """Return how long a card has been continuously SATURATED (seconds), or 0.0 when it is not.
@@ -8249,6 +8277,8 @@ class HordeWorkerProcessManager:
             self._state.last_pop_maintenance_mode or self._state.supervisor_paused or self._state.self_throttle_paused
         )
         slot_duty_totals, slot_duty_capacity, dispatch_hold_bucket = self._inference_scheduler.slot_duty_snapshot()
+        device_reading = self.latest_device_reading()
+        reading_shadow = self.device_reading_shadow()
 
         stats_sample = self._run_metrics.record_stats_sample(
             StatsSample(
@@ -8293,6 +8323,11 @@ class HordeWorkerProcessManager:
                 slot_duty_totals=slot_duty_totals,
                 slot_duty_capacity=slot_duty_capacity,
                 dispatch_hold_bucket=dispatch_hold_bucket,
+                device_free_mb=None if device_reading is None else device_reading.free_mb,
+                device_free_provenance=None if device_reading is None else device_reading.provenance.value,
+                device_free_child_reported_mb=reading_shadow.child_reported_free_mb,
+                device_free_ledger_capped_mb=reading_shadow.ledger_capped_free_mb,
+                device_free_adapter_counter_mb=reading_shadow.adapter_counter_free_mb,
             ),
         )
         latest_stats_sample = stats_sample or self._run_metrics.latest_stats_sample()

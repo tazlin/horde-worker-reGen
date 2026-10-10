@@ -53,6 +53,52 @@ class DeviceMemoryReading:
         return self.provenance is ReadingProvenance.DEVICE_WIDE
 
 
+@dataclass(frozen=True)
+class DeviceReadingShadow:
+    """What each other source reads as a card's free memory at one sample, recorded beside the reading in use.
+
+    Nothing acts on these figures. On a card NVML answers for they say how far each alternative is from the
+    device figure, which is the only way to know what a card without NVML is being priced against.
+    """
+
+    child_reported_free_mb: float | None
+    """The most conservative free figure the card's processes report, as reported."""
+    ledger_capped_free_mb: float | None
+    """The reported figure capped at the card's total less the worker's committed ledger."""
+    adapter_counter_free_mb: float | None
+    """The card's total less the dedicated memory Windows counts on its adapter. None off Windows."""
+
+
+def shadow_free_figures(
+    *,
+    reported_free_mb: float | None,
+    reported_total_mb: float | None,
+    committed_mb: float,
+    adapter_dedicated_used_mb: float | None,
+) -> DeviceReadingShadow:
+    """Return every alternative free figure that can be formed from what the parent holds for a card.
+
+    The capped figure is taken from :func:`child_reported_reading` as Windows forms it, so the comparison
+    records the reading a card with no device read is given and no second copy of that arithmetic exists.
+    """
+    windows_fallback = child_reported_reading(
+        reported_free_mb=reported_free_mb,
+        reported_total_mb=reported_total_mb,
+        committed_mb=committed_mb,
+        platform="win32",
+    )
+    capped_mb = None if windows_fallback is None else windows_fallback.free_mb
+    if adapter_dedicated_used_mb is None or reported_total_mb is None:
+        adapter_free_mb = None
+    else:
+        adapter_free_mb = max(0.0, reported_total_mb - adapter_dedicated_used_mb)
+    return DeviceReadingShadow(
+        child_reported_free_mb=reported_free_mb,
+        ledger_capped_free_mb=capped_mb,
+        adapter_counter_free_mb=adapter_free_mb,
+    )
+
+
 def nvml_reading(*, free_mb: float, total_mb: float) -> DeviceMemoryReading:
     """Return the reading for a card NVML answered for, which is device-wide by construction."""
     return DeviceMemoryReading(

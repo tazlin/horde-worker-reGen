@@ -1004,6 +1004,18 @@ class StatsSample(BaseModel):
     """Configured concurrent-inference slot count the slot-duty totals are normalized against."""
     dispatch_hold_bucket: str | None = None
     """The slot-duty bucket currently holding the next dispatch (None when dispatching or no work waits)."""
+    device_free_mb: float | None = None
+    """Card 0's free memory (MB) from the reading admission prices against, or None before the first."""
+    device_free_provenance: str | None = None
+    """How far that reading describes the card: ``device_wide``, ``process_local`` or ``host_memory``."""
+    device_free_child_reported_mb: float | None = None
+    """The free figure card 0's processes report, as reported. Recorded for comparison, not acted on."""
+    device_free_ledger_capped_mb: float | None = None
+    """The reported figure capped at the card's total less the worker's committed ledger, the reading a card
+    with no device read gets on Windows. Recorded for comparison, not acted on."""
+    device_free_adapter_counter_mb: float | None = None
+    """The card's total less the dedicated memory Windows counts on its adapter, or None off Windows.
+    Recorded for comparison, not acted on."""
 
 
 class StatsRollupRow(BaseModel):

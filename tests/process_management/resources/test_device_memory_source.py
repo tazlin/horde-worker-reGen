@@ -9,6 +9,7 @@ from horde_worker_regen.process_management.resources.device_memory_source import
     ReadingProvenance,
     child_reported_reading,
     nvml_reading,
+    shadow_free_figures,
 )
 
 
@@ -104,6 +105,41 @@ def test_a_host_memory_card_reports_system_ram_uncapped_and_marked(platform: str
     assert reading.free_mb == 40000.0
     assert reading.provenance is ReadingProvenance.HOST_MEMORY
     assert not reading.is_device_wide
+
+
+def test_the_shadow_figures_are_formed_from_what_the_parent_holds() -> None:
+    """Each alternative free figure is stated beside the others, with the cap and the adapter figure applied."""
+    shadow = shadow_free_figures(
+        reported_free_mb=15009.0,
+        reported_total_mb=16375.0,
+        committed_mb=2144.0,
+        adapter_dedicated_used_mb=3240.0,
+    )
+
+    assert shadow.child_reported_free_mb == 15009.0
+    assert shadow.ledger_capped_free_mb == 14231.0
+    assert shadow.adapter_counter_free_mb == 13135.0
+
+
+def test_a_shadow_figure_with_no_input_is_none() -> None:
+    """A figure whose source has not answered is absent, and the others are still formed."""
+    unreported = shadow_free_figures(
+        reported_free_mb=None,
+        reported_total_mb=None,
+        committed_mb=0.0,
+        adapter_dedicated_used_mb=3240.0,
+    )
+    no_counter = shadow_free_figures(
+        reported_free_mb=15009.0,
+        reported_total_mb=16375.0,
+        committed_mb=0.0,
+        adapter_dedicated_used_mb=None,
+    )
+
+    assert (unreported.child_reported_free_mb, unreported.ledger_capped_free_mb) == (None, None)
+    assert unreported.adapter_counter_free_mb is None
+    assert no_counter.adapter_counter_free_mb is None
+    assert no_counter.ledger_capped_free_mb == 15009.0
 
 
 def test_an_nvml_reading_is_device_wide() -> None:

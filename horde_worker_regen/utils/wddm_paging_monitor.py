@@ -31,10 +31,13 @@ from loguru import logger
 _SHARED_USAGE_COUNTER_PATH = r"\GPU Process Memory(*)\Shared Usage"
 _LOCAL_USAGE_COUNTER_PATH = r"\GPU Process Memory(*)\Local Usage"
 
+_ADAPTER_DEDICATED_COUNTER_PATH = r"\GPU Adapter Memory(*)\Dedicated Usage"
+
 _PDH_MORE_DATA = 0x800007D2
 _PDH_FMT_LARGE = 0x00000400
 
 _INSTANCE_PID_PATTERN = re.compile(r"pid_(\d+)")
+_INSTANCE_LUID_PATTERN = re.compile(r"luid_(0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)")
 
 _BYTES_PER_MB = 1024.0 * 1024.0
 
@@ -50,6 +53,11 @@ class GpuProcessMemorySample:
     timestamp: float
     shared_mb_by_pid: dict[int, float] = field(default_factory=dict)
     local_mb_by_pid: dict[int, float] = field(default_factory=dict)
+    local_mb_by_pid_and_adapter: dict[tuple[int, str], float] = field(default_factory=dict)
+    """Dedicated GPU memory per process and adapter LUID, which says which adapter a process is on."""
+    adapter_dedicated_mb: dict[str, float] = field(default_factory=dict)
+    """Dedicated memory in use on each adapter across every process, keyed by adapter LUID. Empty where
+    the ``GPU Adapter Memory`` counter set is unavailable."""
 
 
 def parse_counter_instance_pid(instance_name: str) -> int | None:
@@ -61,6 +69,68 @@ def parse_counter_instance_pid(instance_name: str) -> int | None:
     if match is None:
         return None
     return int(match.group(1))
+
+
+def parse_counter_instance_adapter(instance_name: str) -> str | None:
+    """Extract the adapter LUID from a GPU counter instance name, or None.
+
+    Both counter sets name the adapter the same way: ``luid_0x00000000_0x0000ABCD_phys_0`` for an adapter,
+    and the same text after ``pid_12345_`` for a process on it.
+    """
+    match = _INSTANCE_LUID_PATTERN.search(instance_name)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def adapter_dedicated_used_mb(sample: GpuProcessMemorySample, pids: set[int]) -> float | None:
+    """Return the dedicated memory in use on the adapter ``pids`` run on, across every process, or None.
+
+    The adapter is the one on which the given processes hold the most dedicated memory between them, so a
+    card is found from the worker processes pinned to it with no index-to-LUID table. None when the adapter
+    counters are unavailable or none of the processes holds memory on any adapter yet.
+    """
+    if not sample.adapter_dedicated_mb:
+        return None
+    held_by_adapter: dict[str, float] = {}
+    for (pid, adapter), local_mb in sample.local_mb_by_pid_and_adapter.items():
+        if pid in pids and local_mb > 0.0:
+            held_by_adapter[adapter] = held_by_adapter.get(adapter, 0.0) + local_mb
+    if not held_by_adapter:
+        return None
+    adapter = max(held_by_adapter, key=lambda candidate: held_by_adapter[candidate])
+    return sample.adapter_dedicated_mb.get(adapter)
+
+
+def sum_by_pid(mb_by_instance: dict[str, float]) -> dict[int, float]:
+    """Sum per-instance megabytes by the OS PID each instance names, dropping instances that name none."""
+    totals: dict[int, float] = {}
+    for instance_name, megabytes in mb_by_instance.items():
+        pid = parse_counter_instance_pid(instance_name)
+        if pid is not None:
+            totals[pid] = totals.get(pid, 0.0) + megabytes
+    return totals
+
+
+def sum_by_pid_and_adapter(mb_by_instance: dict[str, float]) -> dict[tuple[int, str], float]:
+    """Sum per-instance megabytes by the PID and adapter each instance names, dropping any that lack either."""
+    totals: dict[tuple[int, str], float] = {}
+    for instance_name, megabytes in mb_by_instance.items():
+        pid = parse_counter_instance_pid(instance_name)
+        adapter = parse_counter_instance_adapter(instance_name)
+        if pid is not None and adapter is not None:
+            totals[(pid, adapter)] = totals.get((pid, adapter), 0.0) + megabytes
+    return totals
+
+
+def sum_by_adapter(mb_by_instance: dict[str, float]) -> dict[str, float]:
+    """Sum per-instance megabytes by the adapter each instance names, dropping instances that name none."""
+    totals: dict[str, float] = {}
+    for instance_name, megabytes in mb_by_instance.items():
+        adapter = parse_counter_instance_adapter(instance_name)
+        if adapter is not None:
+            totals[adapter] = totals.get(adapter, 0.0) + megabytes
+    return totals
 
 
 def assess_worker_paging(
@@ -123,7 +193,14 @@ def _make_pdh_reader() -> Callable[[], GpuProcessMemorySample | None] | None:
                 return None
             counter_handles[kind] = handle
 
-        def _read_counter_array(handle: ctypes.c_void_p) -> dict[int, float] | None:
+        # The adapter counters are a second counter set. A host without it keeps the per-process reading.
+        adapter_handle = ctypes.c_void_p()
+        adapter_counters_available = (
+            pdh.PdhAddEnglishCounterW(query_handle, _ADAPTER_DEDICATED_COUNTER_PATH, 0, ctypes.byref(adapter_handle))
+            == 0
+        )
+
+        def _read_counter_array(handle: ctypes.c_void_p) -> dict[str, float] | None:
             buffer_size = wintypes.DWORD(0)
             item_count = wintypes.DWORD(0)
             # PDH statuses are unsigned 32-bit HRESULT-style codes; ctypes returns them through the
@@ -149,15 +226,12 @@ def _make_pdh_reader() -> Callable[[], GpuProcessMemorySample | None] | None:
             if status != 0:
                 return None
             items = ctypes.cast(buffer, ctypes.POINTER(_PdhFmtCounterValueItem * item_count.value)).contents
-            totals: dict[int, float] = {}
+            by_instance: dict[str, float] = {}
             for item in items:
                 if item.szName is None:
                     continue
-                pid = parse_counter_instance_pid(item.szName)
-                if pid is None:
-                    continue
-                totals[pid] = totals.get(pid, 0.0) + item.FmtValue.largeValue / _BYTES_PER_MB
-            return totals
+                by_instance[item.szName] = by_instance.get(item.szName, 0.0) + item.FmtValue.largeValue / _BYTES_PER_MB
+            return by_instance
 
         def _read() -> GpuProcessMemorySample | None:
             try:
@@ -167,10 +241,13 @@ def _make_pdh_reader() -> Callable[[], GpuProcessMemorySample | None] | None:
                 local = _read_counter_array(counter_handles["local"])
                 if shared is None and local is None:
                     return None
+                adapters = _read_counter_array(adapter_handle) if adapter_counters_available else None
                 return GpuProcessMemorySample(
                     timestamp=time.time(),
-                    shared_mb_by_pid=shared or {},
-                    local_mb_by_pid=local or {},
+                    shared_mb_by_pid=sum_by_pid(shared or {}),
+                    local_mb_by_pid=sum_by_pid(local or {}),
+                    local_mb_by_pid_and_adapter=sum_by_pid_and_adapter(local or {}),
+                    adapter_dedicated_mb=sum_by_adapter(adapters or {}),
                 )
             except Exception:  # noqa: BLE001 - telemetry must never raise into the control loop
                 return None

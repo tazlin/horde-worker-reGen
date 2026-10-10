@@ -42,6 +42,14 @@ deletion; a foreign file, a leftover `.tmp`, or a nested folder is never touched
 | `decision`       | On an admission/dispatch/reclaim verdict (coalesced) | `decision_kind`, `subject`, `verdict`, `reason`, and a flat `inputs` map of the quantities the arbiter decided from. |
 | `resource_state` | On a device/overflow transition (edge-triggered) | `state_kind` (governor / WDDM paging / saturation-unresolved / dispatch hold), `state`, `device_index`, and flat `inputs`. A `dispatch_hold` record is written when a head's dispatch is first held by the residency gate (`standing`), when it is admitted (`released`, with `reason` `measured_attempt`, `reclaim` or `natural_free`), or when the job leaves the queue unadmitted (`abandoned`); its inputs carry the measured room breakdown described below plus `hold_seconds`. |
 
+A `stats_sample` carries card 0's free memory from the reading admission prices against (`device_free_mb`,
+with `device_free_provenance`) and three figures recorded for comparison that nothing acts on:
+`device_free_child_reported_mb` (what the card's processes report), `device_free_ledger_capped_mb` (that
+figure capped at the card's total less the committed ledger) and `device_free_adapter_counter_mb` (the total
+less the dedicated memory Windows counts on the card's adapter, absent off Windows). On a card NVML answers
+for, each one's difference from `device_free_mb` is the error a card without NVML would carry under the same
+traffic. The adapter figure comes from a counter sampled every two seconds, so it lags a fast change.
+
 A `job_completed` record pairs the priced request with what it cost to serve: alongside resolution, steps
 and batch count it carries `sampler_name` (as the horde advertised it, uncanonicalized), `scheduler`
 (the schedule sampled on, `karras`/`normal` when the request only carried the legacy karras bool) and
