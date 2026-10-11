@@ -6252,9 +6252,11 @@ class InferenceScheduler:
                         job_id=str(referenced.id_) if referenced.id_ is not None else None,
                     ),
                 )
-            elif (
-                process_info.last_process_state == HordeProcessState.INFERENCE_STARTING and referenced.id_ is not None
-            ):
+            elif process_info.is_sampling_owned_job() and referenced.id_ is not None:
+                # A pinned sampler re-bound inside its previous job's sample-result tick is in neither population
+                # until its next report: it is not primed for the new job, and the sampling it still reports
+                # (with that job's step progress) is the previous job's. Read as the new job sampling, the
+                # controller would flag it unpriced and never clear its real wait.
                 samplers.append(
                     ActiveSampler(
                         process_id=process_info.process_id,

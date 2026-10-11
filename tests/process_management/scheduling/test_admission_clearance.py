@@ -531,6 +531,80 @@ async def test_a_pinned_disaggregated_sampler_waits_on_clearance_only_from_its_s
     assert staged_waiter_ids() == [0], "the sample stage's prime makes the pinned sampler a waiter"
 
 
+async def test_a_sampler_rebound_inside_its_result_tick_is_cleared_for_its_next_job() -> None:
+    """A pinned sampler re-bound while still reporting its previous job's denoise loop is granted its next job.
+
+    The staged-ahead handoff binds the next job to the sampler in the tick that releases the previous job's
+    pin, before the child's idle report lands. The slot still reports ``INFERENCE_STARTING`` with the previous
+    job's step progress. Read as the new job sampling, the controller flags an unpriced window and records a
+    sampling grant for the new job, so the child's real clearance wait (its prime, moments later) is never
+    cleared and it samples only after its acquire timeout. The slot is in neither population until a report
+    postdates the new ownership; its prime then makes it a waiter that is cleared.
+    """
+    scheduler, _previous_job, waiter = await _staged_waiter(device_free_mb=24000.0)
+    controller = ClearanceController(device_index=0, slot_cap=1, tail_overlap=False)
+    clearance = threading.BoundedSemaphore(1)
+    clearance.acquire()
+    controller.register(0, ClearanceLeaseProxy(clearance=clearance, done=threading.Semaphore(0)))
+
+    def tick() -> None:
+        controller.step(scheduler.build_clearance_inputs(device_index=0), admit_fn=scheduler.clearance_admit_process)
+
+    # The previous job was cleared, took its permit, and sampled to its last step.
+    tick()
+    assert controller.grant_state(0) is GrantState.CLEARED
+    assert clearance.acquire(blocking=False)
+    waiter.last_process_state = HordeProcessState.INFERENCE_STARTING
+    previous_sampling_reported_at = time.time()
+    waiter.last_process_state_started_at = previous_sampling_reported_at
+    waiter.current_first_step_at = previous_sampling_reported_at
+    waiter.last_current_step = 20
+    waiter.last_total_steps = 20
+    tick()
+    assert controller.grant_state(0) is GrantState.SAMPLING
+
+    # Its pin is released and the next job is bound to the slot in the same tick, ahead of any child report.
+    next_job = make_job_pop_response(_JOB_MODEL)
+    await track_popped_job_async(scheduler._job_tracker, next_job)  # type: ignore[attr-defined]
+    await mark_job_in_progress_async(scheduler._job_tracker, next_job)  # type: ignore[attr-defined]
+    waiter.last_job_referenced = next_job
+    waiter.record_inference_ownership(next_job, attempt_ordinal=1, disaggregated=True)
+    assert waiter.inference_ownership is not None
+    # The rebind follows the previous job's last report by a tick; the clock may not separate them here.
+    waiter.inference_ownership = replace(waiter.inference_ownership, recorded_at=previous_sampling_reported_at + 1.0)
+    ownership = waiter.inference_ownership
+    assert waiter.is_sampling_owned_job() is False
+    assert waiter.is_staged_short_of_sampling() is False
+
+    inputs = scheduler.build_clearance_inputs(device_index=0)
+    assert inputs.staged_waiters == ()
+    assert inputs.active_grants == ()
+    tick()
+    assert controller.unpriced_sampling_windows == 0
+    assert controller.grant_state(0) is GrantState.IDLE, "the previous job's grant retires with its pin"
+
+    # The child's trailing reports land: idle for the previous job, then primed for the next.
+    waiter.last_process_state = HordeProcessState.WAITING_FOR_JOB
+    waiter.last_process_state_started_at = ownership.recorded_at + 0.1
+    tick()
+    assert controller.grant_state(0) is GrantState.IDLE
+    waiter.last_process_state = HordeProcessState.INFERENCE_PRIMED
+    waiter.last_process_state_started_at = ownership.recorded_at + 0.2
+    tick()
+    assert controller.grant_state(0) is GrantState.CLEARED, "the prime is a real wait and is cleared"
+    assert controller.unpriced_sampling_windows == 0
+    assert controller.grants_issued == 2
+
+    waiter.last_process_state = HordeProcessState.INFERENCE_STARTING
+    waiter.last_process_state_started_at = ownership.recorded_at + 0.3
+    waiter.current_first_step_at = time.time()
+    waiter.last_current_step = 1
+    tick()
+    assert waiter.is_sampling_owned_job() is True
+    assert controller.grant_state(0) is GrantState.SAMPLING
+    assert controller.unpriced_sampling_windows == 0
+
+
 async def _refused_past_its_deadline(
     monkeypatch: pytest.MonkeyPatch,
     *,

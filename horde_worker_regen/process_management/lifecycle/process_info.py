@@ -630,6 +630,22 @@ class HordeProcessInfo:
             return state_follows_ownership and self.last_process_state == HordeProcessState.INFERENCE_PRIMED
         return not (state_follows_ownership and self.last_process_state in _INFERENCE_ACTIVE_STATES)
 
+    def is_sampling_owned_job(self) -> bool:
+        """Return whether this slot reports the denoise loop of the job it currently owns.
+
+        A re-bound slot keeps reporting its previous job's sampling until its next report lands, so an
+        ``INFERENCE_STARTING`` report is the owned job's only when it began after the ownership was recorded.
+        Read without that check, the previous job's loop (and its step progress) is attributed to the new job,
+        which then looks like it sampled without a clearance grant while it is in fact still waiting for one.
+        """
+        ownership = self.inference_ownership
+        if ownership is None or self.current_inference_job() is None:
+            return False
+        return (
+            self.last_process_state == HordeProcessState.INFERENCE_STARTING
+            and self.last_process_state_started_at >= ownership.recorded_at
+        )
+
     def note_clearance_wait_entered(self, entered_at: float) -> None:
         """Record that the child began waiting on its clearance permit at wall-clock ``entered_at``."""
         self.clearance_wait_entered_at = entered_at
