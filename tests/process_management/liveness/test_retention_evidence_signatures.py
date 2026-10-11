@@ -115,6 +115,7 @@ async def _drive_signature(
     width: int = 1024,
     height: int = 1024,
     watch_retention: list[str] | None = None,
+    queue_depth: int = _QUEUE_DEPTH,
 ) -> list[ImageGenerateJobPopResponse]:
     """Feed ``world`` jobs cycling through ``models``, keeping its queue full, and run until the work settles.
 
@@ -128,7 +129,7 @@ async def _drive_signature(
     jobs: list[ImageGenerateJobPopResponse] = []
     settling = 0
     for _ in range(_MAX_TICKS):
-        while len(world.job_tracker.jobs_pending_inference) < _QUEUE_DEPTH and len(jobs) < job_count:
+        while len(world.job_tracker.jobs_pending_inference) < queue_depth and len(jobs) < job_count:
             model = models[len(jobs) % len(models)]
             job = make_job_pop_response(model.name, width=width, height=height, ddim_steps=30)
             await world.pop(job)
@@ -230,24 +231,31 @@ async def test_a_pool_locked_traffic_is_granted_retention_after_its_warmup() -> 
 async def test_a_defect_reinjection_an_unsatisfiable_gate_reuploads_every_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With the evidence window emptied, the pool-locked run pays a weight upload per job again.
+    """With the evidence gate unsatisfiable, the pool-locked run pays a weight upload per job again.
 
-    Reinjected at the window alone: a gate that can never find evidence is the shape a mis-aimed evidence
-    requirement takes, and it costs a pool-locked operator the whole of the feature. It is what makes the
-    scenario above a measurement of the warmup bound rather than a restatement of whatever the gate does.
+    Reinjected at the gate alone: a gate that can never find evidence, in the queue or in the slot's trailing
+    dispatches, is the shape a mis-aimed evidence requirement takes, and it costs a pool-locked operator the
+    whole of the feature. It is what makes the scenario above a measurement of the warmup bound rather than a
+    restatement of whatever the gate does.
     """
-    monkeypatch.setattr(retention_module, "RETENTION_REPEAT_EVIDENCE_DISPATCHES", 0)
+    monkeypatch.setattr(
+        RetentionLedger,
+        "slot_has_repeat_evidence",
+        lambda self, process_id, model, *, exclude_latest=False, pending_models=(), displacing_pending_models=(): (
+            False
+        ),
+    )
     world = _signature_world()
 
     jobs = await _drive_signature(world, [_SDXL])
 
     _assert_signature_drained(world, jobs, context="unsatisfiable-gate pool-locked signature")
     assert world.weight_uploads == len(jobs), (
-        "with the evidence window emptied a pool-locked streak must pay one weight upload per job, which is "
+        "with the evidence gate unsatisfiable a pool-locked streak must pay one weight upload per job, which is "
         f"the cost the gate must not impose on it; it paid {world.weight_uploads} for {len(jobs)} jobs"
     )
     assert world.scheduler.retention.grants_issued == 0, (
-        "an unsatisfiable evidence window must grant nothing, so the warmup bound the scenario asserts would "
+        "an unsatisfiable evidence gate must grant nothing, so the warmup bound the scenario asserts would "
         "pass on a tree whose gate never fires"
     )
 
@@ -314,7 +322,7 @@ async def test_b_defect_reinjection_an_ungated_grant_brings_the_unused_holds_bac
     monkeypatch.setattr(
         RetentionLedger,
         "slot_has_repeat_evidence",
-        lambda self, process_id, model, *, exclude_latest=False: True,
+        lambda self, process_id, model, *, exclude_latest=False, pending_models=(), displacing_pending_models=(): True,
     )
     world = _signature_world(card=_CARD_24GB)
 
@@ -412,10 +420,14 @@ async def test_d_sustained_pressure_revokes_the_hold_nothing_came_back_for() -> 
     for its debounce, the hold whose traffic is still arriving is left alone on the same card at the same
     moment, and the revocation goes out through the ordinary idle-model unload rather than a second eviction
     mechanism of its own.
+
+    The feed holds one job at a time. Two lanes alternating models cannot both end a deeper feed retaining,
+    because whichever lane dispatches second to last sees the other model pending, which is a refusal; a
+    one-deep queue is the case the trailing window exists for, and it leaves both copies held for the sweep.
     """
     world = _signature_world()
 
-    await _drive_signature(world, [_SDXL, _SD15], job_count=8, width=512, height=512)
+    await _drive_signature(world, [_SDXL, _SD15], job_count=8, width=512, height=512, queue_depth=1)
     retained = world.retained_residents()
     assert len(retained) == 2, (
         f"stale-hold revoke: the run left {retained} held, but the scenario needs two retaining lanes to say "
@@ -427,7 +439,9 @@ async def test_d_sustained_pressure_revokes_the_hold_nothing_came_back_for() -> 
     # the two lanes when the sweep runs.
     world.now += retention_module.RETENTION_STALE_HOLD_SECONDS + world.tick_seconds
     reused_model = sorted(retained.items())[0][1]
-    await _drive_signature(world, [_model_class_named(reused_model)], job_count=1, width=512, height=512)
+    await _drive_signature(
+        world, [_model_class_named(reused_model)], job_count=1, width=512, height=512, queue_depth=1
+    )
     still_retained = world.retained_residents()
     reused_lane = next(lane for lane, model in still_retained.items() if model == reused_model)
     stale_lane = next(lane for lane, model in still_retained.items() if model != reused_model)

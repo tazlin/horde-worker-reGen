@@ -428,7 +428,7 @@
         {
           "control_flag": "START_INFERENCE",
           "job": "job-1",
-          "keep_model_resident_after": false,
+          "keep_model_resident_after": true,
           "model": "sdxl-checkpoint",
           "process_id": 2
         }
@@ -671,38 +671,6 @@
         }
       ],
       "tick": 17
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sdxl-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-2",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 18
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sdxl-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-2",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 19
     }
   ],
   "ticks_driven": 32

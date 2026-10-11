@@ -39,7 +39,7 @@
         {
           "control_flag": "START_INFERENCE",
           "job": "job-1",
-          "keep_model_resident_after": false,
+          "keep_model_resident_after": true,
           "model": "sd15-checkpoint",
           "process_id": 0
         }
@@ -120,44 +120,6 @@
       "tick": 4
     },
     {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-2",
-          "verdict": "no_op"
-        },
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-3",
-          "verdict": "no_op"
-        },
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-4",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 5
-    },
-    {
       "dispatches": [
         {
           "lane": 0,
@@ -176,7 +138,7 @@
       "sampling_started": [
         "job-3"
       ],
-      "tick": 6
+      "tick": 5
     },
     {
       "dispatches": [
@@ -197,7 +159,7 @@
       "sampling_started": [
         "job-4"
       ],
-      "tick": 7
+      "tick": 6
     }
   ],
   "ticks_driven": 24

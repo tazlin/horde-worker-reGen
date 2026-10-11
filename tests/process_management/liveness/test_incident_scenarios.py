@@ -331,14 +331,14 @@ two-sample debounce can commit on a dip that a coarser tick would never see."""
 _STREAK_JOBS = 16
 """Jobs in a same-model streak: long enough that a per-job re-upload dominates the run's time budget."""
 
-_STREAK_WEIGHT_UPLOADS = 2
+_STREAK_WEIGHT_UPLOADS = 1
 """Weight uploads a same-model streak is permitted, against one per job for a streak that retains nothing.
 
-Retention is granted on evidence the slot's own trailing dispatches supply, so the first dispatch on a slot
-has nothing behind it and is refused; the second supplies the repeat and every dispatch after it is served
-from the retained copy. The streak therefore pays for its weights twice rather than once, and the difference
-amortizes to nothing over any real streak. What the scenarios below are about is the gap between this and the
-sixteen their reinjections produce, not the warmup itself."""
+Retention reads the queue first: a pending job for the committing dispatch's model is the successor, so a
+streak whose queue already holds it is granted retention on its first dispatch and every job after it is
+served from that copy. The slot's trailing dispatches decide only when no other job is pending, so a streak
+behind a queue of one is refused on its first dispatch and pays twice. The worlds below keep the queue full, and what
+they are about is the gap between this and the one upload per job their reinjections produce."""
 
 _QUEUE_DEPTH = 4
 """Jobs the worker is kept holding, so a successor is always available while the retainer is still busy."""
@@ -762,7 +762,7 @@ async def test_d_a_retention_streak_fits_the_card_on_device_truth() -> None:
     The card here is asked for more than the forecast priced, so a shortfall genuinely arises and somebody has
     to answer it. Read as one positive statement and its consequences: the dispatch carries the parent's
     device reading, the child's relief comes out of its own footprint, the card keeps its margin, the governor
-    never saturates, no lane is taken off the air, and the streak still drains on its warmup upload alone.
+    never saturates, no lane is taken off the air, and the streak still drains on its first upload alone.
     """
     world = _streak_world(
         child_free_view_lie_mb=_CHILD_VIEW_LIE_MB,
@@ -1354,11 +1354,13 @@ async def _drive_pressure(
     models: tuple[_ModelClass, ...] | None = None,
     shape: tuple[int, int] | None = None,
     ddim_steps: int = 30,
+    queue_depth: int = _QUEUE_DEPTH,
 ) -> None:
     """Keep ``world``'s queue full with a rotation for ``ticks``, so pressure recurs rather than happens once.
 
     The rotation is what keeps an idle resident on the lane that is not sampling, so the ladder has a resident
     rung to issue; refilling the queue for the whole run is what makes the card cross the cliff repeatedly.
+    ``queue_depth`` is how many jobs are held pending; a feed of one leaves nothing pending at each dispatch.
     """
     if models is None or shape is None:
         # Only a caller that leaves the workload to the card class needs the per-card table; one that names both
@@ -1369,7 +1371,7 @@ async def _drive_pressure(
     width, height = shape
     popped = 0
     for _ in range(ticks):
-        while len(world.job_tracker.jobs_pending_inference) < _QUEUE_DEPTH and popped < job_count:
+        while len(world.job_tracker.jobs_pending_inference) < queue_depth and popped < job_count:
             model = models[popped % len(models)]
             await world.pop(make_job_pop_response(model.name, width=width, height=height, ddim_steps=ddim_steps))
             popped += 1
@@ -1482,11 +1484,16 @@ async def test_g_a_slow_release_is_not_graded_a_failed_rung(
 
     Run across the card classes operators actually have, because the budget a release needs scales with the
     bytes being released: a verdict that only holds on the card it was measured on is a constant in disguise.
+
+    The feed holds one job at a time. The release being graded is one the ladder orders against an idle copy
+    nobody retained; a deeper feed names each model's successor at its dispatch, every copy is then retained,
+    and the residency reconciliation takes it back before the ladder has anything to release. With nothing
+    pending, the first round on each lane is refused on an empty history and leaves the ladder its copy.
     """
     _blind_children_to_device_truth(monkeypatch)
     world = _pressure_world(card=card)
 
-    await _drive_pressure(world, job_count=_PRESSURE_JOBS, ticks=_PRESSURE_TICKS)
+    await _drive_pressure(world, job_count=_PRESSURE_JOBS, ticks=_PRESSURE_TICKS, queue_depth=1)
 
     _assert_slow_release_was_not_misjudged(world, context=f"slow release on {card.label}")
 
@@ -1721,9 +1728,14 @@ async def test_i_defect_reinjection_a_displaced_record_hides_the_head_from_the_p
     weights nothing holds. What comes back is the wedge in full, and its signature is what distinguishes it
     from ordinary memory pressure: jobs pending against idle lanes, a card with most of its memory free, and
     no reclaim ordered at all, because nothing in the worker believes it is short of anything.
+
+    The displaced record only forms when the lane loaded over holds an unretained copy: a retained one is
+    reclaimed before the load, and that unload reconciles the record. The rotation keeps the displaced model
+    in the queue, which earns it retention, so the row holds retention off through the legacy unload hatch
+    and measures the reconciliation it names.
     """
     monkeypatch.setattr(HordeProcessInfo, "holds_different_model", lambda self, model_name: False)
-    world = _streak_world(max_threads=max_threads)
+    world = _streak_world(max_threads=max_threads, legacy_comfy_vram_unload=True)
 
     jobs = await _drive_rotation(world, _ROTATION_3, job_count=_ROTATION_3_JOBS)
 
@@ -2399,13 +2411,16 @@ _GOVERNED_LIGHT_JOBS = 3
 single dispatch that could be luck, and few enough that the run stays inside the dwell."""
 
 
-def _governed_head_world() -> _DispatchWorld:
+def _governed_head_world(*, legacy_comfy_vram_unload: bool = False) -> _DispatchWorld:
     """A 16 GB card whose whole-card grace allowance is spent, with the light class already resident.
 
     The allowance is spent through the ledger's own charge record, which is what a card that has recently
     cycled a residency twice carries. The light checkpoint is seeded resident because the failure is about
     dispatch, not about staging: a line-skip only exists where a smaller ready job is already on a lane the
     card can dispatch it from.
+
+    ``legacy_comfy_vram_unload`` configures the escape hatch that denies every retention grant, for a row whose
+    reinjected defect needs the light copy unretained.
     """
     world = _DispatchWorld(
         card=_CARD_16GB,
@@ -2416,6 +2431,7 @@ def _governed_head_world() -> _DispatchWorld:
         closed_loop=True,
         tick_seconds=_GOVERNED_HEAD_TICK_SECONDS,
         cooldown_seconds=120,
+        legacy_comfy_vram_unload=legacy_comfy_vram_unload,
     )
     state = world.scheduler._whole_card_ledger.state_for(None)
     cycle_seconds = WHOLE_CARD_ESTABLISH_GRACE_SECONDS + WHOLE_CARD_RESTORE_GRACE_SECONDS
@@ -2530,9 +2546,14 @@ async def test_o_defect_reinjection_a_governor_deferred_head_goes_on_reserving_t
     fitting sibling would take. Both liveness verdicts must then fail, and their messages are what say which
     failure this is: a run of idle ticks with fitting work on the card, and a dispatch held for a head that is
     cold, unloading, and standing down.
+
+    The withheld sibling is one whose re-dispatch is priced as a fresh load of the light checkpoint, which
+    only an unretained copy is; a retained one dispatches at no charge and leaves the pricing nothing to
+    withhold. The light jobs queue behind each other, which earns the copy retention, so the row holds
+    retention off through the legacy unload hatch and measures the pricing it names.
     """
     monkeypatch.setattr(InferenceScheduler, "_displaced_head_outstanding_mb", _price_the_deferred_head)
-    world = _governed_head_world()
+    world = _governed_head_world(legacy_comfy_vram_unload=True)
 
     _head, light = await _drive_governed_head(world)
 
@@ -4194,12 +4215,20 @@ Each such card serves one class off weights it already holds and is never the la
 run is a reason for it to idle. A pool that reaches full concurrency once and then serializes fails this."""
 
 
-def _chain_world(*, max_threads: int = 1, preload_ends_dispatch: bool = False) -> _DispatchWorld:
+def _chain_world(
+    *,
+    max_threads: int = 1,
+    preload_ends_dispatch: bool = False,
+    legacy_comfy_vram_unload: bool = False,
+) -> _DispatchWorld:
     """Four cards, two lanes each, ``max_threads`` sampling slots per card, and a backlogged lane on card 1.
 
     ``max_threads`` defaults to one sampling slot per card, the posture the chain rows were written against.
     Raising it is a supported aggressive operator setting and puts both of a card's lanes in play at once,
     which is what makes a dispatch gate's hold on one lane observable against the other cards' ready work.
+
+    ``legacy_comfy_vram_unload`` configures the escape hatch that denies every retention grant, for a row whose
+    reinjected defect needs its residents unretained.
     """
     world = _DispatchWorld(
         card=_CARD_24GB,
@@ -4214,6 +4243,7 @@ def _chain_world(*, max_threads: int = 1, preload_ends_dispatch: bool = False) -
         post_process_card_index=_CHAIN_CARD,
         post_processing_chain_ticks=_CHAIN_TICKS,
         preload_ends_dispatch=preload_ends_dispatch,
+        legacy_comfy_vram_unload=legacy_comfy_vram_unload,
     )
     for lane_id, model in enumerate(_CHAIN_POOL_MODELS):
         world.seed_resident(lane_id, model, in_vram=True)
@@ -4369,11 +4399,16 @@ async def test_t2_a_staged_model_does_not_stop_the_cards_that_were_ready_to_samp
 async def test_t2_defect_reinjection_a_held_head_ends_the_dispatch_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     """With the re-selection removed, a withheld head idles the lanes that were ready to sample.
 
-    The pair's other half. Everything else about the run is identical, so a cycle counted here is one whose
-    only difference is that the withheld job ended the loop instead of being routed around.
+    The pair's other half. The traffic and pool are the same, so a cycle counted here is one where the
+    withheld job ended the loop instead of being routed around.
+
+    The hold that ends the loop is the one a resident's re-dispatch draws when it is priced as a fresh load
+    against the head's demand, which only an unretained copy is. Every class keeps a successor queued, which
+    earns each resident retention, so the row holds retention off through the legacy unload hatch and
+    measures the loop it names.
     """
     _make_a_hold_end_the_dispatch_loop(monkeypatch)
-    world = _chain_world(max_threads=_CHAIN_AGGRESSIVE_THREADS)
+    world = _chain_world(max_threads=_CHAIN_AGGRESSIVE_THREADS, legacy_comfy_vram_unload=True)
 
     await _drive_chain_traffic(world)
 

@@ -1117,7 +1117,7 @@
         {
           "control_flag": "START_INFERENCE",
           "job": "job-3",
-          "keep_model_resident_after": false,
+          "keep_model_resident_after": true,
           "model": "sd15-checkpoint",
           "process_id": 1
         }
@@ -1174,22 +1174,6 @@
         "job-4"
       ],
       "tick": 33
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-4",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 34
     }
   ],
   "ticks_driven": 40

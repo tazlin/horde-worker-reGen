@@ -6,9 +6,16 @@ suppresses that eviction for one job. Eviction elsewhere is on-demand and verifi
 the reclaim ladder), so a grant does not need to be stingy about fit: it needs to be stingy about evidence,
 because a copy nothing comes back for holds the card, prices every later grant against itself, and saves nothing.
 
-The evidence is trailing, never a queue lookahead: the pop cycle refills the queue after a dispatch drains it, so
-a same-model successor is almost never visible at the dispatch instant even when one arrives milliseconds later.
-What the slot has already been asked to run predicts the successor the queue cannot yet show.
+The evidence is read from the pending queue first, through what the queue says about this slot. A popped job for
+the same model is the successor itself. A popped job for a model no other lane holds, with no free lane left to
+take it, will need a lane freed for it, so it counts against the grant; one that another lane already holds routes
+there, and one a free lane can take displaces nobody, and neither says anything about this slot. With no pending
+job deciding, the slot's trailing dispatches predict the successor the queue cannot show: a queue of one is drained
+by the dispatch and refilled only afterwards, and a lane rotation (each lane serving its own model while the shared
+queue names the others) repeats per slot without the queue ever naming it first. Measured on a four-lane worker
+with a two-deep queue and a wide mix whose lanes were always occupied, grants the queue named were reused about
+nine times in ten and trailing grants made with unhomed models pending about one time in two, each miss holding a
+checkpoint-sized copy the next clearance had to evict.
 
 A grant is bounded rather than permanent. A cross-model dispatch onto the retaining slot evicts before it loads,
 the reclaim ladder treats retained residents as first-class candidates, and a hold that goes unreused past the
@@ -444,12 +451,28 @@ class RetentionLedger:
             self._slot_dispatch_history[process_id] = history
         history.appendleft(model)
 
-    def slot_has_repeat_evidence(self, process_id: int, model: str, *, exclude_latest: bool = False) -> bool:
-        """Whether the slot's trailing dispatches contain ``model``, so a same-model successor is predicted.
+    def slot_has_repeat_evidence(
+        self,
+        process_id: int,
+        model: str,
+        *,
+        exclude_latest: bool = False,
+        pending_models: Iterable[str] = (),
+        displacing_pending_models: Iterable[str] = (),
+    ) -> bool:
+        """Whether a same-model successor is predicted by the pending queue, or by the slot's trailing dispatches.
 
-        ``exclude_latest`` skips the newest dispatch so a live grant can be re-asked the question its issuance
-        answered, rather than a looser one its own dispatch would satisfy.
+        ``pending_models`` are the models of the jobs popped and not yet dispatched; one naming ``model`` is the
+        successor itself. ``displacing_pending_models`` are those among them that will need a lane freed (no other
+        lane holds them and no free lane is left to take them), so any of them refuses. A pending model another
+        lane holds or a free lane can take leaves the question to the trailing window. ``exclude_latest`` skips
+        the newest dispatch so a live grant can be re-asked the question its issuance answered, rather than a
+        looser one its own dispatch would satisfy.
         """
+        if model in tuple(pending_models):
+            return True
+        if any(pending != model for pending in displacing_pending_models):
+            return False
         history = self._slot_dispatch_history.get(process_id)
         if history is None:
             return False

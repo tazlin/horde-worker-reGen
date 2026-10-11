@@ -6,7 +6,7 @@ import enum
 import statistics
 import sys
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -10304,15 +10304,25 @@ class InferenceScheduler:
         # whose encoders and weights together exceed the card is not helped by keeping its weights: the
         # encoder then runs offloaded and the backend evicts part of the retained copy to seat it, which costs
         # more than the re-upload the grant would save.
+        pending_models = self._pending_models_besides(dispatched_job)
+        displacing = self._displacing_pending_models(pending_models, besides=process_with_model)
         if not residency_names_model and not self._retention.slot_has_repeat_evidence(
-            process_with_model.process_id, model
+            process_with_model.process_id,
+            model,
+            pending_models=pending_models,
+            displacing_pending_models=displacing,
         ):
+            source = (
+                f"pending job(s) for {', '.join(sorted(set(displacing)))} will need a lane freed"
+                if displacing
+                else f"no pending job names it and this slot's last {retention.RETENTION_REPEAT_EVIDENCE_DISPATCHES} "
+                f"dispatch(es) did not run it"
+            )
             return self._deny_retention(
                 model,
                 process_with_model,
                 RetentionDenialReason.NO_REPEAT_EVIDENCE,
-                f"no repeat evidence: {model} is absent from this slot's last "
-                f"{retention.RETENTION_REPEAT_EVIDENCE_DISPATCHES} dispatch(es)",
+                f"no repeat evidence: {source}",
             )
         fit = self._retention_fit(
             dispatched_job,
@@ -10333,6 +10343,42 @@ class InferenceScheduler:
             denial_reason=None if fit.granted else RetentionDenialReason.STATIC_FIT,
         )
         return fit.granted
+
+    def _pending_models_besides(self, dispatched_job: ImageGenerateJobPopResponse) -> tuple[str, ...]:
+        """The models of the popped jobs still awaiting dispatch, with ``dispatched_job`` itself left out.
+
+        The dispatch committing now can still sit in the pending set on the tick it commits, and counted it
+        would be its own successor.
+        """
+        return tuple(
+            job.model
+            for job in self._job_tracker.jobs_pending_inference
+            if job.model is not None and job.id_ != dispatched_job.id_
+        )
+
+    def _displacing_pending_models(self, models: Iterable[str], *, besides: HordeProcessInfo) -> tuple[str, ...]:
+        """The pending models that will need a lane freed: held by no lane but ``besides``, beyond the free lanes.
+
+        A pending job for a model some other lane holds routes to that lane, and one a free lane (holding nothing)
+        can take displaces nobody; only the unhomed models left over once the free lanes are spoken for are
+        evidence against keeping ``besides`` occupied. Counting free lanes is what keeps a cold start from refusing
+        every grant: with every lane empty nothing needs freeing, and a refusal would drop a copy that then reads
+        as unhomed at the next decision.
+        """
+        held_elsewhere: set[str] = set()
+        free_lanes = 0
+        for process_info in self._process_map.values():
+            if (
+                process_info.process_type != HordeProcessType.INFERENCE
+                or process_info.process_id == besides.process_id
+            ):
+                continue
+            if process_info.loaded_horde_model_name is None:
+                free_lanes += 1
+            else:
+                held_elsewhere.add(process_info.loaded_horde_model_name)
+        unhomed = [name for name in dict.fromkeys(models) if name not in held_elsewhere]
+        return tuple(unhomed[free_lanes:])
 
     def _deny_retention(
         self,

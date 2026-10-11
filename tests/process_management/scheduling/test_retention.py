@@ -127,6 +127,39 @@ class TestRepeatEvidence:
         ledger.record_slot_dispatch(1, "a")
         assert ledger.slot_has_repeat_evidence(1, "a") is False
 
+    def test_a_pending_same_model_job_is_evidence_without_history(self) -> None:
+        """A popped job naming the model is the successor itself, so a slot with no history is still granted."""
+        ledger = RetentionLedger(_Clock())
+        assert ledger.slot_has_repeat_evidence(1, "a", pending_models=("b", "a")) is True
+        assert ledger.slot_has_repeat_evidence(1, "a", pending_models=("b", "c")) is False
+
+    def test_a_displacing_pending_model_overrides_the_trailing_window(self) -> None:
+        """A pending job that will need a lane freed refuses the grant, whatever this slot ran before.
+
+        A pending model another lane holds, or one a free lane can take, leaves the trailing window to decide;
+        the trailing window read against a displacing pending model is a coin flip, and each miss holds a copy
+        the next clearance has to evict. The scheduler decides which pending models displace.
+        """
+        ledger = RetentionLedger(_Clock())
+        for model in ["a", "a", "a"]:
+            ledger.record_slot_dispatch(1, model)
+        assert ledger.slot_has_repeat_evidence(1, "a") is True
+        assert ledger.slot_has_repeat_evidence(1, "a", pending_models=("b",)) is True
+        assert (
+            ledger.slot_has_repeat_evidence(1, "a", pending_models=("b",), displacing_pending_models=("b",)) is False
+        )
+        assert (
+            ledger.slot_has_repeat_evidence(1, "a", pending_models=("a", "b"), displacing_pending_models=("b",))
+            is True
+        )
+
+    def test_pending_evidence_survives_exclude_latest(self) -> None:
+        """Re-asking a live grant still reads the queue: a pending successor keeps the hold worth keeping."""
+        ledger = RetentionLedger(_Clock())
+        ledger.record_slot_dispatch(1, "a")
+        assert ledger.slot_has_repeat_evidence(1, "a", exclude_latest=True) is False
+        assert ledger.slot_has_repeat_evidence(1, "a", exclude_latest=True, pending_models=("a",)) is True
+
 
 class TestHoldAges:
     """When a retention episode starts, ends, and counts as stale."""

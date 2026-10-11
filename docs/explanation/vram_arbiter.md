@@ -1186,21 +1186,30 @@ itself, and is eventually handed back through the reclaim ladder having saved no
 wide model mix that describes most copies, and the accumulated holds recreate the pressure the ladder then has
 to resolve.
 
-The evidence a grant needs is therefore what the slot has already been asked to run: the dispatched model must
-appear among that slot's previous three dispatches. This adapts to whatever an operator offers without
-encoding an assumed mix or a machine's capacity. A slot serving a single-model pool supplies the evidence on
-every dispatch after its first and is granted exactly as freely as an ungated policy would grant it; a slot
-rotating more models than the window holds earns close to nothing.
+The evidence a grant needs is an observation of the successor, read from the pending queue through what it
+says about this slot. A popped job still pending for the same model is the successor itself: on a queue deeper
+than one job the pops run ahead of the dispatches, so at the dispatch instant the next same-model job is
+usually already visible. A pending job for a model that no other lane holds, with no free lane left to take
+it, will need a lane freed for it and refuses the grant; a pending model some other lane already holds routes
+there, one a free lane can take displaces nobody, and neither says anything about this slot. When no pending
+job decides, the slot's previous three dispatches do: a queue of one job is drained
+by the dispatch and refilled only afterwards, and a lane rotation (each lane serving its own model while the
+shared queue names the others) repeats per slot without the queue ever naming the successor first. All of it
+adapts to whatever an operator offers without encoding an assumed mix or a machine's capacity. A slot serving a
+single-model pool supplies the evidence on every dispatch and is granted exactly as freely as an ungated
+policy would grant it; a slot rotating a wide mix earns close to nothing.
 
-The evidence is **trailing**, never a queue lookahead, and that distinction is why the gate can exist at all.
-The pop cycle refills the queue immediately *after* a dispatch drains it, so at the dispatch instant a
-same-model successor is almost never visible in the pending set even when one arrives milliseconds later; a
-gate reading the queue would refuse a pool-locked worker every grant and make retention unreachable. What a
-slot has already run is under no such timing.
+The trailing window is not read while a displacing model is pending because it is wrong about half the time
+there, measured on a four-lane worker with a two-deep queue and a wide mix whose lanes were always occupied:
+grants the queue named were reused
+about nine times in ten, trailing grants made with unhomed models pending about one time in two, and each
+miss held a checkpoint-sized copy that the next clearance had to evict through the reclaim ladder before it
+could clear.
 
-The one cost is warmup: the first dispatch on a slot has no history behind it and is refused, so a streak pays
-for its weights twice rather than once. That amortizes to nothing over any real streak, and it is the price of
-granting on evidence rather than on assumption.
+The queue is read with the committing dispatch left out, so a job never counts as its own successor. The one
+remaining cost is warmup on a queue of one: the first dispatch on a slot has no history behind it and nothing
+pending, so a streak pays for its weights twice rather than once. That amortizes to nothing over any real
+streak, and it is the price of granting on evidence rather than on assumption.
 
 The trailing history lives on the scheduler, keyed by slot, because it describes the slot's traffic rather
 than one process's residency: it must outlive every job boundary, and a slot whose child was replaced is still

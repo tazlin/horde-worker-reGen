@@ -111,10 +111,10 @@ def _map_with_model_on_process(
 
 
 async def test_retains_when_healthy_and_budget_fits_without_queue_lookahead() -> None:
-    """A healthy card with a fitting budget retains, even with an empty pending queue.
+    """A healthy card with a fitting budget retains on trailing evidence when nothing is pending.
 
-    The pop cycle refills the queue after a dispatch drains it, so requiring a visible same-model
-    successor would make retention structurally unreachable.
+    A queue of one is drained by the dispatch and refilled only afterwards, so with an empty pending set the
+    slot's own trailing dispatches are the only evidence a streak can leave.
     """
     job_tracker = JobTracker()
     dispatched = make_job_pop_response(model=_MODEL)
@@ -1153,6 +1153,67 @@ async def test_an_idle_lane_holding_components_is_charged_as_a_tenant() -> None:
     assert (
         scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
     )
+
+
+async def test_retains_on_an_unseeded_slot_when_the_queue_names_a_successor() -> None:
+    """A pending popped job for the same model is the successor, so the streak's first dispatch is granted.
+
+    The trailing window refuses the first dispatch of every streak, and on a queue deeper than one job that
+    refusal re-uploads weights the queue already shows will be needed again. A pending job for another model
+    is no such evidence, and the dispatch committing now does not count as its own successor.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model="a-streak-model")
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    ), "control: with no history and nothing pending the grant is refused"
+
+    await track_popped_job_async(job_tracker, make_job_pop_response(model=_OTHER_MODEL))
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    ), "a pending job for another model no lane holds is not evidence"
+
+    await track_popped_job_async(job_tracker, make_job_pop_response(model="a-streak-model"))
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+async def test_a_pending_model_another_lane_holds_leaves_the_trailing_window_to_decide() -> None:
+    """A pending job for a model a sibling lane holds routes there, so this slot's own history still earns the grant.
+
+    Four lanes each serving one model of a rotation repeat per slot while the shared queue names the others;
+    refusing on those would reload every job. A pending model held nowhere else will need a lane freed and
+    refuses, since the trailing window read against it is a coin flip whose misses the ladder has to evict.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+    await track_popped_job_async(job_tracker, make_job_pop_response(model=_OTHER_MODEL))
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    scheduler._overhead.set_marginal_overhead_mb(1354.0)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    ), "the other model is homed on the sibling, so the seeded trailing evidence decides"
+
+    await track_popped_job_async(job_tracker, make_job_pop_response(model="a-model-no-lane-holds"))
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    ), "a pending model held nowhere, with no free lane, will need a lane freed"
+
+    free_lane = make_mock_process_info(_SIBLING_PROCESS_ID + 1, model_name=None)
+    scheduler._process_map[_SIBLING_PROCESS_ID + 1] = free_lane
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    ), "a free lane takes the unhomed pending job, so nothing needs freeing and the trailing window decides"
 
 
 async def test_retains_the_model_a_held_whole_card_residency_advertises() -> None:

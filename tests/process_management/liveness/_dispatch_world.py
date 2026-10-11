@@ -714,6 +714,11 @@ class _RecordingActuator:
         acted = self._scheduler.pause_component_lane(device_index)
         return self._record(ReclaimRungKind.PAUSE_COMPONENT_LANE, "component_lane", None, acted)
 
+    def demote_safety_weights(self, device_index: int | None) -> bool:
+        """Move safety's weights to host RAM in place, recording the rung when the scheduler acted."""
+        acted = self._scheduler.demote_safety_weights(device_index)
+        return self._record(ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS, "safety_weights", None, acted)
+
     def safety_off_gpu(self, device_index: int | None) -> bool:
         """Move safety off the card, recording the rung when the scheduler acted."""
         acted = self._scheduler.safety_off_gpu(device_index)
