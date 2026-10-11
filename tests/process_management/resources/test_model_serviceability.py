@@ -11,6 +11,7 @@ from horde_worker_regen.process_management.resources.model_serviceability import
     ModelFootprintFigures,
     ModelServiceabilityTier,
     assess_model_serviceability,
+    check_card_weight_budget,
     decide_constrained_offer,
     max_power_to_pixels,
     model_footprint_figures_for_baseline,
@@ -460,3 +461,157 @@ class TestModelServiceabilityVerdicts:
             )
             == []
         )
+
+
+# Core weights no 16 GB card's weight budget holds, with a recommended minimum card a 16 GB card meets (the
+# qwen_image seed shape: the recommendation alone would offer it).
+_OVER_BUDGET_ON_16GB = ModelFootprintFigures(
+    weights_mb=19500.0,
+    activation_per_megapixel_mb=1500.0,
+    min_recommended_card_mb=14000.0,
+)
+
+
+class TestWeightBudget:
+    """Core weights over the card's weight budget are unserviceable in every branch, as dispatch rules."""
+
+    def test_streaming_model_over_the_budget_is_unserviceable_though_its_recommended_card_fits(self) -> None:
+        """16 GB: the model streams and its recommended card fits the capacity, but the weights exceed the budget."""
+        verdict = assess_model_serviceability(
+            total_vram_mb=16 * _GB,
+            baseline_mb=0.0,
+            noise_buffer_mb=0.0,
+            figures=_OVER_BUDGET_ON_16GB,
+        )
+
+        assert verdict.capacity_mb is not None
+        assert _OVER_BUDGET_ON_16GB.streams_on(verdict.capacity_mb)
+        assert _OVER_BUDGET_ON_16GB.min_recommended_card_mb <= verdict.capacity_mb
+        assert verdict.tier is ModelServiceabilityTier.UNSERVICEABLE
+        assert verdict.over_weight_budget is True
+        assert verdict.largest_fitting_max_power is None
+        assert "exceed the weight budget" in verdict.reason()
+
+    def test_whole_card_model_over_the_budget_is_unserviceable_though_its_recommended_card_fits(self) -> None:
+        """The whole-card branch compares the recommendation with the total; the budget still rules first."""
+        verdict = assess_model_serviceability(
+            total_vram_mb=16 * _GB,
+            baseline_mb=0.0,
+            noise_buffer_mb=0.0,
+            figures=_OVER_BUDGET_ON_16GB,
+            whole_card=True,
+        )
+
+        assert verdict.tier is ModelServiceabilityTier.UNSERVICEABLE
+        assert "exceed the weight budget" in verdict.reason()
+
+    @pytest.mark.parametrize("whole_card", [False, True])
+    def test_the_same_figures_are_serviceable_on_a_24gb_card(self, whole_card: bool) -> None:
+        """24 GB holds the weights within its budget, so the over-budget rule does not fire."""
+        verdict = assess_model_serviceability(
+            total_vram_mb=24 * _GB,
+            baseline_mb=0.0,
+            noise_buffer_mb=0.0,
+            figures=_OVER_BUDGET_ON_16GB,
+            whole_card=whole_card,
+        )
+
+        assert verdict.over_weight_budget is False
+        assert verdict.tier is ModelServiceabilityTier.SERVICEABLE
+
+    def test_a_whole_card_model_subtracts_the_fixed_reservation(self) -> None:
+        """Krea-class weights fit a 16 GB card's budget, but not what a 2 GB fixed reservation leaves of it."""
+        krea = ModelFootprintFigures(
+            weights_mb=12600.0,
+            activation_per_megapixel_mb=1500.0,
+            min_recommended_card_mb=14000.0,
+        )
+        unreserved = assess_model_serviceability(
+            total_vram_mb=16375.0,
+            baseline_mb=0.0,
+            noise_buffer_mb=None,
+            figures=krea,
+            whole_card=True,
+        )
+        reserved = assess_model_serviceability(
+            total_vram_mb=16375.0,
+            baseline_mb=0.0,
+            noise_buffer_mb=None,
+            figures=krea,
+            whole_card=True,
+            fixed_reserved_vram_mb=2000.0,
+        )
+
+        assert unreserved.tier is ModelServiceabilityTier.SERVICEABLE
+        assert reserved.tier is ModelServiceabilityTier.UNSERVICEABLE
+        assert "fixed reservation 2000 MB" in reserved.reason()
+
+    def test_a_shared_card_model_ignores_the_fixed_reservation(self) -> None:
+        """A model that shares the card meets the tenant through runtime admission, so its budget is the total's."""
+        verdict = assess_model_serviceability(
+            total_vram_mb=16375.0,
+            baseline_mb=0.0,
+            noise_buffer_mb=None,
+            figures=_FLUX,
+            fixed_reserved_vram_mb=8000.0,
+        )
+
+        assert verdict.weight_budget is not None
+        assert verdict.weight_budget.fixed_reserved_vram_mb == 0.0
+        assert verdict.over_weight_budget is False
+
+    @pytest.mark.parametrize(
+        ("total_vram_mb", "weight_mb"),
+        [(16 * _GB, None), (None, 19500.0), (0.0, 19500.0)],
+    )
+    def test_unknown_weight_or_total_abstains(self, total_vram_mb: float | None, weight_mb: float | None) -> None:
+        """Missing facts read as fitting, so missing metadata never de-lists a model."""
+        check = check_card_weight_budget(total_vram_mb=total_vram_mb, weight_mb=weight_mb)
+
+        assert check.fits is True
+        assert check.budget_mb is None
+
+    def test_a_reservation_leaving_no_usable_vram_does_not_fit(self) -> None:
+        """A reservation as large as the card leaves no budget at all."""
+        check = check_card_weight_budget(total_vram_mb=8192.0, weight_mb=100.0, fixed_reserved_vram_mb=8192.0)
+
+        assert check.fits is False
+        assert "does NOT fit" in check.reason()
+
+    def test_a_failed_budget_lookup_fits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unavailable budget estimate must not block routing."""
+        import hordelib.vram_planning as vram_planning
+
+        def _raise(total_vram_mb: int) -> int:
+            raise RuntimeError("no estimate")
+
+        monkeypatch.setattr(vram_planning, "compute_weight_budget_mb", _raise)
+
+        check = check_card_weight_budget(total_vram_mb=16 * _GB, weight_mb=19500.0)
+
+        assert check.fits is True
+        assert check.budget_mb is None
+
+    @pytest.mark.parametrize(("total_vram_mb", "expected"), [(16384.0, False), (24576.0, True)])
+    def test_the_offer_holds_back_a_qwen_image_model_a_16gb_card_cannot_hold(
+        self,
+        total_vram_mb: float,
+        expected: bool,
+    ) -> None:
+        """The verdicts the popper reads use hordelib's qwen_image seeds and agree with the dispatch budget."""
+        model = "qwen_model"
+        config = make_mock_bridge_data(image_models_to_load=[model])
+        config.vram_admission_noise_mb = None
+        metadata = make_test_model_metadata(
+            {model: make_mock_model_reference_record(model, baseline=KNOWN_IMAGE_GENERATION_BASELINE.qwen_image)},
+        )
+
+        verdicts = model_serviceability_verdicts(
+            model,
+            card_runtimes=make_test_card_runtimes(config=config, total_vram_mb=total_vram_mb),
+            model_metadata=metadata,
+            admission_baseline_provider=None,
+            max_pixels=None,
+        )
+
+        assert [verdict.serviceable for _, verdict in verdicts] == [expected]

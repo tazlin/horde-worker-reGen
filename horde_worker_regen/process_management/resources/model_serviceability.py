@@ -11,6 +11,12 @@ sampling activation scaled by megapixels. That is what a card must host at sampl
 (text encoders, VAE) are loaded around the sampler rather than beside it, and the decode transient is bounded
 by tiling and covered by the admission noise buffer.
 
+Every tier first requires the model's core weights to fit ComfyUI's static weight budget for the card
+(:func:`check_card_weight_budget`). Weights over that budget cannot be resident even alone, so every sampling
+step reads them from host RAM, and dispatch eligibility refuses such a job on that card. A model over the
+budget is ``UNSERVICEABLE`` whatever the tiers below say; the offer and dispatch call the one function, so the
+worker never advertises a model that dispatch would fault.
+
 A baseline whose smallest resident job (core weights plus the smallest legal activation) exceeds the card's
 capacity is never resident on that card at any size: ComfyUI streams its weights from host RAM, and the
 worker gives it the whole card. For such a model the resident-footprint inequality is the wrong question, so
@@ -123,6 +129,116 @@ class ModelFootprintFigures:
 
 
 @dataclass(frozen=True)
+class CardWeightBudgetCheck:
+    """One card's weight-budget judgement of a model's core weights.
+
+    ``budget_mb`` is ComfyUI's static weight budget for the card's usable VRAM. It is None when the check
+    abstained (unknown weights or total, or a failed budget lookup) and when the fixed reservation leaves no
+    usable VRAM, which ``fits`` tells apart.
+    """
+
+    fits: bool
+    weight_mb: float | None
+    total_vram_mb: float | None
+    fixed_reserved_vram_mb: float
+    budget_mb: float | None
+
+    @property
+    def usable_vram_mb(self) -> float | None:
+        """Return the card total less the fixed reservation (MB), or None when the total is unknown."""
+        if self.total_vram_mb is None:
+            return None
+        return self.total_vram_mb - max(0.0, self.fixed_reserved_vram_mb)
+
+    def reason(self) -> str:
+        """Render the checked weight-budget arithmetic for logs and fault diagnostics."""
+        if self.weight_mb is None or self.total_vram_mb is None:
+            return "core weights or device total unknown; weight-budget check abstains"
+        card = f"{self.total_vram_mb:.0f} MB card"
+        if self.fixed_reserved_vram_mb > 0:
+            card = (
+                f"{self.total_vram_mb:.0f} MB card less a fixed reservation {self.fixed_reserved_vram_mb:.0f} MB "
+                f"({self.usable_vram_mb:.0f} MB usable)"
+            )
+        if self.budget_mb is None:
+            if self.fits:
+                return f"weight budget of a {card} is unknown; weight-budget check abstains"
+            return f"the {card} leaves no VRAM for weights: does NOT fit"
+        if self.fits:
+            return f"core weights {self.weight_mb:.0f} MB vs weight budget {self.budget_mb:.0f} MB of a {card}: fits"
+        return (
+            f"core weights {self.weight_mb:.0f} MB exceed the weight budget {self.budget_mb:.0f} MB of a {card}, "
+            "so they can never be resident and every step would stream them from host RAM: does NOT fit"
+        )
+
+
+def check_card_weight_budget(
+    *,
+    total_vram_mb: float | None,
+    weight_mb: float | None,
+    fixed_reserved_vram_mb: float = 0.0,
+) -> CardWeightBudgetCheck:
+    """Return whether a model's core weights fit a card's static weight budget.
+
+    The budget is hordelib's mirror of ComfyUI's ``maximum_vram_for_weights()``; weights above it stream from
+    host RAM on every step even with the card to themselves. Both promises the worker makes about a model call
+    this: the pop offer (:func:`assess_model_serviceability`) and dispatch eligibility
+    (``gpu_eligibility.reasons_card_cannot_serve``).
+
+    Unknown weights or total abstain as fitting, so missing metadata never de-lists a model. A failed budget
+    lookup also fits, because an unavailable estimate must not block routing.
+
+    Args:
+        total_vram_mb: The card's total VRAM (MB), or None when unknown.
+        weight_mb: The model's core (diffusion) weights (MB), or None when unknown.
+        fixed_reserved_vram_mb: Device memory another tenant holds for the session, subtracted from the total
+            before the budget is computed. The caller passes it only for a whole-card model: a model that
+            shares the card meets that tenant through runtime admission instead.
+
+    Returns:
+        The check, with the budget it compared against.
+    """
+    reserved_mb = max(0.0, fixed_reserved_vram_mb)
+    if weight_mb is None or total_vram_mb is None or total_vram_mb <= 0:
+        return CardWeightBudgetCheck(
+            fits=True,
+            weight_mb=weight_mb,
+            total_vram_mb=None if total_vram_mb is None or total_vram_mb <= 0 else total_vram_mb,
+            fixed_reserved_vram_mb=reserved_mb,
+            budget_mb=None,
+        )
+    usable_vram_mb = total_vram_mb - reserved_mb
+    if usable_vram_mb <= 0:
+        return CardWeightBudgetCheck(
+            fits=False,
+            weight_mb=weight_mb,
+            total_vram_mb=total_vram_mb,
+            fixed_reserved_vram_mb=reserved_mb,
+            budget_mb=None,
+        )
+    try:
+        from hordelib.vram_planning import compute_weight_budget_mb
+
+        budget_mb = float(compute_weight_budget_mb(int(usable_vram_mb)))
+    except Exception as error:  # noqa: BLE001 - an unavailable estimate must not crash routing
+        logger.debug(f"Weight-budget lookup failed for {usable_vram_mb} MB: {type(error).__name__} {error}")
+        return CardWeightBudgetCheck(
+            fits=True,
+            weight_mb=weight_mb,
+            total_vram_mb=total_vram_mb,
+            fixed_reserved_vram_mb=reserved_mb,
+            budget_mb=None,
+        )
+    return CardWeightBudgetCheck(
+        fits=weight_mb <= budget_mb,
+        weight_mb=weight_mb,
+        total_vram_mb=total_vram_mb,
+        fixed_reserved_vram_mb=reserved_mb,
+        budget_mb=budget_mb,
+    )
+
+
+@dataclass(frozen=True)
 class ModelServiceabilityVerdict:
     """The result of checking a model's footprint against one card."""
 
@@ -135,6 +251,13 @@ class ModelServiceabilityVerdict:
     """The operator's ``max_power`` job in pixels, or None when the check covered the minimum job only."""
     whole_card: bool = False
     """Whether the model was judged as a whole-card model, by its recommended minimum card against the total."""
+    weight_budget: CardWeightBudgetCheck | None = None
+    """The card's weight-budget check of the model's core weights, or None when the verdict abstained."""
+
+    @property
+    def over_weight_budget(self) -> bool:
+        """Whether the model's core weights exceed the card's weight budget, so no job size fits."""
+        return self.weight_budget is not None and not self.weight_budget.fits
 
     @property
     def serviceable(self) -> bool:
@@ -151,7 +274,7 @@ class ModelServiceabilityVerdict:
     @property
     def largest_fitting_pixels(self) -> int | None:
         """The largest batch-1 pixel count that fits this card, or None when unknown or nothing fits."""
-        if self.capacity_mb is None or self.figures is None:
+        if self.capacity_mb is None or self.figures is None or self.over_weight_budget:
             return None
         return self.figures.largest_fitting_pixels(self.capacity_mb)
 
@@ -169,6 +292,8 @@ class ModelServiceabilityVerdict:
             return "device total is unknown; serviceability check abstains"
         if self.figures is None or self.capacity_mb is None:
             return "model footprint is unknown; serviceability check abstains"
+        if self.weight_budget is not None and self.over_weight_budget:
+            return self.weight_budget.reason()
         capacity = (
             f"capacity total {self.total_vram_mb:.0f} - baseline {self.baseline_mb:.0f} - noise "
             f"{self.noise_buffer_mb:.0f} = {self.capacity_mb:.0f} MB"
@@ -221,11 +346,15 @@ def assess_model_serviceability(
     figures: ModelFootprintFigures | None,
     max_pixels: int | None = None,
     whole_card: bool = False,
+    fixed_reserved_vram_mb: float = 0.0,
 ) -> ModelServiceabilityVerdict:
     """Return which tier a model falls in on one card.
 
     Unknown capacity or unknown footprint figures abstain as serviceable: the worker must not de-list a model
-    on missing metadata. When both sides are known, the smallest legal job's ``weights + activation`` is
+    on missing metadata. When both sides are known, core weights over the card's weight budget
+    (:func:`check_card_weight_budget`) are ``UNSERVICEABLE`` before any other inequality, the rule dispatch
+    eligibility applies; ``fixed_reserved_vram_mb`` is subtracted from the total for that check only when
+    ``whole_card`` is set, as dispatch does. Otherwise the smallest legal job's ``weights + activation`` is
     compared with ``total - baseline - noise``; when ``max_pixels`` is given, the job at that size is compared
     too, and a model whose minimum fits but whose ``max_pixels`` job does not is ``CONSTRAINED``. The baseline
     is the shared device load the worker cannot reclaim; the noise buffer is the same admission slack used by
@@ -244,7 +373,16 @@ def assess_model_serviceability(
             whole_card=whole_card,
         )
     capacity_mb = (float(total_vram_mb) - max(0.0, baseline_mb)) - max(0.0, resolved_noise_mb)
-    if whole_card:
+    weight_budget = check_card_weight_budget(
+        total_vram_mb=float(total_vram_mb),
+        weight_mb=figures.weights_mb,
+        fixed_reserved_vram_mb=fixed_reserved_vram_mb if whole_card else 0.0,
+    )
+    if not weight_budget.fits:
+        # A recommended minimum card that fits says nothing about weights over the budget: they stream every
+        # step, and dispatch eligibility refuses the job on this card by the same check.
+        tier = ModelServiceabilityTier.UNSERVICEABLE
+    elif whole_card:
         floor_mb = figures.min_recommended_card_mb
         tier = (
             ModelServiceabilityTier.SERVICEABLE
@@ -275,6 +413,7 @@ def assess_model_serviceability(
         figures=figures,
         max_pixels=max_pixels,
         whole_card=whole_card,
+        weight_budget=weight_budget,
     )
 
 
@@ -332,6 +471,10 @@ def model_serviceability_verdicts(
     abstains (reads as serviceable) when the model's footprint or the card's total is unknown. The noise
     buffer is the card's admission margin (the operator's per-card override, else the platform default), the
     same slack runtime VRAM admission subtracts.
+
+    The weight-budget check reads the card's whole total: no per-card fixed reservation reaches this function,
+    so a whole-card model beside a fixed on-GPU safety residency is judged here against a larger budget than
+    dispatch eligibility uses for it.
     """
     serving_cards = [card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)]
     if not serving_cards:

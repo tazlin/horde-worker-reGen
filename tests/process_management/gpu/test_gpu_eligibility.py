@@ -176,3 +176,49 @@ class TestHeterogeneousWeightFit:
 
         assert eligible_cards([safety_card, sibling], ordinary) == {0, 1}
         assert eligible_cards([safety_card, sibling], whole_card) == {1}
+
+    @pytest.mark.parametrize(
+        ("total_vram_mb", "weight_mb", "fixed_reserved_vram_mb", "wants_whole_card"),
+        [
+            (16384.0, 19500.0, 0.0, True),
+            (24576.0, 19500.0, 0.0, True),
+            (16375.0, 12600.0, 0.0, True),
+            (16375.0, 12600.0, 2000.0, True),
+            (16375.0, 12600.0, 2000.0, False),
+            (8192.0, 4900.0, 0.0, False),
+            (8192.0, 11500.0, 0.0, False),
+        ],
+    )
+    def test_model_weights_reason_is_the_unmodified_budget_rule(
+        self,
+        total_vram_mb: float,
+        weight_mb: float,
+        fixed_reserved_vram_mb: float,
+        wants_whole_card: bool,
+    ) -> None:
+        """The reason fires exactly when weights exceed the budget of the total less a whole-card reservation."""
+        from hordelib.vram_planning import compute_weight_budget_mb
+
+        card = _profile(
+            device_index=0,
+            total_vram_mb=total_vram_mb,
+            served={"model"},
+            fixed_reserved_vram_mb=fixed_reserved_vram_mb,
+        )
+        job = make_job_pop_response(model="model", width=512, height=512)
+        ordinary = describe_job_requirements(job, _SDXL, weight_mb=weight_mb)
+        requirements = JobRequirements(
+            model=ordinary.model,
+            baseline=ordinary.baseline,
+            weight_mb=ordinary.weight_mb,
+            image_features=ordinary.image_features,
+            pixels=ordinary.pixels,
+            batch=ordinary.batch,
+            wants_whole_card=wants_whole_card,
+        )
+        usable_vram_mb = total_vram_mb - (fixed_reserved_vram_mb if wants_whole_card else 0.0)
+        expected_over_budget = weight_mb > compute_weight_budget_mb(int(usable_vram_mb))
+
+        reasons = reasons_card_cannot_serve(card, requirements)
+
+        assert (CARD_NOT_CAPABLE_REASON.model_weights in reasons) is expected_over_budget

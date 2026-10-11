@@ -107,6 +107,7 @@ lease a dispatch is the load, and the job-start prefetch already covers the read
 | Clearance admit for a staged child | [`decide_clearance_admit`][horde_worker_regen.process_management.scheduling.admission.clearance.decide_clearance_admit] | snapshot, the frozen arbiter | `ClearancePlan` | `clearance_admit_process` |
 | Host RAM governance | [`ResourceGovernor`][horde_worker_regen.process_management.scheduling.governance.governor.ResourceGovernor] | `HostMemorySnapshot` | `GovernanceAction` list | `PlanExecutor.execute_governance_actions` |
 | Model serviceability (the pop offer and the preload gate share it) | [`model_serviceability_verdicts`][horde_worker_regen.process_management.resources.model_serviceability.model_serviceability_verdicts] | card runtimes, model metadata, the admission baseline | one verdict per serving card | the popper, the process manager's card report, the snapshot builder |
+| Weight budget (the serviceability verdict and dispatch eligibility share it) | [`check_card_weight_budget`][horde_worker_regen.process_management.resources.model_serviceability.check_card_weight_budget] | card total, core weight seed, a whole-card model's fixed reservation | `CardWeightBudgetCheck` | `assess_model_serviceability`, `reasons_card_cannot_serve` |
 
 A child maps a checkpoint as a copy-on-write file view. On Windows that view charges its whole file size to
 system commit when it is mapped, for as long as the lane holds it, while consuming no physical RAM, so psutil's

@@ -242,8 +242,14 @@ that would relieve the pressure it is waiting on.
 ## Serviceability: what a card can host, and the constrained lane
 
 Before any of the narrowings above, each offered model is judged against the card it would run on
-(`resources/model_serviceability.py`). A model whose smallest legal job cannot fit `total - baseline -
-noise` is never advertised. A model whose smallest job fits but whose `max_power` job does not is
+(`resources/model_serviceability.py`). The first test is the card's weight budget, ComfyUI's static
+`maximum_vram_for_weights()` as hordelib mirrors it (`check_card_weight_budget`). Core weights above it
+cannot be resident even with the card to themselves, so every step would stream them from host RAM. Such a
+model is never advertised on that card, whatever its recommended minimum card says. Dispatch eligibility
+(`gpu/gpu_eligibility.py`) calls the same function for each accepted job, so the offer and the dispatch
+verdict agree. For a whole-card model dispatch subtracts a fixed safety residency from the total first; the
+offer has no per-card reservation to subtract and reads the whole total. A model whose smallest legal job
+cannot fit `total - baseline - noise` is never advertised. A model whose smallest job fits but whose `max_power` job does not is
 *constrained*: it is still offered, at the largest `max_power` it fits. A baseline whose core weights
 alone exceed the card's capacity is never resident on that card at any size (ComfyUI streams it and the
 worker gives it the whole card), so it is judged by the baseline's recommended minimum card instead of the
