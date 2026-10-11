@@ -1834,6 +1834,57 @@ class TestHandlePopErrorResponse:
 
         assert popper.is_in_error_backoff is False
 
+    def test_the_dropped_jobs_advice_is_printed_only_for_maintenance_the_horde_imposed(self) -> None:
+        """An owner who set maintenance is not sent looking for dropped jobs."""
+        printer = "horde_worker_regen.process_management.jobs.job_popper.MaintenanceModeMessenger"
+
+        with patch(printer) as owner_set:
+            _make_popper()._handle_pop_error_response(
+                RequestErrorResponse(
+                    message="This worker has been put into maintenance mode by its owner",
+                    rc=RC.WorkerMaintenance,
+                ),
+            )
+        with patch(printer) as forced:
+            _make_popper()._handle_pop_error_response(
+                RequestErrorResponse(
+                    message="Maintenance mode activated because worker is dropping too many jobs.",
+                    rc=RC.WorkerMaintenance,
+                ),
+            )
+
+        owner_set.print_maintenance_mode_messages.assert_not_called()
+        forced.print_maintenance_mode_messages.assert_called_once()
+
+    def test_a_maintenance_reply_is_an_empty_pop_for_a_whole_card_claim(self) -> None:
+        """Under maintenance a pop with no work is answered with the refusal, so the claim must count it."""
+        from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardPopClaim
+
+        popper = _make_popper()
+        outcome = Mock()
+        popper._whole_card_pop_outcome = outcome
+        claim = WholeCardPopClaim(model="Krea2-Turbo_fp8", device_index=None, held_since=0.0, expires_at=180.0)
+
+        popper._handle_pop_error_response(
+            RequestErrorResponse(message="owner-only traffic", rc=RC.WorkerMaintenance),
+            pop_claim=claim,
+        )
+
+        outcome.assert_called_once_with(served=False)
+
+    def test_a_real_error_reports_nothing_to_a_whole_card_claim(self) -> None:
+        """An API error says nothing about the claimed model's demand, so the run of empty pops is untouched."""
+        from horde_worker_regen.process_management.scheduling.governance.whole_card import WholeCardPopClaim
+
+        popper = _make_popper()
+        outcome = Mock()
+        popper._whole_card_pop_outcome = outcome
+        claim = WholeCardPopClaim(model="Krea2-Turbo_fp8", device_index=None, held_since=0.0, expires_at=180.0)
+
+        popper._handle_pop_error_response(RequestErrorResponse(message="Internal server error"), pop_claim=claim)
+
+        outcome.assert_not_called()
+
     def test_a_real_error_still_backs_off_after_maintenance(self) -> None:
         """Exempting maintenance must not exempt the errors that follow it."""
         popper = _make_popper()

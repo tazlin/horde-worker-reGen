@@ -1163,7 +1163,8 @@ class JobPopper:
 
         Only an attempt that reached the horde and was answered carries evidence: a request that errored or
         timed out says nothing about whether the claimed model has demand, so those paths report nothing and
-        the run of empty answers keeps whatever length it had.
+        the run of empty answers keeps whatever length it had. A maintenance refusal is an answer, and is
+        reported as an empty one.
         """
         if claim is None or self._whole_card_pop_outcome is None:
             return
@@ -1834,26 +1835,44 @@ class JobPopper:
         except Exception as e:
             logger.error(f"Failed to process API messages: {e}")
 
-    def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
+    def _handle_pop_error_response(
+        self,
+        response: RequestErrorResponse,
+        *,
+        pop_claim: WholeCardPopClaim | None = None,
+    ) -> None:
         """Log and categorize an error response from the pop API, backing off the pop cadence for real errors.
 
         A worker in maintenance is refused every pop with ``WorkerMaintenance`` as the return code. That is a
         hold the operator chose or the horde imposed, never an API error, and the horde still hands the owner's
         own jobs to this worker's pops. Backing off would only make the worker the slowest one to reach them,
         so a maintenance reply keeps the normal cadence, as it does in the text and alchemy flows.
+
+        ``pop_claim`` is the whole-card claim the refused offer was made under, if any. A maintenance reply
+        is reported to it as an empty pop. Under maintenance that reply is the only answer a pop with no work
+        receives, so a claim that ignored it could end only at its maximum hold.
         """
         message_lower = response.message.lower()
         is_maintenance = response.rc == RC.WorkerMaintenance or "maintenance mode" in message_lower
 
         if is_maintenance:
             if not self._state.last_pop_maintenance_mode:
+                forced_by_server = _is_server_forced_maintenance(message_lower)
                 logger.warning(f"Failed to pop job (Maintenance Mode): {response}")
-                MaintenanceModeMessenger.print_maintenance_mode_messages()
+                if forced_by_server:
+                    MaintenanceModeMessenger.print_maintenance_mode_messages()
+                else:
+                    # The advice above is for a worker the horde paused for dropped jobs. It would send an
+                    # owner who set maintenance on purpose looking for a fault that is not there.
+                    logger.info(
+                        "This worker is in maintenance on the horde. Only requests from its owner reach it until "
+                        "maintenance is lifted. If you did not set maintenance, clear it on the horde's worker page.",
+                    )
                 self._state.last_pop_maintenance_mode = True
                 self._state.server_maintenance_cleared_by_job_pop = False
                 self._state.server_maintenance_latched_at = time.time()
                 self._state.server_maintenance_pop_rejections = 0
-                self._state.server_maintenance_forced_by_server = _is_server_forced_maintenance(message_lower)
+                self._state.server_maintenance_forced_by_server = forced_by_server
                 if self._run_metrics is not None:
                     self._run_metrics.record_event(
                         WorkerEventKind.MAINTENANCE_ON,
@@ -1868,6 +1887,7 @@ class JobPopper:
             # The throttler is not told either way. A maintenance reply says nothing about whether an earlier
             # real error has cleared, so a backoff that error opened is neither extended nor ended here.
             self._state.last_pop_no_jobs_available = True
+            self._note_whole_card_pop_outcome(pop_claim, served=False)
             return
 
         if "we cannot accept workers serving" in message_lower:
@@ -2432,7 +2452,7 @@ class JobPopper:
             self._process_api_messages(job_pop_response)
 
             if isinstance(job_pop_response, RequestErrorResponse):
-                self._handle_pop_error_response(job_pop_response)
+                self._handle_pop_error_response(job_pop_response, pop_claim=pop_claim)
                 return
 
         except Exception as e:

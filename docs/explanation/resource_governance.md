@@ -558,7 +558,8 @@ has three ends, and the first to arrive wins:
   window as well as a count, is the finding that the burst is over, and the claim releases early rather than
   idling out the cap. Both rails are fixed constants: they describe how much evidence is needed to believe a
   reading, which is not an operator preference. The hysteresis is what stops one unlucky pop ending a
-  productive burst.
+  productive burst. A pop the horde refuses because the worker is in maintenance counts as an empty pop.
+  Under maintenance that refusal is the only answer a pop with no work receives.
 - **The residency itself.** The claim is derived from the residency and the clock on every ask rather than
   latched, so a residency that drains and restores for any other reason takes its claim with it.
 
