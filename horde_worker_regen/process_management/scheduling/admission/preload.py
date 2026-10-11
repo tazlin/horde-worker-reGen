@@ -894,7 +894,7 @@ def preload_candidate_delta_mb(snapshot: SchedulingSnapshot, job_id: str, proces
     )
     if delta_mb is None or not bool(snapshot.config.gpu_sampling_lease_enabled):
         return delta_mb
-    return min(delta_mb, pricing.STAGING_ENCODE_VRAM_MB)
+    return min(delta_mb, pricing.staging_charge_mb(job.baseline))
 
 
 def predictive_vram_verdict(snapshot: SchedulingSnapshot, job_id: str, device_index: int | None) -> BudgetVerdict:

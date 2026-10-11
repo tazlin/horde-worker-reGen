@@ -194,9 +194,9 @@ class TestPreloadCandidatePricing:
         job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
         await track_popped_job_async(scheduler._job_tracker, job)
 
-        assert (
-            preload.preload_candidate_delta_mb(scheduler.snapshot(), str(job.id_), None)
-            == pricing.STAGING_ENCODE_VRAM_MB
+        snapshot = scheduler.snapshot()
+        assert preload.preload_candidate_delta_mb(snapshot, str(job.id_), None) == pricing.staging_charge_mb(
+            snapshot.queue.jobs[str(job.id_)].baseline,
         )
 
 

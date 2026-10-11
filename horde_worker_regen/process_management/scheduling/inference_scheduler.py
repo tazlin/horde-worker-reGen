@@ -173,7 +173,6 @@ from horde_worker_regen.process_management.scheduling.admission.preload import (
     price_preload,
     select_idle_lane_warms,
 )
-from horde_worker_regen.process_management.scheduling.admission.pricing import STAGING_ENCODE_VRAM_MB
 from horde_worker_regen.process_management.scheduling.admission.snapshot import (
     HostRamSnapshot,
     SchedulingSnapshot,
@@ -4079,7 +4078,7 @@ class InferenceScheduler:
         head_card = self._card_runtimes.get(process.device_index) if self._multi_gpu_routing_active else None
         if head_card is not None:
             jobs_on_head_card = len(self._jobs_in_progress_on_card(head_card.device_index))
-            head_card_cap = self._max_jobs_in_progress_allowed(card=head_card)
+            head_card_cap = self._max_jobs_in_progress_allowed(card=head_card, job=head)
             if jobs_on_head_card >= head_card_cap:
                 if self._job_tracker.has_exclusive_job_in_progress(head_card.device_index) and not (
                     self._job_tracker.is_admitted_exclusive(head)
@@ -4096,7 +4095,7 @@ class InferenceScheduler:
                 )
 
         in_progress = len(self._job_tracker.jobs_in_progress)
-        cap = self._max_jobs_in_progress_allowed()
+        cap = self._max_jobs_in_progress_allowed(job=head)
         if in_progress >= cap:
             # The exclusive-admit hold collapses the cap to the running job; name it distinctly so the
             # serialization is attributed to the admit, not to a generic cap the operator would chase
@@ -5706,8 +5705,10 @@ class InferenceScheduler:
         if arbiter is None or not arbiter.has_cycle or candidate_job.model is None:
             return None
         lease_active = self._clearance_lease_active()
+        baseline = self._model_metadata.get_baseline(candidate_job.model)
         staging_charge_mb = pricing.overlap_staging_charge_mb(
             clearance_lease_active=lease_active,
+            baseline=baseline,
             running_remaining_sampling_seconds=(
                 self._running_remaining_sampling_seconds(target_device_index) if lease_active else ()
             ),
@@ -5717,7 +5718,6 @@ class InferenceScheduler:
                 else None
             ),
         )
-        baseline = self._model_metadata.get_baseline(candidate_job.model)
         resident_model_info = self._horde_model_map.root.get(candidate_job.model)
         resident_pid = resident_model_info.process_id if resident_model_info is not None else None
         if staging_charge_mb is not None and resident_pid is not None:
@@ -5950,6 +5950,7 @@ class InferenceScheduler:
         self,
         *,
         card: CardRuntime | None = None,
+        job: ImageGenerateJobPopResponse | None = None,
     ) -> int:
         """The cap on concurrently in-progress jobs for this scheduling decision.
 
@@ -5971,6 +5972,9 @@ class InferenceScheduler:
                 for the whole fleet and hold every idle card at one card's worth of work. The free-VRAM
                 staging headroom is that card's own measured free; ``None`` reads the worker-wide
                 (tightest-card) figure.
+            job: The job this decision would dispatch. The free-VRAM headroom is compared against its
+                family's staging charge (:func:`pricing.staging_charge_mb`); ``None`` compares against the
+                floor figure.
         """
         # An exclusive admit suppresses only its planned card once routing has attributed it. Before attribution
         # (and on the worker-wide single-GPU path), the conservative worker-wide answer still blocks every card.
@@ -6001,20 +6005,26 @@ class InferenceScheduler:
         # processes idle while jobs queued). The full materialisation is priced at clearance, so speculation
         # here never over-commits the device: it only funds the encode footprint the staging actually incurs.
         reserve_mb = self._vram_budget.reserve_mb if self._budget_active() else 0.0
+        staging_baseline = (
+            self._model_metadata.get_baseline(job.model) if job is not None and job.model is not None else None
+        )
+        staging_charge_mb = pricing.staging_charge_mb(staging_baseline)
         free_vram_mb = self._measured_free_vram_mb(device_index=card.device_index if card is not None else None)
         if free_vram_mb is None:
             self._note_staging_defer(
                 StagingDeferReason.MEASUREMENT_UNREAD,
                 headroom_mb=None,
+                staging_charge_mb=staging_charge_mb,
                 slot_cap=base,
                 process_ceiling=process_ceiling,
             )
             return base
         headroom_mb = free_vram_mb - reserve_mb
-        if headroom_mb < STAGING_ENCODE_VRAM_MB:
+        if headroom_mb < staging_charge_mb:
             self._note_staging_defer(
                 StagingDeferReason.ENCODE_HEADROOM_SHORT,
                 headroom_mb=headroom_mb,
+                staging_charge_mb=staging_charge_mb,
                 slot_cap=base,
                 process_ceiling=process_ceiling,
             )
@@ -6027,6 +6037,7 @@ class InferenceScheduler:
         reason: StagingDeferReason,
         *,
         headroom_mb: float | None,
+        staging_charge_mb: float,
         slot_cap: int,
         process_ceiling: int,
     ) -> None:
@@ -6044,7 +6055,7 @@ class InferenceScheduler:
         suffix = f" (suppressed {suppressed} unchanged repeats)" if suppressed > 0 else ""
         logger.debug(
             f"Holding the in-progress cap at {slot_cap} sampling slot(s) rather than pre-staging onto "
-            f"{process_ceiling}: {reason.value}, {measured} against the {STAGING_ENCODE_VRAM_MB:.0f}MB a "
+            f"{process_ceiling}: {reason.value}, {measured} against the {staging_charge_mb:.0f}MB a "
             f"staged job's encode working set charges.{suffix}",
         )
 
@@ -7570,12 +7581,12 @@ class InferenceScheduler:
 
         Under the clearance lease a dispatch stages the job (checkpoint disk load, prompt encode) without
         loading the diffusion weights to VRAM, which happens inside the leased sample call at clearance. With
-        ``staging_only`` the reservation is booked at the encode charge (:data:`STAGING_ENCODE_VRAM_MB`)
-        rather than the full activation-inclusive peak, so a staged job holds only the device footprint it
-        actually incurs. :meth:`_upgrade_dispatch_reservation_to_full` re-books it at what is left to
-        materialise when the job is cleared (``set_planned`` refreshes the same ``(flow, unit)`` entry in place,
-        re-charging in full and resetting its materialisation watermark, so the encode charge is upgraded, never
-        double-booked).
+        ``staging_only`` the reservation is booked at the family's encode charge
+        (:func:`pricing.staging_charge_mb`) rather than the full activation-inclusive peak, so a staged job holds
+        only the device footprint it actually incurs. :meth:`_upgrade_dispatch_reservation_to_full` re-books it at
+        what is left to materialise when the job is cleared (``set_planned`` refreshes the same ``(flow, unit)``
+        entry in place, re-charging in full and resetting its materialisation watermark, so the encode charge is
+        upgraded, never double-booked).
 
         A dispatch onto an already-resident model materialises the job's activation-inclusive peak (net of the
         resident-weight credit the model already holds) over the sampling window the device-free reading does
@@ -7593,7 +7604,7 @@ class InferenceScheduler:
         if job.id_ is None:
             return
         if staging_only:
-            charge_mb: float | None = STAGING_ENCODE_VRAM_MB
+            charge_mb: float | None = pricing.staging_charge_mb(baseline)
         else:
             charge_mb = self._measured_admission_candidate_delta_mb(
                 job,
@@ -8761,7 +8772,7 @@ class InferenceScheduler:
             jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
         else:
             jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
-        return jobs_in_progress_count < self._max_jobs_in_progress_allowed(card=target_card)
+        return jobs_in_progress_count < self._max_jobs_in_progress_allowed(card=target_card, job=job)
 
     def pending_inference_in_placement_order(self) -> tuple[ImageGenerateJobPopResponse, ...]:
         """The pending-inference queue in the order the scheduler places work from, retained copies first.
@@ -9143,6 +9154,7 @@ class InferenceScheduler:
                 return None
             if len(self._jobs_in_progress_on_card(candidate_device_index)) >= self._max_jobs_in_progress_allowed(
                 card=candidate_card,
+                job=candidate_job,
             ):
                 return None
         if not self._concurrent_overlap_allowed(candidate_job, target_device_index=candidate_device_index):
@@ -9885,7 +9897,7 @@ class InferenceScheduler:
             jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
         else:
             jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
-        max_jobs_allowed = self._max_jobs_in_progress_allowed(card=target_card)
+        max_jobs_allowed = self._max_jobs_in_progress_allowed(card=target_card, job=next_job)
         if jobs_in_progress_count >= max_jobs_allowed:
             exclusive_scope = target_card.device_index if target_card is not None else None
             if self._job_tracker.has_exclusive_job_in_progress(exclusive_scope):
@@ -10452,7 +10464,7 @@ class InferenceScheduler:
             )
             if materialisation_mb is None:
                 return None
-            charges_mb += max(0.0, materialisation_mb - STAGING_ENCODE_VRAM_MB)
+            charges_mb += max(0.0, materialisation_mb - pricing.staging_charge_mb(staged_baseline))
         return charges_mb
 
     def _retained_resident_charges_mb(
@@ -11818,6 +11830,7 @@ class InferenceScheduler:
         # moment. Without the lease this is the VRAM moment, so the full materialisation is priced as before.
         staging_charge_override = pricing.dispatch_staging_charge_mb(
             clearance_lease_active=self._clearance_lease_active(),
+            baseline=self._model_metadata.get_baseline(next_job.model),
         )
 
         outcome = self._evaluate_materialization_admission(

@@ -22,6 +22,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
     StreamForecast,
     _job_feature_kinds,
+    baseline_burden_entry,
     effective_inference_reserve_mb,
     forecast_weight_streaming,
     predict_job_decode_spike_mb,
@@ -46,29 +47,61 @@ from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quot
 
 type Baseline = KNOWN_IMAGE_GENERATION_BASELINE | str | None
 
-STAGING_ENCODE_VRAM_MB = 2048.0
-"""VRAM a staged (dispatched but not-yet-cleared) job actually charges the device under the clearance
-lease: the text-encoder footprint plus the conditioning working set for the largest supported family
-(SDXL's dual CLIP encode lands near 1.5-2GB). Under the clearance lease the diffusion weights load
-*inside* the leased sample call, at clearance, not at dispatch, so a staged job's device footprint is
-only this encode working set until it is cleared. Dispatch admits staging while measured device free net
-of the reserve covers this charge; the full materialisation is priced at clearance instead."""
+STAGING_ENCODE_ALLOWANCE_MB = 348.0
+"""VRAM (MB) a staged job's encode allocates beyond its family's text-encoder and VAE weights: the latents and
+the conditioning working set the encode holds before the child acquires the sampling lease. Sized so SDXL,
+whose support weights are 1700 MB, stages at the 2048 MB its dual CLIP encode was measured near."""
+
+_STAGING_FLOOR_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+"""The family whose staging charge is every family's floor, and the charge of a job whose family is unknown.
+
+A family with lighter support weights still allocates the encode working set, so pricing it below SDXL's
+measured figure would admit staging into room the encode then overruns."""
 
 
-def dispatch_staging_charge_mb(*, clearance_lease_active: bool) -> float | None:
+def staging_charge_mb(baseline: Baseline) -> float:
+    """Return the VRAM (MB) a staged (dispatched, not yet cleared) job of the family charges the card.
+
+    Under the clearance lease the diffusion weights load inside the leased sample call, so a staged job holds
+    only its encode until clearance: the family's support weights (hordelib's ``vram_support_weights_mb``) plus
+    :data:`STAGING_ENCODE_ALLOWANCE_MB`, floored at the SDXL figure. A heavy text encoder (Flux, Qwen,
+    Z-Image) therefore stages at its own size, where one flat SDXL-sized figure admitted encodes the card
+    could not hold.
+
+    Args:
+        baseline: The job's model family; None or a family hordelib has no seed for is charged the floor.
+
+    Returns:
+        The staging charge (MB).
+    """
+    floor_mb = _family_support_weights_mb(_STAGING_FLOOR_BASELINE) + STAGING_ENCODE_ALLOWANCE_MB
+    if baseline is None:
+        return floor_mb
+    return max(floor_mb, _family_support_weights_mb(baseline) + STAGING_ENCODE_ALLOWANCE_MB)
+
+
+def _family_support_weights_mb(baseline: KNOWN_IMAGE_GENERATION_BASELINE | str) -> float:
+    """Return the family's text-encoder and VAE weights (MB) from hordelib's seed, or 0 when it has none."""
+    burden = baseline_burden_entry(str(baseline), None)
+    return float(burden.vram_support_weights_mb) if burden is not None else 0.0
+
+
+def dispatch_staging_charge_mb(*, clearance_lease_active: bool, baseline: Baseline) -> float | None:
     """Return what a dispatch puts on the card when it only stages the job, or None when it is the VRAM moment.
 
     Under the clearance lease the weights land at clearance, which prices the full materialisation, so the
-    dispatch charges the encode working set alone. The residency gate charges this with no duration term: its
-    head-protection arithmetic is stated against it, and the overlap gate, which governs a dispatch beside a
-    running sampler, adds the duration term through :func:`overlap_staging_charge_mb`.
+    dispatch charges the encode working set alone (:func:`staging_charge_mb`). The residency gate charges this
+    with no duration term: its head-protection arithmetic is stated against it, and the overlap gate, which
+    governs a dispatch beside a running sampler, adds the duration term through
+    :func:`overlap_staging_charge_mb`.
     """
-    return STAGING_ENCODE_VRAM_MB if clearance_lease_active else None
+    return staging_charge_mb(baseline) if clearance_lease_active else None
 
 
 def overlap_staging_charge_mb(
     *,
     clearance_lease_active: bool,
+    baseline: Baseline,
     running_remaining_sampling_seconds: Sequence[float | None],
     incoming_load_seconds: float | None,
 ) -> float | None:
@@ -80,8 +113,8 @@ def overlap_staging_charge_mb(
     measured weight-load seconds fits the timeout twice over, so the estimate may be wrong by its own size. An
     unknown remaining time or an unmeasured load keeps the full price.
     """
-    staging_charge_mb = dispatch_staging_charge_mb(clearance_lease_active=clearance_lease_active)
-    if staging_charge_mb is None or incoming_load_seconds is None:
+    dispatch_charge_mb = dispatch_staging_charge_mb(clearance_lease_active=clearance_lease_active, baseline=baseline)
+    if dispatch_charge_mb is None or incoming_load_seconds is None:
         return None
     known_remaining_seconds = [seconds for seconds in running_remaining_sampling_seconds if seconds is not None]
     if len(known_remaining_seconds) != len(running_remaining_sampling_seconds):
@@ -90,7 +123,7 @@ def overlap_staging_charge_mb(
     margin_seconds = expected_wait_seconds
     if expected_wait_seconds + margin_seconds >= CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:
         return None
-    return staging_charge_mb
+    return dispatch_charge_mb
 
 
 # ---- context overheads
@@ -749,6 +782,16 @@ def has_teardownable_idle_context(
     return bool(teardownable_idle_contexts(snapshot, head_process_id, device_index=device_index))
 
 
+def is_bare_context(*, model: str | None, held_component_count: int) -> bool:
+    """Whether an idle inference slot is a bare context: no model and no held components.
+
+    Only such a slot is a teardown candidate, since a slot holding a model or components has a cheaper rung
+    that unloads or releases them. It is also the only idle slot whose context the admission room may count
+    as returnable.
+    """
+    return model is None and held_component_count == 0
+
+
 def teardownable_idle_context_returns_mb(
     snapshot: SchedulingSnapshot,
     head_process_id: int,
@@ -760,7 +803,7 @@ def teardownable_idle_context_returns_mb(
     return [
         max(0.0, float(slot.reserved_mb or 0)) + marginal_mb
         for slot in teardownable_idle_contexts(snapshot, head_process_id, device_index=device_index)
-        if slot.model is None and slot.held_component_count == 0
+        if is_bare_context(model=slot.model, held_component_count=slot.held_component_count)
     ]
 
 

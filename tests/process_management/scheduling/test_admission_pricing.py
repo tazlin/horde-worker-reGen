@@ -13,6 +13,7 @@ from unittest.mock import Mock
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
+from hordelib.feature_impact import get_baseline_burden
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -362,6 +363,37 @@ class TestReclaimPredicates:
         )
 
 
+_FLUX = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
+"""A family whose text encoder is far heavier than SDXL's."""
+
+
+class TestStagingCharge:
+    """A staged job charges its family's support weights plus the encode allowance, floored at SDXL's figure."""
+
+    def test_sdxl_stages_at_2048(self) -> None:
+        """SDXL's figure is the one every staging charge was sized against, so its scheduling is unchanged."""
+        assert pricing.staging_charge_mb(KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl) == 2048.0
+
+    def test_flux_stages_at_its_family_figure(self) -> None:
+        """Flux's staging charge is its own support weights plus the allowance, well above SDXL's."""
+        flux_burden = get_baseline_burden(_FLUX.value)
+        assert flux_burden is not None
+        expected_mb = flux_burden.vram_support_weights_mb + pricing.STAGING_ENCODE_ALLOWANCE_MB
+        assert expected_mb > 2048.0
+        assert pricing.staging_charge_mb(_FLUX) == expected_mb
+
+    @pytest.mark.parametrize("baseline", [None, "not_a_known_family"])
+    def test_an_unknown_family_stages_at_the_sdxl_figure(self, baseline: str | None) -> None:
+        """A job whose family hordelib has no seed for is charged the SDXL figure."""
+        assert pricing.staging_charge_mb(baseline) == pricing.staging_charge_mb(
+            KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+        )
+
+    def test_a_lighter_family_is_floored_at_the_sdxl_figure(self) -> None:
+        """SD1's support weights are below SDXL's, but its encode still allocates the working set."""
+        assert pricing.staging_charge_mb(KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1) == 2048.0
+
+
 class TestDispatchStagingCharge:
     """Under the lease a dispatch charges its staging cost only while clearance is expected before the timeout.
 
@@ -371,10 +403,11 @@ class TestDispatchStagingCharge:
 
     def test_without_the_lease_both_gates_price_the_full_job(self) -> None:
         """Without the lease the dispatch is the VRAM moment, so neither charge applies."""
-        assert pricing.dispatch_staging_charge_mb(clearance_lease_active=False) is None
+        assert pricing.dispatch_staging_charge_mb(clearance_lease_active=False, baseline=_FLUX) is None
         assert (
             pricing.overlap_staging_charge_mb(
                 clearance_lease_active=False,
+                baseline=_FLUX,
                 running_remaining_sampling_seconds=(1.0,),
                 incoming_load_seconds=1.0,
             )
@@ -383,18 +416,18 @@ class TestDispatchStagingCharge:
 
     def test_the_residency_gate_charges_staging_whatever_the_duration(self) -> None:
         """The residency gate's charge carries no duration term."""
-        assert pricing.dispatch_staging_charge_mb(clearance_lease_active=True) == pricing.STAGING_ENCODE_VRAM_MB
+        assert pricing.dispatch_staging_charge_mb(clearance_lease_active=True, baseline=_FLUX) == (
+            pricing.staging_charge_mb(_FLUX)
+        )
 
     def test_a_short_wait_charges_staging(self) -> None:
         """A sampler finishing well inside the timeout lets the next job stage at the encode charge."""
-        assert (
-            pricing.overlap_staging_charge_mb(
-                clearance_lease_active=True,
-                running_remaining_sampling_seconds=(5.0, 3.0),
-                incoming_load_seconds=4.0,
-            )
-            == pricing.STAGING_ENCODE_VRAM_MB
-        )
+        assert pricing.overlap_staging_charge_mb(
+            clearance_lease_active=True,
+            baseline=_FLUX,
+            running_remaining_sampling_seconds=(5.0, 3.0),
+            incoming_load_seconds=4.0,
+        ) == pricing.staging_charge_mb(_FLUX)
 
     def test_a_wait_without_its_own_margin_prices_the_full_job(self) -> None:
         """The longest remaining sample plus the load must fit the timeout twice over."""
@@ -402,6 +435,7 @@ class TestDispatchStagingCharge:
         assert (
             pricing.overlap_staging_charge_mb(
                 clearance_lease_active=True,
+                baseline=_FLUX,
                 running_remaining_sampling_seconds=(1.0, half_timeout - 4.0),
                 incoming_load_seconds=4.0,
             )
@@ -413,6 +447,7 @@ class TestDispatchStagingCharge:
         assert (
             pricing.overlap_staging_charge_mb(
                 clearance_lease_active=True,
+                baseline=_FLUX,
                 running_remaining_sampling_seconds=(2.0, None),
                 incoming_load_seconds=1.0,
             )
@@ -424,6 +459,7 @@ class TestDispatchStagingCharge:
         assert (
             pricing.overlap_staging_charge_mb(
                 clearance_lease_active=True,
+                baseline=_FLUX,
                 running_remaining_sampling_seconds=(2.0,),
                 incoming_load_seconds=None,
             )

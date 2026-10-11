@@ -278,7 +278,8 @@ def sibling_staging_relief_mb(snapshot: SchedulingSnapshot, job_id: str, process
             still_to_allocate_mb = 0.0
         else:
             held_mb = staged_held_mb(snapshot, sibling_job_id, sibling.process_id)
-            still_to_allocate_mb = max(0.0, pricing.STAGING_ENCODE_VRAM_MB - held_mb)
+            sibling_staging_mb = pricing.staging_charge_mb(snapshot.queue.jobs[sibling_job_id].baseline)
+            still_to_allocate_mb = max(0.0, sibling_staging_mb - held_mb)
         relief_mb += max(0.0, outstanding_mb - still_to_allocate_mb)
     return relief_mb
 

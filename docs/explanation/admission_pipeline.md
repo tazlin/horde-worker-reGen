@@ -74,7 +74,10 @@ the encode runs on another lane, so it is a waiter only once its sample stage re
 slot reporting `INFERENCE_STARTING` for its owned job is an active sampler. A completion report ends the
 staging, so a finished sample is never cleared again while its result is in flight. The device free a grant
 carries is rewritten from each cycle's reading until the child takes its permit, because the child reaches its
-sample call seconds after the grant, with its encoder already moved to host RAM.
+sample call seconds after the grant, with its encoder already moved to host RAM. Until it is cleared a staged
+job is charged its family's staging figure
+([`staging_charge_mb`][horde_worker_regen.process_management.scheduling.admission.pricing.staging_charge_mb]),
+hordelib's support weights for the job's baseline plus a fixed encode allowance, never below SDXL's 2048 MB.
 
 Under the clearance lease a third step follows dispatch: `warm_idle_lanes`. A lane holding a model keeps its
 weights as views over the checkpoint file, and the host may drop those pages while the lane idles, so the

@@ -116,7 +116,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     LearnedFootprintStore,
     learned_post_process_vram_mb,
 )
-from horde_worker_regen.process_management.scheduling.admission.pricing import STAGING_ENCODE_VRAM_MB
+from horde_worker_regen.process_management.scheduling.admission.pricing import staging_charge_mb
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     ClearanceController,
@@ -2901,8 +2901,10 @@ class _DispatchWorld:
                 # Under the lease a dispatch only stages the job: the lane holds its encode working set and
                 # nothing else, and the weights land when the parent clears it. The slot stays in the primed
                 # state production stamped on it at dispatch, which is what makes it a clearance waiter.
+                admitted_record = self._reference.get(admitted.model) if admitted.model is not None else None
+                admitted_baseline = admitted_record.baseline if admitted_record is not None else None
                 self._encode_staging_mb[lanes[0]] = self.staged_encode_mb_by_model.get(
-                    admitted.model or "", STAGING_ENCODE_VRAM_MB
+                    admitted.model or "", staging_charge_mb(admitted_baseline)
                 )
                 self._clearance_waiting_since[job_id] = self.now
                 # The world's encode lands with the dispatch, so the child begins its clearance wait at once and

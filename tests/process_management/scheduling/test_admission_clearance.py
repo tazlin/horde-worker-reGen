@@ -635,25 +635,32 @@ async def test_a_prior_native_crash_of_the_jobs_model_makes_the_refusal_terminal
 _SIBLING_HOLDS_MB = 554
 """What a light staged sibling holds on the card once its encode is done: far below the staging charge."""
 
+_UNKNOWN_FAMILY_STAGING_MB = pricing.staging_charge_mb(None)
+"""The staging charge of a sibling whose model the default metadata has no record for: the floor figure."""
+
+_FLUX_SIBLING_MODEL = "flux_sibling_checkpoint"
+_FLUX_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
+
 
 async def _head_beside_staged_sibling(
-    *, device_free_mb: float
+    *, device_free_mb: float, sibling_model: str = _JOB_MODEL, model_metadata: ModelMetadata | None = None
 ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse, HordeProcessInfo]:
     """The clearance head on process 0 and, behind it in slot order, a primed sibling on process 1.
 
     The sibling's staging charge is booked against the reading it already shows, so the whole charge stands
     outstanding whatever its encode turns out to hold.
     """
-    scheduler, job, _head = await _staged_waiter(device_free_mb=device_free_mb)
-    sibling = make_mock_process_info(1, model_name=_JOB_MODEL, state=HordeProcessState.INFERENCE_PRIMED)
+    scheduler, job, _head = await _staged_waiter(device_free_mb=device_free_mb, model_metadata=model_metadata)
+    sibling = make_mock_process_info(1, model_name=sibling_model, state=HordeProcessState.INFERENCE_PRIMED)
     sibling.total_vram_mb = 16000
     sibling.process_reserved_mb = _SIBLING_HOLDS_MB
     scheduler._process_map[1] = sibling
-    sibling_job = make_job_pop_response(_JOB_MODEL)
+    sibling_job = make_job_pop_response(sibling_model)
     await track_popped_job_async(scheduler._job_tracker, sibling_job)  # type: ignore[attr-defined]
     await mark_job_in_progress_async(scheduler._job_tracker, sibling_job)  # type: ignore[attr-defined]
     sibling.last_job_referenced = sibling_job
-    scheduler._record_dispatch_reservation(sibling_job, sibling, baseline=None, staging_only=True)  # type: ignore[attr-defined]
+    sibling_baseline = scheduler._model_metadata.get_baseline(sibling_model)  # type: ignore[attr-defined]
+    scheduler._record_dispatch_reservation(sibling_job, sibling, baseline=sibling_baseline, staging_only=True)  # type: ignore[attr-defined]
     return scheduler, job, sibling_job, sibling
 
 
@@ -667,7 +674,7 @@ async def _free_that_fits_the_head_only_without_the_sibling_charge() -> float:
     assert plan.verdict is not None and plan.candidate_delta_mb is not None
     noise_mb = plan.verdict.measured.noise_buffer_mb
     assert noise_mb is not None
-    margin_mb = pricing.STAGING_ENCODE_VRAM_MB / 2
+    margin_mb = _UNKNOWN_FAMILY_STAGING_MB / 2
     return plan.candidate_delta_mb + noise_mb + margin_mb
 
 
@@ -684,7 +691,7 @@ async def test_a_head_beside_a_sibling_waiting_on_clearance_is_not_charged_its_s
     outstanding_mb = snapshot.services.reserve_ledger.planned_charge_for_unit(
         DISPATCH_ADMISSION_FLOW, str(sibling_job.id_), dict(snapshot.card(None).reserved_by_pid)
     )
-    assert outstanding_mb == pricing.STAGING_ENCODE_VRAM_MB
+    assert outstanding_mb == _UNKNOWN_FAMILY_STAGING_MB
 
     plan = _decide(scheduler, 0)
 
@@ -703,8 +710,35 @@ async def test_a_head_beside_a_sibling_still_encoding_keeps_the_staging_charge_l
 
     assert plan.priced is not None and plan.verdict is not None
     assert plan.priced.request.sibling_staging_relief_mb == _SIBLING_HOLDS_MB
-    assert plan.verdict.measured.outstanding_reservations_mb == pricing.STAGING_ENCODE_VRAM_MB - _SIBLING_HOLDS_MB
+    assert plan.verdict.measured.outstanding_reservations_mb == _UNKNOWN_FAMILY_STAGING_MB - _SIBLING_HOLDS_MB
     assert plan.decision is ClearanceDecision.HOLD
+
+
+async def test_a_staged_flux_sibling_still_encoding_is_charged_its_familys_staging_less_its_holding() -> None:
+    """A staged Flux sibling still to allocate is charged the Flux staging figure, not the SDXL floor.
+
+    Its encode holds the Flux text encoder, so what it can still allocate is the Flux figure less what it holds.
+    Charged the SDXL figure, the head would be granted room the sibling's encode then fills.
+    """
+    flux_staging_mb = pricing.staging_charge_mb(_FLUX_BASELINE)
+    assert flux_staging_mb > pricing.staging_charge_mb(_JOB_BASELINE)
+    metadata = make_test_model_metadata(
+        {
+            _JOB_MODEL: make_mock_model_reference_record(_JOB_MODEL, baseline=_JOB_BASELINE),
+            _FLUX_SIBLING_MODEL: make_mock_model_reference_record(_FLUX_SIBLING_MODEL, baseline=_FLUX_BASELINE),
+        },
+    )
+    scheduler, _job, _sibling_job, _sibling = await _head_beside_staged_sibling(
+        device_free_mb=24000.0,
+        sibling_model=_FLUX_SIBLING_MODEL,
+        model_metadata=metadata,
+    )
+
+    plan = _decide(scheduler, 0)
+
+    assert plan.priced is not None and plan.verdict is not None
+    assert plan.priced.request.sibling_staging_relief_mb == _SIBLING_HOLDS_MB
+    assert plan.verdict.measured.outstanding_reservations_mb == flux_staging_mb - _SIBLING_HOLDS_MB
 
 
 async def test_a_wait_entry_older_than_the_siblings_dispatch_is_no_evidence_its_encode_is_done() -> None:
@@ -733,7 +767,7 @@ async def test_a_cleared_sibling_keeps_its_whole_charge() -> None:
 
     assert plan.priced is not None and plan.verdict is not None
     assert plan.priced.request.sibling_staging_relief_mb == 0.0
-    assert plan.verdict.measured.outstanding_reservations_mb == pricing.STAGING_ENCODE_VRAM_MB
+    assert plan.verdict.measured.outstanding_reservations_mb == _UNKNOWN_FAMILY_STAGING_MB
     assert plan.decision is ClearanceDecision.HOLD
 
 

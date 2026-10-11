@@ -6312,10 +6312,11 @@ async def test_y_defect_reinjection_staging_behind_a_long_sample_samples_unprice
     def unconditional(
         *,
         clearance_lease_active: bool,
+        baseline: pricing_mod.Baseline,
         running_remaining_sampling_seconds: object,
         incoming_load_seconds: object,
     ) -> float | None:
-        return pricing_mod.dispatch_staging_charge_mb(clearance_lease_active=clearance_lease_active)
+        return pricing_mod.dispatch_staging_charge_mb(clearance_lease_active=clearance_lease_active, baseline=baseline)
 
     monkeypatch.setattr(pricing_mod, "overlap_staging_charge_mb", unconditional)
     world = _staging_world()

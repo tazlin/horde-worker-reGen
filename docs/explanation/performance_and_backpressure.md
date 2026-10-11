@@ -615,9 +615,10 @@ still resident and tip a heavy pair into WDDM demand-paging; the per-process cle
 parent a checkpoint at the true VRAM moment.
 
 Two admission consequences follow. First, staging is cheap: a staged job's device footprint is only its
-encode working set (`_STAGING_ENCODE_VRAM_MB`, the text-encoder plus conditioning working set for the largest
-supported family), because its weights have not loaded yet. So `_max_jobs_in_progress_allowed` admits a spare
-process to stage ahead whenever measured free net of the reserve covers that encode charge, rather than
+encode working set (`pricing.staging_charge_mb`: the family's text-encoder and VAE weights from hordelib's
+`vram_support_weights_mb` plus a fixed allowance for the latents and conditioning, never below SDXL's 2048 MB),
+because its weights have not loaded yet. So `_max_jobs_in_progress_allowed` admits a spare process to stage
+ahead whenever measured free net of the reserve covers the encode charge of the job it would dispatch, rather than
 gating on a flat multi-GB device-free floor that mid-sampling rarely cleared (which stranded the spare
 process idle through nearly every sampling window despite queued work). When it does hold the cap at the
 sampling-slot count it records why (no device reading yet, or free net of the reserve short of the encode
