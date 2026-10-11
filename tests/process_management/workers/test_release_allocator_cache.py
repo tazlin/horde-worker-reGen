@@ -1,15 +1,18 @@
-"""Per-lane handler tests for RELEASE_ALLOCATOR_CACHE (Stage 0 actuation scaffolding).
+"""Per-lane handler tests for RELEASE_ALLOCATOR_CACHE.
 
 Releasing the allocator cache must reclaim the torch caching allocator's free blocks WITHOUT unloading
 any model: the observable contract is that the child sends a fresh memory report and emits no
-model-unload state change. The component lane, which previously handled no unload/cache messages at all,
-additionally gains a real model-unload handler; these tests pin both behaviours on the dry-run lanes
-(their ML paths are rig-only, so a dry-run instance exercises the message contract without a backend).
+model-unload state change. The component lane also has a model-unload handler. The service lanes are pinned
+on their dry-run instances (their ML paths are rig-only, so a dry-run instance exercises the message contract
+without a backend). The inference child is pinned on its actuator alone: it drops its unretained components
+before the cache release only while it idles with its model in host RAM, and reports after both.
 """
 
 from __future__ import annotations
 
 from unittest.mock import Mock
+
+import pytest
 
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
@@ -18,8 +21,10 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessMemoryMessage,
     HordeProcessState,
     HordeProcessStateChangeMessage,
+    ModelLoadState,
 )
 from horde_worker_regen.process_management.workers.component_lane_process import HordeComponentLaneProcess
+from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 from horde_worker_regen.process_management.workers.post_process_process import HordePostProcessProcess
 from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
 
@@ -151,3 +156,76 @@ class TestComponentLaneUnloadHandler:
         lane._receive_and_handle_control_message(_unload_vram_message())
 
         assert [m for m in queue.messages if isinstance(m, HordeModelStateChangeMessage)] == []
+
+
+def _inference_child(
+    calls: list[str],
+    *,
+    busy: bool,
+    load_state: ModelLoadState | None,
+) -> HordeInferenceProcess:
+    """An inference child wired only for the cache release, recording each step it takes in order.
+
+    The cache empty and the memory report read the device, so each records a marker instead. The component
+    release stays real down to hordelib's module function, which records too.
+    """
+    child = object.__new__(HordeInferenceProcess)
+    child._dry_run_skip_inference = False
+    child._reports_held_components = True
+    child._is_busy = busy
+    child._active_model_name = "sdxl-checkpoint" if load_state is not None else None
+    child._active_model_load_state = load_state
+    child.clear_gc_and_torch_cache = Mock(side_effect=lambda: calls.append("empty"))  # type: ignore[method-assign]
+
+    def _record_report(*_args: object, **_kwargs: object) -> bool:
+        calls.append("report")
+        return True
+
+    child.send_memory_report_message = Mock(side_effect=_record_report)  # type: ignore[method-assign]
+    return child
+
+
+@pytest.fixture
+def component_release_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every call into hordelib's unretained-component release on a shared list."""
+    from hordelib.execution import component_cache
+
+    calls: list[str] = []
+
+    def _record_release() -> int:
+        calls.append("release")
+        return 2
+
+    monkeypatch.setattr(component_cache, "release_unretained_components", _record_release)
+    return calls
+
+
+class TestInferenceCacheRelease:
+    """The inference child drops unretained components only while it idles with its model in host RAM."""
+
+    def test_idle_with_model_in_ram_releases_then_empties_then_reports(
+        self,
+        component_release_calls: list[str],
+    ) -> None:
+        """The components go first, so the cache empty returns their blocks and the report shows it."""
+        child = _inference_child(component_release_calls, busy=False, load_state=ModelLoadState.LOADED_IN_RAM)
+
+        child.release_allocator_cache()
+
+        assert component_release_calls == ["release", "empty", "report"]
+
+    def test_busy_lane_only_empties_and_reports(self, component_release_calls: list[str]) -> None:
+        """A lane serving a job keeps its components."""
+        child = _inference_child(component_release_calls, busy=True, load_state=ModelLoadState.LOADED_IN_RAM)
+
+        child.release_allocator_cache()
+
+        assert component_release_calls == ["empty", "report"]
+
+    def test_model_on_the_device_only_empties_and_reports(self, component_release_calls: list[str]) -> None:
+        """A lane whose weights are on the device is the eviction rung's, and keeps its components."""
+        child = _inference_child(component_release_calls, busy=False, load_state=ModelLoadState.LOADED_IN_VRAM)
+
+        child.release_allocator_cache()
+
+        assert component_release_calls == ["empty", "report"]

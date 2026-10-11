@@ -146,6 +146,10 @@ The failures encoded here:
   restarts that clock, so a waiter still short after its rungs waited past its lease-acquire timeout and
   loaded unpriced on an idle card. That is the ``waiter nothing can help`` scenario, and its reinjection restores
   the horizon and the starved-clock deadline.
+- **Idle lanes held allocations no rung returned.** Idle lanes whose models were in RAM still held their split
+  text encoder and VAE on the device. The room counted them as a closable rung, so the measured load attempt was
+  refused, but no rung could return them, and a staged head short by a few MB waited out its lease-acquire
+  timeout. That is the ``unretained components`` scenario.
 - **A residency kept safety beside a job it could not seat.** With safety held on the GPU by configuration, a
   residency moved it off only when the model's weights could not fit beside it. A large LoRA job whose weights
   fit beside safety but whose whole need did not was held at clearance with the card idle. That is the
@@ -190,6 +194,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
+    HordeControlMessage,
     HordeImageResult,
     HordeInferenceControlMessage,
     HordeProcessState,
@@ -213,6 +218,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
 )
+from horde_worker_regen.process_management.resources.run_metrics import DecisionKind, DecisionVerdict
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     VramArbiter,
@@ -1839,14 +1845,15 @@ async def test_j_a_head_is_let_onto_a_card_packed_with_idle_held_components() ->
 
 
 async def test_j_defect_reinjection_an_unreclaimable_tenancy_starves_the_head() -> None:
-    """With the idle unload refused, the same card starves the head, which is what the bound above forbids.
+    """With every idle reclaim refused, the same card starves the head, which is what the bound above forbids.
 
     The reinjection is the actuator rather than a policy: whatever issues the reclaim, it issues it through
-    the one idle-unload surface, so refusing that surface reproduces the regime the scenario is about without
-    naming the decision that reaches it.
+    the idle unload or the allocator-cache release, the two surfaces that return a held component tenancy, so
+    refusing both reproduces the regime the scenario is about without naming the decision that reaches it.
     """
     world = _held_component_world()
     world.scheduler.unload_idle_model = lambda process_id, device_index=None: False  # type: ignore[method-assign]
+    world.scheduler.release_allocator_cache = lambda process_id: False  # type: ignore[method-assign]
 
     head = await _drive_held_component_head(world)
 
@@ -6784,3 +6791,185 @@ async def test_a_process_local_view_that_overstates_free_still_serves_within_the
     context = "process-local reports 6 GB ahead of the card"
     assert world.submitted_jobs == _NO_DEVICE_READING_JOBS, f"{context}: work stopped flowing. {world.state_dump()}"
     assert world.card_overcommits == [], f"{context}: admission bought room the card did not have"
+
+
+# --------------------------------------------------------------------------------------------------------
+# Unretained components on idle lanes: a converged card whose idle lanes still hold device allocations
+# --------------------------------------------------------------------------------------------------------
+
+_UNRETAINED_LANES = 3
+_UNRETAINED_COMPONENT_MB = 1800.0
+"""Split text-encoder and VAE allocations (MB) an idle lane keeps on the device after its model went to RAM."""
+_UNRETAINED_FOREIGN_MB = 6000.0
+"""Device memory other programs hold, sized so the staged head is short by a few hundred MB."""
+_UNRETAINED_HEAD_BATCH = 4
+_UNRETAINED_TICK_SECONDS = 0.5
+_UNRETAINED_MAX_TICKS = 400
+_UNRETAINED_CLEARANCE_BOUND_SECONDS = 10.0
+"""How long the staged head may wait for clearance: a release and the report that follows it, well inside the
+lease-acquire timeout."""
+
+
+_UNRETAINED_IDLE_MODELS = {1: _SDXL_OTHER, 2: _SD15}
+"""The idle lanes and the model each holds in RAM. The head stages on lane 0, which holds no components."""
+
+
+async def _drive_head_past_unretained_components(
+    *,
+    components_pinned: bool = False,
+) -> tuple[_DispatchWorld, ImageGenerateJobPopResponse]:
+    """Stage one SDXL batch on a 24 GB card whose two idle lanes hold unretained components, and run it out.
+
+    Every lane holds its checkpoint in RAM. The idle lanes have served their VRAM unloads and still hold their
+    split text encoder and VAE on the device as live allocation. Other programs hold enough of the card that the
+    head is short at clearance by less than those components. ``components_pinned`` makes the idle lanes' cache
+    release return nothing, as live references in the child would.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=_UNRETAINED_LANES,
+        max_threads=_UNRETAINED_LANES,
+        queue_depth=_UNRETAINED_LANES,
+        closed_loop=True,
+        clearance_lease=True,
+        tick_seconds=_UNRETAINED_TICK_SECONDS,
+        foreign_vram_mb_by_tick={1: _UNRETAINED_FOREIGN_MB},
+        unretained_components_pinned=components_pinned,
+    )
+    world.seed_resident(0, _SDXL, in_vram=False)
+    world.scheduler._process_map[0].last_process_state = HordeProcessState.WAITING_FOR_JOB
+    for lane_id, model in _UNRETAINED_IDLE_MODELS.items():
+        world.seed_resident(lane_id, model, in_vram=False)
+        world.seed_served_vram_unload(lane_id)
+        world.seed_unretained_components(lane_id, _UNRETAINED_COMPONENT_MB)
+    head = make_job_pop_response(_SDXL.name, width=1024, height=1024, n_iter=_UNRETAINED_HEAD_BATCH)
+    await world.pop(head)
+    for _ in range(_UNRETAINED_MAX_TICKS):
+        await world.step()
+        if world.completed_jobs >= 1:
+            break
+    assert world.completed_jobs == 1, world.state_dump()
+    holds = [
+        record
+        for record in world.decision_records
+        if record.decision_kind is DecisionKind.CLEARANCE and record.verdict is DecisionVerdict.DEFER
+    ]
+    assert holds, f"precondition: the staged head must be held at clearance at least once. {world.state_dump()}"
+    first_deficit_mb = holds[0].inputs.get("room_deficit_mb")
+    assert isinstance(first_deficit_mb, float), f"precondition: the first hold carries no room. {holds[0]}"
+    assert 0.0 < first_deficit_mb < _UNRETAINED_COMPONENT_MB * len(_UNRETAINED_IDLE_MODELS), (
+        f"precondition: the head must be short by less than the idle lanes' unretained components, or this row "
+        f"says nothing about returning them; it was short {first_deficit_mb:.0f}MB. {world.state_dump()}"
+    )
+    window = world.job_windows.get(str(head.id_))
+    assert window is not None and window.lane_id not in _UNRETAINED_IDLE_MODELS, (
+        f"precondition: the head must stage on the lane holding no components. {world.state_dump()}"
+    )
+    return world, head
+
+
+async def test_unretained_components_on_idle_lanes_are_released_for_a_staged_head() -> None:
+    """A staged head short by less than idle lanes' unretained components is cleared, not timed out.
+
+    No model is on the card to evict, no idle context is bare, and the idle lanes' allocator caches hold nothing
+    to empty, while the room counted the idle lanes as a closable rung and so refused the measured load attempt.
+    The head waited out its lease-acquire timeout and sampled unpriced. The release rung has the idle lanes drop
+    their unretained components, and the head clears within seconds with both lanes and their models kept.
+    """
+    world, head = await _drive_head_past_unretained_components()
+
+    context = "a staged head short by less than the idle lanes' unretained components"
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, so the room "
+        f"counted the idle lanes as closable while no rung could return them. {world.state_dump()}"
+    )
+    window = world.job_windows[str(head.id_)]
+    assert window.cleared_at is not None, world.state_dump()
+    assert window.cleared_at - window.dispatched_at <= _UNRETAINED_CLEARANCE_BOUND_SECONDS, (
+        f"{context}: the head waited {window.cleared_at - window.dispatched_at:.1f}s for clearance. "
+        f"{world.state_dump()}"
+    )
+    assert all(
+        world.scheduler._process_map[lane_id].loaded_horde_model_name == model.name
+        for lane_id, model in _UNRETAINED_IDLE_MODELS.items()
+    ), f"{context}: an idle lane was torn down or lost its model to clear the head. {world.state_dump()}"
+
+
+async def test_unretained_components_a_release_that_returns_nothing_is_not_repeated() -> None:
+    """When the idle lanes' release returns nothing, the head gets the measured attempt, not the 60 s timeout.
+
+    Live references in the child can pin the components, so the release frees nothing. Re-targeting the lanes
+    every cycle kept an acting rung on the ladder, which reset the head's starved clock and refused the measured
+    attempt until the head sampled unpriced through its lease-acquire timeout. A release is graded after the
+    teardown settle: one that returned nothing is not sent again, and the room stops counting the lanes.
+    """
+    world, head = await _drive_head_past_unretained_components(components_pinned=True)
+
+    context = "a staged head beside idle lanes whose release returns nothing"
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout, so the lanes "
+        f"stayed release targets though no release returned anything. {world.state_dump()}"
+    )
+    window = world.job_windows[str(head.id_)]
+    assert window.cleared_at is not None, world.state_dump()
+    # The release's settle, then the measured attempt: well inside the lease-acquire timeout.
+    clearance_bound_seconds = (
+        reclaim_ladder_module.teardown_verification_settle_seconds() + _UNRETAINED_CLEARANCE_BOUND_SECONDS
+    )
+    assert window.cleared_at - window.dispatched_at <= clearance_bound_seconds, (
+        f"{context}: the head waited {window.cleared_at - window.dispatched_at:.1f}s for clearance. "
+        f"{world.state_dump()}"
+    )
+    for lane_id in _UNRETAINED_IDLE_MODELS:
+        pipe_sends = world.scheduler._process_map[lane_id].pipe_connection.send.call_args_list
+        releases = [
+            call
+            for call in pipe_sends
+            if call.args
+            and isinstance(call.args[0], HordeControlMessage)
+            and call.args[0].control_flag is HordeControlFlag.RELEASE_ALLOCATOR_CACHE
+        ]
+        assert len(releases) <= 1, (
+            f"{context}: lane {lane_id} was asked to release {len(releases)} times; a release that returned "
+            f"nothing must not be sent again. {world.state_dump()}"
+        )
+
+
+async def test_unretained_components_defect_reinjection_no_rung_returns_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no release rung for the idle lanes and the room counting them whole, the head samples unpriced.
+
+    Reinjected at both seams: the release targets only cache, and the room charges every idle sibling as a bare
+    context. The room reads closable on tenancy no rung pulls, the measured load attempt is refused, and the head
+    reaches its denoise loop through the lease-acquire timeout.
+    """
+
+    def no_release_target(self: InferenceScheduler, process_info: HordeProcessInfo) -> bool:
+        return False
+
+    def every_idle_sibling_bare(
+        self: InferenceScheduler,
+        device_index: int | None,
+        release_targets: frozenset[int],
+    ) -> dict[int, float]:
+        return {}
+
+    monkeypatch.setattr(InferenceScheduler, "_releases_unretained_components", no_release_target)
+    monkeypatch.setattr(InferenceScheduler, "_held_idle_returns_mb", every_idle_sibling_bare)
+
+    world, head = await _drive_head_past_unretained_components()
+
+    assert [job_id for _tick, _lane, job_id in world.clearance_timeouts] == [str(head.id_)], (
+        "the head must reach its denoise loop through the lease-acquire timeout once no rung returns the idle "
+        f"lanes' components; the run recorded {world.clearance_timeouts}. {world.state_dump()}"
+    )
+    holds = [
+        record
+        for record in world.decision_records
+        if record.decision_kind is DecisionKind.CLEARANCE and record.verdict is DecisionVerdict.DEFER
+    ]
+    assert all(record.inputs.get("room_closable") is True for record in holds), (
+        f"every hold must read the room closable, which is what refuses the measured load attempt. {holds}"
+    )
+    assert not any(record.inputs.get("reclaim_applied_kinds") for record in holds), (
+        f"no rung may act for the head, since none can return the idle lanes' components. {holds}"
+    )

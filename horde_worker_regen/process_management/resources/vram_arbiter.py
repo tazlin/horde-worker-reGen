@@ -614,6 +614,10 @@ class DeviceVramState:
     """Each live GPU process's tenant class by process id, for the room breakdown a refusal is explained with.
     Inference processes are classed idle or busy by the snapshot builder; the requester's target slot is
     reclassed per request."""
+    held_idle_returns_mb: Mapping[int, float] = field(default_factory=dict)
+    """For each idle inference process holding a model or components, what an unload or a cache release would
+    return (MB). The room permits only that much of such a sibling, since its context is never torn down; an
+    idle process absent here is a bare context, whose whole tenancy the teardown returns."""
     utilities_context_count: int = 0
     """Number of on-GPU image-utilities contexts on this card."""
     post_process_reclaim_allowed: bool = False
@@ -1044,6 +1048,7 @@ class VramArbiter:
             safety_reclaim_permitted=state.safety_reclaim_allowed,
             utilities_reclaim_permitted=state.utilities_reclaim_allowed,
             safety_residency_fixed=state.safety_residency_fixed,
+            held_idle_returns_mb=state.held_idle_returns_mb,
         )
 
     def _head_protection_defer(
@@ -1334,8 +1339,9 @@ class VramArbiter:
         if not self._card_converged_empty(request, measured):
             return False
         room = self._room(request, state, measured)
-        # A permitted service-lane rung that would close the deficit is a real remedy still on the ladder; the
-        # speculative load waits for it (reclaim before speculation), so the probe never pre-empts a pause.
+        # A permitted rung that would close the deficit (a service lane, or what an idle sibling's release or
+        # unload returns) is a real remedy still on the ladder; the speculative load waits for it (reclaim before
+        # speculation), so the probe never pre-empts a pause or a release.
         return room is None or not room.closable
 
     @classmethod

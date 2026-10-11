@@ -388,9 +388,25 @@ class AdmissionRoom:
         for lane, mb in self.tenancy_mb.items():
             inputs[f"tenancy_{lane.value}_mb"] = round(mb, 1)
         for rung in self.rungs:
+            permitted_key = f"rung_{rung.kind.value}_permitted"
+            if not rung.permitted and inputs.get(permitted_key) is True:
+                # One key per kind: an idle sibling holding a model lists a forbidden remainder after its
+                # permitted rung, and the record keeps the permitted figure.
+                continue
             inputs[f"rung_{rung.kind.value}_mb"] = round(rung.promised_mb, 1)
-            inputs[f"rung_{rung.kind.value}_permitted"] = rung.permitted
+            inputs[permitted_key] = rung.permitted
         return inputs
+
+
+def _idle_sibling_rungs(charge_mb: float, held_returns_mb: float | None) -> tuple[RoomRung, ...]:
+    """The rungs one idle inference sibling offers: its whole tenancy if bare, else what a rung returns."""
+    if held_returns_mb is None:
+        return (RoomRung(RoomRungKind.IDLE_SIBLING_CONTEXT, charge_mb, True),)
+    returned_mb = min(charge_mb, max(0.0, held_returns_mb))
+    return (
+        RoomRung(RoomRungKind.IDLE_SIBLING_CONTEXT, returned_mb, True),
+        RoomRung(RoomRungKind.IDLE_SIBLING_CONTEXT, charge_mb - returned_mb, False),
+    )
 
 
 def admission_room(
@@ -409,6 +425,7 @@ def admission_room(
     safety_reclaim_permitted: bool,
     utilities_reclaim_permitted: bool,
     safety_residency_fixed: bool = False,
+    held_idle_returns_mb: Mapping[int, float] | None = None,
 ) -> AdmissionRoom:
     """Decompose the admission identity for one candidate into tenancy by class and reclaim rungs.
 
@@ -418,9 +435,13 @@ def admission_room(
     too (its context stays whatever happens), but it is never a rung. The foreign share is the device-used
     reading less everything attributed, floored at zero.
 
-    Rungs, cheapest first: each idle inference sibling context (its full tenancy returns when the process
-    exits), the post-processing lane, safety off-GPU, the utilities lane. A rung is listed even when policy
-    forbids it, so the line a person reads shows what an operator setting would unlock. A fixed safety
+    Rungs, cheapest first: each idle inference sibling, the post-processing lane, safety off-GPU, the utilities
+    lane. A bare idle sibling context returns its full tenancy when the process exits. A sibling holding a model
+    or components is never torn down, so its rung is only what an unload or a release returns
+    (``held_idle_returns_mb``), and the rest of its tenancy is listed as a rung that is not permitted. That
+    keeps the room from reading closable on tenancy no rung can pull, which would refuse the measured load
+    attempt. A rung is listed even when policy forbids it, so the line a person reads shows what an operator
+    setting would unlock. A fixed safety
     residency is the one exception: no setting unlocks it, so it is charged at no less than its whole-device
     footprint and named as tenancy only, never as a rung a candidate could be admitted against.
 
@@ -440,6 +461,9 @@ def admission_room(
         utilities_reclaim_permitted: Whether policy permits pausing the utilities lane off-GPU now.
         safety_residency_fixed: Whether safety's card is fixed, so its charge cannot fall below its
             whole-device footprint and no candidate may be admitted against moving it off.
+        held_idle_returns_mb: For each idle inference sibling holding a model or components, what an unload or
+            a release would return (MB). A sibling absent from it is a bare context. None treats every idle
+            sibling as a bare context.
     """
     tenancy: dict[TenantLane, float] = {}
     rungs: list[RoomRung] = []
@@ -460,7 +484,7 @@ def admission_room(
         tenancy[classed] = tenancy.get(classed, 0.0) + charge
         attributed += charge
         if classed is TenantLane.INFERENCE_IDLE:
-            rungs.append(RoomRung(RoomRungKind.IDLE_SIBLING_CONTEXT, charge, True))
+            rungs.extend(_idle_sibling_rungs(charge, (held_idle_returns_mb or {}).get(process_id)))
     lane_rungs = (
         (TenantLane.POST_PROCESS, RoomRungKind.POST_PROCESS_LANE, post_process_reclaim_permitted),
         (TenantLane.SAFETY, RoomRungKind.SAFETY_OFF_GPU, safety_reclaim_permitted),

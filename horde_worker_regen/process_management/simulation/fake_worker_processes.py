@@ -857,7 +857,9 @@ class FakeInferenceProcess(HordeProcess):
         elif message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
             # Mirror the real child: releasing the allocator cache keeps every model resident and only
             # sends a fresh memory report, so the fake emits the same report traffic and no model-unload
-            # state change (the ledger residency is untouched).
+            # state change (the ledger residency is untouched). The real child also drops its unretained
+            # components when it idles with its model in RAM; the fake holds no component cache, so the
+            # ledger has nothing of that kind to give back.
             self.send_memory_report_message(include_vram=True)
         elif isinstance(message, HordeEvictComponentsControlMessage):
             # The fake holds no real component cache, so the base handler no-ops; accepting the message

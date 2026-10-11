@@ -257,6 +257,8 @@ class HordeInferenceProcess(HordeProcess):
 
     _active_model_name: str | None = None
     """The name of the currently active model. Note that other models may be loaded in RAM or VRAM."""
+    _active_model_load_state: ModelLoadState | None = None
+    """The load state last reported to the parent for the active model, or None before any report."""
     _active_model_diffusion_model_only: bool = False
     """Whether the active model's preload asked for its diffusion model alone.
 
@@ -666,6 +668,8 @@ class HordeInferenceProcess(HordeProcess):
             info (str | None, optional): A marker the parent reads for the cause of a failed load
                 (:data:`HOST_COMMIT_FAILED_INFO`). None sends the descriptive default.
         """
+        if horde_model_name == self._active_model_name:
+            self._active_model_load_state = horde_model_state
         model_update_message = HordeModelStateChangeMessage(
             process_state=process_state,
             process_id=self.process_id,
@@ -1678,11 +1682,37 @@ class HordeInferenceProcess(HordeProcess):
         the card while the resident model stays loaded, then sends a fresh memory report so the parent's
         per-process ``process_reserved_mb`` reflects the release promptly. Deliberately emits no model
         state change: nothing was unloaded.
+
+        On an idle lane whose model is in host RAM it first drops the component-cache entries held only
+        while the model is retained (a split graph's text encoder and VAE). A retained job leaves them on the
+        device, and a later VRAM unload frees the model but not them, so they are live allocation the cache
+        release alone cannot return. Retention has ended once the model is off the device, so nothing it holds
+        is released; a lane serving a job or holding its weights on the device keeps them.
         """
         logger.debug("Releasing allocator cache (resident models stay loaded)")
         if not self._dry_run_skip_inference:
+            if self._idles_with_model_in_host_ram():
+                self._release_unretained_components()
             self.clear_gc_and_torch_cache()
         self.send_memory_report_message(include_vram=True)
+
+    def _idles_with_model_in_host_ram(self) -> bool:
+        """Whether this lane waits for a job with its active model reported in host RAM."""
+        return (
+            not self._is_busy
+            and self._active_model_name is not None
+            and self._active_model_load_state is ModelLoadState.LOADED_IN_RAM
+        )
+
+    def _release_unretained_components(self) -> None:
+        """Drop the component-cache entries held only while the model is retained, logging what was dropped."""
+        if not self._reports_held_components:
+            return
+        from hordelib.execution.component_cache import release_unretained_components
+
+        released = release_unretained_components()
+        if released:
+            logger.info(f"Released {released} unretained component(s) held on the device beside an unloaded model")
 
     @logger.catch(reraise=True)
     def unload_models_from_ram(self) -> None:

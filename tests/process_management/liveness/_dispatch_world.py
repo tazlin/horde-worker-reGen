@@ -771,6 +771,7 @@ class _DispatchWorld:
         clearance_lease: bool = False,
         staged_lane_prefetch: bool = False,
         idle_lane_warm: bool = False,
+        unretained_components_pinned: bool = False,
         tail_overlap: bool = False,
         gpu_sampling_lease_slots: int | None = None,
         performance_model: bool = False,
@@ -880,6 +881,9 @@ class _DispatchWorld:
                 A dispatch of that model to the lane carries the read on, so clearance pays only what the warm
                 has not finished. Needs ``host_ram`` and the lease; off, the lane ignores the message and reads
                 nothing before its job is staged.
+            unretained_components_pinned: Whether a lane's unretained components survive its allocator-cache
+                release, as they do when live references still pin them in the child. The lane keeps reporting
+                them, so the release returns nothing. Off, the release returns them.
             tail_overlap: Whether each card's clearance controller may clear the next lane inside the outgoing
                 sample's tail, as production does by default. With it, each sampling lane reports its step
                 position through the parent's heartbeat path every tick, and each finished job that paid a device
@@ -1034,6 +1038,7 @@ class _DispatchWorld:
         self.staged_lane_prefetch = staged_lane_prefetch
         self.staged_encode_mb_by_model: Mapping[str, float] = dict(staged_encode_mb_by_model or {})
         self.idle_lane_warm = idle_lane_warm
+        self.unretained_components_pinned = unretained_components_pinned
         self.tail_overlap = tail_overlap
         self.child_free_view_lie_mb = child_free_view_lie_mb
         self.parent_device_reading = parent_device_reading
@@ -1161,6 +1166,14 @@ class _DispatchWorld:
         footprint, and the only thing that returns it is an unload the parent actuates on that lane. A card
         packed with these is therefore squeezed by lanes that are idle and hold no running work, which is the
         regime a fit computed from live contexts and dispatched jobs alone cannot see."""
+        self._unretained_component_mb: dict[int, float] = {}
+        """Per-lane split text-encoder and VAE entries left on the device after the lane's model went to RAM.
+
+        hordelib keeps them only while retention holds the model, and drops them at the end of an unretained
+        job, but a model a retention grant kept and the parent later unloaded leaves them behind: the VRAM
+        unload frees the model and not the component cache. The lane reports them as live allocation, so an
+        allocator-cache release frees nothing of them; only the release of unretained components the child runs
+        on ``RELEASE_ALLOCATOR_CACHE`` while it idles with its model in RAM returns them."""
         self._granted_resident_evicted: set[int] = set()
         """Lanes whose committed weights the child freed mid-job while the parent still records them.
 
@@ -1176,6 +1189,11 @@ class _DispatchWorld:
         One command is served once. The parent's record of it stands until something retires it, and reading
         that standing record as a fresh command every tick would manufacture a re-issue the parent never
         made, which is exactly the behaviour a scenario here has to be able to tell apart from the real one."""
+        self._unload_served: set[int] = set()
+        """Lanes seeded as having served their standing VRAM unload: the model went to RAM and the flag stands.
+
+        Production retires the flag only when the slot materialises VRAM again, so a converged idle lane keeps
+        it and stays out of the eviction mirror. The world otherwise retires the flag as the release lands."""
         self.retained_resident_divergences: list[tuple[int, int, str]] = []
         """Every tick an idle slot's retained-resident record named weights the card was not holding.
 
@@ -1781,6 +1799,7 @@ class _DispatchWorld:
                 self._resident_mb,
                 self._transient_mb,
                 self._held_component_mb,
+                self._unretained_component_mb,
                 self._encode_staging_mb,
                 self._post_process_chain_mb,
             )
@@ -1877,6 +1896,7 @@ class _DispatchWorld:
             self._resident_mb.get(lane_id, 0.0)
             + self._transient_mb.get(lane_id, 0.0)
             + self._held_component_mb.get(lane_id, 0.0)
+            + self._unretained_component_mb.get(lane_id, 0.0)
             + self._encode_staging_mb.get(lane_id, 0.0)
             + self._post_process_chain_mb.get(lane_id, 0.0)
         )
@@ -2198,6 +2218,28 @@ class _DispatchWorld:
         self._ram_held_checkpoint_lanes.add(lane_id)
         self._sync_reported_vram()
 
+    def seed_served_vram_unload(self, lane_id: int) -> None:
+        """Have ``lane_id`` idle with its model in RAM after a VRAM unload whose flag the parent still holds.
+
+        The lane must already hold its model in RAM (``seed_resident(..., in_vram=False)``). It waits for a job,
+        and its ``UNLOAD_MODELS_FROM_VRAM`` flag stands, as production keeps it until the slot materialises VRAM
+        again.
+        """
+        lane = self._process_map[lane_id]
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        lane.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        self._unload_served.add(lane_id)
+
+    def seed_unretained_components(self, lane_id: int, component_mb: float) -> None:
+        """Leave ``component_mb`` of split text-encoder and VAE entries on ``lane_id``'s device.
+
+        The tenancy of a lane whose retained model the parent has since unloaded to RAM (see
+        ``_unretained_component_mb``). The lane reports it as live allocation and not as held components, so
+        the parent sees a reservation with no cache in it and a model that is not on the device.
+        """
+        self._unretained_component_mb[lane_id] = component_mb
+        self._sync_reported_vram()
+
     def _ram_held_checkpoint_report(self, lane: HordeProcessInfo) -> list[HeldComponentSnapshot] | None:
         """The held-component report of a lane whose seated checkpoint sits in host RAM, or None when empty."""
         model = _model_by_name(lane.loaded_horde_model_name or "")
@@ -2262,6 +2304,10 @@ class _DispatchWorld:
         """
         for lane in self._process_map.values():
             self._receive_pipe_only_unloads(lane)
+            if lane.process_id in self._unload_served:
+                if lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                    continue
+                self._unload_served.discard(lane.process_id)
             if self.host_ram is not None and lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
                 self.host_ram.evict(lane.process_id)
                 # The child's unload report re-stamps the unload on the host clock the readings share. The world
@@ -2291,21 +2337,36 @@ class _DispatchWorld:
         Some unloads go out on the pipe alone, ahead of START_INFERENCE, and set no control flag. The child acts
         on the message whatever the slot's flag says, so the card gives back the device weights before the next
         message is read. While the slot's flag carries an unload, the flag's path releases the whole lane and
-        owns the release.
+        owns the release. An allocator-cache release is sent on the pipe alone too, and is delivered the same way.
         """
         pipe: object = lane.pipe_connection
         assert isinstance(pipe, Mock), "the world's lanes send through a recording pipe"
         sends = pipe.send.call_args_list
         first_unread = self._pipe_messages_read.get(lane.process_id, 0)
         self._pipe_messages_read[lane.process_id] = len(sends)
-        if lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
-            return
+        unload_flagged = lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
         for call in sends[first_unread:]:
             message = call.args[0] if call.args else None
-            if isinstance(message, HordeControlMessage) and (
-                message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
-            ):
+            if not isinstance(message, HordeControlMessage):
+                continue
+            if message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
+                self._release_unretained_components(lane)
+            elif message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM and not unload_flagged:
                 self._free_device_weights(lane)
+
+    def _release_unretained_components(self, lane: HordeProcessInfo) -> None:
+        """Return ``lane``'s unretained components to the card, as the child's cache release does when idle.
+
+        The child releases them only while it waits for a job with its model off the device, so a lane serving
+        a job or holding its weights on the card keeps them. With ``unretained_components_pinned`` nothing is
+        returned.
+        """
+        if self.unretained_components_pinned:
+            return
+        if lane.last_process_state is not HordeProcessState.WAITING_FOR_JOB or lane.process_id in self._resident_mb:
+            return
+        if self._unretained_component_mb.pop(lane.process_id, 0.0) > 0.0:
+            self._sync_reported_vram()
 
     def _free_device_weights(self, lane: HordeProcessInfo) -> None:
         """Return every weight ``lane`` holds on the card, as the child's whole-device free does, keeping its job.
@@ -3636,6 +3697,7 @@ class _DispatchWorld:
         self._encode_staging_mb.pop(lane_id, None)
         self._offloaded_mb.pop(lane_id, None)
         self._held_component_mb.pop(lane_id, None)
+        self._unretained_component_mb.pop(lane_id, None)
         self._granted_resident_evicted.discard(lane_id)
         self._unload_due_at.pop(lane_id, None)
         self._unload_leaked.discard(lane_id)
@@ -3719,6 +3781,7 @@ class _DispatchWorld:
         self._encode_staging_mb.pop(victim, None)
         self._offloaded_mb.pop(victim, None)
         self._held_component_mb.pop(victim, None)
+        self._unretained_component_mb.pop(victim, None)
         self._granted_resident_evicted.discard(victim)
         self._unload_due_at.pop(victim, None)
         self._unload_leaked.discard(victim)

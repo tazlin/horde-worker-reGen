@@ -918,7 +918,13 @@ full pool rebuild on the process's next slice, which is paid on every job, while
 is only worth anything when another demand actually needs the memory. The arbiter's escalation ladder is
 therefore the sole reclaim path: a deferred demand emits a release command targeting a specific idle
 process's cache, the preload adapter executes it, and the freed reservation shows up in the next cycle's
-measurement.
+measurement. An idle inference lane whose model is in host RAM is also a release target once its reservation
+reaches the release threshold: the child drops the split text encoder and VAE entries it kept only while the
+model was retained, which a VRAM unload leaves on the device as live allocation, before it empties the cache.
+A release is graded on what it returned, after the teardown settle the ladder gives a lane rung: a lane is not
+asked again while its release is inside the settle, and one whose reservation has still not moved by the release
+threshold after it is no longer a target, with the room counting nothing a rung returns from it, until the lane
+loads or unloads a model.
 
 ## The measured room, the lane rungs, and the probe
 
@@ -940,7 +946,9 @@ The room is also what the other frames read, so they cannot disagree with the ve
   deficit a bare idle sibling context would return is marked teardownable and the depth is exactly the
   contexts needed. A sibling holding a model or warm components is never a candidate, since its eviction or
   unload is the cheaper rung, and a deficit no context can close leaves the request as it was (a teardown that
-  cannot produce a fit is churn).
+  cannot produce a fit is churn). The room therefore permits such a sibling only what its eviction or cache
+  release returns, and lists the rest of its tenancy as a rung that is not permitted, so a card whose idle lanes
+  hold only that rest reads not closable and the measured load attempt can fire.
 - **Whole-card retirement** judges the alone frame net of the admission margin and the tenancy no teardown
   returns (the foreign floor, and the utilities lane when policy withholds it), so a claim is retired only
   against room the dispatch will find. `whole_card_models` pins a model (by name or baseline id) against any

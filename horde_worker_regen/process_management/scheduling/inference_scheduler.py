@@ -45,7 +45,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import (
     MEMORY_REPORT_INTERVAL_SECONDS,
     HordeProcessType,
 )
-from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo, ReleaseCacheGrade
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     PENDING_GPU_START_PROGRESS_EPSILON_MB,
     PauseOwner,
@@ -81,6 +81,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRungKind,
     VerifiedReclaimLadder,
     build_reclaim_ladder,
+    teardown_verification_settle_seconds,
 )
 from horde_worker_regen.process_management.resources.resource_budget import (
     _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
@@ -364,7 +365,8 @@ is its resident weights or components (a component/VAE/post-process lane holding
 reserved) has no such cache, so asking it to release frees nothing. Requiring this measured margin keeps a
 resident-weight lane out of the release-target set so the escalation ladder does not emit a rung that can
 never yield, which would otherwise keep the ladder non-empty forever and defer a head that reclaim can
-never actually relieve."""
+never actually relieve. An idle inference lane whose model is in host RAM is the exception: its reservation is
+its unretained components, which the release also drops, so the whole reservation is measured against this."""
 
 _CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS = 60.0
 """Minimum gap between live-context reductions on one card.
@@ -5200,9 +5202,11 @@ class InferenceScheduler:
         is not a target: asking it to release frees nothing, and emitting a rung that can never yield would keep
         the escalation ladder non-empty forever. An idle process that still holds a horde model is an eviction
         candidate (a distinct ladder rung), not a cache-release target, so it is left out here to keep the two
-        remedies separate. A busy process is never a target. When the in-use allocation has not yet been
-        reported the reclaimable margin cannot be measured, so the process is not targeted rather than assumed
-        to hold cache.
+        remedies separate, unless its model is in host RAM (:meth:`_releases_unretained_components`). A busy
+        process is never a target. When the in-use allocation has not yet been reported the reclaimable margin
+        cannot be measured, so the process is not targeted rather than assumed to hold cache. A process with a
+        release outstanding is not targeted again, and one whose release returned nothing is not a target until it
+        loads or unloads a model (:meth:`_release_cache_grade`).
         """
         cache_bearing = (
             HordeProcessType.INFERENCE,
@@ -5221,14 +5225,115 @@ class InferenceScheduler:
                 busy.add(process_info.process_id)
                 continue
             if process_info.loaded_horde_model_name is not None:
+                if self._releases_unretained_components(process_info) and not self._release_cache_withheld(
+                    process_info,
+                ):
+                    idle.add(process_info.process_id)
                 continue
             reserved_mb = process_info.process_reserved_mb
             allocated_mb = process_info.process_allocated_mb
             if reserved_mb is None or allocated_mb is None:
                 continue
-            if reserved_mb - allocated_mb >= _RELEASE_CACHE_MIN_RECLAIMABLE_MB:
+            if reserved_mb - allocated_mb >= _RELEASE_CACHE_MIN_RECLAIMABLE_MB and not self._release_cache_withheld(
+                process_info,
+            ):
                 idle.add(process_info.process_id)
         return frozenset(idle), frozenset(busy)
+
+    def _release_cache_withheld(self, process_info: HordeProcessInfo) -> bool:
+        """Whether the lane is passed over as a release target: its release is outstanding or returned nothing."""
+        return self._release_cache_grade(process_info) in (
+            ReleaseCacheGrade.AWAITING_GRADE,
+            ReleaseCacheGrade.RETURNED_NOTHING,
+        )
+
+    def _release_cache_grade(self, process_info: HordeProcessInfo) -> ReleaseCacheGrade:
+        """Grade the lane's outstanding allocator-cache release, as the ladder grades a lane rung after a settle.
+
+        Every reclaim step is graded on what it freed. A release the child could not honour (live references
+        still pin the blocks) leaves the reservation within ``_RELEASE_CACHE_MIN_RECLAIMABLE_MB`` of the figure it
+        was sent at, and sending it again every cycle would keep an acting rung on the ladder that resets the
+        starved head's clock without returning anything. The release gets the teardown verification settle
+        before an unmoved reservation is graded, so a report still in flight is never read as a refusal; until
+        then the lane is not asked again. A graded refusal stands until a load or an unload clears the record
+        (:meth:`HordeProcessInfo.forget_release_cache_request`); a moved reservation clears it at once.
+        """
+        grade = process_info.release_cache_grade(
+            now=self._clock(),
+            settle_seconds=teardown_verification_settle_seconds(),
+            min_return_mb=_RELEASE_CACHE_MIN_RECLAIMABLE_MB,
+        )
+        if grade is ReleaseCacheGrade.RETURNED:
+            process_info.forget_release_cache_request()
+            return ReleaseCacheGrade.NO_REQUEST
+        if grade is ReleaseCacheGrade.RETURNED_NOTHING and not process_info.release_cache_refusal_logged:
+            process_info.release_cache_refusal_logged = True
+            logger.info(
+                f"Process {process_info.process_id} still reserves {process_info.process_reserved_mb} MB "
+                f"{teardown_verification_settle_seconds():.0f}s after an allocator-cache release sent at "
+                f"{process_info.release_cache_requested_at_reserved_mb} MB; it is no longer a release target until "
+                "it loads or unloads a model.",
+            )
+        return grade
+
+    def _releases_unretained_components(self, process_info: HordeProcessInfo) -> bool:
+        """Whether a cache release would return an idle inference lane's reservation though it holds a model.
+
+        A lane waiting for a job with its model in host RAM still holds whatever split text encoder and VAE its
+        last retained job left on the device, as live allocation an ``empty_cache`` alone cannot return. The
+        child drops those unretained components on the same release while it idles with its model off the
+        device, so such a lane is a target once its reservation reaches the release threshold. A lane whose
+        weights are on the device is the eviction rung's, and a retained lane keeps its components for its
+        next job.
+        """
+        reserved_mb = process_info.process_reserved_mb
+        return (
+            process_info.process_type == HordeProcessType.INFERENCE
+            and process_info.last_process_state == HordeProcessState.WAITING_FOR_JOB
+            and reserved_mb is not None
+            and reserved_mb >= _RELEASE_CACHE_MIN_RECLAIMABLE_MB
+            and not self._candidate_weights_resident_on_process(
+                process_info.loaded_horde_model_name,
+                process_info.process_id,
+            )
+        )
+
+    def _held_idle_returns_mb(self, device_index: int | None, release_targets: frozenset[int]) -> dict[int, float]:
+        """What a rung returns from each idle inference lane on the card that holds a model or components (MB).
+
+        The admission room permits only this much of such a lane, since the context teardown never takes it. An
+        eviction or a cache release returns its reservation; a lane whose model is in host RAM and which is not
+        a release target holds nothing a rung returns, unless its release is still inside the settle. A lane
+        whose unload the device refused returns nothing either: the ladder passes it over until it next
+        materialises weights (:attr:`HordeProcessInfo.vram_unload_refused`). Bare contexts are left out: their
+        whole tenancy is the teardown's.
+        """
+        returns: dict[int, float] = {}
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE or process_info.is_process_busy():
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if pricing.is_bare_context(
+                model=process_info.loaded_horde_model_name,
+                held_component_count=len(process_info.held_components or ()),
+            ):
+                continue
+            if process_info.vram_unload_refused:
+                returns[process_info.process_id] = 0.0
+                continue
+            model_in_host_ram = process_info.loaded_horde_model_name is not None and not (
+                self._candidate_weights_resident_on_process(
+                    process_info.loaded_horde_model_name,
+                    process_info.process_id,
+                )
+            )
+            release_outstanding = self._release_cache_grade(process_info) is ReleaseCacheGrade.AWAITING_GRADE
+            if model_in_host_ram and process_info.process_id not in release_targets and not release_outstanding:
+                returns[process_info.process_id] = 0.0
+                continue
+            returns[process_info.process_id] = max(0.0, float(process_info.process_reserved_mb or 0))
+        return returns
 
     def build_vram_arbiter_device_state(
         self,
@@ -5345,6 +5450,7 @@ class InferenceScheduler:
             safety_residency_fixed=self._safety_residency_fixed_on(device_index) and safety_contexts > 0,
             safety_footprint_mb=self._safety_footprint_mb() if safety_contexts > 0 else 0.0,
             lane_by_process_id=self._tenant_lane_by_process_id(device_index),
+            held_idle_returns_mb=self._held_idle_returns_mb(device_index, idle_process_ids),
             utilities_context_count=utilities_contexts,
             post_process_reclaim_allowed=(
                 post_process_contexts > 0
@@ -12643,6 +12749,7 @@ class InferenceScheduler:
             HordeControlMessage(control_flag=HordeControlFlag.RELEASE_ALLOCATOR_CACHE),
         )
         if delivered:
+            process_info.note_release_cache_requested(now=self._clock())
             logger.debug(f"Asked process {process_id} to release its allocator cache")
         return delivered
 

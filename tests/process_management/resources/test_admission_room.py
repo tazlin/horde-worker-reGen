@@ -35,13 +35,15 @@ def _edge_room(
     safety_permitted: bool = True,
     safety_reserved_mb: float | None = None,
     safety_residency_fixed: bool = False,
+    held_idle_returns_mb: dict[int, float] | None = None,
 ) -> AdmissionRoom:
     """A 24 GB card holding two inference contexts, a post-processing lane, a utilities lane and safety.
 
     The target slot (pid 2) and its idle sibling (pid 3) each report a small allocator reservation; the
     lanes report theirs; safety reports nothing and is priced at its footprint. The device-free reading is
     set so the foreign share comes out to a round figure. ``safety_reserved_mb`` gives safety a reported
-    reservation instead, for the rows about what a fixed residency is charged.
+    reservation instead, for the rows about what a fixed residency is charged. ``held_idle_returns_mb`` marks
+    an idle sibling as holding a model or components, with what a rung returns from it.
     """
     reserved = {2: 100.0, 3: 100.0, 1: 808.0, 4: 554.0}
     if safety_reserved_mb is not None:
@@ -70,6 +72,7 @@ def _edge_room(
         safety_reclaim_permitted=safety_permitted,
         utilities_reclaim_permitted=utilities_permitted,
         safety_residency_fixed=safety_residency_fixed,
+        held_idle_returns_mb=held_idle_returns_mb,
     )
 
 
@@ -191,6 +194,45 @@ def test_a_reservation_above_the_footprint_still_charges_the_reservation() -> No
     room = _edge_room(safety_reserved_mb=5000.0, safety_residency_fixed=True)
 
     assert room.tenancy_mb[TenantLane.SAFETY] == 5000.0 + _CONTEXT_MB
+
+
+def test_a_held_idle_sibling_lists_what_a_rung_returns_and_a_forbidden_remainder() -> None:
+    """A sibling holding a model or components is never torn down, so only what a rung returns is permitted."""
+    room = _edge_room(held_idle_returns_mb={3: 60.0})
+
+    sibling_rungs = [rung for rung in room.rungs if rung.kind is RoomRungKind.IDLE_SIBLING_CONTEXT]
+    assert [(rung.promised_mb, rung.permitted) for rung in sibling_rungs] == [
+        (60.0, True),
+        (100 + _CONTEXT_MB - 60.0, False),
+    ]
+    assert room.reclaimable_mb == 60.0 + (808 + _CONTEXT_MB) + 3044.0
+
+
+def test_a_held_idle_sibling_no_rung_returns_offers_nothing_permitted() -> None:
+    """A sibling whose release returned nothing reports zero, so its whole tenancy is the forbidden remainder."""
+    room = _edge_room(held_idle_returns_mb={3: 0.0})
+
+    sibling_rungs = [rung for rung in room.rungs if rung.kind is RoomRungKind.IDLE_SIBLING_CONTEXT]
+    assert [(rung.promised_mb, rung.permitted) for rung in sibling_rungs] == [
+        (0.0, True),
+        (100 + _CONTEXT_MB, False),
+    ]
+
+
+def test_a_bare_idle_sibling_lists_its_whole_tenancy_permitted() -> None:
+    """A sibling absent from the held map is a bare context, which the teardown returns whole."""
+    room = _edge_room(held_idle_returns_mb={})
+
+    sibling_rungs = [rung for rung in room.rungs if rung.kind is RoomRungKind.IDLE_SIBLING_CONTEXT]
+    assert [(rung.promised_mb, rung.permitted) for rung in sibling_rungs] == [(100 + _CONTEXT_MB, True)]
+
+
+def test_inputs_keep_one_key_per_rung_kind_with_the_permitted_figure() -> None:
+    """The forbidden remainder of a held sibling never overwrites its permitted rung in the record."""
+    inputs = _edge_room(held_idle_returns_mb={3: 60.0}).as_inputs()
+
+    assert inputs["rung_idle_sibling_context_mb"] == 60.0
+    assert inputs["rung_idle_sibling_context_permitted"] is True
 
 
 def test_arbiter_attaches_the_room_to_a_non_fitting_verdict() -> None:

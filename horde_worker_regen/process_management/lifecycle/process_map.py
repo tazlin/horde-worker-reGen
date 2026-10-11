@@ -614,6 +614,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
         self[process_id].loaded_horde_model_name = horde_model_name
         self[process_id].loaded_horde_model_baseline = horde_model_baseline
+        self[process_id].forget_release_cache_request()
 
         self[process_id].last_received_timestamp = time.time()
         if last_job_referenced is not None:
@@ -713,6 +714,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """
         self[process_id].clear_retained_resident()
         self[process_id].vram_unload_refused = False
+        self[process_id].forget_release_cache_request()
 
     def retire_ownership_of_ended_jobs(
         self, in_progress_job_ids: set[GenerationID]
@@ -756,6 +758,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         # a refusal to give the device back cannot outlive the weights it was about.
         self[process_id].clear_retained_resident()
         self[process_id].vram_unload_refused = False
+        self[process_id].forget_release_cache_request()
         self[process_id].recently_unloaded_from_ram = True
         # The reclaim path judges whether an unload actually returned RAM by comparing the slot's next
         # memory report against this stamp; a reading older than it predates the unload entirely.

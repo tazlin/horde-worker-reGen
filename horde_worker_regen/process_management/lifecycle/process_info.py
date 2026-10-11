@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import time
 from dataclasses import dataclass
 from typing import Protocol, override
@@ -30,6 +31,19 @@ try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
+
+
+class ReleaseCacheGrade(enum.StrEnum):
+    """How the allocator-cache release last sent to a lane stands against the lane's reservation."""
+
+    NO_REQUEST = "no_request"
+    """No release is outstanding."""
+    AWAITING_GRADE = "awaiting_grade"
+    """The release is inside its settle and the reservation has not yet moved."""
+    RETURNED = "returned"
+    """The reservation moved by at least the release threshold since the send."""
+    RETURNED_NOTHING = "returned_nothing"
+    """The settle has passed and the reservation is still within the release threshold of the send's figure."""
 
 
 class ChildProcessHandle(Protocol):
@@ -343,6 +357,18 @@ class HordeProcessInfo:
     silently. Re-issuing the same unload the next tick asks the same question of the same refusal, so the
     reclaim ladder has to be able to pass this slot over and escalate to its next rung instead. Cleared when
     the slot next materialises weights or loads a model, which is the point the refusal stops describing it."""
+    release_cache_requested_at_reserved_mb: int | None
+    """The reservation (MB) this lane reported when the parent last sent it ``RELEASE_ALLOCATOR_CACHE``, or None.
+
+    A release is graded on what it returned, after a settle. A reservation still within the release threshold of
+    this figure once the settle has passed means the release returned nothing (live references still pin the
+    blocks, or the reservation is not cache), and asking again asks the same question of the same refusal, so the
+    lane stops being a release target. Cleared when the lane loads or unloads a model, since the reservation then
+    describes a different tenancy."""
+    release_cache_requested_at: float | None
+    """The scheduler-clock instant the outstanding release was sent, or None; the settle is measured from it."""
+    release_cache_refusal_logged: bool
+    """Whether the refusal of the outstanding release has been logged, so the line fires once per request."""
 
     batch_amount: int
     """The total amount of batching being run by this process."""
@@ -470,6 +496,9 @@ class HordeProcessInfo:
         self.retention_granted_component_only = False
         self.retained_resident_component_only = False
         self.vram_unload_refused = False
+        self.release_cache_requested_at_reserved_mb = None
+        self.release_cache_requested_at = None
+        self.release_cache_refusal_logged = False
 
         self.ram_usage_bytes = 0
         self.ram_private_bytes = None
@@ -726,6 +755,36 @@ class HordeProcessInfo:
         self.retained_resident_since = None
         self.retained_resident_component_only = False
         self.retention_granted_component_only = False
+
+    def note_release_cache_requested(self, *, now: float) -> None:
+        """Record the reservation and the scheduler-clock instant a just-sent allocator-cache release is graded on."""
+        self.release_cache_requested_at_reserved_mb = self.process_reserved_mb
+        self.release_cache_requested_at = now
+        self.release_cache_refusal_logged = False
+
+    def forget_release_cache_request(self) -> None:
+        """Drop the outstanding release, because it was graded as returned or a load or unload changed the lane."""
+        self.release_cache_requested_at_reserved_mb = None
+        self.release_cache_requested_at = None
+        self.release_cache_refusal_logged = False
+
+    def release_cache_grade(self, *, now: float, settle_seconds: float, min_return_mb: float) -> ReleaseCacheGrade:
+        """Return how the outstanding release stands: a moved reservation at once, an unmoved one after the settle.
+
+        Args:
+            now: The scheduler-clock instant of this evaluation.
+            settle_seconds: How long a release gets before an unmoved reservation is graded as returning nothing.
+            min_return_mb: How far the reservation must move from the send's figure to count as returned.
+        """
+        requested_at_mb = self.release_cache_requested_at_reserved_mb
+        requested_at = self.release_cache_requested_at
+        if requested_at_mb is None or requested_at is None or self.process_reserved_mb is None:
+            return ReleaseCacheGrade.NO_REQUEST
+        if abs(self.process_reserved_mb - requested_at_mb) >= min_return_mb:
+            return ReleaseCacheGrade.RETURNED
+        if now - requested_at < settle_seconds:
+            return ReleaseCacheGrade.AWAITING_GRADE
+        return ReleaseCacheGrade.RETURNED_NOTHING
 
     def is_process_busy(self) -> bool:
         """Return true if the process is actively engaged in a task.
