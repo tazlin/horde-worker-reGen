@@ -3922,6 +3922,80 @@ class TestOutOfMemoryCause:
         )
 
 
+_OOM_FAULT_JOB = "c0d7c4c8-c1fd-4082-b295-6dbb345f3e45"
+"""The job :func:`_oom_fault` names."""
+
+
+def _lane_job_started(ts: str, job_id: str) -> str:
+    """inference_process.start_inference: the inference process's own line opening a job."""
+    return (
+        f"2026-06-24 {ts} | INFO     | horde_worker_regen.process_management.workers.inference_process:"
+        f"start_inference:1344 - Starting inference for job(s) [{job_id}]"
+    )
+
+
+def _sampling_beside_residents(ts: str, *, resident_mb: int = 9420) -> str:
+    """The comfy_patches._log_sampling_beside_resident_models line in hordelib: a load left beside residents."""
+    return (
+        f"2026-06-24 {ts} | INFO     | hordelib.execution.comfy_patches:_log_sampling_beside_resident_models:620 - "
+        f"Sampling beside resident models: reason=overflow Flux loading 11350 MB with {resident_mb} MB of other "
+        "models resident (FluxClipModel_), free 8120 MB; no forced eviction"
+    )
+
+
+class TestOutOfMemoryBesideResidentModels:
+    """The out-of-memory finding attributing a fault to models hordelib left loaded for its job."""
+
+    def _findings(self, tmp_path: Path, *lane_lines: str) -> dict[str, Finding]:
+        bridge = _lane_log(_oom_fault("18:10:00.000", process=2, runtime_error=False))
+        return _diagnose(tmp_path, bridge, {"bridge_2.log": "\n".join([_session_start(), *lane_lines])})
+
+    def test_a_fault_after_the_line_in_its_own_job_is_counted_and_named(self, tmp_path: Path) -> None:
+        """The resident-models line between the job's start and its fault is reported with its resident MB."""
+        finding = self._findings(
+            tmp_path,
+            _lane_job_started("18:09:50.000", _OOM_FAULT_JOB),
+            _sampling_beside_residents("18:09:51.000", resident_mb=1630),
+            _sampling_beside_residents("18:09:55.000"),
+        )["oom"]
+        assert finding.evidence[-2] == (
+            '1 of 1 fault loaded the model beside other models kept on the card ("Sampling beside resident models")'
+        )
+        assert finding.evidence[-1].startswith(
+            "job c0d7c4c8 on process 2, 9420 MB resident (FluxClipModel_): 18:09:55"
+        )
+        assert "stayed loaded on the card" in finding.action
+        assert "`horde-log bundle`" in finding.action
+        assert "favours" not in finding.action
+
+    def test_a_job_without_the_line_keeps_the_full_card_advice(self, tmp_path: Path) -> None:
+        """A lane log with the job's start and no resident-models line adds nothing."""
+        finding = self._findings(tmp_path, _lane_job_started("18:09:50.000", _OOM_FAULT_JOB))["oom"]
+        assert not any("Sampling beside resident models" in line for line in finding.evidence)
+        assert "favours too much work on the card" in finding.action
+
+    def test_a_line_from_an_earlier_job_on_the_lane_is_not_attributed(self, tmp_path: Path) -> None:
+        """The lookback stops at the faulting job's start, so a previous job's line does not explain this fault."""
+        finding = self._findings(
+            tmp_path,
+            _lane_job_started("18:09:40.000", "7c9bb27c-0000-4000-8000-000000000000"),
+            _sampling_beside_residents("18:09:41.000"),
+            _lane_job_started("18:09:50.000", _OOM_FAULT_JOB),
+        )["oom"]
+        assert not any("Sampling beside resident models" in line for line in finding.evidence)
+
+    def test_the_resident_copy_follows_the_guide(self, tmp_path: Path) -> None:
+        """The "Do this" line carrying the resident-models sentence stays within the copy guide."""
+        from tests.analysis.test_finding_copy_style import _emit_problems
+
+        finding = self._findings(
+            tmp_path,
+            _lane_job_started("18:09:50.000", _OOM_FAULT_JOB),
+            _sampling_beside_residents("18:09:55.000"),
+        )["oom"]
+        assert _emit_problems(finding) == []
+
+
 def test_the_lane_finding_copy_follows_the_guide(tmp_path: Path) -> None:
     """Every variant these findings word per emit reads as the copy guide asks, beyond the one golden fixture."""
     from tests.analysis.test_finding_copy_style import _emit_problems

@@ -418,6 +418,12 @@ _OOM_CONCENTRATION_MIN_FAULTS = 3
 # The out-of-memory headline names this many models and counts the rest, so a session failing every model it
 # serves still reads as one sentence.
 _OOM_HEADLINE_MODELS = 3
+# hordelib's line for a load that proceeded beside other resident models with no forced eviction, and the
+# inference process's job start that bounds the lookback to the faulting job. The finding names this many such
+# faults in its evidence and counts the rest.
+_SAMPLING_BESIDE_RESIDENTS_RE = pattern_for("sampling_beside_resident_models")
+_CHILD_JOB_STARTED_RE = pattern_for("inference_child_job_started")
+_OOM_RESIDENT_EVIDENCE_FAULTS = 3
 # A host commit exhaustion this close before a CUDA error or a dropped channel is taken as its likely cause.
 _HOST_COMMIT_LOOKBACK = timedelta(seconds=60)
 # A fault streak with at least this many resource faults, whose process fails again within the refault window
@@ -1176,8 +1182,9 @@ _LANE_STOPPED_RE = pattern_for("service_lane_stopped")
 _LANE_RESTARTED_RE = pattern_for("service_lane_restarted")
 _LANE_HOLD_RE = pattern_for("reclaim_lane_hold")
 
-# A lane cold start costs 6 to 27 seconds, so a restart within this many seconds of its stop freed nothing a
-# job could use. Three such pairs on one lane is a pattern; one or two can be a single pressure spike.
+# A lane cold start costs 6 to 27 seconds. A restart within this many seconds of its stop is typically a lane
+# stopped for one post-processing job that did not fit beside it, which ran in a few seconds. Three such pairs on
+# one lane is a pattern; one or two can be a single pressure spike.
 _LANE_QUICK_RESTART_SECONDS = 5.0
 _LANE_CHURN_QUICK_PAIRS = 3
 
@@ -1284,7 +1291,7 @@ def detect_lane_double_dispatch_signature(context: SessionContext) -> list[Findi
 _INFERENCE_DISPATCHED_RE = pattern_for("inference_dispatched")
 _UNPRICED_SAMPLING_WINDOW_RE = pattern_for("unpriced_sampling_window")
 
-# A wait this short from the start of inference means the grant was issued and the parent's ledger missed it.
+# A wait this short from the start of inference means the child never waited for a grant.
 _UNPRICED_SHORT_WAIT_SECONDS = 3.0
 # A wait this long means the child sat through most of its lease-acquire timeout (60 s) with the card idle.
 _UNPRICED_LONG_WAIT_SECONDS = 30.0
@@ -1295,8 +1302,8 @@ _UNPRICED_LONG_WAIT_WARNING_COUNT = 3
 def detect_unpriced_sampling_windows(context: SessionContext) -> list[Finding]:
     """Sampling without a recorded clearance grant, banded by the wait since that process's start of inference.
 
-    Each window pairs with the most recent start of inference on the same process. A short wait is a grant
-    the parent's ledger missed; a wait of 30 s or more is a child that ran out its lease-acquire timeout with
+    Each window pairs with the most recent start of inference on the same process. A short wait is a child
+    that never waited for a grant; a wait of 30 s or more is a child that ran out its lease-acquire timeout with
     the card idle, which is what costs throughput. A window with no prior start on its process is counted
     but not banded.
     """
@@ -1524,6 +1531,62 @@ def _broken_process_verdict(records: list[LogRecord], faults: list[LogRecord]) -
     )
 
 
+@dataclass(frozen=True)
+class _ResidentSamplingFault:
+    """An out-of-memory fault whose job loaded its model beside other models hordelib did not evict."""
+
+    job_id: str
+    process_id: int
+    resident_line: LogRecord
+    resident_mb: int
+    resident_names: str
+
+
+def _resident_sampling_fault(context: SessionContext, fault: LogRecord) -> _ResidentSamplingFault | None:
+    """Return the fault's most recent resident-models line from its own job, or None when its job logged none.
+
+    The lane log is walked back from the fault to the most recent job start. That start has to name the faulting
+    job, since a start for another job means the fault's own start is missing (a head-truncated lane log). A
+    resident-models line from an earlier job on the same lane does not explain this fault.
+    """
+    job_match = _FAULTED_ON_PROCESS_JOB_RE.search(fault.message)
+    if job_match is None or fault.timestamp is None:
+        return None
+    job_id = job_match["job"]
+    process_id = int(job_match["pid"])
+    lane_records = _records_in_window(context.bundle.child_records(process_id), None, fault.timestamp)
+    latest: tuple[LogRecord, re.Match[str]] | None = None
+    for record in reversed(lane_records):
+        if (started := _CHILD_JOB_STARTED_RE.search(record.message)) is not None:
+            if job_id not in started["jobs"] or latest is None:
+                return None
+            resident_line, resident = latest
+            return _ResidentSamplingFault(
+                job_id=job_id,
+                process_id=process_id,
+                resident_line=resident_line,
+                resident_mb=int(resident["resident_mb"]),
+                resident_names=resident["resident"],
+            )
+        if latest is None and (resident_match := _SAMPLING_BESIDE_RESIDENTS_RE.search(record.message)):
+            latest = (record, resident_match)
+    return None
+
+
+def _resident_sampling_evidence(resident_faults: list[_ResidentSamplingFault], fault_count: int) -> list[str]:
+    """Return the count of faults that sampled beside resident models and up to three of them by job."""
+    lines = [
+        f"{len(resident_faults)} of {_count_text(fault_count, 'fault')} loaded the model beside other models "
+        'kept on the card ("Sampling beside resident models")',
+    ]
+    lines.extend(
+        f"job {resident.job_id[:8]} on process {resident.process_id}, {resident.resident_mb} MB resident "
+        f"({resident.resident_names}): {_evidence(resident.resident_line)}"
+        for resident in resident_faults[:_OOM_RESIDENT_EVIDENCE_FAULTS]
+    )
+    return lines
+
+
 def detect_oom(context: SessionContext) -> list[Finding]:
     """Out-of-memory faults (explicit CUDA OOM), naming the faulting model and the card's co-residency.
 
@@ -1537,6 +1600,10 @@ def detect_oom(context: SessionContext) -> list[Finding]:
     the card has room. When the faults single one process out and its siblings kept finishing jobs, the
     finding names that process instead of advising less work on the card. A CUDA runtime error
     (``torch.AcceleratorError``) is named as a failed CUDA call.
+
+    hordelib forces no eviction before a load it does not force-load in full, and logs the models it left
+    resident. A fault whose own job logged that line is counted and named in the evidence, so a fault caused
+    by the models left in place is attributable from a bundle.
     """
     oom = _matching(context.session.records, _OOM_RE)
     if not oom:
@@ -1547,6 +1614,10 @@ def detect_oom(context: SessionContext) -> list[Finding]:
     faults = [record for record in oom if _FAULTED_ON_PROCESS_RE.search(record.message)] or oom
     runtime_errors = sum(1 for record in faults if _CUDA_RUNTIME_OOM_RE.search(record.message))
     broken = _broken_process_verdict(context.session.records, faults)
+    resident_faults = [
+        resident for record in faults if (resident := _resident_sampling_fault(context, record)) is not None
+    ]
+    resident_evidence = _resident_sampling_evidence(resident_faults, len(faults)) if resident_faults else []
 
     models = _faulting_models(faults)
     model_names = [f'"{model}"' for model in models[:_OOM_HEADLINE_MODELS]]
@@ -1581,6 +1652,7 @@ def detect_oom(context: SessionContext) -> list[Finding]:
                 for other, count in sorted(broken.other_finishes.items())
             ),
             *(_evidence(record) for record in faults[:4]),
+            *resident_evidence,
         ]
         return [
             Finding(
@@ -1610,7 +1682,14 @@ def detect_oom(context: SessionContext) -> list[Finding]:
             verdict += f" and {max_siblings + 1} processes sharing the card"
     verdict += "."
 
-    if runtime_errors:
+    if resident_faults:
+        # The copy guide caps "Do this" at three sentences, so this sentence replaces the general verdict. Models
+        # left loaded beside the faulting one are the more specific explanation.
+        likelier = (
+            "Some faults came while other models stayed loaded on the card, so send the log with "
+            "`horde-log bundle` to the worker maintainers."
+        )
+    elif runtime_errors:
         likelier = (
             'The evidence favours a full card, though a "CUDA error: out of memory" can also mean a broken process.'
         )
@@ -1625,7 +1704,7 @@ def detect_oom(context: SessionContext) -> list[Finding]:
                 f"{likelier} Lower `max_threads` or `queue_size`, or turn on the VRAM budget, and run fewer models "
                 "when several share a full card."
             ),
-            evidence=[_evidence(r) for r in faults[:4]],
+            evidence=[*(_evidence(r) for r in faults[:4]), *resident_evidence],
         ),
     ]
 

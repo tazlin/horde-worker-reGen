@@ -308,11 +308,18 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.SERVICE_LANE_RESTART_CHURN,
         title="A helper process was stopped and restarted again and again",
-        action="Send the log with `horde-log bundle` to the worker maintainers.",
+        action=(
+            "See whether each restart came right after a post-processing job. If so, this is the cost of "
+            "post-processing on a full card. Setting `starved_head_utilities_pause` to false keeps the "
+            "image-utilities process running instead."
+        ),
         detail=(
-            "To free memory for a large job, the worker can stop a helper process such as post-processing "
-            "(the reclaim ladder). Restarting it costs 6 to 27 seconds. A restart within 5 seconds of the stop "
-            "freed nothing useful and cost a cold start."
+            "To free memory, the worker can stop a helper process and restart it once the card has room "
+            "(the reclaim ladder). A post-processing job that does not fit beside the image-utilities process "
+            "stops that process for the job. The job runs in a few seconds and the process restarts right after, "
+            "within 5 seconds of the stop. The room was used, but each such job costs a cold restart of 6 to 27 "
+            "seconds. With `starved_head_utilities_pause` false, the post-processing job waits for room or moves "
+            "the safety check to the CPU instead."
         ),
         reference_page="docs/explanation/resilience_and_recovery.md",
     ),
@@ -421,6 +428,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "models were admitted onto one card. One process with plenty free elsewhere means that model "
             "alone is too large for the card. When nearly every fault comes from one process while another "
             "keeps finishing jobs, that process is broken and the card still has room. "
+            "The evidence also counts faults whose job loaded its model while other models stayed on the card. "
             '"torch.AcceleratorError: CUDA error: out of memory" comes from a failed CUDA call and can leave the '
             "process unusable."
         ),
@@ -522,14 +530,12 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         title="Image generation started without a recorded memory grant",
         detail=(
             "An image process waits for a memory grant before it starts generating (the clearance lease). "
-            "If no grant comes within 60 seconds it generates anyway, and the worker logs that it did so with no "
-            "grant on record. "
+            "The worker logs a line when a process starts generating with no grant on record. "
             "For each such job, this finding measures the time from the job being handed to the process to that "
             "log line. "
-            "A wait under 3 seconds means a grant was issued and the worker did not record it. "
-            'A "cleared process" line exists for it, and it costs nothing. '
-            "A wait of 30 seconds or more means the process spent most or all of the 60 seconds waiting for a "
-            "grant that never came. That points at how the job's memory was priced or freed. "
+            "A wait under 3 seconds means the process never waited for a grant. "
+            "A wait of 30 seconds or more means the process waited out its 60 second limit for a grant that never "
+            "came. That points at how the job's memory was priced or freed. "
             "A wait in between needs the log around it to tell which."
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,

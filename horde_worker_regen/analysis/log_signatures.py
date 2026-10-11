@@ -93,6 +93,7 @@ _EARLIER_WORKER_VERSIONS_ONLY = (
 _HORDELIB_READOUT_NOT_EXERCISED = (
     "the dry-run harness's fake inference children never call hordelib's free-VRAM readout"
 )
+_CHILD_LOG_NOT_READ = "written to an inference process's own log, and the dry-run contract reads only the parent's log"
 _TEXT_BACKEND_NOT_LAUNCHED = (
     "printed once by the text backend into its own `logs/text_backend.log`, which a dry run never launches"
 )
@@ -175,6 +176,13 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"Starting inference for job (?P<job>[0-9a-fA-F]{8}) on process (?P<process>\d+)",
         emitter="process_management.scheduling.inference_scheduler:start_inference",
         sample="Starting inference for job f5fd3c31 on process 10",
+    ),
+    _signature(
+        "inference_child_job_started",
+        r"Starting inference for job\(s\) \[(?P<jobs>[^\]]*)\]",
+        emitter="process_management.workers.inference_process:start_inference",
+        sample="Starting inference for job(s) [85dd5d68-02c5-475e-9d28-d8b9deba969e]",
+        dry_run_reason=_CHILD_LOG_NOT_READ,
     ),
     _signature(
         "inference_finished",
@@ -1264,6 +1272,21 @@ _SIGNATURE_LIST: list[LogSignature] = [
             "Free VRAM 11 MB is below the 1219 MB inference reserve: sampling activations will stream from host RAM."
         ),
         dry_run_reason=_HORDELIB_READOUT_NOT_EXERCISED,
+    ),
+    _signature(
+        # Logged once per load that skipped hordelib's force-full load while other models kept weights on the
+        # device. hordelib forces no eviction for such a load, so an OOM after it is attributable to these
+        # residents. The sample is built from the emitter's format string; no released hordelib wrote it yet.
+        "sampling_beside_resident_models",
+        r"Sampling beside resident models: reason=(?P<reason>\w+) (?P<loading>.+?) loading (?P<loading_mb>\d+) MB "
+        r"with (?P<resident_mb>\d+) MB of other models resident \((?P<resident>.*)\), free (?P<free_mb>-?\d+) MB; "
+        r"no forced eviction",
+        emitter="hordelib.execution.comfy_patches:_log_sampling_beside_resident_models",
+        sample=(
+            "Sampling beside resident models: reason=overflow Flux loading 11350 MB with 9420 MB of other models "
+            "resident (FluxClipModel_), free 8120 MB; no forced eviction"
+        ),
+        dry_run_reason=_CHILD_LOG_NOT_READ,
     ),
     _signature(
         "post_processing_breaker_tripped",
