@@ -126,7 +126,8 @@ class ControlView(VerticalScroll):
         table.add_row("Auto-start", auto_start, "Restart attempts", str(restart_attempts))
 
         help_text = Text(
-            "Pause only stops new pops; in-flight jobs finish. Horde maintenance asks the API to stop sending work.",
+            "Pause stops new pops and lets in-flight jobs finish. "
+            "Horde maintenance asks the horde to stop sending work.",
             style="grey62",
         )
         return Panel(Group(table, help_text), title="Control state", title_align="left", border_style="grey37")

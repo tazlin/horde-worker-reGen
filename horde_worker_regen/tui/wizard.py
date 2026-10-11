@@ -222,7 +222,7 @@ PRESETS: tuple[Preset, ...] = (
         kind=PresetKind.ESSENTIALS,
         title="Essentials",
         offer="Serves the single most commonly requested model, which is the fastest way to be useful.",
-        stance="Accepts plain image requests and the finishing touches (upscaling, face fixing).",
+        stance="Accepts plain image requests and finishing touches (upscaling, face fixing).",
         features={"allow_post_processing": True, "allow_lora": False, "allow_controlnet": False},
     ),
     Preset(
@@ -231,7 +231,7 @@ PRESETS: tuple[Preset, ...] = (
         offer="Serves the most-requested models your graphics card can hold, so few requests pass you by.",
         stance=(
             "Accepts plain image requests, finishing touches, and LoRA styles. LoRA files download on "
-            "demand and build up their own cache over time."
+            "demand and build up a separate cache over time."
         ),
         features={"allow_post_processing": True, "allow_lora": True, "allow_controlnet": False},
     ),
@@ -286,14 +286,14 @@ class PresetPlan:
             return "The model list for this preset is not available yet."
         if self.plan is None:
             return "Download sizes are unavailable until the model list loads."
-        free = "an unknown amount of" if self.plan.free_disk_bytes is None else human_bytes(self.plan.free_disk_bytes)
+        free = "an unknown amount" if self.plan.free_disk_bytes is None else human_bytes(self.plan.free_disk_bytes)
         qualifier = "at least " if not self.plan.sizes_complete else "about "
         sentence = (
-            f"Needs {qualifier}{human_bytes(self.plan.to_download_bytes)} downloaded, {free} free where models go."
+            f"Needs {qualifier}{human_bytes(self.plan.to_download_bytes)} downloaded. The models drive has {free} free"
         )
         if not self.plan.fits:
-            sentence += f" That is {human_bytes(self.plan.shortfall_bytes)} more than this computer has free."
-        return sentence
+            return f"{sentence}, {human_bytes(self.plan.shortfall_bytes)} too little."
+        return f"{sentence}."
 
 
 def _catalog_state() -> tuple[list[ModelInfo] | None, dict[str, int] | None]:
@@ -420,12 +420,12 @@ _WHAT_IS_NEEDED = (
     "Three things get a worker running:\n\n"
     "  A worker name. This is how the horde tells your computer apart from everyone else's, and it is "
     "shown publicly, so it has to be one nobody else has taken.\n\n"
-    "  An API key. This is what makes the kudos you earn land on your account. Anonymous contribution "
-    "works, but nothing you earn is kept. A key is free from " + REGISTER_URL + " (type that address "
-    "into a browser).\n\n"
+    "  An API key. It credits the kudos you earn to your account. A key is free from "
+    + REGISTER_URL
+    + " (type that address into a browser).\n\n"
     "  Models on disk. A request can only be served by a computer that already holds the model it asks "
-    "for, so the models you offer are downloaded first. That is what the sizes below are: real files, "
-    "on your drive, before the first request arrives."
+    "for, so the models you offer are downloaded first. The sizes below are how much each choice "
+    "downloads to your drive before it can serve a request."
 )
 
 
@@ -535,14 +535,14 @@ class GettingStartedScreen(Screen[bool]):
                 yield Static("Worker name (public, and unique on the horde)")
                 yield Input(placeholder="Worker name", id="gs-name")
                 yield Static("", id="gs-name-error", classes="gs-error")
-                yield Static(f"API key (free from {REGISTER_URL}; without one, kudos are not kept)")
+                yield Static(f"API key (free from {REGISTER_URL})")
                 yield Input(placeholder="API key", password=True, id="gs-api-key")
                 yield Static("", id="gs-api-key-error", classes="gs-error")
                 with Vertical(id="gs-civitai"):
                     yield Static(
                         "Civitai token (optional). LoRA files download from Civitai as jobs ask for "
-                        "them, and some refuse anonymous downloads; a token from a free Civitai "
-                        "account gets those.",
+                        "them. Some refuse anonymous downloads, and a token from a free Civitai "
+                        "account allows them.",
                     )
                     yield Input(placeholder="Civitai API token", password=True, id="gs-civitai-token")
                 with Horizontal(classes="gs-field-row"):
@@ -689,7 +689,7 @@ class GettingStartedScreen(Screen[bool]):
         static = self.query_one("#gs-selection", Static)
         if self._custom_models is not None:
             names = ", ".join(self._custom_models) or "(none)"
-            static.update(Text.assemble(("Your own selection: ", "grey62"), (names, "bold")))
+            static.update(Text.assemble(("Your selection: ", "grey62"), (names, "bold")))
             return
         plan = self._plans.get(self._chosen)
         title = PRESETS_BY_KIND[self._chosen].title
@@ -775,8 +775,8 @@ class GettingStartedScreen(Screen[bool]):
         result = await asyncio.to_thread(verify_api_key, api_key)
         if result.status is AdvisoryStatus.PROBLEM:
             self.app.notify(
-                f"That API key did not validate with the horde ({result.detail or 'rejected'}). "
-                "Double-check it before you start the worker.",
+                f"The horde did not accept that API key ({result.detail or 'rejected'}). "
+                "Check it before you start the worker.",
                 title="API key",
                 severity="warning",
                 timeout=8,

@@ -902,7 +902,7 @@ def test_the_feed_says_who_held_the_requests_back_and_when_they_returned() -> No
         "The horde is holding requests back (maintenance)",
         "Requests are flowing again",
         "Paused on this computer, so no new requests are being taken",
-        "Resumed on this computer; requests are flowing again",
+        "Resumed on this computer, and requests are flowing again",
         "Backing off from the horde after errors",
         "Back to normal polling",
     ]
@@ -991,7 +991,7 @@ async def test_home_names_the_worker_and_what_it_offers(tmp_path: Path) -> None:
     assert "image-to-image" not in rendered, "a capability that is off must not be advertised"
     assert "Serving 12 models, up to 2 requests at once" in rendered
     assert "1h 01m" in rendered, "the session's uptime is on the landing screen"
-    assert "4,321 an hour working" in rendered
+    assert "4,321 per working hour" in rendered
 
 
 @pytest.mark.slow
@@ -1318,7 +1318,7 @@ def test_the_posture_line_says_when_the_worker_has_not_been_asked_or_reached() -
     )
 
     assert _posture_words(snapshot, connected=False).startswith("Not in contact with the worker")
-    assert "never asked yet" in _posture_words(snapshot, connected=False)
+    assert "has not asked the horde yet" in _posture_words(snapshot, connected=False)
     assert _posture_words(None, connected=False) == "Not in contact with the worker"
 
 
@@ -1387,6 +1387,6 @@ def test_the_attention_card_rewords_the_two_text_findings() -> None:
         animated=False,
     )
 
-    assert "has not reported a loaded model" in _text_posture_words(unready)[0]
-    assert "stopped producing words" in _text_posture_words(stalled)[0]
+    assert "is not ready" in _text_posture_words(unready)[0]
+    assert "stopped producing text" in _text_posture_words(stalled)[0]
     assert _text_posture_words(nominal) == []

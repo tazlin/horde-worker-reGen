@@ -35,12 +35,12 @@ _LEVEL_SUMMARIES: dict[ExperienceLevel, tuple[str, str]] = {
     ),
     ExperienceLevel.ADVANCED: (
         "Advanced",
-        "The full operator surface: queues, per-process state, scheduler behaviour, download detail, "
+        "The full dashboard: queues, per-process state, scheduler behaviour, download detail, "
         "and the complete configuration.",
     ),
     ExperienceLevel.DEVELOPER: (
         "Developer",
-        "Everything in Advanced plus forensic detail and settings that can stop a healthy worker. "
+        "Everything in Advanced, plus diagnostic detail and settings that can stop a healthy worker. "
         "Intended for debugging and tuning rather than everyday contribution.",
     ),
 }
@@ -132,8 +132,8 @@ class DashboardPreferencesView(Vertical):
         yield Label("Dashboard", classes="config-section")
         yield Rule()
         yield Static(
-            "How much detail this dashboard shows. Every tab is available at every level; the level "
-            "changes how each one is presented, not which ones exist.",
+            "How much detail this dashboard shows. Every tab is available at every level, and the level "
+            "changes how much each one shows.",
             classes="config-guidance",
         )
         with Horizontal(classes="experience-row"):
@@ -283,10 +283,10 @@ class DeveloperWarningModal(ResponsiveModalScreen[bool]):
         return Text.assemble(
             ("Developer level exposes settings that can stop a working worker\n\n", "bold"),
             (
-                "It adds forensic detail and uncommon tuning controls. Several of them will interrupt "
-                "generation, evict loaded models, or put the worker into a state the horde treats as "
-                "unhealthy if set carelessly.\n\n"
-                "You only see this notice once.",
+                "It adds diagnostic detail and uncommon tuning controls. Set carelessly, several of them "
+                "interrupt generation, unload models, or leave the worker in a state the horde treats as "
+                "unhealthy.\n\n"
+                "This notice is shown once.",
                 "grey70",
             ),
         )
@@ -349,9 +349,9 @@ class HelpModal(ResponsiveModalScreen[None]):
             (f"{summary}\n\n", "grey70"),
             ("Finding things\n", "bold"),
             (
-                "Ctrl+P opens the command palette: every tab, every shortcut, and the experience levels "
-                "are listed there by name. The bar at the bottom shows as many shortcuts as fit, so on a "
-                "narrow terminal it shows only the first few; the palette and this list are always "
+                "Ctrl+P opens the command palette, which lists every tab, every shortcut, and the "
+                "experience levels by name. The bar at the bottom shows as many shortcuts as fit, so a "
+                "narrow terminal shows only the first few. The palette and this list are always "
                 "complete.\n\n",
                 "grey70",
             ),

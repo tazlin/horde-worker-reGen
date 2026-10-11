@@ -64,19 +64,19 @@ if TYPE_CHECKING:
     )
 
 _PHASE_WORDS: dict[WorkerPhase, str] = {
-    WorkerPhase.STOPPED: "Not contributing yet",
+    WorkerPhase.STOPPED: "Not contributing",
     WorkerPhase.CRASHED: "The worker stopped unexpectedly",
     WorkerPhase.RESTARTING: "Restarting",
     WorkerPhase.INITIALIZING: "Starting up",
     WorkerPhase.WARMING_UP: "Getting models ready",
-    WorkerPhase.SERVING: "Creating images for the community",
+    WorkerPhase.SERVING: "Working on community requests",
     WorkerPhase.READY: "Ready for requests",
     WorkerPhase.IDLE: "Waiting for the next request",
     WorkerPhase.MAINTENANCE: "Paused for maintenance",
     WorkerPhase.PAUSED: "Paused",
     WorkerPhase.SHUTTING_DOWN: "Finishing current work",
-    WorkerPhase.DEGRADED: "Working, but something needs attention",
-    WorkerPhase.DISCONNECTED: "Lost contact with the worker",
+    WorkerPhase.DEGRADED: "Something needs attention",
+    WorkerPhase.DISCONNECTED: "Cannot reach the AI Horde",
     WorkerPhase.UNRESPONSIVE: "The worker has stopped responding",
 }
 
@@ -152,8 +152,8 @@ def _transfer_detail(item: CurrentDownloadStatus) -> str:
         size = f"{human_bytes(item.downloaded_bytes)} so far"
     rate = f"{human_bytes(item.speed_bps)}/s" if item.speed_bps else "measuring speed"
     if item.eta_seconds is None:
-        return f"{size} - {rate}"
-    return f"{size} - {rate} - about {human_duration(item.eta_seconds)} left"
+        return f"{size}, {rate}"
+    return f"{size}, {rate}, about {human_duration(item.eta_seconds)} left"
 
 
 def _download_impact(snapshot: WorkerStateSnapshot) -> str:
@@ -165,7 +165,7 @@ def _download_impact(snapshot: WorkerStateSnapshot) -> str:
     """
     serving = any(process.loaded_horde_model_name for process in snapshot.processes if not process.is_external)
     if serving:
-        return "Models download in the background; the worker keeps contributing meanwhile."
+        return "Models download in the background, and the worker keeps contributing meanwhile."
     return "The worker starts contributing once the first of these finishes. Leaving it running is enough."
 
 
@@ -205,10 +205,8 @@ def _text_progress_total(snapshot: WorkerStateSnapshot) -> int:
 
 
 _TEXT_POSTURE_WORDS: dict[str, str] = {
-    TEXT_BACKEND_CHECK_NAME: (
-        "The text program on this computer has not reported a loaded model, so no text requests are being taken."
-    ),
-    TEXT_GENERATION_CHECK_NAME: "A text request has stopped producing words and is being given up on.",
+    TEXT_BACKEND_CHECK_NAME: "The text backend is not ready, so no text requests are being taken.",
+    TEXT_GENERATION_CHECK_NAME: "A text request stopped producing text, so the worker is abandoning it.",
 }
 """Simple's wording for each text finding, keyed by the health check's name.
 
@@ -283,7 +281,7 @@ def event_sentence(event: WorkerEvent) -> str | None:
             return "The horde is holding requests back (maintenance)"
         case WorkerEventKind.MAINTENANCE_OFF:
             if event.workload is None:
-                return "Resumed on this computer; requests are flowing again"
+                return "Resumed on this computer, and requests are flowing again"
             return "Requests are flowing again"
         case WorkerEventKind.POP_BACKOFF_ENTERED:
             return "Backing off from the horde after errors"
@@ -329,7 +327,9 @@ def _posture_words(snapshot: WorkerStateSnapshot | None, *, connected: bool) -> 
         return parts[0]
     since_pop = snapshot.seconds_since_last_pop
     parts.append(
-        f"last asked the horde {human_duration(since_pop)} ago" if since_pop is not None else "never asked yet",
+        f"last asked the horde {human_duration(since_pop)} ago"
+        if since_pop is not None
+        else "has not asked the horde yet",
     )
     config = snapshot.config
     if config.dreamer:
@@ -540,7 +540,7 @@ def _fault_share(snapshot: WorkerStateSnapshot, _report: HealthReport) -> str | 
         return None
     return (
         f"{snapshot.num_jobs_faulted:,} of {attempts:,} requests this session could not be finished "
-        f"({share * 100:.0f}%). The Logs tab carries the reason each one gave."
+        f"({share * 100:.0f}%). The Logs tab shows the reason for each one."
     )
 
 
@@ -553,7 +553,7 @@ def _nothing_finished_yet(snapshot: WorkerStateSnapshot, report: HealthReport) -
         return None
     return (
         f"{snapshot.num_jobs_popped:,} requests have been accepted over {human_duration(elapsed)} and none "
-        "have been sent back yet. The Live tab shows where they are sitting."
+        "have been sent back yet. The Live tab shows where each one is."
     )
 
 
@@ -562,9 +562,9 @@ def _process_restarts(snapshot: WorkerStateSnapshot, _report: HealthReport) -> s
     if snapshot.num_process_recoveries <= 0:
         return None
     return (
-        "The worker has replaced background programs that stopped responding, without being asked "
-        f"(restarts this session: {snapshot.num_process_recoveries}). Nothing is needed now, and a count "
-        "that keeps climbing is the figure to quote when asking for help."
+        "The worker has replaced background programs that stopped responding "
+        f"(restarts this session: {snapshot.num_process_recoveries}). No action is needed. If the count "
+        "keeps rising, include it when asking for help."
     )
 
 
@@ -577,8 +577,8 @@ def _waiting_on_a_model(snapshot: WorkerStateSnapshot, _report: HealthReport) ->
     if not any(process.last_process_state in _MODEL_LOADING_STATES for process in inference_processes):
         return None
     return (
-        f"Requests are queued ({pending:,} waiting to start) and no program is holding one yet, because a "
-        "model is still being made ready. The first use of a model takes a few minutes."
+        f"Requests are queued ({pending:,} waiting to start) because a model is still being prepared. "
+        "The first use of a model takes a few minutes."
     )
 
 
@@ -587,8 +587,8 @@ def _consecutive_failures(snapshot: WorkerStateSnapshot, _report: HealthReport) 
     if snapshot.consecutive_failed_jobs <= 0:
         return None
     return (
-        f"Requests are failing back to back (currently {snapshot.consecutive_failed_jobs} in a row). The "
-        "count resets on the next success, so quote it as it stands when asking for help."
+        f"Requests are failing one after another ({snapshot.consecutive_failed_jobs} in a row so far). The "
+        "count resets on the next success, so note it before asking for help."
     )
 
 
@@ -597,8 +597,8 @@ def _error_backoff(snapshot: WorkerStateSnapshot, _report: HealthReport) -> str 
     if not snapshot.in_error_backoff:
         return None
     return (
-        "The worker has slowed its calls to the horde after repeated errors. It clears this itself once a "
-        "call succeeds, so give it a few minutes before changing anything."
+        "The worker has slowed its calls to the horde after repeated errors. It returns to normal once a "
+        "call succeeds, so wait a few minutes before changing anything."
     )
 
 
@@ -608,8 +608,7 @@ def _horde_notices(snapshot: WorkerStateSnapshot, _report: HealthReport) -> str 
         return None
     return (
         f"The horde has sent this worker messages (currently {len(snapshot.api_messages)}), shown in the log "
-        "alongside the worker's own lines. They concern maintenance or your account rather than anything "
-        "this computer did."
+        "with the worker's lines. They come from the horde's operators or concern maintenance."
     )
 
 
@@ -622,19 +621,18 @@ def _demand_limited(snapshot: WorkerStateSnapshot, _report: HealthReport) -> str
     if share < _DEMAND_LIMITED_SHARE:
         return None
     return (
-        f"{human_duration(snapshot.time_spent_no_jobs_available)} of this session ({share * 100:.0f}%) has "
-        "gone by with the horde having nothing to send. That is demand, and no setting on this computer "
-        "shortens it."
+        f"The horde had no matching work for {human_duration(snapshot.time_spent_no_jobs_available)} of "
+        f"this session ({share * 100:.0f}%). Offering more models or raising max_power can shorten that."
     )
 
 
 def _slowdowns(snapshot: WorkerStateSnapshot, _report: HealthReport) -> str | None:
-    """Report requests that ran slower than the horde was promised."""
+    """Report requests that earned less per second than the submitter's slow-job threshold."""
     if snapshot.num_job_slowdowns < _NOTABLE_SLOWDOWNS:
         return None
     return (
-        f"{snapshot.num_job_slowdowns:,} requests have run slower than the horde was promised. Offering "
-        "fewer models, or taking fewer requests at once, is the usual way to bring that back into line."
+        f"{snapshot.num_job_slowdowns:,} requests earned under 0.4 kudos per second, which is slower than "
+        "ideal. Lowering max_power or max_threads usually helps."
     )
 
 
@@ -1028,7 +1026,7 @@ class SimpleHomeView(VerticalScroll):
             ),
         )
         kudos_per_hour = snapshot.kudos_per_hour if snapshot is not None else None
-        pace = f"{kudos_per_hour:,.0f} an hour working" if kudos_per_hour is not None else "hourly rate not yet known"
+        pace = f"{kudos_per_hour:,.0f} per working hour" if kudos_per_hour is not None else "hourly rate not yet known"
         self.query_one("#simple-kudos", Static).update(
             Text.assemble(
                 (f"{kudos:,.1f}\n", "bold magenta"),

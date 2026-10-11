@@ -133,7 +133,7 @@ def test_stale_but_shutting_down_reads_as_shutting_down_not_unresponsive() -> No
     )
     assert report.phase is WorkerPhase.SHUTTING_DOWN
     assert report.severity is HealthStatus.INFO
-    assert "teardown" in report.detail.lower()
+    assert "ending its processes" in report.detail.lower()
 
 
 def test_shutting_down_with_fresh_snapshot_is_still_shutting_down() -> None:
@@ -322,7 +322,7 @@ def test_optimistic_server_maintenance_is_shown_before_poll_confirmation() -> No
     )
 
     assert report.phase is WorkerPhase.MAINTENANCE
-    assert "requested" in report.detail.lower()
+    assert "asked the horde" in report.detail.lower()
     connectivity = next(check for check in report.checks if check.name == "API")
     assert "maintenance" in connectivity.detail.lower()
 
@@ -552,7 +552,7 @@ def test_withheld_post_processing_offer_warns_with_its_reason() -> None:
 
     assert len(checks) == 1
     assert checks[0].status is HealthStatus.WARN
-    assert checks[0].detail == "Offer withheld: post-processing models are not on disk yet"
+    assert checks[0].detail == "Not offered: post-processing models are not on disk yet"
 
 
 def test_offered_or_unbuilt_post_processing_offer_has_no_row() -> None:

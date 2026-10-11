@@ -311,9 +311,9 @@ class BenchmarkOverWorkerModal(ResponsiveModalScreen[bool]):
             )
         else:
             body = (
-                "The worker is running but not serving jobs (it is held, e.g. while downloading). Starting the "
-                "benchmark takes the idle GPU while the worker stays alive and keeps downloading; it resumes "
-                "serving when you press Go live. Cancel to leave the worker as it is."
+                "The worker is running but not serving jobs (it is held, for example while downloading). "
+                "Starting the benchmark takes the idle GPU while the worker stays alive and keeps downloading. "
+                "It resumes serving when you press Go live. Cancel to leave the worker as it is."
             )
         return Text.assemble(("Start benchmark?\n\n", "bold"), (body, "grey70"))
 
@@ -460,8 +460,8 @@ class ServerMaintenanceModal(ResponsiveModalScreen[ServerMaintenanceChoice | Non
                 Text.assemble(
                     ("Horde maintenance, per worker\n\n", "bold"),
                     (
-                        "Each role is its own worker on the horde. A worker in maintenance is sent no new "
-                        "jobs; in-flight work finishes.",
+                        "Each role is a separate worker on the horde. A worker in maintenance is sent no new "
+                        "jobs, and its in-flight jobs finish.",
                         "grey70",
                     ),
                 ),
@@ -516,7 +516,7 @@ class ServerMaintenanceModal(ResponsiveModalScreen[ServerMaintenanceChoice | Non
 class HordeWorkerTUI(App[None]):
     """A Textual dashboard that owns and visualises the reGen worker."""
 
-    TITLE = f"AI Horde Worker - v{__version__}"
+    TITLE = f"AI Horde Worker v{__version__}"
     CSS_PATH = "horde.tcss"
     """The Horde design system projection. Layout rules that depend on runtime intent stay in ``CSS``
     below; this file carries the shared surfaces (hero, card, muted) and the level/density policy."""
@@ -593,7 +593,7 @@ class HordeWorkerTUI(App[None]):
         ("f7", "toggle_download_pause", "Pause downloads"),
         ("t", "cycle_trend_window", "Trend window"),
         ("r", "reset_trends", "Reset trends"),
-        ("j", "toggle_work_ledger_recent_jobs", "Ledger recent"),
+        ("j", "toggle_work_ledger_recent_jobs", "Recent jobs"),
         ("f11", "restart_worker", "Restart worker"),
         ("m", "toggle_server_maintenance", "Maintenance (horde)"),
         ("ctrl+q", "quit", "Quit"),
@@ -724,14 +724,14 @@ class HordeWorkerTUI(App[None]):
             with TabPane("Stats", id="tab-stats"):
                 yield TabPrimer(
                     "Totals and averages for the work this computer has done. Nothing here needs "
-                    "changing; it is a record of what happened.",
+                    "changing. It is a record of what happened.",
                     PRIMERS.get("Stats", ()),
                 )
                 yield StatsView()
             with TabPane("Control", id="tab-control"):
                 yield TabPrimer(
-                    "The background programs that do the work. The worker starts and restarts these on "
-                    "its own; this is where you would look if one stopped.",
+                    "Start, stop, pause or restart the worker here, and set horde maintenance. The worker "
+                    "restarts its background programs without help.",
                     PRIMERS.get("Control", ()),
                 )
                 yield ControlView()
@@ -806,7 +806,7 @@ class HordeWorkerTUI(App[None]):
         m, s = divmod(remainder, 60)
         clock = f"{h:02d}:{m:02d}:{s:02d}"
         suffix = " (Update Available)" if self._update_info is not None else ""
-        return f"AI Horde Worker - v{__version__} [{clock}]{suffix}"
+        return f"AI Horde Worker v{__version__} [{clock}]{suffix}"
 
     def _refresh_title(self) -> None:
         self.title = self._build_title()
@@ -1016,7 +1016,7 @@ class HordeWorkerTUI(App[None]):
             self.query_one(ConfigEditorView).reload_from_disk()
         self.notify(
             "Setup saved. Press F3 to start contributing. Your chosen models download on the first "
-            "start; that can take 30-60 minutes, and the worker serves each one as it finishes.",
+            "start. That can take 30-60 minutes, and the worker serves each model once it has downloaded.",
             title="Setup saved",
             timeout=12,
         )
@@ -1047,7 +1047,9 @@ class HordeWorkerTUI(App[None]):
                 self.query_one("#main-tabs", TabbedContent).active = "tab-downloads"
             self._supervisor.start()
             self._pending_downloads_only_hold = True
-            self.notify("Starting in download-only mode: fetching models, the GPU stays idle until you Go live.")
+            self.notify(
+                "Starting in download-only mode. Models download and the GPU stays idle until you press Go live."
+            )
             return
         if choice is WorkerStartChoice.START_AND_REMEMBER:
             with contextlib.suppress(Exception):
@@ -1076,7 +1078,7 @@ class HordeWorkerTUI(App[None]):
             self._app_state_store.record_onboarding_choice(choice)
         if choice is OnboardingChoice.ACCEPTED:
             self._pending_benchmark_options = BenchmarkOptions(process_mode=self._supervisor.mode.value)
-            self.notify("Stopping worker to free the GPU for the benchmark…")
+            self.notify("Freeing the GPU for the benchmark…")
             self.run_worker(self._start_benchmark_flow, thread=True, exclusive=True, group="lifecycle")
 
     def _tick(self) -> None:
@@ -1118,7 +1120,7 @@ class HordeWorkerTUI(App[None]):
         # Toast exactly once when the pop loop first sees a maintenance-mode error from the horde.
         pop_maint = snapshot.last_pop_maintenance_mode if snapshot is not None else False
         if pop_maint and not self._prev_pop_maintenance_mode:
-            self.notify("Server maintenance active: the horde has stopped sending jobs.", severity="warning")
+            self.notify("Horde maintenance is on. The horde has stopped sending jobs.", severity="warning")
         self._prev_pop_maintenance_mode = pop_maint
         maintenance_mode = snapshot.maintenance_mode if snapshot is not None else False
         if maintenance_mode and not self._prev_maintenance_mode:
@@ -1218,7 +1220,7 @@ class HordeWorkerTUI(App[None]):
     def on_stats_view_export_toggled(self, message: StatsView.ExportToggled) -> None:
         """Forward the Stats tab JSONL export toggle to the worker."""
         if not self._supervisor.request_set_stats_export(message.enabled):
-            self.notify("Stats export toggle could not be sent; worker is not connected.", severity="warning")
+            self.notify("Stats export was not changed. The worker is not connected.", severity="warning")
             return
         state = "enabled" if message.enabled else "disabled"
         self.notify(f"Stats JSONL export {state}.")
@@ -1254,9 +1256,9 @@ class HordeWorkerTUI(App[None]):
             if self._benchmark_drained_worker and self._supervisor.is_alive():
                 self.notify("Benchmark finished. Apply the suggested config, or press Go live to resume serving.")
             else:
-                self.notify("Benchmark finished. Apply the suggested config, or press F9 to restart the worker.")
+                self.notify("Benchmark finished. Apply the suggested config, or press F11 to restart the worker.")
         elif status is BenchmarkSupervisorStatus.FAILED:
-            self.notify(f"Benchmark failed; see the run's console.log.{self._resume_hint()}", severity="error")
+            self.notify(f"Benchmark failed. See the run's console.log.{self._resume_hint()}", severity="error")
         elif status is BenchmarkSupervisorStatus.CANCELLED:
             self.notify(f"Benchmark cancelled.{self._resume_hint()}")
         if status in (BenchmarkSupervisorStatus.FINISHED, BenchmarkSupervisorStatus.FAILED):
@@ -1283,10 +1285,10 @@ class HordeWorkerTUI(App[None]):
         """Send the resume/pause download command and notify, given the current paused state."""
         if currently_paused:
             sent = self._supervisor.request_resume_downloads()
-            self.notify("Resuming downloads." if sent else "Worker not running; resume not sent.")
+            self.notify("Resuming downloads." if sent else "Worker not running. Resume not sent.")
         else:
             sent = self._supervisor.request_pause_downloads()
-            self.notify("Pausing downloads." if sent else "Worker not running; pause not sent.")
+            self.notify("Pausing downloads." if sent else "Worker not running. Pause not sent.")
 
     def on_downloads_view_pause_toggle_requested(self, message: DownloadsView.PauseToggleRequested) -> None:
         """Forward a Downloads-panel pause/resume click to the worker."""
@@ -1304,7 +1306,7 @@ class HordeWorkerTUI(App[None]):
         )
         sent = self._supervisor.request_set_download_priority_policy(wanted)
         if not sent:
-            self.notify("Worker not running; download order not sent.", severity="warning")
+            self.notify("Worker not running. Download order not sent.", severity="warning")
         elif wanted is DownloadPriorityPolicy.SERVE_FIRST:
             self.notify("Downloads ordered to get the worker serving first.")
         else:
@@ -1338,7 +1340,7 @@ class HordeWorkerTUI(App[None]):
         """Forward a Downloads-panel bandwidth-cap change to the worker."""
         sent = self._supervisor.request_download_rate_limit(message.kbps)
         if not sent:
-            self.notify("Worker not running; rate limit not sent.", severity="warning")
+            self.notify("Worker not running. Rate limit not sent.", severity="warning")
         elif message.kbps <= 0:
             self.notify("Download rate limit cleared (unlimited).")
         else:
@@ -1361,10 +1363,12 @@ class HordeWorkerTUI(App[None]):
             # not start in the meantime.
             self._supervisor.start()
             self._pending_downloads_only_hold = True
-            self.notify("Starting the worker in download-only mode: fetching models, the GPU stays idle.")
+            self.notify("Starting the worker in download-only mode. Models download and the GPU stays idle.")
             return
         if self._supervisor.request_downloads_only_hold():
-            self.notify("Download-only mode: fetching models; the worker will not serve jobs until you Go live.")
+            self.notify(
+                "Download-only mode is on. Models download and the worker serves no jobs until you press Go live."
+            )
         else:
             self.notify("Could not enter download-only mode (worker not reachable).", severity="warning")
 
@@ -1378,8 +1382,8 @@ class HordeWorkerTUI(App[None]):
                     title="Go live while benchmark models download?",
                     body=(
                         "Going live resumes serving and may stop the benchmark-only model downloads still in "
-                        "progress; they are not in this worker's config, so serving will not re-fetch them. "
-                        "Continue, or cancel and let them finish first?"
+                        "progress. Those models are not in this worker's config, so serving will not download "
+                        "them again. Continue, or cancel and let them finish first?"
                     ),
                     confirm_label="Go live anyway",
                 ),
@@ -1398,9 +1402,9 @@ class HordeWorkerTUI(App[None]):
         """Send the go-live request and report whether the worker will start serving."""
         sent = self._supervisor.request_go_live()
         self.notify(
-            "Going live: the worker will start serving jobs as models finish downloading."
+            "Going live. The worker serves jobs as models finish downloading."
             if sent
-            else "Worker not running; Go live not sent.",
+            else "Worker not running. Go live not sent.",
             severity="information" if sent else "warning",
         )
 
@@ -1447,7 +1451,8 @@ class HordeWorkerTUI(App[None]):
         if sent:
             count = len(selection.model_names)
             aux = " plus auxiliary models" if selection.include_aux else ""
-            self.notify(f"Downloading {count} selected model(s){aux}; the worker stays in download-only hold.")
+            plural = "" if count == 1 else "s"
+            self.notify(f"Downloading {count} selected model{plural}{aux}. The worker stays in download-only mode.")
         else:
             self.notify("Could not request the download (worker not reachable).", severity="warning")
 
@@ -1642,7 +1647,7 @@ class HordeWorkerTUI(App[None]):
             return None
         colour = "red" if stall.budget_spent else "yellow"
         gap = f" gap {stall.largest_tick_gap_seconds:.0f}s" if stall.largest_tick_gap_seconds else ""
-        return f"[{colour}]stalls {stall.resets_in_window}/{stall.max_forgiven_resets}{gap}[/]"
+        return f"[{colour}]supervisor stalls {stall.resets_in_window}/{stall.max_forgiven_resets}{gap}[/]"
 
     @staticmethod
     def _badge_colour(severity: HealthStatus) -> str:
@@ -1674,9 +1679,11 @@ class HordeWorkerTUI(App[None]):
     """The order F6 steps through: the lean redesign, the verbose detail view, then the thin bar."""
 
     _VIEW_MODE_NOTICE = {
-        OverviewViewMode.NORMAL: "View: normal (the everyday density, across all tabs).",
-        OverviewViewMode.DETAILS: "View: details (every diagnostic: extra columns, log tally, all config sub-tabs).",
-        OverviewViewMode.THIN: "View: thin (essentials only: status bar, slim downloads, bare log, Essentials).",
+        OverviewViewMode.NORMAL: "View: normal, the everyday level of detail on every tab.",
+        OverviewViewMode.DETAILS: "View: details. Adds extra columns, the log tally, and every config sub-tab.",
+        OverviewViewMode.THIN: (
+            "View: thin. Shows the status bar, slim downloads, a bare log, and the Essentials config page."
+        ),
     }
 
     def destinations(self) -> list[tuple[str, str]]:
@@ -1930,7 +1937,7 @@ class HordeWorkerTUI(App[None]):
         for label, destination in self.destinations():
             yield SystemCommand(
                 f"Go to {label}",
-                "Open this dashboard destination",
+                "Open this tab",
                 partial(self._navigate_to, destination),
             )
         # Every keyboard action is offered here with its shortcut attached. The Footer can only fit a
@@ -2084,7 +2091,7 @@ class HordeWorkerTUI(App[None]):
             self.notify("No overview elements are hidden.")
             return
         self._reveal_hidden_elements = not self._reveal_hidden_elements
-        state = "revealed" if self._reveal_hidden_elements else "re-hidden"
+        state = "revealed" if self._reveal_hidden_elements else "hidden again"
         self.notify(f"Hidden overview elements {state}.")
         self._tick()
 
@@ -2162,7 +2169,7 @@ class HordeWorkerTUI(App[None]):
         """Send the request, record the intent per worker, and say what was asked."""
         sent = self._supervisor.request_set_server_maintenance(enable, workloads)
         if not sent:
-            self.notify("Worker not running; maintenance change not sent.")
+            self.notify("Worker not running. Maintenance change not sent.")
             return
         snapshot = self._supervisor.latest_snapshot
         addressed = workloads
@@ -2195,7 +2202,7 @@ class HordeWorkerTUI(App[None]):
         if already_stopping:
             # The request is re-sent, but its force-kill deadline is not extended; say so, because the
             # obvious reading of an unchanged screen is that the press did nothing.
-            self.notify("Stop already under way; the worker is still draining in-flight jobs.")
+            self.notify("Stop already under way. The worker is still finishing in-flight jobs.")
         else:
             self.notify("Stopping worker (in-flight jobs will finish)…")
 
@@ -2214,7 +2221,7 @@ class HordeWorkerTUI(App[None]):
         if self._supervisor.request_reload_config():
             self.notify("Config reload sent to worker.")
         else:
-            self.notify("Worker not running; reload not sent.", severity="warning")
+            self.notify("Worker not running. Reload not sent.", severity="warning")
 
     def action_restart_worker(self) -> None:
         """Begin a cooperative worker restart driven by the normal supervisor ticks."""
@@ -2340,9 +2347,9 @@ class HordeWorkerTUI(App[None]):
                 BenchmarkActionConfirmModal(
                     title="Benchmark models still downloading",
                     body=(
-                        "The benchmark's models are still downloading in the background. Run now anyway? They "
-                        "will be fetched mid-run, which slows and skews the measurement. Or cancel and wait for "
-                        "the waiting banner to clear, then run."
+                        "The benchmark's models are still downloading in the background. If you run now, they "
+                        "are fetched mid-run, which slows and skews the measurement. To avoid that, cancel and "
+                        "run once the waiting banner clears."
                     ),
                     confirm_label="Run anyway",
                 ),
@@ -2390,7 +2397,7 @@ class HordeWorkerTUI(App[None]):
                 self._benchmark_supervisor.status,
             )
             self.query_one("#main-tabs", TabbedContent).active = "tab-benchmark"
-        self.notify("Stopping worker to free the GPU for the benchmark…")
+        self.notify("Freeing the GPU for the benchmark…")
         self.run_worker(self._start_benchmark_flow, thread=True, exclusive=True, group="lifecycle")
 
     def on_benchmark_view_download_requested(self, message: BenchmarkView.DownloadRequested) -> None:
@@ -2515,7 +2522,7 @@ class HordeWorkerTUI(App[None]):
             return
         if self._benchmark_download_seen_active and downloads.phase is DownloadPhase.ERROR:
             self._clear_benchmark_waiting()
-            self.notify("Some benchmark model downloads failed; see the Downloads tab.", severity="warning")
+            self.notify("Some benchmark model downloads failed. See the Downloads tab.", severity="warning")
             return
         view.set_benchmark_waiting(BenchmarkWaitingState(total=total, ready=ready))
 
@@ -2624,7 +2631,7 @@ class HordeWorkerTUI(App[None]):
         told how to resume rather than being left to wonder why it sits idle.
         """
         if self._benchmark_drained_worker and self._supervisor.is_alive():
-            return " The worker is held; press Go live to resume serving."
+            return " The worker is held. Press Go live to resume serving."
         return ""
 
     def _after_benchmark_started(self) -> None:
@@ -2632,9 +2639,11 @@ class HordeWorkerTUI(App[None]):
         with contextlib.suppress(NoMatches):
             self.query_one("#main-tabs", TabbedContent).active = "tab-benchmark"
         if self._benchmark_drained_worker:
-            self.notify("Benchmark started; the worker is held (GPU freed) and resumes with Go live when it finishes.")
+            self.notify(
+                "Benchmark started. The worker is held with the GPU freed. Press Go live afterwards to resume."
+            )
         else:
-            self.notify("Benchmark started; the worker is stopped until it completes.")
+            self.notify("Benchmark started. The worker is stopped while it runs.")
 
     def on_benchmark_view_cancel_requested(self, message: BenchmarkView.CancelRequested) -> None:
         """Cancel the running benchmark, off the UI thread."""
@@ -2729,7 +2738,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse the TUI command-line arguments."""
     parser = argparse.ArgumentParser(
         prog="horde-worker",
-        description="Textual frontend that launches and supervises the AI Horde reGen worker.",
+        description="Terminal dashboard that launches and supervises the AI Horde reGen worker.",
     )
     parser.add_argument(
         "--process-mode",

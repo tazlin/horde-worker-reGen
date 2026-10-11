@@ -191,7 +191,7 @@ def test_preset_plans_price_and_gate_on_free_space(monkeypatch: pytest.MonkeyPat
 
     showcase = plans[PresetKind.SHOWCASE]
     assert showcase.selectable is False
-    assert "more than this computer has free" in showcase.disk_sentence()
+    assert "too little" in showcase.disk_sentence()
 
 
 def test_preset_plan_says_at_least_when_sizes_are_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -417,7 +417,7 @@ async def test_unfitting_preset_is_disabled_on_the_page(tmp_path: Path, monkeypa
         assert app.screen.query_one("#gs-choose-essentials", Button).disabled is False
         assert app.screen.query_one("#gs-choose-showcase", Button).disabled is True
         body = _plain(app.screen.query_one("#gs-preset-showcase-body", Static))
-        assert "more than this computer has free" in body
+        assert "too little" in body
 
 
 async def test_page_renders_without_a_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

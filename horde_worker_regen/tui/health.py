@@ -224,7 +224,7 @@ def _derive_phase(
             WorkerPhase.CRASHED,
             HealthStatus.ERROR,
             "Worker crashed",
-            "The worker process exited unexpectedly and was not (or could not be) restarted. Check the logs.",
+            "The worker process exited unexpectedly and was not restarted. Check the logs.",
             pre_flight,
             False,
         )
@@ -268,7 +268,7 @@ def _derive_phase(
     # STOPPED.
     if snapshot.shutting_down:
         detail = (
-            "Finishing teardown; it has gone quiet while stopping its processes."
+            "Ending its processes. No status updates arrive during this step."
             if stale
             else "Finishing in-flight jobs before exit."
         )
@@ -296,7 +296,7 @@ def _derive_phase(
         return HealthReport(
             WorkerPhase.DEGRADED,
             HealthStatus.ERROR,
-            "PyTorch cannot run this GPU",
+            "PyTorch cannot use this GPU",
             f"{reason} The worker has stopped popping jobs until this is fixed.",
             checks,
             True,
@@ -324,7 +324,7 @@ def _derive_phase(
         )
 
     if snapshot.user_info_failed or snapshot.in_error_backoff:
-        reason = snapshot.user_info_failed_reason or "Repeated job-pop failures; the server or network is unreachable."
+        reason = snapshot.user_info_failed_reason or "Job pops keep failing. The server or network is unreachable."
         return HealthReport(
             WorkerPhase.DISCONNECTED,
             HealthStatus.ERROR,
@@ -389,7 +389,7 @@ def _derive_phase(
         return HealthReport(
             WorkerPhase.IDLE,
             HealthStatus.INFO,
-            "Idle; waiting for work",
+            "Idle, waiting for work",
             "No jobs have been available recently (low demand). Offering more models or raising max_power can help.",
             checks,
             False,
@@ -406,7 +406,7 @@ def _derive_phase(
         return HealthReport(
             WorkerPhase.READY,
             HealthStatus.OK,
-            "Ready; no jobs available right now",
+            "Ready, no jobs available right now",
             detail,
             checks,
             False,
@@ -415,7 +415,7 @@ def _derive_phase(
     return HealthReport(
         WorkerPhase.READY,
         HealthStatus.OK,
-        "Ready; waiting for the next job",
+        "Ready, waiting for the next job",
         "Models are loaded and the worker is ready to serve.",
         checks,
         False,
@@ -541,8 +541,8 @@ def _maintenance_detail(
         and not snapshot.last_pop_maintenance_mode
     ):
         return (
-            "The TUI has requested horde maintenance ON and is showing it immediately while the horde "
-            "registers the change."
+            "The dashboard asked the horde to turn maintenance on. It is shown here before the horde "
+            "confirms the change."
         )
     note_on_maintenance = (
         " If you did not set this, the worker faulted or timed out on several jobs."
@@ -561,7 +561,7 @@ def _maintenance_detail(
         )
     if snapshot.last_pop_maintenance_mode:
         return (
-            "The job-pop response returned a maintenance-mode error. The horde has stopped sending this "
+            "The horde refused the last job pop with a maintenance-mode error and has stopped sending this "
             "worker jobs. Press the Maintenance (horde) key to clear it."
             f"{note_on_maintenance}"
         )
@@ -641,7 +641,7 @@ def _build_checks(
             HealthCheck(
                 "LoRA",
                 HealthStatus.ERROR,
-                "Disabled: LoRA cache disk is full and cannot be cleared. Free disk space to restore.",
+                "Disabled. The LoRA cache disk is full and cannot be cleared. Free disk space to enable LoRA again.",
             )
         )
     if snapshot.post_processing_disabled:
@@ -649,8 +649,7 @@ def _build_checks(
             HealthCheck(
                 "Post-processing",
                 HealthStatus.WARN,
-                snapshot.post_processing_disabled_reason
-                or "Disabled for this session after structural post-processing failures.",
+                snapshot.post_processing_disabled_reason or "Disabled after post-processing failures.",
             )
         )
     elif snapshot.config.allow_post_processing and snapshot.post_processing_offered is False:
@@ -660,7 +659,7 @@ def _build_checks(
             HealthCheck(
                 "Post-processing",
                 HealthStatus.WARN,
-                f"Offer withheld: {snapshot.post_processing_offer_withheld_reason or 'reason not reported'}",
+                f"Not offered: {snapshot.post_processing_offer_withheld_reason or 'reason not reported'}",
             )
         )
 
@@ -669,8 +668,9 @@ def _build_checks(
             HealthCheck("Job health", HealthStatus.ERROR, f"{snapshot.consecutive_failed_jobs} consecutive failures")
         )
     elif snapshot.consecutive_failed_jobs > 0:
+        failed = snapshot.consecutive_failed_jobs
         checks.append(
-            HealthCheck("Job health", HealthStatus.WARN, f"{snapshot.consecutive_failed_jobs} consecutive failure(s)")
+            HealthCheck("Job health", HealthStatus.WARN, f"{failed} consecutive failure{'' if failed == 1 else 's'}")
         )
     else:
         checks.append(HealthCheck("Job health", HealthStatus.OK, "OK"))
@@ -715,7 +715,7 @@ def _process_recovery_check(snapshot: WorkerStateSnapshot) -> HealthCheck | None
 
     age = max(0.0, snapshot.timestamp - last)
     lane = snapshot.last_process_recovery_lane
-    detail = f"{detail}; last {human_duration(age)} ago{f' ({lane})' if lane else ''}"
+    detail = f"{detail}, last {human_duration(age)} ago{f' ({lane})' if lane else ''}"
     status = HealthStatus.WARN if age <= PROCESS_RECOVERY_WARN_SECONDS else HealthStatus.INFO
     return HealthCheck("Processes", status, detail)
 
@@ -739,8 +739,8 @@ def _api_check(
     if snapshot.in_error_backoff:
         return HealthCheck("API", HealthStatus.WARN, "Backing off after pop failures")
     if snapshot.worker_registered:
-        return HealthCheck("API", HealthStatus.OK, f"Reachable; registered as {snapshot.config.worker_display_name}")
-    return HealthCheck("API", HealthStatus.INFO, "Reachable; not yet acknowledged by the horde")
+        return HealthCheck("API", HealthStatus.OK, f"Reachable, registered as {snapshot.config.worker_display_name}")
+    return HealthCheck("API", HealthStatus.INFO, "Reachable, not yet acknowledged by the horde")
 
 
 def _per_card_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
@@ -761,8 +761,13 @@ def _per_card_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
             free = "?" if card.free_vram_mb is None else f"{card.free_vram_mb / 1024:.1f}G"
             problems.append(HealthCheck(name, HealthStatus.WARN, f"VRAM pressure: only {free} free"))
         elif card.unservable_models:
+            count = len(card.unservable_models)
             problems.append(
-                HealthCheck(name, HealthStatus.WARN, f"{len(card.unservable_models)} model(s) locally unservable"),
+                HealthCheck(
+                    name,
+                    HealthStatus.WARN,
+                    f"{count} model{'' if count == 1 else 's'} not run on this card after repeated faults",
+                ),
             )
     if problems:
         return problems
@@ -784,13 +789,10 @@ def _model_fit_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
             more = f" (+{len(card.unserviceable_models) - 3})" if len(card.unserviceable_models) > 3 else ""
             rows.append(HealthCheck(name, HealthStatus.ERROR, f"Not offered, cannot fit this card: {names}{more}"))
         if card.constrained_models:
-            lowest = min(card.constrained_models.values())
             names = ", ".join(f"{model} (max_power {cap})" for model, cap in list(card.constrained_models.items())[:3])
             more = f" (+{len(card.constrained_models) - 3})" if len(card.constrained_models) > 3 else ""
             rows.append(
-                HealthCheck(
-                    name, HealthStatus.WARN, f"Offered at reduced size, pops capped at {lowest}: {names}{more}"
-                ),
+                HealthCheck(name, HealthStatus.WARN, f"Offered with a lower max_power: {names}{more}"),
             )
     return rows
 
@@ -894,7 +896,7 @@ def _text_posture_report(snapshot: WorkerStateSnapshot, checks: list[HealthCheck
             WorkerPhase.WARMING_UP,
             HealthStatus.INFO,
             f"Warming up: {started_by} the text backend, {human_duration(wait.seconds)} so far",
-            "Loading the model into the backend. No text jobs are popped until it reports one.",
+            "Loading the model into the backend. No text jobs are popped until the backend reports a loaded model.",
             checks,
             True,
         )
@@ -919,7 +921,7 @@ def _text_backend_remedy(wait: TextBackendWait) -> str:
     if wait.credentials_refused:
         return "Set `text_backend_password` to the password your backend was started with."
     if wait.managed:
-        return "The worker launches it; see the Text Backend row and logs/text_backend.log."
+        return "The worker launches it. See the Text Backend row and logs/text_backend.log."
     return "Check that it is running and that `kai_url` is its address."
 
 
@@ -968,8 +970,9 @@ def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
             HealthCheck(
                 TEXT_GENERATION_CHECK_NAME,
                 HealthStatus.WARN,
-                f"A text generation has produced nothing for {human_duration(stalled)}; the worker gives "
-                "up on it and faults the job at that point.",
+                f"A text generation has produced nothing for {human_duration(stalled)}. The worker abandons a "
+                f"generation after {snapshot.config.text_stall_seconds:.0f}s without output (`text_stall_seconds`) "
+                "and faults the job.",
             ),
         )
     return rows
@@ -1048,7 +1051,7 @@ def build_offline_checks(config_path: Path) -> list[HealthCheck]:
 def _config_file_check(config_path: Path) -> HealthCheck:
     """Check that the bridgeData config exists and parses, for the stopped-worker pre-flight."""
     if not config_path.exists():
-        return HealthCheck("Config", HealthStatus.WARN, f"{config_path} not found; run setup to create it")
+        return HealthCheck("Config", HealthStatus.WARN, f"{config_path} not found. Getting started creates it.")
     from ruamel.yaml import YAMLError
 
     from horde_worker_regen.tui.config_form import load_config

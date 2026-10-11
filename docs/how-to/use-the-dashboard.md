@@ -99,7 +99,7 @@ worker and for env-var config (`-e`).
 | Level | What it is for |
 |-------|----------------|
 | **Simple** (default) | Contributing without needing to understand the worker: plain wording, live per-request progress, and the settings most contributors change. |
-| **Advanced** | The full operator surface: queues, per-process state, scheduler behaviour, download detail, and the whole configuration. |
+| **Advanced** | The full dashboard: queues, per-process state, scheduler behaviour, download detail, and the whole configuration. |
 | **Developer** | Advanced plus the worker's internal safety levers: hung-process timeouts, the VRAM and RAM budgets, and the fault breakers. Entering it asks you to confirm once. |
 
 Change level on the Config tab's **Dashboard** page, or press `Ctrl+P` and search for the level. The
@@ -602,7 +602,7 @@ carries how many requests it is producing and how many are waiting for it.
 
 Its controls are deliberately few: start, graceful stop, local pause/resume, and horde maintenance.
 **Pause** stops this worker from accepting new work locally; **Horde maintenance** changes the worker's
-advertised state at the horde. They are independent. Each enabled role is its own worker on the horde,
+advertised state at the horde. They are independent. Each enabled role is a separate worker on the horde,
 so with more than one role on there is one maintenance button per worker plus an all-workers pair, and
 the Session card names the workers held when only some are. The **Full terminal dashboard** link goes
 to everything else.
@@ -623,7 +623,7 @@ dashboard is still at `/` on the same port. The trusted-network rule above appli
 Bind the network as above, then open `http://<worker-machine>:<dashboard-port>` on the device (port
 8000 unless you configured another). Prefer [`/native`](#the-lightweight-native-page) for a
 conventional mobile overview and the core controls; use the terminal view when you need the full
-operator surface.
+dashboard.
 
 Three things adapt on their own:
 

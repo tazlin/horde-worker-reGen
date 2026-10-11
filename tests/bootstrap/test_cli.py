@@ -110,7 +110,7 @@ def test_sync_self_heals_stale_cu126_on_blackwell(env: tuple[Path, list], monkey
     """A persisted cu126 on a Blackwell GPU is clamped up to cu130 (and re-persisted), not reinstalled.
 
     cu126 carries no sm_120 kernel image, so reinstalling it would leave torch unable to launch a single
-    kernel ("PyTorch cannot run this GPU"). The live compute capability must override the stale token.
+    kernel ("PyTorch cannot use this GPU"). The live compute capability must override the stale token.
     """
     root, calls = env
     backend.write_backend_file(root / "bin" / "backend", "cu126")

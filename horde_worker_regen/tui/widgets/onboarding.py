@@ -65,7 +65,7 @@ class WorkerStartModal(ResponsiveModalScreen[WorkerStartChoice]):
         with Vertical(id="worker-start-dialog"):
             yield Static(self._message(), id="worker-start-message")
             yield Button("Start worker now", id="worker-start-now", variant="success")
-            yield Button("Start & auto-start from now on", id="worker-start-remember", variant="primary")
+            yield Button("Start now and on every launch", id="worker-start-remember", variant="primary")
             yield Button("Download models only (no GPU)", id="worker-start-download-only", variant="default")
             yield Button("Stay stopped", id="worker-start-stay-stopped", variant="default")
 
@@ -75,9 +75,9 @@ class WorkerStartModal(ResponsiveModalScreen[WorkerStartChoice]):
         return Text.assemble(
             ("Start the worker?\n\n", "bold"),
             (
-                "Starting the worker begins real work for the AI Horde: it spawns inference "
-                "processes and uses your GPU. It does not start automatically. You can start or "
-                "stop it any time with F3, and manage auto-start from the Control tab.",
+                "Starting the worker begins serving jobs for the AI Horde, which uses your GPU. "
+                "It does not start automatically. You can start or stop it at any time with F3, "
+                "and change auto-start on the Control tab.",
                 "grey70",
             ),
         )
@@ -138,8 +138,9 @@ class BenchmarkOnboardingModal(ResponsiveModalScreen[OnboardingChoice]):
         return Text.assemble(
             (headline + "\n\n", "bold"),
             (
-                "A benchmark ramps the worker through safe difficulty levels and suggests a tuned "
-                "bridgeData. It stops the worker while it runs (it needs the GPU).",
+                "A benchmark runs test jobs of increasing difficulty and suggests settings for "
+                "bridgeData.yaml. The worker serves no jobs while it runs, because the benchmark "
+                "needs the GPU.",
                 "grey70",
             ),
         )
