@@ -72,7 +72,9 @@ def test_abrupt_host_death_kills_worker_tree(tmp_path: Path) -> None:
     env = dict(os.environ)
     env[_host_stop_workers.PIDFILE_ENV_VAR] = str(pidfile)
 
-    harness = subprocess.Popen([sys.executable, "-m", "tests.tui._orphan_host_harness"], env=env)
+    # The run-root fixture moves the working directory, and ``-m`` resolves ``tests.tui`` against it.
+    repo_root = Path(__file__).resolve().parents[2]
+    harness = subprocess.Popen([sys.executable, "-m", "tests.tui._orphan_host_harness"], env=env, cwd=repo_root)
     worker_pid: int | None = None
     grandchild_pid: int | None = None
     try:
