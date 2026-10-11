@@ -23,11 +23,14 @@ from horde_worker_regen.tui.recommendations import analyze
 from horde_worker_regen.tui.widgets.finding_card import FindingCard
 
 _SEAT_SOURCE_GLYPHS: dict[str, tuple[str, str]] = {
-    "MANUAL": ("M", "yellow"),
-    "RANKER": ("R", "cyan"),
-    "RESCUE": ("S", "magenta"),
+    "MANUAL": ("pin", "yellow"),
+    "RANKER": ("ranker", "cyan"),
+    "RESCUE": ("rescue", "magenta"),
 }
-"""Compact glyph plus style per seat source (``M``anual pin, ``R``anker fill, re``S``cue)."""
+"""Word plus style per seat source: a pin from the config, a demand-ranker fill, or the rescue seat."""
+
+POOL_LANE_TEXT: dict[str, str] = {"FIXED": "seated models", "FREE": "other models"}
+"""What a pop on each ``PopLane`` offered. An unknown value is shown as it arrives."""
 
 _BENCH_ROWS_SHOWN = 3
 """How many benched models the pool panel lists before summarizing the remainder."""
@@ -63,7 +66,7 @@ class InsightsView(VerticalScroll):
         with Vertical(id="insights-findings") as findings:
             findings.border_title = "Findings"
             yield Static(
-                Text("Waiting for the first worker snapshot.", style="grey50"), id="insights-findings-message"
+                Text("Waiting for the worker's first status report.", style="grey50"), id="insights-findings-message"
             )
             yield Vertical(id="insights-findings-cards")
         yield Static(id="insights-activity")
@@ -121,9 +124,9 @@ class InsightsView(VerticalScroll):
             ("Model pool: ", "grey70"),
             ("off", "bold grey62"),
             (
-                "  ·  the worker serves your whole model list evenly, for the widest variety of jobs. Enabling "
-                "the pool (or the demand-following preset) biases pops toward a small seat set. This can reduce "
-                "model swaps when those seats are resident, at the cost of serving less model variety.",
+                "  ·  Model selection is unchanged, so any model on your list can be offered. With the pool or "
+                "the demand-following preset on, some pops offer only a small set of seated models. That can "
+                "reduce model swaps while those models stay loaded, and the worker serves less model variety.",
                 "grey62",
             ),
         )
@@ -149,7 +152,7 @@ class InsightsView(VerticalScroll):
             if queue_values:
                 table.add_row("Avg queue wait", human_duration(sum(queue_values) / len(queue_values)))
 
-        table.add_row("GPU busy fraction", self._fraction(snapshot.gpu_utilization_busy_fraction))
+        table.add_row("GPU busy", self._fraction(snapshot.gpu_utilization_busy_fraction))
         return Panel(table, title="Recent activity", title_align="left", border_style="grey37")
 
     def _render_model_pool(self, pool: ModelPoolSnapshot) -> Panel:
@@ -166,22 +169,22 @@ class InsightsView(VerticalScroll):
 
     def _render_pool_status_line(self, pool: ModelPoolSnapshot) -> Text:
         """Render the one-line lane/demand/budget status for the pool panel."""
-        lane = pool.current_lane or "-"
+        lane = POOL_LANE_TEXT.get(pool.current_lane or "", pool.current_lane or "-")
         demand = human_duration(pool.demand_age_seconds) if pool.demand_age_seconds is not None else "-"
         parts = [
-            Text.assemble(("Lane ", "grey70"), (lane, "bold")),
+            Text.assemble(("Last pop offered ", "grey70"), (lane, "bold")),
             Text.assemble(
                 ("resident ", "grey70"),
                 (str(sum(seat.readiness == "RESIDENT" for seat in pool.seats)), "bold"),
                 (f" / {sum(seat.model is not None for seat in pool.seats)} seated", "grey70"),
             ),
-            Text.assemble(("last fixed offer ", "grey70"), (str(pool.last_fixed_seat_count), "bold")),
-            Text.assemble(("demand ", "grey70"), (demand, "bold")),
+            Text.assemble(("seats last offered ", "grey70"), (str(pool.last_fixed_seat_count), "bold")),
+            Text.assemble(("demand ranking age ", "grey70"), (demand, "bold")),
         ]
         if pool.download_budget_gb > 0:
             used = human_bytes(pool.download_bytes_charged)
             total = f"{pool.download_budget_gb:.1f} GB"
-            parts.append(Text.assemble(("download admission ", "grey70"), (f"{used} / {total}", "bold")))
+            parts.append(Text.assemble(("auto-download budget used ", "grey70"), (f"{used} / {total}", "bold")))
         return Text("  ·  ").join(parts)
 
     def _render_pool_seats(self, pool: ModelPoolSnapshot) -> Table:
@@ -201,12 +204,12 @@ class InsightsView(VerticalScroll):
         table.add_column(justify="right")
         table.add_row(
             Text("Model", style="bold grey70"),
-            Text("Src", style="bold grey70"),
+            Text("Source", style="bold grey70"),
             Text("Readiness", style="bold grey70"),
             Text("Dwell", style="bold grey70"),
             Text("Matched", style="bold grey70"),
-            Text("Empty", style="bold grey70"),
-            Text("Rescue", style="bold grey70"),
+            Text("Empty pops", style="bold grey70"),
+            Text("Rescue ends", style="bold grey70"),
         )
         for seat in pool.seats:
             model = seat.model if seat.model is not None else "-"
@@ -236,20 +239,24 @@ class InsightsView(VerticalScroll):
     def _render_pool_bench(self, pool: ModelPoolSnapshot) -> Text:
         """Render the top few benched models (name, reason, remaining cooldown) as one line."""
         if not pool.bench:
-            return Text.assemble(("Bench ", "grey70"), ("empty", "grey50"))
+            return Text.assemble(("Cooling down ", "grey70"), ("none", "grey50"))
         shown = pool.bench[:_BENCH_ROWS_SHOWN]
-        entries = [f"{row.model} ({row.reason}, {human_duration(row.cooldown_remaining_seconds)})" for row in shown]
+        entries = [
+            f"{row.model} ({row.reason.replace('_', ' ').lower()}, "
+            f"{human_duration(row.cooldown_remaining_seconds)} left)"
+            for row in shown
+        ]
         remainder = len(pool.bench) - len(shown)
         if remainder > 0:
             entries.append(f"+{remainder} more")
-        return Text.assemble(("Bench ", "grey70"), ("  |  ".join(entries), "grey50"))
+        return Text.assemble(("Cooling down ", "grey70"), ("  |  ".join(entries), "grey50"))
 
     @staticmethod
     def _source_glyph(source: str | None) -> Text:
         """Render a seat source as a compact, colour-coded glyph (or a dash when the seat is empty)."""
         if source is None:
             return Text("-", style="grey50")
-        glyph, style = _SEAT_SOURCE_GLYPHS.get(source, (source[:1].upper(), "grey70"))
+        glyph, style = _SEAT_SOURCE_GLYPHS.get(source, (source.lower(), "grey70"))
         return Text(glyph, style=style)
 
     @staticmethod
@@ -262,12 +269,12 @@ class InsightsView(VerticalScroll):
         """A static pointer to the full benchmark sweep (the in-TUI Benchmark tab, or the CLI)."""
         body = Text.assemble(
             (
-                "For an authoritative capability sweep (safe ramp levels, suggested bridgeData, and "
-                "robustness findings), open the ",
+                "The benchmark finds the load this machine sustains and suggests bridgeData settings. Run it "
+                "from the ",
                 "grey70",
             ),
-            ("Benchmark tab "),
-            ("to run it live here, or from a shell:\n\n", "grey70"),
+            ("Benchmark tab"),
+            (", or from a shell:\n\n", "grey70"),
             ("    horde-benchmark\n", "bold green"),
         )
-        return Panel(body, title="Deeper analysis", title_align="left", border_style="grey37")
+        return Panel(body, title="Benchmark", title_align="left", border_style="grey37")

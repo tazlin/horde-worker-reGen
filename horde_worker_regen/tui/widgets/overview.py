@@ -81,6 +81,7 @@ from horde_worker_regen.tui.trends import (
     trend_bounds,
 )
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
+from horde_worker_regen.tui.widgets.insights import POOL_LANE_TEXT
 from horde_worker_regen.tui.widgets.overview_layout import OVERVIEW_ELEMENTS
 from horde_worker_regen.update_check import UpdateInfo, current_version
 from horde_worker_regen.utils import get_system_appropriate_updater
@@ -107,17 +108,17 @@ _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SERVING_PULSE = ("dark_green", "green", "green3", "bright_green", "green3", "green")
 
 _POOL_SOURCE_GLYPHS: dict[str, tuple[str, str]] = {
-    "MANUAL": ("M", "yellow"),
-    "RANKER": ("R", "cyan"),
-    "RESCUE": ("S", "magenta"),
+    "MANUAL": ("pin", "yellow"),
+    "RANKER": ("ranker", "cyan"),
+    "RESCUE": ("rescue", "magenta"),
 }
-"""Seat-source glyphs mirroring the Insights seats table (M manual pin, R ranker fill, S rescue), so the two
-model-pool surfaces read as one feature."""
+"""How each seat got its model, in the words the Insights seats table uses, so the two model-pool surfaces
+read as one feature."""
 
 _POP_CLAIM_RELEASE_TEXT: dict[str, str] = {
     "maximum_hold": "the maximum hold elapsed",
     "no_further_work": "the horde had no further work for it",
-    "residency_released": "the residency released",
+    "residency_released": "the residency ended",
 }
 """How each ``WholeCardPopClaimRelease`` reads to an operator watching the offer widen back out. An unknown
 value is shown as it arrives, so a worker newer than the dashboard still says something true."""
@@ -297,7 +298,7 @@ class OverviewView(Vertical):
         """Return the current trend window."""
         return self._trend_window
 
-    def soft_reset_trends(self, *, notice: str = "Trends reset; waiting for fresh samples.") -> None:
+    def soft_reset_trends(self, *, notice: str = "Trends reset. Waiting for new samples.") -> None:
         """Reset the client-side trend view: clear the sample buffers and start a fresh epoch.
 
         Every buffer here is display-only (no scheduling, throttle, or dispatch path reads them), so clearing
@@ -313,7 +314,7 @@ class OverviewView(Vertical):
 
     def note_config_changed(self) -> None:
         """Mark trend output as stabilizing after a capacity/workload-affecting config change."""
-        self.soft_reset_trends(notice="Config changed; trends may take time to restabilize.")
+        self.soft_reset_trends(notice="Config changed. Trends may take a while to settle.")
 
     def set_update_available(self, info: UpdateInfo) -> None:
         """Record that a newer release is available; the nag box shows on the next update_view call."""
@@ -720,7 +721,7 @@ class OverviewView(Vertical):
             if snapshot.lora_pops_blocked_by_downloads:
                 body.append(
                     Text(
-                        "LoRA pops paused while background downloads are active.",
+                        "LoRA jobs paused while background downloads are running.",
                         style="yellow",
                     )
                 )
@@ -798,7 +799,7 @@ class OverviewView(Vertical):
             if reduced:
                 body.append(Text.assemble(("No work, ", "yellow"), (reduced, "italic yellow")))
             if snapshot.lora_pops_blocked_by_downloads:
-                body.append(Text("LoRA pops paused for downloads.", style="yellow"))
+                body.append(Text("LoRA jobs paused for downloads.", style="yellow"))
             if snapshot.whole_card_residency.active:
                 body.append(self._residency_banner(snapshot.whole_card_residency))
             for message in snapshot.api_messages[:3]:
@@ -997,14 +998,14 @@ class OverviewView(Vertical):
             (" has sole use of the GPU", "#f0beff"),
         )
         line.append(
-            f"; running {residency.processes_now}/{residency.processes_max} inference processes",
+            f". Running {residency.processes_now}/{residency.processes_max} inference processes",
             style="grey70",
         )
         if residency.safety_paused:
             line.append(", safety off-GPU", style="grey70")
         if residency.weights_mb and residency.total_vram_mb:
             line.append(
-                f"; needs ~{human_mb(residency.weights_mb)} of {human_mb(residency.total_vram_mb)} for weights",
+                f". Weights need ~{human_mb(residency.weights_mb)} of {human_mb(residency.total_vram_mb)}",
                 style="grey70",
             )
         if residency.pop_claim_model is not None:
@@ -1013,7 +1014,7 @@ class OverviewView(Vertical):
                 if residency.pop_claim_remaining_seconds is not None
                 else ""
             )
-            line.append(f"; advertising only {residency.pop_claim_model}{claim_window}", style="grey70")
+            line.append(f". Offering only {residency.pop_claim_model}{claim_window}", style="grey70")
         if residency.phase == "establishing":
             line.append(" (establishing…)", style="italic yellow")
         else:
@@ -1033,12 +1034,12 @@ class OverviewView(Vertical):
         paused = max(0, residency.processes_max - residency.processes_now)
         if paused:
             plural = "process" if paused == 1 else "processes"
-            clauses.append(f"{paused} idle inference {plural} paused")
+            clauses.append(f"{paused} idle inference {plural} stopped")
         if residency.safety_paused:
             clauses.append("safety off-GPU")
         if not clauses:
             return f"Whole-card residency: {model} has sole use of the GPU (intentional)"
-        return f"Whole-card residency: {' + '.join(clauses)} for {model} (intentional)"
+        return f"Whole-card residency: {' and '.join(clauses)} for {model} (intentional)"
 
     @staticmethod
     def _render_residency_panel(residency: WholeCardResidencyStatus, *, compact: bool = False) -> Panel:
@@ -1096,7 +1097,7 @@ class OverviewView(Vertical):
                 "Safety paused",
                 "yes" if residency.safety_paused else "no",
             )
-            add_pair("Weights", human_mb(residency.weights_mb), "Step reserve", human_mb(residency.reserve_mb))
+            add_pair("Weights", human_mb(residency.weights_mb), "Sampling reserve", human_mb(residency.reserve_mb))
             add_pair(
                 "Free at load",
                 human_mb(residency.free_now_mb),
@@ -1109,30 +1110,30 @@ class OverviewView(Vertical):
                 if residency.cooldown_remaining_seconds is not None
                 else "-"
             )
-            add_pair("Max co-resident", max_resident, "Restores in", cooldown_left)
+            add_pair("Processes that fit", max_resident, "Restores in", cooldown_left)
 
         # The claim is what the worker is asking the horde for, which changes what arrives rather than only
         # what runs, so it is shown whether or not a residency reads as active right now.
         if residency.pop_claim_model is not None:
             add_pair(
-                "Pop claim",
+                "Offering only",
                 Text(residency.pop_claim_model, style="#f0beff"),
-                "Claim ends in",
+                "Ends in",
                 human_duration(residency.pop_claim_remaining_seconds)
                 if residency.pop_claim_remaining_seconds is not None
                 else "-",
             )
         elif residency.pop_claim_release is not None:
             add_pair(
-                "Pop claim",
-                Text("released", style="grey62"),
+                "Offering only",
+                Text("no longer", style="grey62"),
                 "Because",
                 Text(_POP_CLAIM_RELEASE_TEXT.get(residency.pop_claim_release, residency.pop_claim_release)),
             )
 
         border = "#f0beff" if residency.active else "grey37"
         subtitle = (
-            Text("armed; engages for very heavy models", style="grey50")
+            Text("on standby for very heavy models", style="grey50")
             if not residency.active and residency.possible
             else None
         )
@@ -1170,7 +1171,9 @@ class OverviewView(Vertical):
                 else:
                     seats_line.append("   ")
                     seat_line = seats_line
-                glyph, glyph_style = _POOL_SOURCE_GLYPHS.get(seat.source or "", ((seat.source or "?")[:1], "grey70"))
+                glyph, glyph_style = _POOL_SOURCE_GLYPHS.get(
+                    seat.source or "", ((seat.source or "?").lower(), "grey70")
+                )
                 downloading = seat.pending_model is not None or seat.state == "PENDING_DOWNLOAD"
                 seat_line.append(seat.model or seat.pending_model or "-", style="grey70")
                 if seat.model is not None and seat.pending_model is not None:
@@ -1188,41 +1191,42 @@ class OverviewView(Vertical):
                     seat_line.append("cold seat", style="grey62")
             seats_line = seat_lines[0]
 
+        lane = POOL_LANE_TEXT.get(pool.current_lane or "", pool.current_lane or "-")
         status_line = Text.assemble(
-            ("lane ", "grey50"),
-            (pool.current_lane or "-", "bold"),
-            ("   ·   last fixed offer ", "grey50"),
+            ("last pop offered ", "grey50"),
+            (lane, "bold"),
+            ("   ·   seats last offered ", "grey50"),
             (str(pool.last_fixed_seat_count), "grey70"),
         )
         if pool.fixed_pops > 0:
             rate = pool.fixed_fulfilled / pool.fixed_pops * 100
-            status_line.append("   ·   fixed matches ", style="grey50")
+            status_line.append("   ·   seated pops filled ", style="grey50")
             status_line.append(f"{pool.fixed_fulfilled}/{pool.fixed_pops}", style="grey70")
             status_line.append(f" ({rate:.0f}%)", style="grey50")
-            status_line.append("   ·   resident ", style="grey50")
+            status_line.append("   ·   already resident ", style="grey50")
             status_line.append(f"{pool.fixed_resident_hits}/{pool.fixed_fulfilled}", style="grey70")
         if pool.bench:
-            status_line.append("   ·   bench ", style="grey50")
+            status_line.append("   ·   cooling down ", style="grey50")
             status_line.append(str(len(pool.bench)), style="grey70")
 
         body: RenderableType = Group(*seat_lines, status_line)
         if compact:
             status_lines = [
-                Text.assemble(("lane ", "grey50"), (pool.current_lane or "-", "bold")),
-                Text.assemble(("last fixed offer ", "grey50"), (str(pool.last_fixed_seat_count), "grey70")),
+                Text.assemble(("last pop offered ", "grey50"), (lane, "bold")),
+                Text.assemble(("seats last offered ", "grey50"), (str(pool.last_fixed_seat_count), "grey70")),
             ]
             if pool.fixed_pops > 0:
                 rate = pool.fixed_fulfilled / pool.fixed_pops * 100
                 status_lines.append(
                     Text.assemble(
-                        ("fixed matches ", "grey50"),
+                        ("seated pops filled ", "grey50"),
                         (f"{pool.fixed_fulfilled}/{pool.fixed_pops} ({rate:.0f}%)", "grey70"),
-                        ("  ·  resident ", "grey50"),
+                        ("  ·  already resident ", "grey50"),
                         (f"{pool.fixed_resident_hits}/{pool.fixed_fulfilled}", "grey70"),
                     ),
                 )
             if pool.bench:
-                status_lines.append(Text.assemble(("bench ", "grey50"), (str(len(pool.bench)), "grey70")))
+                status_lines.append(Text.assemble(("cooling down ", "grey50"), (str(len(pool.bench)), "grey70")))
             body = Group(*seat_lines, *status_lines)
 
         return Panel(
@@ -1254,38 +1258,37 @@ class OverviewView(Vertical):
         grid.add_column(ratio=1)
 
         if not ram.measured:
-            ram_text = Text("waiting for first governor tick", style="grey50")
+            ram_text = Text("no RAM reading yet", style="grey50")
         else:
             ram_style = "red" if ram.under_pressure else "yellow" if ram.pop_hold_active else "green"
-            ram_text = Text(ram.reason or "RAM governor measured", style=ram_style)
+            ram_text = Text(ram.reason or "RAM measured", style=ram_style)
         grid.add_row("RAM", ram_text)
 
         intake_parts: list[tuple[str, str]] = []
         intake_parts.append(
             (
-                "pop hold on" if ram.pop_hold_active else "pop hold off",
+                "held for RAM" if ram.pop_hold_active else "not held",
                 "yellow" if ram.pop_hold_active else "grey62",
             )
         )
         if ram.pop_pause_active:
             pause = human_duration(ram.pop_pause_remaining_seconds)
-            intake_parts.append((f"hard pause {pause}", "yellow"))
+            intake_parts.append((f"paused for {pause}", "yellow"))
         grid.add_row("Intake", Text.assemble(*_join_styled(intake_parts, " · ")))
 
         reclaim_bits: list[str] = []
         if ram.draining_process_ids:
-            reclaim_bits.append("draining p" + ", p".join(str(pid) for pid in ram.draining_process_ids))
+            reclaim_bits.append("recycling p" + ", p".join(str(pid) for pid in ram.draining_process_ids))
         if ram.shed_card_indices:
-            reclaim_bits.append("shed GPU " + ", ".join(str(index) for index in ram.shed_card_indices))
-        grid.add_row("Reclaim", Text("; ".join(reclaim_bits) if reclaim_bits else "none active", style="grey62"))
+            reclaim_bits.append("fewer processes on GPU " + ", ".join(str(index) for index in ram.shed_card_indices))
+        grid.add_row("Reclaim", Text(" · ".join(reclaim_bits) if reclaim_bits else "none active", style="grey62"))
 
         if ram.measured:
             restore = (
-                f"{human_mb(ram.restore_headroom_mb)} headroom; "
-                f"{human_mb(ram.per_context_ram_estimate_mb)} per context"
+                f"{human_mb(ram.restore_headroom_mb)} spare · {human_mb(ram.per_context_ram_estimate_mb)} per process"
             )
             if ram.per_process_ceiling_mb is not None:
-                restore += f"; {human_mb(ram.per_process_ceiling_mb)} process ceiling"
+                restore += f" · {human_mb(ram.per_process_ceiling_mb)} process limit"
             grid.add_row("Restore", Text(restore, style="grey62"))
 
         decision = OverviewView._preload_decision_label(preload.decision)
@@ -1295,7 +1298,7 @@ class OverviewView(Vertical):
         preload_style = _preload_decision_style(preload.decision)
         grid.add_row("Preload", Text.assemble((decision, preload_style), (f" · {model} · {target}{age}", "grey70")))
         if preload.reason:
-            grid.add_row("Gate", Text(preload.reason, style="grey62"))
+            grid.add_row("Reason", Text(preload.reason, style="grey62"))
 
         active = ram.under_pressure or ram.pop_hold_active or preload_style == "yellow"
         return grid, active
@@ -1334,7 +1337,7 @@ class OverviewView(Vertical):
             grid.add_row(Text("●", style="yellow"), governor.label, Text.assemble(reason.strip(), "  ", timing))
 
         if not active:
-            grid.add_row(Text("·", style="grey50"), Text("none engaged", style="grey50"), "")
+            grid.add_row(Text("·", style="grey50"), Text("none active", style="grey50"), "")
 
         if detailed and history:
             for governor in history:
@@ -1446,7 +1449,8 @@ class OverviewView(Vertical):
                 table.add_row(Text("⊟", style="grey62"), Text("Features", style="bold"), features_line)
         title = "Health"
         if models_loaded is not None:
-            title += f" · {models_loaded} models" if models_loaded else " · no models"
+            plural = "" if models_loaded == 1 else "s"
+            title += f" · {models_loaded} model{plural} loaded" if models_loaded else " · no models loaded"
         return Panel(table, title=title, title_align="left", border_style="grey37", padding=(0, 1))
 
     _COMPACT_READINESS_STYLE: dict[FeatureReadinessState, str] = {
@@ -1460,7 +1464,7 @@ class OverviewView(Vertical):
     _COMPACT_READINESS_VERB: dict[FeatureReadinessState, str] = {
         FeatureReadinessState.OFFERED: "offered",
         FeatureReadinessState.WAITING: "downloading",
-        FeatureReadinessState.MISSING_DEPS: "no deps",
+        FeatureReadinessState.MISSING_DEPS: "missing deps",
         FeatureReadinessState.FAILED: "failed",
     }
 
@@ -1642,7 +1646,7 @@ class OverviewView(Vertical):
             headroom_detail = f" (max {config.alchemy_max_concurrency}, {config.alchemy_vram_headroom_mb} MB headroom)"
             mode_parts.append(Text(headroom_detail, style="grey62"))
         else:
-            mode_parts.append(Text("backfill only", style="yellow"))
+            mode_parts.append(Text("only when the image queue is empty", style="yellow"))
         if config.alchemy_caption_enabled:
             mode_parts.append(Text(" · caption on", style="grey62"))
 
@@ -1697,7 +1701,7 @@ class OverviewView(Vertical):
         # attempt for a backend the worker runs, which excludes the time spent obtaining its program.
         wait = text_backend_wait(snapshot)
         waited = f" for {human_duration(wait.seconds)}" if wait is not None and wait.seconds is not None else ""
-        return Text.assemble(("not ready", "yellow"), (f"{waited} · no jobs are popped until it answers", "grey62"))
+        return Text.assemble(("not ready", "yellow"), (f"{waited} · no jobs are taken until it responds", "grey62"))
 
     @classmethod
     def _render_text_panel(cls, snapshot: WorkerStateSnapshot, *, compact: bool = False) -> Panel:
@@ -1963,7 +1967,7 @@ class OverviewView(Vertical):
         if not show_recent_jobs and recent_entries:
             summary = f"{completed} job{'s' if completed != 1 else ''} completed recently"
             if faulted:
-                summary += f"; {faulted} faulted"
+                summary += f", {faulted} faulted"
             extra_lines.append(Text(f"({summary})", style="grey62"))
         disagg_line = self._disagg_stage_line(snapshot)
         if disagg_line is not None:
@@ -2000,7 +2004,7 @@ class OverviewView(Vertical):
         rows = snapshot.disagg_job_stages
         if not rows:
             return None
-        line = Text("Disagg: ", style="bold grey62")
+        line = Text("Disaggregated: ", style="bold grey62")
         for index, row in enumerate(rows[: cls._DISAGG_STAGE_LINE_CAP]):
             if index:
                 line.append("   ", style="grey50")
@@ -2224,14 +2228,14 @@ class OverviewView(Vertical):
             if compact:
                 details = Text()
                 details.append_text(self._gpus_strip_vram(card))
-                details.append(f"  {card.loaded_contexts}/{card.target_process_count} ctx  ", style="grey62")
+                details.append(f"  {card.loaded_contexts}/{card.target_process_count} procs  ", style="grey62")
                 details.append_text(tail)
                 grid.add_row(gpu_label(card.device_index, card.device_name, card.kind), details)
             else:
                 grid.add_row(
                     gpu_label(card.device_index, card.device_name, card.kind),
                     self._gpus_strip_vram(card),
-                    f"{card.loaded_contexts}/{card.target_process_count} ctx",
+                    f"{card.loaded_contexts}/{card.target_process_count} procs",
                     tail,
                 )
         # Card count and mean duty ride the title so utilization reads at a glance, and a multi-GPU host is
@@ -2364,8 +2368,9 @@ class OverviewView(Vertical):
                 which = f"GPU {low_duty_cards[0]}"
             else:
                 which = "GPUs " + ", ".join(str(index) for index in low_duty_cards)
+            verb = "are" if len(snapshot.per_card) > 1 and len(low_duty_cards) > 1 else "is"
             duty_warning = Text(
-                f"{which} near-idle while a job is running: check the loaded model and the logs.",
+                f"{which} {verb} nearly idle while a job is running. Check the loaded model and the logs.",
                 style="dark_orange",
             )
 
@@ -2387,7 +2392,7 @@ class OverviewView(Vertical):
         samples = self._windowed_job_samples()
         label = "All" if self._trend_window is OverviewTrendWindow.ALL else self._trend_window.value
         if len(samples) < 2:
-            return f"{label} window · warming up"
+            return f"{label} window · collecting samples"
         start, end, configured = trend_bounds(
             self._trend_window,
             session_start=self._trend_session_start,
@@ -2492,7 +2497,7 @@ class OverviewView(Vertical):
         if total_procs:
             title = f"Processes · {alive}/{total_procs} alive"
             if hot:
-                title += f" · {hot} hot"
+                title += f" · {hot} busy"
         table = Table(
             title=title,
             title_style="bold",
@@ -2503,7 +2508,7 @@ class OverviewView(Vertical):
         add_columns(table, layout.columns)
 
         if not snapshot.processes:
-            table.add_row(*placeholder_row(layout.columns, "State", "waiting for first snapshot"))
+            table.add_row(*placeholder_row(layout.columns, "State", "waiting for worker status"))
             return table
 
         now = time.time()
@@ -2690,7 +2695,7 @@ class OverviewView(Vertical):
         if pending:
             title = f"Queue · {pending} pending"
             if snapshot.pending_megapixelsteps:
-                title += f" · {snapshot.pending_megapixelsteps:,.0f} MP"
+                title += f" · {snapshot.pending_megapixelsteps:,.0f} megapixelsteps"
         return Panel(
             body,
             title=title,

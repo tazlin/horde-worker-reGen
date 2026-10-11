@@ -57,7 +57,7 @@ class MetaBuilderModal(ResponsiveModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         """Lay out the kind selector, count input, guidance, and buttons."""
         with Vertical(id="meta-dialog"):
-            yield Label("Build a meta model-load command", classes="dialog-title")
+            yield Label("Build a meta command", classes="dialog-title")
             yield Select(
                 [(option.label, option.kind.value) for option in META_OPTIONS],
                 value=META_OPTIONS[0].kind.value,

@@ -111,7 +111,7 @@ class ModelListEditor(Vertical):
             yield Button("Add", id=f"mle-add-{self._key}")
         with Horizontal(classes="mle-controls mle-controls-secondary"):
             yield Button("Pick models…", id=f"mle-pick-{self._key}", variant="default")
-            yield Button("Build meta…", id=f"mle-meta-{self._key}", variant="default")
+            yield Button("Build meta command…", id=f"mle-meta-{self._key}", variant="default")
             yield Button("Clear", id=f"mle-clear-{self._key}", variant="warning")
         if self._show_disk_total:
             yield Static("", classes="mle-disk", id=f"mle-disk-{self._key}")
@@ -163,7 +163,10 @@ class ModelListEditor(Vertical):
         container.remove_children()
         if not self._values:
             container.mount(
-                Static("(none; add models, pick from the reference, or build a meta command)", classes="mle-empty")
+                Static(
+                    "No entries. Type a model name, pick from the reference, or build a meta command.",
+                    classes="mle-empty",
+                )
             )
         else:
             for index, entry in enumerate(self._values):
@@ -196,7 +199,7 @@ class ModelListEditor(Vertical):
         except Exception:  # noqa: BLE001 - the widget may have been torn down mid-compute
             return
         if summary is None:
-            line.update(Text("disk total: open the picker once to load model sizes", style="grey50"))
+            line.update(Text("Disk total needs model sizes. Open the picker once to load them.", style="grey50"))
             return
         text = Text.assemble(
             ("disk  ", "grey50"),
@@ -210,11 +213,14 @@ class ModelListEditor(Vertical):
             ("  ·  ", "grey50"),
         )
         text.append(
-            "fits" if summary.fits else f"OVER BUDGET by {human_bytes(summary.shortfall_bytes)}",
+            "fits" if summary.fits else f"does not fit, short by {human_bytes(summary.shortfall_bytes)}",
             style="green" if summary.fits else "bold red",
         )
         if summary.num_unsized:
-            text.append(f"  ·  {summary.num_unsized} entries not sized (meta/unknown)", style="yellow")
+            text.append(
+                f"  ·  {summary.num_unsized} entries of unknown size (meta commands or names not in the reference)",
+                style="yellow",
+            )
         line.update(text)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -276,7 +282,7 @@ class ModelListEditor(Vertical):
             return
         self.app.push_screen(
             ConfirmModal(
-                f"Clear every entry from {self._display_name()}? This removes unsaved model-rule edits in this list.",
+                f"Clear every entry from the {self._display_name()}? Unsaved edits to this list are lost.",
                 confirm_label="Yes, clear list",
                 cancel_label="No, keep list",
             ),

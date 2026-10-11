@@ -48,6 +48,7 @@ from horde_worker_regen.tui.config_form import (
     coerce_value,
     current_value,
     describe_process_plan,
+    estimate_inference_processes_per_card,
     field_key_present,
     format_number,
     format_yaml_value,
@@ -133,10 +134,15 @@ def _blocks_save(issue: ConfigValidationIssue, saved_issues: frozenset[ConfigVal
     return issue.severity is ConfigValidationSeverity.ERROR and issue not in saved_issues
 
 
+def _sentence(message: str) -> str:
+    """A message ending in exactly one full stop, so several can be shown one after another."""
+    return f"{message.rstrip().rstrip('.')}."
+
+
 def _advisory_text(issue: ConfigValidationIssue) -> str:
     """A non-blocking finding's text, marking an error that is already in the saved file."""
     if issue.severity is ConfigValidationSeverity.ERROR:
-        return f"{issue.message} (already in the saved file; does not block saving)"
+        return f"{_sentence(issue.message)} This is already in the saved file, so it does not block saving."
     return issue.message
 
 
@@ -346,10 +352,10 @@ class ConfigPresetModal(ResponsiveModalScreen[dict[str, object] | None]):
             and not str(self._current.get("civitai_api_token") or "")
         ):
             selected = False
-        restart = " restart" if change.requires_restart else ""
+        restart = " (needs restart)" if change.requires_restart else ""
         field = _FIELD_BY_KEY.get(change.key)
         label_key = field.label if field is not None else change.key
-        label = f"{label_key}: {current!r} -> {change.value!r}{restart} - {change.rationale}"
+        label = f"{label_key}: {current!r} -> {change.value!r}{restart}. {change.rationale}"
         checkbox = Checkbox(
             label,
             value=selected,
@@ -597,8 +603,8 @@ class ConfigEditorView(Vertical):
             yield Static("|", id="config-actions-separator")
             yield Button("Apply preset", id="config-preset", variant="default")
         yield Static(
-            f"Editing {self._config_path}  ·  Save applies automatically (the worker watches the file)  ·  "
-            "⟳ marks fields that only take effect on restart",
+            f"Editing {self._config_path}  ·  A running worker applies saved changes without a restart  ·  "
+            "⟳ marks fields that need a restart",
             id="config-status",
         )
         yield Static(
@@ -1096,7 +1102,8 @@ class ConfigEditorView(Vertical):
             return False
         if not coerced and not gpu_dirty:
             if validation_warnings:
-                self._set_status(f"No changes to save. Warnings: {'; '.join(validation_warnings)}", "yellow")
+                warnings_text = " ".join(_sentence(warning) for warning in validation_warnings)
+                self._set_status(f"No changes to save. Warnings: {warnings_text}", "yellow")
             else:
                 self._set_status("No changes to save.", "green")
             return True
@@ -1116,13 +1123,11 @@ class ConfigEditorView(Vertical):
             gpu_editor.mark_saved()
         self._refresh_action_variants()
         if validation_warnings:
-            self._set_status(
-                f"Saved {self._config_path} with warnings: {'; '.join(validation_warnings)}",
-                "yellow",
-            )
+            warnings_text = " ".join(_sentence(warning) for warning in validation_warnings)
+            self._set_status(f"Saved {self._config_path}. Warnings: {warnings_text}", "yellow")
         else:
             self._set_status(
-                f"Saved {self._config_path}. A running worker reloads it automatically; restart only for ⟳ fields.",
+                f"Saved {self._config_path}. A running worker reloads it without a restart. Only ⟳ fields need one.",
                 "green",
             )
         return True
@@ -1191,7 +1196,7 @@ class ConfigEditorView(Vertical):
             return
         self.query_one(f"#cfg-{_TEXT_MODEL_KEY}", Input).value = chosen
         self._refresh_action_variants()
-        self._set_status(f"Set the scribe's model to {chosen!r} in the form; save to write it.", "yellow")
+        self._set_status(f"Set the scribe's model to {chosen!r} in the form. Save to write it.", "yellow")
 
     def _apply_custom_model_builder_result(self, result: CustomModelBuilderResult | None) -> None:
         """Append a custom model record and optionally add it to the offer list."""
@@ -1211,7 +1216,7 @@ class ConfigEditorView(Vertical):
                 self.query_one(f"#mle-root-{MODELS_TO_LOAD_KEY}", ModelListEditor).add_entry(result.record["name"])
         self._refresh_action_variants()
         self._set_status(
-            f"Added custom model {result.record['name']!r} to the form; save + restart to use it.",
+            f"Added custom model {result.record['name']!r} to the form. Save and restart to use it.",
             "yellow",
         )
 
@@ -1223,9 +1228,7 @@ class ConfigEditorView(Vertical):
             self._set_widget_value(key, value)
         self._update_process_preview()
         self._refresh_action_variants()
-        self._set_status(
-            f"Applied preset changes to the form ({len(changes)} setting(s)); save to write them.", "yellow"
-        )
+        self._set_status(f"Applied {len(changes)} preset setting(s) to the form. Save to write them.", "yellow")
 
     def _set_widget_value(self, key: str, value: object) -> None:
         """Set one config widget from a preset value."""
@@ -1321,9 +1324,9 @@ class ConfigEditorView(Vertical):
                 if tab_label is not None:
                     self.query_one("#config-subtabs", TabbedContent).active = _subtab_id(tab_label)
                 self.query_one(f"#cfg-{first_field.key}").focus()
-        details = "; ".join(message for _field, message in errors)
-        location = f"  See the {tab_label} tab." if tab_label else ""
-        self._set_status(f"Couldn't save: {details}.{location}", "red")
+        details = " ".join(_sentence(message) for _field, message in errors)
+        location = f" See the {tab_label} tab." if tab_label else ""
+        self._set_status(f"Couldn't save. {details}{location}", "red")
 
     def _set_status(self, message: str, colour: str) -> None:
         """Update the status line with a coloured message."""
@@ -1380,12 +1383,16 @@ class ConfigEditorView(Vertical):
         if len(load_rules) > 2:
             model_text += f" +{len(load_rules) - 2}"
 
-        threads = self._state_int(state, "max_threads", 1)
-        queue = self._state_int(state, "queue_size", 0)
+        extra_slow = bool(state.get("extra_slow_worker"))
+        processes = estimate_inference_processes_per_card(
+            max_threads=self._state_int(state, "max_threads", 1),
+            queue_size=self._state_int(state, "queue_size", 0),
+            load_entries=load_rules,
+            serves_image_generation=True,
+            extra_slow_worker=extra_slow,
+        )
         process_text = (
-            "extra-slow: 1 inference context"
-            if bool(state.get("extra_slow_worker"))
-            else (f"up to {threads + queue} inference context(s)/GPU")
+            "extra-slow: 1 inference process" if extra_slow else f"about {processes} inference process(es) per GPU"
         )
         feature_bits = [
             f"LoRA {'on' if bool(state.get('allow_lora')) else 'off'}",
@@ -1393,7 +1400,7 @@ class ConfigEditorView(Vertical):
             f"post-processing {'on' if bool(state.get('allow_post_processing')) else 'off'}",
         ]
         if bool(state.get("allow_sdxl_controlnet")):
-            feature_bits.append("SDXL add-ons on")
+            feature_bits.append("SDXL ControlNet on")
         if bool(state.get("load_large_models")):
             feature_bits.append("large models allowed")
 
@@ -1406,7 +1413,7 @@ class ConfigEditorView(Vertical):
             budget = state.get("model_pool_download_budget_gb", 0)
             try:
                 budget_value = float(budget) if isinstance(budget, int | float | str) else 0.0
-                budget_text = f", {budget_value:g} GB download admission" if budget_value > 0 else ""
+                budget_text = f", {budget_value:g} GB auto-download budget" if budget_value > 0 else ""
             except (TypeError, ValueError):
                 budget_text = ""
             pool_text = f"pool: {seat_text}, {pin_count} pin(s), {ranker}{budget_text}"
@@ -1433,7 +1440,7 @@ class ConfigEditorView(Vertical):
             text.append("  |  restart required for: ", style="bold dark_orange")
             text.append(self._limited_labels(restart_labels), style="dark_orange")
         else:
-            text.append("  |  no restart-only fields changed", style="grey62")
+            text.append("  |  no restart needed", style="grey62")
         return text
 
     def _dirty_field_labels(self) -> tuple[list[str], list[str]]:
@@ -1493,14 +1500,14 @@ class ConfigEditorView(Vertical):
         errors = [issue.message for issue in issues if _blocks_save(issue, saved_issues)]
         warnings = [_advisory_text(issue) for issue in issues if not _blocks_save(issue, saved_issues)]
         shown = errors[:3] if errors else warnings[:3]
-        prefix = "Blocking config issue" if len(shown) == 1 else "Blocking config issues"
+        prefix = "Fix before saving"
         style = "bold red"
         if not errors:
             prefix = "Config warning" if len(shown) == 1 else "Config warnings"
             style = "yellow"
         extra = len(errors or warnings) - len(shown)
         text = Text(f"{prefix}: ", style=style)
-        text.append("; ".join(shown), style=style)
+        text.append(" ".join(_sentence(message) for message in shown), style=style)
         if extra > 0:
             text.append(f" (+{extra} more)", style=style)
         target.update(text)

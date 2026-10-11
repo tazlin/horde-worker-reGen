@@ -63,12 +63,12 @@ def test_model_pool_panel_renders_seats_lane_and_bench() -> None:
     # A pending seat shows the model it is downloading to swap in.
     assert "Flux.1-dev" in text
     # The lane/demand line and its budget usage.
-    assert "FIXED" in text
-    assert "download admission" in text
+    assert "Last pop offered seated models" in text
+    assert "auto-download budget used" in text
     assert "1 / 2 seated" in text
     # The bench line names the demoted model and its reason.
     assert "OldModel" in text
-    assert "EMPTY_POPS" in text
+    assert "empty pops" in text
 
 
 def test_model_pool_status_line_omits_budget_when_not_configured() -> None:
@@ -77,8 +77,8 @@ def test_model_pool_status_line_omits_budget_when_not_configured() -> None:
     pool.download_budget_gb = 0.0
     text = _render(InsightsView()._render_pool_status_line(pool))
 
-    assert "download admission" not in text
-    assert "FIXED" in text
+    assert "auto-download budget used" not in text
+    assert "Last pop offered seated models" in text
 
 
 def test_model_pool_bench_line_summarizes_overflow() -> None:

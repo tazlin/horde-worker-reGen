@@ -44,7 +44,7 @@ class OverviewElement:
 # The display order here is also the modal's order. Grouped so related toggles sit together; the group
 # strings double as the modal's section headers.
 OVERVIEW_ELEMENTS: tuple[OverviewElement, ...] = (
-    OverviewElement("hero", "#overview-hero", "Status hero", "Status & health"),
+    OverviewElement("hero", "#overview-hero", "Status summary", "Status & health"),
     OverviewElement("health", "#overview-health", "Health checklist", "Status & health"),
     OverviewElement("trends", "#overview-trends", "Trends", "Status & health"),
     OverviewElement("gpus", "#overview-gpus", "GPUs", "Workload"),
@@ -148,7 +148,10 @@ class OverviewLayoutModal(ResponsiveModalScreen[frozenset[str] | None]):
                     value=element.key in self._hidden_keys,
                     id=f"layout-cb-{element.key}",
                 )
-            yield Static("space: toggle   a: hide all   n: show all   esc: save & close", id="layout-hint")
+            yield Static(
+                "A checked panel is hidden.   space: toggle   a: hide all   n: show all   esc: save & close",
+                id="layout-hint",
+            )
             yield Footer()
 
     def _set_all(self, hidden: bool) -> None:

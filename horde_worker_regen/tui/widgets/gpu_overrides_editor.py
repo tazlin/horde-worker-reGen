@@ -266,7 +266,7 @@ class GpuOverridesEditor(Vertical):
         yield self._compose_pop_balance_field()
         yield Label("Per-card settings", classes="gpu-heading")
         yield Static(
-            "Each card inherits the global config. To give one card its own value for a setting, turn on the "
+            "Each card inherits the global config. To give one card a separate value for a setting, turn on the "
             "Override switch at the left of that setting's row. Settings left off keep the global value.",
             classes="gpu-hint",
         )
@@ -314,7 +314,7 @@ class GpuOverridesEditor(Vertical):
             return self._no_card_banner()
         undriven = ""
         if self._detected_count and len(self._installed) > self._detected_count:
-            undriven = f" {len(self._installed)} are installed; the worker does not drive the others."
+            undriven = f" {len(self._installed)} are installed, and the worker does not drive the others."
         if count == 1:
             return (
                 f"{prefix}[b]{headline}[/b]{undriven} Per-card overrides are IGNORED on a single-GPU worker, which "
@@ -322,7 +322,7 @@ class GpuOverridesEditor(Vertical):
             )
         return (
             f"{prefix}[b]{headline}[/b]{undriven} Each section below overrides the global config for one physical "
-            "card, keyed by its stable PCI index. Settings whose Override switch is off inherit the global value."
+            "card, identified by its PCI bus index. Settings whose Override switch is off inherit the global value."
         )
 
     def _no_card_banner(self) -> str:

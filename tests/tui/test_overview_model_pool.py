@@ -66,11 +66,11 @@ def test_panel_shows_seats_lane_and_fixed_hit_rate() -> None:
     assert "downloading" in text
     assert "resident gpu 0" in text
     # The lane line carries pop matches, resident matches, and the bench size.
-    assert "FIXED" in text
+    assert "last pop offered seated models" in text
     assert "7/10" in text
     assert "70%" in text
     assert "5/7" in text
-    assert "bench" in text
+    assert "cooling down" in text
 
 
 def test_panel_omits_hit_rate_before_any_fixed_pop() -> None:
@@ -80,8 +80,8 @@ def test_panel_omits_hit_rate_before_any_fixed_pop() -> None:
     pool.fixed_fulfilled = 0
     text = _render(OverviewView._render_model_pool_panel(pool))
 
-    assert "fixed matches" not in text
-    assert "FIXED" in text
+    assert "seated pops filled" not in text
+    assert "last pop offered seated models" in text
 
 
 def test_panel_handles_no_seated_models() -> None:

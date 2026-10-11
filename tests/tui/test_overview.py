@@ -271,7 +271,7 @@ def test_overview_shows_lora_pause_when_background_download_blocks_pops() -> Non
 
     hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
 
-    assert "LoRA pops paused while background downloads are active." in hero
+    assert "LoRA jobs paused while background downloads are running." in hero
     assert OverviewView._allow_summary(snapshot) == "img2img, lora paused, controlnet, post"
 
 
@@ -698,7 +698,7 @@ def test_work_ledger_can_summarize_recent_jobs_without_hiding_active_work() -> N
     assert "7/28" in text
     assert "Deliberate" not in text
     assert "BrokenModel" not in text
-    assert "1 job completed recently; 1 faulted" in text
+    assert "1 job completed recently, 1 faulted" in text
 
 
 def test_queue_table_shows_job_id_and_baseline() -> None:
@@ -852,7 +852,7 @@ def test_trends_show_per_card_duty_and_name_the_starved_card() -> None:
     text = _render(view._render_trends(snapshot), width=120)
 
     assert "card 0 88%" in text and "card 1 2%" in text
-    assert "GPU 1 near-idle" in text
+    assert "GPU 1 is nearly idle" in text
 
 
 def test_single_card_trends_keep_the_unqualified_duty_row() -> None:
@@ -871,7 +871,7 @@ def test_single_card_trends_keep_the_unqualified_duty_row() -> None:
     text = _render(view._render_trends(snapshot), width=120)
 
     assert "card 0" not in text
-    assert "GPU near-idle" in text
+    assert "GPU is nearly idle" in text
 
 
 def test_phone_trends_preserve_each_value_and_graph_without_squeezing_columns() -> None:
@@ -1040,7 +1040,7 @@ def test_process_table_marks_holder_and_explains_paused_siblings() -> None:
 
     assert "★" in text
     assert "Whole-card residency" in text
-    assert "2 idle inference processes paused" in text
+    assert "2 idle inference processes stopped" in text
     assert "safety off-GPU" in text
 
 
@@ -1062,8 +1062,8 @@ def test_residency_panel_shows_a_standing_pop_claim() -> None:
         ),
     )
 
-    assert "Pop claim" in text
-    assert "Claim ends in" in text
+    assert "Offering only" in text
+    assert "Ends in" in text
 
 
 def test_residency_panel_explains_a_recently_released_claim() -> None:
@@ -1074,7 +1074,7 @@ def test_residency_panel_explains_a_recently_released_claim() -> None:
         ),
     )
 
-    assert "released" in text
+    assert "no longer" in text
     assert "no further work" in text
 
 
@@ -1091,9 +1091,10 @@ def test_hero_banner_names_the_model_the_claim_advertises() -> None:
     )
     report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
 
-    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+    # Wide enough that the banner stays on one line, so the phrase is not split by a wrap.
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0), width=200)
 
-    assert "advertising only Flux.1-dev" in hero
+    assert "Offering only Flux.1-dev" in hero
 
 
 def test_residency_panel_armed_when_only_possible() -> None:
@@ -1102,7 +1103,7 @@ def test_residency_panel_armed_when_only_possible() -> None:
         OverviewView._render_residency_panel(_active_residency(active=False, possible=True, model=None)),
     )
 
-    assert "armed" in text
+    assert "on standby" in text
     assert "Weights" not in text
 
 
@@ -1181,8 +1182,8 @@ def test_governance_panel_surfaces_ram_and_preload_decision() -> None:
 
     assert "Scheduling governance" in text
     assert "available 2048 MB below danger floor 4096 MB" in text
-    assert "draining p2" in text
-    assert "shed GPU 1" in text
+    assert "recycling p2" in text
+    assert "fewer processes on GPU 1" in text
     assert "Defer Budget" in text
     assert "Flux.1-dev" in text
     assert "p2" in text
@@ -1256,7 +1257,7 @@ def test_process_table_title_shows_alive_and_hot_tally() -> None:
     )
     text = _render(OverviewView()._render_process_table(snapshot), width=200)
 
-    assert "Processes · 1/1 alive · 1 hot" in text
+    assert "Processes · 1/1 alive · 1 busy" in text
 
 
 def test_queue_title_shows_pending_and_megapixelsteps() -> None:
@@ -1277,7 +1278,7 @@ def test_queue_title_shows_pending_and_megapixelsteps() -> None:
     text = _render(OverviewView._render_queue_table(snapshot), width=200)
 
     assert "Queue · 1 pending" in text
-    assert "1,234 MP" in text
+    assert "1,234 megapixelsteps" in text
 
 
 def test_process_table_keeps_essentials_at_80_columns() -> None:
@@ -1434,7 +1435,7 @@ def test_the_text_panel_says_how_long_a_backend_has_not_answered() -> None:
 
     assert "not ready" in text
     assert "3m" in text
-    assert "no jobs are popped until it answers" in text
+    assert "no jobs are taken until it responds" in text
 
 
 def test_the_text_panel_counts_a_managed_backend_wait_from_its_launch_like_the_health_ladder() -> None:

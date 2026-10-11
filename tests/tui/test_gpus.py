@@ -141,7 +141,7 @@ def test_thin_aggregate_line_summarizes_the_fleet() -> None:
 
     assert "2 GPUs" in out
     assert "36.0G free" in out  # 18 + 18
-    assert "4 ctx" in out  # 2 + 2 loaded
+    assert "4 procs" in out  # 2 + 2 loaded
     assert "2 active" in out  # 1 + 1 busy
 
 
@@ -185,7 +185,7 @@ def test_overview_strip_renders_each_card() -> None:
 
     assert "RTX 4090" in out
     assert "RTX 4091" in out
-    assert "2/2 ctx" in out
+    assert "2/2 procs" in out
 
 
 def test_overview_strip_details_flags_residency_and_unservable() -> None:

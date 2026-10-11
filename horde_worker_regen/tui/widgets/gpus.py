@@ -142,7 +142,7 @@ def _faults_cell(row: _CardRow) -> Text:
     if card.unservable_models:
         return Text(f"{len(card.unservable_models)} unservable ×{card.worst_fault_streak}", style="bold red")
     if card.worst_fault_streak > 0:
-        return Text(f"streak {card.worst_fault_streak}", style="yellow")
+        return Text(f"fault streak {card.worst_fault_streak}", style="yellow")
     if card.unserviceable_models:
         return Text(f"{len(card.unserviceable_models)} cannot fit", style="bold red")
     if card.constrained_models:
@@ -153,10 +153,10 @@ def _faults_cell(row: _CardRow) -> Text:
 _CARD_COLUMNS: list[ColumnSpec[_CardRow]] = [
     ColumnSpec("GPU", DensityTier.CRITICAL, _gpu_cell, min_width=10, no_wrap=True),
     ColumnSpec("VRAM", DensityTier.ESSENTIAL, _vram_cell, min_width=22, no_wrap=True),
-    ColumnSpec("Contexts", DensityTier.ESSENTIAL, _contexts_cell, justify="right", width=10, no_wrap=True),
+    ColumnSpec("Procs", DensityTier.ESSENTIAL, _contexts_cell, justify="right", width=10, no_wrap=True),
     ColumnSpec("it/s", DensityTier.NORMAL, _its_cell, justify="right", width=9),
     ColumnSpec("Jobs/hr", DensityTier.NORMAL, _jobs_cell, min_width=12, no_wrap=True),
-    ColumnSpec("Conc", DensityTier.WIDE, lambda r: str(r.card.max_concurrent_inference), justify="right", width=5),
+    ColumnSpec("Max jobs", DensityTier.WIDE, lambda r: str(r.card.max_concurrent_inference), justify="right", width=8),
     ColumnSpec("Duty", DensityTier.WIDE, _duty_cell, width=9, no_wrap=True),
     ColumnSpec("Residency", DensityTier.DETAILS, _residency_cell, min_width=18, no_wrap=True),
     ColumnSpec("Faults", DensityTier.DETAILS, _faults_cell, min_width=14, no_wrap=True),
@@ -187,7 +187,7 @@ class GpusView(VerticalScroll):
         """Refresh the per-card view for the active ``mode`` from the snapshot's ``per_card`` section."""
         body = self.query_one("#gpus-body", Static)
         if snapshot is None or not snapshot.per_card:
-            body.update(Panel(Text("waiting for first snapshot", style="grey50"), title="GPUs", title_align="left"))
+            body.update(Panel(Text("waiting for worker status", style="grey50"), title="GPUs", title_align="left"))
             return
 
         self._maybe_record(snapshot)
@@ -299,7 +299,7 @@ class GpusView(VerticalScroll):
             sep,
             (f"{free_g:.1f}G free" if free_g is not None else "VRAM ?", "cyan"),
             sep,
-            (f"{loaded} ctx", "grey70"),
+            (f"{loaded} procs", "grey70"),
             sep,
             (f"{busy} active", "green"),
         )

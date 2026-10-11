@@ -606,7 +606,7 @@ async def test_action_bar_separates_presets_and_highlights_restart_edits(tmp_pat
         editor.query_one("#cfg-max_batch", Input).value = "2"
         await pilot.pause()
         assert editor.query_one("#config-restart", Button).variant == "default"
-        assert "no restart-only fields changed" in _plain(editor.query_one("#config-change-summary", Static))
+        assert "no restart needed" in _plain(editor.query_one("#config-change-summary", Static))
 
         editor.query_one("#cfg-max_threads", Input).value = "2"
         await pilot.pause()
@@ -632,7 +632,7 @@ async def test_live_validation_warnings_are_persistent_before_save(tmp_path: Pat
         editor.query_one("#cfg-allow_img2img", Switch).value = False
         await _wait_until(pilot, lambda: warning_strip.display, what="the warning strip to show")
 
-        assert "Blocking config issue" in _plain(warning_strip)
+        assert "Fix before saving" in _plain(warning_strip)
         assert "inpainting requires" in _plain(warning_strip)
 
 
