@@ -180,10 +180,13 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   `_workload_capability_bridge_fields` in `harness.py`. A new job feature, workflow, or resolution
   axis must extend that shared derivation, or the warm path's jobs are ineligible at dispatch and the
   level scores on faults instead of running.
-- **A level's completed/faulted split reads from per-level run metrics**, with tracker deltas as
-  floor/fallback (`WarmHarnessSession._level_job_counts`). Per-job records trail the tracker's
-  counters by a message pump, so they are read through a bounded settle
-  (`_settle_level_metrics`), never at the instant a drain returns.
+- **A warm level ends, and is counted, on its finalized jobs.** A job's run-metrics record is written at
+  finalization, after safety and submit, and the tracker's completion counter moves a whole safety check
+  earlier, at the inference result. The drain therefore waits for a record per job, and the count
+  (`WarmHarnessSession._level_job_counts`) reads only records popped after the level was installed, so a
+  job the previous level left in safety is never counted. Tracker deltas are the fallback for a driver
+  with no run metrics and the floor for a fault that never finalizes. A level's elapsed time and timeout
+  include safety and submit.
 - The pinned `ruff`/`pyrefly` versions in `.pre-commit-config.yaml` must match `pyproject.toml`
   (a test enforces this).
 

@@ -66,6 +66,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 from horde_worker_regen.process_management.resources.run_metrics import (
     SCENARIO_ID_ENV_VAR,
     SCENARIO_REVISION_ENV_VAR,
+    JobMetricsRecord,
     RunMetricsSnapshot,
 )
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
@@ -2572,13 +2573,17 @@ class WarmHarnessSession:
         num_forms_expected: int,
         base_completed: int,
         base_faulted: int,
+        popped_since: float,
         timeout_seconds: float,
     ) -> bool:
-        """Wait until the currently installed scenario's jobs and alchemy forms are accounted for.
+        """Wait until the currently installed scenario's jobs and alchemy forms have reached their end.
 
-        Job completion is a delta over the job tracker's cumulative counters (the tracker is not reset
-        between levels); the alchemy-form counters are reset by ``install_benchmark_scenario`` so they
-        are read absolutely. Returns ``True`` if it drained within ``timeout_seconds``, ``False`` if it
+        A job has reached its end when it is finalized (safety checked and submitted), which is when its
+        run-metrics record is written. The tracker's completion counter moves at the inference result, a
+        whole safety check and submit earlier, so it only gates the more expensive read of the records
+        (see :meth:`_level_jobs_reached_their_end`). The tracker is not reset between levels, so its
+        counters are read as deltas. The alchemy-form counters are reset by ``install_benchmark_scenario``
+        and are read absolutely. Returns ``True`` if it drained within ``timeout_seconds``, ``False`` if it
         timed out.
         """
         manager = self.manager
@@ -2593,7 +2598,15 @@ class WarmHarnessSession:
                 manager._alchemy_coordinator.num_canned_forms_completed
                 + manager._alchemy_coordinator.num_canned_forms_faulted
             )
-            if terminal >= num_jobs_expected and forms_done >= num_forms_expected:
+            if (
+                terminal >= num_jobs_expected
+                and forms_done >= num_forms_expected
+                and self._level_jobs_reached_their_end(
+                    num_jobs_expected=num_jobs_expected,
+                    base_faulted=base_faulted,
+                    popped_since=popped_since,
+                )
+            ):
                 return True
             if time.time() - time_started > timeout_seconds:
                 return False
@@ -2660,58 +2673,66 @@ class WarmHarnessSession:
             )
         return unacknowledged
 
-    async def _settle_level_metrics(
+    @staticmethod
+    def _level_image_records(metrics: RunMetricsSnapshot, *, popped_since: float) -> list[JobMetricsRecord]:
+        """The finalized image jobs that belong to the scenario installed at ``popped_since``.
+
+        Installing a scenario swaps the source the worker pops from, so a job popped after the install is
+        one of that scenario's. The run metrics are cleared at the install, but a job of the previous
+        scenario that is still in safety or submit finalizes afterwards and lands in the cleared metrics.
+        Its pop time tells it apart. A record with no pop time cannot be told apart and is kept.
+        """
+        return [
+            job
+            for job in metrics.jobs
+            if job.workload is WorkloadKind.IMAGE_GENERATION
+            and (job.time_popped is None or job.time_popped >= popped_since)
+        ]
+
+    def _level_jobs_reached_their_end(
         self,
         *,
-        expected_records: int,
-        base_completed: int,
-        budget_seconds: float = 3.0,
-    ) -> RunMetricsSnapshot | None:
-        """Return the level's run metrics once every accounted job has its record, or on a short deadline.
+        num_jobs_expected: int,
+        base_faulted: int,
+        popped_since: float,
+    ) -> bool:
+        """Whether every job of the installed scenario is finalized or was faulted without finalizing.
 
-        The drain returns the moment the job tracker's counters cover the level, but a job's run-metrics
-        record rides the child's metrics message, which can still be in the pipe at that instant. Reading
-        the snapshot immediately undercounts the level's last job(s), so completion is briefly pumped and
-        re-read until the image-record count catches up with the tracker's accounting. Faulted jobs are
-        recorded parent-side at finalization and are never late.
+        A driver with no run metrics has only the tracker's counters to go on, so the caller's counter
+        check stands for it.
         """
         manager = self.manager
-        deadline = time.time() + budget_seconds
-        while True:
-            metrics = manager.get_run_metrics_snapshot()
-            records = (
-                [job for job in metrics.jobs if job.workload is WorkloadKind.IMAGE_GENERATION]
-                if metrics is not None
-                else []
-            )
-            tracker_delta = manager._job_tracker.total_num_completed_jobs - base_completed
-            if len(records) >= min(expected_records, tracker_delta) or time.time() >= deadline:
-                return metrics
-            with contextlib.suppress(Exception):
-                await manager.receive_and_handle_process_messages()
-            await asyncio.sleep(0.1)
+        metrics = manager.get_run_metrics_snapshot()
+        if metrics is None:
+            return True
+        records = self._level_image_records(metrics, popped_since=popped_since)
+        faulted_records = sum(1 for record in records if record.faulted)
+        tracker_faulted = manager._job_tracker.num_jobs_faulted - base_faulted
+        faulted_without_a_record = max(0, tracker_faulted - faulted_records)
+        return len(records) + faulted_without_a_record >= num_jobs_expected
 
-    @staticmethod
+    @classmethod
     def _level_job_counts(
+        cls,
         metrics: RunMetricsSnapshot | None,
         *,
+        popped_since: float,
         tracker_completed: int,
         tracker_faulted: int,
     ) -> tuple[int, int]:
-        """One level's completed and faulted image-job counts, preferring the per-level run metrics.
+        """One level's completed and faulted image-job counts, read from the level's finalized jobs.
 
-        The run metrics are reset per level and carry each finalized job's own outcome, so a job that
-        reached submission in a faulted state reads there as the fault it was. The job tracker's
-        cumulative completion counter does not make that distinction, which is what let a level whose
-        every job hard-faulted score as a clean pass. Tracker deltas remain the fallback for a driver
-        with no run metrics, and the tracker's fault delta is honoured as a floor so a fault that never
-        reached finalization (and so never reached the run metrics) is still counted.
+        A finalized job's record carries that job's outcome, so a job that reached submission in a faulted
+        state reads there as the fault it was, and a job still waiting on safety or submit is not counted
+        as completed. The job tracker's cumulative completion counter makes neither distinction. It moves
+        at the inference result, so a level read from it scores as a clean pass when every job
+        hard-faulted or none was submitted. Tracker deltas are the fallback only for a driver with no
+        run metrics. The tracker's fault delta is honoured as a floor so a fault that never reached
+        finalization (and so never reached the run metrics) is still counted.
         """
         if metrics is None:
             return tracker_completed, tracker_faulted
-        records = [job for job in metrics.jobs if job.workload is WorkloadKind.IMAGE_GENERATION]
-        if not records:
-            return tracker_completed, tracker_faulted
+        records = cls._level_image_records(metrics, popped_since=popped_since)
         completed = sum(1 for record in records if not record.faulted)
         faulted = max(sum(1 for record in records if record.faulted), tracker_faulted)
         return completed, faulted
@@ -2733,10 +2754,12 @@ class WarmHarnessSession:
         before anything else runs (see :meth:`apply_bridge_data_overrides`) and replaced by the next
         level's.
 
-        The drain returns once the level's own jobs and alchemy forms are accounted for, or when
-        ``timeout_seconds`` elapses. The reported completed/faulted split comes from the per-level run
-        metrics (see :meth:`_level_job_counts`), which distinguish a job that finished from one that was
-        submitted faulted; the tracker's cumulative deltas are the fallback.
+        The drain returns once the level's jobs are finalized (safety checked and submitted) and its
+        alchemy forms are accounted for, or when ``timeout_seconds`` elapses, so the level's elapsed time
+        and its timeout include safety and submit. The reported completed/faulted split comes from the
+        level's finalized jobs (see :meth:`_level_job_counts`), which distinguish a job that finished
+        from one that was submitted faulted or never submitted. The tracker's cumulative deltas are the
+        fallback only for a driver with no run metrics.
 
         When ``warmup`` is set, the level's full scenario is run once first to load any
         feature-specific weights (controlnet/QR checkpoints, upscaler/face-fixer/BLIP models) the warm
@@ -2814,10 +2837,13 @@ class WarmHarnessSession:
         base_completed = 0
         base_faulted = 0
         time_started = call_started
+        # Taken before each install. The pass that scores the level counts only jobs popped after it.
+        popped_since = call_started
         timed_out = False
         try:
             if warmup and (scenario_jobs or scenario_forms):
                 warmup_started = time.time()
+                popped_since = warmup_started
                 warmup_budget = min(timeout_seconds, _WARMUP_DRAIN_TIMEOUT_SECONDS)
                 manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=scenario_forms)
                 warmup_base_completed = manager._job_tracker.total_num_completed_jobs
@@ -2827,11 +2853,13 @@ class WarmHarnessSession:
                     num_forms_expected=num_forms_expected,
                     base_completed=warmup_base_completed,
                     base_faulted=warmup_base_faulted,
+                    popped_since=warmup_started,
                     timeout_seconds=warmup_budget,
                 )
                 warmup_seconds = time.time() - warmup_started
                 warm_completed, warm_faulted = self._level_job_counts(
                     manager.get_run_metrics_snapshot(),
+                    popped_since=warmup_started,
                     tracker_completed=manager._job_tracker.total_num_completed_jobs - warmup_base_completed,
                     tracker_faulted=manager._job_tracker.num_jobs_faulted - warmup_base_faulted,
                 )
@@ -2879,6 +2907,7 @@ class WarmHarnessSession:
                 base_completed = manager._job_tracker.total_num_completed_jobs
                 base_faulted = manager._job_tracker.num_jobs_faulted
 
+                popped_since = time.time()
                 manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=alchemy_forms)
 
                 time_started = time.time()
@@ -2887,6 +2916,7 @@ class WarmHarnessSession:
                     num_forms_expected=num_forms_expected,
                     base_completed=base_completed,
                     base_faulted=base_faulted,
+                    popped_since=popped_since,
                     timeout_seconds=timeout_seconds,
                 )
                 timed_out = not drained
@@ -2899,12 +2929,10 @@ class WarmHarnessSession:
                 with contextlib.suppress(asyncio.CancelledError):
                     await progress_task
 
-        metrics = await self._settle_level_metrics(
-            expected_records=num_jobs_expected,
-            base_completed=base_completed,
-        )
+        metrics = manager.get_run_metrics_snapshot()
         completed, faulted = self._level_job_counts(
             metrics,
+            popped_since=popped_since,
             tracker_completed=manager._job_tracker.total_num_completed_jobs - base_completed,
             tracker_faulted=manager._job_tracker.num_jobs_faulted - base_faulted,
         )

@@ -363,6 +363,109 @@ async def test_warm_level_of_all_faulted_jobs_is_disproven() -> None:
     assert any("faulted" in reason for reason in verdict.reasons), verdict.reasons
 
 
+def _snapshot_of(records: list[JobMetricsRecord]) -> RunMetricsSnapshot:
+    return RunMetricsSnapshot(
+        jobs=records,
+        downloads=[],
+        vram_used_high_water_mb_per_process={},
+        ram_used_high_water_mb_per_process={},
+        disk_min_free_bytes={},
+        num_process_recoveries=0,
+        num_job_slowdowns=0,
+        time_spent_no_jobs_available=0.0,
+        process_crash_events=[],
+    )
+
+
+class _LateFinalizingStubManager(_StubManager):
+    """A worker whose jobs finish inference at once and are finalized only after a safety delay.
+
+    The tracker's completion counter covers the level from the install, as it does once the inference
+    results are in. Each job's record appears ``finalize_after_seconds`` later, or never. A job of the
+    previous level, popped before this install, finalizes into the same metrics.
+    """
+
+    def __init__(
+        self,
+        infos: list[_StubProcessInfo],
+        *,
+        num_jobs: int,
+        finalize_after_seconds: float | None,
+        straggler_from_previous_level: bool = False,
+    ) -> None:
+        super().__init__(infos)
+        self._num_jobs = num_jobs
+        self._finalize_after_seconds = finalize_after_seconds
+        self._straggler = straggler_from_previous_level
+        self._created_at = time.time()
+        self._installed_at: float | None = None
+
+    def install_benchmark_scenario(self, *, jobs: object, alchemy_forms: object = None) -> None:
+        self._installed_at = time.time()
+        self._job_tracker.total_num_completed_jobs += self._num_jobs
+
+    def get_run_metrics_snapshot(self) -> RunMetricsSnapshot:
+        records: list[JobMetricsRecord] = []
+        if self._straggler:
+            records.append(JobMetricsRecord(job_id="previous-level", time_popped=self._created_at - 30.0))
+        finalized = (
+            self._installed_at is not None
+            and self._finalize_after_seconds is not None
+            and time.time() - self._installed_at >= self._finalize_after_seconds
+        )
+        if finalized and self._installed_at is not None:
+            records.extend(
+                JobMetricsRecord(job_id=f"own-{index}", time_popped=self._installed_at + 0.05)
+                for index in range(self._num_jobs)
+            )
+        return _snapshot_of(records)
+
+
+async def test_warm_level_waits_for_its_jobs_and_ignores_the_previous_levels() -> None:
+    """A level ends when its jobs are finalized, and it does not count a job the previous level left in safety."""
+    infos = [_StubProcessInfo(process_id=0, process_type=HordeProcessType.INFERENCE, alive=True)]
+    session = _make_session(infos)
+    session._manager = _LateFinalizingStubManager(  # type: ignore[assignment]  # white-box: stub stands in for the manager
+        infos,
+        num_jobs=2,
+        finalize_after_seconds=0.5,
+        straggler_from_previous_level=True,
+    )
+
+    started = time.monotonic()
+    result = await session.run_level(
+        jobs=[make_canned_job("Deliberate") for _ in range(2)],
+        threads=1,
+        timeout_seconds=10.0,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.timed_out is False
+    assert elapsed >= 0.5, f"the level returned before its jobs were finalized (after {elapsed:.2f}s)"
+    assert result.num_jobs_completed == 2
+    assert result.num_jobs_faulted == 0
+
+
+async def test_warm_level_whose_jobs_are_never_submitted_is_not_a_pass() -> None:
+    """Inference results alone do not complete a level. Jobs that never reach submit time it out with none done."""
+    infos = [_StubProcessInfo(process_id=0, process_type=HordeProcessType.INFERENCE, alive=True)]
+    session = _make_session(infos)
+    session._manager = _LateFinalizingStubManager(  # type: ignore[assignment]  # white-box: stub stands in for the manager
+        infos,
+        num_jobs=2,
+        finalize_after_seconds=None,
+    )
+
+    result = await session.run_level(
+        jobs=[make_canned_job("Deliberate") for _ in range(2)],
+        threads=1,
+        timeout_seconds=0.5,
+    )
+
+    assert result.timed_out is True
+    assert result.num_jobs_completed == 0
+
+
 def test_fake_inference_entry_point_records_startup_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
