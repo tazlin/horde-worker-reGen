@@ -106,7 +106,7 @@ def test_detail_says_an_unmeasured_model_is_unknown_and_has_nothing_to_load() ->
     """Both absences are stated, since either one silently read as "fine" would mislead a choice."""
     detail = _render(TextModelPickerModal._detail_for(_MODELS[2]))
 
-    assert "none on offer" in detail
+    assert "none in the reference" in detail
     assert "unknown" in detail
 
 

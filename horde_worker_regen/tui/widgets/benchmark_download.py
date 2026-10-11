@@ -68,6 +68,11 @@ def _gb(num_bytes: int | None) -> str:
     return f"{num_bytes / 1024**3:.1f} GB"
 
 
+def _model_count(count: int) -> str:
+    """Return ``1 model`` or ``N models``."""
+    return f"{count} model" if count == 1 else f"{count} models"
+
+
 class BenchmarkDownloadModal(ResponsiveModalScreen[bool]):
     """Show exactly which models a benchmark needs (size, on-disk, destination), then request the missing ones.
 
@@ -139,8 +144,8 @@ class BenchmarkDownloadModal(ResponsiveModalScreen[bool]):
         with Vertical(id="download-dialog"):
             yield Static(
                 Text(
-                    "These are the models this benchmark needs. Models already on your machine are reused; "
-                    "only the missing ones are downloaded, once, before the timed run.",
+                    "These are the models this benchmark needs. Models already on disk are reused. "
+                    "Only the missing ones are downloaded, before the timed run.",
                     style="bold",
                 ),
                 id="download-intro",
@@ -155,8 +160,8 @@ class BenchmarkDownloadModal(ResponsiveModalScreen[bool]):
         """Kick off the (slow, cold) dry-run plan computation and show a working state meanwhile."""
         self._set_body(
             Text(
-                "Working out which models are needed (this starts no benchmark and downloads nothing; "
-                "it can take up to a few minutes the first time while the hardware is detected)…",
+                "Working out which models are needed. Nothing is downloaded yet. "
+                "The first time can take a few minutes while the hardware is detected…",
                 style="yellow",
             ),
         )
@@ -248,14 +253,14 @@ class BenchmarkDownloadModal(ResponsiveModalScreen[bool]):
         if not missing:
             start.disabled = True
             # Distinguish "the worker is already fetching these" from "you genuinely have everything".
-            start.label = "Worker is fetching these" if in_flight else "Nothing to download"
+            start.label = "Already downloading" if in_flight else "Nothing to download"
         elif not plan.fits:
             start.disabled = True
             start.label = "Not enough disk space"
         else:
             start.disabled = False
             to_download_bytes = sum(row.size_bytes or 0 for row in missing)
-            start.label = f"Request {len(missing)} model(s) ({_gb(to_download_bytes)})"
+            start.label = f"Request {_model_count(len(missing))} ({_gb(to_download_bytes)})"
 
     def _render_error(self, message: str) -> None:
         """Explain why the plan could not be computed (UI thread)."""
@@ -294,14 +299,14 @@ class BenchmarkDownloadModal(ResponsiveModalScreen[bool]):
             start.disabled = True
             self._set_body(
                 Text(
-                    f"Requested {missing_total} model(s) from the download subsystem. They download in the "
-                    "background; track progress on the Downloads tab and the Benchmark tab's waiting banner. ",
+                    f"Requested {_model_count(missing_total)}. They download in the background. "
+                    "The Downloads tab and the banner on the Benchmark tab show progress.",
                     style="green",
                 ),
             )
         else:
             self._set_body(
-                Text("Could not reach the download subsystem to request the download; try again.", style="red"),
+                Text("The download request could not be sent to the worker. Try again.", style="red"),
             )
 
     def _set_body(self, renderable: RenderableType) -> None:
@@ -321,7 +326,7 @@ def _plan_table(statuses: list[tuple[DownloadModelRow, str]]) -> Table:
             model.name,
             _gb(model.size_bytes),
             _plan_status_text(status),
-            model.target_path or "(destination undetermined)",
+            model.target_path or "(location unknown)",
         )
     return table
 
@@ -347,7 +352,7 @@ def _plan_footer(plan: DownloadEvent) -> Text:
     if not plan.fits:
         footer.append("\n")
         footer.append(
-            f"Not enough space: about {_gb(plan.shortfall_bytes)} short. Free up disk or choose fewer tiers.",
+            f"Not enough disk space, about {_gb(plan.shortfall_bytes)} short. Free up space or select fewer tiers.",
             style="bold red",
         )
     return footer

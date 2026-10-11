@@ -356,7 +356,7 @@ class BenchmarkSupervisor:
         """
         self._status = BenchmarkSupervisorStatus.PREPARING
         self.run_state = BenchmarkRunState()
-        self.run_state.startup_phase = "Stopping the worker to free the GPU for the benchmark…"
+        self.run_state.startup_phase = "Freeing the GPU for the benchmark. Jobs in progress finish first…"
 
     def start(self, options: BenchmarkOptions) -> None:
         """Launch a benchmark ramp subprocess into a fresh timestamped output directory."""
@@ -364,7 +364,7 @@ class BenchmarkSupervisor:
         out_dir.mkdir(parents=True, exist_ok=True)
         self._out_dir = out_dir
         self.run_state = BenchmarkRunState()
-        self.run_state.startup_phase = "Launching benchmark subprocess…"
+        self.run_state.startup_phase = "Starting the benchmark…"
         self.report = None
 
         # Redirect the benchmark's console output to a file: it would otherwise corrupt the Textual terminal.

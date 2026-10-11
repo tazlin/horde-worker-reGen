@@ -87,7 +87,7 @@ def test_form_kind_label_classifies_graph_and_clip() -> None:
 def test_form_rollups_table_handles_no_forms() -> None:
     """With no finalized forms the table shows a clear placeholder rather than an empty grid."""
     text = _render(StatsView._render_form_rollups([]))
-    assert "no finalized alchemy forms yet" in text
+    assert "no finished alchemy forms yet" in text
 
 
 def test_headline_alchemy_row_shows_graph_clip_split() -> None:

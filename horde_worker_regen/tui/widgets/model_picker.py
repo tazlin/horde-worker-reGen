@@ -37,7 +37,7 @@ _MARKER_COL = 0
 _COLUMNS: tuple[tuple[str, int], ...] = (
     ("Mark", 10),  # mark state: add/remove/clear mark
     ("Model", _NAME_WIDTH),
-    ("In config", 14),
+    ("In config", 16),
     ("Baseline", 10),
     ("Disk", 10),
     ("Flags", 12),
@@ -242,7 +242,7 @@ class ModelPickerModal(ResponsiveModalScreen[ModelPickerResult | list[str] | Non
                 )
                 yield Checkbox("Show NSFW", value=True, id="picker-nsfw")
                 yield Checkbox("Inpainting only", value=False, id="picker-inpaint")
-                yield Checkbox("Show marks only", value=False, id="picker-marked-only")
+                yield Checkbox("Marked only", value=False, id="picker-marked-only")
             yield Input(placeholder="search name, description, tags…", id="picker-search")
             with Horizontal(id="picker-body"):
                 yield _PickerTable(id="picker-table", cursor_type="cell", zebra_stripes=True)
@@ -339,9 +339,9 @@ class ModelPickerModal(ResponsiveModalScreen[ModelPickerResult | list[str] | Non
     def _in_config_cell(self, model: ModelInfo) -> Text:
         """Whether the model is already in the list being edited or in the sibling list."""
         if model.name in self._marked_add:
-            return Text(f"add -> {self._target_label}", style="bold green")
+            return Text(f"add to {self._target_label}", style="bold green")
         if model.name in self._marked_remove:
-            return Text(f"remove -> {self._target_label}", style="bold red")
+            return Text(f"remove from {self._target_label}", style="bold red")
         if model.name in self._in_target:
             return Text(self._target_label, style="green")
         if model.name in self._in_other:
@@ -437,9 +437,9 @@ class ModelPickerModal(ResponsiveModalScreen[ModelPickerResult | list[str] | Non
         text = Text.assemble(
             (f"{len(self._visible)} shown (of {len(self._all_models)})", "grey70"),
             ("  ·  ", "grey50"),
-            (f"{add_count} add mark(s)", "green" if add_count else "grey70"),
+            (f"{add_count} to add", "green" if add_count else "grey70"),
             ("  ·  ", "grey50"),
-            (f"{remove_count} remove mark(s)", "red" if remove_count else "grey70"),
+            (f"{remove_count} to remove", "red" if remove_count else "grey70"),
         )
         if self._in_target:
             text.append("  ·  ", style="grey50")
@@ -506,7 +506,7 @@ class ModelPickerModal(ResponsiveModalScreen[ModelPickerResult | list[str] | Non
         grid.add_column(style="bold cyan", justify="right", no_wrap=True)
         grid.add_column()
         if model.is_beta:
-            grid.add_row("Source", Text("beta (PRIMARY pending queue)", style="magenta"))
+            grid.add_row("Source", Text("beta (not yet in the main model reference)", style="magenta"))
         grid.add_row("Baseline", model.baseline or "-")
         disk_text = (
             Text("on disk (unverified)", style="green")
@@ -637,7 +637,7 @@ class ModelPickerModal(ResponsiveModalScreen[ModelPickerResult | list[str] | Non
             return
         self.app.push_screen(
             ConfirmModal(
-                "Clear all staged add/remove marks? This keeps the underlying config lists unchanged.",
+                "Clear all add and remove marks? The config lists are not changed.",
                 confirm_label="Yes, clear marks",
                 cancel_label="No, keep marks",
             ),

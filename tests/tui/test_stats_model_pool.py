@@ -53,14 +53,14 @@ def test_pool_section_shows_per_lane_matches_residency_seats_and_bench() -> None
     assert "Model pool" in text
     assert "FIXED" in text
     assert "1 resident / 1 seated / 2 total" in text
-    assert "6 / 10 matched (60%); 5 resident" in text
-    assert "1 / 4 matched (25%); 0 resident" in text
+    assert "6 / 10 matched (60%), 5 resident" in text
+    assert "1 / 4 matched (25%), 0 resident" in text
 
 
 def test_lane_pop_summary_dashes_before_any_pop() -> None:
     """A lane with no pops yet shows a dash rather than a divide-by-zero rate."""
     assert StatsView._lane_pop_summary(0, 0, 0) == "-"
-    assert StatsView._lane_pop_summary(3, 4, 2) == "3 / 4 matched (75%); 2 resident"
+    assert StatsView._lane_pop_summary(3, 4, 2) == "3 / 4 matched (75%), 2 resident"
 
 
 def test_by_model_rollup_marks_seated_models() -> None:

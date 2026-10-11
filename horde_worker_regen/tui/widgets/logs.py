@@ -278,7 +278,7 @@ class LogsView(Vertical):
             first = False
             text.append(f"{count:,}", style=f"bold {style}")
             text.append(f" {level}", style="grey50")
-        tally.update(text if text.plain else Text("no levelled lines yet", style="grey50"))
+        tally.update(text if text.plain else Text("no lines with a log level yet", style="grey50"))
 
     def on_select_changed(self, event: Select.Changed) -> None:
         """Handle process/history/level selection changes (ignoring programmatic updates)."""
@@ -351,7 +351,8 @@ class LogsView(Vertical):
         """Show or hide the 'new lines below' hint based on whether the user has scrolled up."""
         hint = self.query_one("#log-scroll-hint", Static)
         if self._unseen_below > 0:
-            hint.update(Text(f"↓ {self._unseen_below:,} new line(s) below; press End to jump to latest"))
+            noun = "line" if self._unseen_below == 1 else "lines"
+            hint.update(Text(f"↓ {self._unseen_below:,} new {noun} below. Press End to jump to the latest."))
             hint.display = True
         else:
             hint.display = False
@@ -375,7 +376,7 @@ class LogsView(Vertical):
         if button.disabled:
             return
         button.disabled = True
-        self.notify("Generating support bundle… this can take ~15s.", title="Support bundle")
+        self.notify("Generating the support bundle. This can take about 15 seconds.", title="Support bundle")
         self.run_worker(self._build_support_bundle, thread=True, exclusive=True, group="support-bundle")
 
     def _build_support_bundle(self) -> None:
@@ -398,8 +399,8 @@ class LogsView(Vertical):
         """UI-thread callback: announce the written bundle and re-enable the button."""
         self.query_one("#log-bundle", Button).disabled = False
         self.notify(
-            f"Wrote {out_path.name}. Redacted {redaction_count} secret/identifier occurrence(s); "
-            "skim it before sending.",
+            f"Wrote {out_path.name}. Secrets and identifiers were redacted in {redaction_count} places. "
+            "Check it before sending.",
             title="Support bundle",
             timeout=12,
         )

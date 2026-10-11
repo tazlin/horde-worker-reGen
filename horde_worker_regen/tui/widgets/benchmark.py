@@ -97,16 +97,16 @@ class _TierToggle(typing.NamedTuple):
 
 
 _TIER_TOGGLES: tuple[_TierToggle, ...] = (
-    _TierToggle(BenchTier.SD15, "SD 1.5", "Smallest and fastest; the recommended starting point.", True),
-    _TierToggle(BenchTier.SDXL, "SDXL", "Larger SDXL checkpoints; needs more VRAM than SD 1.5.", True),
+    _TierToggle(BenchTier.SD15, "SD 1.5", "The smallest and fastest tier. Start with it.", True),
+    _TierToggle(BenchTier.SDXL, "SDXL", "Larger checkpoints that need more VRAM than SD 1.5.", True),
     _TierToggle(
-        BenchTier.FLUX, "Flux", "Very large (17-20 GB download, 13-16 GB VRAM); auto-skips if it does not fit.", False
+        BenchTier.FLUX, "Flux", "Very large (17-20 GB download, 13-16 GB VRAM). Skipped if it does not fit.", False
     ),
-    _TierToggle(BenchTier.QWEN, "Qwen", "Very large beta model; auto-skips if absent.", False),
+    _TierToggle(BenchTier.QWEN, "Qwen", "Very large beta model. Skipped if it is not downloaded.", False),
     _TierToggle(
         BenchTier.ZIMAGE,
         "Z-Image",
-        "~19 GB beta model (pending reference); fixed steps=9, no hires_fix. Auto-skips when absent.",
+        "Beta model of about 19 GB. Runs at a fixed 9 steps without hires-fix. Skipped if it is not downloaded.",
         False,
     ),
 )
@@ -155,11 +155,17 @@ _AXIS_GROUPS: tuple[tuple[str, tuple[_AxisToggle, ...]], ...] = (
         "Alchemy",
         (
             _AxisToggle(
-                CapabilityKind.ALCHEMY_CLIP, "Alchemy: CLIP lane", "Caption / interrogation / NSFW (safety process)."
+                CapabilityKind.ALCHEMY_CLIP,
+                "CLIP forms",
+                "Caption, interrogation and NSFW forms, which run in the safety process.",
             ),
-            _AxisToggle(CapabilityKind.ALCHEMY_GRAPH, "Alchemy: graph lane", "Upscale / face-fix / strip-background."),
             _AxisToggle(
-                CapabilityKind.ALCHEMY_CONCURRENT, "Alchemy: concurrent", "Alchemy forms alongside image jobs."
+                CapabilityKind.ALCHEMY_GRAPH,
+                "Image forms",
+                "Upscale, face-fix and strip-background forms.",
+            ),
+            _AxisToggle(
+                CapabilityKind.ALCHEMY_CONCURRENT, "With image jobs", "Alchemy forms run while image jobs run."
             ),
         ),
     ),
@@ -352,8 +358,8 @@ class BenchmarkView(VerticalScroll):
             yield Label("Model tiers", classes="adv-group")
             yield Static(
                 Text(
-                    "Model families to benchmark, in order. sd15/sdxl are the common path; flux/qwen are very "
-                    "large and auto-skip if they do not fit this machine.",
+                    "Model families to benchmark, in order. Most workers serve SD 1.5 and SDXL. Flux and Qwen "
+                    "are very large and are skipped if they do not fit this machine.",
                     style="grey50",
                 ),
                 classes="adv-section-help",
@@ -370,24 +376,23 @@ class BenchmarkView(VerticalScroll):
                     "Soak (min)",
                     "benchmark-soak",
                     "5",
-                    "How long the post-ramp sustained-load soak runs.",
+                    "Minutes the sustained-load check runs after the levels finish.",
                 )
                 yield self._switch_row(
                     "Validate",
                     "benchmark-validate",
                     default=True,
-                    help_text="Run the post-ramp soak that proves the suggested config holds under load.",
+                    help_text="After the levels, run the suggested config under sustained load to check it holds.",
                 )
                 yield self._switch_row(
                     "Downloads",
                     "benchmark-downloads",
                     default=False,
-                    help_text="Include the level that fetches a lora from CivitAI (needs network + a token).",
+                    help_text="Include the level that fetches a lora from CivitAI. It needs the network and a token.",
                 )
                 yield Static(
                     Text(
-                        "Capabilities to measure. Each is separate: turn off any you do not run, and only its "
-                        "levels are skipped.",
+                        "Capabilities to measure. Turning one off skips only its levels.",
                         style="grey50",
                     ),
                     classes="adv-section-help",
@@ -405,7 +410,7 @@ class BenchmarkView(VerticalScroll):
                     "Force",
                     "benchmark-force",
                     default=False,
-                    help_text="Attempt levels that do not fit this machine (insufficient VRAM/disk) or lack a token.",
+                    help_text="Run levels the plan would skip for too little VRAM or disk, or for a missing token.",
                 )
                 yield self._switch_row(
                     "Verbose",
@@ -418,7 +423,7 @@ class BenchmarkView(VerticalScroll):
         # run leads with the live progress), with the per-level table and the full resource breakdown each
         # tucked behind a collapsible. update_view expands the table only in the Preview phase.
         yield Static(id="benchmark-plan-summary")
-        with Collapsible(title="Plan: what runs on each level", collapsed=False, id="benchmark-plan-detail"):
+        with Collapsible(title="Plan by level", collapsed=False, id="benchmark-plan-detail"):
             yield Static(id="benchmark-plan-table")
             with Collapsible(
                 title="Resource detail (VRAM, disk, network, key, controlnet)",
@@ -452,33 +457,36 @@ class BenchmarkView(VerticalScroll):
     def _guided_steps() -> Panel:
         """The plan-first guided path shown above the controls, in plain language."""
         body = Text.assemble(
-            ("New to benchmarking? Follow these steps:\n\n", "bold"),
+            ("Steps for a first benchmark\n\n", "bold"),
             ("1. ", "bold cyan"),
             ("Preview plan", "bold"),
-            (" - see what each level needs and what will run on this machine. No GPU, no risk.\n", "grey70"),
+            (
+                ". Shows what each level needs and which levels will run on this machine. It does not use the GPU.\n",
+                "grey70",
+            ),
             ("2. ", "bold cyan"),
             ("Download models", "bold"),
             (
-                " - fetch any checkpoints the plan says you are missing, so the timed run is not slowed by "
-                "downloading mid-benchmark. Skip this if the plan shows nothing to download.\n",
+                ". Fetches the models the plan lists as missing, so the timed run does not wait on downloads. "
+                "Skip this if the plan shows nothing to download.\n",
                 "grey70",
             ),
             ("3. ", "bold cyan"),
             ("Run benchmark", "bold"),
             (
-                " - measures the worker (this stops the worker; it needs the GPU) and suggests a tuned config.\n",
+                ". Runs the levels and suggests settings. The worker stops taking jobs and releases the GPU "
+                "while the benchmark runs.\n",
                 "grey70",
             ),
             ("4. ", "bold cyan"),
             ("Apply suggested config", "bold"),
-            (" - write the recommendation into bridgeData.yaml.\n\n", "grey70"),
-            ("Open ", "grey70"),
+            (". Writes the suggested settings into bridgeData.yaml and restarts the worker.\n\n", "grey70"),
             ("Advanced options", "italic"),
-            (" only if you want to narrow the run. ", "grey70"),
+            (" narrows the run. ", "grey70"),
             ("History", "italic"),
-            (" reviews and compares past runs.", "grey70"),
+            (" shows past runs and compares a run with the one before it.", "grey70"),
         )
-        return Panel(body, title="How this works", title_align="left", border_style="cyan")
+        return Panel(body, title="Benchmark steps", title_align="left", border_style="cyan")
 
     def on_mount(self) -> None:
         """Load the persisted benchmark status and render the initial idle view."""
@@ -590,7 +598,7 @@ class BenchmarkView(VerticalScroll):
                 parts.append(("   →   ", "grey42"))
         return Panel(
             Text.assemble(*parts),
-            title="Benchmark · auto-tune this worker",
+            title="Benchmark",
             title_align="left",
             border_style="cyan",
         )
@@ -722,7 +730,7 @@ class BenchmarkView(VerticalScroll):
         spinner = _SPINNER[frame % len(_SPINNER)]
         elapsed = 0.0 if self._plan_computing_since is None else time.monotonic() - self._plan_computing_since
         return Text(
-            f"{spinner} Computing the plan (detecting your hardware; no worker is started)… {elapsed:.0f}s",
+            f"{spinner} Computing the plan from the detected hardware. The worker is not started… {elapsed:.0f}s",
             style="yellow",
         )
 
@@ -898,11 +906,11 @@ class BenchmarkView(VerticalScroll):
         A features-only download (controlnet checkpoints / annotators, fetched via the aux pass) has no named
         image models to count, so it reads as a plain in-progress message rather than an ``N of M`` tally.
         """
-        progress = f"; {state.ready} of {state.total} downloaded. " if state.total else "in the background. "
+        progress = f", {state.ready} of {state.total} downloaded. " if state.total else " to download. "
         return Text.assemble(
-            ("⏳ Waiting for benchmark models ", "bold yellow"),
+            ("⏳ Waiting for benchmark models", "bold yellow"),
             (progress, "yellow"),
-            ("Track progress on the Downloads tab; Run is held until they finish.", "grey70"),
+            ("The Downloads tab shows progress. Run the benchmark when they finish.", "grey70"),
         )
 
     def _update_buttons(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> None:
@@ -932,7 +940,7 @@ class BenchmarkView(VerticalScroll):
         availability = benchmark_status_summary(state, current_version=__version__)
 
         if availability is BenchmarkAvailability.NONE:
-            summary = Text("No benchmark on record; run one to auto-tune this worker.", style="yellow")
+            summary = Text("No benchmark has been run. A run suggests settings for this worker.", style="yellow")
         else:
             benchmark = state.last_benchmark
             assert benchmark is not None  # NONE is the only case with no record
@@ -953,8 +961,8 @@ class BenchmarkView(VerticalScroll):
             summary.append("\n")
             summary.append_text(
                 Text.from_markup(
-                    f"[grey62]known-good[/] {known_good.source.value} on v{known_good.worker_version} "
-                    "- restorable below",
+                    f"[grey62]known-good[/] {known_good.source.value} on v{known_good.worker_version}, "
+                    "restored by Restore last-known-good",
                 ),
             )
         return summary
@@ -990,19 +998,19 @@ class BenchmarkView(VerticalScroll):
         """The pre-run message: recommend Preview plan first, before committing the GPU."""
         body = Text.assemble(
             (
-                "A benchmark ramps the worker through safe difficulty levels, suggests a tuned bridgeData, "
-                "and flags robustness problems.\n\n",
+                "A benchmark runs test jobs of increasing difficulty and suggests settings for bridgeData.yaml. "
+                "It also reports crashes, out-of-memory errors, lost jobs and process restarts.\n\n",
                 "grey70",
             ),
             ("Start with ", "grey70"),
             ("Preview plan", "bold cyan"),
             (
-                ": it shows what each level needs and what will run on this machine, without starting the "
-                "worker or using the GPU. When you are ready, ",
+                ". It shows what each level needs and which levels will run on this machine, without starting "
+                "the worker or using the GPU. ",
                 "grey70",
             ),
             ("Run benchmark", "bold green"),
-            (" stops the worker and measures it for real.", "grey70"),
+            (" then runs the levels. The worker stops taking jobs and releases the GPU for the run.", "grey70"),
         )
         return Panel(body, title="Benchmark", title_align="left", border_style="cyan")
 
@@ -1019,8 +1027,11 @@ class BenchmarkView(VerticalScroll):
             (f"{spinner} ", "bold yellow"),
             (run_state.startup_phase or "Starting…", "yellow"),
             "\n\n",
-            ("This can take a minute on a cold start (importing the inference stack and probing the GPU). ", "grey70"),
-            ("Live detail is written to the run's ", "grey70"),
+            (
+                "The first start can take a minute while the benchmark loads its libraries and checks the GPU. ",
+                "grey70",
+            ),
+            ("The detail is in the run's ", "grey70"),
             ("console.log", "grey85"),
             (".", "grey70"),
         )
@@ -1117,10 +1128,10 @@ class BenchmarkView(VerticalScroll):
     @staticmethod
     def _render_suggestion(run_state: BenchmarkRunState) -> Panel:
         """The recommended bridgeData, its run totals, and the per-setting provenance behind each value."""
-        findings = f"  ·  {run_state.num_findings} robustness findings" if run_state.num_findings else ""
+        findings = f"  ·  {run_state.num_findings} findings" if run_state.num_findings else ""
         header = Text.from_markup(
             f"[bold]{run_state.levels_passed}/{run_state.levels_total}[/] levels passed{findings}\n"
-            "Press [bold green]Apply suggested config[/] to write these into bridgeData.yaml.\n",
+            "Press [bold green]Apply suggested config[/] to write these settings into bridgeData.yaml.\n",
         )
         sections: list[RenderableType] = [header, Text(run_state.suggested_bridge_data_yaml, style="grey82")]
         if run_state.suggestion_decisions:

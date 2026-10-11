@@ -187,7 +187,7 @@ async def test_live_in_flight_shows_downloading_and_is_not_offered() -> None:
         assert modal._missing_model_names() == []
         start = modal.query_one("#download-start", Button)
         assert start.disabled is True
-        assert "Worker is fetching these" in str(start.label)  # distinct from "you have everything"
+        assert "Already downloading" in str(start.label)  # distinct from "you have everything"
 
 
 async def test_mixed_live_state_offers_only_the_genuinely_missing() -> None:
@@ -203,7 +203,7 @@ async def test_mixed_live_state_offers_only_the_genuinely_missing() -> None:
         assert modal._missing_model_names() == ["C"]
         start = modal.query_one("#download-start", Button)
         assert start.disabled is False
-        assert "Request 1 model(s)" in str(start.label)
+        assert "Request 1 model (" in str(start.label)
 
 
 async def test_delegate_requests_only_models_not_already_in_flight() -> None:
@@ -242,7 +242,7 @@ async def test_no_live_state_falls_back_to_the_offline_scan() -> None:
         assert modal._missing_model_names() == ["A"]
         start = modal.query_one("#download-start", Button)
         assert start.disabled is False
-        assert "Request 1 model(s)" in str(start.label)
+        assert "Request 1 model (" in str(start.label)
 
 
 async def test_a_raising_live_state_reader_falls_back_to_the_scan() -> None:

@@ -159,28 +159,28 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--host",
         type=str,
         default=None,
-        help=f"Address to bind the web server (default {DEFAULT_HOST}; ${HOST_ENV_VAR} then "
-        f"{CONFIG_HOST_KEY} in bridgeData.yaml are the fallbacks). "
-        "Use 0.0.0.0 to expose on the LAN (unauthenticated; opt-in).",
+        help=f"Address the web server binds (default {DEFAULT_HOST}). Falls back to ${HOST_ENV_VAR}, then "
+        f"{CONFIG_HOST_KEY} in bridgeData.yaml. "
+        "0.0.0.0 serves the dashboard to the local network without authentication.",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help=f"Web server port (default {DEFAULT_PORT}; ${PORT_ENV_VAR} then {CONFIG_PORT_KEY} in "
-        "bridgeData.yaml are the fallbacks).",
+        help=f"Web server port (default {DEFAULT_PORT}). Falls back to ${PORT_ENV_VAR}, then {CONFIG_PORT_KEY} "
+        "in bridgeData.yaml.",
     )
     parser.add_argument(
         "--host-port",
         type=int,
         default=None,
-        help=f"Worker-host socket port (default {sp.DEFAULT_HOST_PORT}; ${HOST_PORT_ENV_VAR} overrides).",
+        help=f"Worker-host socket port (default {sp.DEFAULT_HOST_PORT}). Falls back to ${HOST_PORT_ENV_VAR}.",
     )
     parser.add_argument("--no-browser", action="store_true", help="Do not open any window automatically.")
     parser.add_argument(
         "--status",
         action="store_true",
-        help="Report whether a worker host is already running (and its status), then exit.",
+        help="Report whether a worker host is running and its status, then exit.",
     )
     parser.add_argument(
         "--stop",
@@ -196,10 +196,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--process-mode",
         choices=("real", "fake"),
         default="real",
-        help="Worker mode: 'fake' serves a synthetic worker for demos.",
+        help="Worker mode. 'fake' runs a synthetic worker for demos.",
     )
-    parser.add_argument("--config", type=str, default=None, help="Forwarded to the dashboard: bridgeData.yaml path.")
-    parser.add_argument("-e", "--load-config-from-env-vars", action="store_true", help="Worker reads AIWORKER_* env.")
+    parser.add_argument("--config", type=str, default=None, help="Path to bridgeData.yaml, passed to the dashboard.")
+    parser.add_argument(
+        "-e",
+        "--load-config-from-env-vars",
+        action="store_true",
+        help="The worker reads its config from AIWORKER_* environment variables.",
+    )
     parser.add_argument("--amd", "--amd-gpu", action="store_true", help="Enable AMD GPU optimisations on the worker.")
     parser.add_argument("-n", "--worker-name", type=str, default=None, help="Override the worker name.")
     parser.add_argument("--directml", type=int, default=None, help="Enable directml on the given device index.")
@@ -228,7 +233,8 @@ def _resolve_port(arg_port: int | None, config: Mapping[str, object]) -> int:
         # The launcher reads the YAML directly rather than through reGenBridgeData, so a bad value here
         # has had no schema to bounce off. Saying so and carrying on beats refusing to open a dashboard.
         print(
-            f"Ignoring {CONFIG_PORT_KEY}={configured_port!r} in the config: not a port number. Using {DEFAULT_PORT}.",
+            f"Ignoring {CONFIG_PORT_KEY}={configured_port!r} in the config because it is not a port number. "
+            f"Using {DEFAULT_PORT}.",
             file=sys.stderr,
         )
         return DEFAULT_PORT
@@ -244,7 +250,7 @@ def _load_dashboard_config(config_path: str | None) -> Mapping[str, object]:
     try:
         loaded = config_form.load_config(path)
     except (OSError, YAMLError) as read_error:
-        print(f"Could not read {path} for dashboard settings ({read_error}); using defaults.", file=sys.stderr)
+        print(f"Could not read {path} for dashboard settings ({read_error}). Using defaults.", file=sys.stderr)
         return {}
     return loaded if isinstance(loaded, Mapping) else {}
 
@@ -1065,14 +1071,14 @@ def _wind_down_launcher(
     session its quit message and waits for it. If that cooperative path wedges, only the registered session
     shell trees are terminated; browsers were never registered and cannot be selected by this fallback.
     """
-    print("Worker host has exited; closing the dashboard launcher.", file=sys.stderr)
+    print("The worker host has exited. Closing the dashboard launcher.", file=sys.stderr)
     server.request_threadsafe_exit()
     if server.wait_stopped(graceful_timeout):
         return
     terminated = session_processes.terminate_all()
     if terminated:
         print(
-            f"Dashboard sessions did not exit within {graceful_timeout:.1f}s; terminated session roots {terminated}.",
+            f"Dashboard sessions did not exit within {graceful_timeout:.1f}s. Ended their processes {terminated}.",
             file=sys.stderr,
         )
     if server.wait_stopped(_DASHBOARD_SESSION_KILL_GRACE_SECONDS):
@@ -1136,7 +1142,7 @@ def _request_host_stop(address: tuple[str, int], *, timeout: float = 5.0) -> int
     except OSError:
         print(f"No worker host is running on {address[0]}:{address[1]}.")
         return 1
-    print(f"Asked the worker host on {address[0]}:{address[1]} to stop; it drains in-flight jobs first.")
+    print(f"Asked the worker host on {address[0]}:{address[1]} to stop. It finishes jobs in progress first.")
     return 0
 
 
@@ -1227,13 +1233,13 @@ def main(argv: list[str] | None = None) -> None:
     forced_serve = args.no_browser or remote_exposed
     if not _is_graphical_environment() and not forced_serve:
         if sys.stdout.isatty():
-            print("No graphical display detected; opening the in-terminal dashboard instead of a browser.")
+            print("No graphical display detected. Opening the dashboard in this terminal instead of a browser.")
             _run_terminal_fallback(args)
             return
         print(
             "No graphical display and no interactive terminal were detected, so the web dashboard cannot "
             "be shown here. Use '--headless' to run the worker with no UI, or '--host 0.0.0.0' to serve "
-            "the dashboard for a browser on another machine (unauthenticated; opt-in).",
+            "the dashboard to a browser on another machine, without authentication.",
             file=sys.stderr,
         )
         raise SystemExit(1)

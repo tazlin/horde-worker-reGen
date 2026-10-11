@@ -87,7 +87,7 @@ def test_no_residency_rows_without_reported_components() -> None:
     """A process that reported no residency shows neither the Resident nor the Retained row."""
     text = _render(LiveView()._render_process_panel(_process("INFERENCE_STARTING")))
     assert "Resident" not in text
-    assert "Retained" not in text
+    assert "Other RAM" not in text
 
 
 def test_residency_rows_list_components_and_retained_remainder() -> None:
@@ -106,8 +106,8 @@ def test_residency_rows_list_components_and_retained_remainder() -> None:
     assert "checkpoint" in text
     assert "vae" in text
     # Retained = 5000 MB RSS minus the listed 2760 MB approximation.
-    assert "Retained" in text
-    assert "unattributed" in text
+    assert "Other RAM" in text
+    assert "outside the components listed" in text
     assert human_mb(5000 - 2760) in text
 
 
@@ -121,7 +121,7 @@ def test_retained_row_floors_at_zero_when_listing_exceeds_rss() -> None:
 
     text = _render(LiveView()._render_process_panel(process))
 
-    assert "Retained" in text
+    assert "Other RAM" in text
     assert human_mb(0) in text
 
 
@@ -166,7 +166,7 @@ def test_fresh_snapshot_has_no_banner() -> None:
 def test_quiet_work_heartbeat_is_rendered_as_expected_quiet_work() -> None:
     """A model download can block without child heartbeats, so the panel should not imply a dead process."""
     text = LiveView._heartbeat_text(12.0, True, "DOWNLOADING_MODEL").plain
-    assert text == "working quietly for 12.0s"
+    assert text == "12.0s ago (normal while starting or loading)"
 
 
 def test_sampling_stale_heartbeat_still_warns() -> None:

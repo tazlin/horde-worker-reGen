@@ -261,7 +261,7 @@ def test_annotator_preload_renders_as_a_setup_step_not_a_progress_bar() -> None:
         current=CurrentDownloadStatus(model_name="annotators", feature="ControlNet annotators", target_dir="/m"),
     )
     text = _render(DownloadsView()._render_current(downloads))
-    assert "one-time setup" in text  # explained as a setup step, not a download
+    assert "Setting up the ControlNet annotators" in text  # explained as a setup step, not a download
     assert "█" not in text and "░" not in text  # and never as a (frozen) progress bar
 
 
@@ -334,7 +334,7 @@ def test_readiness_panel_surfaces_missing_deps_hint() -> None:
     with console.capture() as capture:
         console.print(DownloadsView()._render_readiness(summary))
     text = capture.get()
-    assert "missing deps" in text
+    assert "not installed" in text
     assert "post-processing" in text
 
 

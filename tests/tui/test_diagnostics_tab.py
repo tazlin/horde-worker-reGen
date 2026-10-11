@@ -107,7 +107,7 @@ async def _wait_for_analysis(pilot: object, view: DiagnosticsView) -> str:
     for _ in range(100):
         await pilot.pause()  # type: ignore[attr-defined]
         status = _text(view.query_one("#diag-status", Static))
-        if not view._run_in_flight and ("finding(s)" in status or "No worker sessions" in status):
+        if not view._run_in_flight and (" finding" in status or "No worker sessions" in status):
             return status
         await asyncio.sleep(0.02)
     raise AssertionError("diagnostics analysis did not complete")
@@ -137,7 +137,7 @@ async def test_diagnostics_tab_renders_findings(tmp_path: Path, monkeypatch: pyt
         status = await _run_and_wait(pilot, view)
 
         # The latest session (#1, two findings) is shown by default; the selector lists both sessions.
-        assert "Session #1" in status and "2 finding(s)" in status
+        assert "Session #1" in status and "2 findings" in status
         assert view._diagnoses == results
         select = view.query_one("#diag-session", Select)
         assert select.disabled is False

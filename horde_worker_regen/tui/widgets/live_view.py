@@ -123,7 +123,9 @@ class LiveView(VerticalScroll):
         governance = self._render_governance_strip(snapshot.scheduling_governance, detailed=detailed)
         if not snapshot.processes:
             body.update(
-                Group(governance, Text(""), Text("Waiting for the first worker snapshot…", style="italic grey62"))
+                Group(
+                    governance, Text(""), Text("Waiting for the worker's first status update…", style="italic grey62")
+                )
             )
             return
 
@@ -142,7 +144,7 @@ class LiveView(VerticalScroll):
         content.extend(panels)
         if stale:
             banner = Text(
-                f"⚠ Live data is {snapshot_age:.0f}s old; the worker may be busy, hung, or restarting.",
+                f"⚠ Live data is {snapshot_age:.0f}s old. The worker may be busy, hung or restarting.",
                 style="bold yellow",
             )
             body.update(Group(banner, Text(""), *content))
@@ -212,16 +214,16 @@ class LiveView(VerticalScroll):
 
         if not ram.measured:
             ram_label = Text("pending", style="grey50")
-            ram_detail = "waiting for governor tick"
+            ram_detail = "waiting for the first RAM reading"
         elif ram.under_pressure:
             ram_label = Text("pressure", style="red")
             ram_detail = ram.reason
         elif ram.pop_hold_active:
             ram_label = Text("holding", style="yellow")
-            ram_detail = ram.reason or "pop hold active"
+            ram_detail = ram.reason or "new jobs are held"
         else:
             ram_label = Text("ok", style="green")
-            ram_detail = ram.reason or "above RAM floor"
+            ram_detail = ram.reason or "enough free RAM"
 
         decision_style = LiveView._preload_decision_style(preload.decision)
         decision = LiveView._preload_decision_label(preload.decision)
@@ -241,9 +243,9 @@ class LiveView(VerticalScroll):
                 reclaim.append("draining p" + ", p".join(str(pid) for pid in ram.draining_process_ids))
             if ram.shed_card_indices:
                 reclaim.append("shed GPU " + ", ".join(str(index) for index in ram.shed_card_indices))
-            intake = "pop hold on" if ram.pop_hold_active else "pop hold off"
+            intake = "holding new jobs" if ram.pop_hold_active else "taking new jobs"
             if ram.pop_pause_active:
-                intake += f"; hard pause {human_duration(ram.pop_pause_remaining_seconds)}"
+                intake += f", paused for {human_duration(ram.pop_pause_remaining_seconds)}"
             gate = preload.reason or "-"
             table.add_row("Intake", Text(intake, style="grey62"), "Gate", Text(gate, style="grey62"))
             table.add_row("Reclaim", Text("; ".join(reclaim) if reclaim else "none active", style="grey62"), "", "")
@@ -346,7 +348,7 @@ class LiveView(VerticalScroll):
                 self._heartbeat_text(heartbeat_age, process.is_alive, process.last_process_state),
             )
             if process.is_busy:
-                body.add_row("HB type", process.last_heartbeat_type.replace("_", " ").title())
+                body.add_row("Heartbeat type", process.last_heartbeat_type.replace("_", " ").title())
         # A running tally so a healthy-but-quiet process (the safety process especially, whose checks
         # are each over in milliseconds) visibly does work rather than looking parked.
         if process.process_type == "SAFETY":
@@ -384,20 +386,18 @@ class LiveView(VerticalScroll):
         # The port comes with the rendered command line, so a backend the worker has not obtained yet has
         # no port to name and the line says which of the two situations the row is in.
         backend_line = (
-            f"{detail.kind}, program not yet obtained"
-            if detail.port is None
-            else f"{detail.kind} on port {detail.port}"
+            f"{detail.kind}, program not ready yet" if detail.port is None else f"{detail.kind} on port {detail.port}"
         )
         body.add_row("Backend", backend_line)
         if detail.provision_error is not None:
-            body.add_row("Not obtained", detail.provision_error)
+            body.add_row("Program error", detail.provision_error)
         if process.os_pid is not None:
             body.add_row("OS pid", str(process.os_pid))
         if detail.context_length is not None:
             generation_cap = "" if detail.max_length is None else f"   (up to {detail.max_length:,} generated)"
             body.add_row("Context", f"{detail.context_length:,} tokens{generation_cap}")
         if detail.active_requests or detail.queued_requests:
-            body.add_row("Requests", f"{detail.active_requests} in flight, {detail.queued_requests} queued")
+            body.add_row("Requests", f"{detail.active_requests} running, {detail.queued_requests} queued")
         if detail.tokens_per_second is not None:
             body.add_row("Throughput", f"{detail.tokens_per_second:.1f} tokens/s")
         # Labelled a measurement, not an allocator reading: it is the card's free-VRAM drop across the
@@ -459,7 +459,7 @@ class LiveView(VerticalScroll):
         body.add_row("Resident", resident_text)
 
         retained_mb = max(0.0, process.ram_usage_bytes / 1024 / 1024 - listed_mb)
-        body.add_row("Retained", Text(f"{human_mb(retained_mb)} unattributed", style="grey54"))
+        body.add_row("Other RAM", Text(f"{human_mb(retained_mb)} outside the components listed", style="grey54"))
 
     @staticmethod
     def _state_colour(state: str) -> str:
@@ -480,7 +480,7 @@ class LiveView(VerticalScroll):
         if age is None:
             return Text("-", style="grey62")
         if state in _EXPECTED_QUIET_STATES:
-            return Text(f"working quietly for {age:.1f}s", style="grey70" if age < 30 else "yellow")
+            return Text(f"{age:.1f}s ago (normal while starting or loading)", style="grey70" if age < 30 else "yellow")
         if age < 5:
             colour = "green"
         elif age < 15:

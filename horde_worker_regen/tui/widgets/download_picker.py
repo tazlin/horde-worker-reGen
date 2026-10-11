@@ -95,8 +95,8 @@ class DownloadPickerModal(ResponsiveModalScreen["DownloadSelection | None"]):
             else:
                 yield Static(
                     Text(
-                        "No configured models resolved yet. Open the Config → Models tab and press Resolve, "
-                        "then reopen this picker.",
+                        "The configured model list is not resolved yet. Open the Config → Models tab, press "
+                        "Resolve, then reopen this picker.",
                         style="yellow",
                     ),
                     id="download-picker-list",
@@ -117,8 +117,8 @@ class DownloadPickerModal(ResponsiveModalScreen["DownloadSelection | None"]):
             ("Choose models to download\n\n", "bold"),
             (
                 "These are the models this configuration would load. The "
-                f"{missing} not yet on disk are pre-selected. Downloading does not start inference or use "
-                "the GPU; the worker stays in a download-only hold until you press Go live.",
+                f"{missing} not yet on disk are pre-selected. Downloading does not use the GPU. "
+                "The worker takes no jobs while it downloads, until you press Go live.",
                 "grey70",
             ),
         )

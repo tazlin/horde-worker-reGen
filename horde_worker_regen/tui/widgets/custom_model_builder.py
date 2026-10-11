@@ -87,7 +87,7 @@ class CustomModelBuilderModal(ResponsiveModalScreen[CustomModelBuilderResult | N
                     baseline_options, value="stable_diffusion_1", allow_blank=False, id="custom-model-baseline"
                 )
                 yield Static(
-                    "Choose the closest architecture family; it controls scheduling and compatibility.",
+                    "Choose the closest architecture family. It controls scheduling and compatibility.",
                     classes="builder-help",
                 )
             with Vertical(classes="builder-field"):

@@ -107,7 +107,9 @@ class StatsView(Vertical):
         self._snapshot = snapshot
         if snapshot is None:
             placeholder = Panel(
-                Text("Waiting for worker snapshot.", style="grey62"), title="Stats", border_style="grey37"
+                Text("Waiting for the worker's first status update.", style="grey62"),
+                title="Stats",
+                border_style="grey37",
             )
             self.query_one("#stats-headlines", Static).update(placeholder)
             return
@@ -214,7 +216,7 @@ class StatsView(Vertical):
         lines.append(Text.assemble(("Stats files ", "grey50"), (human_bytes(export.bytes_in_stats_files), "grey70")))
         if export.warning_over_50_mib:
             lines.append(
-                Text("Stats JSONL files exceed 50 MiB; remove old files when you no longer need them.", style="yellow")
+                Text("The stats JSONL files are over 50 MiB. Delete old ones you no longer need.", style="yellow")
             )
         if export.last_write_error:
             lines.append(Text(f"Last write error: {export.last_write_error}", style="red"))
@@ -283,7 +285,7 @@ class StatsView(Vertical):
         """Format a lane's matches, pop rate, and resident subset, or a dash before any pop."""
         if pops <= 0:
             return "-"
-        return f"{matches:,} / {pops:,} matched ({matches / pops * 100:.0f}%); {resident_hits:,} resident"
+        return f"{matches:,} / {pops:,} matched ({matches / pops * 100:.0f}%), {resident_hits:,} resident"
 
     @staticmethod
     def _render_rollups(
@@ -311,7 +313,7 @@ class StatsView(Vertical):
         table.add_column("Batch>1", justify="right")
         any_seated_shown = False
         if not rows:
-            empty = ["no finalized image jobs yet"] + ([""] if is_model_table else []) + ["", "", "", "", ""]
+            empty = ["no finished image jobs yet"] + ([""] if is_model_table else []) + ["", "", "", "", ""]
             table.add_row(*empty)
         else:
             for row in rows:
@@ -392,7 +394,7 @@ class StatsView(Vertical):
         table.add_column("Total E2E", justify="right")
         table.add_column("Peak VRAM", justify="right")
         if not rows:
-            table.add_row("no finalized alchemy forms yet", "", "", "", "", "", "")
+            table.add_row("no finished alchemy forms yet", "", "", "", "", "", "")
         else:
             for row in rows:
                 average = row.e2e_seconds / row.jobs if row.jobs else 0.0

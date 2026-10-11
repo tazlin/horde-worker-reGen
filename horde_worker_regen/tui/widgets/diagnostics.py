@@ -184,9 +184,9 @@ class DiagnosticsView(Vertical):
     def on_mount(self) -> None:
         """Show the idle hint, and tick a clock so the analysis age (and staleness) stays current."""
         self.query_one("#diag-maintenance-clock").display = False
-        self._set_status("Choose a scope, then press Run analysis (works whether or not the worker is running).")
+        self._set_status("Choose a scope, then press Run analysis. The worker does not need to be running.")
         self._show_results_message(
-            Text("No analysis yet; press Run analysis to triage the worker logs.", style="grey50"),
+            Text("No analysis yet. Press Run analysis to check the worker logs.", style="grey50"),
         )
         # A 1s tick keeps the "now" clock and the age/staleness readout live without re-parsing; it only
         # rewrites a one-line Static, so it is cheap even while the tab is in the background.
@@ -224,7 +224,7 @@ class DiagnosticsView(Vertical):
         """Show that the chosen scope is not applied until Run analysis is pressed."""
         label = _SCOPE_LABELS.get(scope, scope)
         if self._analyzed_scope is not None and scope != self._analyzed_scope:
-            self._set_status(f"Scope changed to '{label}'; press Run analysis to apply it.", style="bold yellow")
+            self._set_status(f"Scope changed to '{label}'. Press Run analysis to apply it.", style="bold yellow")
         else:
             self._set_status(f"Scope: {label}. Press Run analysis to run.")
 
@@ -375,7 +375,7 @@ class DiagnosticsView(Vertical):
         position = "latest" if is_latest and not is_benchmark_run else session_label(session)
         version = f"v{session.version}" if session.version else "v?"
         worst = self._worst_severity(diagnosis)
-        flag = f"; {worst.value}" if worst is not None else ""
+        flag = f"  {worst.value}" if worst is not None else ""
         return f"{position}  {version}  ({session.end_reason}){flag}"
 
     @staticmethod
@@ -387,16 +387,20 @@ class DiagnosticsView(Vertical):
         """Render the findings for the session with ``session_key`` from the cache."""
         diagnosis = next((d for d in self._diagnoses if _session_key(d.session) == session_key), None)
         if diagnosis is None:
-            self._show_results_message(Text("Session no longer available; run analysis again.", style="grey50"))
+            self._show_results_message(
+                Text("This session is no longer available. Run analysis again.", style="grey50")
+            )
             return
         session = diagnosis.session
         scope_label = _SCOPE_LABELS.get(self._analyzed_scope or "", "")
+        count = len(diagnosis.findings)
         self._set_status(
-            f"Session {session_label(session)} ({session.end_reason}); {len(diagnosis.findings)} finding(s). "
-            f"Scope: {scope_label}. Change scope or Run analysis to refresh.",
+            f"Session {session_label(session)} ({session.end_reason}), "
+            f"{count} {'finding' if count == 1 else 'findings'}. "
+            f"Scope: {scope_label}. Press Run analysis to refresh.",
         )
         if not diagnosis.findings:
-            self._show_results_message(Text("No findings; this session looks clean.", style="green"))
+            self._show_results_message(Text("No findings in this session.", style="green"))
             return
         self.query_one("#diag-results-message", Static).display = False
         # Removal is asynchronous in Textual; mounting straight after it would race the removal and show the
@@ -452,7 +456,7 @@ class DiagnosticsView(Vertical):
             line = Text()
             line.append(" STALE ", style="bold white on red")
             line.append(
-                f"  analysis is {human_duration(age)} old (>5 min); press Run analysis to refresh.  ",
+                f"  analysis is {human_duration(age)} old (>5 min). Press Run analysis to refresh.  ",
                 style="bold yellow",
             )
             line.append(f"Analyzed {analyzed_text} · now {now_text}", style="yellow")

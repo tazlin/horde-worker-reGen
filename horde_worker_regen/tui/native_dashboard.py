@@ -445,7 +445,7 @@ class NativeDashboardBridge:
             return NativeActionResult(accepted=True, message="Worker start requested.")
         if action is NativeDashboardAction.STOP:
             self.supervisor.request_graceful_stop()
-            return NativeActionResult(accepted=True, message="Graceful stop requested; in-flight work will drain.")
+            return NativeActionResult(accepted=True, message="Stop requested. Jobs in progress finish first.")
         if action is NativeDashboardAction.PAUSE:
             accepted = self.supervisor.request_pause()
             return NativeActionResult(

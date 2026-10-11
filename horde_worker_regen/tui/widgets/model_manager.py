@@ -167,7 +167,7 @@ class ModelManagerView(Vertical):
             yield Static(id="mm-headline")
             yield VerticalScroll(Static(id="mm-effective-body"), id="mm-effective")
             yield Static(id="mm-warnings")
-            yield Label("Resolution controls", classes="mm-rules-label")
+            yield Label("Model list controls", classes="mm-rules-label")
             with Grid(id="mm-resolution-controls"):
                 with Vertical(classes="mm-control-card"):
                     with Horizontal(id="mm-resolve-row"):
@@ -197,7 +197,7 @@ class ModelManagerView(Vertical):
                 with Vertical(classes="mm-rule-card"):
                     yield Label("Offer list", classes="mm-rules-label")
                     yield Static(
-                        "Start here. Add exact model names or meta rules such as TOP 2 / ALL SDXL. "
+                        "Start here. Add exact model names or meta rules such as TOP 2 or ALL SDXL. "
                         "An empty or missing models_to_load behaves as TOP 2 on an image worker.",
                         classes="mm-rules-help",
                     )
@@ -205,8 +205,8 @@ class ModelManagerView(Vertical):
                 with Vertical(classes="mm-rule-card"):
                     yield Label("Exclusion list", classes="mm-rules-label")
                     yield Static(
-                        "Subtract only. Entries here remove matches from the offer list above; they never add "
-                        "replacement models back into TOP / ALL results.",
+                        "Entries here remove matching models from the offer list. A removed model is not "
+                        "replaced by the next one in a TOP or ALL result.",
                         classes="mm-rules-help",
                     )
                     yield ModelListEditor("models_to_skip", self._skip_values, sibling_values=self._load_editor_values)
@@ -319,7 +319,7 @@ class ModelManagerView(Vertical):
             )
             self.app.call_from_thread(
                 self._set_resolve_status,
-                Text(f"Loaded reference; usage stats unavailable ({error}).", style="yellow"),
+                Text(f"The reference loaded, but usage stats are unavailable ({error}).", style="yellow"),
             )
             return
         self.app.call_from_thread(
@@ -396,7 +396,7 @@ class ModelManagerView(Vertical):
         headline = self.query_one("#mm-headline", Static)
         if not result.catalog_loaded:
             hint = Text("EFFECTIVE MODELS  ", style="bold")
-            hint.append("press Resolve to load the reference and compute what will load.", style="grey62")
+            hint.append("press Resolve to load the reference and list the models that will load.", style="grey62")
             headline.update(hint)
             return
 
@@ -414,11 +414,13 @@ class ModelManagerView(Vertical):
         text.append(verdict, style="green" if fits else "bold red")
         unsized = sum(1 for model in included if model.size_bytes is None)
         if unsized:
-            text.append(f"  ·  {unsized} unsized", style="yellow")
+            text.append(f"  ·  {unsized} of unknown size", style="yellow")
         if self._weights_root:
             text.append(f"\nmodels dir: {self._weights_root}", style="grey50")
         if self._worker_loaded_count is not None:
-            text.append(f"\nWorker currently has {self._worker_loaded_count} model(s) loaded.", style="grey50")
+            loaded = self._worker_loaded_count
+            noun = "model" if loaded == 1 else "models"
+            text.append(f"\nThe worker has {loaded} {noun} loaded.", style="grey50")
         headline.update(text)
 
     def _render_body(self, result: ResolutionResult) -> None:
@@ -427,12 +429,12 @@ class ModelManagerView(Vertical):
         if not result.catalog_loaded:
             lines = Text()
             if result.default_applied:
-                lines.append("No load rules set; the worker would default to 'top 2'.\n", style="grey62")
+                lines.append("The offer list is empty, so the worker uses TOP 2.\n", style="grey62")
             lines.append("The effective list appears here once the reference is loaded.", style="grey50")
             body.update(lines)
             return
         if not result.rows:
-            body.update(Text("Nothing resolved. Add a model or a meta command below.", style="grey50"))
+            body.update(Text("No models match. Add a model or a meta rule below.", style="grey50"))
             return
 
         table = Table.grid(padding=(0, 1))
@@ -472,7 +474,7 @@ class ModelManagerView(Vertical):
         warnings = self.query_one("#mm-warnings", Static)
         text = Text()
         for entry in result.needs_resolve:
-            text.append(f"⟳ '{entry}' not expanded yet; press Resolve.\n", style="dark_orange")
+            text.append(f"⟳ '{entry}' is not expanded yet. Press Resolve.\n", style="dark_orange")
         for warning in result.warnings:
             text.append(f"⚠ {warning}\n", style="yellow")
         warnings.update(text)

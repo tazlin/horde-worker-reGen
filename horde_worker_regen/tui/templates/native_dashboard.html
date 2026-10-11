@@ -95,7 +95,7 @@
     .models { display: flex; flex-wrap: wrap; gap: 7px; }
     .chip { max-width: 100%; padding: 5px 9px; border-radius: 999px; background: #263743; overflow-wrap: anywhere; }
     .messages { margin: 0; padding-left: 20px; color: var(--yellow); }
-    .messages:empty::after { content: "No current API messages."; color: var(--muted); }
+    .messages:empty::after { content: "No messages from the horde."; color: var(--muted); }
     .maintenance-on { color: var(--yellow); }
     .insight { color: var(--text); font-size: 1rem; }
     .insight.attention { color: var(--yellow); }
@@ -347,7 +347,7 @@
       <div>
         <div class="eyebrow">AI Horde Worker</div>
         <h1 id="worker-name">Worker overview</h1>
-        <p class="subline"><span id="identity">Waiting for a worker snapshot…</span><span class="identity-separator"> · </span><span id="uptime">—</span></p>
+        <p class="subline"><span id="identity">Waiting for the worker's first status update…</span><span class="identity-separator"> · </span><span id="uptime">—</span></p>
       </div>
       <div class="header-actions">
         <button class="quiet" id="view-toggle" aria-pressed="false">Glance view</button>
@@ -358,7 +358,7 @@
     <div class="controls" aria-label="Worker controls">
       <button class="primary" id="lifecycle-button" disabled>Start worker</button>
       <button id="pause-button" disabled>Pause locally</button>
-      <span id="maintenance-controls"><button class="warn" id="maintenance-button" disabled>Horde maintenance on</button></span>
+      <span id="maintenance-controls"><button class="warn" id="maintenance-button" disabled>Start Horde maintenance</button></span>
     </div>
     <p class="notice" id="action-notice" aria-live="polite"></p>
 
@@ -366,7 +366,7 @@
       <article class="card"><div class="label">Active / queued</div><div class="value"><span id="active">0</span> / <span id="queued">0</span></div><div class="detail">image jobs</div></article>
       <article class="card"><div class="label">Completed</div><div class="value" id="submitted">0</div><div class="detail"><span id="faulted">0</span> faulted</div></article>
       <article class="card"><div class="label">Kudos / hour</div><div class="value" id="kudos-rate">—</div><div class="detail"><span id="kudos-session">—</span> this session</div></article>
-      <article class="card"><div class="label">GPU duty</div><div class="value" id="gpu-duty">—</div><div class="detail" id="freshness">No snapshot</div></article>
+      <article class="card"><div class="label">GPU duty</div><div class="value" id="gpu-duty">—</div><div class="detail" id="freshness">No data yet</div></article>
     </div>
 
     <div class="body-grid" id="dashboard-body">
@@ -417,7 +417,7 @@
         <div class="facts">
           <div class="fact"><span class="label">Backend</span><b id="text-backend">Not ready</b></div>
           <div class="fact"><span class="label">Model</span><b id="text-model">-</b></div>
-          <div class="fact"><span class="label">In flight</span><b id="text-in-flight">0</b></div>
+          <div class="fact"><span class="label">In progress</span><b id="text-in-flight">0</b></div>
           <div class="fact"><span class="label">Completed / faulted</span><b><span id="text-done">0</span> / <span id="text-faulted">0</span></b></div>
           <div class="fact"><span class="label">Token rate</span><b id="text-rate">not reported</b></div>
         </div>
@@ -436,7 +436,7 @@
       </section>
     </div>
 
-    <footer><span>Basic native protocol view · updates every second</span><a href="/">Open full terminal dashboard</a></footer>
+    <footer><span>Basic view · updates every second</span><a href="/">Open full terminal dashboard</a></footer>
   </main>
   <script>
     (() => {
@@ -509,7 +509,7 @@
           summary = `New work is held by ${holds.join(" and ")}.`;
           attention = true;
         } else if (state.effective_maintenance) {
-          summary = "The worker reports an effective maintenance hold; check the full dashboard for its source.";
+          summary = "The horde answered the last job request with maintenance mode, so no new work arrives.";
           attention = true;
         } else if (offline) {
           summary = `${offline} worker process${offline === 1 ? " is" : "es are"} offline.`;
@@ -518,15 +518,15 @@
           const stages = new Map();
           state.active_jobs.forEach(job => stages.set(job.stage, (stages.get(job.stage) || 0) + 1));
           const busiest = [...stages.entries()].sort((a, b) => b[1] - a[1])[0];
-          summary = `${state.active_jobs.length} active job${state.active_jobs.length === 1 ? "" : "s"}; most work is ${humanState(busiest[0])}.`;
+          summary = `${state.active_jobs.length} active job${state.active_jobs.length === 1 ? "" : "s"}. The most common stage is ${humanState(busiest[0])}.`;
         } else if (state.jobs_queued) {
-          summary = `${state.jobs_queued} queued job${state.jobs_queued === 1 ? " is" : "s are"} waiting for an inference slot.`;
+          summary = `${state.jobs_queued} queued job${state.jobs_queued === 1 ? " is" : "s are"} waiting for a free image process.`;
         } else {
-          summary = "Healthy and waiting for a community request.";
+          summary = "Running and waiting for a job from the horde.";
         }
         const processFact = state.processes_total
           ? `${state.processes_alive}/${state.processes_total} processes alive · ${state.processes_busy} busy`
-          : "process inventory pending";
+          : "Waiting for the process list";
         insight.textContent = `${summary} ${processFact}.`;
         insight.className = `insight${attention ? " attention" : ""}`;
       };
@@ -536,7 +536,7 @@
         configureEntryGrid(jobs, state.active_jobs.length, "--jobs-share");
         setText("active-job-count", formatNumber(state.active_jobs.length));
         if (!state.active_jobs.length) {
-          emptyRow(jobs, state.jobs_queued ? "Jobs are queued but none is executing yet." : "No active jobs.");
+          emptyRow(jobs, state.jobs_queued ? "Jobs are queued. None has started yet." : "No active jobs.");
           return;
         }
         state.active_jobs.forEach(job => {
@@ -627,7 +627,7 @@
           const stateLabel = document.createElement("b");
           stateLabel.textContent = process.alive ? humanState(process.state) : "offline";
           const detail = document.createElement("small");
-          detail.textContent = process.model || (process.busy ? `job ${shortId(process.current_job_id)}` : "No model resident");
+          detail.textContent = process.model || (process.busy ? `job ${shortId(process.current_job_id)}` : "No model loaded");
           detail.title = detail.textContent;
           main.append(stateLabel, detail);
           addProgress(main, process.progress_percent);
@@ -637,7 +637,7 @@
           // freshness is the age of its last health answer, so its meta line is built from those instead.
           const card = process.device_index === null ? "" : `GPU ${process.device_index} · `;
           const vram = process.is_external
-            ? (process.footprint_mb === null ? "VRAM unmeasured" : `${formatNumber(process.footprint_mb)} MB measured`)
+            ? (process.footprint_mb === null ? "VRAM not measured" : `${formatNumber(process.footprint_mb)} MB measured`)
             : (process.vram_total_mb ? `${(process.vram_used_mb / 1024).toFixed(1)}/${(process.vram_total_mb / 1024).toFixed(0)} GB` : `${formatNumber(process.vram_used_mb)} MB`);
           const age = process.is_external ? process.health_age_seconds : process.heartbeat_age_seconds;
           const heartbeat = age === null || age === undefined ? "" : ` · ${Math.round(age)}s`;
@@ -675,7 +675,7 @@
         pill.className = `status ${lifecycle}`;
         setText("status", lifecycle.replaceAll("_", " "));
         setText("worker-name", state.worker_name || "Worker overview");
-        setText("identity", state.worker_version ? `v${state.worker_version}${state.horde_username ? ` · ${state.horde_username}` : ""}` : "Waiting for a worker snapshot…");
+        setText("identity", state.worker_version ? `v${state.worker_version}${state.horde_username ? ` · ${state.horde_username}` : ""}` : "Waiting for the worker's first status update…");
         setText("uptime", state.session_start_time ? `up ${formatDuration(state.server_time - state.session_start_time)}` : "not running");
         setText("active", formatNumber(state.jobs_active));
         setText("queued", formatNumber(state.jobs_queued));
@@ -684,7 +684,7 @@
         setText("kudos-rate", formatNumber(state.kudos_per_hour));
         setText("kudos-session", formatNumber(state.kudos_this_session));
         setText("gpu-duty", state.gpu_duty_percent === null ? "—" : `${Math.round(state.gpu_duty_percent)}%`);
-        setText("freshness", state.snapshot_timestamp ? `updated ${formatDuration(state.server_time - state.snapshot_timestamp)} ago` : "No snapshot");
+        setText("freshness", state.snapshot_timestamp ? `updated ${formatDuration(state.server_time - state.snapshot_timestamp)} ago` : "No data yet");
         setText("pipe-in-hand", `${formatNumber(state.jobs_in_hand)} in hand`);
         setText("pipe-queue", formatNumber(state.jobs_queued));
         setText("pipe-active", formatNumber(state.jobs_active));
@@ -783,7 +783,7 @@
         }
       }
 
-      // Each enabled role is its own worker on the horde with its own maintenance flag. One role keeps the
+      // Each enabled role is a separate worker on the horde with a separate maintenance flag. One role keeps the
       // single button; more than one gets a button per worker plus the all-workers pair, each naming the
       // workload its role serves so the worker addresses the right one.
       function renderMaintenanceControls(state, connected) {
@@ -802,16 +802,16 @@
         };
         container.replaceChildren();
         if (workers.length <= 1) {
-          container.appendChild(button(state.horde_maintenance ? "Horde maintenance off" : "Horde maintenance on",
+          container.appendChild(button(state.horde_maintenance ? "End Horde maintenance" : "Start Horde maintenance",
             state.horde_maintenance ? "maintenance_off" : "maintenance_on", null));
           return;
         }
         workers.forEach(worker => {
-          container.appendChild(button(`${worker.worker_name}: maintenance ${worker.maintenance ? "off" : "on"}`,
+          container.appendChild(button(`${worker.worker_name}: ${worker.maintenance ? "end" : "start"} maintenance`,
             worker.maintenance ? "maintenance_off" : "maintenance_on", worker.workload));
         });
-        container.appendChild(button("All: maintenance on", "maintenance_on", null));
-        container.appendChild(button("All: maintenance off", "maintenance_off", null));
+        container.appendChild(button("All: start maintenance", "maintenance_on", null));
+        container.appendChild(button("All: end maintenance", "maintenance_off", null));
       }
 
       async function perform(action, workload) {

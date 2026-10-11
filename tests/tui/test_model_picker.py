@@ -72,7 +72,7 @@ def test_detail_for_shows_beta_source() -> None:
     beta_model = ModelInfo("Qwen-Image", "qwen_image", nsfw=False, inpainting=False, is_beta=True)
     detail = _render(ModelPickerModal._detail_for(beta_model))
     assert "beta" in detail
-    assert "pending queue" in detail
+    assert "not yet in the main model reference" in detail
 
 
 def test_detail_for_shows_full_record_with_homepage() -> None:
@@ -100,10 +100,10 @@ def test_marker_and_in_config_membership() -> None:
     assert _render(modal._in_config_cell(_MODELS[1])).strip() == "-"
     modal._marked_add.add(_MODELS[1].name)
     assert modal._marker_for(_MODELS[1]) == "✕ Clear"
-    assert _render(modal._in_config_cell(_MODELS[1])).strip() == "add -> load"
+    assert _render(modal._in_config_cell(_MODELS[1])).strip() == "add to load"
     modal._marked_remove.add(_MODELS[0].name)
     assert modal._marker_for(_MODELS[0]) == "✕ Clear"
-    assert _render(modal._in_config_cell(_MODELS[0])).strip() == "remove -> load"
+    assert _render(modal._in_config_cell(_MODELS[0])).strip() == "remove from load"
 
 
 def test_matches_search_spans_metadata() -> None:
@@ -224,11 +224,11 @@ async def test_model_picker_membership_shows_and_blocks_target(monkeypatch: pyte
         modal._toggle(1)  # mark Deliberate for removal
         await pilot.pause()
         assert str(table.get_cell_at(Coordinate(1, 0))) == "✕ Clear"
-        assert _render(table.get_cell_at(Coordinate(1, 2))).strip() == "remove -> load"
+        assert _render(table.get_cell_at(Coordinate(1, 2))).strip() == "remove from load"
 
         modal._toggle(0)  # mark AlbedoBase (not in either list)
         await pilot.pause()
-        assert _render(table.get_cell_at(Coordinate(0, 2))).strip() == "add -> load"
+        assert _render(table.get_cell_at(Coordinate(0, 2))).strip() == "add to load"
         await pilot.click("#picker-add")
         await pilot.pause()
 

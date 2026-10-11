@@ -29,7 +29,7 @@ from horde_worker_regen.tui.responsive import PHONE_BAND_MAX_WIDTH, ResponsiveMo
 
 _NAME_WIDTH = 52
 
-_DIVIDER_NAME = "— known to the reference, no file on offer —"
+_DIVIDER_NAME = "── in the reference with no file ──"
 """The separator row between choosable models and the ones with nothing to load."""
 
 # (header, width) for every table column, in table order.
@@ -240,7 +240,7 @@ class TextModelPickerModal(ResponsiveModalScreen[str | None]):
         text = Text.assemble(
             (f"{len(shown)} shown (of {len(self._all_models)})", "grey70"),
             ("  ·  ", "grey50"),
-            (f"{len(choosable)} with a file on offer", "green" if choosable else "grey70"),
+            (f"{len(choosable)} with a file", "green" if choosable else "grey70"),
         )
         self.query_one("#text-picker-status", Static).update(text)
 
@@ -251,8 +251,8 @@ class TextModelPickerModal(ResponsiveModalScreen[str | None]):
         self._current = model
         if model is None:
             body.update(
-                "The models below this divider are names the reference knows without a file to load, so "
-                "the worker has no artefact to obtain for them."
+                "The reference lists the models below this row without a file, so the worker has nothing "
+                "to download or load for them."
                 if self._visible
                 else "No models match the search.",
             )
@@ -266,11 +266,11 @@ class TextModelPickerModal(ResponsiveModalScreen[str | None]):
         grid.add_column(style="bold cyan", justify="right", no_wrap=True)
         grid.add_column()
         if not model.has_file:
-            grid.add_row("File", Text("none on offer", style="yellow"))
+            grid.add_row("File", Text("none in the reference", style="yellow"))
         else:
             grid.add_row(
                 "File",
-                Text("on disk", style="green") if model.on_disk else Text("will be fetched", style="yellow"),
+                Text("on disk", style="green") if model.on_disk else Text("will download", style="yellow"),
             )
             if model.size_bytes:
                 grid.add_row("Size", human_bytes(model.size_bytes))
@@ -297,7 +297,7 @@ class TextModelPickerModal(ResponsiveModalScreen[str | None]):
             parts.append(Text(""))
             parts.append(
                 Text(
-                    "Nobody has measured this model on this worker, so its VRAM cost is unknown rather than small.",
+                    "This model has no VRAM measurement, so its VRAM use is unknown.",
                     style="grey70",
                 ),
             )
@@ -329,7 +329,7 @@ class TextModelPickerModal(ResponsiveModalScreen[str | None]):
             return
         if not model.has_file:
             self.notify(
-                f"{model.name} has no file on offer, so the worker has nothing to load for it.",
+                f"{model.name} has no file in the reference, so the worker has nothing to load for it.",
                 severity="warning",
             )
             return

@@ -158,7 +158,9 @@ class BenchmarkHistoryModal(ResponsiveModalScreen[None]):
         if index is None:
             return
         if index + 1 >= len(self._summaries):
-            self._set_detail(Text("No earlier run to compare against (this is the oldest run).", style="yellow"))
+            self._set_detail(
+                Text("This is the oldest run, so there is no earlier run to compare it with.", style="yellow")
+            )
             return
         newer = load_report(Path(self._summaries[index].run_dir))
         older = load_report(Path(self._summaries[index + 1].run_dir))
@@ -206,7 +208,7 @@ def _render_comparison(comparison: ReportComparison) -> Table:
         style = "red" if delta > 0 else "green"
         table.add_row(
             "findings",
-            "robustness findings",
+            "total",
             str(comparison.older_findings),
             Text(f"{comparison.newer_findings} ({delta:+d})", style=style),
         )

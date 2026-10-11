@@ -52,9 +52,9 @@ _PHASE_DETAIL: dict[DownloadPhase, str] = {
     DownloadPhase.INITIALIZING: "Fetching the model reference (a network call on first run)…",
     DownloadPhase.SCANNING: "Verifying which configured models are already on disk…",
     DownloadPhase.DOWNLOADING: "Downloading models in the background while the worker serves what it has.",
-    DownloadPhase.IDLE: "All requested models are present; nothing queued.",
-    DownloadPhase.PAUSED: "Downloads are paused; queued work is held until resumed.",
-    DownloadPhase.ERROR: "The download subsystem hit an error (see below).",
+    DownloadPhase.IDLE: "All requested models are on disk. Nothing is queued.",
+    DownloadPhase.PAUSED: "Downloads are paused. Queued models wait until you resume.",
+    DownloadPhase.ERROR: "A download error occurred. The message is below.",
 }
 
 _BAR_WIDTH = 32
@@ -189,7 +189,14 @@ class DownloadsView(VerticalScroll):
         """Lay out the controls row, phase banner, disk-plan panel, current download, queue, failures."""
         with Horizontal(id="downloads-controls", classes="responsive-toolbar"):
             yield Button("Pause downloads", id="downloads-pause")
-            yield Button(_PRIORITY_POLICY_LABEL[DownloadPriorityPolicy.SERVE_FIRST], id="downloads-order")
+            yield Button(
+                _PRIORITY_POLICY_LABEL[DownloadPriorityPolicy.SERVE_FIRST],
+                id="downloads-order",
+                tooltip=(
+                    "Serve first downloads the models the worker needs to start serving before the rest. "
+                    "Parallel downloads models in the order they were queued."
+                ),
+            )
             yield Input(placeholder="rate limit KB/s (0 = off)", id="downloads-rate", type="integer")
             yield Button("Apply limit", id="downloads-rate-apply")
             yield Button("Download only", id="downloads-only-hold")
@@ -283,15 +290,15 @@ class DownloadsView(VerticalScroll):
             detail = Text(
                 f"The configured models need {human_bytes(plan.to_download_bytes)} to download but only "
                 f"{human_bytes(plan.free_disk_bytes)} is free (short by {human_bytes(plan.shortfall_bytes)}). "
-                "Downloads will proceed until the disk fills, then stop with a disk-full error.",
+                "Downloads continue until the disk fills, then stop with a disk-full error.",
                 style="red",
             )
             return Panel(detail, title=title, title_align="left", border_style="red", padding=(0, 1))
 
         if downloads is None:
             detail = Text(
-                "No download process is running. Models load at worker startup; this tab shows the "
-                "configuration's disk plan below once the model reference is loaded.",
+                "No download process is running. Models load when the worker starts. "
+                "The disk plan appears below once the model reference is loaded.",
                 style="grey70",
             )
             return Panel(detail, title="Downloads", title_align="left", border_style="grey37", padding=(0, 1))
@@ -315,8 +322,8 @@ class DownloadsView(VerticalScroll):
         ):
             lines.append(
                 Text(
-                    "ControlNet annotators are downloading and verifying (one-time setup). "
-                    "This can take up to 60 minutes.",
+                    "ControlNet annotators are downloading and being checked. "
+                    "This runs once and can take up to 60 minutes.",
                     style="yellow",
                 )
             )
@@ -393,7 +400,7 @@ class DownloadsView(VerticalScroll):
         if not plan.sizes_complete:
             table.add_row(
                 "Note",
-                Text("some models lack size metadata; totals are a lower bound", style="yellow"),
+                Text("some models have no recorded size, so the totals are a lower bound", style="yellow"),
             )
 
         return Panel(table, title="Disk plan", title_align="left", border_style="grey37", padding=(0, 1))
@@ -427,7 +434,7 @@ class DownloadsView(VerticalScroll):
     _READINESS_STYLE: dict[FeatureReadinessState, tuple[str, str]] = {
         FeatureReadinessState.OFFERED: ("green", "offered"),
         FeatureReadinessState.WAITING: ("yellow", "downloading…"),
-        FeatureReadinessState.MISSING_DEPS: ("red", "missing deps"),
+        FeatureReadinessState.MISSING_DEPS: ("red", "not installed"),
         FeatureReadinessState.DISABLED: ("grey50", "off"),
     }
 
@@ -466,7 +473,7 @@ class DownloadsView(VerticalScroll):
         if not active and downloads is not None and downloads.current is not None:
             active = [downloads.current]
         if not active:
-            body: RenderableType = Text("Nothing downloading right now.", style="grey50")
+            body: RenderableType = Text("Nothing is downloading.", style="grey50")
             return Panel(body, title="Downloading now", title_align="left", border_style="grey37", padding=(0, 1))
 
         rate_limit_kbps = downloads.rate_limit_kbps if downloads is not None else None
@@ -502,8 +509,8 @@ class DownloadsView(VerticalScroll):
                 header,
                 where,
                 Text(
-                    "Preparing controlnet annotators (one-time setup, initialising the inference engine and "
-                    "verifying each preprocessor). This can take several minutes and runs only once.",
+                    "Setting up the ControlNet annotators. The worker loads its image libraries and runs each "
+                    "preprocessor once to check that it works. This shows no progress bar.",
                     style="yellow",
                 ),
             ]
@@ -538,7 +545,7 @@ class DownloadsView(VerticalScroll):
         if rate_limit_kbps and current.speed_bps is not None and current.speed_bps > rate_limit_kbps * 1024:
             renderables.append(
                 Text(
-                    "Speed shown above the set limit: the rolling average takes a moment to settle "
+                    "The speed shown is a rolling average, so it can read above the limit for a moment "
                     "after the limit is applied.",
                     style="grey50 italic",
                 )
