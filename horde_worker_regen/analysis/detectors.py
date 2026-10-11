@@ -673,7 +673,11 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
         r for r in context.recoveries if r.last_state in {"INFERENCE_POST_PROCESSING", "POST_PROCESSING"}
     ]
     dropped = _total_dropped_jobs(context.session.records)
-    forced_maintenance = bool(_matching(context.session.records, _MAINTENANCE_POP_RE))
+    # Maintenance the owner set is refused with the same line, so the horde's reason is what tells the two apart.
+    forced_maintenance = any(
+        _DROPPING_JOBS_RE.search(record.full_text)
+        for record in _matching(context.session.records, _MAINTENANCE_POP_RE)
+    )
     escalated = dropped > 0 or forced_maintenance or bool(breaker_trips)
 
     # Corroboration that the overlap was a genuine stall rather than admitted co-residency: a watchdog reap,

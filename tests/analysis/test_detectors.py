@@ -2261,6 +2261,27 @@ class TestPostProcessingVramStall:
         assert "nothing stalled" in finding.headline
         assert "free VRAM was low" in finding.headline
 
+    def test_owner_set_maintenance_does_not_escalate_co_residency(self, tmp_path: Path) -> None:
+        """Maintenance the owner set is not a consequence of post-processing, so it adds nothing to the finding.
+
+        The horde refuses a pop with the same line whoever set maintenance. Only a reason that cites dropped
+        jobs makes maintenance an outcome of the worker's faults.
+        """
+        child = "\n".join(
+            [
+                "2026-06-28 16:53:12.000 | INFO | horde_worker_regen.process_management.workers.post_process_process:_run_post_processing:190 - Post-processing job 9bccbf84",
+                "2026-06-28 16:53:14.000 | WARNING | comfy.model_management:free_memory:1110 - Free VRAM: 316 MB (+5272 MB reclaimable torch cache; comfy sees 5588)",
+            ],
+        )
+        bridge = self._bridge(
+            "2026-06-28 16:53:30.000 | WARNING  | horde_worker_regen.process_management.jobs.job_popper:_handle_pop_error_response:475 - "
+            "Failed to pop job (Maintenance Mode): message='This worker has been put into maintenance mode by its owner' "
+            "object_data=None rc='WorkerMaintenance'",
+        )
+        finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
+        assert finding.severity is Severity.INFO
+        assert "maintenance" not in finding.headline
+
     def test_wddm_paging_corroborates_warning(self, tmp_path: Path) -> None:
         """A WDDM demand-paging verdict in the window corroborates the overlap and keeps the warning."""
         child = "\n".join(
