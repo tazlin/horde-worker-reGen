@@ -563,6 +563,55 @@ class TestControllerClearing:
         assert controller.grant_state(2) is GrantState.IDLE
         assert controller.held_grant_count == 0
 
+    def test_retiring_an_unconsumed_grant_takes_its_permit_back(self) -> None:
+        """A job-1 permit never consumed is gone after its grant retires, and job 2 is granted afresh."""
+        controller = _controller()
+        proxy = _StubProxy()
+        controller.register(2, proxy)
+        controller.step(
+            _inputs(staged=(ClearanceWaiter(process_id=2, priority=1, job_id="job-1"),)),
+            admit_fn=_always_admit,
+        )
+        assert proxy.clearance_value == 1  # job 1 never reaches its sample call
+
+        controller.step(_inputs(), admit_fn=_always_admit)  # job 1 finished: its grant retires
+        assert controller.grant_state(2) is GrantState.IDLE
+        assert proxy.clearance_value == 0, "the retired grant's permit must not wait for the next job"
+
+        proxy.begin_job()  # job 2
+        assert proxy.acquire(True, 0.0) is False, "job 2 must not sample on job 1's permit"
+
+        result = controller.step(
+            _inputs(staged=(ClearanceWaiter(process_id=2, priority=1, job_id="job-2"),)),
+            admit_fn=_always_admit,
+        )
+        assert result.cleared_process_ids == (2,), "job 2's grant releases a permit of its own"
+        assert controller.grants_issued == 2
+        proxy.begin_job()
+        assert proxy.acquire(True, 0.0) is True
+
+    def test_retiring_a_consumed_grant_takes_nothing(self) -> None:
+        """A permit the child already took leaves retirement nothing to take, and job 2 is granted normally."""
+        controller = _controller()
+        proxy = _StubProxy()
+        controller.register(2, proxy)
+        staged = (ClearanceWaiter(process_id=2, priority=1, job_id="job-1"),)
+        proxy.begin_job()
+        controller.step(_inputs(staged=staged), admit_fn=_always_admit)
+        assert proxy.acquire(True, 0.0) is True  # job 1 consumed its grant
+
+        controller.step(_inputs(), admit_fn=_always_admit)
+        assert controller.grant_state(2) is GrantState.IDLE
+        assert proxy.clearance_value == 0
+
+        proxy.begin_job()  # job 2
+        result = controller.step(
+            _inputs(staged=(ClearanceWaiter(process_id=2, priority=1, job_id="job-2"),)),
+            admit_fn=_always_admit,
+        )
+        assert result.cleared_process_ids == (2,)
+        assert proxy.acquire(True, 0.0) is True
+
     def test_note_child_replaced_discards_state(self) -> None:
         """A replaced child's grant state is dropped so its dead slot never holds a phantom grant."""
         controller = _controller()
@@ -707,6 +756,53 @@ class TestGrantCarriesClearanceTruth:
         proxy.begin_job()  # job-b
         assert proxy.acquire(True, 0.0) is True, "the unconsumed permit is still there"
         assert proxy.take_cleared_device_free_mb() is None
+
+    def test_an_unconsumed_grant_carries_the_latest_reading(self) -> None:
+        """Each step before the child's sample call rewrites the grant's figure; the child reads the last one."""
+        controller = _controller()
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+
+        for reading in (12_000.0, 15_000.0, 16_500.0):
+            controller.step(_inputs(staged=staged, device_free_mb=reading), admit_fn=_always_admit)
+
+        assert proxy.clearance_value == 1, "the refresh returns the permit it held"
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 16_500.0
+
+    def test_a_step_without_a_reading_keeps_the_last_figure(self) -> None:
+        """An unread step leaves the unconsumed grant's figure as the previous step wrote it."""
+        controller = _controller()
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+        controller.step(_inputs(staged=staged, device_free_mb=15_000.0), admit_fn=_always_admit)
+
+        controller.step(_inputs(staged=staged, device_free_mb=None), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 15_000.0
+
+    def test_a_consumed_grant_is_not_rewritten(self) -> None:
+        """Once the child took its permit, a later step's reading leaves the figure as the child read it."""
+        controller = _controller()
+        figure = _shared_figure()
+        proxy = _StubProxy(cleared_device_free=figure)
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 13_500.0
+
+        # The snapshot still shows the child staged on its granted job, as it does until its first step lands.
+        controller.step(_inputs(staged=staged, device_free_mb=9_000.0), admit_fn=_always_admit)
+
+        assert figure.value == 13_500.0
+        assert proxy.clearance_value == 0, "the refresh must not hand a consumed grant a second permit"
+        assert controller.grant_state(2) is GrantState.CLEARED
 
     def test_proxy_without_a_shared_figure_carries_none(self) -> None:
         """A proxy built with no shared figure behaves as before: grants carry nothing."""

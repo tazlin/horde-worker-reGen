@@ -8,10 +8,11 @@ per-child clearance handshake so the parent decides, against measured device tru
 may enter its load-and-sample window.
 
 Each inference child receives a :class:`ClearanceLeaseProxy` as its ``gpu_sampling_lease``. The proxy holds
-two parent-created semaphores: ``clearance`` (the child blocks on it around ``comfy.sample.sample`` until the
-parent grants one permit) and ``done`` (the child signals it on release so the parent learns the sampling
-window closed). The child stages its pipeline (checkpoint disk load, prompt encode) freely up to the sample
-call, then waits for clearance; the parent clears the best staged waiter once its full materialisation fits.
+two parent-created semaphores: ``clearance`` (the child blocks on it around ComfyUI's guider sample call,
+``comfy.samplers.CFGGuider.sample``, until the parent grants one permit) and ``done`` (the child signals it on
+release so the parent learns the sampling window closed). The child stages its pipeline (checkpoint disk load,
+prompt encode) freely up to the sample call, then waits for clearance; the parent clears the best staged
+waiter once its full materialisation fits.
 A multi-sample job (hires-fix, refiner) consumes one grant for its whole job: the second and later
 ``acquire`` calls pass through so a single job never blocks twice.
 
@@ -91,8 +92,8 @@ class ClearanceLeaseProxy:
 
     Handed to one inference child as its ``gpu_sampling_lease`` and registered with hordelib, so it satisfies
     the same ``acquire(block, timeout) -> bool`` / ``release() -> None`` protocol hordelib wraps around
-    ``comfy.sample.sample``. It additionally exposes :meth:`begin_job`, called by the child at job start, so a
-    single grant covers a whole job's samples.
+    ``comfy.samplers.CFGGuider.sample``. It additionally exposes :meth:`begin_job`, called by the child at job
+    start, so a single grant covers a whole job's samples.
 
     The two semaphores are created by the parent so the parent can grant (release ``clearance``) and observe
     completion (drain ``done``). The proxy is picklable and shared into the child by spawn inheritance, exactly
@@ -104,7 +105,9 @@ class ClearanceLeaseProxy:
     shared figure before the permit is released. The child's free-VRAM clamp was set from the dispatch-time
     reading, taken while the previous sampler still held the card; rebasing it on the clearance figure lets the
     child judge its load against the card the parent just admitted it to. The child reads the figure only on
-    an acquire that obtained the permit, so a timed-out or passed-through acquire yields none.
+    an acquire that obtained the permit, so a timed-out or passed-through acquire yields none. Until the child
+    takes the permit the parent rewrites the figure from each control step's reading, since the child can reach
+    its sample call seconds after the grant, by which time it has moved its own encoder off the card.
 
     The child can also register a wait-entry callback (:meth:`set_wait_entry_callback`), run once per job just
     before the acquire blocks. The parent prices a staged child net of its last reported reservation, so the
@@ -250,6 +253,27 @@ class ClearanceLeaseProxy:
         if self._cleared_device_free is not None:
             self._cleared_device_free.value = math.nan if device_free_mb is None else device_free_mb
         self._clearance.release()
+
+    def _parent_refresh_grant_figure(self, *, device_free_mb: float) -> bool:
+        """Parent-side: rewrite the figure of a grant the child has not consumed, returning whether it did.
+
+        The permit is held across the write. The child's acquire can return only once the permit is back, so it
+        reads the new figure, and a permit the child already took leaves nothing to hold, so a consumed grant is
+        never rewritten. A child that probes during the hold finds no permit and blocks until the release.
+        """
+        if self._cleared_device_free is None:
+            return False
+        if not self._clearance.acquire(False):
+            return False
+        try:
+            self._cleared_device_free.value = device_free_mb
+        finally:
+            self._clearance.release()
+        return True
+
+    def _parent_reclaim_unconsumed_permit(self) -> bool:
+        """Parent-side: non-blockingly take back a granted permit the child never consumed; return whether one was."""
+        return bool(self._clearance.acquire(False))
 
     def _parent_drain_done(self) -> bool:
         """Parent-side: non-blockingly take one done signal, returning whether one was present."""
@@ -552,9 +576,9 @@ class ClearanceController:
     does not is held, and its wait is reported so the scheduler attributes the empty slot.
 
     The controller owns its grant accounting for the session and self-heals rather than propagating: a
-    double-clear is guarded, a replaced child's state is discarded, and a released-then-reclaimed grant that
-    the child never consumed is bounded by the clearance semaphore's own capacity. Nothing here blocks the
-    control loop; the caller isolates a raised tick fail-inert.
+    double-clear is guarded, a replaced child's state is discarded, and a grant the child never consumed has
+    its permit taken back when the grant retires. Nothing here blocks the control loop; the caller isolates a
+    raised tick fail-inert.
     """
 
     def __init__(
@@ -650,6 +674,7 @@ class ClearanceController:
         self._drain_done_discard()
         self._reconcile_grants(inputs)
         self._prune_tail_dedup(inputs)
+        self._refresh_unconsumed_grant_figures(inputs.device_free_mb)
 
         # Only children the controller still holds IDLE are clearable; a cleared-but-not-yet-sampling child is
         # still reported as a primed waiter by the scheduler snapshot, so filter it out here rather than let a
@@ -725,6 +750,22 @@ class ClearanceController:
             f"load-and-sample window.",
         )
         return True
+
+    def _refresh_unconsumed_grant_figures(self, device_free_mb: float | None) -> None:
+        """Rewrite every cleared child's grant figure from this step's reading until the child consumes it.
+
+        Between the grant and the child's sample call the child releases its encoder to host RAM and siblings
+        unload, so the figure frozen at the grant tick understates the card the child loads into. A step with no
+        reading leaves the last figure in place.
+        """
+        if device_free_mb is None:
+            return
+        for process_id, state in self._grant_state.items():
+            if state is not GrantState.CLEARED:
+                continue
+            proxy = self._proxies.get(process_id)
+            if proxy is not None:
+                proxy._parent_refresh_grant_figure(device_free_mb=device_free_mb)
 
     def _log_tail_overlap_clear(self, inputs: ClearanceInputs, *, outgoing_job_id: str) -> None:
         """Emit the dedicated INFO signal for a tail-overlap early clear so its firing rate is measurable.
@@ -863,7 +904,18 @@ class ClearanceController:
                 )
 
     def _retire_grant(self, process_id: int) -> None:
-        """Return a held grant to idle so its steady-state slot reopens (grant accounting only)."""
+        """Return a held grant to idle so its steady-state slot reopens, taking back a permit never consumed.
+
+        A grant can retire still cleared with its permit untaken, when the job ran a graph that never called the
+        lease or sampled past its acquire timeout before the grant. Left in the semaphore, that permit would let
+        the next job on the slot sample unpriced, so the controller takes it back and the semaphore stays matched
+        to this ledger. A child already inside its acquire may win the permit and sample on it, which the
+        controller then flags as an unpriced window, as before.
+        """
+        if self._grant_state.get(process_id) is GrantState.CLEARED:
+            proxy = self._proxies.get(process_id)
+            if proxy is not None:
+                proxy._parent_reclaim_unconsumed_permit()
         self._grant_state[process_id] = GrantState.IDLE
         self._granted_job_id.pop(process_id, None)
         self._unpriced_flagged.discard(process_id)

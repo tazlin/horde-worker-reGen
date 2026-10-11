@@ -640,9 +640,12 @@ now the VRAM moment for a leased job. A grant also carries the measured device f
 against. The controller writes it to a shared float beside the child's clearance semaphore before releasing
 the permit, and the child's `ClearanceLeaseProxy` hands it to hordelib once, on the acquire that obtained the
 permit. hordelib then rebases the run's free-VRAM clamp on it (see [VRAM arbiter](vram_arbiter.md)). The
-figure is the card before this child materialises, since the clamp subtracts the child's own growth from it. A
-timed-out or passed-through acquire carries none, and a job start unsets the figure so a permit left over from
-a timed-out job never brings the previous admission's figure into the next. A clearance held for VRAM fit is
+figure is the card before this child materialises, since the clamp subtracts the child's own growth from it.
+Until the child takes the permit the controller rewrites the figure from each step's reading, because the
+child reaches its sample call seconds after the grant, after it has moved its own encoder off the card. A
+timed-out or passed-through acquire carries none, a job start unsets the figure, and a grant that retires
+with its permit never taken has that permit taken back by the controller, so a leftover permit never lets
+the next job on the slot sample unpriced. A clearance held for VRAM fit is
 attributed to the `clearance_hold`
 slot-duty bucket (see [GPU duty cycle](duty-cycle.md)). Liveness always wins over pricing: a child whose
 clearance is starved past hordelib's bounded lease-acquire timeout samples anyway, and the parent logs that
