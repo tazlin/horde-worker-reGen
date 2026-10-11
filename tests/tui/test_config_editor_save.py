@@ -132,7 +132,11 @@ async def test_max_throughput_mode_refreshes_effective_pool_values_without_freez
         editor = app.query_one(ConfigEditorView)
         await pilot.pause()
         editor.query_one("#cfg-max_throughput_mode", Switch).value = True
-        await pilot.pause()
+        await _wait_until(
+            pilot,
+            lambda: editor.query_one("#cfg-model_pool_enabled", Switch).value is True,
+            what="the preset's inherited pool values to show",
+        )
 
         assert editor.query_one("#cfg-model_pool_enabled", Switch).value is True
         assert editor.query_one("#cfg-model_pool_ranker_enabled", Switch).value is True
@@ -153,7 +157,12 @@ async def test_max_throughput_mode_allows_an_explicit_pool_override(tmp_path: Pa
         editor = app.query_one(ConfigEditorView)
         await pilot.pause()
         editor.query_one("#cfg-max_throughput_mode", Switch).value = True
-        await pilot.pause()
+        # The override is typed only after the inherited values have landed, or they would replace it.
+        await _wait_until(
+            pilot,
+            lambda: editor.query_one("#cfg-model_pool_enabled", Switch).value is True,
+            what="the preset's inherited pool values to show",
+        )
         editor.query_one("#cfg-model_pool_download_budget_gb", Input).value = "12"
         assert editor._save() is True
         await pilot.pause()
