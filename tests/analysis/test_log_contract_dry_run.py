@@ -37,7 +37,7 @@ from horde_worker_regen.analysis.log_signatures import SIGNATURES, LogSignature
 from horde_worker_regen.harness import HarnessConfig, run_harness_async
 from horde_worker_regen.process_management.process_manager import SystemResources
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
-from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
+from horde_worker_regen.process_management.simulation._canned_scenarios import ArrivalSchedule, make_canned_job
 
 pytestmark = pytest.mark.slow
 
@@ -105,6 +105,11 @@ def dry_run_bridge_log(tmp_path_factory: pytest.TempPathFactory) -> Path:
     try:
         config = HarnessConfig(
             scenario=_scenario(),
+            # One job every two seconds, the length of a job. The two lanes drain faster than that, so the
+            # worker asks for work while none has arrived and logs the empty-pop line. With every job
+            # available at once, an empty pop happens only if a poll lands between the queue draining and
+            # the scenario completing.
+            arrival=ArrivalSchedule(kind="steady", rate_per_minute=30.0),
             process_mode="fake",
             skip_api=True,
             timeout_seconds=240.0,
