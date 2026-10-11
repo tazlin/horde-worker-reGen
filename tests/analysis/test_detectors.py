@@ -490,7 +490,7 @@ class TestForcedMaintenance:
         finding = _diagnose(tmp_path, bridge)["forced_maintenance"]
         assert finding.severity is Severity.CRITICAL
         assert "gave up on 3 queued jobs" in " ".join(finding.evidence)
-        assert "cancelled 1 jobs as too slow" in " ".join(finding.evidence)
+        assert "cancelled 1 job as too slow" in " ".join(finding.evidence)
 
     def test_counts_enriched_giveup_phrasing(self, tmp_path: Path) -> None:
         """The dropped-job count survives the worker enriching the give-up line with its wedge cause.
@@ -651,7 +651,7 @@ class TestSlowGenerationDropSpiral:
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
         assert finding.severity is Severity.CRITICAL
-        assert "waiting after generation finished" in finding.headline
+        assert "waiting after generation" in finding.headline
         assert "after generation finished" in " ".join(finding.evidence)
         # The remediation must not blame max_power for a pipeline-balance problem.
         assert "stops taking new jobs" in finding.detail
@@ -700,7 +700,7 @@ class TestSlowGenerationDropSpiral:
             _server_slow_abort("07:22:00.000"),
         )
         finding = _diagnose(tmp_path, bridge)["slow_generation_drop_spiral"]
-        assert "cannot say where the wait was" in finding.headline
+        assert "this log cannot say where" in finding.headline
         assert "cannot say where the time went" in finding.title
 
     def test_genuinely_slow_generation_keeps_gpu_framing(self, tmp_path: Path) -> None:
@@ -1099,7 +1099,8 @@ class TestSafetyStartEscalatedToCpu:
         )
         assert "slower on the CPU" in finding.action
         assert (
-            finding.evidence[0] == "safety check after the last escalation: stayed on the CPU until the session ended"
+            finding.evidence[0]
+            == "After the last move to the CPU, the safety check stayed on the CPU until the session ended."
         )
         assert finding.see_also is FindingKind.SAFETY_STAGE_STALL
 
@@ -1126,7 +1127,9 @@ class TestSafetyStartEscalatedToCpu:
 
         finding = _diagnose(tmp_path, bridge)["safety_start_escalated_to_cpu"]
 
-        assert finding.evidence[0] == "safety check after the last escalation: returned to a card at 02:10:00"
+        assert (
+            finding.evidence[0] == "After the last move to the CPU, the safety check returned to a card at 02:10:00."
+        )
 
     def test_a_restore_before_the_escalation_is_not_a_return(self, tmp_path: Path) -> None:
         """Only a restore after the escalation counts."""
@@ -1212,7 +1215,7 @@ class TestResourceFindings:
         assert "oom" in findings
         verdict = findings["oom"].headline
         assert "Z-Image-Turbo" in verdict
-        assert "processes 4" in verdict
+        assert "process 4" in verdict
         # Two sibling "Process N has ..." lines + the faulting process itself == 3 co-resident.
         assert "3 processes sharing the card" in verdict
         assert "194 MiB free" in verdict
@@ -1243,7 +1246,7 @@ class TestResourceFindings:
         fd = findings["file_descriptor_exhaustion"]
         assert fd.severity is Severity.CRITICAL
         assert "WAI-NSFW-illustrious-SDXL" in fd.headline
-        assert "processes 3" in fd.headline
+        assert "process 3" in fd.headline
         assert any("/proc/meminfo" in line for line in fd.evidence)
         assert "replaced" in fd.action
         # The mechanism note that keeps a maintainer from mistaking it for an OOM.
@@ -1716,7 +1719,7 @@ class TestWholeCardResidencyChurn:
         )
         finding = findings["whole_card_residency_churn"]
         figures = " ".join(finding.evidence)
-        assert "demanded no reduction" in figures, figures
+        assert "so it stopped none" in figures, figures
         assert "target 21" in figures
         assert "unmeasured marginal" not in finding.action, (
             "an incoherent claim must not be blamed on an unmeasured per-context marginal"
@@ -1784,7 +1787,7 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "1 jobs failed" in finding.headline
+        assert "1 job failed" in finding.headline
         assert any(_GIVEN_UP_JOB[:8] in line for line in finding.evidence)
         assert any("WAI-NSFW-illustrious-SDXL" in line for line in finding.evidence)
 
@@ -1804,7 +1807,12 @@ class TestFaultedJobCensus:
         )
         finding = findings["faulted_job_census"]
         assert "4 jobs failed" in finding.headline
-        for cause in ("give-up backstop", "safety-unrecoverable", "disaggregation stage fault", "process fault"):
+        for cause in (
+            "dropped when the worker gave up on its queue",
+            "the safety check could not be completed",
+            "a stage of the split pipeline failed (disaggregation)",
+            "fault in the image process",
+        ):
             assert cause in finding.evidence[0], f"{cause} missing from {finding.evidence[0]}"
 
     def test_a_malformed_pop_is_attributed_not_left_unexplained(self, tmp_path: Path) -> None:
@@ -1817,7 +1825,7 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "malformed pop (no model name)" in finding.evidence[0]
+        assert "job offer with no model name" in finding.evidence[0]
         assert "other" not in finding.evidence[0]
 
     def test_a_requeued_attempt_is_not_a_faulted_job(self, tmp_path: Path) -> None:
@@ -1830,7 +1838,7 @@ class TestFaultedJobCensus:
             ),
         )
         finding = findings["faulted_job_census"]
-        assert "1 jobs failed" in finding.headline
+        assert "1 job failed" in finding.headline
         assert all(_SLOT_FAULT_JOB[:8] not in line for line in finding.evidence)
 
     def test_a_job_is_counted_once_across_both_fault_surfaces(self, tmp_path: Path) -> None:
@@ -1842,7 +1850,7 @@ class TestFaultedJobCensus:
                 _fault_report("08:00:02.000", job_id=_SLOT_FAULT_JOB),
             ),
         )
-        assert "1 jobs failed" in findings["faulted_job_census"].headline
+        assert "1 job failed" in findings["faulted_job_census"].headline
 
 
 class TestPopLivenessFullQueue:
@@ -1975,7 +1983,7 @@ class TestWholeCardPopClaim:
     def test_a_claim_still_standing_at_the_end_is_reported(self, tmp_path: Path) -> None:
         """A session that ended inside a claim still says the offer was narrowed and by what."""
         findings = _diagnose(tmp_path, self._bridge(_pop_claim_engaged("07:51:00.000")))
-        assert "still standing" in " ".join(findings["whole_card_pop_claim_episodes"].evidence)
+        assert "still in force at the session end" in " ".join(findings["whole_card_pop_claim_episodes"].evidence)
 
     def test_no_claim_lines_report_nothing(self, tmp_path: Path) -> None:
         """A worker whose residencies never claim the offer produces no episode finding at all."""
@@ -2403,7 +2411,7 @@ class TestPostProcessingVramStall:
         bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
         finding = _diagnose(tmp_path, bridge, {"bridge_1.log": child})["post_processing_vram_stall"]
         assert finding.severity is Severity.WARNING
-        assert "low 1 times" in finding.headline
+        assert "low once" in finding.headline
 
     def test_silent_without_signals(self, tmp_path: Path) -> None:
         """A crash-on-start recovery is not a post-processing stall, so the detector stays silent."""
@@ -2478,12 +2486,12 @@ class TestPostProcessingOfferWithheld:
         )
         assert "Serve fewer models" in finding.action
         assert any(
-            line.startswith("longest stretch opened") and "16:55:00  bridge.log:" in line for line in finding.evidence
+            line.startswith("longest stretch began") and "16:55:00  bridge.log:" in line for line in finding.evidence
         )
         assert any(
-            line.startswith("longest stretch closed") and "17:25:00  bridge.log:" in line for line in finding.evidence
+            line.startswith("longest stretch ended") and "17:25:00  bridge.log:" in line for line in finding.evidence
         )
-        assert "the VRAM arbiter ruling the peak out: turned off 1 time(s), 30 min in total" in finding.evidence
+        assert "no card with room for the post-processing peak: turned off once, 30 min in total" in finding.evidence
 
     def test_legacy_lines_name_the_old_gate_and_advise_an_update(self, tmp_path: Path) -> None:
         """A worker up to 18.8.1 logged only its headroom gate, which reads as the same state change."""
@@ -2497,7 +2505,9 @@ class TestPostProcessingOfferWithheld:
         assert "73 percent" in finding.headline
         assert "30 minutes" in finding.headline
         assert finding.action.startswith("Update the worker.")
-        assert "the old free-VRAM headroom gate: turned off 1 time(s), 30 min in total" in finding.evidence
+        assert (
+            "a dip in free VRAM, on a worker at 18.8.1 or older: turned off once, 30 min in total" in finding.evidence
+        )
 
     def test_time_before_the_first_edge_is_not_counted(self, tmp_path: Path) -> None:
         """Twenty of 21 observed minutes off is 95 percent. Counting the 21 minutes before it would change that."""
@@ -2507,7 +2517,9 @@ class TestPostProcessingOfferWithheld:
         )
         finding = _diagnose(tmp_path, bridge)[self._FINDING]
         assert "off for 95 percent" in finding.headline
-        assert finding.evidence[0].endswith("21 min not counted, before the first offer change or with the log silent")
+        assert finding.evidence[0].endswith(
+            "21 min were left out, because they came before the first logged change or while the log was silent."
+        )
 
     def test_a_log_silence_inside_a_stretch_is_not_counted(self, tmp_path: Path) -> None:
         """Twenty silent minutes inside a stretch count toward neither side, so 10 of 21 recorded minutes are off.
@@ -2526,12 +2538,12 @@ class TestPostProcessingOfferWithheld:
         assert finding.headline == (
             "Post-processing was off for 48 percent of the session, the longest stretch 10 minutes."
         )
-        assert finding.evidence[0].startswith("off 10 min, on 11 min, 21 min not counted")
+        assert finding.evidence[0].startswith("Off for 10 min and on for 11 min. 21 min were left out")
         assert any(
-            line.startswith("longest stretch opened") and "16:55:00  bridge.log:" in line for line in finding.evidence
+            line.startswith("longest stretch began") and "16:55:00  bridge.log:" in line for line in finding.evidence
         )
         assert any(
-            line.startswith("longest stretch closed") and "17:25:00  bridge.log:" in line for line in finding.evidence
+            line.startswith("longest stretch ended") and "17:25:00  bridge.log:" in line for line in finding.evidence
         )
 
     def test_every_reason_fragment_tracks_one_popper_reason(self) -> None:
@@ -2579,7 +2591,7 @@ class TestPostProcessingOfferWithheld:
         finding = _diagnose(tmp_path, bridge)[self._FINDING]
         assert finding.severity is Severity.CRITICAL
         assert "98 percent" in finding.headline
-        assert "reclaim ladder" in finding.action
+        assert "paused post-processing to make room" in finding.action
         assert "longest stretch ran to the session end at 17:35:00" in finding.evidence
 
 
@@ -3186,11 +3198,11 @@ class TestHostRamStarvation:
         )
         finding = _diagnose(tmp_path, "\n".join(lines))["host_ram_starvation"]
         evidence = " ".join(finding.evidence)
-        assert "hard floor 6343 MB" in evidence
-        assert "preload 14692 MB" in evidence
-        assert "engage rate 1.0/hour (2 edges)" in evidence
-        assert "recycle count 1" in evidence
-        assert "capture available 14649 MB" in evidence
+        assert "below 6343 MB (danger floor)" in evidence
+        assert "14692 MB to load a model (preload)" in evidence
+        assert "New jobs were held 2 times, 1.0 an hour." in evidence
+        assert "1 process was restarted (recycling or cycling)" in evidence
+        assert "The bundle recorded 14649 MB available." in evidence
 
     def test_one_refused_load_is_not_host_starvation(self, tmp_path: Path) -> None:
         """An isolated admission refusal gives no evidence of a throughput-shaping RAM problem."""
@@ -3258,8 +3270,8 @@ class TestIdleFillOfferStuckFromAdvertisedOffer:
         finding = _diagnose(tmp_path, log)["idle_fill_offer_stuck"]
         assert finding.severity is Severity.CRITICAL
         assert finding.headline == "The worker asked for 1 of 109 models for 8 minutes."
-        assert "still narrowed at the session end" in finding.evidence
-        assert any("horde skipped 154 job(s) for models" in line for line in finding.evidence)
+        assert "still asking for fewer models at the session end" in finding.evidence
+        assert any("skipped 154 jobs because of the models asked for" in line for line in finding.evidence)
 
     def test_a_narrowed_offer_that_widens_within_seconds_does_not_fire(self, tmp_path: Path) -> None:
         """The ladder's rungs narrow the offer for seconds at a time; that is the breaker working."""
@@ -3293,7 +3305,7 @@ class TestIdleFillOfferStuckFromAdvertisedOffer:
         )
         finding = _diagnose(tmp_path, log)["idle_fill_offer_stuck"]
         assert finding.headline == "The worker asked for fewer models for 5 minutes with 3 models offered."
-        assert any("narrowed to 3 of 109 models" in line for line in finding.evidence)
+        assert any("the worker asked for 3 of 109 models" in line for line in finding.evidence)
 
 
 def _lane_pair(minute: int, restart_seconds: int) -> tuple[str, str]:
@@ -3316,7 +3328,8 @@ class TestServiceLaneRestartChurn:
         assert finding.severity is Severity.WARNING
         assert finding.headline == "The post-processing process was stopped and restarted within 5 seconds 3 times."
         assert finding.evidence[0] == (
-            "post-processing: 3 stop and restart pair(s), 3 restarted within 5 s, median 2.0 s, 0 held for a job"
+            "post-processing: stopped and restarted 3 times, 3 of them within 5 s, median 2.0 s from stop to restart, "
+            "0 kept down until a job finished sampling"
         )
 
     def test_slow_or_few_pairs_do_not_fire(self, tmp_path: Path) -> None:
@@ -3341,9 +3354,15 @@ class TestLaneDoubleDispatchSignature:
         )
         finding = _diagnose(tmp_path, _o2_log(self._RELEASED, lost))["lane_double_dispatch_signature"]
         assert finding.severity is Severity.CRITICAL
-        assert finding.headline == "The worker lost track of which process owned a job 1 times."
-        assert "inference_result_lost: 1" in finding.evidence
-        assert "ended_job_ownership_released: 1" in finding.evidence
+        assert finding.headline == "The worker lost track of which process owned a job once."
+        assert (
+            'results lost while their job was still in progress ("its inference result was lost"): 1'
+            in finding.evidence
+        )
+        assert (
+            'jobs released after ending with no result, which is normal cleanup ("Released process"): 1'
+            in finding.evidence
+        )
 
     def test_a_release_alone_does_not_fire(self, tmp_path: Path) -> None:
         """The release is the designed cleanup, so on its own it is not a finding."""
@@ -3465,9 +3484,9 @@ class TestModelEconomics:
             "took 44.4% of wall time."
         )
         assert finding.evidence == [
-            "Alpha: 2 jobs, 60 kudos (60.0%), 3.00 per sampling-second, 1.50 per wall-second, 44.4% of wall",
-            "Beta: 1 job, 20 kudos (20.0%), 4.00 per sampling-second, 2.00 per wall-second, 11.1% of wall",
-            "Gamma: 20 jobs, 20 kudos (20.0%), 1.00 per sampling-second, 0.50 per wall-second, 44.4% of wall",
+            "Alpha: 2 jobs, 60 kudos (60.0%), 3.00 per sampling-second, 1.50 per wall-second, 44.4% of wall time",
+            "Beta: 1 job, 20 kudos (20.0%), 4.00 per sampling-second, 2.00 per wall-second, 11.1% of wall time",
+            "Gamma: 20 jobs, 20 kudos (20.0%), 1.00 per sampling-second, 0.50 per wall-second, 44.4% of wall time",
         ]
         assert finding.see_also is FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES
 
@@ -3480,7 +3499,7 @@ class TestModelEconomics:
         finding = _diagnose(tmp_path, log)["model_economics"]
         assert len(finding.evidence) == 9
         assert finding.evidence[-1] == (
-            "Cheap: 20 jobs, 20 kudos (2.4%), 1.00 per sampling-second, 0.20 per wall-second, 55.6% of wall"
+            "Cheap: 20 jobs, 20 kudos (2.4%), 1.00 per sampling-second, 0.20 per wall-second, 55.6% of wall time"
         )
         assert finding.headline.endswith(', and the lowest payer, "Cheap", took 55.6% of wall time.')
 
@@ -3599,7 +3618,7 @@ class TestInferenceLaneReplaced:
         assert finding.headline == "The worker replaced image process 2 once after a CUDA error."
         assert "recovered on its own" in finding.action
         assert "horde-log bundle" not in finding.action
-        assert any(line.startswith("host commit ran out 20s before") for line in finding.evidence)
+        assert any(line.startswith("Windows ran out of memory to commit 20s before") for line in finding.evidence)
 
     def test_a_context_fault_without_memory_pressure_is_a_defect(self, tmp_path: Path) -> None:
         """A commit exhaustion more than a minute earlier does not explain the error."""
@@ -3610,7 +3629,7 @@ class TestInferenceLaneReplaced:
         finding = findings["inference_lane_replaced"]
         assert "worker or driver defect" in finding.action
         assert "`horde-log bundle`" in finding.action
-        assert any(line.startswith("no host commit exhaustion") for line in finding.evidence)
+        assert any(line.startswith("Windows did not run out of memory to commit") for line in finding.evidence)
 
     def test_repeated_context_faults_are_a_defect_even_after_commit_ran_out(self, tmp_path: Path) -> None:
         """One process breaking twice is not a one-off host condition."""
@@ -3767,7 +3786,7 @@ class TestLaneFaultRuleMisfire:
         assert finding.headline == (
             "Image process 2 was taken out of service after a CUDA error that followed system memory running out."
         )
-        assert any(line.startswith("host commit ran out 20s before") for line in finding.evidence)
+        assert any(line.startswith("Windows ran out of memory to commit 20s before") for line in finding.evidence)
         assert "`horde-log bundle`" in findings["inference_slot_quarantined"].action
 
     def test_a_context_fault_long_after_commit_ran_out_does_not_fire(self, tmp_path: Path) -> None:
@@ -3803,7 +3822,7 @@ class TestSupervisorChannelLost:
         findings = _diagnose(tmp_path, _lane_log(_supervisor_dropped("18:10:12.000")))
         finding = findings["supervisor_channel_lost"]
         assert finding.headline == "The worker lost its link to its supervisor at 18:10:12."
-        assert finding.evidence[-1].startswith("no host commit exhaustion")
+        assert finding.evidence[-1].startswith("Windows did not run out of memory to commit")
 
     def test_repeated_drops_are_counted(self, tmp_path: Path) -> None:
         """Several drops read as a count and the first time."""

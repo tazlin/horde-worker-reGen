@@ -36,7 +36,7 @@ errors-only `trace.log` help pin down a specific failure. The full table is in
 [Logs](../reference/logs.md). You can tail a log live: `Get-Content bridge.log -Wait` on Windows
 PowerShell, or `less +F bridge.log` on Linux.
 
-## Diagnose a crash or recovery storm from the logs
+## Diagnose a crash or repeated process restarts from the logs
 
 Reading `bridge.log` by hand is slow: it is appended across every restart, the real crash cause is
 usually a traceback in a *different* file (a child's `bridge_inference_<N>_startup.log`), and the
@@ -70,7 +70,7 @@ beside a live worker stays its own session. A clean exit requires the outer `Wor
 gathered background request can still hold the main process open. `diagnose` then runs detectors over a
 session and prints ranked findings: it recognizes an
 inference pool that crashes on start (and surfaces the child's actual exception, e.g. a CPU-only torch
-reporting `Torch not compiled with CUDA enabled`), a recovery storm that never gave up, GPU
+reporting `Torch not compiled with CUDA enabled`), repeated process restarts that never gave up, GPU
 out-of-memory (naming the faulting model and whether the card was over-admitted, i.e. several models
 co-resident with near-zero free VRAM, rather than one model too large), file-descriptor exhaustion (a
 slot that faults every job with "Too many open files" until it is replaced, which reads as an OOM but

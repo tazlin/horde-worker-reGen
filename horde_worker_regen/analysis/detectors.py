@@ -35,7 +35,7 @@ from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
 
 from .correlate import RecoveryDiagnostic, SessionContext, find_child_crash
 from .finding_kinds import SEVERITY_ORDER, Finding, FindingKind, Severity
-from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_LABELS, GOVERNOR_PLAIN_PHRASES
+from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_PLAIN_PHRASES
 from .job_lifecycle import JobLifecycleModel, LaneRole, job_lifecycle_for, percentile
 from .log_ingest import LogRecord
 from .log_signatures import pattern_for
@@ -518,6 +518,17 @@ def _evidence(record: LogRecord) -> str:
     return f"{ts}  {record.source_path.name}:{record.raw_lineno}  {message}"
 
 
+def _count_text(count: int, singular: str, plural: str | None = None) -> str:
+    """Return a count with its noun in the matching number: "1 job", "3 jobs"."""
+    noun = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {noun}"
+
+
+def _times_text(count: int) -> str:
+    """Return how often something happened as a reader would say it: "once", "3 times"."""
+    return "once" if count == 1 else f"{count} times"
+
+
 def detect_crash_on_start_loop(context: SessionContext) -> list[Finding]:
     """Inference children that crash during startup, with the child's exception as the root cause."""
     crashing = [r for r in context.recoveries if r.last_state == "PROCESS_STARTING" and r.exitcode not in ("0", "")]
@@ -533,32 +544,32 @@ def detect_crash_on_start_loop(context: SessionContext) -> list[Finding]:
         crash = find_child_crash(context.bundle, process_id, first.timestamp, os_pid=first.os_pid)
         if crash is not None:
             exceptions[crash.exception] = exceptions.get(crash.exception, 0) + 1
-            evidence.append(f"slot {process_id}: {_evidence(crash.record).split('  ', 1)[1]} -> {crash.exception}")
+            evidence.append(f"process {process_id}: {_evidence(crash.record).split('  ', 1)[1]} -> {crash.exception}")
             crash_texts.append(crash.record.full_text)
 
     cause = max(exceptions, key=lambda exc: exceptions[exc]) if exceptions else None
     git_failure = any(_GIT_ENVIRONMENT_FAILURE_RE.search(text) for text in crash_texts)
     starts = len(crashing)
-    processes = len({r.process_id for r in crashing})
+    processes = _count_text(len({r.process_id for r in crashing}), "process", "processes")
     if cause is not None and git_failure:
         verdict = (
-            f'{starts} image process starts across {processes} processes crashed with "{cause}" while '
+            f'{starts} image process starts across {processes} crashed with "{cause}" while '
             "preparing the shared ComfyUI environment."
         )
         remediation = (
-            "Delete the environment directory named in the error and start the worker again so one process "
+            "Delete the environment directory shown in the error and start the worker again so one process "
             "rebuilds it. Your Python packages are not the problem. Updating hordelib prevents a repeat, since "
             "newer versions prepare that directory one process at a time and repair a half-written one."
         )
     elif cause is not None:
-        verdict = f'{starts} image process starts across {processes} processes crashed with "{cause}".'
+        verdict = f'{starts} image process starts across {processes} crashed with "{cause}".'
         remediation = (
             f'Fix the environment fault behind "{cause}". If it says torch was not compiled with CUDA, '
             "reinstall a CUDA-enabled torch."
         )
     else:
         verdict = (
-            f"{starts} image process starts across {processes} processes crashed before they were ready, and "
+            f"{starts} image process starts across {processes} crashed before they were ready, and "
             "no start-up log shows the error."
         )
         remediation = "Open the process's start-up log in the logs folder and look for the failing import or error."
@@ -591,8 +602,8 @@ def detect_doomed_pool_no_giveup(context: SessionContext) -> list[Finding]:
         return []
 
     verdict = (
-        f"The worker rebuilt its crashed image processes {len(soft_resets)} times and restarted a process "
-        f"{session.peak_process_recoveries} times without ever stopping itself, and the session ended as "
+        f"The worker rebuilt its crashed image processes {_times_text(len(soft_resets))} and restarted a process "
+        f"{_times_text(session.peak_process_recoveries)} without ever stopping itself, and the session ended as "
         f'"{session.end_reason}".'
     )
     return [
@@ -630,8 +641,8 @@ def detect_stuck_inference_step(context: SessionContext) -> list[Finding]:
             kind=FindingKind.STUCK_INFERENCE_STEP,
             severity=Severity.WARNING,
             headline=(
-                f"{len(stuck)} times an image process repeated one sampling step without finishing and was "
-                "restarted, losing the job it was running."
+                "An image process repeated one sampling step without finishing and was restarted "
+                f"{_times_text(len(stuck))}, losing the job it was running{' each time' if len(stuck) > 1 else ''}."
             ),
             evidence=[_evidence(r) for r in stuck[:4]],
         ),
@@ -692,7 +703,8 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
                 severity=Severity.INFO,
                 title_override="Post-processing shared the card and nothing stalled",
                 headline=(
-                    f"Post-processing ran while free VRAM was low {len(low_vram_warnings)} times, and nothing stalled."
+                    f"Post-processing ran while free VRAM was low {_times_text(len(low_vram_warnings))}, and "
+                    "nothing stalled."
                 ),
                 action_addendum="No action needed.",
                 evidence=[_evidence(r) for r in (dedicated_activity[:2] + low_vram_warnings[:2])],
@@ -700,11 +712,12 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
         ]
     outcome = ""
     if dropped > 0 or forced_maintenance:
-        outcome = f", {dropped} jobs were dropped" + (
+        outcome = f", {_count_text(dropped, 'job')} {'was' if dropped == 1 else 'were'} dropped" + (
             " and the horde put the worker into maintenance" if forced_maintenance else ""
         )
     verdict = (
-        f"Post-processing stalled {len(stalls)} times while free VRAM was low {len(low_vram_warnings)} times{outcome}."
+        f"Post-processing stalled {_times_text(len(stalls))} while free VRAM was low "
+        f"{_times_text(len(low_vram_warnings))}{outcome}."
     )
     if breaker_trips:
         action = (
@@ -732,14 +745,14 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
 class _OfferWithheldReason(enum.StrEnum):
     """Why a pop went out with post-processing off, worded as the finding's evidence names it."""
 
-    LEGACY_HEADROOM_GATE = "the old free-VRAM headroom gate"
-    FAULT_BREAKER = "the fault breaker"
-    VRAM_ARBITER = "the VRAM arbiter ruling the peak out"
-    LANE_PAUSED = "the post-processing lane paused"
-    MODELS_NOT_ON_DISK = "the post-processing models not on disk"
+    LEGACY_HEADROOM_GATE = "a dip in free VRAM, on a worker at 18.8.1 or older"
+    FAULT_BREAKER = "repeated post-processing faults (the fault breaker)"
+    VRAM_ARBITER = "no card with room for the post-processing peak"
+    LANE_PAUSED = "post-processing paused to free memory"
+    MODELS_NOT_ON_DISK = "post-processing models not on disk"
     JOBS_IN_HAND = "too many post-processing jobs in hand"
     CONFIGURED_OFF = "post-processing off in the config"
-    OTHER = "an unrecognised reason"
+    OTHER = "a reason this report does not recognise"
 
 
 # Fragments of the reasons ``job_popper`` writes into the withheld edge. Matched by fragment because some carry
@@ -760,13 +773,13 @@ _OFFER_WITHHELD_ACTIONS: dict[_OfferWithheldReason, str] = {
         "Update the worker. Versions up to 18.8.1 turned post-processing off on every free-VRAM dip."
     ),
     _OfferWithheldReason.FAULT_BREAKER: (
-        "Repeated post-processing faults turned it off. Fix the cause named in the post-processing finding."
+        "Repeated post-processing faults turned it off. Fix the cause given in the post-processing finding."
     ),
     _OfferWithheldReason.VRAM_ARBITER: (
         "No card had room for the post-processing peak beside the loaded models. Serve fewer models on that card."
     ),
     _OfferWithheldReason.LANE_PAUSED: (
-        "The reclaim ladder paused post-processing to make room for image generation. Serve fewer models on that "
+        "The worker paused post-processing to make room for image generation. Serve fewer models on that "
         "card if this repeats."
     ),
     _OfferWithheldReason.MODELS_NOT_ON_DISK: (
@@ -963,12 +976,12 @@ def detect_post_processing_offer_withheld(context: SessionContext) -> list[Findi
     before_first_edge = (edges[0].timestamp - start).total_seconds() if start is not None else 0.0
     unknown_seconds = before_first_edge + timeline.silent_seconds
     closed_line = (
-        f"longest stretch closed: {_evidence(longest.closed_by)}"
+        f"longest stretch ended: {_evidence(longest.closed_by)}"
         if longest.closed_by is not None
         else f"longest stretch ran to the session end at {_clock_text(longest.end)}"
     )
     reason_lines = [
-        f"{kind.value}: turned off {timeline.closures.get(kind, 0)} time(s), {seconds / 60:.0f} min in total"
+        f"{kind.value}: turned off {_times_text(timeline.closures.get(kind, 0))}, {seconds / 60:.0f} min in total"
         for kind, seconds in sorted(timeline.withheld_seconds.items(), key=lambda item: item[1], reverse=True)
     ]
     return [
@@ -981,9 +994,10 @@ def detect_post_processing_offer_withheld(context: SessionContext) -> list[Findi
             ),
             action_addendum=_OFFER_WITHHELD_ACTIONS[dominant],
             evidence=[
-                f"off {withheld_seconds / 60:.0f} min, on {timeline.offered_seconds / 60:.0f} min, "
-                f"{unknown_seconds / 60:.0f} min not counted, before the first offer change or with the log silent",
-                f"longest stretch opened ({longest.reason.value}): {_evidence(longest.opened_by)}",
+                f"Off for {withheld_seconds / 60:.0f} min and on for {timeline.offered_seconds / 60:.0f} min. "
+                f"{unknown_seconds / 60:.0f} min were left out, because they came before the first logged change "
+                "or while the log was silent.",
+                f"longest stretch began ({longest.reason.value}): {_evidence(longest.opened_by)}",
                 closed_line,
                 *reason_lines,
             ],
@@ -1075,9 +1089,10 @@ def detect_idle_fill_offer_stuck(context: SessionContext) -> list[Finding]:
     assert session_end is not None
     narrow = _longest_narrow_offer(records, session_end)
     narrow_evidence = (
-        f"advertised offer narrowed to {narrow.models} of {narrow.widest} models for {_span_text(narrow.seconds)}"
+        f"the worker asked for {narrow.models} of {narrow.widest} models for {_span_text(narrow.seconds)}"
         + (
-            f", horde skipped {narrow.models_skipped} job(s) for models on its last empty pop"
+            f", and the horde's last empty reply in that time skipped {_count_text(narrow.models_skipped, 'job')} "
+            "because of the models asked for"
             if narrow.models_skipped
             else ""
         )
@@ -1121,12 +1136,13 @@ def detect_idle_fill_offer_stuck(context: SessionContext) -> list[Finding]:
                     f"The worker asked for {narrow.models} of {narrow.widest} models for {_span_text(narrow.seconds)}."
                 ),
                 evidence=[
-                    f"narrowed: {_evidence(narrow.opened)}",
-                    f"widened: {_evidence(narrow.closed)}"
+                    f"fewer models asked for from: {_evidence(narrow.opened)}",
+                    f"full list asked for again from: {_evidence(narrow.closed)}"
                     if narrow.closed is not None
-                    else "still narrowed at the session end",
+                    else "still asking for fewer models at the session end",
                     narrow_evidence,
-                    "no idle-fill arm lines in this log, so this is read from the advertised offer",
+                    "This log has no idle-fill breaker lines, so the finding is read from the model counts in the "
+                    "worker's job requests.",
                 ],
             ),
         ]
@@ -1134,13 +1150,18 @@ def detect_idle_fill_offer_stuck(context: SessionContext) -> list[Finding]:
     opened, closed, offer = longest
     offer_match = _IDLE_FILL_OFFER_RE.search(offer.message) if offer is not None else None
     evidence = [
-        f"armed: {_evidence(opened)}",
-        f"disarmed: {_evidence(closed)}" if closed is not None else "still armed at the session end",
-        f"last offer: {_evidence(offer)}" if offer is not None else "no offer line while armed",
-        f"{len(stuck)} of {len(arms)} arm(s) lasted {_IDLE_FILL_STUCK_SECONDS / 60:.0f} minutes or more",
+        f"idle-fill breaker turned on: {_evidence(opened)}",
+        f"turned off: {_evidence(closed)}" if closed is not None else "still on at the session end",
+        f"last narrowed request while on: {_evidence(offer)}"
+        if offer is not None
+        else "no narrowed request was logged while it was on",
+        f"The breaker turned on {_times_text(len(arms))} and stayed on for "
+        f"{_IDLE_FILL_STUCK_SECONDS / 60:.0f} minutes or more {_times_text(len(stuck))}.",
         *([narrow_evidence] if narrow_evidence is not None else []),
     ]
-    models_text = f" with {offer_match['models']} models offered" if offer_match is not None else ""
+    models_text = (
+        f" with {_count_text(int(offer_match['models']), 'model')} offered" if offer_match is not None else ""
+    )
     return [
         Finding(
             kind=FindingKind.IDLE_FILL_OFFER_STUCK,
@@ -1196,8 +1217,9 @@ def detect_service_lane_restart_churn(context: SessionContext) -> list[Finding]:
         median = _median([seconds for seconds, _ in lane_pairs]) or 0.0
         kept = sum(1 for _, was_held in lane_pairs if was_held)
         evidence.append(
-            f"{lane}: {len(lane_pairs)} stop and restart pair(s), {quick} restarted within "
-            f"{_LANE_QUICK_RESTART_SECONDS:.0f} s, median {median:.1f} s, {kept} held for a job",
+            f"{lane}: stopped and restarted {_times_text(len(lane_pairs))}, {quick} of them within "
+            f"{_LANE_QUICK_RESTART_SECONDS:.0f} s, median {median:.1f} s from stop to restart, {kept} kept down "
+            "until a job finished sampling",
         )
     worst = max(churning, key=lambda lane: len(churning[lane]))
     worst_quick = sum(1 for seconds, _ in churning[worst] if seconds < _LANE_QUICK_RESTART_SECONDS)
@@ -1215,6 +1237,11 @@ def detect_service_lane_restart_churn(context: SessionContext) -> list[Finding]:
 
 
 _DOUBLE_DISPATCH_SIGNATURES = ("inference_result_lost", "inference_result_job_missing")
+_DOUBLE_DISPATCH_EVIDENCE_LABELS: dict[str, str] = {
+    "inference_result_lost": 'results lost while their job was still in progress ("its inference result was lost")',
+    "inference_result_job_missing": 'results for a job the worker no longer tracked ("not found in jobs_in_progress")',
+}
+"""What each signature counts, in a reader's words, with the log phrase to search for."""
 _OWNERSHIP_RELEASED_RE = pattern_for("ended_job_ownership_released")
 
 
@@ -1244,10 +1271,10 @@ def detect_lane_double_dispatch_signature(context: SessionContext) -> list[Findi
         Finding(
             kind=FindingKind.LANE_DOUBLE_DISPATCH_SIGNATURE,
             severity=Severity.CRITICAL,
-            headline=f"The worker lost track of which process owned a job {total} times.",
+            headline=f"The worker lost track of which process owned a job {_times_text(total)}.",
             evidence=[
-                *(f"{name}: {len(found)}" for name, found in hits.items()),
-                f"ended_job_ownership_released: {released}",
+                *(f"{_DOUBLE_DISPATCH_EVIDENCE_LABELS[name]}: {len(found)}" for name, found in hits.items()),
+                f'jobs released after ending with no result, which is normal cleanup ("Released process"): {released}',
                 f"first: {_evidence(first)}",
             ],
         ),
@@ -1304,7 +1331,13 @@ def detect_unpriced_sampling_windows(context: SessionContext) -> list[Finding]:
     if total == 0:
         return []
     severity = Severity.WARNING if len(long_windows) >= _UNPRICED_LONG_WAIT_WARNING_COUNT else Severity.INFO
-    if long_windows:
+    if total == 1:
+        headline = "Image generation started without a recorded memory grant once, " + (
+            f"after waiting {_UNPRICED_LONG_WAIT_SECONDS:.0f} seconds or more."
+            if long_windows
+            else f"after a wait under {_UNPRICED_LONG_WAIT_SECONDS:.0f} seconds."
+        )
+    elif long_windows:
         headline = (
             f"Image generation started without a recorded memory grant {total} times, {len(long_windows)} of them "
             f"after waiting {_UNPRICED_LONG_WAIT_SECONDS:.0f} seconds or more."
@@ -1329,7 +1362,7 @@ def detect_unpriced_sampling_windows(context: SessionContext) -> list[Finding]:
     if (median := _median(waits)) is not None:
         evidence.append(f"median wait: {median:.1f} s")
     if unpaired:
-        evidence.append(f"no start of inference on the same process before it: {unpaired}")
+        evidence.append(f"not timed, because the log has no job start on the same process beforehand: {unpaired}")
     costliest_bands = (
         (long_windows, f"{_UNPRICED_LONG_WAIT_SECONDS:.0f} s or more", "at"),
         (middle_windows, f"{_UNPRICED_SHORT_WAIT_SECONDS:.0f} s to under {_UNPRICED_LONG_WAIT_SECONDS:.0f} s", "from"),
@@ -1399,8 +1432,9 @@ def detect_post_processing_deferral_starvation(context: SessionContext) -> list[
     starved = len(worst) >= _PP_DEFER_STARVATION_THRESHOLD
 
     verdict = (
-        f'Job "{worst_job}" waited for post-processing room {len(worst)} times and {len(defer_records)} jobs '
-        "waited in total" + (", and no post-processing finished after the waits began." if lane_fully_starved else ".")
+        f'Job "{worst_job}" waited for post-processing room {len(worst)} times and '
+        f"{_count_text(len(defer_records), 'job')} waited in total"
+        + (", and no post-processing finished after the waits began." if lane_fully_starved else ".")
     )
     return [
         Finding(
@@ -1517,7 +1551,7 @@ def detect_oom(context: SessionContext) -> list[Finding]:
     models = _faulting_models(faults)
     model_names = [f'"{model}"' for model in models[:_OOM_HEADLINE_MODELS]]
     if len(models) > _OOM_HEADLINE_MODELS:
-        model_names.append(f"{len(models) - _OOM_HEADLINE_MODELS} more models")
+        model_names.append(_count_text(len(models) - _OOM_HEADLINE_MODELS, "more model"))
 
     if broken is not None:
         others = sorted(broken.other_finishes)
@@ -1525,7 +1559,8 @@ def detect_oom(context: SessionContext) -> list[Finding]:
         noun = "process" if len(others) == 1 else "processes"
         verdict = (
             f"Process {broken.process_id} had {broken.faults} of {len(faults)} out-of-memory faults while "
-            f"{noun} {_clause_join([str(other) for other in others])} finished {finished} jobs in the same time."
+            f"{noun} {_clause_join([str(other) for other in others])} finished {_count_text(finished, 'job')} in "
+            "the same time."
         )
         if runtime_errors:
             addendum = (
@@ -1539,9 +1574,10 @@ def detect_oom(context: SessionContext) -> list[Finding]:
                 "`horde-log bundle`, and restart an older worker, which cannot replace the process by itself."
             )
         evidence = [
-            f"process {broken.process_id} finished {broken.own_finishes} jobs between its first and last fault",
+            f"process {broken.process_id} finished {_count_text(broken.own_finishes, 'job')} between its first and "
+            "last fault",
             *(
-                f"process {other} finished {count} jobs over the same span"
+                f"process {other} finished {_count_text(count, 'job')} in the same time"
                 for other, count in sorted(broken.other_finishes.items())
             ),
             *(_evidence(record) for record in faults[:4]),
@@ -1561,11 +1597,11 @@ def detect_oom(context: SessionContext) -> list[Finding]:
     sibling_counts = [len(_OOM_SIBLING_RE.findall(r.message)) for r in faults]
     max_siblings = max(sibling_counts, default=0)
 
-    verdict = f"{len(faults)} out-of-memory faults"
+    verdict = _count_text(len(faults), "out-of-memory fault")
     if model_names:
         verdict += f" on {_clause_join(model_names)}"
     if slots:
-        verdict += f" in processes {_clause_join([str(s) for s in slots])}"
+        verdict += f" in {'process' if len(slots) == 1 else 'processes'} {_clause_join([str(s) for s in slots])}"
     if free_vrams:
         verdict += f", with as little as {min(free_vrams):.0f} MiB free"
         if max_siblings:
@@ -1632,7 +1668,8 @@ def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
         None,
     )
 
-    slot_clause = f" in processes {_clause_join([str(s) for s in slots])}" if slots else ""
+    slot_noun = "process" if len(slots) == 1 else "processes"
+    slot_clause = f" in {slot_noun} {_clause_join([str(s) for s in slots])}" if slots else ""
     model_clause = f" while serving {_clause_join([f'"{m}"' for m in models])}" if models else ""
     resource_clause = (
         f"The refused opens include {_clause_join([f'"{path}"' for path in resources[:4]])}. " if resources else ""
@@ -1648,7 +1685,8 @@ def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
             kind=FindingKind.FILE_DESCRIPTOR_EXHAUSTION,
             severity=Severity.CRITICAL,
             headline=(
-                f"A process ran out of file handles {len(faults)} times{slot_clause}{model_clause}{window_clause}."
+                f"A process ran out of file handles {_times_text(len(faults))}{slot_clause}{model_clause}"
+                f"{window_clause}."
             ),
             action_addendum=recovery_clause,
             evidence=([resource_clause.strip()] if resource_clause else [])
@@ -1784,7 +1822,10 @@ def detect_swallowed_oom(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.SWALLOWED_OOM,
             severity=Severity.WARNING,
-            headline=f'{len(no_images)} jobs failed with a plain "no images produced" message and no cause given.',
+            headline=(
+                f'{_count_text(len(no_images), "job")} failed with a plain "no images produced" message and no '
+                "cause given."
+            ),
             evidence=[_evidence(r) for r in no_images[:4]],
         ),
     ]
@@ -1925,14 +1966,14 @@ def detect_inference_lane_replaced(context: SessionContext) -> list[Finding]:
         exhausted = exhaustion.before(replacement.record.timestamp)
         if exhausted is None:
             evidence.append(
-                f"no host commit exhaustion in the {_HOST_COMMIT_LOOKBACK.total_seconds():.0f}s before the CUDA "
-                f"error on process {replacement.process_id}",
+                f"Windows did not run out of memory to commit in the {_HOST_COMMIT_LOOKBACK.total_seconds():.0f}s "
+                f"before the CUDA error on process {replacement.process_id}",
             )
             continue
         host_explained += 1
         evidence.append(
-            f"host commit ran out {_seconds_before(exhausted, replacement.record):.0f}s before the CUDA error on "
-            f"process {replacement.process_id}: {_evidence(exhausted)}",
+            f"Windows ran out of memory to commit {_seconds_before(exhausted, replacement.record):.0f}s before the "
+            f"CUDA error on process {replacement.process_id}: {_evidence(exhausted)}",
         )
 
     sentences: list[str] = []
@@ -2146,8 +2187,8 @@ def detect_lane_fault_rule_misfire(context: SessionContext) -> list[Finding]:
             evidence.extend(
                 [
                     _evidence(replacement.record),
-                    f"host commit ran out {_seconds_before(exhausted, replacement.record):.0f}s before: "
-                    f"{_evidence(exhausted)}",
+                    f"Windows ran out of memory to commit {_seconds_before(exhausted, replacement.record):.0f}s "
+                    f"before: {_evidence(exhausted)}",
                 ],
             )
 
@@ -2216,9 +2257,11 @@ def detect_supervisor_channel_lost(context: SessionContext) -> list[Finding]:
         evidence.append(_evidence(drop))
         exhausted = exhaustion.before(drop.timestamp)
         evidence.append(
-            f"host commit ran out {_seconds_before(exhausted, drop):.0f}s before: {_evidence(exhausted)}"
+            f"Windows ran out of memory to commit {_seconds_before(exhausted, drop):.0f}s before: "
+            f"{_evidence(exhausted)}"
             if exhausted is not None
-            else f"no host commit exhaustion in the {_HOST_COMMIT_LOOKBACK.total_seconds():.0f}s before"
+            else "Windows did not run out of memory to commit in the "
+            f"{_HOST_COMMIT_LOOKBACK.total_seconds():.0f}s before"
         )
     return [
         Finding(
@@ -2255,18 +2298,17 @@ def _describe_drops(records: list[LogRecord]) -> str:
     """
     giveups = _total_dropped_jobs(records)
     aborts = _count_server_slow_aborts(records)
+    given_up = _count_text(giveups, "queued job")
+    cancelled = _count_text(aborts, "job")
     if giveups and aborts:
-        return (
-            f"Just before, the worker gave up on {giveups} queued jobs and the horde cancelled {aborts} jobs "
-            "as too slow."
-        )
+        return f"Just before, the worker gave up on {given_up} and the horde cancelled {cancelled} as too slow."
     if aborts:
         return (
-            f"Just before, the horde cancelled {aborts} jobs as too slow. The worker was generating slower than "
+            f"Just before, the horde cancelled {cancelled} as too slow. The worker was generating slower than "
             "the horde's per-job deadline."
         )
     if giveups:
-        return f"Just before, the worker gave up on {giveups} queued jobs."
+        return f"Just before, the worker gave up on {given_up}."
     return "The log does not say which jobs were dropped."
 
 
@@ -2295,12 +2337,12 @@ def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
                 kind=FindingKind.FORCED_MAINTENANCE,
                 severity=Severity.CRITICAL,
                 headline=(
-                    f"The horde put the worker into maintenance after it dropped {dropped} jobs, and refused "
-                    f"{len(maintenance)} requests for work."
+                    f"The horde put the worker into maintenance after it dropped {_count_text(dropped, 'job')}, and "
+                    f"refused {_count_text(len(maintenance), 'request')} for work."
                     if dropped
                     else (
                         "The horde put the worker into maintenance for dropping jobs, and refused "
-                        f"{len(maintenance)} requests for work."
+                        f"{_count_text(len(maintenance), 'request')} for work."
                     )
                 ),
                 action_addendum=(
@@ -2318,8 +2360,8 @@ def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
             severity=Severity.INFO,
             title_override="The worker was in maintenance mode",
             headline=(
-                f"The horde refused {len(maintenance)} requests for work because the worker was in maintenance, "
-                "but not for dropped jobs."
+                f"The horde refused {_count_text(len(maintenance), 'request')} for work because the worker was in "
+                "maintenance for a reason other than dropped jobs."
             ),
             action_addendum=(
                 "If you did not set maintenance yourself, clear it on the horde's worker page and check the API "
@@ -2359,9 +2401,9 @@ def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
                 severity=Severity.CRITICAL,
                 headline=(
                     f"The VRAM budget held the next job back for up to {max_starved} seconds on an idle card, "
-                    f"then rebuilt the processes and dropped {dropped} jobs."
+                    f"then rebuilt the processes and dropped {_count_text(dropped, 'job')}."
                 ),
-                evidence=[f"Rebuilt {len(soft_resets)} times{free_hint}."]
+                evidence=[f"The worker rebuilt its processes {_times_text(len(soft_resets))}{free_hint}."]
                 + [_evidence(r) for r in (starved[:2] + soft_resets[:1])],
                 see_also=FindingKind.FORCED_MAINTENANCE,
             ),
@@ -2485,9 +2527,12 @@ def _aging_finding(
     """
     pre_segment, _inference_segment, post_segment = lifecycle.wait_segments()
     pre_median, post_median = pre_segment.median, post_segment.median
-    lead = (
-        f"{base_verdict} Generation was fast, a median {median_gen:.0f} seconds, but each job took a median "
-        f"{median_latency:.0f} seconds from offer to submit"
+    # The caller's verdict is a whole sentence. The headline is one sentence, so it continues that verdict
+    # and the two medians it rests on go to the evidence.
+    lead = base_verdict.rstrip(".")
+    medians_clause = (
+        f"Generation took a median {median_gen:.0f} seconds, and each job took a median {median_latency:.0f} "
+        "seconds from offer to submit."
     )
 
     if pre_median is None and post_median is None:
@@ -2496,13 +2541,17 @@ def _aging_finding(
                 kind=FindingKind.SLOW_GENERATION_DROP_SPIRAL,
                 severity=severity,
                 title_override="Jobs were dropped, and the log cannot say where the time went",
-                headline=f"{lead}, and this log cannot say where the wait was.",
+                headline=(
+                    f"{lead}, and this log cannot say where each job's median {median_latency:.0f} seconds went."
+                ),
                 action_addendum=(
                     "Capture the log again at DEBUG so the job start and finish lines are present, then run "
                     "`horde-log jobs` to see where the wait is. Lowering `max_power` will not help, since "
                     "generation was already fast."
                 ),
-                evidence=([tail.strip()] if tail else []) + [_evidence(record) for record in aborts[:2]],
+                evidence=[medians_clause]
+                + ([tail.strip()] if tail else [])
+                + [_evidence(record) for record in aborts[:2]],
             ),
         ]
 
@@ -2520,13 +2569,13 @@ def _aging_finding(
                 kind=FindingKind.SLOW_GENERATION_DROP_SPIRAL,
                 severity=severity,
                 title_override="Jobs were dropped while waiting to start",
-                headline=f"{lead}, most of it waiting to start.",
+                headline=(f"{lead}, and jobs spent most of a median {median_latency:.0f} seconds waiting to start."),
                 action_addendum=(
                     "Lowering `max_power` will not help, and neither will a faster safety check. Look at what "
                     "held jobs from starting, and on a multi-card host whether work spread across the cards. "
                     "Run `horde-log jobs` for the per-job split."
                 ),
-                evidence=[split_clause]
+                evidence=[medians_clause, split_clause]
                 + ([tail.strip()] if tail else [])
                 + [_evidence(record) for record in (aborts[:2] + stall_evidence)],
                 see_also=FindingKind.MULTI_CARD_DISPATCH_SERIALIZATION,
@@ -2538,19 +2587,21 @@ def _aging_finding(
         for record in _matching(context.session.records, _SAFETY_DURATION_RE)
         if (match := _SAFETY_DURATION_RE.search(record.message))
     ]
-    safety_clause = f" The safety stage averaged {_mean(safety_times):.1f}s per check." if safety_times else ""
+    safety_clause = f" Safety checks averaged {_mean(safety_times):.1f}s each." if safety_times else ""
     safety_evidence = _matching(context.session.records, _SAFETY_DURATION_RE)[:1]
     return [
         Finding(
             kind=FindingKind.SLOW_GENERATION_DROP_SPIRAL,
             severity=severity,
             title_override="Jobs were dropped while waiting after generation",
-            headline=f"{lead}, most of it waiting after generation finished.",
-            action_addendum=(
-                "Lowering `max_power` will not help. Speed up the stage behind inference by turning on "
-                "`safety_on_gpu`, so the safety check is not bound to the CPU."
+            headline=(
+                f"{lead}, and jobs spent most of a median {median_latency:.0f} seconds waiting after generation."
             ),
-            evidence=[split_clause]
+            action_addendum=(
+                "Lowering `max_power` will not help. Speed up the safety check by turning on "
+                "`safety_on_gpu`, so it does not run on the CPU."
+            ),
+            evidence=[medians_clause, split_clause]
             + ([safety_clause.strip()] if safety_clause else [])
             + ([tail.strip()] if tail else [])
             + [_evidence(record) for record in (aborts[:2] + safety_evidence)],
@@ -2601,8 +2652,8 @@ def detect_slow_generation_drop_spiral(context: SessionContext) -> list[Finding]
         and median_latency >= median_gen * _QUEUE_AGING_LATENCY_RATIO
     )
 
-    base_verdict = f"The horde dropped {len(aborts)} jobs{span_clause} for taking too long."
-    tail = "" if spiral else "Isolated so far. A sustained run draws forced maintenance."
+    base_verdict = f"The horde dropped {_count_text(len(aborts), 'job')}{span_clause} for taking too long."
+    tail = "" if spiral else "Few so far. If the drops continue, the horde puts the worker into maintenance."
 
     if queue_aging:
         assert median_latency is not None and median_gen is not None
@@ -2650,7 +2701,9 @@ def detect_consecutive_failure_pause(context: SessionContext) -> list[Finding]:
         Finding(
             kind=FindingKind.CONSECUTIVE_FAILURE_PAUSE,
             severity=Severity.WARNING,
-            headline=f"The worker paused asking for work {len(pauses)} times after three failed jobs in a row.",
+            headline=(
+                f"The worker paused asking for work {_times_text(len(pauses))} after three failed jobs in a row."
+            ),
             evidence=[_evidence(r) for r in pauses[:3]],
         ),
     ]
@@ -2880,7 +2933,7 @@ def _inference_slot_retired_finding(
     for retirement in retirements[:3]:
         began_text = _clock_text(retirement.gave_up.record.timestamp)
         ended_text = "the session end" if retirement.restored is None else _clock_text(retirement.restored.timestamp)
-        evidence.append(f"card {device}: out of the plan from {began_text} to {ended_text}")
+        evidence.append(f"card {device}: one image process fewer from {began_text} to {ended_text}")
     evidence.append(_evidence(retirements[0].gave_up.record))
     evidence.extend(_evidence(retirement.restored) for retirement in retirements[:2] if retirement.restored)
 
@@ -3019,7 +3072,11 @@ def detect_safety_start_escalated_to_cpu(context: SessionContext) -> list[Findin
         if returned is None
         else f"returned to a card at {_clock_text(returned.timestamp)}"
     )
-    count_note = [] if len(escalations) == 1 else [f"{len(escalations)} escalations to the CPU this session"]
+    count_note = (
+        []
+        if len(escalations) == 1
+        else [f"The safety check was started on the CPU {len(escalations)} times this session."]
+    )
     return [
         Finding(
             kind=FindingKind.SAFETY_START_ESCALATED_TO_CPU,
@@ -3027,7 +3084,7 @@ def detect_safety_start_escalated_to_cpu(context: SessionContext) -> list[Findin
             headline=headline,
             action_addendum=action,
             evidence=[
-                f"safety check after the last escalation: {outcome}",
+                f"After the last move to the CPU, the safety check {outcome}.",
                 *count_note,
                 *(_evidence(escalation.record) for escalation in escalations[:3]),
             ],
@@ -3039,24 +3096,28 @@ def _asserted_safety_chain(*, cycle_count: int, owners: list[str], retired_count
     """State the parent-ordered safety cycle as the cause, from the actuator lines that record it.
 
     The generic wording offers a menu (a crash, a residency cycle, a dropped message) because usually
-    nothing in the log says which. When the parent's own pause/restore lines are present they name the
+    nothing in the log says which. When the parent's pause/restore lines are present they give the
     subsystem that ordered the move, and a verdict dropped on a retired launch is the exact mechanism that
     turns such a move into a stranded job, so the two together are an attribution rather than a candidate.
+    Each part is a whole sentence, so the text reads cleanly whichever parts the log supplies.
     """
-    parts: list[str] = []
+    sentences: list[str] = []
     if cycle_count:
-        who = _clause_join(owners) if owners else "the parent"
-        parts.append(
-            f"{who} moved the safety process off and back onto the GPU {cycle_count} time(s) this session",
+        quoted_owners = _clause_join([f'"{owner}"' for owner in owners])
+        by_whom = f", ordered by {quoted_owners}" if owners else ""
+        sentences.append(
+            f"The worker moved the safety process off the GPU or back onto it {_times_text(cycle_count)} this "
+            f"session{by_whom}.",
         )
     if retired_count:
-        parts.append(
-            f"{retired_count} verdict(s) arrived from a launch that move had already retired and were dropped",
+        sentences.append(
+            f"{_count_text(retired_count, 'safety result')} arrived from a process such a move had already "
+            f"replaced, and {'was' if retired_count == 1 else 'were'} dropped.",
         )
-    return (
-        "This was not an unexplained safety crash: " + _clause_join(parts) + ". Each replacement invalidates "
-        "the launch that owns the in-flight checks, so the jobs waiting on them have no verdict to receive."
+    sentences.append(
+        "Each move replaces the safety process, so the checks it had in progress never return a result.",
     )
+    return " ".join(sentences)
 
 
 def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
@@ -3087,16 +3148,22 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
 
     detail_bits: list[str] = []
     if lost_results:
-        detail_bits.append(f"{len(lost_results)} safety result(s) never returned")
+        detail_bits.append(f"{_count_text(len(lost_results), 'safety result')} never returned")
     if requeues:
-        detail_bits.append(f"{len(requeues)} job(s) re-checked")
+        detail_bits.append(f"{_count_text(len(requeues), 'job')} checked again")
     if unrecoverable:
-        detail_bits.append(f"{len(unrecoverable)} faulted with no image")
+        detail_bits.append(f"{_count_text(len(unrecoverable), 'job')} failed with no image")
     if soft_pauses:
-        detail_bits.append(f"{len(soft_pauses)} soft-pause(s)")
+        detail_bits.append(
+            f"{_count_text(len(soft_pauses), 'pause')} on asking for jobs after a check failed "
+            '("Soft-pausing job pops")'
+        )
     if backpressure:
-        detail_bits.append(f"{len(backpressure)} pop-throttle(s) on backlog")
-    detail = "; ".join(detail_bits)
+        detail_bits.append(
+            f"{_count_text(len(backpressure), 'hold')} on asking for jobs while checks were behind "
+            '("Withholding job pops")'
+        )
+    detail = ", ".join(detail_bits)
 
     placement_cycles = _matching(records, _SAFETY_PLACEMENT_CYCLE_RE)
     retired_drops = _matching(records, _RETIRED_SAFETY_RESULT_RE)
@@ -3107,8 +3174,9 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
     narrative: list[str] = [f"Counts: {detail}."]
     if escalated:
         verdict = (
-            f"The safety check lost results and {len(unrecoverable)} jobs were dropped with no image, which the "
-            "horde counts against the worker."
+            f"The safety check lost results and {_count_text(len(unrecoverable), 'job')} "
+            f"{'was' if len(unrecoverable) == 1 else 'were'} dropped with no image, which the horde counts against "
+            "the worker."
         )
         if placement_cycles or retired_drops:
             # The parent's own actuator is in the log, so the chain is readable end to end and there is no
@@ -3121,9 +3189,9 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
                 )
             )
             remediation = (
-                "The worker's subsystem named in the evidence keeps moving the safety check off the GPU, "
-                "and a result in flight is lost each time. Turn off `unload_models_from_vram_often` or "
-                "whole-card residency to reduce how often, and report it."
+                "The evidence shows which part of the worker keeps moving the safety check off the GPU, "
+                "and a result in progress is lost each time. Turn off `unload_models_from_vram_often` or "
+                "whole-card reservations to reduce how often, and report it."
             )
         else:
             remediation = (
@@ -3178,8 +3246,8 @@ def detect_whole_card_convergence_wedge(context: SessionContext) -> list[Finding
             kind=FindingKind.WHOLE_CARD_CONVERGENCE_WEDGE,
             severity=Severity.CRITICAL,
             headline=(
-                f"A model that needs the whole card was refused {len(wedges)} times because something never "
-                "left the card to make room."
+                f"A model that needs the whole card was refused {_times_text(len(wedges))} because something "
+                "never left the card to make room."
             ),
             evidence=[_evidence(r) for r in wedges[:3]],
         ),
@@ -3208,10 +3276,10 @@ def detect_whole_card_nonhead_residency_starvation(context: SessionContext) -> l
             kind=FindingKind.WHOLE_CARD_NONHEAD_RESIDENCY_STARVATION,
             severity=Severity.CRITICAL if escalated else Severity.WARNING,
             headline=(
-                f"The next job was held back {len(starvations)} times while the card was reserved for a job "
-                "behind it"
+                f"The next job was held back {_times_text(len(starvations))} while the card was reserved for a later "
+                "job"
                 + (
-                    f", then rebuilt and dropped {dropped} jobs."
+                    f", then processes were rebuilt and {_count_text(dropped, 'job')} dropped."
                     if escalated
                     else ", and the stall cleared on its own."
                 )
@@ -3272,15 +3340,18 @@ def _whole_card_claims(records: list[LogRecord]) -> list[_WholeCardClaim]:
 def _claim_figures_text(claims: list[_WholeCardClaim], *, count: int) -> str:
     """The process-count and free-VRAM figures the reservations carried, or a note that they carried none."""
     if not claims:
-        return f"None of the {count} reservation(s) stated its process-count arithmetic."
+        return f"None of the {_count_text(count, 'reservation')} logged its image process counts."
     counts = _distinct_ordered([claim.counts_text for claim in claims])
-    text = f"Its stated arithmetic across {len(claims)} reservation(s): {_clause_join(counts)}."
+    text = (
+        f"Image process counts logged by {_count_text(len(claims), 'reservation')}, as running -> after of the "
+        f"maximum, then the target: {_clause_join(counts)}."
+    )
     frees = [claim.free_mb for claim in claims if claim.free_mb is not None]
     if frees:
         text += (
-            f" Device free VRAM at reservation ranged {min(frees)}-{max(frees)}MB."
+            f" Free VRAM on the card at reservation ranged from {min(frees)} to {max(frees)}MB."
             if min(frees) != max(frees)
-            else f" Device free VRAM at reservation was {frees[0]}MB."
+            else f" Free VRAM on the card at reservation was {frees[0]}MB."
         )
     return text
 
@@ -3301,20 +3372,32 @@ class _StreamForecast:
         return self.marginal_source is not None and self.marginal_source.startswith("seed")
 
     def describe(self) -> str:
-        """The cause figures, worded so the marginal's provenance is visible rather than assumed."""
+        """The cause figures, worded so the marginal's provenance is visible rather than assumed.
+
+        The log's field name follows the one figure a reader may want to search for.
+        """
         parts: list[str] = []
         if self.marginal_mb is not None and self.marginal_source is not None:
-            provenance = "seeded, not measured" if self.marginal_is_seeded else f"measured from {self.marginal_source}"
-            parts.append(f"per-context marginal {self.marginal_mb:.0f}MB ({provenance})")
+            provenance = (
+                "a built-in estimate, since none was measured"
+                if self.marginal_is_seeded
+                else f"measured, source {self.marginal_source}"
+            )
+            parts.append(f"charged {self.marginal_mb:.0f}MB for each extra image process ({provenance})")
         elif self.marginal_source is not None:
-            parts.append(f"per-context marginal unavailable (src={self.marginal_source})")
+            parts.append(f"had no figure for what each extra image process costs (source {self.marginal_source})")
         if self.unreclaimable_mb is not None:
-            parts.append(f"{self.unreclaimable_mb:.0f}MB charged as unreclaimable")
+            parts.append(f"counted {self.unreclaimable_mb:.0f}MB as memory that stopping processes cannot free")
         if self.needs_reduction is not None:
-            parts.append(f"needs_process_count_reduction={self.needs_reduction}")
+            judged = (
+                "found that idle image processes had to be stopped for the model to fit"
+                if self.needs_reduction
+                else "did not call for idle image processes to be stopped"
+            )
+            parts.append(f"{judged} (needs_process_count_reduction={self.needs_reduction})")
         if not parts:
             return ""
-        return f"The forecast for {self.model} priced it with {_clause_join(parts)}."
+        return f'The memory forecast for {self.model} ("Stream forecast" in the log) {_clause_join(parts)}.'
 
 
 def _last_stream_forecast(records: list[LogRecord]) -> _StreamForecast | None:
@@ -3368,22 +3451,24 @@ def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
     unmeasured_marginal = forecast is not None and forecast.marginal_is_seeded
 
     outcome = (
-        f", until the worker rebuilt its processes {len(soft_resets)} times and dropped {dropped} jobs"
+        f", until the worker rebuilt its processes {_times_text(len(soft_resets))} and dropped "
+        f"{_count_text(dropped, 'job')}"
         if escalated
         else ""
     )
     figures = [_claim_figures_text(claims, count=len(establishes))]
     if all_incoherent:
         figures.append(
-            f"Every reservation that stated its arithmetic demanded no reduction: the target process count was "
-            f"at or above the live count (for example {incoherent[0].counts_text})."
+            "Every reservation that logged its counts asked for at least as many image processes as were already "
+            f"running, so it stopped none. One of them logged {incoherent[0].counts_text}."
         )
     if forecast is not None:
         figures.append(forecast.describe())
-        if forecast.unreclaimable_mb is not None:
-            figures.append(f"The forecast counts {forecast.unreclaimable_mb:.0f} MB as memory no teardown can return.")
     if declined:
-        figures.append(f"The trust gate declined {len(declined)} further reservations.")
+        figures.append(
+            f"The worker declined to reserve the card for {_count_text(len(declined), 'model')} whose memory "
+            'figures it did not trust ("Declined a whole-card residency" in the log).'
+        )
     return [
         Finding(
             kind=FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
@@ -3413,7 +3498,7 @@ def _churn_remediation(
     """
     if all_incoherent:
         unreclaimable = (
-            f" The forecast counts {forecast.unreclaimable_mb:.0f} MB as memory no teardown can return."
+            f" The worker counts {forecast.unreclaimable_mb:.0f} MB as memory that stopping processes cannot free."
             if forecast is not None and forecast.unreclaimable_mb is not None
             else ""
         )
@@ -3523,8 +3608,8 @@ def detect_whole_card_pop_claim_episodes(context: SessionContext) -> list[Findin
     durations: list[float] = []
     for episode in episodes:
         per_model[episode.model] = per_model.get(episode.model, 0) + 1
-        per_release[episode.release or "still standing at the end of the session"] = (
-            per_release.get(episode.release or "still standing at the end of the session", 0) + 1
+        per_release[episode.release or "still in force at the session end"] = (
+            per_release.get(episode.release or "still in force at the session end", 0) + 1
         )
         seconds = episode.seconds
         if seconds is not None:
@@ -3537,7 +3622,8 @@ def detect_whole_card_pop_claim_episodes(context: SessionContext) -> list[Findin
         f"{release} x{count}" for release, count in sorted(per_release.items(), key=lambda kv: -kv[1])
     )
     held_text = (
-        f" They held the offer for {sum(durations):.0f}s in total (longest {max(durations):.0f}s)."
+        f" The worker asked for one model only for {sum(durations):.0f}s in total, {max(durations):.0f}s at the "
+        "longest."
         if durations
         else ""
     )
@@ -3546,8 +3632,8 @@ def detect_whole_card_pop_claim_episodes(context: SessionContext) -> list[Findin
             kind=FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
             severity=Severity.INFO,
             headline=(
-                f"The worker asked the horde for one model only {len(episodes)} times this session while that "
-                "model held the card."
+                f"The worker asked the horde for one model only {_times_text(len(episodes))} this session while "
+                "that model held the card."
             ),
             evidence=[f"By model: {model_breakdown}.", f"How each ended: {release_breakdown}.{held_text}"]
             + [_evidence(episode.engaged) for episode in episodes[:3]],
@@ -3591,7 +3677,10 @@ def detect_whole_card_pop_claim_monopoly(context: SessionContext) -> list[Findin
                 f"{len(squeezing)} times the worker kept asking for one model until the hold cap stopped it, "
                 "while jobs for other models waited."
             ),
-            evidence=[f"Claimed by: {', '.join(claimants)}.", f"Jobs waiting meanwhile: {starved_breakdown}."]
+            evidence=[
+                f"The one model asked for: {', '.join(claimants)}.",
+                f"Times a job for another model was logged as held back meanwhile: {starved_breakdown}.",
+            ]
             + [_evidence(episode.engaged) for episode, _parked in squeezing[:3]],
         ),
     ]
@@ -3627,8 +3716,8 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
                 severity=Severity.CRITICAL,
                 title_override="The next job did not start although nothing was holding it",
                 headline=(
-                    f"{len(bug_stalls)} times the next job had its model loaded on an idle process with nothing "
-                    "holding it back, and still did not start."
+                    f"The next job did not start {_times_text(len(bug_stalls))} although its model was loaded on "
+                    "an idle process and nothing was holding it back."
                 ),
                 action_addendum=(
                     "Capture the log around the stall and report it. As a stopgap, turn off "
@@ -3644,8 +3733,8 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
             kind=FindingKind.HEAD_DISPATCH_STALL,
             severity=Severity.WARNING,
             headline=(
-                f"The next job was held back {len(stalls)} times, each time by a rule the log reports: a "
-                "concurrency cap, an overlap wait, or a load the VRAM budget put off."
+                f"The next job was held back {_times_text(len(stalls))}, {'each time ' if len(stalls) > 1 else ''}by "
+                "a rule the log reports."
             ),
             action_addendum=(
                 "If throughput is low, change the setting behind the rule in the evidence, which is "
@@ -3720,9 +3809,12 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
             kind=FindingKind.RESIDENCY_RECONCILIATION_HOLDS,
             severity=Severity.WARNING if escalated else Severity.INFO,
             headline=(
-                f"The worker paused {len(holds)} times to unload an idle model before the next job, about "
-                f"{holds_per_hour:.0f} an hour and {parked_seconds_total:.0f} seconds in total"
-                + (f", and {len(wedge_lines)} of those pauses never cleared." if wedged else ".")
+                f"The worker paused {_times_text(len(holds))} to unload an idle model before the next job"
+                + (
+                    f", with {_count_text(len(wedge_lines), 'stall or recovery line')} logged in that time."
+                    if wedged
+                    else f", about {holds_per_hour:.0f} an hour and {parked_seconds_total:.0f} seconds in total."
+                )
             ),
             action_addendum=(
                 "Something held the card that no job finishing gives back. Capture the log around the pause "
@@ -3737,8 +3829,16 @@ def detect_residency_reconciliation_holds(context: SessionContext) -> list[Findi
             ),
             evidence=[
                 f"Pauses by model: {model_breakdown}."
-                + (f" Parked for {parked_fraction:.0%} of the session." if duration else ""),
+                + (f" The pauses took {parked_fraction:.0%} of the session." if duration else ""),
             ]
+            + (
+                [
+                    f"About {holds_per_hour:.0f} pauses an hour and {parked_seconds_total:.0f} seconds in total.",
+                    *(_evidence(record) for record in wedge_lines[:2]),
+                ]
+                if wedged
+                else []
+            )
             + [_evidence(r) for r in holds[:3]],
         ),
     ]
@@ -3805,7 +3905,8 @@ def detect_pop_governor_dominance(context: SessionContext) -> list[Finding]:
         return []
     top_name, top_seconds = dominant[0]
     phrases = [
-        f"{GOVERNOR_LABELS.get(name, name)}: {seconds / duration * 100:.0f}% of the session, {seconds / 60:.1f} min"
+        f"{GOVERNOR_PLAIN_PHRASES.get(name, name)} ({name} in the log): {seconds / duration * 100:.0f}% of the "
+        f"session, {seconds / 60:.1f} min"
         for name, seconds in dominant
     ]
     return [
@@ -3850,6 +3951,15 @@ The backstop faults its jobs and the submitter reports each one in the same burs
 to cover the submits themselves; wider, and an unrelated later fault would be misattributed to it."""
 
 
+_FAULT_CAUSE_NO_MODEL_NAME = "job offer with no model name"
+_FAULT_CAUSE_STAGE = "a stage of the split pipeline failed (disaggregation)"
+_FAULT_CAUSE_SAFETY = "the safety check could not be completed"
+_FAULT_CAUSE_PROCESS = "fault in the image process"
+_FAULT_CAUSE_GAVE_UP = "dropped when the worker gave up on its queue"
+_FAULT_CAUSE_OTHER = "other"
+"""The cause labels the failed-jobs evidence prints. Display text only, never compared."""
+
+
 def _faulted_job_models(records: list[LogRecord]) -> dict[str, str]:
     """Map job id to the model it was popped for, from the pop lines that state both."""
     models: dict[str, str] = {}
@@ -3875,8 +3985,8 @@ def _classify_fault(
     if timestamp is not None and any(
         0 <= (timestamp - given_up).total_seconds() <= _GIVE_UP_ATTRIBUTION_SECONDS for given_up in give_up_times
     ):
-        return "give-up backstop"
-    return "other"
+        return _FAULT_CAUSE_GAVE_UP
+    return _FAULT_CAUSE_OTHER
 
 
 def _faulted_jobs(context: SessionContext) -> list[_FaultedJob]:
@@ -3896,14 +4006,14 @@ def _faulted_jobs(context: SessionContext) -> list[_FaultedJob]:
         # of the worker handled it, so it is never a model or a device failure however it faults later.
         malformed = _EMPTY_MODEL_POP_RE.search(record.message) or _MALFORMED_POP_REJECTED_RE.search(record.message)
         if malformed is not None:
-            id_anchored[malformed.group("job")] = "malformed pop (no model name)"
+            id_anchored[malformed.group("job")] = _FAULT_CAUSE_NO_MODEL_NAME
     for record in child + parent:
         stage = _STAGE_FAULT_RE.search(record.message)
         if stage is not None:
-            id_anchored.setdefault(stage.group("job"), "disaggregation stage fault")
+            id_anchored.setdefault(stage.group("job"), _FAULT_CAUSE_STAGE)
         safety = _SAFETY_UNRECOVERABLE_JOB_RE.search(record.message)
         if safety is not None:
-            id_anchored[safety.group("job")] = "safety-unrecoverable"
+            id_anchored[safety.group("job")] = _FAULT_CAUSE_SAFETY
 
     faults: dict[str, _FaultedJob] = {}
     for record in parent:
@@ -3913,7 +4023,7 @@ def _faulted_jobs(context: SessionContext) -> list[_FaultedJob]:
             job_id = slot_fault.group("job")
             model = _FAULT_MODEL_RE.search(record.message)
             if not requeued:
-                id_anchored.setdefault(job_id, "process fault")
+                id_anchored.setdefault(job_id, _FAULT_CAUSE_PROCESS)
             if model is not None:
                 models.setdefault(job_id, model.group("model"))
         reported = _FAULT_REPORTED_RE.search(record.message)
@@ -3950,13 +4060,13 @@ def detect_faulted_job_census(context: SessionContext) -> list[Finding]:
     counts: dict[str, int] = {}
     for fault in faults:
         counts[fault.cause] = counts.get(fault.cause, 0) + 1
-    breakdown = _clause_join([f"{count} {cause}" for cause, count in sorted(counts.items(), key=lambda kv: -kv[1])])
+    breakdown = ", ".join(f"{cause} ({count})" for cause, count in sorted(counts.items(), key=lambda kv: -kv[1]))
     models = _distinct_ordered([fault.model for fault in faults if fault.model is not None])
     return [
         Finding(
             kind=FindingKind.FAULTED_JOB_CENSUS,
             severity=Severity.WARNING,
-            headline=f"{len(faults)} jobs failed this session.",
+            headline=f"{_count_text(len(faults), 'job')} failed this session.",
             evidence=[f"By cause: {breakdown}."]
             + ([f"Models: {_clause_join(models)}."] if models else [])
             + [fault.describe() for fault in faults[:8]],
@@ -4018,7 +4128,7 @@ def detect_pop_liveness_full_queue(context: SessionContext) -> list[Finding]:
             kind=FindingKind.POP_LIVENESS_FULL_QUEUE,
             severity=Severity.CRITICAL,
             headline=(
-                f"The queue was full and nothing moved {len(frozen)} times, for as long as {worst} seconds"
+                f"The queue was full and nothing moved {_times_text(len(frozen))}, for as long as {worst} seconds"
                 + (f', with "{_clause_join(_distinct_ordered(heads))}" next in line.' if heads else ".")
             ),
             action_addendum=(
@@ -4080,11 +4190,15 @@ def detect_model_reference_sample_fault(context: SessionContext) -> list[Finding
             kind=FindingKind.MODEL_REFERENCE_SAMPLE_FAULT,
             severity=Severity.WARNING,
             headline=(
-                f"{len(faults)} jobs failed because the {_clause_join(quoted_categories)} model list could not be "
-                f"read, affecting jobs {_clause_join([job[:8] for job in jobs[:4]])}."
+                f"{_count_text(len(faults), 'job')} failed because the {_clause_join(quoted_categories)} model list "
+                f"could not be read, affecting {'job' if len(jobs[:4]) == 1 else 'jobs'} "
+                f"{_clause_join([job[:8] for job in jobs[:4]])}."
             ),
             evidence=(
-                [f"{len(stale)} stale-cache lines sit alongside them, so a reference refresh was in flight."]
+                [
+                    f"The log has {_count_text(len(stale), 'stale-cache line')} within a minute of the failures, so "
+                    "the model list was being refreshed at the time."
+                ]
                 if stale
                 else []
             )
@@ -4131,13 +4245,14 @@ def detect_empty_model_pop_cascade(context: SessionContext) -> list[Finding]:
 
     if uncontained:
         blocked = (
-            f", and block the blank name {len(blank_quarantines)} times"
+            f", and block the blank name {_times_text(len(blank_quarantines))}"
             if blank_quarantines or quarantine_skips
             else ""
         )
         verdict = (
-            f"{len(empty_pops)} blank job offers made the worker load a nameless model {len(blank_preloads)} "
-            f"times, crash {len(blank_deaths)} image processes{blocked}."
+            f"{_count_text(len(empty_pops), 'blank job offer')} made the worker load a nameless model "
+            f"{_times_text(len(blank_preloads))}, crash "
+            f"{_count_text(len(blank_deaths), 'image process', 'image processes')}{blocked}."
         )
         remediation = (
             "Update the worker. Newer versions hand a blank offer straight back without loading anything or "
@@ -4151,8 +4266,8 @@ def detect_empty_model_pop_cascade(context: SessionContext) -> list[Finding]:
         evidence_lines = [_evidence(r) for r in evidence[0]] + [_evidence(r) for r in evidence[1]]
     else:
         verdict = (
-            f"{len(rejected)} job offers arrived with no model name and the worker handed each one back "
-            "without loading anything or losing a process."
+            f"{_count_text(len(rejected), 'job offer')} arrived with no model name and the worker handed "
+            f"{'it' if len(rejected) == 1 else 'each one'} back without loading anything or losing a process."
         )
         remediation = "Each refused offer is a job this worker could not serve, so watch the rate."
         severity = Severity.WARNING
@@ -4210,8 +4325,8 @@ def detect_preload_kills_child_loop(context: SessionContext) -> list[Finding]:
             kind=FindingKind.PRELOAD_KILLS_CHILD_LOOP,
             severity=Severity.CRITICAL,
             headline=(
-                f'Loading "{model}" crashed an image process {len(deaths)} times across processes '
-                f"{_clause_join([str(slot) for slot in slots])}"
+                f'Loading "{model}" crashed an image process {len(deaths)} times across '
+                f"{'process' if len(slots) == 1 else 'processes'} {_clause_join([str(slot) for slot in slots])}"
                 + (f', and "{_clause_join(others)}" did the same.' if others else ".")
             ),
             evidence=[_evidence(recovery.record) for recovery in deaths[:3]],
@@ -4290,7 +4405,7 @@ def detect_pop_api_error_dominance(context: SessionContext) -> list[Finding]:
             ),
             evidence=[f'The message: "{message}".']
             + ([f"The horde's error code was {code}."] if code else [])
-            + ([f"{others} other refusal messages also occurred."] if others > 0 else [])
+            + ([f"{_count_text(others, 'other refusal message')} also occurred."] if others > 0 else [])
             + [_evidence(record) for record in (occurrences[:1] + occurrences[-1:])],
         ),
     ]
@@ -4393,7 +4508,7 @@ def detect_model_economics(context: SessionContext) -> list[Finding]:
         evidence.append(
             f"{economics.model}: {jobs_text}, {economics.kudos:.0f} kudos ({kudos_share:.1f}%), "
             f"{_rate_text(economics.kudos_per_sampling_second)} per sampling-second, "
-            f"{_rate_text(economics.kudos_per_wall_second)} per wall-second, {wall_share:.1f}% of wall"
+            f"{_rate_text(economics.kudos_per_wall_second)} per wall-second, {wall_share:.1f}% of wall time"
         )
     return [
         Finding(
@@ -4433,10 +4548,10 @@ def detect_session_summary(context: SessionContext) -> list[Finding]:
             severity=severity,
             headline=f"The session ran for {duration_text} and {_SESSION_END_PHRASES[session.end_reason]}.",
             evidence=[
-                f"Peak process recoveries {session.peak_process_recoveries}, "
-                f"{len(context.recoveries)} recovery diagnostics.",
+                f"The process restart count reached {session.peak_process_recoveries}, and the log has "
+                f"{_count_text(len(context.recoveries), 'restart report')}.",
                 f"Version v{session.version or '?'}, {session.num_models or '?'} models, "
-                f"{session.max_threads or '?'} threads.",
+                f"{_count_text(session.max_threads, 'thread') if session.max_threads else '? threads'}.",
             ]
             + ([f"hordelib {session.hordelib}."] if session.hordelib else [])
             # A parent log rotates by size mid-run, so which archives were read decides the span every
@@ -4468,8 +4583,9 @@ def _snapshot_evidence(lifecycle: JobLifecycleModel, *, count: int = 2) -> list[
         }
         stamp = snapshot.timestamp.strftime("%H:%M:%S") if snapshot.timestamp else "--:--:--"
         lines.append(
-            f"{stamp}  status: {len(sampling)}/{len(lanes)} lane(s) sampling on {len(cards)} card(s), "
-            f"{sum(1 for lane in lanes if lane.idle)} idle, {len(snapshot.pending_jobs)} job(s) queued",
+            f"{stamp}  status: {len(sampling)} of {_count_text(len(lanes), 'image process', 'image processes')} "
+            f"sampling on {_count_text(len(cards), 'card')}, {sum(1 for lane in lanes if lane.idle)} idle, "
+            f"{_count_text(len(snapshot.pending_jobs), 'job')} queued",
         )
     return lines
 
@@ -4517,44 +4633,47 @@ def detect_multi_card_dispatch_serialization(context: SessionContext) -> list[Fi
     parent_healthy = drain.drains >= _PARENT_LOOP_MIN_DRAINS and not drain.gaps_over_threshold
     if parent_healthy:
         loop_clause = (
-            f" The parent loop was healthy throughout (longest IPC drain gap {drain.max_gap_seconds:.0f}s "
-            f"against a {drain.threshold_seconds:.0f}s stall threshold), so this is a dispatch decision, "
-            f"not a stalled orchestrator."
+            f" The main process kept reading its workers' messages throughout, with a longest gap of "
+            f"{drain.max_gap_seconds:.0f}s against a {drain.threshold_seconds:.0f}s limit. It was not stalled, so "
+            "the idle cards come from a scheduling decision."
         )
     elif drain.gaps_over_threshold:
-        loop_clause = " The parent loop also stalled; see parent_loop_stall."
+        loop_clause = (
+            " The main process also stopped reading its workers' messages at times. See the parent_loop_stall finding."
+        )
     else:
-        loop_clause = " This capture carries no IPC drain lines, so parent-loop health is unknown."
+        loop_clause = (
+            ' This log has no "Received ... from process" lines, so it cannot show whether the main process stalled.'
+        )
 
     heads = census.head_states
     head_clause = ""
     if heads.total:
         head_clause = (
-            f" At the head of the queue, {100 * heads.resident_but_blocked / heads.total:.0f}% of status "
-            f"prints had the head's model already resident but every holder's card busy, "
-            f"{100 * heads.cold / heads.total:.0f}% had it resident nowhere."
+            f" In {100 * heads.resident_but_blocked / heads.total:.0f}% of status prints the next job's model was "
+            f"loaded only on processes whose card was busy. In {100 * heads.cold / heads.total:.0f}% it was loaded "
+            "nowhere."
         )
 
     severity = (
         Severity.CRITICAL if mean_busy <= card_count * _MULTI_CARD_CONCURRENCY_CRITICAL_FRACTION else Severity.WARNING
     )
     evidence = [
-        f"sampling concurrency: {profile.describe(top=card_count + 1)} "
+        f"share of time by cards sampling at once: {profile.describe(top=card_count + 1)} "
         f"(time-weighted mean {mean_busy:.1f} of {card_count} cards over {profile.observed_seconds / 60:.0f} min)",
-        f"queue: median {census.median_pending:.0f} job(s) pending against an intake budget of {budget}, "
-        f"with a median {census.median_idle_lanes:.0f} idle lane(s) and "
-        f"{census.median_seatable_pending:.0f} pending job(s) whose model was resident on an idle lane on "
-        f"an unoccupied card (peak {census.max_seatable_pending})",
-        f"wait split: pop->dispatch median {pre_segment.median or 0:.0f}s (p90 {pre_segment.p90 or 0:.0f}s), "
-        f"generation median {inference_segment.median or 0:.0f}s, "
-        f"finished->submit median {post_segment.median or 0:.0f}s over {pre_segment.count} job(s)",
+        f"where a job's time went: a median {pre_segment.median or 0:.0f}s from accepting it to starting it "
+        f"(p90 {pre_segment.p90 or 0:.0f}s), {inference_segment.median or 0:.0f}s generating, and "
+        f"{post_segment.median or 0:.0f}s from finishing to submitting, over {_count_text(pre_segment.count, 'job')}",
     ]
     skips = lifecycle.line_skip_census()
     if skips:
         by_reason = ", ".join(f"{reason} {count}" for reason, count in sorted(skips.items()))
-        evidence.append(f"line skips ({sum(skips.values())} total): {by_reason}")
+        evidence.append(
+            f"jobs started ahead of the next in line to fill an idle process ({sum(skips.values())} in total, "
+            f'"skipped the line" in the log), by reason: {by_reason}',
+        )
     else:
-        evidence.append("line skips: none; no job was ever seated ahead of the head to fill an idle lane")
+        evidence.append("No job was started ahead of the next in line to fill an idle process.")
     evidence.extend(_snapshot_evidence(lifecycle))
 
     return [
@@ -4567,11 +4686,11 @@ def detect_multi_card_dispatch_serialization(context: SessionContext) -> list[Fi
                 "seconds of generation."
             ),
             evidence=[
-                f"Median {census.median_pending:.0f} jobs waiting per status print with "
-                f"{census.median_idle_lanes:.0f} idle processes and an intake budget of {budget}. A median "
-                f"{census.median_seatable_pending:.0f} of "
+                f"Each status print showed a median {census.median_pending:.0f} jobs waiting and "
+                f"{census.median_idle_lanes:.0f} idle processes, and the worker holds up to {budget} jobs at once "
+                f"(its intake budget). A median {census.median_seatable_pending:.0f} of "
                 "the waiting jobs already had their model loaded on an idle process whose card was running "
-                f"nothing.{head_clause}{loop_clause}",
+                f"nothing, and at most {census.max_seatable_pending}.{head_clause}{loop_clause}",
             ]
             + evidence,
         ),
@@ -4610,7 +4729,10 @@ def _bundle_ram_requirements(context: SessionContext, charge_mb: float) -> str:
             config_path = root / "bridgeData.yaml"
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if not isinstance(config, dict) or not isinstance(inventory, dict):
-            return "RAM requirements unavailable: bundle metadata is not a mapping"
+            return (
+                "The worker's RAM limits could not be worked out, because the bundle's system or config file is "
+                "not in the expected form."
+            )
         memory = inventory.get("ram", {})
         total = float(memory["total_bytes"]) / (1024 * 1024)
         available = float(memory["available_bytes"]) / (1024 * 1024)
@@ -4623,13 +4745,18 @@ def _bundle_ram_requirements(context: SessionContext, charge_mb: float) -> str:
             context_cost_mb=charge_mb,
         )
     except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as error:
-        return f"RAM requirements unavailable: {type(error).__name__}"
+        return (
+            "The worker's RAM limits could not be worked out, because reading the bundle's system or config file "
+            f"failed with {type(error).__name__}."
+        )
     return (
-        f"Shared RAM requirements: hard floor {thresholds.hard_floor_mb:.0f} MB, "
-        f"soft hold {thresholds.soft_hold_mb:.0f} MB before outstanding job transients, "
-        f"preload {thresholds.preload_requirement_mb:.0f} MB, restore at least "
-        f"{thresholds.restore_requirement_mb:.0f} MB at a {charge_mb:.0f} MB observed load charge; "
-        f"capture available {available:.0f} MB"
+        "Available system RAM the worker needs, from this bundle's config and hardware. It pauses intake below "
+        f"{thresholds.hard_floor_mb:.0f} MB (danger floor). It holds new jobs below {thresholds.soft_hold_mb:.0f} MB "
+        "plus what running jobs still need (soft hold). It needs "
+        f"{thresholds.preload_requirement_mb:.0f} MB to load a model (preload) and at least "
+        f"{thresholds.restore_requirement_mb:.0f} MB to bring a process back (restore), with a model load taken as "
+        f"{charge_mb:.0f} MB, the median of the postponed loads in the log. The bundle recorded {available:.0f} MB "
+        "available."
     )
 
 
@@ -4655,13 +4782,18 @@ def detect_host_ram_starvation(context: SessionContext) -> list[Finding]:
     charge = statistics.median(float(match.group("charge")) for _record, match in defers) if defers else 0.0
     evidence = [
         _bundle_ram_requirements(context, charge),
-        f"pop-hold engage rate {engage_rate:.1f}/hour ({len(holds)} edges); RAM-defer count {len(defers)}; "
-        f"ceiling drain count {drains}; recycle count {recycles}",
+        f"New jobs were held {_times_text(len(holds))}, {engage_rate:.1f} an hour. Model loads were postponed "
+        f"{_times_text(len(defers))}. For holding too much RAM, {_count_text(drains, 'process', 'processes')} "
+        f"{'was' if drains == 1 else 'were'} given no new work until restarted (draining) and "
+        f"{_count_text(recycles, 'process', 'processes')} {'was' if recycles == 1 else 'were'} restarted "
+        "(recycling or cycling).",
     ]
     if readings:
-        evidence.append(f"available RAM at hold/defer edges: median {statistics.median(readings):.0f} MB")
+        evidence.append(
+            f"available RAM when jobs were held or loads postponed: median {statistics.median(readings):.0f} MB"
+        )
     if holds:
-        evidence.append("Recorded hold requirements: " + holds[0][0].message)
+        evidence.append("The first hold line in the log: " + holds[0][0].message)
     # Sweep jobs rather than distinct cards: one card may run several inference processes.
     lifecycle = job_lifecycle_for(context)
     events: list[tuple[datetime, int, int]] = []
@@ -4681,15 +4813,18 @@ def detect_host_ram_starvation(context: SessionContext) -> list[Finding]:
         queued += queue_delta
         previous = stamp
     if busy_queued > 0:
-        evidence.append(f"one in-flight job while work was queued: {one / busy_queued:.1%} of {busy_queued:.0f}s")
+        evidence.append(
+            f"With jobs queued and at least one running, only one was running for {one / busy_queued:.1%} of "
+            f"{busy_queued:.0f}s."
+        )
     evidence.extend(_evidence(record) for record, _match in defers[:2])
     return [
         Finding(
             kind=FindingKind.HOST_RAM_STARVATION,
             severity=Severity.WARNING,
             headline=(
-                f"System RAM held new jobs {len(holds)} times and postponed model loads {len(defers)} times, "
-                f"with {recycles} process restarts."
+                f"System RAM held new jobs {_times_text(len(holds))} and postponed model loads "
+                f"{_times_text(len(defers))}, with {_count_text(recycles, 'process restart')}."
             ),
             evidence=evidence,
         )
@@ -4728,15 +4863,17 @@ def detect_model_churn(context: SessionContext) -> list[Finding]:
             severity=severity,
             action_addendum="System RAM pressure also held jobs or model loads during these swaps." if ram else None,
             headline=(
-                f"Over {dispatches} jobs the worker loaded {movement.preloads} models and unloaded "
-                f"{movement.unloads}, and {movement.cleared_preloads} of those loads were thrown away before "
-                "they ran."
+                f"Over {dispatches} jobs the worker loaded {_count_text(movement.preloads, 'model')} and unloaded "
+                f"{movement.unloads}, and {movement.cleared_preloads} of those loads "
+                f"{'was thrown away before it' if movement.cleared_preloads == 1 else 'were thrown away before they'}"
+                " ran."
             ),
             evidence=[
                 f"loads {movement.preloads} ({preload_ratio:.2f} per job), unloads {movement.unloads} "
                 f"({unload_ratio:.2f} per job), loads cleared before use {movement.cleared_preloads} "
-                f"({cleared_ratio:.2f} per job), displaced-entry expiries {movement.displaced_expiries}, "
-                f"model to system RAM moves {movement.moved_to_system_ram}, against {dispatches} jobs",
+                f"({cleared_ratio:.2f} per job), records dropped for a model another model had replaced "
+                f'{movement.displaced_expiries} ("Expiring displaced entry"), models moved from VRAM to system RAM '
+                f"{movement.moved_to_system_ram}, against {dispatches} jobs",
             ],
         ),
     ]
@@ -4751,6 +4888,14 @@ auxiliary lanes are placed once and can land somewhere else on a later spawn."""
 _SAFETY_GPU_DEVICE_INDEX = 0
 """The card the safety lane occupies when it runs on the GPU. Its spawn line carries no device index, so
 this is the only way to reason about what shares a card with it."""
+
+_LANE_ROLE_NAMES: dict[LaneRole, str] = {
+    LaneRole.INFERENCE: "image",
+    LaneRole.SAFETY: "safety",
+    LaneRole.POST_PROCESS: "post-processing",
+    LaneRole.UTILITIES: "image utilities",
+}
+"""What the evidence calls each kind of process, in the words the findings use."""
 
 _AUX_LANE_SAFETY_SHARING_RE = pattern_for("auxiliary_lane_safety_sharing")
 _UTILITIES_BRINGUP_FAILED_RE = pattern_for("utilities_bringup_failed")
@@ -4794,22 +4939,32 @@ def detect_lane_placement(context: SessionContext) -> list[Finding]:
     for migration in migrations:
         stamp = migration.timestamp.strftime("%H:%M:%S") if migration.timestamp else "--:--:--"
         evidence.append(
-            f"{stamp}  {migration.role} lane (process {migration.process_id}) moved from card "
-            f"{migration.from_device_index} to card {migration.to_device_index}",
+            f"{stamp}  the {_LANE_ROLE_NAMES[migration.role]} process (process {migration.process_id}) moved "
+            f"from card {migration.from_device_index} to card {migration.to_device_index}",
         )
     for device_index in sorted(occupancy):
-        lanes = ", ".join(f"p{placement.process_id} {placement.role}" for placement in occupancy[device_index])
+        lanes = ", ".join(
+            f"process {placement.process_id} ({_LANE_ROLE_NAMES[placement.role]})"
+            for placement in occupancy[device_index]
+        )
         evidence.append(f"card {device_index} now holds: {lanes}")
 
     verdict_parts: list[str] = []
     if migrations:
-        moved = ", ".join(f"{migration.role} (process {migration.process_id})" for migration in migrations)
-        verdict_parts.append(f"{len(migrations)} helper process restarts landed on a different card than before.")
+        moved = ", ".join(
+            f"{_LANE_ROLE_NAMES[migration.role]} (process {migration.process_id})" for migration in migrations
+        )
+        verdict_parts.append(
+            f"{_count_text(len(migrations), 'helper process restart')} landed on a different card than before."
+        )
         evidence.insert(0, f"Moved: {moved}.")
     if co_located:
-        names = ", ".join(f"{placement.role} (process {placement.process_id})" for placement in stacked)
+        names = ", ".join(
+            f"{_LANE_ROLE_NAMES[placement.role]} (process {placement.process_id})" for placement in stacked
+        )
         verdict_parts.append(
-            f"Card {_SAFETY_GPU_DEVICE_INDEX} carries {len(stacked)} helper processes beside the safety check on "
+            f"Card {_SAFETY_GPU_DEVICE_INDEX} carries "
+            f"{_count_text(len(stacked), 'helper process', 'helper processes')} beside the safety check on "
             f"a host driving {card_count} cards."
         )
         evidence.insert(0, f"Stacked on card {_SAFETY_GPU_DEVICE_INDEX}: {names}.")
@@ -4912,22 +5067,24 @@ def detect_parent_loop_stall(context: SessionContext) -> list[Finding]:
     )
     cadence = lifecycle.status_cadence_seconds()
     cadence_clause = (
-        f"derived from this session's {cadence:.0f}s status cadence"
+        f"comes from this session's {cadence:.0f}s interval between status prints"
         if cadence is not None
-        else "the default, this session having no status prints to derive one from"
+        else "is the default, because this session has no status prints to work one out from"
     )
     return [
         Finding(
             kind=FindingKind.PARENT_LOOP_STALL,
             severity=severity,
             headline=(
-                f"The main process stopped reading its workers' messages {len(drain.gaps_over_threshold)} times "
+                f"The main process stopped reading its workers' messages "
+                f"{_times_text(len(drain.gaps_over_threshold))} "
                 f"for over {drain.threshold_seconds:.0f} seconds, the worst {worst:.0f} seconds and "
                 f"{stalled_seconds:.0f} in total."
             ),
-            evidence=[f"The {drain.threshold_seconds:.0f}s threshold is {cadence_clause}."]
+            evidence=[f"The {drain.threshold_seconds:.0f}s limit {cadence_clause}."]
             + [
-                f"{timestamp.strftime('%H:%M:%S')}  IPC drain resumed after {seconds:.0f}s of silence"
+                f"{timestamp.strftime('%H:%M:%S')}  the main process read a worker message again after "
+                f"{seconds:.0f}s without reading any"
                 for timestamp, seconds in drain.gaps_over_threshold[:5]
             ],
         ),
@@ -5024,12 +5181,12 @@ def detect_safety_stage_capacity(context: SessionContext) -> list[Finding]:
             ),
             evidence=([generation_clause] if generation_clause else [])
             + [
-                f"demand: {len(finishes)} inference finish(es) over {busy_span / 60:.0f} min "
-                f"({demand:.2f}/s) across {card_count} card(s)",
-                f"capacity: {len(checks)} safety check(s), median {median_check:.2f}s "
-                f"(p90 {percentile(checks, 0.9) or 0:.2f}s), so {capacity:.2f} check(s)/s",
-                f"finished->safety wait: median {median_wait:.1f}s (p90 {percentile(waits, 0.9) or 0:.1f}s) "
-                f"over {len(waits)} job(s)",
+                f"jobs finishing: {len(finishes)} over {busy_span / 60:.0f} min "
+                f"({demand:.2f} a second) across {card_count} cards",
+                f"safety check speed: {len(checks)} checks, median {median_check:.2f}s each "
+                f"(p90 {percentile(checks, 0.9) or 0:.2f}s), so {capacity:.2f} checks a second",
+                f"wait from finishing to the safety result: median {median_wait:.1f}s "
+                f"(p90 {percentile(waits, 0.9) or 0:.1f}s) over {len(waits)} jobs",
             ],
         ),
     ]

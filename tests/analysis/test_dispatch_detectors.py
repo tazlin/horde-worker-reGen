@@ -169,13 +169,13 @@ class TestMultiCardDispatchSerialization:
         assert "Only 2.0 of the 8 cards" in finding.headline
         # The census, not a guess, is what makes this a scheduling verdict.
         joined = " ".join(finding.evidence)
-        assert "sampling concurrency" in joined
-        assert "resident on an idle lane on an unoccupied card" in joined
+        assert "share of time by cards sampling at once" in joined
+        assert "already had their model loaded on an idle process whose card was running nothing" in joined
         # The head's model is resident on the lane that is sampling it, so the queue is blocked behind
         # work the rest of the fleet had the capacity to run.
-        assert "had the head's model already resident but every holder's card busy" in " ".join(finding.evidence)
+        assert "the next job's model was loaded only on processes whose card was busy" in " ".join(finding.evidence)
         assert "100%" in " ".join(finding.evidence)
-        assert "parent loop was healthy" in " ".join(finding.evidence)
+        assert "kept reading its workers' messages throughout" in " ".join(finding.evidence)
 
     def test_silent_on_a_single_card_worker(self, tmp_path: Path) -> None:
         """A single-card worker emits no 'Driving N cards' line, and one busy card is not a shortfall."""
@@ -426,7 +426,7 @@ class TestSafetyStageCapacity:
         assert "median 1.20s" in " ".join(finding.evidence)
         assert "longer than the median" in " ".join(finding.evidence)
         joined = " ".join(finding.evidence)
-        assert "finished->safety wait" in joined
+        assert "wait from finishing to the safety result" in joined
         assert "safety_on_gpu" in finding.action
         assert "`max_power` or `queue_size` will not help" in finding.action
 
@@ -475,7 +475,7 @@ class TestParentLoopStall:
         finding = diagnose(tmp_path, self._session(gap_at=200.0))["parent_loop_stall"]
         assert finding.severity is Severity.CRITICAL
         assert "stopped reading its workers" in finding.headline
-        assert "status cadence" in " ".join(finding.evidence)
+        assert "interval between status prints" in " ".join(finding.evidence)
 
     def test_silent_on_a_healthy_loop(self, tmp_path: Path) -> None:
         """A loop that keeps draining produces no finding; findings are for problems."""

@@ -148,7 +148,7 @@ def _session_listing_lines(sessions: list[WorkerSession]) -> list[str]:
         span, duration = _fmt_session_span(session)
         version = session.version or "?"
         recoveries = session.peak_process_recoveries
-        flag = "  <-- recovery storm" if recoveries >= 5 else ""
+        flag = "  <-- many process restarts" if recoveries >= 5 else ""
         lines.append(
             f"{session_label(session)}  {span}  ({duration})  v{version}  "
             f"{session.end_reason}  recoveries: {recoveries}{flag}",

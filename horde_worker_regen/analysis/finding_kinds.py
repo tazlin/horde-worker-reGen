@@ -232,19 +232,19 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     FindingSpec(
         kind=FindingKind.DOOMED_POOL_NO_GIVEUP,
         title="The worker kept restarting processes that could not recover",
-        action="Fix the crash named in the crash-on-start finding, then restart the worker.",
+        action="Fix the crash in the crash-on-start finding, then restart the worker.",
         detail=(
             "When every image process has crashed on start the worker is meant to stop itself so a "
             "supervisor can restart it. Here it kept rebuilding the processes instead. The stop only fires "
             "when every process is out of use at the same moment, and a rebuild briefly brings one back, so "
-            "the moment never came. Until that is changed in the worker, fixing the crash is the only remedy."
+            "the moment never came. Fixing the crash is the only remedy."
         ),
         see_also=FindingKind.CRASH_ON_START_LOOP,
     ),
     FindingSpec(
         kind=FindingKind.GAVE_UP_CLEAN,
         title="The worker stopped itself after its processes could not be restored",
-        action="No action needed here. Fix the crash named in the crash-on-start finding.",
+        action="Fix the crash in the crash-on-start finding, then start the worker again.",
         detail=(
             "Stopping is the intended outcome when repeated rebuilds cannot restore a working image process. "
             "A supervisor or service manager can then restart the worker once the cause is fixed. This is "
@@ -272,7 +272,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         detail=(
             "An upscale or face fix peaks after sampling, and that peak competes with the image models and "
             "the other processes on the same card. When it does not fit, ComfyUI falls back to slower tiled "
-            "or streamed execution or stalls outright. A process can only free its own memory, so making room "
+            "or streamed execution or stalls outright. A process can free only the memory it holds, so making room "
             "is the worker's job. With the VRAM budget on, the post-processing peak is priced before it starts "
             "and idle models are unloaded to fit it. The `post_processing_fault_breaker_enabled` breaker turns "
             "post-processing off after repeated stalls, so the worker stops taking jobs it cannot finish, and "
@@ -284,9 +284,11 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         kind=FindingKind.POST_PROCESSING_OFFER_WITHHELD,
         title="Post-processing was not offered to the horde",
         detail=(
-            "The worker can send its job request with post-processing off while the config says on. It does so "
-            "for a reason it logs. The reasons are the fault breaker, the VRAM arbiter ruling the peak out, the "
-            "post-processing lane paused, the models not on disk, or too many post-processing jobs in hand. "
+            "The worker can send its job request with post-processing off while the config says on. It logs the "
+            "reason each time. It does so after repeated post-processing faults (the fault breaker), when no "
+            "card has room for the post-processing peak, or when post-processing is paused to free memory. "
+            "It also does so while the post-processing models are not on disk, or with too many "
+            "post-processing jobs already in hand. "
             "While it is off, requests with an upscaler or face fixer cannot be assigned to this worker."
         ),
         see_also=FindingKind.POST_PROCESSING_VRAM_STALL,
@@ -368,8 +370,9 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "An image process is replaced at once when a job fails with a CUDA runtime error, because the GPU "
             "state it holds can no longer be trusted. It is also replaced after a few failed jobs in a row across "
             "more than one model. Each replacement counts toward the limit that takes a process out of service "
-            "when it is replaced too often. A CUDA error right after Windows ran out of memory to commit is the "
-            "host condition. The evidence says whether that happened before each CUDA error."
+            "when it is replaced too often. A CUDA error within a minute of Windows running out of memory to "
+            "commit was most likely caused by that shortage. The evidence says, for each CUDA error, whether "
+            "that happened."
         ),
         see_also=FindingKind.INFERENCE_SLOT_QUARANTINED,
         reference_page="docs/explanation/resilience_and_recovery.md",
@@ -394,15 +397,15 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         kind=FindingKind.LANE_FAULT_RULE_MISFIRE,
         title="A process replacement may not have helped",
         action=(
-            "This finding exists so the worker maintainers can judge whether the rules for replacing a failing "
-            "process need to change. Send the log with `horde-log bundle` to the worker maintainers."
+            "Send the log with `horde-log bundle` to the worker maintainers. They use it to judge whether the "
+            "rules for replacing a failing process need to change."
         ),
         detail=(
             "The worker replaces an image process that fails several jobs in a row on different models. An "
             "out-of-memory fault on a card with too much work counts toward that, so a healthy process can be "
             "replaced because the card was too full. The sign is the same process failing again soon after. A CUDA "
-            "error caused by Windows running out of memory to commit also counts. It can take a process out of "
-            "service for a host condition."
+            "error caused by Windows running out of memory to commit also counts. A healthy process can then be "
+            "taken out of service because the computer was short of memory."
         ),
         see_also=FindingKind.INFERENCE_LANE_REPLACED,
         reference_page="docs/explanation/resilience_and_recovery.md",
@@ -445,11 +448,11 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         detail=(
             "The leak is in the worker and these logs cannot say where, so it is worth reporting. "
             "Once a process passes its open-file limit every file open is refused, so it fails every job "
-            "while still sending heartbeats, and the silence check cannot see it. The model named is "
-            "whatever was running when the limit was hit, not the cause. The fault text is the same plain "
-            '"produced no results" an out-of-memory fault uses, which is why this is easy to misread. The '
-            "worker reports no open-file headroom yet, so the growth cannot be traced from the log. Windows "
-            "has a far higher handle ceiling, so this is a Linux concern."
+            "while still sending heartbeats, and the silence check cannot see it. The model in the headline is "
+            "whatever was running when the limit was hit. It did not cause the fault. The fault text is the "
+            'same plain "produced no results" an out-of-memory fault uses, which is why this is easy to misread. '
+            "The worker does not log how many files a process has open, so the growth cannot be traced from the "
+            "log. Windows has a far higher handle limit, so this is a Linux concern."
         ),
     ),
     FindingSpec(
@@ -462,7 +465,8 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         detail=(
             "Windows reserves room in RAM or the paging file for every block of memory a process may use. "
             "That total is the commit limit. Loading a model or a GPU library fails with error 1455 once it "
-            "is reached. Every worker process holds its own libraries and models, so the total grows with the "
+            "is reached. Every worker process holds a separate copy of its libraries and models, so the total "
+            "grows with the "
             "number of processes. A process that fails this way is started again and usually fails again, so "
             "jobs stop until memory is freed."
         ),
@@ -518,11 +522,14 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         title="Image generation started without a recorded memory grant",
         detail=(
             "An image process waits for a memory grant before it starts generating (the clearance lease). "
-            "The wait from the job's start to the moment it generated without a grant on record shows the cost. "
-            "A wait under 3 seconds is a grant that was issued but is missing from the worker's records. "
+            "If no grant comes within 60 seconds it generates anyway, and the worker logs that it did so with no "
+            "grant on record. "
+            "For each such job, this finding measures the time from the job being handed to the process to that "
+            "log line. "
+            "A wait under 3 seconds means a grant was issued and the worker did not record it. "
             'A "cleared process" line exists for it, and it costs nothing. '
-            "A wait of 30 seconds or more is the process running out its 60 second grant timeout while the card "
-            "sat idle. That points at how the job's memory was priced or freed. "
+            "A wait of 30 seconds or more means the process spent most or all of the 60 seconds waiting for a "
+            "grant that never came. That points at how the job's memory was priced or freed. "
             "A wait in between needs the log around it to tell which."
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
@@ -577,7 +584,8 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         kind=FindingKind.WHOLE_CARD_NONHEAD_RESIDENCY_STARVATION,
         title="The card was reserved for a job that was not next in line",
         action=(
-            "Capture the log around the stall and report it. The worker should only reserve the card for the next job."
+            "Capture the log around the stall and report it. Reserving the card for a job that is not next is a "
+            "worker fault."
         ),
         detail=(
             "Reserving the whole card tears down the neighbouring processes. Granting that to a job further "
@@ -592,11 +600,11 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         title="The whole card was reserved and released over and over",
         detail=(
             "Reserving the whole card reduces the running processes and moves the safety check off the GPU. "
-            "Releasing it reverses both. A few times a session is a deliberate hold. Many times is thrash. "
+            "Releasing it reverses both. A few times a session is expected. Many times means the card is "
+            "reserved and released over and over, and each cycle costs a model reload and a safety restart. "
             "On a large card that usually means a model that does not need the whole card is being given it, "
-            "since each extra process was charged too much memory. Each round trip costs a "
-            "model reload and a safety restart, and paired with rebuilt processes or dropped jobs it is the "
-            "reservation feeding a stall."
+            "since each extra process was charged too much memory. When processes were also rebuilt or jobs "
+            "dropped, the reservations are part of what stalled the queue."
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
     ),
@@ -624,10 +632,10 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "needs the whole card."
         ),
         detail=(
-            "A claim on the offer is meant to end on its own when the horde runs out of that model's jobs. "
-            "One that runs to the hold cap was still narrowing the offer when the cap stopped it. Doing that "
-            "repeatedly while other models' jobs sat waiting means accepted work aged behind an offer that "
-            "would not take anything to relieve it."
+            "While a whole-card model holds the card, the worker asks the horde for that model only. That "
+            "normally ends when the horde has no more jobs for the model. Here it ran until "
+            "`whole_card_residency_max_hold_seconds` ended it, more than once. Jobs the worker had already "
+            "accepted for other models sat in its queue the whole time, because the card stayed with the one model."
         ),
         see_also=FindingKind.WHOLE_CARD_POP_CLAIM_EPISODES,
     ),
@@ -652,7 +660,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         title="Work is not spreading across the cards",
         action=(
             "Run `horde-log jobs` for the per-job split and the busy-cards histogram, then report it with the "
-            "log. Lowering `max_power` or `queue_size` only shrinks the queue, it does not spread it."
+            "log. Lowering `max_power` or `queue_size` shrinks the queue without spreading it."
         ),
         detail=(
             "Jobs were waiting with their model already loaded on an idle process, while that process's card "
@@ -668,7 +676,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         title="The next job kept being held back",
         detail=(
             "The scheduler reports the rule that held the next job each time: a concurrency cap, an overlap "
-            "wait, or a load the VRAM budget put off. Sustained, that starves throughput even though nothing "
+            "wait, or a load the VRAM budget put off. When it keeps happening, throughput drops even though nothing "
             "is stuck. A hold with no rule reported is different. The model was loaded on an idle process and "
             "nothing was in the way, so the scheduler is at fault."
         ),
@@ -681,7 +689,8 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "worker, and enough drops put the worker into maintenance. Where the time went matters. Waiting "
             "to start is a scheduling problem, and generation itself is a settings problem. Waiting after "
             "generation means a stage behind inference, usually the safety check, cannot keep up. The worker "
-            "stops taking new jobs while the safety backlog cannot clear within the deadline, which bounds it."
+            "stops taking new jobs while the safety backlog cannot clear within the deadline, which keeps the "
+            "backlog from growing."
         ),
         see_also=FindingKind.FORCED_MAINTENANCE,
     ),
@@ -693,10 +702,11 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "post-processing on this worker."
         ),
         detail=(
-            "Post-processing runs on its own process and asks for room on the card before each chain. Here the "
-            "answer stayed no for far longer than any chain could need. Either the room arithmetic was wrong "
-            "for that card, or the job should have been given up on and let the ones behind it pass, and "
-            "neither happened."
+            "Post-processing runs in a separate process, and the worker checks for room on the card before it "
+            "starts each job there. A job with no room waits and is checked again, and the worker logs the wait. "
+            "A current worker fails such a job after 90 seconds so the horde reissues it, and meanwhile starts "
+            "later jobs that fit. Here one job was logged waiting far more often than that allows, so it was "
+            "held much longer than post-processing takes."
         ),
         see_also=FindingKind.POST_PROCESSING_VRAM_STALL,
         reference_page="docs/explanation/process_lanes_and_chaining.md",
@@ -730,8 +740,9 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         title="The queue was full and nothing was moving",
         detail=(
             "The worker holds a short queue of accepted jobs and asks the horde for more only when it has "
-            "room. A full queue with nothing starting and nothing finishing is a stall, not the worker "
-            "pacing itself. The log says what the next job was waiting for where the scheduler knows."
+            "room. A full queue is normal while jobs are starting and finishing. Here it was full and no job "
+            "started or finished, so the worker was stalled. The log says what the next job was waiting for "
+            "where the scheduler knows."
         ),
         see_also=FindingKind.WHOLE_CARD_RESIDENCY_CHURN,
     ),
@@ -800,9 +811,9 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         kind=FindingKind.FORCED_MAINTENANCE,
         title="The horde put the worker into maintenance",
         detail=(
-            "The horde puts a worker into maintenance after it drops too many jobs, and refuses its requests "
-            "for work until maintenance is cleared. Maintenance is the horde's response to the drops, so "
-            "clearing it without fixing the cause triggers it again."
+            "The horde refuses a worker's requests for work while the worker is in maintenance. The owner "
+            "can set maintenance, and the horde sets it after a worker drops too many jobs. When the horde "
+            "set it, clearing it without fixing the cause triggers it again."
         ),
     ),
     FindingSpec(
@@ -849,13 +860,15 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
     ),
     FindingSpec(
         kind=FindingKind.POP_GOVERNOR_DOMINANCE,
-        title="One of the worker's own waits took much of the session",
+        title="The worker held itself back for much of the session",
         action=(
             "Nothing to do if throughput was as expected. Otherwise this says where the time went, and the "
             "details say which setting each wait follows."
         ),
         detail=(
-            "These waits are the worker pacing itself, not faults. The whole-card and large-model waits "
+            "The worker holds back from asking for or starting jobs under several rules. The log calls each "
+            "one a pop governor and records when it starts and ends. These waits are expected. They are not faults. "
+            "The whole-card and large-model waits "
             "follow the model mix and `whole_card_residency_cooldown_seconds`, "
             "`large_model_switch_min_seconds` and `large_model_reentry_cooldown_seconds`. The safety wait "
             "means the safety check is slower than the cards. The unservable hold means a model this card "
@@ -870,9 +883,10 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
             "rate leads to forced maintenance."
         ),
         detail=(
-            "The horde reissues each failed job and counts it against this worker. A give-up count means the "
-            "scheduler stalled and the worker dropped its backlog to recover. A safety count means images "
-            "were made but could not be checked. A process fault count points at the process that ran them."
+            "The horde reissues each failed job and counts it against this worker. Jobs dropped when the worker "
+            "gave up on its queue mean the scheduler stalled and the backlog was dropped to recover. Jobs the "
+            "safety check could not complete had images that were made and could not be checked. A fault in the "
+            "image process points at the process that ran the job."
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
     ),
@@ -999,7 +1013,7 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         ),
         detail=(
             "The pool ranks models by horde demand, refreshed on a timer. An old reading means the ranker "
-            "is acting on a frozen signal."
+            "is working from out-of-date demand."
         ),
     ),
     FindingSpec(

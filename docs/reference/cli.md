@@ -587,7 +587,7 @@ an operator sent you.
 selectors of both kinds combine (worker sessions first); `timeline` also takes
 `--process N`, `--grep RE`, and `--child` (include verbose child-loop records), and `jobs` takes
 `--limit N` (`0` for every row; the summary always covers every job whatever the table shows). Each detector recognizes one incident
-class (an inference pool crashing on start, a recovery storm that never gives up, GPU OOM, the swallowed
+class (an inference pool crashing on start, repeated process restarts that never give up, GPU OOM, the swallowed
 "no images produced" OOM, an orphaned-job storm, a local queue that filled and stopped moving, a
 model-reference read that faulted a running sample, a pop that named no model, a model that ends every
 slot it is loaded onto, and the horde repeatedly refusing this worker's pops) and emits the child's
@@ -595,7 +595,7 @@ exception as the root cause where it can. Every session also carries a census of
 with each one's model and cause. Every finding id, with its severity and what it means, is catalogued in
 [Log findings](log_findings.md); a finding whose remedy needs background prints a `see:` line naming the
 docs page that explains the subsystem behind it. See
-[Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-recovery-storm-from-the-logs).
+[Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-repeated-process-restarts-from-the-logs).
 
 Findings quote the worker's own words wherever the log carries them, and only fall back to listing
 candidate causes when it does not: a pop rejection is reported with the horde's verbatim message and
