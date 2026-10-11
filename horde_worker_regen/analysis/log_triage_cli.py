@@ -26,6 +26,7 @@ from .job_lifecycle import job_lifecycle_for
 from .sessions import WorkerSession, segment_bundle_sessions
 from .support_bundle import build_support_bundle
 from .triage_report import (
+    count_text,
     finding_to_dict,
     job_lifecycle_to_dict,
     render_findings,
@@ -189,11 +190,12 @@ def _run_bundle(args: argparse.Namespace) -> int:
     )
     size_mb = result.size_bytes / (1024 * 1024)
     print(
-        f"Wrote {result.out_path} ({size_mb:.1f} MB, {result.member_count} files, {result.session_count} session(s)).",
+        f"Wrote {result.out_path} ({size_mb:.1f} MB, {count_text(result.member_count, 'file')}, "
+        f"{count_text(result.session_count, 'session')} diagnosed).",
     )
     print(
-        f"Redacted {result.redaction_count} secret/identifier occurrence(s). "
-        "Please skim the contents and confirm nothing sensitive remains before sending.",
+        f"Redacted {count_text(result.redaction_count, 'occurrence')} of a secret or identifier. "
+        "Redaction can miss things. Read through the contents before sending.",
     )
     return 0
 
@@ -225,7 +227,7 @@ def _add_common_source_args(parser: argparse.ArgumentParser) -> None:
         help="A logs directory, a single log file, or a .zip of logs (default: logs/).",
     )
     _add_session_selector_args(parser, verb="Only")
-    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text.")
+    parser.add_argument("--json", action="store_true", help="Print JSON instead of text.")
 
 
 def _add_session_selector_args(parser: argparse.ArgumentParser, *, verb: str) -> None:
@@ -244,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Construct the ``horde-log`` argument parser with its subcommands."""
     parser = argparse.ArgumentParser(
         prog="horde-log",
-        description="Triage worker logs into sessions, timelines, and actionable findings.",
+        description="Read worker logs: list each session, show its events and report what went wrong.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -257,24 +259,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     diagnose_parser = subparsers.add_parser(
         "diagnose",
-        help="Run detectors and report what went wrong, with remediation.",
+        help="Report what went wrong in each session and what to do about it.",
     )
     _add_common_source_args(diagnose_parser)
     diagnose_parser.set_defaults(func=_run_diagnose)
 
     timeline_parser = subparsers.add_parser(
         "timeline",
-        help="Merged parent/child/ledger event stream for a session.",
+        help="Events from the main process log, the child process logs and the action ledger, in time order.",
     )
     _add_common_source_args(timeline_parser)
-    timeline_parser.add_argument("--process", type=int, default=None, metavar="N", help="Only slot #N.")
+    timeline_parser.add_argument("--process", type=int, default=None, metavar="N", help="Only process #N.")
     timeline_parser.add_argument("--grep", default=None, metavar="RE", help="Only entries matching this regex.")
-    timeline_parser.add_argument("--child", action="store_true", help="Include verbose child-loop records.")
+    timeline_parser.add_argument("--child", action="store_true", help="Include every line of the child process logs.")
     timeline_parser.set_defaults(func=_run_timeline)
 
     jobs_parser = subparsers.add_parser(
         "jobs",
-        help="Per-job lifecycle table: pop->dispatch, generation, and finished->submit for every job.",
+        help="List every job with its wait before generation, its generation time and its wait to be submitted.",
     )
     _add_common_source_args(jobs_parser)
     jobs_parser.add_argument(
@@ -282,11 +284,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         metavar="N",
-        help="Show only the first N jobs (0 for all; default: 50). The summary always covers every job.",
+        help="Show only the first N jobs (default: 50, 0 for all). The summary always covers every job.",
     )
     jobs_parser.set_defaults(func=_run_jobs)
 
-    job_parser = subparsers.add_parser("job", help="Trace one job across the parent and its inference slot.")
+    job_parser = subparsers.add_parser(
+        "job", help="Show one job's events in the main process and in the process that ran it."
+    )
     job_parser.add_argument("job_id", help="The horde job id (full UUID or its leading 8 characters).")
     job_parser.add_argument(
         "path",
@@ -295,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="A logs directory, a single log file, or a .zip of logs (default: logs/).",
     )
-    job_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text.")
+    job_parser.add_argument("--json", action="store_true", help="Print JSON instead of text.")
     job_parser.set_defaults(func=_run_job)
 
     bundle_parser = subparsers.add_parser(
@@ -313,35 +317,45 @@ def build_parser() -> argparse.ArgumentParser:
         "--out",
         type=Path,
         default=None,
-        help="Output .zip path (default: horde_support_<ts>.zip).",
+        help="Output .zip path (default: horde_support_<timestamp>.zip).",
     )
     _add_session_selector_args(bundle_parser, verb="Diagnose only")
     bundle_parser.add_argument(
         "--full-logs",
         action="store_true",
-        help="Include rotation archives and do not tail-cap large logs (much larger bundle).",
+        help=(
+            "Include rotated logs and every stats file, and keep large files whole. By default a large file is "
+            "cut to its most recent part. The bundle is much larger."
+        ),
     )
     bundle_parser.add_argument(
         "--no-cache-inventory",
         dest="cache_inventory",
         action="store_false",
-        help="Skip the on-disk model listing.",
+        help="Leave out the list of model files on disk.",
     )
-    bundle_parser.add_argument("--probe-gpu", action="store_true", help="Run the GPU probe for system info (slower).")
+    bundle_parser.add_argument(
+        "--probe-gpu", action="store_true", help="Add the GPUs torch detects to the system info (slower)."
+    )
     bundle_parser.add_argument(
         "--keep-identifiers",
         action="store_true",
-        help="Do not scrub home paths / username / worker name (secrets are always redacted).",
+        help="Keep the home path, username and worker name. Secrets are always redacted.",
     )
     bundle_parser.add_argument(
         "--config",
         type=Path,
         default=Path("bridgeData.yaml"),
-        help="Worker config to redact and source secrets/cache from (default: bridgeData.yaml).",
+        help=(
+            "Worker config to include with its secrets redacted. The secrets to redact and the model cache "
+            "location are read from it (default: bridgeData.yaml)."
+        ),
     )
     bundle_parser.set_defaults(func=_run_bundle)
 
-    watch_parser = subparsers.add_parser("watch", help="Live-watch logs and alert on new findings.")
+    watch_parser = subparsers.add_parser(
+        "watch", help="Watch a running worker's logs and print new findings as they appear."
+    )
     watch_parser.add_argument(
         "path",
         nargs="?",
@@ -349,13 +363,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="A logs directory or single log file to watch (default: logs/).",
     )
-    watch_parser.add_argument("--interval", type=float, default=5.0, metavar="S", help="Poll interval (default: 5s).")
-    watch_parser.add_argument("--once", action="store_true", help="Run a single pass and exit (for scripting/tests).")
+    watch_parser.add_argument(
+        "--interval", type=float, default=5.0, metavar="S", help="Seconds between checks (default: 5)."
+    )
+    watch_parser.add_argument("--once", action="store_true", help="Check once and exit (for scripts and tests).")
     watch_parser.set_defaults(func=_run_watch)
 
     duty_parser = subparsers.add_parser(
         "duty",
-        help="GPU duty report: stats-backed sampling concurrency, clearance holds and learned footprint prices.",
+        help="Report how much of the time the GPU was generating and what it waited on the rest of the time.",
         description="The same report as horde-duty-report, with the same options.",
     )
     add_duty_report_arguments(duty_parser)

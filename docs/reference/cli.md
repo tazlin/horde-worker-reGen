@@ -188,15 +188,15 @@ The stats-backed report separates idle loss from partial-utilization loss, repor
 
 Three more views read what a support bundle carries:
 
-- **Sampling concurrency.** `concurrency occupancy` counts jobs in progress, and a staged job counts there
-  while its lane waits. `sampling concurrency` counts the inference lanes in `INFERENCE_STARTING` per stats
-  sample (0, 1, 2+). The zero share is split by what the lanes were doing with a job in progress (`primed`,
-  `loading`, other) or with none. Each row below the slot-duty capacity is broken down by the sample's
-  `dispatch_hold_bucket` and by whether inference work was pending.
+- **Sampling concurrency.** `jobs in progress at once` counts jobs in progress, and a staged job counts there
+  while its lane waits. `image processes sampling at once` counts the inference lanes in `INFERENCE_STARTING`
+  per stats sample (0, 1, 2+). The zero share is split by what the lanes were doing with a job in progress
+  (preparing to sample, loading a model, other) or with none. Each row below the limit is broken down by the
+  sample's `dispatch_hold_bucket` and by whether jobs were queued.
 - **Clearance holds.** With `--logs`, the `bridge.log` epoch the stats session belongs to (matched by the stats
   filename's start stamp, which is the worker host's clock) is read for `Clearance held for process` lines.
-  Per model it prints the hold count, the median candidate, available and outstanding-reservation figures,
-  and how many holds ran each reclaim (`none` included). The worker logs a hold once per process and
+  Per model it prints the hold count, the median VRAM needed, available and reserved for other jobs,
+  and how many holds took each set of steps to free VRAM (`none` included). The worker logs a hold once per process and
   decision, so the count is distinct holds, not held time.
 - **Learned footprints.** Each sampling key in the footprint store, tagged `[all]` for the pooled key or with
   its job class (`[b4]`, `[b1 hires]`), and each learned post-processing chain, tagged with its operations, with
@@ -585,10 +585,11 @@ an operator sent you.
 `--last` to select a worker session, `--benchmark N` or `--last-benchmark` to select a benchmark run, and
 `--json` for machine-readable output. Worker sessions and benchmark runs are each numbered from #0, and
 selectors of both kinds combine (worker sessions first); `timeline` also takes
-`--process N`, `--grep RE`, and `--child` (include verbose child-loop records), and `jobs` takes
+`--process N`, `--grep RE`, and `--child` (include every line of the child process logs), and `jobs` takes
 `--limit N` (`0` for every row; the summary always covers every job whatever the table shows). Each detector recognizes one incident
 class (an inference pool crashing on start, repeated process restarts that never give up, GPU OOM, the swallowed
-"no images produced" OOM, an orphaned-job storm, a local queue that filled and stopped moving, a
+"no images produced" OOM, a run of jobs dropped because their process disappeared, a local queue that
+filled and stopped moving, a
 model-reference read that faulted a running sample, a pop that named no model, a model that ends every
 slot it is loaded onto, and the horde repeatedly refusing this worker's pops) and emits the child's
 exception as the root cause where it can. Every session also carries a census of the jobs it faulted,
@@ -623,7 +624,7 @@ line-skip census. On a multi-card host this is the view that separates "each car
 two cards are doing anything":
 
 ```text
-1000 job(s); wait segments (seconds):
+1000 jobs; wait segments (seconds):
   pre_inference   n=992   median=    87.8 p90=   154.3
   inference       n=1002  median=    15.9 p90=    37.6
   post_inference  n=969   median=     4.9 p90=    13.6

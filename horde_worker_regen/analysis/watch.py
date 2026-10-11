@@ -63,7 +63,7 @@ def watch_pass(bundle: LogBundle, state: WatchState) -> tuple[list[str], WatchSt
         alerts.append(f"{stamp}  [{finding.badge}] {finding.title}: {finding.headline}")
 
     if session.peak_process_recoveries > baseline_recoveries:
-        alerts.append(f"process recoveries rose to {session.peak_process_recoveries}")
+        alerts.append(f"process restart count rose to {session.peak_process_recoveries}")
 
     return alerts, WatchState(
         session_index=session.index,

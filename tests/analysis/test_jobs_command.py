@@ -81,7 +81,7 @@ def test_table_carries_a_row_per_job_with_its_lane_card_and_waits(tmp_path: Path
 def test_summary_reports_percentiles_and_the_concurrency_histogram(tmp_path: Path) -> None:
     """The summary is the part that answers "where did the time go" for the whole session."""
     rendered = _render(tmp_path)
-    assert "3 job(s); wait segments (seconds):" in rendered
+    assert "3 jobs; wait segments (seconds):" in rendered
     assert "pre_inference   n=3" in rendered
     assert "inference       n=3" in rendered
     assert "post_inference  n=3" in rendered
@@ -92,8 +92,8 @@ def test_summary_reports_percentiles_and_the_concurrency_histogram(tmp_path: Pat
 def test_limit_truncates_the_table_but_not_the_summary(tmp_path: Path) -> None:
     """A capped table still summarises every job, so the cap cannot mislead about the session."""
     rendered = _render(tmp_path, limit=1)
-    assert "... 2 more job(s) not shown" in rendered
-    assert "3 job(s); wait segments (seconds):" in rendered
+    assert "... 2 more jobs not shown" in rendered
+    assert "3 jobs; wait segments (seconds):" in rendered
 
 
 def test_json_form_carries_the_rows_and_the_summary(tmp_path: Path) -> None:

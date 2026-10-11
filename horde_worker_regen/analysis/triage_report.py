@@ -17,6 +17,11 @@ from .job_lifecycle import JobLifecycleModel, JobRecord
 from .sessions import WorkerSession
 
 
+def count_text(count: int, singular: str, plural: str | None = None) -> str:
+    """Return ``count`` with its noun in the matching number, so a report never prints ``1 job(s)``."""
+    return f"{count} {singular}" if count == 1 else f"{count} {plural or singular + 's'}"
+
+
 def _fmt_ts_ms(ts: datetime | None) -> str:
     """Format a timestamp as HH:MM:SS.mmm for the fine-grained timeline view."""
     return ts.strftime("%H:%M:%S.%f")[:-3] if ts is not None else "--:--:--.---"
@@ -125,7 +130,7 @@ def render_sessions(sessions: list[WorkerSession], *, root: Path, stitch: Rotati
     worker_sessions = [session for session in sessions if not session.is_benchmark_run]
     benchmark_runs = [session for session in sessions if session.is_benchmark_run]
     if worker_sessions:
-        lines = [f"{len(worker_sessions)} worker session(s) in {root}"]
+        lines = [f"{count_text(len(worker_sessions), 'worker session')} in {root}"]
     else:
         lines = [f"No worker sessions found in {root}."]
     if stitch is not None:
@@ -135,7 +140,7 @@ def render_sessions(sessions: list[WorkerSession], *, root: Path, stitch: Rotati
     if benchmark_runs:
         if worker_sessions:
             lines.append("")
-        lines.append(f"{len(benchmark_runs)} benchmark run(s) in {root}")
+        lines.append(f"{count_text(len(benchmark_runs), 'benchmark run')} in {root}")
         lines.append("")
         lines.extend(_session_listing_lines(benchmark_runs))
     return "\n".join(lines)
@@ -355,10 +360,10 @@ def render_job_lifecycle(session: WorkerSession, model: JobLifecycleModel, *, li
             f"{_fmt_seconds(job.post_inference_seconds):>10}",
         )
     if limit is not None and len(ordered) > limit:
-        lines.append(f"... {len(ordered) - limit} more job(s) not shown (use --limit 0 for all)")
+        lines.append(f"... {count_text(len(ordered) - limit, 'more job')} not shown (use --limit 0 for all)")
 
     lines.append("")
-    lines.append(f"{len(ordered)} job(s); wait segments (seconds):")
+    lines.append(f"{count_text(len(ordered), 'job')}; wait segments (seconds):")
     for segment in model.wait_segments():
         lines.append(
             f"  {segment.name:<15} n={segment.count:<5} median={_fmt_seconds(segment.median):>8} "

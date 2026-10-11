@@ -150,8 +150,8 @@ def test_epoch_attributes_pop_governor_spell_time() -> None:
 
     assert report.governor_seconds.get("large_model_reentry") == 180.0
     rendered = render_report([report])
-    assert "pop governors engaged" in rendered
-    assert "the large-model re-entry cooldown" in rendered
+    assert "time not asking the horde for work" in rendered
+    assert "the wait before returning to a large model" in rendered
 
 
 def test_open_governor_spell_counts_to_epoch_end() -> None:
@@ -284,9 +284,12 @@ class TestClearanceHoldParsing:
         )
         assert model_a.reclaim_runs == {"none": 2, "evict_idle_model": 1}
         rendered = "\n".join(render_clearance_hold_digest(digests))
-        assert "clearance holds (distinct holds logged): 4" in rendered
-        assert "Model A: 3 (defer 3); median candidate 9000MB, available 4000MB, outstanding 1000MB" in rendered
-        assert "reclaim run: release_cache+evict_idle_model 1" in rendered
+        assert "times a job waited for free VRAM before sampling (clearance holds): 4" in rendered
+        assert (
+            "Model A: 3 (defer 3), median VRAM needed 9000MB, available 4000MB, reserved for other jobs 1000MB"
+            in rendered
+        )
+        assert "steps taken to free VRAM: release_cache+evict_idle_model 1" in rendered
 
 
 _SESSION_LOG_LINES = [
@@ -366,8 +369,8 @@ class TestDutyReportCli:
         main()
 
         output = capsys.readouterr().out
-        assert "sampling concurrency: 0 100.0% of 1 samples" in output
-        assert "primed but not sampling 100.0% (1 samples" in output
+        assert "image processes sampling at once: 0 100.0% of 1 sample" in output
+        assert "none sampling, a job is preparing to sample 100.0% (1 sample," in output
         assert "This Session Model: 1 (defer 1)" in output
         assert "Earlier Session Model" not in output
         assert "== Learned footprints (" in output

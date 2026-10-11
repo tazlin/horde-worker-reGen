@@ -286,9 +286,9 @@ class TestBenchmarkRunSessions:
         sessions = _bundle_sessions(tmp_path, harness_text=_HARNESS_PREAMBLE + _HARNESS_BODY)
         listing = render_sessions(sessions, root=Path("logs"))
 
-        assert "2 worker session(s) in logs" in listing
-        assert "1 benchmark run(s) in logs" in listing
-        assert listing.index("#1  19:30:00") < listing.index("1 benchmark run(s) in logs"), "worker list first"
+        assert "2 worker sessions in logs" in listing
+        assert "1 benchmark run in logs" in listing
+        assert listing.index("#1  19:30:00") < listing.index("1 benchmark run in logs"), "worker list first"
         assert "#0  [benchmark run: bridge_harness.log]  18:10:00 -> 18:50:00" in listing
         assert "#0  18:00:00" in listing, "worker sessions keep their untagged heading"
         assert render_findings(sessions[2], []).startswith("=== Session #0  [benchmark run: bridge_harness.log]")
@@ -305,7 +305,7 @@ class TestBenchmarkRunSessions:
             root=Path("logs"),
         )
 
-        assert with_benchmark.startswith(worker_only + "\n\n1 benchmark run(s) in logs\n")
+        assert with_benchmark.startswith(worker_only + "\n\n1 benchmark run in logs\n")
 
 
 def _run_sessions_cli(logs: Path, *flags: str, capsys: pytest.CaptureFixture[str]) -> list[tuple[str, int]]:

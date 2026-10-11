@@ -374,8 +374,8 @@ class TestDutyReportCli:
         duty_report_main()
 
         output = capsys.readouterr().out
-        assert "inference queue wait:" in output
-        assert "inference dispatch gap:" in output
+        assert "wait from pop to start of generation:" in output
+        assert "jobs queued while none was in progress:" in output
 
     def test_log_only_fallback_preserves_existing_parser(
         self,
@@ -403,7 +403,7 @@ class TestDutyReportCli:
 
         duty_report_main()
 
-        assert "Epoch 0" in capsys.readouterr().out
+        assert "Log session 0" in capsys.readouterr().out
 
 
 class TestSlotDutyAndOccupancy:
@@ -476,10 +476,10 @@ class TestSlotDutyAndOccupancy:
 
         output = render_session_duty_report(analyze_stats_sessions(stats_dir))
 
-        assert "slot duty:" in output
+        assert "image process time by state:" in output
         assert "sampling" in output
         assert "preload_deferred" in output
-        assert "concurrency occupancy (capacity 2):" in output
+        assert "jobs in progress at once (limit 2):" in output
 
     def test_pre_field_stats_files_degrade_gracefully(self, tmp_path: Path) -> None:
         """Sessions recorded before the slot-duty fields existed report empty slot-duty, not errors."""
@@ -589,10 +589,13 @@ class TestSamplingConcurrency:
 
         output = render_session_duty_report(analyze_stats_sessions(stats_dir))
 
-        assert "concurrency occupancy (capacity 2):" in output
-        assert "sampling concurrency (capacity 2): 0 66.7%  1 16.7%  2+ 16.7% of 6 samples" in output
-        assert "primed but not sampling 33.3% (2 samples, 2s): clearance_hold with work pending 2 (2s)" in output
-        assert "1 sampling 16.7% (1 samples, 1s): overlap_headway with work pending 1 (1s)" in output
+        assert "jobs in progress at once (limit 2):" in output
+        assert "image processes sampling at once (limit 2): 0 66.7%  1 16.7%  2+ 16.7% of 6 samples" in output
+        assert (
+            "none sampling, a job is preparing to sample 33.3% (2 samples, 2s), by scheduler hold: "
+            "clearance_hold with jobs queued 2 (2s)"
+        ) in output
+        assert "1 sampling 16.7% (1 sample, 1s), by scheduler hold: overlap_headway with jobs queued 1 (1s)" in output
 
     def test_samples_without_lane_summaries_leave_it_unset(self, tmp_path: Path) -> None:
         """Stats written without a ``process_state_summary`` report no sampling concurrency."""

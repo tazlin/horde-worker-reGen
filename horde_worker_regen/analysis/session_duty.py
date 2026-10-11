@@ -80,6 +80,29 @@ class DutyLossKind(StrEnum):
     UNKNOWN = "unknown"
 
 
+_DUTY_LOSS_LABELS: dict[DutyLossKind, str] = {
+    DutyLossKind.DEMAND_LIMITED: "the horde had no jobs for this worker",
+    DutyLossKind.SCHEDULER_WAIT: "jobs queued but not started",
+    DutyLossKind.MODEL_LOAD: "loading a model",
+    DutyLossKind.MODEL_UNLOAD: "unloading a model",
+    DutyLossKind.VRAM_TRANSFER: "moving a model into VRAM",
+    DutyLossKind.AUX_DOWNLOAD: "alchemy work waiting or running",
+    DutyLossKind.SAFETY: "safety check",
+    DutyLossKind.SUBMIT: "submitting results",
+    DutyLossKind.POST_PROCESSING: "post-processing",
+    DutyLossKind.VAE_DECODE: "VAE decode",
+    DutyLossKind.TEXT_ENCODE: "prompt encoding",
+    DutyLossKind.PROCESS_RECOVERY: "a process being restarted",
+    DutyLossKind.LOCAL_PAUSE: "worker paused or in maintenance mode",
+    DutyLossKind.API_BACKOFF: "waiting after horde errors, horde maintenance mode or a self-throttle pause",
+    DutyLossKind.UNKNOWN: "cause not identified",
+}
+"""What each loss bucket means, in the conditions :func:`_idle_kind` and :func:`_partial_kind` test.
+
+The text report prints the label beside the bucket key. The key is what the JSON output and the stats
+tooling carry, so it stays visible for searching."""
+
+
 @dataclass
 class DutyLossBucket:
     """Aggregated wall-clock-equivalent loss for one duty attribution bucket."""
@@ -412,13 +435,13 @@ def analyze_stats_files(
 def render_session_duty_report(reports: list[SessionDutyReport]) -> str:
     """Render stats-backed duty reports for terminal output."""
     if not reports:
-        return "No stats-backed duty-cycle sessions found. Falling back to log parsing may still work."
+        return "No sessions found in the stats files. The report can still be built from bridge.log."
 
     out: list[str] = []
     for report in reports:
         start = _format_ts(report.start_timestamp)
         end = _format_ts(report.end_timestamp, time_only=True)
-        out.append(f"== Stats session {report.session_id} | {start}-{end} | {report.sample_count} samples ==")
+        out.append(f"== Stats session {report.session_id} | {start}-{end} | samples: {report.sample_count} ==")
         duty = "?" if report.mean_gpu_duty_percent is None else f"{report.mean_gpu_duty_percent:.0f}%"
         busy = "?" if report.busy_fraction_percent is None else f"{report.busy_fraction_percent:.0f}%"
         out.append(f"   duty: mean {duty}  busy {busy}  completed jobs {report.completed_jobs}")
@@ -429,8 +452,8 @@ def render_session_duty_report(reports: list[SessionDutyReport]) -> str:
                     f"{count}x {seconds / occupancy_total:.0%}"
                     for count, seconds in sorted(report.concurrency_occupancy.items(), key=lambda kv: kv[0])
                 )
-                capacity = f" (capacity {report.slot_duty_capacity})" if report.slot_duty_capacity else ""
-                out.append(f"   concurrency occupancy{capacity}: {shares}")
+                capacity = f" (limit {report.slot_duty_capacity})" if report.slot_duty_capacity else ""
+                out.append(f"   jobs in progress at once{capacity}: {shares}")
         if report.sampling_concurrency is not None:
             out.extend(_render_sampling_concurrency(report.sampling_concurrency))
         if report.slot_duty_seconds:
@@ -440,17 +463,17 @@ def render_session_duty_report(reports: list[SessionDutyReport]) -> str:
                     f"{bucket} {seconds / slot_total:.0%} ({seconds:.0f}s)"
                     for bucket, seconds in sorted(report.slot_duty_seconds.items(), key=lambda kv: -kv[1])[:6]
                 )
-                out.append(f"   slot duty: {slots}")
+                out.append(f"   image process time by state: {slots}")
         top = [bucket for bucket in report.buckets if bucket.total_seconds > 0.0][:5]
         if top:
-            rendered = "  ".join(
-                f"{bucket.kind.value} {bucket.total_seconds:.0f}s"
-                f" (idle {bucket.idle_seconds:.0f}s, partial {bucket.partial_utilization_seconds:.0f}s)"
+            out.append("   GPU time lost, largest causes first:")
+            out.extend(
+                f"     {_DUTY_LOSS_LABELS[bucket.kind]} ({bucket.kind.value}): {bucket.total_seconds:.0f}s"
+                f" (idle {bucket.idle_seconds:.0f}s, below full load {bucket.partial_utilization_seconds:.0f}s)"
                 for bucket in top
             )
-            out.append(f"   top loss buckets: {rendered}")
         else:
-            out.append("   top loss buckets: none attributed")
+            out.append("   GPU time lost: none found")
         if report.per_job_phase_medians:
             phases = "  ".join(
                 f"{phase} {seconds:.1f}s/job"
@@ -458,41 +481,41 @@ def render_session_duty_report(reports: list[SessionDutyReport]) -> str:
                     report.per_job_phase_medians.items(), key=lambda item: item[1], reverse=True
                 )[:5]
             )
-            out.append(f"   phase medians: {phases}")
+            out.append(f"   median time per job by phase: {phases}")
         if report.inference_queue_wait is not None:
             wait = report.inference_queue_wait
             ratio = "?" if wait.wait_to_sampling_ratio is None else f"{wait.wait_to_sampling_ratio:.2f}x"
             out.append(
-                "   inference queue wait: "
-                f"total {wait.total_seconds:.0f}s ({wait.total_seconds / max(wait.jobs, 1):.1f}s/job; "
-                f"median {wait.median_seconds:.1f}s, p90 {wait.p90_seconds:.1f}s, max {wait.max_seconds:.1f}s; "
-                f"{ratio} sampling time; overlaps active inference)"
+                "   wait from pop to start of generation: "
+                f"total {wait.total_seconds:.0f}s, {wait.total_seconds / max(wait.jobs, 1):.1f}s/job "
+                f"(median {wait.median_seconds:.1f}s, p90 {wait.p90_seconds:.1f}s, max {wait.max_seconds:.1f}s), "
+                f"{ratio} the sampling time. Other jobs run during this wait, so it is not all idle GPU time."
             )
             if wait.top_models:
                 models = "  ".join(
-                    f"{model.model_name} {model.total_seconds:.0f}s/{model.jobs}j" for model in wait.top_models[:3]
+                    f"{model.model_name} {model.total_seconds:.0f}s over {_count_text(model.jobs, 'job')}"
+                    for model in wait.top_models[:3]
                 )
-                out.append(f"   queue wait by model: {models}")
+                out.append(f"   that wait by model: {models}")
         if report.inference_dispatch_gap is not None:
             gap = report.inference_dispatch_gap
             fraction = (
                 "?" if gap.no_active_inference_fraction is None else f"{gap.no_active_inference_fraction * 100.0:.0f}%"
             )
             out.append(
-                "   inference dispatch gap: "
-                f"{gap.no_active_inference_seconds:.0f}s queued with no active inference "
-                f"({fraction} of queued sample time)"
+                "   jobs queued while none was in progress: "
+                f"{gap.no_active_inference_seconds:.0f}s ({fraction} of the time jobs were queued)"
             )
             if gap.top_states:
                 states = "  ".join(f"{state} {seconds:.0f}s" for state, seconds in list(gap.top_states.items())[:3])
-                out.append(f"   dispatch gap states: {states}")
+                out.append(f"   process states during that time: {states}")
         if report.churn_per_completed_job:
             churn = "  ".join(f"{kind} {value:.2f}/job" for kind, value in report.churn_per_completed_job.items())
-            out.append(f"   churn: {churn}")
+            out.append(f"   reloads and restarts: {churn}")
         if report.operator_recommendations:
-            out.append("   operator view: " + " ".join(report.operator_recommendations[:3]))
+            out.append("   for the operator: " + " ".join(report.operator_recommendations[:3]))
         if report.maintainer_notes:
-            out.append("   maintainer view: " + " ".join(report.maintainer_notes[:3]))
+            out.append("   for a maintainer: " + " ".join(report.maintainer_notes[:3]))
         out.append("")
     return "\n".join(out).rstrip()
 
@@ -1014,13 +1037,22 @@ def _add_sampling_hold(row: SamplingConcurrencyRow, sample: dict[str, Any], inte
     hold.seconds += interval
 
 
+_NOT_SAMPLING_LABELS: dict[NotSamplingLaneState, str] = {
+    NotSamplingLaneState.NO_JOB: "none sampling, no job in progress",
+    NotSamplingLaneState.PRIMED: "none sampling, a job is preparing to sample",
+    NotSamplingLaneState.LOADING: "none sampling, a model is loading",
+    NotSamplingLaneState.OTHER: "none sampling, a job is in progress",
+}
+
+
+def _count_text(count: int, singular: str) -> str:
+    """Return ``count`` with its noun in the matching number."""
+    return f"{count} {singular}" if count == 1 else f"{count} {singular}s"
+
+
 def _sampling_row_label(row: SamplingConcurrencyRow) -> str:
-    if row.lane_state is NotSamplingLaneState.NO_JOB:
-        return "no job in progress"
-    if row.lane_state is NotSamplingLaneState.OTHER:
-        return "in progress but not sampling"
     if row.lane_state is not None:
-        return f"{row.lane_state.value} but not sampling"
+        return _NOT_SAMPLING_LABELS[row.lane_state]
     plus = "+" if row.sampling_lanes >= _SAMPLING_CONCURRENCY_TOP else ""
     return f"{row.sampling_lanes}{plus} sampling"
 
@@ -1034,19 +1066,19 @@ def _render_sampling_concurrency(summary: SamplingConcurrencySummary) -> list[st
         f"{count}{'+' if count >= _SAMPLING_CONCURRENCY_TOP else ''} {samples / total:.1%}"
         for count, samples in sorted(by_count.items())
     )
-    capacity = f" (capacity {summary.capacity})" if summary.capacity else ""
-    lines = [f"   sampling concurrency{capacity}: {counts} of {total} samples"]
+    capacity = f" (limit {summary.capacity})" if summary.capacity else ""
+    lines = [f"   image processes sampling at once{capacity}: {counts} of {_count_text(total, 'sample')}"]
     for row in summary.rows:
         if not row.holds:
             continue
-        holds = "; ".join(
-            f"{hold.dispatch_hold_bucket} {'with' if hold.work_pending else 'without'} work pending "
+        holds = "  ".join(
+            f"{hold.dispatch_hold_bucket} {'with' if hold.work_pending else 'without'} jobs queued "
             f"{hold.samples} ({hold.seconds:.0f}s)"
             for hold in row.holds[:4]
         )
         lines.append(
-            f"   {_sampling_row_label(row)} {row.samples / total:.1%} ({row.samples} samples, {row.seconds:.0f}s): "
-            f"{holds}"
+            f"   {_sampling_row_label(row)} {row.samples / total:.1%} "
+            f"({_count_text(row.samples, 'sample')}, {row.seconds:.0f}s), by scheduler hold: {holds}"
         )
     return lines
 
@@ -1091,26 +1123,25 @@ def _operator_recommendations(report: SessionDutyReport) -> list[str]:
     model_load = bucket_map.get(DutyLossKind.MODEL_LOAD)
     local_pause = bucket_map.get(DutyLossKind.LOCAL_PAUSE)
     if demand is not None and demand.total_seconds > 0:
-        recs.append(
-            "The session spent measurable time demand-limited; adding more local tuning cannot create Horde jobs."
-        )
+        recs.append("For part of the session the horde had no jobs for this worker. No worker setting changes that.")
     if scheduler is not None and scheduler.total_seconds > 0:
         recs.append(
-            "Pending work existed while the GPU was not busy; check queue size, concurrency, and residency settings."
+            "Jobs were queued while the GPU was idle. Check `queue_size`, `max_threads` and the settings that "
+            "keep models loaded."
         )
     if model_load is not None and model_load.total_seconds > 0:
         recs.append(
-            "Model load/transfer dominated loss; reduce model churn or use a smaller served model set "
-            "for this VRAM size."
+            "GPU time was lost to loading models. Switch models less often, or offer fewer models for this "
+            "amount of VRAM."
         )
     if local_pause is not None and local_pause.total_seconds > 0:
-        recs.append("Local pause or maintenance time is counted separately from worker inefficiency.")
+        recs.append("Time the worker was paused or in maintenance mode is listed apart from the other losses.")
     if (
         not recs
         and report.mean_gpu_duty_percent is not None
         and report.mean_gpu_duty_percent >= report.target_duty_percent
     ):
-        recs.append("Duty met the configured target; no duty-cycle tuning action is indicated from these stats.")
+        recs.append("GPU duty met the target. Nothing to change.")
     return recs
 
 
@@ -1118,14 +1149,18 @@ def _maintainer_notes(report: SessionDutyReport) -> list[str]:
     notes: list[str] = []
     unknown = next((bucket for bucket in report.buckets if bucket.kind == DutyLossKind.UNKNOWN), None)
     if unknown is not None and unknown.total_seconds > 0:
-        notes.append(
-            "Unknown/unattributed time remains; inspect sample state/intent coverage around the evidence timestamps."
-        )
+        notes.append("Some lost time has no cause identified. Read the stats samples around the evidence timestamps.")
     recovery = next((bucket for bucket in report.buckets if bucket.kind == DutyLossKind.PROCESS_RECOVERY), None)
     if recovery is not None and recovery.total_seconds > 0:
-        notes.append("Process recovery coincided with duty loss; correlate with action ledger and crash diagnostics.")
+        notes.append(
+            "A process was restarted while GPU time was being lost. Compare with the action ledger and the crash "
+            "findings."
+        )
     if report.unknown_event_count:
-        notes.append(f"Ignored {report.unknown_event_count} unknown stats event(s); preserve them when downsampling.")
+        notes.append(
+            f"Stats events of an unknown type skipped: {report.unknown_event_count}. Keep them when downsampling "
+            "the file."
+        )
     return notes
 
 

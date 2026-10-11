@@ -91,13 +91,16 @@ class RotationStitch:
 
     def describe(self) -> str:
         """A one-line disclosure naming the rotations read and, when any were left out, the first skipped."""
-        included = ", ".join(path.name for path in self.included) or "none"
-        text = f"stitched {len(self.included)} rotated predecessor(s): {included}"
+        if self.included:
+            names = ", ".join(path.name for path in self.included)
+            text = f"also read {_count_text(len(self.included), 'rotated log')} ({names})"
+        else:
+            text = "read no rotated logs"
         if self.excluded:
-            first = self.excluded[0].name
+            newest_excluded = self.excluded[0].name
             text += (
-                f"; excluded {len(self.excluded)} older rotation(s) from {first} back, whose ranges do not "
-                "abut this run"
+                f", and left out {_count_text(len(self.excluded), 'older rotated log')} from an earlier launch "
+                f"({newest_excluded} and older)"
             )
         return text
 
@@ -334,6 +337,11 @@ class LogBundle:
         if self._ledger_cache is None:
             self._ledger_cache = ledger_ingest.load_ledger_for(self.root)
         return self._ledger_cache
+
+
+def _count_text(count: int, singular: str) -> str:
+    """Return ``count`` with its noun in the matching number."""
+    return f"{count} {singular}" if count == 1 else f"{count} {singular}s"
 
 
 def _active_paths(paths: list[Path]) -> list[Path]:

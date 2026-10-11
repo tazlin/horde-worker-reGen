@@ -300,17 +300,19 @@ horde-duty-report path/to/bridge.log           # legacy log-only path
 A stats-backed session renders roughly like this:
 
 ```text
-== Stats session 20260620-140201 v12.16.0 | 2026-06-20 14:02-14:26 | 1440 samples ==
+== Stats session 20260620-140201 v12.16.0 | 2026-06-20 14:02-14:26 | samples: 1440 ==
    duty: mean 44%  busy 82%  completed jobs 61
-   top loss buckets: model_load 420s (idle 180s, partial 240s)  scheduler_wait 210s (idle 210s, partial 0s)
-   phase medians: sampling 8.2s/job  model_load 1.8s/job  vram_transfer 1.2s/job  safety 0.9s/job
-   inference queue wait: total 210s (3.4s/job; median 2.1s, p90 8.8s, max 22.0s; 0.42x sampling time; overlaps active inference)
-   queue wait by model: model-a 90s/18j  model-b 54s/12j
-   inference dispatch gap: 32s queued with no active inference (15% of queued sample time)
-   dispatch gap states: inf#0=PRELOADING_MODEL 20s  inf#0=WAITING_FOR_JOB 12s
-   churn: model_swap 0.48/job  vram_eviction 0.36/job
-   operator view: Model load/transfer dominated loss; reduce model churn or use a smaller served model set for this VRAM size.
-   maintainer view: Unknown/unattributed time remains; inspect sample state/intent coverage around the evidence timestamps.
+   GPU time lost, largest causes first:
+     loading a model (model_load): 420s (idle 180s, below full load 240s)
+     jobs queued but not started (scheduler_wait): 210s (idle 210s, below full load 0s)
+   median time per job by phase: sampling 8.2s/job  model_load 1.8s/job  vram_transfer 1.2s/job  safety 0.9s/job
+   wait from pop to start of generation: total 210s, 3.4s/job (median 2.1s, p90 8.8s, max 22.0s), 0.42x the sampling time. Other jobs run during this wait, so it is not all idle GPU time.
+   that wait by model: model-a 90s over 18 jobs  model-b 54s over 12 jobs
+   jobs queued while none was in progress: 32s (15% of the time jobs were queued)
+   process states during that time: inf#0=PRELOADING_MODEL 20s  inf#0=WAITING_FOR_JOB 12s
+   reloads and restarts: model_swap 0.48/job  vram_eviction 0.36/job
+   for the operator: GPU time was lost to loading models. Switch models less often, or offer fewer models for this amount of VRAM.
+   for a maintainer: Some lost time has no cause identified. Read the stats samples around the evidence timestamps.
 ```
 
 The report intentionally keeps three related views separate. Idle seconds are wall-clock intervals where

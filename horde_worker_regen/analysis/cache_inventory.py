@@ -33,10 +33,10 @@ def collect_cache_inventory(cache_home: str | None) -> dict[str, Any]:
     records *that* (an unset/inaccessible cache is itself a useful signal).
     """
     if not cache_home:
-        return {"cache_home": None, "present": False, "reason": "cache_home not resolved"}
+        return {"cache_home": None, "present": False, "reason": "no model cache directory is set"}
     root = Path(cache_home)
     if not root.is_dir():
-        return {"cache_home": cache_home, "present": False, "reason": "directory does not exist"}
+        return {"cache_home": cache_home, "present": False, "reason": "the model cache directory does not exist"}
 
     files: list[dict[str, Any]] = []
     model_count = 0

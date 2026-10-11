@@ -153,19 +153,19 @@ class EpochConfig:
         if self.num_models is not None:
             parts.append(f"models={self.num_models}")
         if self.max_threads is not None:
-            parts.append(f"threads={self.max_threads}")
+            parts.append(f"max_threads={self.max_threads}")
         if self.queue_size is not None:
-            parts.append(f"queue={self.queue_size}")
+            parts.append(f"queue_size={self.queue_size}")
         if self.max_power is not None:
             parts.append(f"max_power={self.max_power}")
         flags = {
-            "unload_often": self.unload_models_from_vram_often,
-            "high_perf": self.high_performance_mode,
-            "high_mem": self.high_memory_mode,
-            "safety_gpu": self.safety_on_gpu,
+            "unload_models_from_vram_often": self.unload_models_from_vram_often,
+            "high_performance_mode": self.high_performance_mode,
+            "high_memory_mode": self.high_memory_mode,
+            "safety_on_gpu": self.safety_on_gpu,
         }
         parts.extend(name for name, value in flags.items() if value)
-        return ", ".join(parts) if parts else "(config not seen)"
+        return ", ".join(parts) if parts else "(not found in the log)"
 
 
 @dataclass
@@ -486,15 +486,16 @@ def render_clearance_hold_digest(digests: list[ClearanceHoldDigest]) -> list[str
     if not digests:
         return []
     total = sum(digest.hold_lines for digest in digests)
-    out = [f"   clearance holds (distinct holds logged): {total}"]
+    out = [f"   times a job waited for free VRAM before sampling (clearance holds): {total}"]
     for digest in digests:
         decisions = ", ".join(f"{decision} {count}" for decision, count in digest.decisions.items())
         # A run of several commands is comma-joined in the line itself, so it is rejoined with "+" here.
         reclaim = ", ".join(f"{run.replace(', ', '+')} {count}" for run, count in digest.reclaim_runs.items()) or "n/a"
         out.append(
-            f"     {digest.model}: {digest.hold_lines} ({decisions}); median candidate "
+            f"     {digest.model}: {digest.hold_lines} ({decisions}), median VRAM needed "
             f"{_mb_or_na(digest.median_candidate_mb)}, available {_mb_or_na(digest.median_available_mb)}, "
-            f"outstanding {_mb_or_na(digest.median_outstanding_mb)}; reclaim run: {reclaim}"
+            f"reserved for other jobs {_mb_or_na(digest.median_outstanding_mb)}, "
+            f"steps taken to free VRAM: {reclaim}"
         )
     return out
 
@@ -535,22 +536,25 @@ def _verdict(report: EpochReport) -> str:
     """A one-line plain-language read of the epoch's headline number."""
     mean = report.mean_duty()
     if mean is None:
-        return "no duty-cycle data"
+        return "no GPU duty cycle readings"
     if mean >= _DUTY_TARGET:
         return f"at target ({mean:.0f}% >= {int(_DUTY_TARGET)}%)"
     busy = report.mean_busy()
-    detail = f"mean {mean:.0f}%"
+    verdict = f"below the {int(_DUTY_TARGET)}% target, mean {mean:.0f}%"
     if busy is not None:
         idle = max(0.0, 100.0 - busy)
         partial = max(0.0, busy - mean)
-        detail += f"; ~{idle:.0f}% idle (hand-off/no-work) + ~{partial:.0f}% partial-utilization"
-    return f"below {int(_DUTY_TARGET)}% target: {detail}"
+        verdict += (
+            f". The GPU was idle about {idle:.0f}% of the time and lost about {partial:.0f}% "
+            "to running below full load"
+        )
+    return verdict
 
 
 def render_report(reports: list[EpochReport]) -> str:
     """Render the per-epoch report as a human-readable block."""
     if not reports:
-        return "No session epochs with duty-cycle data found in the log."
+        return "No session with GPU duty cycle readings found in the log."
 
     out: list[str] = []
     for report in reports:
@@ -558,7 +562,9 @@ def render_report(reports: list[EpochReport]) -> str:
         end = report.end.strftime("%H:%M") if report.end else "?"
         duration = report.duration_minutes
         duration_str = f"{duration:.0f} min" if duration is not None else "? min"
-        out.append(f"== Epoch {report.index} | {start}-{end} ({duration_str}) | {len(report.windows)} windows ==")
+        out.append(
+            f"== Log session {report.index} | {start}-{end} ({duration_str}) | duty readings: {len(report.windows)} =="
+        )
         out.append(f"   config: {report.config.summary()}")
         out.append(f"   verdict: {_verdict(report)}")
 
@@ -566,18 +572,18 @@ def render_report(reports: list[EpochReport]) -> str:
         if values:
             out.append(f"   duty: mean {statistics.mean(values):.0f}%  min {min(values)}%  max {max(values)}%")
             bands = report.band_distribution()
-            out.append("   bands: " + "  ".join(f"{label} {count}" for label, count in bands.items()))
+            out.append("   readings by duty: " + "  ".join(f"{label} {count}" for label, count in bands.items()))
 
         gaps = report.mean_gaps()
         if gaps:
             top = "  ".join(f"{label} {seconds:.1f}s/job" for label, seconds in list(gaps.items())[:4])
-            out.append(f"   top per-job gaps: {top}")
+            out.append(f"   longest waits per job: {top}")
 
         churn = report.churn_totals()
         if churn:
-            out.append("   reload churn: " + "  ".join(f"{label} {count}" for label, count in churn.items()))
+            out.append("   reloads and restarts: " + "  ".join(f"{label} {count}" for label, count in churn.items()))
         else:
-            out.append("   reload churn: none reported (pre-instrumentation log, or no churn)")
+            out.append("   reloads and restarts: none reported (none happened, or the log is from an older worker)")
 
         governors = report.governor_attribution()
         if governors:
@@ -587,10 +593,12 @@ def render_report(reports: list[EpochReport]) -> str:
                 label = GOVERNOR_LABELS.get(name, name)
                 share = f" ({seconds / epoch_seconds * 100:.0f}%)" if epoch_seconds > 0 else ""
                 parts.append(f"{label} {seconds / 60:.1f}m{share}")
-            out.append("   pop governors engaged: " + "  ".join(parts))
+            out.append("   time not asking the horde for work: " + "  ".join(parts))
 
         if report.min_disk_free_gb is not None:
-            out.append(f"   (!) disk pressure: dipped to {report.min_disk_free_gb:.1f} GB free (can stall downloads)")
+            out.append(
+                f"   (!) low disk space: down to {report.min_disk_free_gb:.1f} GB free, which can stall downloads"
+            )
         out.append("")
     return "\n".join(out).rstrip()
 
@@ -623,7 +631,10 @@ def add_duty_report_arguments(parser: argparse.ArgumentParser) -> None:
         nargs="?",
         default=None,
         type=Path,
-        help="Path to the bridge.log to analyze when stats are unavailable or --logs is used.",
+        help=(
+            "A bridge.log to report from. Given without --stats, the report is built from this log alone. "
+            "Default: logs/bridge.log, read only when no stats files are found."
+        ),
     )
     parser.add_argument(
         "--stats",
@@ -635,19 +646,22 @@ def add_duty_report_arguments(parser: argparse.ArgumentParser) -> None:
         "--logs",
         type=Path,
         default=None,
-        help="Log file or directory containing bridge.log; with stats, adds each session's clearance holds.",
+        help=(
+            "A log file, or a directory containing bridge.log. Used like the positional log. With --stats, "
+            "it adds to each session the times a job waited for free VRAM before sampling."
+        ),
     )
     parser.add_argument(
         "--footprints",
         type=Path,
         default=None,
         help=(
-            "Learned VRAM footprint store to list sampling prices from (default: the bundle's "
-            "config/vram_footprints.json beside --stats, else the worker's own store)."
+            "The learned VRAM usage file (vram_footprints.json) to list. Default: config/vram_footprints.json "
+            "beside --stats in a support bundle, otherwise the worker's file."
         ),
     )
-    parser.add_argument("--last", action="store_true", help="Only report the most recent session/epoch.")
-    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text.")
+    parser.add_argument("--last", action="store_true", help="Only the most recent session.")
+    parser.add_argument("--json", action="store_true", help="Print JSON instead of text.")
 
 
 def run_duty_report(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -702,7 +716,9 @@ def run_duty_report(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
 def main() -> None:
     """CLI entry point: prefer stats JSONL, then fall back to bridge.log parsing."""
-    parser = argparse.ArgumentParser(description="Offline GPU duty-cycle report over stats JSONL or bridge.log.")
+    parser = argparse.ArgumentParser(
+        description="GPU duty cycle report from the worker's stats files or its bridge.log."
+    )
     add_duty_report_arguments(parser)
     exit_code = run_duty_report(parser.parse_args(), parser)
     if exit_code:
@@ -726,7 +742,7 @@ def _print_footprints(args: argparse.Namespace) -> None:
     store_path = args.footprints or default_footprint_store_path(args.stats)
     if not store_path.is_file():
         if args.footprints is not None:
-            print(f"\nLearned footprint store not found: {store_path}")
+            print(f"\nLearned VRAM usage file not found: {store_path}")
         return
     print()
     print(render_learned_sampling_footprints(store_path, learned_sampling_footprints(store_path)))

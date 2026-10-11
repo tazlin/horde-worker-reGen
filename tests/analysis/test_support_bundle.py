@@ -533,7 +533,7 @@ class TestBenchmarkRuns:
         build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
 
         sessions_text = _read_member(out, "sessions.txt")
-        assert sessions_text.index("1 worker session(s)") < sessions_text.index("1 benchmark run(s)")
+        assert sessions_text.index("1 worker session in") < sessions_text.index("1 benchmark run in")
         diagnose_text = _read_member(out, "diagnose.txt")
         worker_heading = diagnose_text.index("=== Session #0 ")
         benchmark_heading = diagnose_text.index("=== Session #0  [benchmark run: bridge_harness.log]")

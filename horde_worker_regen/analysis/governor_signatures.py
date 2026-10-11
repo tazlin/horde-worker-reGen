@@ -17,21 +17,6 @@ GOVERNOR_ENTER_RE = re.compile(r"Pop governor ENTER: (?P<name>\w+)")
 GOVERNOR_EXIT_RE = re.compile(r"Pop governor EXIT: (?P<name>\w+)")
 """Matches a governor spell closing; ``name`` is the governor's machine key."""
 
-GOVERNOR_LABELS = {
-    "whole_card_residency": "whole-card residency",
-    "large_model_switch": "the large-model switch throttle",
-    "large_model_reentry": "the large-model re-entry cooldown",
-    "post_inference_backpressure": "post-inference backpressure",
-    "unservable_model_holdback": "the unservable-model holdback",
-    "consecutive_failure_pause": "the consecutive-failure pause",
-    "pop_error_backoff": "pop error-backoff",
-    "lora_pop_backoff": "the LoRA pop backoff",
-    "self_throttle_pause": "the self-throttle pause",
-    "megapixelstep_wait": "the megapixelstep wait",
-    "model_stickiness": "model stickiness",
-}
-"""Machine governor key -> human phrase for report text; an unknown key falls back to the key itself."""
-
 GOVERNOR_PLAIN_PHRASES = {
     "whole_card_residency": "The whole-card reservation",
     "large_model_switch": "The wait between large models",
@@ -46,3 +31,15 @@ GOVERNOR_PLAIN_PHRASES = {
     "model_stickiness": "Staying on the current model",
 }
 """Machine governor key -> the plain phrase a finding's headline uses, in the words of the style guide."""
+
+
+def _mid_sentence(phrase: str) -> str:
+    """Lower the first letter of a sentence-leading phrase so it reads inside a line."""
+    return phrase[:1].lower() + phrase[1:]
+
+
+GOVERNOR_LABELS = {name: _mid_sentence(phrase) for name, phrase in GOVERNOR_PLAIN_PHRASES.items()}
+"""Machine governor key -> the same plain phrase for use inside a report line.
+
+Derived from :data:`GOVERNOR_PLAIN_PHRASES` so the duty report and the findings use one wording. An unknown
+key falls back to the key itself at the call site."""

@@ -138,26 +138,34 @@ def _job_class_label(key: FootprintKey) -> str:
 def render_learned_sampling_footprints(path: Path, rows: list[SamplingFootprintRow]) -> str:
     """Render the sampling rows for terminal output, figures only."""
     if not rows:
-        return f"== Learned footprints ({path}) ==\n   no sampling keys"
+        return f"== Learned footprints ({path}) ==\n   no sampling entries"
     out = [
         f"== Learned footprints ({path}) ==",
-        "   watermark: raise-only term; measured: margined window figure net of the context charge, "
-        "which prices a job when lower; resident: net of the context charge",
+        "   watermark: the highest VRAM use recorded for this kind of job.",
+        "   measured: recent VRAM use plus a margin, without the per-process CUDA context. "
+        "A job is budgeted at this figure when it is the lower of the two.",
+        "   activation watermark: the highest VRAM use recorded beyond the model weights.",
+        "   resident: the VRAM a loaded model holds while idle, without the per-process CUDA context.",
     ]
     for row in rows:
         measured = (
             f"measured {row.measured_mb:.0f}MB"
             if row.measured_mb is not None
-            else f"measured n/a ({row.window_size} in window)"
+            else f"measured n/a ({_count_text(row.window_size, 'recent reading')}, too few)"
         )
         activation = "n/a" if row.activation_watermark_mb is None else f"{row.activation_watermark_mb:.0f}MB"
         out.append(
             f"   {row.baseline} {row.resolution_bucket or '-'} {row.stage} [{row.job_class}]: "
             f"watermark {row.watermark_mb:.0f}MB, "
-            f"{measured} ({row.observation_count} obs); activation watermark {activation}; "
-            f"resident {_render_residents(row.residents)}"
+            f"{measured} ({_count_text(row.observation_count, 'observation')}), "
+            f"activation watermark {activation}, resident {_render_residents(row.residents)}"
         )
     return "\n".join(out)
+
+
+def _count_text(count: int, singular: str) -> str:
+    """Return ``count`` with its noun in the matching number."""
+    return f"{count} {singular}" if count == 1 else f"{count} {singular}s"
 
 
 def _persisted_keys(path: Path) -> list[FootprintKey]:
@@ -213,7 +221,7 @@ def _render_residents(residents: list[ResidentFootprint]) -> str:
         return "n/a"
     if len(residents) == 1:
         return f"{residents[0].resident_mb:.0f}MB ({residents[0].checkpoint})"
-    return f"{residents[-1].resident_mb:.0f}-{residents[0].resident_mb:.0f}MB over {len(residents)} checkpoints"
+    return f"{residents[-1].resident_mb:.0f}-{residents[0].resident_mb:.0f}MB across {len(residents)} checkpoints"
 
 
 __all__ = [

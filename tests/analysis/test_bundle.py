@@ -180,7 +180,10 @@ class TestRotationStitching:
         assert [path.name for path in bundle.rotation_stitch.excluded] == [
             "bridge.2026-06-24_08-00-00_000001.log.zip",
         ]
-        assert "excluded" in bundle.rotation_stitch.describe()
+        assert (
+            "left out 1 older rotated log from an earlier launch (bridge.2026-06-24_08-00-00_000001.log.zip and older)"
+            in bundle.rotation_stitch.describe()
+        )
 
     def test_no_rotations_leaves_no_disclosure(self, tmp_path: Path) -> None:
         """Nothing to stitch means nothing to disclose."""
