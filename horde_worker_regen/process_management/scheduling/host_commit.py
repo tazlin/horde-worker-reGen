@@ -48,7 +48,9 @@ def measure_available_commit_mb() -> float | None:
         return None
     status = _MemoryStatusEx()
     status.dwLength = ctypes.sizeof(_MemoryStatusEx)
-    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+    # ``windll`` exists only on Windows, and the platform check above guards this read.
+    kernel32 = ctypes.windll.kernel32  # pyrefly: ignore[missing-attribute]
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
         if not _commit_read_failure_logged:
             _commit_read_failure_logged = True
             logger.warning(
