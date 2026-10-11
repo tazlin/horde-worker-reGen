@@ -479,8 +479,8 @@ class GpuOverride(BaseModel):
 
     Lives on :attr:`reGenBridgeData.gpu_overrides`, keyed by stable (PCI-bus) device index. Only the fields
     meaningful to gate per card are present (concurrency, the served model set, feature flags, and the VRAM
-    budget); ``extra="forbid"`` makes a typo or an attempt to override a global-only field (e.g. ``api_key``)
-    a loud validation error rather than a silently ignored key. Constraints mirror the corresponding fields
+    budget). ``extra="forbid"`` makes a typo, or an attempt to override a global-only field (e.g. ``api_key``),
+    a validation error. Without it the key would be ignored. Constraints mirror the corresponding fields
     on :class:`reGenBridgeData`. The orchestrator resolves these into a per-card :class:`reGenBridgeData`
     via :func:`horde_worker_regen.bridge_data.gpu_config.resolve_effective_gpu_config`.
     """
@@ -513,7 +513,7 @@ class GpuOverride(BaseModel):
 
     # -- Safety --
     safety_on_gpu: bool | None = None
-    """This card's permission to host the on-GPU safety process, not a request that it do so.
+    """Whether this card may host the on-GPU safety process. Setting it does not place safety here.
 
     Safety is a single process occupying one card, so the worker places it on a card that permits it (the one
     with the most measured headroom) and runs it off-GPU when no card does."""
@@ -522,6 +522,7 @@ class GpuOverride(BaseModel):
     enable_vram_budget: bool | None = None
     vram_reserve_mb: int | None = Field(default=None, ge=0)
     vram_to_leave_free: str | None = Field(default=None, pattern=r"^\d+%$|^\d+$")
+    """Accepted so older configs still load. Nothing in the worker reads it, so it has no effect."""
     whole_card_exclusive_residency: bool | None = None
     vram_admission_noise_mb: int | None = Field(default=None, ge=0)
     measured_load_probe_seconds: int | None = Field(default=None, ge=0, le=600)
@@ -533,9 +534,9 @@ class GpuOverride(BaseModel):
 class PinnedModelEntry(BaseModel):
     """A model the operator pins into the fixed model pool, with a persistent seating bias.
 
-    The affinity is a bias, never a lock: it orders which pins claim seats first (highest first) and makes a
-    pinned model stickier against rotation, but a sufficiently stronger candidate can still take the seat and
-    the pin can re-seat later. 1.0 is the strongest bias; values approach (but never reach) 0 for a pin the
+    The affinity is a bias. It orders which pins claim seats first (highest first) and makes a pinned model
+    harder to rotate out. A sufficiently stronger candidate can still take the seat, and the pin can re-seat
+    later. 1.0 is the strongest bias; values approach (but never reach) 0 for a pin the
     pool should hold only when nothing else wants the seat.
     """
 
@@ -575,11 +576,10 @@ class ModelPoolConfig(BaseModel):
 
     rotation_minutes: float = Field(default=60.0, gt=0.0)
     """How long a seat serves before it becomes eligible for a timed re-contest against a stronger candidate.
-    A pin's affinity extends its own rotation window on top of this base."""
+    A pin's affinity extends its rotation window on top of this base."""
 
     min_dwell_minutes: float = Field(default=10.0, ge=0.0)
-    """The minimum time a freshly-seated model is held before any demotion or rotation may unseat it, so a
-    seat is never churned before it has had a fair chance to earn its place."""
+    """The minimum time a freshly-seated model is held before any demotion or rotation may unseat it."""
 
     rescue_enabled: bool = False
     """Whether a starved, high-wait model may briefly claim the weakest ranker seat. Off by default."""
@@ -593,7 +593,7 @@ class ModelPoolConfig(BaseModel):
     consulted when ``rescue_enabled``."""
 
     demand_poll_seconds: float = Field(default=90.0, ge=60.0)
-    """How often the pool refreshes its demand ranking. Floored at 60 seconds to keep the poll gentle on the
+    """How often the pool refreshes its demand ranking. The minimum is 60 seconds, to limit load on the
     horde's demand endpoint."""
 
     download_budget_gb: float = Field(default=0.0, ge=0.0)
@@ -608,7 +608,7 @@ class ModelPoolConfig(BaseModel):
 class reGenBridgeData(CombinedHordeBridgeData):
     """The config model for reGen. Extra fields added here are specific to this worker implementation.
 
-    See `CombinedHordeBridgeData` from the SDK for more information..
+    See `CombinedHordeBridgeData` from the SDK for more information.
     """
 
     _loaded_from_env_vars: bool = False
@@ -716,9 +716,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     cycle_process_on_model_change: bool = Field(
         default=False,
     )
-    """If true, the process will stop and restart when the model loaded changes.
+    """If true, an inference process holding one model is replaced when it has to load a different model.
 
-    Warning: This can cause substantial delays in processing.
+    The process is ended and a new one started in its place, which returns all of its RAM and VRAM to the
+    system. Every model switch then waits for a process to start, which causes substantial delays.
     """
 
     CIVIT_API_TOKEN: str | None = Field(
@@ -744,12 +745,15 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """The maximum amount of time to allow a job to run before it is killed"""
 
     post_process_timeout: int = Field(default=120, ge=15)
+    """The maximum time (seconds) for post-processing (upscaling, face-fixing) before the job is killed."""
 
     download_timeout: int = Field(default=TOTAL_LORA_DOWNLOAD_TIMEOUT + 1)
-    """How long a popped job may wait for its LoRAs and textual inversions to download, in seconds.
+    """How long a popped job waits for its LoRAs and textual inversions to download, in seconds.
 
-    The budget for the job's dispatch hold; a transfer still moving when it expires is given up to two more
-    budgets before the job is faulted. No process is killed on it."""
+    A transfer still moving when the wait expires gets up to two more waits of this length. After that the
+    job is dispatched without the files that did not arrive. The job is not faulted, no process is killed,
+    and the download continues for later jobs. The wait also ends once 35% of the job's horde time limit
+    has passed."""
 
     download_rate_limit_kbps: int | None = Field(default=None, ge=0)
     """Cap background model downloads to this many KB/s (None or 0 means unlimited).
@@ -1084,13 +1088,13 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """
 
     alchemy_vram_headroom_mb: int = Field(default=2000, ge=0)
-    """Cold-start floor (MB) for an alchemy form's predicted VRAM cost.
+    """The lowest VRAM cost (MB) the worker assumes for one alchemy form.
 
     Alchemy admission shares the same committed-reserve accounting as image generation: a form is
     popped only when the device's *effective* free VRAM (measured free minus VRAM already committed by
-    in-flight image and alchemy work) covers the form's predicted cost. That prediction comes from the
-    headroom estimator, which raises it toward the observed median cost of recent forms; until real
-    measurements accumulate it falls back to this floor. Free VRAM is read from worker memory reports;
+    in-flight image and alchemy work) covers the form's predicted cost. The prediction is the larger of
+    this value and the median measured cost of recent forms, so this value applies alone until forms
+    have been measured. Free VRAM is read from worker memory reports;
     when unavailable, alchemy falls back to backfill-only behavior.
     """
 
@@ -1107,11 +1111,11 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """If true, this worker also pops and processes text-generation jobs (/v2/generate/text/pop).
 
     Text generation runs in a separate program, the text backend (koboldcpp today; sonar and others
-    planned), which the operator starts themselves and the worker reaches over HTTP at `kai_url`. There
-    is no inference child process and no GPU work in the worker itself, so a scribe can be combined with
-    any other role or run on its own. What the worker advertises comes from `text_model`,
-    `text_threads`, `max_length` and `max_context_length`, each narrowed to what the backend says it
-    will accept.
+    planned). The worker launches and supervises it when `text_backend_managed` is true (the default),
+    and otherwise reaches one the operator runs over HTTP at `kai_url`. Text jobs do not run in the
+    worker's inference processes, so a scribe can be combined with any other role or run alone. What the
+    worker advertises comes from `text_model`, `text_threads`, `max_length` and `max_context_length`,
+    each limited to what the backend reports it accepts.
     """
 
     text_model: str | None = Field(default=None)
@@ -1130,8 +1134,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     `<AIWORKER_CACHE_HOME>/text_models`.
 
     A `text_model` naming a path is read where it sits and never copied here. The model reference
-    publishes no on-disk folder for text model files, so this location is the worker's own choice rather
-    than part of the shared model-cache layout.
+    publishes no on-disk folder for text model files, so the worker chooses this location and it is not
+    part of the shared model-cache layout.
     """
 
     text_model_name: str | None = Field(default=None)
@@ -1152,8 +1156,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     Also the flow's in-flight ceiling and the thread count advertised on a text pop, so the horde sizes
     this worker's share of text work by it. Separate from `max_threads`, which sizes GPU inference lanes
-    in this worker's own child processes; the two have nothing in common and setting one says nothing
-    about the other.
+    in this worker's child processes. The two settings are independent.
     """
 
     text_generation_timeout_seconds: float | None = Field(default=None, gt=0)
@@ -1178,10 +1181,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     text_backend_kind: TEXT_BACKENDS = Field(default=TEXT_BACKENDS.koboldcpp)
     """Which text backend program serves this worker's text jobs.
 
-    Named in the horde's own vocabulary, so the same value chooses how the backend is launched, which
+    The value uses the horde's backend names, so it also chooses how the backend is launched, which
     driver talks to it, and how the advertised model name is prefixed. koboldcpp is the default and the
-    first supported backend; a backend the worker cannot launch yet is refused by name at start-up, with
-    the supported list in the message.
+    first supported backend. For a backend the worker cannot launch yet, no backend is started and the
+    worker logs an error listing the ones it can launch.
     """
 
     text_backend_managed: bool = Field(default=True)
@@ -1194,12 +1197,12 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """
 
     text_backend_executable: Path | None = Field(default=None)
-    """A backend program to launch instead of the one the worker would provision itself.
+    """A backend program to launch instead of the one the worker would provision.
 
     Leave unset to let the worker obtain the pinned release for `text_backend_kind`. Set it to run a
     build of your own, a newer upstream release, or a backend the worker cannot yet provision. A `.py`
     path is a source checkout's entry script (koboldcpp's `koboldcpp.py` beside its compiled library) and
-    is run by the worker's own interpreter.
+    is run by the worker's Python interpreter.
     """
 
     text_backend_password: str | None = Field(default=None)
@@ -1223,7 +1226,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     else still holds, because a backend that survived a previous run is the usual holder."""
 
     text_gpu_layers: int = Field(default=99, ge=0)
-    """How much of the model the managed backend places on the card, in the backend's own unit (layers
+    """How much of the model the managed backend places on the card, in the backend's unit (layers
     for llama.cpp-based backends). A large value means the whole model; 0 keeps it on the CPU."""
 
     text_gpu_device_index: int | None = Field(default=None, ge=0)
@@ -1244,8 +1247,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     proactive guard against the multi-process over-commit that OOMs a shared GPU. Set false to
     restore the prior availability-only behavior (not recommended on a shared/consumer GPU).
 
-    Off means no deferral, not no housekeeping: a post-processing chain the arbiter would not admit takes the
-    cheapest reclaim rung that acts, then dispatches on the same tick."""
+    Turning the budget off removes deferral only. A post-processing chain the arbiter would not admit still
+    takes the cheapest reclaim rung that acts, then dispatches on the same tick."""
 
     enable_pipeline_disaggregation: bool = Field(default=False)
     """Route eligible jobs through the disaggregated stage pipeline instead of the monolithic path.
@@ -1336,9 +1339,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     vram_reserve_mb: int = Field(default=2048, ge=0)
     """Free VRAM (MB) the budget keeps in reserve on top of a job's estimated peak.
 
-    Covers transient spikes the steady-state estimate misses, most notably tiled VAE decode (the
-    phase that produced the observed live OOM). Larger values trade throughput for safety. Only used
-    when `enable_vram_budget` is true."""
+    Covers transient spikes the steady-state estimate misses, most notably tiled VAE decode. Larger
+    values trade throughput for safety. Only used when `enable_vram_budget` is true."""
 
     ram_reserve_mb: int = Field(default=4096, ge=0)
     """Host RAM (MB) kept available after every modeled allocation, admitted or incoming, has landed.
@@ -1396,26 +1398,23 @@ class reGenBridgeData(CombinedHordeBridgeData):
     least-recently-used first, so a swapped-away model reloads from a warm RAM copy instead of from disk. This
     is the lever that lets a small-VRAM card serve diverse traffic without paying a full disk reload on every
     model switch. None (the default) leaves the legacy single-slot behaviour (one component resident at a
-    time), so an existing worker is unchanged until an operator opts in. 0 is equivalent to legacy. The value
-    validated in testing on a 16GB card is 12288 (~12GB); size it against the host RAM available beside the
-    per-process ceiling and any co-tenants rather than copying that figure blindly. Consumed by the child
+    time), so an existing worker is unchanged until an operator opts in. 0 is equivalent to legacy. 12288
+    (~12GB) was validated in testing on a 16GB card. Size yours against the host RAM left beside the
+    per-process ceiling and the other programs on the host. Consumed by the child
     processes via the ``HORDE_COMPONENT_CACHE_MB`` environment variable this worker exports on their behalf."""
 
     post_processing_fault_breaker_enabled: bool = Field(default=True)
     """Let the worker automatically stop advertising post-processing when a card cannot host its VRAM peak.
 
     A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
-    over-commits) faults the job; the horde reassigns it, but a worker that keeps faulting trips the horde's
-    forced-maintenance, the very spiral this guards against. When true (the default), two mechanisms cooperate:
-    a reactive rolling-window breaker counts post-processing-over-commit faults (both the planner's
-    unhostable-peak faults and watchdog-reaped post-processing stalls) and, once they exceed
-    `post_processing_fault_threshold` within `post_processing_fault_window_seconds`, stops popping
-    post-processing-requesting jobs; and, where the parent has a truthful device-free VRAM reading, a proactive
-    gate withholds post-processing advertising whenever the card's free VRAM sits below the post-processing peak
-    plus a safety margin, before any fault occurs. Both re-open on their own once the card's measured free VRAM
-    recovers (a heavy resident unloads, or a seat rotates to a smaller model); a host without an NVML reading
-    keeps the reactive breaker alone, session-latched until restart. Set false to opt out entirely and manage
-    post-processing advertising by hand."""
+    over-commits) faults the job. The horde reassigns it, but a worker that keeps faulting trips the horde's
+    forced maintenance. When true (the default), post-processing over-commit faults (the planner's
+    unhostable-peak faults and watchdog-reaped post-processing stalls) are counted in a rolling window. Once
+    they exceed `post_processing_fault_threshold` within `post_processing_fault_window_seconds` the worker
+    stops advertising post-processing. It advertises it again once the window passes with no further
+    over-commit fault and a driven card can host the post-processing peak. A host with no device VRAM reading
+    re-enables on the quiet window alone. Set false to opt out and manage post-processing advertising by
+    hand."""
 
     post_processing_fault_threshold: int = Field(default=4, ge=1)
     """The breaker trips when *more than* this many post-processing-over-commit faults occur within
@@ -1493,22 +1492,26 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     measured_load_probe_seconds: int = Field(default=10, ge=0, le=600)
     """How long (seconds) the head of queue must have starved at a card with nothing left to reclaim before
-    the worker admits one real load to let measured reality decide, instead of holding on arithmetic.
+    the worker admits one real load to see whether it fits.
 
-    The reclaim rungs and the idle-context teardown run first; once they have nothing left this is the only
-    wait that remains. 0 probes as soon as the ladder is empty. Overridable per card under `gpu_overrides`."""
+    The reclaim rungs and the idle-context teardown run first. Once they have nothing left this is the only
+    wait that remains. 0 probes as soon as the ladder is empty. A job that misses the free-VRAM reading by
+    more than 1024 MB waits at least 60 seconds whatever is set here, unless the worker has already measured
+    that job's peak. A miss that large on a card the worker counts as empty usually means something the
+    worker does not track is holding VRAM, so a real load is unlikely to fit. Overridable per card under
+    `gpu_overrides`."""
 
     starved_head_lane_reclaim: bool = Field(default=True)
     """Whether a head of queue that has starved past the teardown grace, with every cheaper reclaim exhausted,
     may stop an idle service lane (the post-processing lane, the safety process off-GPU, the image-utilities
-    lane) to make its room, cheapest first and one at a time. The lanes come back through the reclaim
-    ladder's restore once the card is healthy. False keeps every lane on the card and leaves such a head to
-    the measured-load probe. Overridable per card under `gpu_overrides`."""
+    lane) to make room, cheapest first and one at a time. The lanes are restarted once the card has room
+    again. False keeps every lane on the card and leaves such a head to the measured-load probe. Overridable
+    per card under `gpu_overrides`."""
 
     starved_head_utilities_pause: bool = Field(default=True)
     """Whether the image-utilities lane is among the lanes a starved head may stop (see
-    `starved_head_lane_reclaim`). It is the last rung and costs the service a restart; false keeps it on the
-    card while the other lanes stay eligible. Overridable per card under `gpu_overrides`."""
+    `starved_head_lane_reclaim`). It is the last lane stopped, and it has to be restarted afterwards. False
+    keeps it on the card while the other lanes stay eligible. Overridable per card under `gpu_overrides`."""
 
     whole_card_models: list[str] = Field(default_factory=list)
     """Models the worker must treat as needing the card to itself regardless of what its footprint store has
@@ -1537,7 +1540,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     end: a multi-model worker must return to its full pool, and a card whose model is in demand could
     otherwise hold the offer for as long as that demand lasts. This is the ceiling on one residency episode,
     measured from its establishment and covering the claim, the minimum hold and the cooldown alike; past it
-    the residency stops being retained and lets go as soon as its own accepted work has drained. The
+    the residency stops being retained and lets go as soon as its accepted work has drained. The
     residency's other exits still apply beneath it: a burst that dries up releases early on the empty-pop
     evidence, and a drained residency still releases at its cooldown.
 
@@ -1562,8 +1565,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """Seconds to avoid *any* very-large model after the last one drains (the re-entry cooldown).
 
     Once the whole-card residency lease is up and no very-large model remains loaded or queued, the worker
-    stops offering *any* very-large model for this long, so it does ordinary work for a beat instead of
-    immediately re-entering large-model territory and re-thrashing. -1 (the default) inherits
+    stops offering *any* very-large model for this long, so it does ordinary work in between instead of
+    reloading large models back to back. -1 (the default) inherits
     `whole_card_residency_cooldown_seconds`, tying it to the residency lease it complements; 0 disables it; a
     positive value overrides. As with the switch throttle, an idle worker with an empty local queue offers
     large models again regardless, so it never sits idle. Independent of `whole_card_exclusive_residency`."""
@@ -1573,8 +1576,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     A best-effort over-budget admit of a heavy model can stream weights through VRAM each step, so even
     on an un-contended device its steps are legitimately far slower than `inference_step_timeout`. Killing
-    such a slow-but-progressing job and dropping it is what produced the live drop storm; this generous
-    per-step grace lets it complete (slowly) instead. Applied to every step of an over-budget job (not
+    such a slow but progressing job drops work the card would have finished, so this wider per-step grace
+    lets it complete. Applied to every step of an over-budget job (not
     only its first), floored at `inference_step_timeout`. Only used when `enable_vram_budget` is true."""
 
     unservable_model_fault_threshold: int = Field(default=3, ge=0, le=20)
@@ -1583,8 +1586,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     A model the device genuinely cannot run will fault every attempt no matter how it is isolated; left
     unchecked the worker keeps popping and dropping it, and the horde server forces the worker into
     maintenance for "dropping too many jobs". After this many consecutive over-budget faults for a model,
-    the worker stops popping and best-effort-admitting it for `unservable_model_cooldown_seconds`, so the
-    bleeding stops. A successful generation of the model resets its counter. 0 disables the breaker."""
+    the worker stops popping and best-effort-admitting it for `unservable_model_cooldown_seconds`, so it
+    stops dropping those jobs. A successful generation of the model resets its counter. 0 disables the breaker."""
 
     unservable_model_cooldown_seconds: int = Field(default=900, ge=0)
     """How long a model flagged locally unservable is held back before the worker tries it again."""
@@ -1613,8 +1616,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     A backstop above the per-model breaker: if resource faults across *all* models accumulate fast enough
     to risk the horde's server-side "dropping too many jobs" guard, the worker proactively enters a local
-    pop-pause for `self_maintenance_cooldown_seconds` (in-flight jobs finish) so it stops the bleeding on
-    its own terms before the server forces maintenance. 0 disables the backstop."""
+    pop-pause for `self_maintenance_cooldown_seconds` (in-flight jobs finish) so it stops dropping jobs
+    before the server forces maintenance. 0 disables the backstop."""
 
     self_maintenance_window_seconds: int = Field(default=600, ge=1)
     """Rolling window (seconds) over which resource/OOM faults are counted for the self-throttle backstop."""
@@ -1640,8 +1643,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     It used to select ComfyUI's memory mode for every ComfyUI-running child, which decided cross-job VRAM
     residency wholesale. Retention actuation superseded it: the scheduler grants residency per dispatch on
     device evidence, hordelib evicts explicitly at the end of every ungranted job, and inference children
-    no longer carry ComfyUI's aggressive-offload flag at all. Setting it draws a one-time pointer at
-    ``legacy_comfy_vram_unload``, the escape hatch that restores the old flag-based regime."""
+    no longer carry ComfyUI's aggressive-offload flag at all. Setting it logs a one-time notice pointing to
+    ``legacy_comfy_vram_unload``, which restores the old flag-based regime."""
 
     legacy_comfy_vram_unload: bool = Field(default=False)
     """Restore the pre-retention memory regime on inference children by launching them with ComfyUI's

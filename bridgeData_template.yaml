@@ -50,8 +50,9 @@ queue_size: 1
 #   <32gb system RAM: 0
 
 
-# Max batch size: number of images in one sampled batch.
-# More optimized than doing them one by one but slower.
+# Max batch size: the most images one job may ask for.
+# A batch is sampled in one pass, which takes less time per image than separate jobs, but each job takes
+# longer and needs more VRAM.
 # Ensure you can generate your max_batch at half your max_power.
 max_batch: 1
 # Suggested values:
@@ -227,7 +228,7 @@ allow_lora: false
 #
 # If you set "models_to_load" to something like "top 5", it is necessary to provide this token,
 # as many of the most popular models require it for the download. Downloading many models in bulk
-# could also lead to issues if no token is required.
+# can also fail without a token.
 #
 # You can get your civitai API Key from https://civitai.com/user/account (look for 'Add API Key')
 #
@@ -261,7 +262,7 @@ limit_max_steps: false
 
 # Frequency (in seconds) to output worker summary stats, such as kudos per hour.
 # Set to zero to disable stats output completely.
-stats_output_frequency: 20
+stats_output_frequency: 30
 
 # Location where models are stored.
 # Left commented by default: the scripted installers keep models in a peered data dir (a sibling of the
@@ -280,11 +281,12 @@ always_download: true # Currently unused in reGen
 # NOTE: reGen defaults this to true (TUI disabled). Set to false to enable the TUI.
 disable_terminal_ui: false
 
-# Obsolete
+# Accepted so older configs still load. reGen does not read it, globally or per card.
+# vram_reserve_mb and vram_admission_noise_mb set how much VRAM is kept free.
 vram_to_leave_free: "80%" # Currently unused in reGen
 
-# Target amount of system RAM to keep free.
-# The worker only makes a best effort. Avoid using too much RAM with other programs.
+# Accepted so older configs still load. reGen does not read it.
+# ram_reserve_mb and ram_pressure_pause_percent set how much system RAM is kept free.
 ram_to_leave_free: "80%" # Currently unused in reGen
 
 # Obsolete
@@ -307,8 +309,9 @@ disable_disk_cache: false # Currently unused in reGen
 # If you use `TOP` or `ALL` load commands, set a `civitai_api_token`; many popular models require it
 # and the Config tab blocks saving meta-load rules without one.
 #
-# SD15 models are generally 1-2GB each, SD21 models are generally 5-37B each, and SDXL models are generally 7B each.
-# Flux.1-Schnell fp8 (Compact) is 17GB, and Cascade is 14gb total.
+# By the file sizes in the model reference, SD15 models are mostly 2-4GB each (un-pruned ones reach 8GB),
+# SD21 models are 3-5GB each, and SDXL models are about 7GB each.
+# Flux.1-Schnell fp8 (Compact) is 17GB, and Stable Cascade is 14GB in total.
 #
 #
 # Important note: models_to_skip are only removed and other models are *not* added back in.
@@ -392,10 +395,10 @@ model_pool:
   # or below your inference-process count unless you know you want the trade.
   seats: 0
 
-  # Models you pin into seats yourself. A pin's `affinity` is a bias, never a lock: higher affinity fills its
-  # seat earlier, extends its rotation deadline, and bolsters it in a re-contest, but a sufficiently stronger
-  # candidate can still take the seat, and a benched pin has to re-earn its place. Affinity is in the half-open
-  # range (0, 1]; 1.0 (the default when omitted) is the strongest bias.
+  # Models you pin into seats yourself. A pin's `affinity` is a bias. Higher affinity fills its seat earlier,
+  # extends its rotation window and strengthens it in a re-contest. A sufficiently stronger candidate can
+  # still take the seat, and a pin that loses its seat has to win one back. Affinity must be greater than 0
+  # and at most 1. 1.0 (the default when omitted) is the strongest bias.
   # pinned:
   #   - name: "Deliberate"
   #     affinity: 1.0
@@ -407,7 +410,7 @@ model_pool:
   ranker_enabled: true
 
   # How long (minutes) a seat serves before it becomes eligible for a timed re-contest against a stronger
-  # candidate. A pin's affinity extends its own window on top of this. Default 60.
+  # candidate. A pin's affinity extends its window on top of this. Default 60.
   # rotation_minutes: 60.0
 
   # The minimum time (minutes) a freshly-seated model is held before any rotation or demotion may unseat it.
@@ -451,13 +454,16 @@ exit_on_unhandled_faults: false
 #########################
 
 # Set to true to serve text-generation jobs. Generation happens in a separate program, the text
-# backend, that you start yourself and the worker reaches over HTTP at kai_url. Supported backends:
+# backend. By default the worker downloads, starts and supervises that backend for you and loads the
+# model named by text_model (see text_backend_managed). Supported backends:
 #   koboldcpp (https://github.com/LostRuins/koboldcpp)
-# Others that serve the KoboldAI API (sonar/aphrodite is next) are planned and attach the same way:
-# launch them instead and point kai_url at them.
-# The worker runs no text inference of its own, so a scribe costs no VRAM here and can be combined with
-# any other role or run on its own. Start the backend before the worker: the worker waits for it to
-# report a loaded model and then advertises what that model can do.
+# Others that serve the KoboldAI API (sonar/aphrodite is next) are planned.
+# To use a backend you run yourself, set text_backend_managed: false, point kai_url at it, and start it
+# before the worker. Either way the worker waits for the backend to report a loaded model and then
+# advertises what that model can do.
+# Text jobs do not run in the worker's inference processes, so a scribe can be combined with any other
+# role or run alone. A backend the worker runs loads its model on one of the worker's cards (see
+# text_gpu_device_index).
 scribe: false
 
 # Worker name for running a Scribe worker.
@@ -465,13 +471,18 @@ scribe: false
 # If you get the error `Wrong credentials to submit as this worker.`, try changing this name, someone else is already using it.
 scribe_name: "An Awesome Scribe"
 
-# Where your text backend listens (it serves the KoboldAI API).
+# Where a text backend you run yourself listens (it serves the KoboldAI API). Only used when
+# text_backend_managed is false. A backend the worker runs is reached on text_backend_port instead.
 kai_url: "http://localhost:5000"
 
-# Max tokens to generate with this worker.
+# The most tokens this worker offers to generate per job. The worker advertises the smaller of this and
+# the backend's limit.
 max_length: 80
 
-# Max tokens to use from the prompt.
+# The largest prompt plus answer, in tokens, this worker offers to hold. The worker advertises the smaller
+# of this and the backend's limit. The horde never sends a request that needs more than this, so the
+# default of 1024 reaches very little work. A backend the worker runs is launched with this much context
+# per text thread, and that context costs VRAM.
 max_context_length: 1024
 
 # Append the Horde alias behind the API key to the model advertised to the Horde.
@@ -514,7 +525,8 @@ text_stall_seconds: 30
 
 # Which text backend program serves text jobs, in the horde's naming. koboldcpp is the default and
 # the first supported backend. The same value decides how it is launched, which driver talks to it and
-# how the advertised model name is prefixed.
+# how the advertised model name is prefixed. If you name a backend the worker cannot launch yet, no
+# backend is started and the worker logs an error listing the ones it can launch.
 text_backend_kind: koboldcpp
 
 # Let the worker run the backend for you. It downloads a pinned release (unless text_backend_executable
@@ -559,7 +571,7 @@ text_gpu_layers: 99
 # independent switches, each adding one kind of work, and any combination of them is valid:
 #   dreamer    -> image generation (on by default; this is the historical worker)
 #   alchemist  -> alchemy forms (graph forms run on the post-processing lane)
-#   scribe     -> text generation, through a text backend you start yourself
+#   scribe     -> text generation, through a text backend the worker runs or one you run yourself
 # With all three false the worker has nothing to serve. A CPU-only install cannot serve image
 # generation regardless of this flag, so only the other roles run there.
 dreamer: true
@@ -601,11 +613,11 @@ alchemy_allow_concurrent: true
 # compute/VRAM to run more alchemy concurrently with image generation.
 alchemy_max_concurrency: 1
 
-# Cold-start floor (MB) for an alchemy form's predicted VRAM cost. Alchemy shares the same
-# committed-reserve accounting as image generation: a form is popped only when EFFECTIVE free
-# VRAM (measured free minus VRAM already committed by in-flight image and alchemy work) covers
-# the form's predicted cost. The prediction starts at this floor and rises toward the observed
-# median cost of recent forms as measurements accumulate.
+# The lowest VRAM cost (MB) the worker assumes for one alchemy form. A form is popped only when the
+# card's free VRAM, less the VRAM in-flight image and alchemy work has already claimed, covers the
+# form's predicted cost. The prediction is the larger of this value and the median measured cost of
+# recent forms, so this value applies alone until forms have been measured. Higher holds alchemy back
+# more often. Lower risks running out of VRAM beside image jobs.
 alchemy_vram_headroom_mb: 2000
 
 # Minimum effective available system RAM (MB) required before popping an alchemy form (graph forms keep
@@ -617,8 +629,9 @@ alchemy_ram_headroom_mb: 2048
 ## reGen Advanced Settings              ##
 ##########################################
 
-# If true, the process will stop and restart when the model loaded changes.
-# Warning: This can cause substantial delays in processing.
+# If true, an inference process that holds one model is ended and replaced by a new process when it has
+# to load a different model. Ending the process returns all of its RAM and VRAM to the system.
+# Warning: every model switch then waits for a process to start, which causes substantial delays.
 cycle_process_on_model_change: false
 
 #############################
@@ -630,10 +643,10 @@ cycle_process_on_model_change: false
 process_timeout: 300
 
 # Maximum time (seconds) for post-processing (e.g. upscaling, face-fixing) before the job is killed.
-post_process_timeout: 60
+post_process_timeout: 120
 
 # Maximum time (seconds) to allow a model to load from disk into VRAM before the process is killed.
-preload_timeout: 80
+preload_timeout: 150
 
 # Maximum time (seconds) a single sampling step may make no progress before the process is killed as hung.
 inference_step_timeout: 20
@@ -659,9 +672,11 @@ contended_step_timeout: 120
 # earlier step a few times before advancing.
 inference_stuck_step_repeat_limit: 20
 
-# How long (seconds) a popped job may wait for its LoRAs and textual inversions to download before it is
-# faulted. A transfer still moving at the deadline is given up to two more budgets. Nothing is killed on it.
-download_timeout: 121
+# How long (seconds) a popped job waits for its LoRAs and textual inversions to download. A transfer still
+# moving at the deadline gets up to two more waits of this length. After that the job runs without the
+# files that did not arrive. The job is not faulted, no process is killed, and the download continues for
+# later jobs. The wait also ends once 35% of the time the horde gave the job has passed.
+download_timeout: 211
 
 # How many times a single job may be dispatched to inference before it is reported faulted.
 # 1 = no retry (one shot, then fault). 2 (default) = one bounded retry.
@@ -729,10 +744,10 @@ vram_reserve_mb: 2048
 # the soft pop-hold band or estimates a context's size. Only used when enable_vram_budget is true.
 ram_reserve_mb: 4096
 
-# Absolute system-RAM danger floor (degrade, never crash). Distinct from ram_reserve_mb (a marginal,
-# per-job admission reserve): when whole-host RAM usage reaches this percentage, the worker stops admitting
-# new model loads, sheds idle resident inference processes, and pauses job pops until RAM recovers, instead
-# of loading a model's weights through an out-of-RAM host and being killed by the kernel OOM-killer. The
+# System RAM usage (percent of the whole host) at which the worker sheds load. At or above it the worker
+# stops admitting new model loads, stops idle inference processes that hold models, and pauses job pops
+# until RAM recovers. Without this, loading a model on a host that is out of RAM gets the worker killed by
+# the kernel OOM-killer. Separate from ram_reserve_mb, which is a reserve applied as each job is admitted. The
 # effective floor is the more conservative of this percentage and ram_pressure_min_free_mb, so a large-RAM
 # host is protected by the percentage and a small-RAM host by the absolute floor. A resident inference
 # process can allocate several GB in a single step (a batch decode, or a fresh checkpoint routed through RAM),
@@ -762,8 +777,8 @@ ram_per_process_max_mb: 18432
 # child keeps only one component resident at a time (legacy behaviour); set a positive value to keep as many
 # loaded checkpoints/components warm in RAM as fit within it, so a swapped-away model reloads from RAM instead
 # of disk. This lets a small-VRAM card serve diverse traffic without a full disk reload on every model switch.
-# The value validated in testing on a 16GB card is 12288; size it against the RAM left beside
-# ram_per_process_max_mb and any co-tenants rather than copying that number blindly. 0 is equivalent to unset.
+# 12288 was validated in testing on a 16GB card. Size yours against the RAM left beside
+# ram_per_process_max_mb and the other programs on the host. 0 is equivalent to unset.
 # component_cache_budget_mb: 12288
 
 # Disable post-processing on this worker after repeated post-processing VRAM-over-commit faults. A peak that
@@ -771,8 +786,8 @@ ram_per_process_max_mb: 18432
 # forced maintenance. When true (default), post-processing over-commit faults (the planner's unhostable-peak
 # faults and watchdog-reaped post-processing stalls) are counted in a rolling window; once they exceed
 # post_processing_fault_threshold within post_processing_fault_window_seconds the worker stops advertising
-# post-processing and logs an advisory to downgrade settings. Session-latched: it clears only on restart
-# (the over-commit is structural).
+# post-processing and logs an advisory to downgrade settings. It advertises post-processing again once the
+# window passes with no further over-commit fault and a card can host the post-processing peak.
 post_processing_fault_breaker_enabled: true
 
 # The breaker trips when *more than* this many post-processing over-commit faults occur within
@@ -811,21 +826,22 @@ whole_card_residency_safety_off_gpu: true
 # run with the card to itself can lower it (or set 0). Does not move the device-free governor's floors.
 # vram_admission_noise_mb: 512
 
-# Seconds the head of queue must have starved at a card with nothing left to reclaim before the worker
-# admits one real load to see whether it fits. The reclaim rungs and the idle-context teardown run
-# first; 0 probes as soon as the ladder is empty. A shortfall larger than the measured-attempt band keeps
-# the longer diagnostic horizon regardless, since a big miss on a card the worker reads as empty is
-# likelier a tenant the ledger cannot see than arithmetic.
+# Seconds the job at the head of the queue must have waited, at a card with nothing left to reclaim,
+# before the worker admits one real load to see whether it fits. The reclaim steps and the idle-context
+# teardown run first. 0 probes as soon as nothing is left to reclaim. A job that misses the free-VRAM
+# reading by more than 1024 MB waits at least 60 seconds whatever is set here, unless the worker has
+# already measured that job's peak. A miss that large on a card the worker counts as empty usually means
+# something the worker does not track is holding VRAM, so a real load is unlikely to fit.
 measured_load_probe_seconds: 10
 
-# Whether a head that has starved past the teardown grace, with every cheaper reclaim exhausted, may stop
-# an idle service lane (the post-processing lane, safety off-GPU, the image-utilities lane) to make its
-# room, cheapest first and one at a time; the lanes come back through the reclaim ladder once the card is
-# healthy. false keeps every lane on the card and leaves such a head to the measured-load probe.
+# Whether a head-of-queue job that has waited past the teardown grace, with every cheaper reclaim
+# exhausted, may stop an idle service lane (the post-processing lane, safety off-GPU, the image-utilities
+# lane) to make room, cheapest first and one at a time. The lanes are restarted once the card has room
+# again. false keeps every lane on the card and leaves such a job to the measured-load probe.
 starved_head_lane_reclaim: true
 
-# Whether the image-utilities lane is among the lanes a starved head may stop. It is the last rung and
-# costs the service a restart; false keeps it on the card while the other lanes stay eligible.
+# Whether the image-utilities lane is among the lanes such a job may stop. It is the last lane stopped,
+# and it has to be restarted afterwards. false keeps it on the card while the other lanes stay eligible.
 starved_head_utilities_pause: true
 
 # Models the worker must treat as needing the card to itself regardless of what its footprint store has
@@ -847,8 +863,7 @@ whole_card_residency_cooldown_seconds: 45
 # residency is held the worker advertises only the resident model, so the horde stops sending work that
 # would push those weights back to system RAM or off the card; this ceiling is what guarantees a
 # multi-model worker returns to its full pool. Past it the residency stops being retained and lets go once
-# its own accepted work has drained. A residency whose model runs out of demand releases sooner than this
-# on its own. 0 disables both the ceiling and the single-model offer. Only used with enable_vram_budget.
+# its accepted work has drained. A residency whose model runs out of demand releases sooner than this. 0 disables both the ceiling and the single-model offer. Only used with enable_vram_budget.
 whole_card_residency_max_hold_seconds: 180
 
 # Minimum seconds between accepting jobs for *different* very-large models (Flux/Cascade/Qwen/Z-Image and
@@ -987,9 +1002,10 @@ capture_kudos_training_data: false
 # wholesale. Overridable per card: max_threads, queue_size, high_performance_mode, moderate_performance_mode,
 # extra_slow_worker, preload_timeout, models_to_load, models_to_skip, dynamic_models, allow_lora,
 # allow_controlnet, allow_sdxl_controlnet, allow_post_processing, allow_painting, allow_img2img, nsfw,
-# max_power, max_batch, safety_on_gpu, enable_vram_budget, vram_reserve_mb, vram_to_leave_free,
+# max_power, max_batch, safety_on_gpu, enable_vram_budget, vram_reserve_mb,
 # whole_card_exclusive_residency, vram_admission_noise_mb, measured_load_probe_seconds,
 # starved_head_lane_reclaim, starved_head_utilities_pause, whole_card_models.
+# vram_to_leave_free is also accepted per card and has no effect.
 # max_batch caps the images one request may ask this card for; safety_on_gpu is this card's permission to
 # host the safety process (the worker picks one permitted card, or runs safety off-GPU if none permits it).
 # gpu_overrides:

@@ -310,7 +310,8 @@ def test_scribe_numeric_fields_round_trip_through_coercion(tmp_path: Path) -> No
         set_field_value(by_key[key], data, coerce_value(by_key[key], entered))
         assert current_value(by_key[key], data) == expected
 
-    # Blank is a meaningful value for the two optional numbers: "derived" and "the lowest driven card".
+    # Blank is a meaningful value for the two optional numbers. It means "derived" for the timeout and "the
+    # driven card with the most free VRAM" for the device index.
     assert coerce_value(by_key["text_generation_timeout_seconds"], "") is None
     assert coerce_value(by_key["text_gpu_device_index"], "") is None
 

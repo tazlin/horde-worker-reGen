@@ -74,7 +74,7 @@ def _change(
 BUILT_IN_PRESETS: tuple[ConfigPreset, ...] = (
     ConfigPreset(
         preset_id="rtx4090_64gb_sdxl_balanced",
-        label="RTX 4090 / 64 GB RAM - SDXL balanced",
+        label="RTX 4090 / 64 GB RAM: SDXL balanced",
         description="Roomy single-card preset for SD 1.5 + SDXL with common features enabled.",
         changes=(
             _change("max_threads", 1, "Keep one active sampler for stable throughput.", PresetCategory.THROUGHPUT),
@@ -134,7 +134,7 @@ BUILT_IN_PRESETS: tuple[ConfigPreset, ...] = (
     ),
     ConfigPreset(
         preset_id="rtx4090_64gb_large_models",
-        label="RTX 4090 / 64 GB RAM - large models",
+        label="RTX 4090 / 64 GB RAM: large models",
         description="Conservative whole-card setup for Flux/Qwen/Z-Image style models.",
         warnings=("Large models are disruptive: this preset disables most optional feature load.",),
         changes=(
@@ -190,7 +190,7 @@ BUILT_IN_PRESETS: tuple[ConfigPreset, ...] = (
     ),
     ConfigPreset(
         preset_id="rtx2080_32gb_sd15_safe",
-        label="RTX 2080 / 32 GB RAM - SD 1.5 safe",
+        label="RTX 2080 / 32 GB RAM: SD 1.5 safe",
         description="Low-pressure SD 1.5-only setup for 8-10 GB VRAM cards.",
         changes=(
             _change("max_threads", 1, "Keep one active sampler.", PresetCategory.THROUGHPUT),
@@ -229,7 +229,7 @@ BUILT_IN_PRESETS: tuple[ConfigPreset, ...] = (
     ),
     ConfigPreset(
         preset_id="midrange_12_16gb_32gb_balanced",
-        label="12-16 GB VRAM / 32 GB RAM - balanced",
+        label="12-16 GB VRAM / 32 GB RAM: balanced",
         description="Moderate SD 1.5 + SDXL starting point for modern midrange cards.",
         changes=(
             _change("max_threads", 1, "Keep one active sampler.", PresetCategory.THROUGHPUT),

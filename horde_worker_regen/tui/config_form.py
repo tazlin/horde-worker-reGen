@@ -251,7 +251,8 @@ SECTION_GUIDANCE: dict[str, str] = {
     "See the suggested values per GPU tier in the README. These fields together decide how many inference "
     "processes the worker spawns (roughly queue_size + max_threads per card). The live estimate below "
     "updates as you edit. queue_size is capped to 3 once max_threads >= 2, and "
-    "extra_slow_worker (on the Performance tab) forces max_threads to 1 and queue_size to 0.",
+    "extra_slow_worker (in the Memory & performance section of this tab) forces max_threads to 1 and "
+    "queue_size to 0.",
     "Memory & performance": "high_performance_mode overrides moderate_performance_mode when both are on, and "
     "each shortens the job timeout (high = 1/3, moderate = 1/2 of the default). extra_slow_worker overrides "
     "both, disables them, and clamps concurrency (max_threads 1, queue_size 0, preload_timeout >= 150).",
@@ -393,7 +394,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max batch size",
         FieldKind.INT,
         "Throughput",
-        "Images per batched request. Ensure you can make max_batch at half your max_power.",
+        "The most images one job may ask for. A batch is sampled in one pass, so a larger one takes longer "
+        "and needs more VRAM. Ensure you can generate max_batch images at half your max_power.",
         minimum=1,
         maximum=20,
     ),
@@ -451,8 +453,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Cycle process on model change",
         FieldKind.BOOL,
         "Memory & performance",
-        "Restart the inference process when the loaded model changes. Reduces inter-run drift "
-        "at the cost of a full process-restart delay on every model switch.",
+        "End an inference process that holds one model and start a new process in its place when it has to "
+        "load a different model. Ending the process returns all of its RAM and VRAM to the system. Every "
+        "model switch then waits for a process to start.",
     ),
     ConfigField(
         "extra_slow_worker",
@@ -717,7 +720,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.FLOAT,
         "Model pool",
         "Minutes a seat serves before it becomes eligible for a timed re-contest against a stronger candidate. A "
-        "pin's affinity extends its own window on top of this. Lower rotates the seat set faster (more variety, "
+        "pin's affinity extends its window on top of this. Lower rotates the seat set faster (more variety, "
         "more swaps); higher holds a committed set longer.",
         minimum=0.0,
         exclusive_minimum=True,
@@ -803,11 +806,11 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Pinned models (structured YAML)",
         FieldKind.YAML,
         "Model pool",
-        "Models you pin into seats yourself, as a YAML list of {name, affinity} entries. Affinity is a bias, not a "
-        "lock (higher fills its seat earlier and bolsters it in a re-contest, but a stronger candidate can still "
-        "take the seat). Enter one list item per model, for example `- name: Deliberate` followed by an optional "
-        "`  affinity: 0.8`. Affinity must be greater than 0 and at most 1. Duplicate and contradictory pins are "
-        "blocked before save.",
+        "Models you pin into seats yourself, as a YAML list of {name, affinity} entries. Affinity is a bias. A "
+        "higher value fills its seat earlier, extends its rotation window and strengthens it in a re-contest. A "
+        "sufficiently stronger candidate can still take the seat. Enter one list item per model, for example "
+        "`- name: Deliberate` followed by an optional `  affinity: 0.8`. Affinity must be greater than 0 and at "
+        "most 1. Duplicate and contradictory pins are blocked before save.",
         yaml_parent="model_pool",
         explicit_default=[],
     ),
@@ -898,8 +901,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Enable dreamer (image generation)",
         FieldKind.BOOL,
         "Roles",
-        "Serve image-generation jobs. Turn this off (with alchemist on) to run an alchemist-only worker; "
-        "a CPU-only install is always alchemist-only regardless.",
+        "Serve image-generation jobs. Turn this off to keep another role without image generation. A "
+        "CPU-only install never serves image generation, whatever this is set to. The alchemist and scribe "
+        "roles still run there.",
         requires_restart=True,
         explicit_default=True,
     ),
@@ -955,7 +959,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Alchemy VRAM floor",
         FieldKind.INT,
         "Alchemist",
-        "Minimum free VRAM (MB) before popping a concurrent graph alchemy form.",
+        "The lowest VRAM cost (MB) the worker assumes for one alchemy form. A form is popped only when the "
+        "card's free VRAM, less what in-flight work has already claimed, covers the larger of this and the "
+        "median measured cost of recent forms. Higher holds alchemy back more often. Lower risks running out "
+        "of VRAM beside image jobs.",
         minimum=0,
         maximum=49152,
         unit="MB",
@@ -987,7 +994,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Scribe name",
         FieldKind.STR,
         "Scribe",
-        "Unique horde-wide name for the scribe worker. Each role registers as its own worker, so this "
+        "Unique horde-wide name for the scribe worker. Each role registers as a separate worker, so this "
         "must differ from the dreamer and alchemist names.",
     ),
     ConfigField(
@@ -1008,8 +1015,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.SELECT,
         "Scribe",
         "Which backend program serves text jobs. It also decides how the advertised model name is "
-        "prefixed. koboldcpp is the one the worker can launch today. Selecting a backend it cannot launch yet "
-        "stops the worker at start-up with an error that lists the supported ones.",
+        "prefixed. koboldcpp is the one the worker can launch today. If you select a backend it cannot launch "
+        "yet, no backend is started and the worker logs an error listing the ones it can launch.",
         requires_restart=True,
         choices=TEXT_BACKEND_CHOICES,
         explicit_default=TEXT_BACKENDS.koboldcpp.value,
@@ -1029,8 +1036,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max tokens per generation",
         FieldKind.INT,
         "Scribe",
-        "The largest answer this worker offers to produce, narrowed to what the backend says it will "
-        "accept. Also what the derived generation deadline is computed from.",
+        "The most tokens this worker offers to generate per job. The worker advertises the smaller of this "
+        "and the backend's limit. The derived generation timeout is computed from this value.",
         requires_restart=True,
         minimum=1,
         maximum=16384,
@@ -1041,10 +1048,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max context length",
         FieldKind.INT,
         "Scribe",
-        "The largest prompt plus answer this worker offers to hold, narrowed to what the backend says it will "
-        "accept. The horde accepts a request that asks for more than this and never sends it here, so the "
-        "default of 1024 reaches very little work. The backend is launched with this much context per thread, "
-        "and that context costs VRAM.",
+        "The largest prompt plus answer, in tokens, this worker offers to hold. The worker advertises the "
+        "smaller of this and the backend's limit. The horde never sends a request that needs more than this, "
+        "so the default of 1024 reaches very little work. A backend the worker runs is launched with this much "
+        "context per text thread, and that context costs VRAM.",
         requires_restart=True,
         minimum=1,
         maximum=16384,
@@ -1139,10 +1146,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Backend GPU device index",
         FieldKind.INT,
         "Scribe",
-        "The stable device index of the card the managed backend uses. Blank means the lowest driven "
-        "card, shared with image generation. Naming a card on a multi-GPU host dedicates it to text by "
-        "removing it from the image device map. On a single-card host the card stays shared whatever is "
-        "set here. Applies when the worker runs the backend.",
+        "The stable device index of the card the managed backend uses. Blank picks the driven card with the "
+        "most free VRAM at launch and shares it with image generation. Naming a card on a multi-GPU host "
+        "dedicates it to text, and image generation stops using that card. On a single-card host the card "
+        "stays shared whatever is set here. Applies when the worker runs the backend.",
         requires_restart=True,
         minimum=0,
         optional=True,
@@ -1301,7 +1308,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Aux download timeout",
         FieldKind.INT,
         "Timeouts",
-        "Max seconds to allow an auxiliary model (LoRA, etc.) to download.",
+        "Seconds a popped job waits for its LoRAs and textual inversions to download. A transfer still moving "
+        "at the deadline gets up to two more waits of this length. After that the job runs without the files "
+        "that did not arrive. The job is not faulted and no process is killed.",
         minimum=15,
         maximum=3600,
         unit="s",
@@ -1442,9 +1451,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Post-processing fault breaker",
         FieldKind.BOOL,
         "Post-processing budget",
-        "After repeated post-processing over-commit faults, stop popping post-processing jobs (session-"
-        "latched) so the worker does not trip the horde's forced maintenance. Only used when the VRAM "
-        "budget is enabled.",
+        "After repeated post-processing over-commit faults, stop popping post-processing jobs so the worker "
+        "does not trip the horde's forced maintenance. Post-processing is offered again once the fault window "
+        "passes with no further fault and a card can host its VRAM peak. Only used when the VRAM budget is "
+        "enabled.",
         explicit_default=True,
         risk_level="dangerous",
     ),
@@ -2027,7 +2037,8 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "VRAM to leave free",
         FieldKind.STR,
         "VRAM budget",
-        "Headroom to leave free on this card, as a percentage ('20%') or a flat MB count ('2048').",
+        "Accepted so older configs still load. reGen does not read it, so it has no effect on this card. VRAM "
+        "reserve and VRAM admission margin set how much VRAM is kept free.",
     ),
     ConfigField(
         "whole_card_exclusive_residency",
@@ -2060,7 +2071,8 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         FieldKind.INT,
         "VRAM budget",
         "Seconds the next job may starve with nothing left to reclaim before one real load is admitted to see "
-        "whether it fits. 0 probes at once.",
+        "whether it fits. 0 probes at once. A job that misses the free-VRAM reading by more than 1024 MB waits "
+        "at least 60 seconds, unless the worker has already measured that job's peak.",
         minimum=0,
         maximum=600,
         unit="s",
@@ -2078,8 +2090,8 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "Starved job may stop the utilities lane",
         FieldKind.BOOL,
         "VRAM budget",
-        "Include the image-utilities lane among the lanes a starved job may stop. It is the last rung and "
-        "costs that service a restart.",
+        "Include the image-utilities lane among the lanes a starved job may stop. It is the last lane stopped, "
+        "and it has to be restarted afterwards.",
     ),
 ]
 

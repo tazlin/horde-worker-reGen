@@ -87,7 +87,7 @@ Overridable per card: `max_threads`, `queue_size`, `high_performance_mode`, `mod
 `extra_slow_worker`, `preload_timeout`, `models_to_load`, `models_to_skip`, `dynamic_models`, `allow_lora`,
 `allow_controlnet`, `allow_sdxl_controlnet`, `allow_post_processing`, `allow_painting`, `allow_img2img`,
 `nsfw`, `max_power`, `max_batch`, `safety_on_gpu`, `enable_vram_budget`, `vram_reserve_mb`,
-`vram_to_leave_free`, `whole_card_exclusive_residency`. Global-only fields (API key, downloader settings,
+`whole_card_exclusive_residency`. `vram_to_leave_free` is also accepted per card and has no effect. Global-only fields (API key, downloader settings,
 alchemy, …) cannot be overridden per card and are rejected if you try.
 
 `max_batch` is a per-card ceiling on the images one request may ask for: the pop asks for the offered card's

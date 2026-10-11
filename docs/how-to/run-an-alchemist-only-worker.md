@@ -9,8 +9,8 @@ for other work, or because you have no usable GPU at all.
 There are two ways to end up alchemist-only:
 
 - **Deliberately, on a GPU box:** set `dreamer: false` and `alchemist: true` in `bridgeData.yaml`.
-- **Automatically, on a CPU install:** a CPU-only torch build cannot run image generation, so it is
-  always alchemist-only regardless of the `dreamer` flag. See
+- **Automatically, on a CPU install:** a CPU-only torch build cannot run image generation, so it never
+  serves it, whatever the `dreamer` flag is set to. The alchemist and scribe roles still run there. See
   [Compute backends](../explanation/compute_backends.md#cpu--alchemist-only-mode-running-without-a-usable-gpu).
 
 ## Deliberate opt-in on a GPU

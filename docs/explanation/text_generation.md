@@ -109,8 +109,8 @@ By default the worker runs the backend for you (`text_backend_managed: true`). I
 compiled library, which the worker runs under its own interpreter), obtains the model file `text_model`
 names, starts it on `text_backend_port`, waits for it to report a loaded model, and from then on relaunches it if it exits and
 stops it when the worker stops. The backend's own output goes to `logs/text_backend.log`. Which program is
-launched, and with what command line, follows `text_backend_kind`; a kind the worker cannot launch yet is
-refused by name at start-up with the supported list.
+launched, and with what command line, follows `text_backend_kind`. For a kind the worker cannot launch yet,
+no backend is started and the worker logs an error listing the kinds it can launch. The worker keeps running.
 
 The backend runs on the card `text_gpu_device_index` names. When it is unset, the worker picks the driven
 card with the most free VRAM at launch (the same per-card reading the safety process is placed by, or the
