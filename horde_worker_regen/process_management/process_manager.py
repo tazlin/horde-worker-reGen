@@ -4556,8 +4556,12 @@ class HordeWorkerProcessManager:
 
             free_process_or_model_loaded = self.is_free_inference_process_available() or self.is_any_model_preloaded()
 
+            # Only maintenance the horde imposed reloads the pool. Under owner-set maintenance the owner's
+            # requests keep arriving and the latch re-engages each time the queue drains, so a reload there
+            # would discard loaded models between jobs.
             if (
                 self._state.last_pop_maintenance_mode
+                and self._state.server_maintenance_forced_by_server
                 and self.num_jobs_total == 0
                 and not self._job_popper._replaced_due_to_maintenance
             ):

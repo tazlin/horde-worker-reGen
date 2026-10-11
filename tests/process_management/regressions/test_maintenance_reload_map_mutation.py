@@ -1,8 +1,8 @@
 """Reproduces a control-loop crash when the maintenance-mode pool reload mutates the process map mid-iteration.
 
-On a maintenance-mode pop with no jobs in flight, the control loop replaces every inference slot to give the
-pool a clean start. The replacement retires the slot from the active process map (a fresh launch spawns
-separately), so iterating the live ``self._process_map.values()`` view while replacing raised
+On a pop refused for maintenance the horde imposed, with no jobs in flight, the control loop replaces every
+inference slot to give the pool a clean start. The replacement retires the slot from the active process map (a
+fresh launch spawns separately), so iterating the live ``self._process_map.values()`` view while replacing raised
 ``RuntimeError: dictionary changed size during iteration``. That exception escaped the control-loop tick and
 took the whole worker down. The reload must iterate a snapshot so every inference slot is replaced regardless
 of the map mutation each replacement causes, signal the complete batch before reaping it against one shared
@@ -74,6 +74,7 @@ async def test_maintenance_reload_replaces_every_inference_slot_without_map_muta
     pm._process_lifecycle._replace_inference_process = _fake_replace  # type: ignore[method-assign]
 
     pm._state.last_pop_maintenance_mode = True
+    pm._state.server_maintenance_forced_by_server = True
     assert pm.num_jobs_total == 0
     assert pm._job_popper._replaced_due_to_maintenance is False
 
@@ -110,7 +111,39 @@ async def test_maintenance_reload_does_not_fire_while_jobs_are_in_flight() -> No
 
     await track_popped_job_async(pm._job_tracker, make_mock_job())
     pm._state.last_pop_maintenance_mode = True
+    pm._state.server_maintenance_forced_by_server = True
     assert pm.num_jobs_total > 0
+
+    await pm._control_loop_tick()
+
+    assert replaced == []
+    assert pm._job_popper._replaced_due_to_maintenance is False
+
+
+async def test_owner_set_maintenance_leaves_the_pool_loaded() -> None:
+    """Maintenance the horde did not impose never reloads the pool, however often the queue drains.
+
+    Under owner-set maintenance the owner's requests keep arriving, and the maintenance latch re-engages on
+    the first refused pop after each one. A reload on that latch would discard the loaded models between
+    consecutive owner jobs.
+    """
+    pm = make_testable_process_manager()
+    pm._sleep = _noop_sleep  # type: ignore[method-assign]
+    pm._last_status_message_time = time.time()
+    pm._download_coordinator.maybe_start_inference_processes = Mock()  # type: ignore[method-assign]
+    pm._download_coordinator.maybe_start_safety_processes = Mock()  # type: ignore[method-assign]
+
+    inf0 = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB, process_type=HordeProcessType.INFERENCE)
+    pm._process_map.update({0: inf0})
+
+    replaced: list[int] = []
+    pm._process_lifecycle._replace_inference_process = (  # type: ignore[method-assign]
+        lambda process_info, **_kwargs: replaced.append(process_info.process_id)
+    )
+
+    pm._state.last_pop_maintenance_mode = True
+    pm._state.server_maintenance_forced_by_server = False
+    assert pm.num_jobs_total == 0
 
     await pm._control_loop_tick()
 

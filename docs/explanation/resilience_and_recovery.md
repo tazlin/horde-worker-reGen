@@ -728,9 +728,11 @@ The escalation, in order:
    escalation policy still **counts** each soft reset (`limp_by_level`) so a
    persistent wedge still escalates to give-up. The parent process and the TUI stay
    attached. A transient wedge (a bad model load, a one-off deadlock) recovers here.
-   The same bounded-reap shape is used when horde maintenance triggers an operational
-   inference-pool reload: every slot is signalled first, then all are joined against
-   one shared deadline instead of paying a full shutdown grace serially per slot.
+   The same bounded-reap shape is used when horde-forced maintenance triggers an
+   operational inference-pool reload. Every slot is signalled first, then all are joined
+   against one shared deadline instead of paying a full shutdown grace serially per slot.
+   Maintenance the owner set does not reload the pool. The owner's requests keep
+   arriving there, so the loaded models are kept.
    The status queue is drained while the reap waits, and stragglers are killed
    under its writer lock, so the rebuild cannot strand the channel by killing a
    child partway through a frame (see [IPC and messaging](ipc_and_messaging.md)).
