@@ -2069,6 +2069,26 @@ class ProcessLifecycleManager:
         """
         return self._state.recovery_parked and not self._state.shutting_down
 
+    def _loaded_process_awaits_an_end_request(self, process_type: HordeProcessType) -> bool:
+        """Whether a lane in its ending phase holds a loaded process that was never told to end.
+
+        The ending phase sends its end request only to a loaded process, so one that was still starting is
+        sent nothing. The next tick removes a process that never loaded, but a process that reports ready
+        between the two ticks is loaded by then and that branch passes it over. Without an end request it
+        stays on the card, and a whole-card pause that ordered the replacement waits on it without end.
+        """
+        return any(
+            process_info.process_type == process_type
+            and not process_info.end_intended
+            and process_info.last_process_state
+            not in (
+                HordeProcessState.PROCESS_STARTING,
+                HordeProcessState.PROCESS_ENDING,
+                HordeProcessState.PROCESS_ENDED,
+            )
+            for process_info in self._process_map.values()
+        )
+
     def _replace_all_post_process_process(self) -> None:
         """Replace the dedicated post-processing process across control-loop ticks.
 
@@ -2091,6 +2111,10 @@ class ProcessLifecycleManager:
             )
             if self._process_map.num_loaded_post_process_processes() > 0:
                 self.end_post_process_processes()
+            return
+
+        if self._loaded_process_awaits_an_end_request(HordeProcessType.POST_PROCESS):
+            self.end_post_process_processes()
             return
 
         if (
@@ -2339,6 +2363,10 @@ class ProcessLifecycleManager:
                 self.end_utilities_processes()
             return
 
+        if self._loaded_process_awaits_an_end_request(HordeProcessType.UTILITIES):
+            self.end_utilities_processes()
+            return
+
         if self._process_map.num_loaded_utilities_processes() == 0 and self._process_map.num_utilities_processes() > 0:
             self._end_replaced_children(HordeProcessType.UTILITIES)
             self._process_map.delete_utilities_processes()
@@ -2505,6 +2533,10 @@ class ProcessLifecycleManager:
             self._component_processes_ending = True
             if self._process_map.num_loaded_component_processes() > 0:
                 self.end_component_processes()
+            return
+
+        if self._loaded_process_awaits_an_end_request(HordeProcessType.COMPONENT):
+            self.end_component_processes()
             return
 
         if self._process_map.num_loaded_component_processes() == 0 and self._process_map.num_component_processes() > 0:
@@ -2724,6 +2756,10 @@ class ProcessLifecycleManager:
             self._vae_lane_processes_ending = True
             if self._process_map.num_loaded_vae_lane_processes() > 0:
                 self.end_vae_lane_processes()
+            return
+
+        if self._loaded_process_awaits_an_end_request(HordeProcessType.VAE_LANE):
+            self.end_vae_lane_processes()
             return
 
         if self._process_map.num_loaded_vae_lane_processes() == 0 and self._process_map.num_vae_lane_processes() > 0:
@@ -4288,6 +4324,10 @@ class ProcessLifecycleManager:
             self._safety_processes_ending = True
             if self._process_map.num_loaded_safety_processes() > 0:
                 self.end_safety_processes()
+            return
+
+        if self._loaded_process_awaits_an_end_request(HordeProcessType.SAFETY):
+            self.end_safety_processes()
             return
 
         if self._process_map.num_loaded_safety_processes() == 0 and self._process_map.num_safety_processes() > 0:

@@ -608,6 +608,51 @@ class TestRecoveryParkLifecycleQuiescence:
             assert getattr(lifecycle, f"_{state_prefix}_should_be_replaced") is False
             assert getattr(lifecycle, f"_{state_prefix}_ending") is False
 
+    @pytest.mark.parametrize(
+        ("replacement_method", "state_prefix", "process_type"),
+        [
+            ("_replace_all_safety_process", "safety_processes", HordeProcessType.SAFETY),
+            ("_replace_all_post_process_process", "post_process_processes", HordeProcessType.POST_PROCESS),
+            ("_replace_all_component_process", "component_processes", HordeProcessType.COMPONENT),
+            ("_replace_all_vae_lane_process", "vae_lane_processes", HordeProcessType.VAE_LANE),
+            ("_replace_all_utilities_process", "utilities_processes", HordeProcessType.UTILITIES),
+        ],
+        ids=["safety", "post-process", "component", "vae", "utilities"],
+    )
+    def test_a_lane_that_finishes_starting_during_its_replacement_is_ended(
+        self,
+        replacement_method: str,
+        state_prefix: str,
+        process_type: HordeProcessType,
+    ) -> None:
+        """A lane that was starting when its replacement began, and has loaded since, is told to end.
+
+        The ending phase sends an end request only to a loaded process, so a starting one is sent nothing. If
+        it reports ready before the next tick it is loaded, and the branch that removes a process that never
+        loaded passes it over. With no end request it would hold the card for good, and whatever ordered the
+        replacement (a whole-card pause among them) would wait on it without end.
+        """
+        lifecycle = _make_plm()
+        lane = make_mock_process_info(
+            1,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=process_type,
+        )
+        lifecycle._process_map[1] = lane
+        start = Mock()
+        setattr(lifecycle, f"start_{state_prefix}", start)
+        # The state the first tick leaves behind for a lane that was still starting: ending, nothing sent.
+        setattr(lifecycle, f"_{state_prefix}_should_be_replaced", True)
+        setattr(lifecycle, f"_{state_prefix}_ending", True)
+        assert lane.end_intended is False
+
+        getattr(lifecycle, replacement_method)()
+
+        assert lane.end_intended is True
+        assert lane.last_process_state is HordeProcessState.PROCESS_ENDING
+        start.assert_not_called()
+
     @pytest.mark.parametrize("parked", [True, False], ids=["parked-before-signal", "ordinary-shutdown"])
     def test_hard_shutdown_timeout_reaches_abort_callback(self, parked: bool) -> None:
         """The five-minute drain timeout remains terminal even if shutdown began from a recovery park."""
