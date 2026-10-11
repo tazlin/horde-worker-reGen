@@ -27,7 +27,7 @@ priority_usernames: []
 # context resident, which is multiple GB of VRAM even while idle (the CUDA/runtime baseline), plus the weights
 # of whatever model it loads (also multiple GB), and a matching chunk of system RAM. It is not a lightweight
 # worker. The worker will not spawn more inference contexts than a card's VRAM physically fits (idle contexts
-# plus the heaviest model you offer, net of a small safety buffer); if you configure more than that it silently
+# plus the heaviest model you offer, net of a small safety buffer). If you configure more than that it
 # spawns fewer and logs why, and the runtime governor further reduces live concurrency under memory pressure.
 max_threads: 1
 # Suggested values:
@@ -188,7 +188,7 @@ allow_img2img: true
 allow_painting: true
 
 # Allow user requests from behind VPNs.
-# Note: The worker does not directly interact with user IPs - it only interacts with the StableHorde API.
+# Note: The worker does not interact with user IPs directly. It only interacts with the StableHorde API.
 allow_unsafe_ip: true
 
 # Offer post-processing jobs (upscalers, face-fixers, background removal).
@@ -202,10 +202,10 @@ allow_post_processing: true
 allow_controlnet: false
 
 # Offer the extended ControlNet control types (everything beyond the classic set).
-# The worker only advertises these once their annotators are actually available (the image-utilities
-# lane serves them, or their weight files are on disk), so this is an opt-out, not an opt-in: leave it
-# true to serve them as soon as they are ready, or set it false to stay on the classic set and save the
-# annotator disk space. Has no effect unless `allow_controlnet: true`.
+# The worker only advertises these once their annotators are available (the image-utilities
+# lane serves them, or their weight files are on disk). Leave it true to serve them as soon as they
+# are ready, or set it false to stay on the classic set and save the annotator disk space.
+# Has no effect unless `allow_controlnet: true`.
 extended_controlnet: true
 
 # Offer SDXL jobs with high memory add-ons like ControlNet or transparency.
@@ -337,8 +337,8 @@ models_to_load:
 
 # If you use a meta command, such as ALL or TOP n, you can allow very large models, such as cascade or flux to be included.
 # By default, these models are excluded due to their large size.
-# Set to true if have a 24GB card and want to include these models.
-# Otherwise, I suggest including the models you know you can handle manually.
+# Set to true if you have a 24GB card and want to include these models.
+# Otherwise, list the large models you know your card can handle by name in models_to_load.
 load_large_models: false
 
 # Only offer models that are already downloaded. When true, any model your load rules resolve to
@@ -357,7 +357,7 @@ models_to_skip:
   # - "Stable Cascade 1.0" # This a *very* VRAM intensive model
   # - ALL NSFW MODELS
   #- "stable_diffusion_inpainting"  # Inpainting is generally quite heavy along with other models for smaller GPUs.
-  #- "ALL SD21"  # Stable diffusion 2.1 has bigger memory requirements than 1.5, so if your card cannot lift, it, disable it
+  #- "ALL SD21"  # Stable diffusion 2.1 has bigger memory requirements than 1.5, so if your card cannot handle it, skip it
   # - HASDX # Un-pruned SD1.5 model (5gb+)
   # - Anygen # Un-pruned SD1.5 model (5gb+)
   # - PFG # Un-pruned SD1.5 model (5gb+)
@@ -410,14 +410,13 @@ model_pool:
   # candidate. A pin's affinity extends its own window on top of this. Default 60.
   # rotation_minutes: 60.0
 
-  # The minimum time (minutes) a freshly-seated model is held before any rotation or demotion may unseat it, so
-  # a seat is never churned before it has had a fair chance to earn its place. Default 10.
+  # The minimum time (minutes) a freshly-seated model is held before any rotation or demotion may unseat it.
+  # Default 10.
   # min_dwell_minutes: 10.0
 
-  # Rescue donates one seat, time-boxed, to the single most-starved model (one with a very high requester wait)
-  # to increase its chance of being offered by this worker. Off by default. `rescue_eta_seconds` is the wait at
-  # or above
-  # which a model counts as starved enough to warrant the borrowed seat; `rescue_window_minutes` is how long it
+  # Rescue lends one seat, for a limited time, to the most-starved model (one with a very high requester wait),
+  # so this worker is more likely to offer it. Off by default. `rescue_eta_seconds` is the wait at or above
+  # which a model counts as starved enough to warrant the borrowed seat. `rescue_window_minutes` is how long it
   # holds that seat before returning it to the ranker.
   rescue_enabled: false
   # rescue_eta_seconds: 10000.0
@@ -429,7 +428,7 @@ model_pool:
   # already on disk. Reaching the limit does not cancel a transfer that already started.
   download_budget_gb: 0.0
 
-  # How often (seconds) the pool refreshes its live demand ranking. Floored at 60 to keep the poll gentle on
+  # How often (seconds) the pool refreshes its live demand ranking. The minimum is 60, to limit load on
   # the horde's demand endpoint. Default 90.
   # demand_poll_seconds: 90.0
 
@@ -492,14 +491,14 @@ branded_model: true
 # Override the name this worker advertises for its text model, spelled as the text model reference spells
 # it ("author/Model", with a quantisation suffix if the file has one). A catalogued model already carries
 # that spelling, so this is for a file of your own whose name is not the one the horde knows, or for a
-# backend you run yourself that reports a name the horde does not recognise. Give the plain name: the
+# backend you run yourself that reports a name the horde does not recognise. Give the plain name. The
 # horde expects it prefixed with the backend serving it, and the worker adds that prefix, so a name that
 # already carries one would be prefixed twice and match no work.
 # text_model_name: "meta-llama/Llama-3.2-3B-Instruct"
 
 # How many text generations your backend can run at once. This is also how many text jobs the worker
-# holds at a time and what it tells the horde about its capacity. Nothing to do with max_threads, which
-# sizes this worker's own GPU inference processes.
+# holds at a time and what it tells the horde about its capacity. Separate from max_threads, which
+# sizes this worker's GPU inference processes.
 text_threads: 1
 
 # Seconds to wait for one text generation before giving up on it and reporting the job as faulted.
@@ -508,13 +507,13 @@ text_threads: 1
 # text_generation_timeout_seconds: 60
 
 # Seconds without a single token arriving before the worker gives up on a generation and faults the job.
-# The backend streams its answer, so a gap this long means it stopped rather than that it is slow; a
+# The backend streams its answer, so a gap this long means it stopped rather than that it is slow. A
 # generation that is merely long is bounded by text_generation_timeout_seconds instead. The first token
 # after the backend starts is exempt, because a cold backend takes seconds to produce anything.
 text_stall_seconds: 30
 
-# Which text backend program serves text jobs, in the horde's own naming. koboldcpp is the default and
-# the first supported backend; the same value decides how it is launched, which driver talks to it and
+# Which text backend program serves text jobs, in the horde's naming. koboldcpp is the default and
+# the first supported backend. The same value decides how it is launched, which driver talks to it and
 # how the advertised model name is prefixed.
 text_backend_kind: koboldcpp
 
@@ -526,7 +525,7 @@ text_backend_managed: true
 
 # A backend program to launch instead of the one the worker provisions: your own build, a newer upstream
 # release, or a backend the worker cannot yet download. A .py path is a source checkout's entry script
-# (koboldcpp.py beside its compiled library) and runs under the worker's own Python.
+# (koboldcpp.py beside its compiled library) and runs under the worker's Python interpreter.
 # text_backend_executable: "C:/tools/koboldcpp.exe"
 
 # The password a backend you run yourself (text_backend_managed: false) requires. Unset sends none.
@@ -541,7 +540,7 @@ text_backend_accelerator: auto
 # Loopback port the managed backend listens on.
 text_backend_port: 5001
 
-# How much of the model goes on the card, in the backend's own unit (layers for llama.cpp-based backends).
+# How much of the model goes on the card, in the backend's unit (layers for llama.cpp-based backends).
 # A large number means all of it; 0 keeps the model on the CPU.
 text_gpu_layers: 99
 
@@ -555,7 +554,7 @@ text_gpu_layers: 99
 ## Alchemist (Image Interrogation and Post-Processing)
 #########################
 
-# Set to false to deliberately deselect image generation on a GPU box while keeping another role.
+# Set to false to turn image generation off on a GPU machine while keeping another role.
 # Leave it true (the default) for the usual dreamer or dreamer+alchemist worker. The three roles are
 # independent switches, each adding one kind of work, and any combination of them is valid:
 #   dreamer    -> image generation (on by default; this is the historical worker)
@@ -673,12 +672,12 @@ max_inference_attempts: 2
 # worker (it does not exit when idle); it is only a reminder that demand is low. 0 (default) disables it.
 minutes_allowed_without_jobs: 0
 
-# DEPRECATED: superseded by the fixed model pool (see the `model_pool` section above). This was a per-pop
+# DEPRECATED: replaced by the fixed model pool (see the `model_pool` section above). This was a per-pop
 # chance (0.0 to 1.0) that a pop would ask only for the currently-loaded models, trading job variety for fewer
-# model switches. The pool delivers that standing-residency intent as a committed seat set rather than a
-# per-pop gamble. A positive value here with the pool off is mapped onto a modest pool for you (ranker on, a
-# 30-minute rotation) wherever you left the `model_pool` fields at their defaults, and a one-time notice is
-# logged; with the pool enabled this key is ignored entirely. Prefer `model_pool`; leave this at 0.0.
+# model switches. The pool does the same job with a committed set of seats. A positive value here with the
+# pool off is mapped onto a modest pool for you (ranker on, a 30-minute rotation) wherever you left the
+# `model_pool` fields at their defaults, and a one-time notice is logged. With the pool enabled this key is
+# ignored. Prefer `model_pool` and leave this at 0.0.
 model_stickiness: 0.0
 
 #############################
@@ -813,7 +812,7 @@ whole_card_residency_safety_off_gpu: true
 # vram_admission_noise_mb: 512
 
 # Seconds the head of queue must have starved at a card with nothing left to reclaim before the worker
-# admits one real load to let measured reality decide. The reclaim rungs and the idle-context teardown run
+# admits one real load to see whether it fits. The reclaim rungs and the idle-context teardown run
 # first; 0 probes as soon as the ladder is empty. A shortfall larger than the measured-attempt band keeps
 # the longer diagnostic horizon regardless, since a big miss on a card the worker reads as empty is
 # likelier a tenant the ledger cannot see than arithmetic.
@@ -942,10 +941,10 @@ extra_model_directories: []
 
 # Define custom models not in the official model reference.
 # Each entry requires: name, baseline, filepath.
-# Example:
 # Custom model definitions are restart-only. A definition is offered only when its name is also selected
 # above and its single checkpoint file is readable at startup. The dashboard derives baseline choices from
 # the installed horde-model-reference and hordelib versions and reports readiness/rejection reasons.
+# Example:
 # custom_models:
 #   - name: "my-custom-model"
 #     baseline: "stable_diffusion_1"

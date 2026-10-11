@@ -234,7 +234,7 @@ class WebQuitWarningModal(ResponsiveModalScreen[bool]):
             ("Worker stays running after you close this tab\n\n", "bold"),
             (
                 "This dashboard is a browser view of a worker process running on your computer. "
-                "Closing this tab or pressing Ctrl+Q only closes the view - the worker keeps "
+                "Closing this tab or pressing Ctrl+Q only closes the view. The worker keeps "
                 "contributing to the horde.\n\n"
                 "To stop the worker completely, right-click the AI Horde icon in the taskbar "
                 "notification area (the small icons in the bottom-right corner of your screen) "
@@ -748,7 +748,7 @@ class HordeWorkerTUI(App[None]):
                 yield DownloadsView()
             with TabPane("Logs", id="tab-logs"):
                 yield TabPrimer(
-                    "The worker's running commentary. Useful to copy from when asking for help; you do "
+                    "What the worker has logged. Useful to copy from when asking for help. You do "
                     "not need to read it to contribute.",
                     PRIMERS.get("Logs", ()),
                 )

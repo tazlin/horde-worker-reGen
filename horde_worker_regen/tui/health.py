@@ -224,7 +224,7 @@ def _derive_phase(
             WorkerPhase.CRASHED,
             HealthStatus.ERROR,
             "Worker crashed",
-            "The worker process exited unexpectedly. Check the logs; it was not (or could not be) restarted.",
+            "The worker process exited unexpectedly and was not (or could not be) restarted. Check the logs.",
             pre_flight,
             False,
         )
@@ -338,7 +338,8 @@ def _derive_phase(
             WorkerPhase.DEGRADED,
             HealthStatus.ERROR,
             "Repeated job failures",
-            f"{snapshot.consecutive_failed_jobs} jobs failed in a row; the worker paused to recover. Check the logs.",
+            f"{snapshot.consecutive_failed_jobs} jobs failed in a row, so the worker paused to recover. "
+            "Check the logs.",
             checks,
             False,
         )
@@ -544,9 +545,9 @@ def _maintenance_detail(
             "registers the change."
         )
     note_on_maintenance = (
-        "NOTE: This happening unexpectedly means your worker faulted or timed out performing several jobs."
-        "Please check your diagnostics and logs to see what the issue is and fix it before clearing maintenance"
-        " mode, otherwise the horde will just set it again."
+        " If you did not set this, the worker faulted or timed out on several jobs."
+        " Check the diagnostics and logs and fix the cause before clearing maintenance mode,"
+        " or the horde will set it again."
     )
 
     if snapshot.worker_details_maintenance or snapshot.worker_details_paused:
@@ -554,19 +555,19 @@ def _maintenance_detail(
         held = held_workers_phrase(snapshot)
         subject = f"the {held} worker" if held else "this worker"
         return (
-            f"The horde has {subject} set to {what} (server-side); it will not be given new jobs until "
-            "cleared. In-flight jobs finish. Press the Maintenance (horde) key to change it."
+            f"The horde has {subject} set to {what} (server-side). It will not be given new jobs until "
+            "this is cleared. In-flight jobs finish. Press the Maintenance (horde) key to change it."
             f"{note_on_maintenance}"
         )
     if snapshot.last_pop_maintenance_mode:
         return (
-            "The job-pop response returned a maintenance-mode error; the horde has stopped sending this "
+            "The job-pop response returned a maintenance-mode error. The horde has stopped sending this "
             "worker jobs. Press the Maintenance (horde) key to clear it."
             f"{note_on_maintenance}"
         )
     if snapshot.self_throttle_paused:
         return (
-            "The worker paused itself: to avoid using too many system resources. It will resume popping "
+            "The worker paused itself to avoid using too many system resources. It will resume popping "
             "automatically once jobs make some progress."
         )
     return "Not popping new jobs (locally paused). In-flight jobs will finish."
@@ -872,7 +873,7 @@ def _text_posture_report(snapshot: WorkerStateSnapshot, checks: list[HealthCheck
             WorkerPhase.DEGRADED,
             HealthStatus.ERROR,
             "Text backend could not be obtained",
-            f"{wait.provision_error} No text jobs can be served until the program is available; "
+            f"{wait.provision_error} No text jobs can be served until the program is available. "
             "`text_backend_executable` can point at one you already have.",
             checks,
             False,
@@ -901,7 +902,7 @@ def _text_posture_report(snapshot: WorkerStateSnapshot, checks: list[HealthCheck
     detail = (
         f"The backend has reported no loaded model. {_text_backend_remedy(wait)}"
         if failed
-        else "The backend has not reported a loaded model yet; a large model on a cold disk can take minutes."
+        else "The backend has not reported a loaded model yet. A large model on a cold disk can take minutes."
     )
     return HealthReport(
         WorkerPhase.DEGRADED,
@@ -947,7 +948,7 @@ def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
             HealthCheck(
                 TEXT_BACKEND_CHECK_NAME,
                 HealthStatus.ERROR,
-                "The text backend refused the worker's credentials; no text jobs are being popped. "
+                "The text backend refused the worker's credentials, so no text jobs are being popped. "
                 f"{_text_backend_remedy(wait)}",
             ),
         )
@@ -957,7 +958,7 @@ def _text_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
             HealthCheck(
                 TEXT_BACKEND_CHECK_NAME,
                 HealthStatus.ERROR if failed else HealthStatus.WARN,
-                f"No loaded model reported for {human_duration(wait.seconds)}; no text jobs are being "
+                f"No loaded model reported for {human_duration(wait.seconds)}, so no text jobs are being "
                 f"popped. {_text_backend_remedy(wait)}",
             ),
         )

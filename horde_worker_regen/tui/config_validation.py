@@ -132,8 +132,8 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
     if _bool(config, "scribe") and _int(config, "max_context_length", context_default) <= context_default:
         warning(
             "max_context_length",
-            f"Max context length is the default of {context_default}; the horde only sends this worker "
-            "requests that fit the advertised context, so most text work passes it by. Raise it to what the "
+            f"Max context length is the default of {context_default}. The horde only sends this worker "
+            "requests that fit the advertised context, so it will receive little text work. Raise it to what the "
             "model and card can hold.",
         )
 
@@ -176,8 +176,8 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
     if _bool(config, "max_throughput_mode") and not pool_enabled:
         warning(
             "model_pool_enabled",
-            "The demand-following pool preset is on, but Enable model pool is explicitly off; the explicit "
-            "override wins, so the preset cannot seat models.",
+            "The demand-following pool preset is on, but Enable model pool is explicitly off. The explicit "
+            "setting wins, so the preset cannot seat models.",
         )
     if pinned and not pool_enabled:
         warning("model_pool_pinned", "Pinned models have no effect while Enable model pool is off.")

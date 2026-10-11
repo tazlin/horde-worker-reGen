@@ -91,7 +91,7 @@ BUILT_IN_PRESETS: tuple[ConfigPreset, ...] = (
             _change(
                 "moderate_performance_mode",
                 False,
-                "High-performance mode owns the performance setting.",
+                "High performance mode overrides this one.",
                 PresetCategory.THROUGHPUT,
             ),
             _change(

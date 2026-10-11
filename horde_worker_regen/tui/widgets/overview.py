@@ -1427,7 +1427,7 @@ class OverviewView(Vertical):
         for check in report.checks:
             if compact:
                 detail = Text(check.name, style=f"bold {check.status.colour}")
-                detail.append(" — ", style="grey50")
+                detail.append(": ", style="grey50")
                 detail.append(check.detail, style="grey70")
                 table.add_row(Text(check.status.glyph, style=check.status.colour), detail)
             else:
@@ -1439,7 +1439,7 @@ class OverviewView(Vertical):
         features_line = self._feature_readiness_line(feature_readiness)
         if features_line is not None:
             if compact:
-                feature_detail = Text("Features — ", style="bold")
+                feature_detail = Text("Features: ", style="bold")
                 feature_detail.append_text(features_line)
                 table.add_row(Text("⊟", style="grey62"), feature_detail)
             else:

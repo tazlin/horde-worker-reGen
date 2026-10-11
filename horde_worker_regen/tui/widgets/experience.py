@@ -31,7 +31,7 @@ _LEVEL_SUMMARIES: dict[ExperienceLevel, tuple[str, str]] = {
     ExperienceLevel.SIMPLE: (
         "Simple",
         "Plain-language status, live progress, and the settings most contributors need. Every tab is "
-        "still here if you want to look; they just lead with what the worker is doing rather than how.",
+        "still available. Each one leads with what the worker is doing, with less detail on how.",
     ),
     ExperienceLevel.ADVANCED: (
         "Advanced",
