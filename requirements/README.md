@@ -52,7 +52,8 @@ cd requirements/utilities
 uv lock
 ```
 
-CI asserts the committed lock is current with `uv lock --check`, so a stale lock fails the build. Do **not**
+CI's `lock-drift` job checks that this lock and the root lock are each current (`uv lock --check`) and that
+both resolve the same torch builds, so a stale lock fails that job. Do **not**
 add `mediapipe` to the annotator extras: the current service release declares an OpenCV wheel conflict
 between those extras.
 

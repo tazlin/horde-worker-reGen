@@ -187,6 +187,9 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   job the previous level left in safety is never counted. Tracker deltas are the fallback for a driver
   with no run metrics and the floor for a fault that never finalizes. A level's elapsed time and timeout
   include safety and submit.
+- **Two locks must agree.** `requirements/utilities/pyproject.toml` pins torch to the version the root
+  `uv.lock` resolves, and a root bump does not move that pin. After one, re-pin and run `uv lock` in
+  `requirements/utilities`. CI's `lock-drift` job fails otherwise.
 - The pinned `ruff`/`pyrefly` versions in `.pre-commit-config.yaml` must match `pyproject.toml`
   (a test enforces this).
 
