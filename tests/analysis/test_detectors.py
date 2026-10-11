@@ -1736,7 +1736,7 @@ class TestWholeCardResidencyChurn:
         )
         finding = findings["whole_card_residency_churn"]
         assert "unmeasured marginal" not in finding.headline
-        assert "really need it" in finding.action
+        assert "need it on this card" in finding.action
         assert "276MB" in " ".join(finding.evidence), "the measured marginal must be quoted"
         assert "1450" in " ".join(finding.evidence), "the unreclaimable charge behind the reduction must be quoted"
 
@@ -3341,7 +3341,7 @@ class TestLaneDoubleDispatchSignature:
         )
         finding = _diagnose(tmp_path, _o2_log(self._RELEASED, lost))["lane_double_dispatch_signature"]
         assert finding.severity is Severity.CRITICAL
-        assert finding.headline == "The worker lost track of which process owned a job, 1 in total."
+        assert finding.headline == "The worker lost track of which process owned a job 1 times."
         assert "inference_result_lost: 1" in finding.evidence
         assert "ended_job_ownership_released: 1" in finding.evidence
 

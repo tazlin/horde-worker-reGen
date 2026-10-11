@@ -559,7 +559,7 @@ def detect_crash_on_start_loop(context: SessionContext) -> list[Finding]:
     else:
         verdict = (
             f"{starts} image process starts across {processes} processes crashed before they were ready, and "
-            "no start-up log names the error."
+            "no start-up log shows the error."
         )
         remediation = "Open the process's start-up log in the logs folder and look for the failing import or error."
     return [
@@ -1126,7 +1126,7 @@ def detect_idle_fill_offer_stuck(context: SessionContext) -> list[Finding]:
                     if narrow.closed is not None
                     else "still narrowed at the session end",
                     narrow_evidence,
-                    "no idle-fill arm lines in this log; read from the advertised offer",
+                    "no idle-fill arm lines in this log, so this is read from the advertised offer",
                 ],
             ),
         ]
@@ -1244,7 +1244,7 @@ def detect_lane_double_dispatch_signature(context: SessionContext) -> list[Findi
         Finding(
             kind=FindingKind.LANE_DOUBLE_DISPATCH_SIGNATURE,
             severity=Severity.CRITICAL,
-            headline=f"The worker lost track of which process owned a job, {total} in total.",
+            headline=f"The worker lost track of which process owned a job {total} times.",
             evidence=[
                 *(f"{name}: {len(found)}" for name, found in hits.items()),
                 f"ended_job_ownership_released: {released}",
@@ -1638,7 +1638,7 @@ def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
         f"The refused opens include {_clause_join([f'"{path}"' for path in resources[:4]])}. " if resources else ""
     )
     recovery_clause = (
-        f'The worker replaced the process, giving "{recovery.reason}".'
+        f'The worker replaced the process, with the reason "{recovery.reason}".'
         if recovery is not None
         else "No replacement was recorded, so the process may have stayed broken until the session ended."
     )
@@ -2060,7 +2060,7 @@ def detect_inference_slot_quarantined(context: SessionContext) -> list[Finding]:
             severity=Severity.CRITICAL,
             headline=headline,
             action_addendum=(
-                "The reasons name CUDA errors or repeated failed jobs, so report it with `horde-log bundle`."
+                "The reasons include CUDA errors or repeated failed jobs, so report it with `horde-log bundle`."
                 if lane_driven
                 else None
             ),
@@ -2262,7 +2262,7 @@ def _describe_drops(records: list[LogRecord]) -> str:
         )
     if aborts:
         return (
-            f"Just before, the horde cancelled {aborts} jobs as too slow: the worker was generating slower than "
+            f"Just before, the horde cancelled {aborts} jobs as too slow. The worker was generating slower than "
             "the horde's per-job deadline."
         )
     if giveups:
@@ -2547,8 +2547,8 @@ def _aging_finding(
             title_override="Jobs were dropped while waiting after generation",
             headline=f"{lead}, most of it waiting after generation finished.",
             action_addendum=(
-                "Lowering `max_power` will not help. Speed up the stage behind inference: turn on "
-                "`safety_on_gpu` so the safety check is not bound to the CPU."
+                "Lowering `max_power` will not help. Speed up the stage behind inference by turning on "
+                "`safety_on_gpu`, so the safety check is not bound to the CPU."
             ),
             evidence=[split_clause]
             + ([safety_clause.strip()] if safety_clause else [])
@@ -2602,7 +2602,7 @@ def detect_slow_generation_drop_spiral(context: SessionContext) -> list[Finding]
     )
 
     base_verdict = f"The horde dropped {len(aborts)} jobs{span_clause} for taking too long."
-    tail = "" if spiral else "Isolated so far; a sustained run draws forced maintenance."
+    tail = "" if spiral else "Isolated so far. A sustained run draws forced maintenance."
 
     if queue_aging:
         assert median_latency is not None and median_gen is not None
@@ -2634,7 +2634,7 @@ def detect_slow_generation_drop_spiral(context: SessionContext) -> list[Finding]
             action_addendum=(
                 "Lower `max_power`, `max_threads`, `queue_size` or `max_batch` so each job finishes in time. Put "
                 "models on an SSD and free up VRAM and RAM. Clearing maintenance without slowing the intake "
-                "just triggers it again."
+                "triggers it again."
             ),
             evidence=slow_evidence + ([tail] if tail else []) + [_evidence(r) for r in (aborts[:2] + slowdowns[:2])],
         ),
@@ -3121,14 +3121,14 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
                 )
             )
             remediation = (
-                "The worker's own subsystem named in the evidence keeps moving the safety check off the GPU, "
+                "The worker's subsystem named in the evidence keeps moving the safety check off the GPU, "
                 "and a result in flight is lost each time. Turn off `unload_models_from_vram_often` or "
                 "whole-card residency to reduce how often, and report it."
             )
         else:
             remediation = (
-                "Keep the safety process stable: with `safety_on_gpu` on, frequent whole-card reservations or "
-                "`unload_models_from_vram_often` can restart it. Check the safety process log for crashes."
+                "With `safety_on_gpu` on, frequent whole-card reservations or `unload_models_from_vram_often` "
+                "can restart the safety process. Check the safety process log for crashes."
             )
     else:
         verdict = "The safety check backed up or lost a result, and the worker recovered without dropping jobs."
@@ -3418,17 +3418,17 @@ def _churn_remediation(
             else ""
         )
         return (
-            "Report it: the reservation could not free anything, since the process count it asked for was "
+            "Report it. The reservation could not free anything, since the process count it asked for was "
             f"already met.{unreclaimable}"
         )
     if unmeasured_marginal:
         return (
-            "Let the worker measure what each extra process costs: run the start-up probe, or leave the "
+            "Let the worker measure what each extra process costs. Run the start-up probe, or leave the "
             "worker idle with every process up so it can read a clean baseline. Until then it charges a "
             "guessed figure per process and gives the card to models that do not need it."
         )
     return (
-        "Check that the models being given the whole card really need it on this card. If they do not, "
+        "Check that the models being given the whole card need it on this card. If they do not, "
         "report it with the log around a reservation."
     )
 
@@ -3644,12 +3644,12 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
             kind=FindingKind.HEAD_DISPATCH_STALL,
             severity=Severity.WARNING,
             headline=(
-                f"The next job was held back {len(stalls)} times, each time by a rule the log names: a "
+                f"The next job was held back {len(stalls)} times, each time by a rule the log reports: a "
                 "concurrency cap, an overlap wait, or a load the VRAM budget put off."
             ),
             action_addendum=(
-                "If throughput is low, the rule named in the evidence is the lever: `max_threads`, `max_batch`, "
-                "or the VRAM budget."
+                "If throughput is low, change the setting behind the rule in the evidence, which is "
+                "`max_threads`, `max_batch` or the VRAM budget."
             )
             if not ram
             else "System RAM pressure held jobs or model loads during this wait. Check the RAM finding.",
@@ -4568,7 +4568,7 @@ def detect_multi_card_dispatch_serialization(context: SessionContext) -> list[Fi
             ),
             evidence=[
                 f"Median {census.median_pending:.0f} jobs waiting per status print with "
-                f"{census.median_idle_lanes:.0f} idle processes and an intake budget of {budget}; a median "
+                f"{census.median_idle_lanes:.0f} idle processes and an intake budget of {budget}. A median "
                 f"{census.median_seatable_pending:.0f} of "
                 "the waiting jobs already had their model loaded on an idle process whose card was running "
                 f"nothing.{head_clause}{loop_clause}",
@@ -4874,7 +4874,7 @@ def detect_utilities_lane_bringup_timeout(context: SessionContext) -> list[Findi
             "Nothing reported healthy after the last time it ran out, so the features it serves were "
             "unavailable for the rest of the session.",
         )
-    narrative.append('The program\'s own output is in the log file named "bridge_utilities_<slot>.log".')
+    narrative.append('The program\'s output is in the log file "bridge_utilities_<slot>.log".')
 
     evidence = timeouts[:2] + ([recovery] if recovery is not None else [])
     return [

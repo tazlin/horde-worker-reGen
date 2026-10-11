@@ -56,7 +56,8 @@ def _start_bound_note(session: WorkerSession) -> str:
         return ""
     cause = "log truncated" if session.start_truncated else "capture begins mid-run"
     return (
-        f"    started at or before {_fmt_ts(session.start_ts)} ({cause}): the span and duration above are lower bounds"
+        f"    started at or before {_fmt_ts(session.start_ts)} ({cause}), "
+        "so the span and duration above are lower bounds"
     )
 
 
