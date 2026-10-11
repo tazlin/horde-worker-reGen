@@ -43,7 +43,7 @@ _LAUNCH_COMMANDS: dict[str, list[str]] = {
 def _print_amd_unsupported() -> None:
     """Explain that no usable AMD backend was found and how to force a choice."""
     print(
-        "An AMD GPU was detected, but no installable GPU backend was matched. The installer supports "
+        "An AMD GPU was detected, but the installer has no GPU build for it. The installer supports "
         "ComfyUI's experimental AMD Windows ROCm profile for supported Radeon/Ryzen AI GPUs, plus Linux "
         "ROCm when the ROCm runtime is present. "
         "Re-run with HORDE_WORKER_BACKEND=cpu for the CPU build (~100x slower), or force a known profile "
@@ -55,8 +55,8 @@ def _print_amd_unsupported() -> None:
 def _print_cpu_notice() -> None:
     """Explain that the CPU build runs in alchemist-only mode (image generation disabled)."""
     print(
-        "Using the CPU build: image generation is disabled (CPU inference is ~100x slower), so the worker "
-        "runs in alchemist-only mode (upscaling, face-fixing, interrogation). Set alchemist: true in "
+        "Using the CPU build. Image generation is disabled because CPU inference is ~100x slower, so the "
+        "worker runs in alchemist-only mode (upscaling, face-fixing, interrogation). Set alchemist: true in "
         "bridgeData.yaml (done automatically for a fresh CPU install). Reinstall a GPU build later with "
         "update-runtime --cu132 (or the matching build) to enable image generation.",
         file=sys.stderr,
@@ -159,25 +159,25 @@ def _maybe_prune(uv: str, root: Path, options: _SyncOptions) -> None:
     """
     if not options.prune or not _cache_is_owned(root):
         return
-    print("Tidying the worker's uv cache (removing superseded wheels; this can take a moment)...", flush=True)
+    print("Removing old packages from the worker's uv cache. This can take a moment...", flush=True)
     rc, reclaimed = runner.uv_cache_prune(uv, root=root)
     if rc == 0:
         if reclaimed:
             reclaimed_human = sync_plan.human_bytes(reclaimed)
             print(f"Reclaimed {reclaimed_human} from the worker's uv cache ({_effective_cache_dir(root)}).")
         else:
-            print("uv cache already tidy; nothing to reclaim.")
+            print("The uv cache has nothing to remove.")
         return
     if rc == runner.PRUNE_TIMED_OUT:
         print(
-            "Cache cleanup timed out and was skipped; the install is complete. "
-            "Raise HORDE_WORKER_PRUNE_TIMEOUT or pass --no-prune to silence this.",
+            "Cache cleanup timed out and was skipped. The install is complete. "
+            "Raise HORDE_WORKER_PRUNE_TIMEOUT to allow more time, or pass --no-prune to skip the cleanup.",
             file=sys.stderr,
         )
     elif rc == runner.PRUNE_INTERRUPTED:
-        print("Cache cleanup was interrupted and skipped; the install is complete.", file=sys.stderr)
+        print("Cache cleanup was interrupted and skipped. The install is complete.", file=sys.stderr)
     else:
-        print("Cache cleanup did not complete (non-fatal); the install is complete.", file=sys.stderr)
+        print("Cache cleanup failed. The install is complete.", file=sys.stderr)
 
 
 def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOptions) -> None:
@@ -208,10 +208,10 @@ def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOp
         if backend_mod.expects_utilities_lock(token):
             print(
                 f"WARNING: the image-utilities lane is enabled for backend '{token}', but its dependency "
-                f"lock is missing at {lock}. The lane cannot be provisioned and will be unavailable (the "
-                f"worker still runs; capabilities that need the lane are disabled). This usually means the "
-                f"install did not receive the requirements/utilities/ directory; reinstall or restore it, "
-                f"then re-run the sync.",
+                f"lock is missing at {lock}, so its environment cannot be installed. The worker still runs, "
+                f"without ControlNet annotation and background removal. The install is probably missing "
+                f"the requirements/utilities/ directory. Reinstall or restore that directory, then re-run "
+                f"the sync.",
                 file=sys.stderr,
             )
         return
@@ -220,19 +220,19 @@ def _maybe_provision_utilities(uv: str, root: Path, token: str, options: _SyncOp
     hold = utilities_env.torch_hold(backend_token=token, root=root)
     if hold is not None:
         print(
-            f"Deferring the image-utilities capability venv: the worker environment is on torch "
-            f"{hold.installed_version} while the image-utilities lock pins {hold.locked_version}. It is "
-            f"provisioned by the first sync that installs the matching torch build.",
+            f"The image-utilities environment was not installed. The worker environment has torch "
+            f"{hold.installed_version} and the image-utilities lock needs {hold.locked_version}. The next "
+            f"sync that installs torch {hold.locked_version} also installs it.",
             flush=True,
         )
         return
-    print("Provisioning the image-utilities capability venv (a separate environment)...", flush=True)
+    print("Installing the image-utilities environment (a separate Python environment)...", flush=True)
     try:
         runner.provision_utilities(uv, backend_token=token, root=root)
     except utilities_env.UtilitiesProvisionError as error:
         print(f"WARNING: {error}", file=sys.stderr)
         return
-    print("Image-utilities capability venv is ready.")
+    print("The image-utilities environment is ready.")
 
 
 def _ensure_utilities_for_current_backend(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> None:
@@ -258,7 +258,9 @@ def _ensure_utilities_for_current_backend(uv: str, root: Path, *, cli_flag: str 
     try:
         _maybe_provision_utilities(uv, root, token, options)
     except ValueError as error:
-        print(f"WARNING: could not resolve image-utilities provisioning: {error}", file=sys.stderr)
+        print(
+            f"WARNING: could not work out whether to install the image-utilities environment: {error}", file=sys.stderr
+        )
 
 
 def _is_headless() -> bool:
@@ -279,7 +281,7 @@ def _run_sync(uv: str, root: Path, token: str, feature_extras: tuple[str, ...], 
     changes = sync_plan.parse_dry_run(output) if rc_dry == 0 else []
     if rc_dry != 0 or not changes:
         if rc_dry != 0:
-            print("Could not preview the sync; proceeding with the normal locked sync.", file=sys.stderr)
+            print("Could not preview the download. Continuing with the normal sync.", file=sys.stderr)
         return runner.uv_sync(uv, token, extras=feature_extras, root=root)
 
     overrides_path = paths.sync_overrides_file(root)
@@ -317,10 +319,10 @@ def _run_sync(uv: str, root: Path, token: str, feature_extras: tuple[str, ...], 
         interactive=consent.is_interactive(),
     )
     if action == "abort":
-        print("Sync cancelled; keeping the current environment.")
+        print("Sync cancelled. The current environment is unchanged.")
         return 1
     if action == "hold":
-        print("Limping along: holding torch/torchvision at the installed version; updating everything else.")
+        print("Keeping torch and torchvision at the installed version and updating everything else.")
         return runner.uv_sync_held(uv, token, overrides_path=overrides_path, extras=feature_extras, root=root)
     return runner.uv_sync(uv, token, extras=feature_extras, root=root)
 
@@ -382,9 +384,9 @@ def _reconcile_backend(root: Path, token: str) -> str:
     if reconciled == token:
         return token
     print(
-        f"Adjusting the torch build from {token} to {reconciled}: this GPU's compute capability has no "
-        f"kernel image in the {token} wheel, so {token} would install but fail at the first kernel launch. "
-        f"Installing {reconciled} instead (and recording it for future updates).",
+        f"Changing the torch build from {token} to {reconciled}. The {token} build has no kernel image for "
+        f"this GPU's compute capability, so it would install and then fail the first time the GPU is "
+        f"used. {reconciled} is installed and recorded for future updates.",
         file=sys.stderr,
     )
     backend_mod.write_backend_file(paths.backend_file(root), reconciled)
@@ -413,12 +415,12 @@ def _verify_installed_torch_arch(uv: str, root: Path, token: str) -> None:
     cap_tag = f"sm_{capability[0]}{capability[1]}"
     print(
         f"WARNING: the torch build just installed ({token}) has no CUDA kernels for this GPU "
-        f"(compute capability {capability[0]}.{capability[1]}, {cap_tag}); the wheel was built for "
-        f"{' '.join(arch_list)}. This build was selected believing it would run this GPU, so this is "
-        f"most likely a worker bug: the build-selection table in worker_bootstrap.detect is out of date "
-        f"for {cap_tag}. Please report it (quoting this message) at "
-        f"https://github.com/Haidra-Org/horde-worker-reGen/issues . As a stopgap, forcing a newer build "
-        f"with HORDE_WORKER_BACKEND (for example cu132) may work if one carries kernels for your card.",
+        f"(compute capability {capability[0]}.{capability[1]}, {cap_tag}). The wheel was built for "
+        f"{' '.join(arch_list)}. The installer chose this build expecting it to run this GPU, so this is "
+        f"most likely a worker bug. The build-selection table in worker_bootstrap.detect is out of date "
+        f"for {cap_tag}. Please report it, quoting this message, at "
+        f"https://github.com/Haidra-Org/horde-worker-reGen/issues . Until it is fixed, a newer build set "
+        f"with HORDE_WORKER_BACKEND (for example cu132) may work if it has kernels for your card.",
         file=sys.stderr,
     )
 
@@ -475,7 +477,7 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    features_note = ", ".join(feature_extras) if feature_extras else "none (lean base)"
+    features_note = ", ".join(feature_extras) if feature_extras else "none"
     print(f"Installing dependencies for GPU backend: {token} (features: {features_note})")
     rc = _run_sync(uv, root, token, feature_extras, options)
     if rc == 0:
@@ -603,7 +605,7 @@ def _ensure_torch_runs_gpu(uv: str, root: Path, *, cli_flag: str | None, options
     if persisted is None or would_install != persisted:
         print(
             f"The installed PyTorch has no CUDA kernels for this GPU (compute capability "
-            f"{capability[0]}.{capability[1]}); re-syncing to install {would_install} before starting.",
+            f"{capability[0]}.{capability[1]}). Installing {would_install} before starting.",
             file=sys.stderr,
         )
         return _sync(uv, root, cli_flag=cli_flag, options=options)
@@ -613,7 +615,7 @@ def _ensure_torch_runs_gpu(uv: str, root: Path, *, cli_flag: str | None, options
     print(
         f"WARNING: the installed PyTorch ({persisted}) cannot run this GPU (compute capability "
         f"{capability[0]}.{capability[1]}) and no alternative locked build is known for it. This is likely "
-        f"a worker or driver issue; starting anyway so the worker can report the specifics (see its log).",
+        f"a worker or driver problem. The worker starts anyway, and its log has the details.",
         file=sys.stderr,
     )
     return None
@@ -713,7 +715,7 @@ def _maybe_offer_update(root: Path) -> None:
     if policy == "prompt":
         if not consent.is_interactive():
             print(
-                f"A worker {kind} is available ({info.current} -> {info.latest}). Run `update` to apply, "
+                f"A worker {kind} is available ({info.current} -> {info.latest}). Run `update` to apply it, "
                 "or set HORDE_WORKER_AUTO_UPDATE=auto.",
                 file=sys.stderr,
             )
@@ -725,7 +727,7 @@ def _maybe_offer_update(root: Path) -> None:
         )
         if answer in ("s", "skip"):
             updater.mark_version_skipped(root, info.latest)
-            print(f"Skipping {info.latest}; you won't be asked again until a newer version is released.")
+            print(f"Skipping {info.latest}. You will be asked again when a newer version is released.")
             return
         if answer in ("n", "no"):
             print("Skipping the update for this launch.")
@@ -745,9 +747,10 @@ def _cmd_launch(args: argparse.Namespace, root: Path, uv: str) -> int:
     """Start the worker in the requested mode, syncing first if the venv is missing or stale."""
     if updater.launchers_need_refresh(root):
         print(
-            "Launcher safety update available: this worker can start normally, but its currently preserved "
-            "runtime script predates verified uv staging. Re-run the latest installer over this folder once "
-            "to refresh the launchers without deleting configuration, environments, or models.",
+            "Launcher safety update available. The launcher scripts in this folder come from an older "
+            "installer and replace uv without verifying the download first. The worker starts normally. "
+            "Run the latest installer over this folder once to replace them. Your configuration, "
+            "environments and models are kept.",
             file=sys.stderr,
         )
     _maybe_offer_update(root)
@@ -810,10 +813,10 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
     # and that path must remain a valid migration from pre-bootstrap releases.
     method = updater.resolve_install_method(root)
     if method == "dev":
-        print("Git checkout detected; leaving source updates to git and syncing dependencies.")
+        print("Git checkout detected. Git updates the source, so only the dependencies are synced.")
         rc = _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
         if rc != 0:
-            print("The dependency sync did not complete; re-run update after resolving the error.", file=sys.stderr)
+            print("The dependency sync did not complete. Fix the error above and re-run update.", file=sys.stderr)
             return rc
         print("Git checkout dependencies are up to date.")
         return 0
@@ -836,8 +839,8 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
             )
             return rc
         print(
-            "Dependencies are up to date, but source update availability could not be checked. "
-            "The worker can start; re-run update later to check for a newer release.",
+            "Dependencies are up to date, but whether a newer release exists could not be checked. "
+            "The worker can start. Re-run update later to check again.",
             file=sys.stderr,
         )
         return 1
@@ -855,7 +858,7 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
         rc = _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
         if rc != 0:
             print(
-                f"{msg} The dependency sync did not complete; re-run update after resolving the error.",
+                f"{msg} The dependency sync did not complete. Fix the error above and re-run update.",
                 file=sys.stderr,
             )
             return rc
@@ -882,7 +885,7 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
         uv = uvbin.ensure_compatible_uv(root, uv)
     except uvbin.UvCompatibilityError as error:
         print(
-            f"{result.message} The private uv update did not complete: {error} The next launch will retry it.",
+            f"{result.message} The update of the worker's uv did not complete: {error} The next launch retries it.",
             file=sys.stderr,
         )
         return 1
@@ -891,7 +894,7 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
     rc = _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
     if rc != 0:
         print(
-            f"{result.message} The dependency sync did not complete; the next launch will retry it.",
+            f"{result.message} The dependency sync did not complete. The next launch retries it.",
             file=sys.stderr,
         )
         return rc
@@ -917,7 +920,7 @@ def _cmd_apply_bundle(args: argparse.Namespace, root: Path, uv: str) -> int:  # 
     except OSError as error:
         print(f"ERROR: could not apply the release bundle: {error}", file=sys.stderr)
         return 1
-    print(f"Applied the release bundle to {root} (stale modules pruned from the import roots).")
+    print(f"Applied the release bundle to {root}. Source files the release no longer includes were removed.")
     return 0
 
 
@@ -952,8 +955,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "--backend",
             default=None,
             help=(
-                "Force a torch build (cu126/cu130/cu132/cpu/rocm/rocm-windows) instead of "
-                "detecting/reading bin/backend."
+                "Use this torch build (cu126/cu130/cu132/cpu/rocm/rocm-windows) instead of the detected "
+                "one or the one saved in bin/backend."
             ),
         )
         # Convenience shortcuts kept for back-compat with the old update-runtime.cmd/sh flag interface
@@ -980,7 +983,7 @@ def _build_parser() -> argparse.ArgumentParser:
             action="store_const",
             const=True,
             default=None,
-            help="Limp along: keep the installed torch/torchvision when no dependency requires the upgrade.",
+            help="Keep the installed torch/torchvision when no dependency requires the upgrade.",
         )
         target.add_argument(
             "--no-hold-torch",
@@ -999,17 +1002,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "--headless-policy",
             choices=["proceed", "hold"],
             default=None,
-            help="Non-interactive behaviour for big optional upgrades: take them (proceed) or hold (default proceed).",
+            help="What a non-interactive run does with a large optional upgrade. proceed installs it (the default). "
+            "hold keeps the installed version.",
         )
         target.add_argument(
             "--no-prune",
             action="store_true",
-            help="Do not auto-prune the worker's owned uv cache after a successful sync.",
+            help="Do not remove old packages from the worker's uv cache after a successful sync.",
         )
         target.add_argument(
             "--skip-utilities",
             action="store_true",
-            help="Skip provisioning the image-utilities capability venv (env: HORDE_WORKER_SKIP_UTILITIES=1).",
+            help="Do not install the image-utilities environment (env: HORDE_WORKER_SKIP_UTILITIES=1).",
         )
         target.add_argument(
             "--cache-mode",
@@ -1020,7 +1024,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_detect = sub.add_parser("detect", help="Detect the GPU/torch build for this machine.")
     add_backend_flag(p_detect)
-    p_detect.add_argument("--write", action="store_true", help="Persist the result to bin/backend.")
+    p_detect.add_argument("--write", action="store_true", help="Save the result to bin/backend.")
 
     p_sync = sub.add_parser("sync", help="Install/update dependencies for the selected build.")
     add_backend_flag(p_sync)
@@ -1045,7 +1049,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_apply = sub.add_parser(
         "apply-bundle",
-        help="Overlay an extracted release bundle onto this install, pruning stale modules (installer use).",
+        help="Copy an extracted release bundle over this install and remove source files it no longer includes. "
+        "Used by the installers.",
     )
     p_apply.add_argument("bundle", help="Path to the extracted release bundle directory.")
 
@@ -1060,7 +1065,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="OWNER/REPO",
         help=(
             "Pull releases from this repo instead of the recorded origin (env: HORDE_WORKER_UPDATE_REPO). "
-            "Persisted to bin/install-info on a successful check so future updates use the same origin "
+            "Saved to bin/install-info on a successful check so future updates use the same origin "
             "without the flag. Use this to switch from a beta fork to the official release channel or "
             "vice versa (e.g. --repo Haidra-Org/horde-worker-reGen)."
         ),

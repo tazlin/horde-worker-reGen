@@ -47,12 +47,12 @@ def test_render_markdown_includes_every_section() -> None:
     assert "## Probes" in markdown
     assert "sd15-baseline" in markdown
     assert "## Suggested bridgeData" in markdown
-    assert "Why each value (provenance):" in markdown
-    assert "No robustness findings" in markdown
+    assert "Why each value:" in markdown
+    assert "No findings." in markdown
 
 
 def test_render_markdown_lists_findings_with_reproduce_hint() -> None:
-    """A finding is rendered in the remediation queue with a slug-targeted reproduce command."""
+    """A finding is rendered in the findings section with a slug-targeted reproduce command."""
     probe = CapabilityProbeResult(
         capability=Capability(tier=BenchTier.SD15, kind=CapabilityKind.CONTROLNET),
         verdict=CapabilityVerdict.CRASHED,
@@ -62,7 +62,7 @@ def test_render_markdown_lists_findings_with_reproduce_hint() -> None:
 
     markdown = render_markdown(report)
 
-    assert "## Remediation queue" in markdown
+    assert "## Findings" in markdown
     assert "sd15-controlnet" in markdown
     assert "horde-benchmark run --only sd15-controlnet" in markdown
 

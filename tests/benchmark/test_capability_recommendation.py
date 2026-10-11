@@ -145,7 +145,7 @@ def test_inconclusive_soak_keeps_the_model_with_a_caveat() -> None:
     """A soak that failed without proving load instability (0 jobs, no hard finding) keeps the model."""
     failed = synthesize_bridge_data(_soak_results(CapabilityVerdict.CRASHED), total_vram_mb=16000)
     assert _MODEL in failed.models_to_load
-    assert any("inconclusive soak" in note for note in failed.notes)
+    assert any("soak was inconclusive" in note for note in failed.notes)
     # The model's provenance still reads as proven (its baseline passed); the caveat lives in notes.
     assert _decision(failed, "models_to_load").basis == SuggestionBasis.PROVEN
 
@@ -159,7 +159,7 @@ def test_unstable_soak_that_ran_meaningfully_drops_the_model() -> None:
     )
     suggestion = synthesize_bridge_data(results, total_vram_mb=16000)
     assert _MODEL not in suggestion.models_to_load
-    assert any("ran and did not hold up" in note for note in suggestion.notes)
+    assert any("soak was unstable" in note for note in suggestion.notes)
 
 
 def test_skipped_soak_omits_the_model() -> None:
@@ -167,7 +167,7 @@ def test_skipped_soak_omits_the_model() -> None:
     skipped = synthesize_bridge_data(_soak_results(CapabilityVerdict.SKIPPED), total_vram_mb=16000)
     assert _MODEL not in skipped.models_to_load
     assert any("was skipped" in note for note in skipped.notes)
-    assert not any("did not hold up" in note for note in skipped.notes)
+    assert not any("was unstable" in note for note in skipped.notes)
 
 
 def test_zero_activity_probe_reads_as_untested_not_failed() -> None:

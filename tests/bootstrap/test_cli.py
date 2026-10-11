@@ -1050,7 +1050,7 @@ def test_sync_hold_defers_the_utilities_venv(
 
     assert calls == [("held", "cu126")]
     assert provisioned == []
-    assert "Deferring the image-utilities capability venv" in capsys.readouterr().out
+    assert "The image-utilities environment was not installed" in capsys.readouterr().out
 
 
 def test_sync_prunes_only_when_cache_owned(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:

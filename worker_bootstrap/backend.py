@@ -104,7 +104,7 @@ def choose_backend_interactively(
 
     emit(
         f"A GPU backend ({detected_token}) was detected. You can instead install the CPU-only build to run "
-        "in alchemist-only mode (image generation disabled; upscaling, face-fixing and interrogation only). "
+        "in alchemist-only mode (no image generation, only upscaling, face-fixing and interrogation). "
         "CPU is ~100x slower and mainly useful without a usable GPU, or to leave the GPU free for other work.",
     )
     answer = prompt("Install for [G]PU (recommended) or [C]PU only / alchemist-only? [G/c] ").strip().lower()
@@ -170,7 +170,7 @@ def validate_locked_extra(token: str, pyproject_path: Path) -> None:
     if token in available:
         return
     raise ValueError(
-        f"'{token}' is not a locked build. The lockfile provides the latest torch for: "
-        f"{', '.join(available)}. For AMD/ROCm or an older torch line, install ad-hoc, e.g.: "
+        f"'{token}' is not a locked build. The lockfile has torch builds for: "
+        f"{', '.join(available)}. For AMD/ROCm or an older torch version, install torch by hand, for example: "
         "UV_TORCH_BACKEND=auto uv pip install torch torchvision torchaudio",
     )

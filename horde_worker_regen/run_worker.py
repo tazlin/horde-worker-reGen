@@ -82,7 +82,7 @@ def main(
             )
     except ConnectionRefusedError:
         logger.error("Could not connect to the the horde. Is it down?")
-        input("Press any key to exit...")
+        input("Press Enter to exit...")
         return
     except Exception as e:
         logger.exception(e)
@@ -96,7 +96,7 @@ def main(
             for error in e.errors():
                 logger.error(f"{error['loc'][0]}: {error['msg']}")
 
-        input("Press any key to exit...")
+        input("Press Enter to exit...")
         return
 
     if not bridge_data:
@@ -513,7 +513,7 @@ def init() -> None:
         "--directml",
         type=int,
         default=None,
-        help="Enable directml and specify device to use.",
+        help="Enable directml on the given device index.",
     )
     parser.add_argument(
         "--gpu-device-indices",
@@ -521,8 +521,8 @@ def init() -> None:
         default=None,
         metavar="INDICES",
         help=(
-            "Comma-separated accelerator indices (stable PCI-bus order) this one worker should drive, e.g. "
-            "'0' or '0,2'. Overrides gpu_device_indices in the config. Omit to auto-detect and use all cards."
+            "The cards this worker uses, as comma-separated indices in PCI-bus order, e.g. '0' or '0,2'. "
+            "Overrides gpu_device_indices in the config. With neither set, the worker uses every card it detects."
         ),
     )
 

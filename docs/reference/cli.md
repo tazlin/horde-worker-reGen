@@ -142,7 +142,7 @@ carries two control options that act on an already-running host and exit without
 |------|---------|
 | `--status` | Report whether a worker host is running here and whether its worker is working, then exit (non-zero when nothing is running). |
 | `--stop` | Ask a running host to drain in-flight jobs and stop the worker and host cleanly, then exit. |
-| `--host-port N` | Worker-host socket port the commands target (default `7717`; `$HORDE_WORKER_HOST_PORT` overrides). |
+| `--host-port N` | Worker-host socket port the commands target. Without the flag, `$HORDE_WORKER_HOST_PORT` is used, then the default `7717`. |
 | `--host HOST`, `--port N` | Bind address/port of the web server itself. Each falls back to `$HORDE_WORKER_WEB_HOST` / `$HORDE_WORKER_WEB_PORT`, then `dashboard_web_host` / `dashboard_web_port` in `bridgeData.yaml`, then `127.0.0.1:8000`. |
 
 Binding anything but loopback serves an **unauthenticated** dashboard: anyone who can reach the port can
@@ -152,7 +152,7 @@ protection it adds. See
 [What a network-bound dashboard exposes](../how-to/use-the-dashboard.md#what-a-network-bound-dashboard-exposes).
 
 On Windows the worker host also shows a **system-tray icon** while it runs, with *Open dashboard* and
-*Stop worker & exit* actions. The host remembers the launcher's resolved web port, so *Open dashboard*
+*Exit now (stop the worker first)* actions. The host remembers the launcher's resolved web port, so *Open dashboard*
 does not assume 8000 when `--port`, the environment, or bridge data selected another one. A detached
 or orphaned worker therefore stays visible and stoppable. See
 [Keep the worker running when you close the dashboard](../how-to/use-the-dashboard.md#keep-the-worker-running-when-you-close-the-dashboard).
@@ -235,6 +235,7 @@ horde-stats --stats-dir /path/to/.horde_worker_regen/stats downsample 60 --inclu
 | `--amd`, `--amd-gpu` | Enable AMD GPU optimisations. |
 | `-n`, `--worker-name NAME` | Override the worker name (for running multiple workers on one machine). |
 | `--directml N` | Enable DirectML on the given device index (currently unavailable). |
+| `--gpu-device-indices INDICES` | The cards this worker uses, as comma-separated indices in PCI-bus order (`0` or `0,2`). Overrides `gpu_device_indices` in the config. With neither set, the worker uses every card it detects. |
 
 ## `horde-benchmark`
 
@@ -242,14 +243,15 @@ Progressive worker benchmarking. Subcommands:
 
 | Subcommand | Purpose |
 |------------|---------|
-| `run` | Run the capability-probe benchmark: prove what this machine can do, on one warm worker. |
-| `plan` | Show each probe's resource requirements and predicted run/skip verdict (no worker is started). |
-| `corpus-preflight` | Check that this machine can produce admissible pricing-corpus rows, and name the fix for anything it cannot. |
-| `pricing-corpus` | Run the cost-attribution corpus that a pricing model is fitted against. |
-| `soak` | Sustain one named traffic mix for a fixed period and score it: the before/after vehicle. |
+| `run` | Run the benchmark: test jobs of increasing difficulty on one worker, then suggested settings for `bridgeData.yaml`. |
+| `plan` | Show what each probe needs and whether it would run or be skipped. No worker is started. |
+| `download` | Download the models the selected tiers need, so the timed benchmark is not slowed by downloading mid-run. |
+| `corpus-preflight` | Check that this machine can produce admissible pricing-corpus rows, and print the fix for each problem found. |
+| `pricing-corpus` | Run the pricing corpus, the fixed set of jobs whose stats records are used to fit a pricing model. |
+| `soak` | Run one mix of jobs continuously for a fixed time and score it, to compare performance before and after a change. |
 | `report OUT_DIR` | Re-render the markdown report from an existing output directory. |
-| `monitor OUT_DIR` | Tail a run's `progress.jsonl` live (attach to or replay a run). |
-| `live` | Open-loop load generation against a live API (not yet implemented). |
+| `monitor OUT_DIR` | Follow a run's `progress.jsonl`, live or as a replay. |
+| `live` | Generate load against a live AI Horde API (not implemented yet). |
 
 ### `run`: the capability-probe benchmark
 
@@ -295,15 +297,15 @@ Key `run` options:
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--tiers` | `sd15,sdxl` | Comma-separated tiers (`sd15`, `sdxl`, `flux`, `qwen`, `zimage`); heavy tiers are opt-in and self-skip when the machine cannot host them. |
-| `--process-mode {fake,dry_run,real}` | `real` | `real` benchmarks the GPU; `fake`/`dry_run` exercise the engine without inference. |
+| `--tiers` | `sd15,sdxl` | Comma-separated tiers (`sd15`, `sdxl`, `flux`, `qwen`, `zimage`). `flux`, `qwen` and `zimage` are very large, so they run only when listed, and are skipped when the machine cannot run them. |
+| `--process-mode {fake,dry_run,real}` | `real` | `real` runs jobs on the GPU. `fake` and `dry_run` test the benchmark itself and run no inference. |
 | `--out PATH` | `benchmark_results/<timestamp>` | Output directory (`report.json`, `report.md`, `progress.jsonl`). |
 | `--jobs-per-level N` | `4` | Jobs run per probe. |
 | `--probe-timeout SECONDS` | `900` | Per-probe timeout. |
 | `--only SLUG` | — | Run one probe by capability slug plus its minimal prerequisite closure; an unknown slug is an error. |
-| `--no-validate` | off | Skip the post-run sustained-load soak (`--soak-minutes` sets its length). |
-| `--strict-duty` | off | Make the soak's 90% GPU-duty target a hard gate (advisory by default). |
-| `--exclude-capability KIND` | — | Drop a single capability kind (repeatable; choices are the `CapabilityKind` values, e.g. `post_processing`, `controlnet`, `alchemy_concurrent`). |
+| `--no-validate` | off | Skip the soak, the sustained-load run that follows the probes (`--soak-minutes` sets its length). |
+| `--strict-duty` | off | Fail a soak whose GPU duty cycle is under the 90% target. Without this flag a miss is only reported. |
+| `--exclude-capability KIND` | — | Skip one capability kind, in addition to anything the `--no-*` flags skip. Repeatable. The choices are the `CapabilityKind` values, e.g. `post_processing`, `controlnet`, `alchemy_concurrent`. |
 | `--no-concurrency` / `--no-features` / `--no-alchemy` / `--include-downloads` | — | Coarse stage selection (drop a whole group of probes; downloads are opt-in). |
 
 ```bash
@@ -520,13 +522,13 @@ the templates' own features. `--override key=value` layers on top, and is the A/
 | `--minutes N` | `20` | How long to sustain it. Short runs are noisy; prefer 20 minutes or more per arm. |
 | `--process-mode {fake,dry_run,real}` | `real` | Only `real` measures anything; `fake`/`dry_run` exercise the plumbing and export no stats. |
 | `--out DIR` | `benchmark_results/<ts>` | Run directory for `controller.log` and the `soak.json` manifest. |
-| `--label TEXT` | — | Names this arm (e.g. `baseline`, `unload-on`) in the manifest and the closing summary. |
-| `--bridge-data PATH` | `bridgeData.yaml` | The config the throughput fields are carried over from. |
-| `--ignore-bridge-data` | off | Carry nothing over; run on harness defaults plus `--override`. |
-| `--override KEY=VALUE` | — | Bridge-data override applied over the carried config (repeatable). |
-| `--no-loras` | off | Strip every LoRA and textual-inversion reference from the mix. |
-| `--shared-lora REFERENCE` | synthetic pool | Resolvable reference for the cache-hit pool (repeatable; at least 3). |
-| `--unique-lora REFERENCE` | synthetic pool | Resolvable reference for the download-pressure pool (repeatable; at least 8). |
+| `--label TEXT` | — | A label for this run, such as `baseline` or `unload-on`. It appears in the manifest and the closing summary. |
+| `--bridge-data PATH` | `bridgeData.yaml` | Worker config to copy the throughput settings from. |
+| `--ignore-bridge-data` | off | Copy nothing from the worker config. The run uses the benchmark defaults plus any `--override`. |
+| `--override KEY=VALUE` | — | Set one config value for this run, over the worker config. Repeatable. |
+| `--no-loras` | off | Remove every LoRA and textual-inversion reference from the mix. |
+| `--shared-lora REFERENCE` | synthetic pool | A downloadable LoRA reference for the pool the mix reuses across jobs (the cache-hit pool). Repeatable. Give at least 3. |
+| `--unique-lora REFERENCE` | synthetic pool | A downloadable LoRA reference for the pool the mix uses once each (the download-pressure pool). Repeatable. Give at least 8. |
 
 ```bash
 # Arm A: the worker as configured today.

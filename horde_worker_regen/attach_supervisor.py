@@ -397,9 +397,9 @@ class AttachSupervisor:
             "t": round(now, 3),
             "rule": "supervisor_overrun",
             "severity": _SEVERITY_WARNING,
-            "summary": f"A poll cycle took {elapsed:.1f}s (> {threshold:.1f}s, "
-            f"{OVERRUN_INTERVAL_FACTOR:.0f}x the {self._interval:.0f}s interval): the observation loop is "
-            "running behind and may be servicing the inbox and state writes late.",
+            "summary": f"A poll cycle took {elapsed:.1f}s (limit {threshold:.1f}s, "
+            f"{OVERRUN_INTERVAL_FACTOR:.0f}x the {self._interval:.0f}s interval). The supervisor is running "
+            "behind, so inbox commands and state lines may be handled late.",
             "elapsed_seconds": round(elapsed, 2),
             "interval_seconds": self._interval,
         }
@@ -564,8 +564,8 @@ class AttachSupervisor:
             "t": round(now, 3),
             "rule": "frozen_parent",
             "severity": _SEVERITY_CRITICAL,
-            "summary": f"Worker control-loop liveness is {age:.0f}s stale (> {LIVENESS_STALE_SECONDS:.0f}s): "
-            "the parent may be frozen.",
+            "summary": f"The worker's main process last ran its control loop {age:.0f}s ago "
+            f"(limit {LIVENESS_STALE_SECONDS:.0f}s). It may be frozen.",
             "liveness_age_seconds": round(age or 0.0, 1),
         }
 
@@ -577,8 +577,8 @@ class AttachSupervisor:
             "t": round(now, 3),
             "rule": "consecutive_failure_pause",
             "severity": _SEVERITY_WARNING,
-            "summary": f"Worker armed its consecutive-failure pause ({snapshot.consecutive_failed_jobs} "
-            "consecutive faults); it stopped popping to protect itself.",
+            "summary": f"The worker stopped taking jobs after {snapshot.consecutive_failed_jobs} jobs "
+            "failed in a row (the consecutive-failure pause).",
             "consecutive_failed_jobs": snapshot.consecutive_failed_jobs,
         }
 
@@ -591,8 +591,8 @@ class AttachSupervisor:
             "t": round(now, 3),
             "rule": "fault_burst",
             "severity": _SEVERITY_WARNING,
-            "summary": f"{faults_in_window} job fault(s) in the last {FAULT_BURST_WINDOW_SECONDS / 60:.0f} "
-            f"minutes (>= {FAULT_BURST_COUNT}).",
+            "summary": f"{faults_in_window} job(s) failed in the last {FAULT_BURST_WINDOW_SECONDS / 60:.0f} "
+            f"minutes (this alert fires at {FAULT_BURST_COUNT}).",
             "faults_in_window": faults_in_window,
             "window_seconds": FAULT_BURST_WINDOW_SECONDS,
         }
@@ -629,8 +629,9 @@ class AttachSupervisor:
             "t": round(now, 3),
             "rule": "gpu_idle_with_pending",
             "severity": _SEVERITY_CRITICAL,
-            "summary": f"{snapshot.jobs_pending_inference} job(s) pending while every inference process has "
-            f"been idle for {idle_seconds:.0f}s (> {GPU_IDLE_PENDING_SECONDS:.0f}s): the GPU is not being fed.",
+            "summary": f"{snapshot.jobs_pending_inference} job(s) have been waiting while every image process "
+            f"sat idle for {idle_seconds:.0f}s (limit {GPU_IDLE_PENDING_SECONDS:.0f}s). The GPU has work "
+            "queued and is not running it.",
             "pending_jobs": snapshot.jobs_pending_inference,
             "idle_seconds": round(idle_seconds, 1),
         }
@@ -663,8 +664,8 @@ class AttachSupervisor:
             "t": round(now, 3),
             "rule": "download_no_progress",
             "severity": _SEVERITY_WARNING,
-            "summary": f"Download of {downloads.current.model_name} made no byte progress for "
-            f"{stall_seconds:.0f}s (> {DOWNLOAD_STALL_SECONDS:.0f}s).",
+            "summary": f"The download of {downloads.current.model_name} has received no data for "
+            f"{stall_seconds:.0f}s (limit {DOWNLOAD_STALL_SECONDS:.0f}s).",
             "model": downloads.current.model_name,
             "downloaded_bytes": current_bytes,
             "stall_seconds": round(stall_seconds, 1),
@@ -708,19 +709,19 @@ class AttachSupervisor:
         )
         reasons: list[str] = []
         if frozen:
-            reasons.append(f"the parent has been frozen for {age:.0f}s")
+            reasons.append(f"the main process has been frozen for {age:.0f}s")
         if gpu_idle:
-            reasons.append(f"{snapshot.jobs_pending_inference} job(s) pending while the GPU sat idle")
+            reasons.append(f"{snapshot.jobs_pending_inference} job(s) were waiting while the GPU sat idle")
         elapsed = now - self._guard_since
         return {
             "t": round(now, 3),
             "rule": "auto_guard_server_maintenance",
             "severity": _SEVERITY_CRITICAL,
-            "summary": "Auto-guard set server-side maintenance ON (one shot): "
+            "summary": "The supervisor put this worker into maintenance mode on the horde because "
             + " and ".join(reasons)
-            + f", persisting past the {AUTO_GUARD_CONFIRM_SECONDS:.0f}s confirmation window "
-            f"({elapsed:.0f}s). The worker will not restart or shut down; lift maintenance via the inbox to "
-            "re-arm the guard.",
+            + f". The condition lasted {elapsed:.0f}s (limit {AUTO_GUARD_CONFIRM_SECONDS:.0f}s). The worker "
+            "keeps running. The supervisor does this once. Turn maintenance off through the inbox to let it "
+            "act again.",
             "confirm_seconds": AUTO_GUARD_CONFIRM_SECONDS,
             "elapsed_seconds": round(elapsed, 1),
         }
@@ -860,7 +861,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--config",
         type=str,
         default=None,
-        help="Path to bridgeData.yaml; its directory becomes the working directory (config + logs live there).",
+        help="Path to bridgeData.yaml. Its directory becomes the working directory, where the logs are written.",
     )
     parser.add_argument("-e", "--load-config-from-env-vars", action="store_true", help="Load config from env vars.")
     parser.add_argument("--amd", "--amd-gpu", action="store_true", help="Enable AMD GPU optimisations.")

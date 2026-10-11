@@ -19,27 +19,24 @@ class MaintenanceModeMessenger:
             )
 
         warning_function_no_format(
-            "Your worker is in maintenance mode. Set your API key at https://tinybots.net/artbot/settings, "
-            "click save, then click unpause on https://tinybots.net/artbot/settings?panel=workers while the worker "
-            "is running to clear this message.",
+            "Your worker is in maintenance mode, so the horde gives it no jobs except your own. To leave "
+            "maintenance mode, enter your API key at https://tinybots.net/artbot/settings and click save, then "
+            "click unpause at https://tinybots.net/artbot/settings?panel=workers while the worker is running.",
         )
         warning_function_no_format(
-            "If you didn't expect seeing this message, its probable that the worker "
-            "dropped too many jobs, and the server stepped in to prevent further jobs from being "
-            "dropped. Please check the logs above, and possibly your logs/ folder as well.",
+            "If you did not turn maintenance mode on, the horde most likely did because the worker dropped too "
+            "many jobs. Check the messages above and the logs/ folder for the cause.",
         )
-        warning_function_no_format("Common reasons for forced maintenance mode are: ")
+        warning_function_no_format("Common reasons the horde forces maintenance mode:")
         warning_function_no_format("  - `max_threads` is too high.")
         warning_function_no_format("  - `queue_size` is too high.")
         warning_function_no_format("  - `max_batch` is too high.")
         warning_function_no_format("  - `max_power` is too high.")
-        warning_function_no_format("  - The worker can't handle, SDXL, Cascade, or Flux models.")
+        warning_function_no_format("  - This machine cannot run the SDXL, Cascade or Flux models the worker offers.")
         warning_function_no_format(
-            "  - If you have the equivalent GPU of a 1070 or less, set"
-            " limit_max_steps or extra_slow_worker. "
-            "This should only be done as a last resort.",
+            "  - The GPU is a GTX 1070 or slower. As a last resort, set `limit_max_steps` or `extra_slow_worker`.",
         )
 
         warning_function_no_format(
-            "If you continue to see this message, come to the official discord (https://discord.gg/3DxrhksKzn).",
+            "If this message keeps appearing, ask for help on the official Discord (https://discord.gg/3DxrhksKzn).",
         )

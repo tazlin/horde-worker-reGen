@@ -210,9 +210,9 @@ def self_update_allowed(root: Path | None = None) -> tuple[bool, str]:
     """
     method = resolve_install_method(root)
     if method == "winget":
-        return False, "This is a winget-managed install; update it with `winget upgrade Haidra.HordeWorker`."
+        return False, "This install is managed by winget. Update it with `winget upgrade Haidra.HordeWorker`."
     if method == "dev":
-        return False, "This looks like a development checkout; update it with `git pull` then `update-runtime`."
+        return False, "This looks like a git checkout. Update it with `git pull`, then `update-runtime`."
     return True, ""
 
 
@@ -793,7 +793,7 @@ def perform_update(root: Path, info: UpdateInfo) -> UpdateResult:
         return UpdateResult(False, "No update available.", info.current, info.latest)
     if not info.checksums_url:
         return UpdateResult(
-            False, "No checksums were published for this release; refusing to apply.", info.current, info.latest
+            False, "No checksums were published for this release, so it was not applied.", info.current, info.latest
         )
 
     with tempfile.TemporaryDirectory(prefix="horde-update-") as tmp:
@@ -808,10 +808,15 @@ def perform_update(root: Path, info: UpdateInfo) -> UpdateResult:
         expected = _expected_hash(checksums, _BUNDLE_ASSET)
         if expected is None:
             return UpdateResult(
-                False, "The bundle's checksum was not found; refusing to apply.", info.current, info.latest
+                False,
+                "The published checksums have no entry for the release bundle, so it was not applied.",
+                info.current,
+                info.latest,
             )
         if _sha256(zip_path).lower() != expected.lower():
-            return UpdateResult(False, "Checksum mismatch; refusing to apply the download.", info.current, info.latest)
+            return UpdateResult(
+                False, "Checksum mismatch, so the download was not applied.", info.current, info.latest
+            )
 
         extracted = tmpdir / "extracted"
         try:
@@ -822,7 +827,7 @@ def perform_update(root: Path, info: UpdateInfo) -> UpdateResult:
             apply_bundle(extracted, root)
         except KeyboardInterrupt:
             return UpdateResult(
-                False, "Update interrupted; the previous version was restored.", info.current, info.latest
+                False, "The update was interrupted and the previous version was restored.", info.current, info.latest
             )
         except Exception as error:  # noqa: BLE001 - every apply failure must become an actionable result
             return UpdateResult(False, f"Could not apply the update: {error}", info.current, info.latest)

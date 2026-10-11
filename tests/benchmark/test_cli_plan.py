@@ -67,7 +67,7 @@ def test_plan_table_renders_controlnet_column() -> None:
 
     table = format_plan_table(rows)
 
-    assert "CN" in table
+    assert "CONTROLNET" in table
     assert "MISSING" in table
     assert "~0.8G" in table
     assert "DOWNLOAD FIRST" in table  # the annotators-missing level reads as a third, actionable state

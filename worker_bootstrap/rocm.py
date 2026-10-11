@@ -134,7 +134,7 @@ def sync_rocm(uv: str, *, root: Path | None = None, hold: bool = False, token: s
     # (rembg/onnxruntime) are off by default and opt-in via HORDE_WORKER_FEATURES (their CPU wheels do
     # exist on x86), resolved against the ROCm token so the cpu base does not auto-pull them.
     feature_extras = backend.desired_feature_extras(token, env_value=os.environ.get("HORDE_WORKER_FEATURES"))
-    features_note = ", ".join(feature_extras) if feature_extras else "none (lean base)"
+    features_note = ", ".join(feature_extras) if feature_extras else "none"
     print(f"Installing the base environment (everything except the GPU torch build; features: {features_note})...")
     base_rc = runner.uv_sync(uv, "cpu", extras=feature_extras, root=root)
     if base_rc != 0:
@@ -144,7 +144,7 @@ def sync_rocm(uv: str, *, root: Path | None = None, hold: bool = False, token: s
     first_torch_spec = next((spec for spec in plan.torch_specs if "torch-" in spec or spec.startswith("torch")), "")
     held_target = first_torch_spec.removeprefix("torch==")
     if hold and first_torch_spec.startswith("torch==") and _rocm_torch_already_satisfies(root, held_target):
-        print(f"Limping along: keeping the installed ROCm torch (target {held_target} already satisfied).")
+        print(f"Keeping the installed ROCm torch (target {held_target} already satisfied).")
         return 0
     print(f"Installing the ROCm PyTorch stack ad-hoc ({token} from {plan.index})...")
     args = ["pip", "install"]

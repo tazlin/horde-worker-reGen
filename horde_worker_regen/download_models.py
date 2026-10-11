@@ -36,7 +36,7 @@ def download_all_models(
             )
     except Exception as e:
         logger.error(e)
-        input("Press any key to exit...")
+        input("Press Enter to exit...")
 
     if bridge_data is None:
         logger.error("Failed to load bridge data")

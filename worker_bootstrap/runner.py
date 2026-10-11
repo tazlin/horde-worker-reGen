@@ -290,9 +290,9 @@ def provision_utilities(
         exit_code = run_command(command)
         if exit_code != 0:
             raise utilities_env.UtilitiesProvisionError(
-                f"the utilities-venv sync `{' '.join(command)}` failed (exit code {exit_code}). "
-                f"Re-run the sync to retry, or set HORDE_WORKER_SKIP_UTILITIES=1 to skip the utilities "
-                f"venv for now (the worker still runs; capabilities that need it are unavailable).",
+                f"installing the image-utilities environment failed: `{' '.join(command)}` returned "
+                f"exit code {exit_code}. Re-run the sync to retry, or set HORDE_WORKER_SKIP_UTILITIES=1 to "
+                f"skip it. The worker still runs, without ControlNet annotation and background removal.",
             )
     utilities_env.write_utilities_stamp(backend_token=backend_token, root=root)
 

@@ -103,8 +103,8 @@ def ensure_consent(
         # No terminal to prompt and no explicit flag: an automated/headless context (e.g. Docker, CI).
         # Proceed so established automation keeps working; the notice above stands as the disclosure.
         print(
-            "No interactive terminal detected and no consent flag set; proceeding. "
-            "Set HORDE_WORKER_ASSUME_YES=1 to make this explicit.",
+            "No interactive terminal was detected and no consent flag is set, so the install continues. "
+            "Set HORDE_WORKER_ASSUME_YES=1 to give consent explicitly.",
         )
         _write_marker(marker_path)
         return True

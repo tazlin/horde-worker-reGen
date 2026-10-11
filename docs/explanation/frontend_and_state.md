@@ -451,8 +451,8 @@ discoverable and stoppable: `horde-worker-web --status` / `--stop` (the same
 status frame and `LIFECYCLE_SHUTDOWN` the host already speaks), and, on Windows, a
 **system-tray icon** the host itself shows (`tui/tray.py`). The tray lives on the
 host rather than the launcher precisely because the host is what survives, so an
-orphaned worker surfaces as a visible icon with *Open dashboard* and *Stop*
-actions instead of an invisible process. The launcher passes the resolved web port when it starts a
+orphaned worker surfaces as a visible icon with *Open dashboard* and
+*Exit now (stop the worker first)* actions instead of an invisible process. The launcher passes the resolved web port when it starts a
 host and sends a `dashboard_port` frame when it reuses a surviving host, so *Open dashboard* follows
 port changes without restarting the worker. The tray is best-effort and
 import-guarded (`pystray`/`Pillow`, Windows-only), so its absence never affects

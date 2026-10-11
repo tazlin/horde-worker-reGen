@@ -583,7 +583,7 @@ def _add_alchemy_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
         axis=BenchAxis.ALCHEMY_CLIP,
         rung=1,
         name="alchemy-clip",
-        description=f"alchemy CLIP lane (safety process): {', '.join(clip_forms)}",
+        description=f"alchemy CLIP forms, run in the safety process: {', '.join(clip_forms)}",
         scenario=Scenario(
             name="alchemy-clip",
             alchemy_forms=[CannedAlchemyFormSpec(form=form, count=1) for form in clip_forms],
@@ -605,7 +605,7 @@ def _add_alchemy_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
         axis=BenchAxis.ALCHEMY_GRAPH,
         rung=1,
         name="alchemy-graph",
-        description=f"alchemy graph lane (inference processes): {len(graph_forms)} post-processor forms",
+        description=f"alchemy image forms: {len(graph_forms)} post-processor forms",
         scenario=Scenario(
             name="alchemy-graph",
             alchemy_forms=[CannedAlchemyFormSpec(form=form, count=1) for form in graph_forms],

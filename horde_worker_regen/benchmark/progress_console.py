@@ -27,26 +27,28 @@ def format_progress_event(event: BenchmarkProgressEvent, *, verbose: bool = Fals
     operators who want to watch the worker's cold start phase-by-phase.
     """
     if isinstance(event, RampStarting):
-        phase = f" - {event.phase}" if event.phase else ""
-        return f"> Ramp {event.run_id} starting (mode={event.process_mode}){phase} ..."
+        phase = f": {event.phase}" if event.phase else ""
+        return f"> Benchmark {event.run_id} starting (mode={event.process_mode}){phase} ..."
     if isinstance(event, RampStarted):
         tiers = ", ".join(event.tiers) or "-"
         gpu = event.gpu_name or "unknown GPU"
-        return f"> Ramp {event.run_id}: {event.num_levels} levels - tiers={tiers} - mode={event.process_mode} - {gpu}"
+        return (
+            f"> Benchmark {event.run_id}: {event.num_levels} levels, tiers={tiers}, mode={event.process_mode}, {gpu}"
+        )
     if isinstance(event, RampPlanned):
         return format_plan_table(event.rows)
     if isinstance(event, LevelStarted):
         position = f"{event.level_index + 1}/{event.num_levels}" if event.num_levels else "soak"
-        expected = f" - {event.jobs_expected} jobs" if event.jobs_expected is not None else ""
+        expected = f", {event.jobs_expected} jobs" if event.jobs_expected is not None else ""
         return f"  |- [{position}] {event.level_id} ({event.stage}/{event.tier}/{event.axis}){expected} ..."
     if isinstance(event, LevelProgress):
         return f"     . {event.level_id}: {_progress_detail(event, verbose=verbose)}"
     if isinstance(event, LevelFinished):
         return f"  '- {event.level_id}: {event.outcome.upper()}{_finished_detail(event)}"
     if isinstance(event, RampFinished):
-        findings = f" - {event.num_findings} findings" if event.num_findings else ""
+        findings = f", {event.num_findings} findings" if event.num_findings else ""
         lines = [
-            f"= Ramp complete: {event.levels_passed}/{event.levels_total} passed{findings} - "
+            f"= Benchmark complete: {event.levels_passed}/{event.levels_total} passed{findings}, "
             f"report={event.report_path}",
         ]
         lines.extend(_provenance_lines(event))
@@ -62,7 +64,7 @@ def _provenance_lines(event: RampFinished) -> list[str]:
         return []
     lines = ["  why each suggested value:"]
     for decision in event.suggestion_decisions:
-        detail = f" - {decision.detail}" if decision.detail else ""
+        detail = f": {decision.detail}" if decision.detail else ""
         lines.append(f"    - {decision.setting}={decision.value_text} [{decision.basis_label}]{detail}")
     return lines
 
@@ -93,7 +95,7 @@ def _progress_detail(event: LevelProgress, *, verbose: bool = False) -> str:
     parts.append(f"t={event.elapsed_seconds:.0f}s")
     if verbose and event.process_summary:
         parts.append(event.process_summary)
-    return " - ".join(parts)
+    return ", ".join(parts)
 
 
 def _format_mb(value_mb: int | None) -> str:
@@ -141,14 +143,15 @@ def _format_verdict(row: LevelPlanRow) -> str:
 
 
 def format_plan_table(rows: list[LevelPlanRow]) -> str:
-    """Render the resource plan as an aligned text table (LEVEL / VRAM / DISK / NET / KEY / CN / VERDICT).
+    """Render the resource plan as an aligned text table.
 
-    The DISK cell reads ``free/needed`` so a shortfall is visible at a glance, the CN cell shows whether a
+    The columns are LEVEL, VRAM, DISK, NET, KEY, CONTROLNET and VERDICT. The DISK cell reads
+    ``free/needed`` so a shortfall is visible at a glance, the CONTROLNET cell shows whether a
     controlnet level can run (and its annotator-download ROM), and a trailing line prompts the ``download``
     subcommand whenever any level still needs models or annotators, so a slow mid-run fetch does not quietly
     skew the timing.
     """
-    header = ("LEVEL", "VRAM", "DISK", "NET", "KEY", "CN", "VERDICT")
+    header = ("LEVEL", "VRAM", "DISK", "NET", "KEY", "CONTROLNET", "VERDICT")
     body: list[tuple[str, str, str, str, str, str, str]] = []
     for row in rows:
         body.append(
@@ -170,15 +173,15 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
     def _line(cells: tuple[str, ...]) -> str:
         return "  ".join(cell.ljust(width) for cell, width in zip(cells, widths, strict=True)).rstrip()
 
-    lines = ["Resource plan (verdicts reflect the detected machine):", _line(header)]
+    lines = ["Resource plan for this machine:", _line(header)]
     lines.extend(_line(cells) for cells in body)
     # A single nag from the per-row download-first verdict (which reckons missing image models, controlnet
     # checkpoints, and confirmed-absent annotators); unknown presence stays silent (the level pre-warms first).
     if any(row.needs_download for row in rows):
         lines.append(
             "Some levels need models, controlnet checkpoints, or annotators that are not downloaded yet. Run "
-            "`horde-benchmark download` first so the timed run is not slowed (and skewed) by downloading "
-            "mid-benchmark.",
+            "`horde-benchmark download` first, so that downloads do not slow the timed run and distort its "
+            "results.",
         )
     return "\n".join(lines)
 
@@ -191,7 +194,7 @@ def _finished_detail(event: LevelFinished) -> str:
     notes = "; ".join(event.reasons + event.advisories)
     if notes:
         parts.append(notes)
-    return f" ({' - '.join(parts)})" if parts else ""
+    return f" ({', '.join(parts)})" if parts else ""
 
 
 class ConsoleProgressSink(ProgressSink):

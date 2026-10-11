@@ -1,15 +1,17 @@
-"""The `horde-benchmark` CLI: progressive worker benchmarking.
+"""The `horde-benchmark` command.
+
+A benchmark runs test jobs of increasing difficulty and suggests settings for bridgeData.yaml.
 
 Subcommands:
-- ``run``: prove the capability catalog on one warm worker via the canned-job harness (no API).
-- ``plan``: preview each probe's resource needs and run/skip verdict (no worker is started).
-- ``download``: fetch the checkpoints the selected tiers need, ahead of a timed run.
-- ``pricing-corpus``: run the cost-attribution corpus whose stats records fit a pricing model.
-- ``corpus-preflight``: check that a machine can produce admissible pricing-corpus rows.
-- ``soak``: run one sustained-traffic mix for a fixed period, as a before/after performance vehicle.
+- ``run``: run the benchmark on one worker, with local test jobs and no connection to the horde.
+- ``plan``: show what each probe needs and whether it would run or be skipped. No worker is started.
+- ``download``: download the models the selected tiers need, ahead of a timed run.
+- ``pricing-corpus``: run the fixed set of jobs whose stats records are used to fit a pricing model.
+- ``corpus-preflight``: check that this machine can produce admissible pricing-corpus rows.
+- ``soak``: run one mix of jobs continuously for a fixed time, to compare performance before and after a change.
 - ``report``: re-render the markdown report from an existing output directory.
-- ``monitor``: tail a run's progress.jsonl live (attach or replay).
-- ``live``: open-loop load generation against a live AI-Horde API (separate phase).
+- ``monitor``: follow a run's progress.jsonl, live or as a replay.
+- ``live``: generate load against a live AI Horde API (not implemented yet).
 """
 
 from __future__ import annotations
@@ -45,24 +47,28 @@ if TYPE_CHECKING:
     from horde_worker_regen.model_download_core import DownloadControls
     from horde_worker_regen.model_download_plan import DownloadPlan
 
+_TIER_NAMES = ", ".join(tier.value for tier in BenchTier)
+"""Every tier name, for the ``--tiers`` help text."""
+
 
 def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
     """Add the ``run`` subcommand: the capability-engine benchmark (one warm worker, no per-probe rampup)."""
     run = subparsers.add_parser(
         "run",
-        help="Run the capability-probe benchmark: prove what this machine can do, on one warm worker.",
+        help="Run the benchmark: test jobs of increasing difficulty on one worker, then suggested settings "
+        "for bridgeData.yaml.",
     )
     run.add_argument(
         "--tiers",
         default="sd15,sdxl",
-        help="Comma-separated model tiers to attempt (sd15, sdxl, flux, qwen, zimage). flux/qwen/zimage "
-        "are opt-in (very large) and auto-skip when the machine cannot host them.",
+        help=f"Comma-separated model tiers to test ({_TIER_NAMES}). flux, qwen and zimage are very large, so "
+        "they run only when listed here, and are skipped when the machine cannot run them.",
     )
     run.add_argument(
         "--process-mode",
         default="real",
         choices=("fake", "dry_run", "real"),
-        help="real = GPU benchmark; fake/dry_run exercise the engine without inference.",
+        help="real runs jobs on the GPU. fake and dry_run test the benchmark itself and run no inference.",
     )
     run.add_argument("--out", type=Path, default=None, help="Output directory (default: benchmark_results/<ts>).")
     run.add_argument("--jobs-per-level", type=int, default=4)
@@ -78,14 +84,18 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         default=[],
         choices=[kind.value for kind in CapabilityKind],
         metavar="CAPABILITY",
-        help="Drop a single capability kind, independent of the coarse stage flags (repeatable).",
+        help="Skip one capability kind, in addition to anything the --no-* flags skip. Repeatable.",
     )
-    run.add_argument("--no-validate", action="store_true", help="Skip the post-run sustained-load soak.")
+    run.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Skip the soak, the sustained-load run that follows the probes.",
+    )
     run.add_argument("--soak-minutes", type=float, default=5.0, help="Duration of each per-tier soak (minutes).")
     run.add_argument(
         "--strict-duty",
         action="store_true",
-        help="Fail a soak whose GPU duty cycle misses the 90%% target (off by default: advisory).",
+        help="Fail a soak whose GPU duty cycle is under the 90%% target. Without this flag a miss is only reported.",
     )
     run.add_argument(
         "-v",
@@ -99,63 +109,67 @@ def _add_soak_parser(subparsers: argparse._SubParsersAction) -> None:
     """Add the ``soak`` subcommand: one sustained-traffic mix, run standalone as an A/B arm."""
     soak = subparsers.add_parser(
         "soak",
-        help="Run one sustained-traffic soak mix for a fixed period and score it from its stats export.",
+        help="Run one mix of jobs continuously for a fixed time and score it from the stats it exports.",
     )
     soak.add_argument(
         "--mix",
         default=SOAK_MIXES[0],
         choices=SOAK_MIXES,
-        help="Which traffic mix to sustain (default: production_replay, the measured production cadence).",
+        help=f"The mix of jobs to run (default: {SOAK_MIXES[0]}, modelled on measured production traffic).",
     )
-    soak.add_argument("--minutes", type=float, default=20.0, help="How long to sustain the mix (default: 20).")
+    soak.add_argument("--minutes", type=float, default=20.0, help="How long to run the mix (default: 20).")
     soak.add_argument(
         "--process-mode",
         default="real",
         choices=("fake", "dry_run", "real"),
-        help="`real` measures the GPU; `fake`/`dry_run` exercise the plumbing without inference.",
+        help="real runs jobs on the GPU. fake and dry_run test the benchmark itself and run no inference.",
     )
     soak.add_argument("--out", type=Path, default=None, help="Output directory (default: benchmark_results/<ts>).")
     soak.add_argument(
         "--label",
         default="",
-        help="Free text naming this arm (e.g. 'baseline', 'unload-on'); recorded in the run manifest.",
+        help="A label for this run, such as 'baseline' or 'unload-on'. It is recorded in the run manifest.",
     )
     soak.add_argument(
         "--bridge-data",
         type=Path,
         default=Path("bridgeData.yaml"),
-        help="Worker config the throughput-relevant fields are carried over from (default: bridgeData.yaml).",
+        help="Worker config to copy the throughput settings from (default: bridgeData.yaml).",
     )
     soak.add_argument(
         "--ignore-bridge-data",
         action="store_true",
-        help="Do not carry any operator config over; run on harness defaults plus --override.",
+        help="Copy nothing from the worker config. The run uses the benchmark defaults plus any --override.",
     )
     soak.add_argument(
         "--override",
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Bridge-data override applied on top of the operator config (repeatable). This is the A/B knob.",
+        help="Set one config value for this run, over the worker config. Repeatable. To compare two runs, "
+        "change this between them.",
     )
     soak.add_argument(
         "--no-loras",
         action="store_true",
-        help="Strip every LoRA and textual-inversion reference from the mix (see the real-mode caveat).",
+        help="Remove every LoRA and textual-inversion reference from the mix. In real mode, pass this "
+        "unless you give --shared-lora and --unique-lora.",
     )
     soak.add_argument(
         "--shared-lora",
         action="append",
         default=[],
         metavar="REFERENCE",
-        help="Resolvable LoRA reference for the mix's cache-hit pool (repeatable; at least 3 for real mode).",
+        help="A downloadable LoRA reference for the pool the mix reuses across jobs, so later uses come "
+        "from the cache. Repeatable. Give at least 3.",
     )
     soak.add_argument(
         "--unique-lora",
         action="append",
         default=[],
         metavar="REFERENCE",
-        help="Resolvable LoRA reference for the mix's download-pressure pool (repeatable; at least 8).",
+        help="A downloadable LoRA reference for the pool the mix uses once each, so each use is a "
+        "download. Repeatable. Give at least 8.",
     )
 
 
@@ -171,31 +185,34 @@ def _add_stage_selection_args(parser: argparse.ArgumentParser) -> None:
         default=[],
         choices=[kind.value for kind in CapabilityKind],
         metavar="CAPABILITY",
-        help="Drop a single capability kind, independent of the coarse stage flags (repeatable).",
+        help="Skip one capability kind, in addition to anything the --no-* flags skip. Repeatable.",
     )
 
 
 def _add_plan_parser(subparsers: argparse._SubParsersAction) -> None:
     plan = subparsers.add_parser(
         "plan",
-        help="Show each level's resource requirements and predicted run/skip verdict (no worker is started).",
+        help="Show what each level needs and whether it would run or be skipped. No worker is started.",
     )
     plan.add_argument(
         "--tiers",
         default="sd15,sdxl",
-        help="Comma-separated model tiers to plan (sd15, sdxl, flux, qwen).",
+        help=f"Comma-separated model tiers to plan ({_TIER_NAMES}).",
     )
     plan.add_argument(
         "--process-mode",
         default="real",
         choices=("fake", "dry_run", "real"),
-        help="Resource gates (disk/VRAM/model presence) apply only in real mode; fake/dry_run always run.",
+        help="The VRAM, model, controlnet and CivitAI token checks apply only in real mode. In fake and "
+        "dry_run every level runs.",
     )
     _add_stage_selection_args(plan)
     plan.add_argument(
         "--force",
         action="store_true",
-        help="Reflect a forced ramp: show levels that do not fit the machine (or lack a CivitAI token) as RUN.",
+        help="Show a level as RUN even when it needs more VRAM than the machine has, controlnet is not "
+        "installed, or no CivitAI token is set. A flux, qwen or zimage level whose model is not downloaded "
+        "is still skipped.",
     )
     plan.add_argument("--json", action="store_true", help="Emit the plan rows as JSON instead of a table.")
 
@@ -203,16 +220,16 @@ def _add_plan_parser(subparsers: argparse._SubParsersAction) -> None:
 def _add_download_parser(subparsers: argparse._SubParsersAction) -> None:
     download = subparsers.add_parser(
         "download",
-        help="Download the model checkpoints the selected tiers need, so the timed ramp is not slowed by "
-        "downloading mid-run. Shows which models are needed, their size, and where they will be stored.",
+        help="Download the models the selected tiers need, so the timed benchmark is not slowed by "
+        "downloading mid-run. Lists each model with its size and where it will be stored.",
     )
     download.add_argument(
         "--tiers",
         default="sd15,sdxl",
-        help="Comma-separated model tiers whose checkpoints to download (sd15, sdxl, flux, qwen).",
+        help=f"Comma-separated model tiers whose models to download ({_TIER_NAMES}).",
     )
     # The download path always sets up the real worker env (so AIWORKER_CACHE_HOME resolves) and only ever
-    # runs in real mode; only ever runs in real mode.
+    # runs in real mode.
     download.set_defaults(process_mode="real")
     _add_stage_selection_args(download)
     download.add_argument(
@@ -243,9 +260,10 @@ def _add_corpus_tier_argument(parser: argparse.ArgumentParser) -> None:
         "--tier",
         default="smoke",
         choices=PRICING_CORPUS_TIERS,
-        help="standard = the marginal-cost fit set (hours); census = every value of every categorical "
-        "axis the kudos manifest encodes, plus a conflated sample (about four hours); heavy = the census "
-        "over the large baselines as well; smoke = a short subset that proves the corpus runs.",
+        help="smoke is a short subset that checks the corpus runs. standard is the set used to fit marginal "
+        "costs, and takes hours. census runs every value of every categorical axis in the kudos manifest, "
+        "plus a sample where several axes vary together, and takes about four hours. heavy is the census "
+        "over the large baselines as well.",
     )
 
 
@@ -253,8 +271,8 @@ def _add_corpus_preflight_parser(subparsers: argparse._SubParsersAction) -> None
     """Add the ``corpus-preflight`` subcommand: judge a machine before hours are spent measuring on it."""
     preflight = subparsers.add_parser(
         "corpus-preflight",
-        help="Check that this machine can produce admissible pricing-corpus rows, naming the fix for "
-        "anything that would spoil the run. Nothing is downloaded and no worker is started.",
+        help="Check that this machine can produce admissible pricing-corpus rows, and print the fix for "
+        "each problem found. Nothing is downloaded and no worker is started.",
     )
     _add_corpus_tier_argument(preflight)
     preflight.add_argument(
@@ -263,14 +281,14 @@ def _add_corpus_preflight_parser(subparsers: argparse._SubParsersAction) -> None
         default=[],
         dest="heavy_models",
         metavar="MODEL",
-        help="Heavy tier only: the models the run will be restricted to (repeatable), so the model check "
-        "covers exactly those.",
+        help="Heavy tier only. Check these models only, for a run that will be restricted to them. Repeatable.",
     )
     preflight.add_argument(
         "--machine",
         required=True,
         metavar="ID",
-        help="Stable id for this machine (lowercase, dashes; `<owner>-<gpu>` by convention).",
+        help="An id for this machine that stays the same across runs. Lowercase with dashes, "
+        "`<owner>-<gpu>` by convention.",
     )
 
 
@@ -278,24 +296,26 @@ def _add_pricing_corpus_parser(subparsers: argparse._SubParsersAction) -> None:
     """Add the ``pricing-corpus`` subcommand: the cost-attribution corpus used to fit a pricing model."""
     corpus = subparsers.add_parser(
         "pricing-corpus",
-        help="Run the pricing corpus: a deterministic, axis-sweeping workload whose stats records are "
-        "training data for a cost model. Emits a definition artifact that labels every job's cell.",
+        help="Run the pricing corpus, a fixed set of jobs that covers each job setting in turn. Its stats "
+        "records are training data for a cost model. Also writes a definition file that records which "
+        "settings each job tested.",
     )
     _add_corpus_tier_argument(corpus)
     corpus.add_argument(
         "--machine",
         default=None,
         metavar="ID",
-        help="Stable id for this machine (lowercase, dashes; `<owner>-<gpu>` by convention). Every row the "
-        "run produces is keyed on it, so it is required except for --dry-list and the smoke tier.",
+        help="An id for this machine that stays the same across runs. Lowercase with dashes, "
+        "`<owner>-<gpu>` by convention. Every row the run produces is keyed on it, so it is required "
+        "except for --dry-list and the smoke tier.",
     )
     corpus.add_argument(
         "--keep-learned-footprints",
         action="store_true",
         help=(
-            "Keep the worker's learned VRAM footprints for this run instead of resetting them. A corpus starts "
-            "from an empty store so one tier's measured peaks do not price the next; keeping them trades that "
-            "predictability for a warm start."
+            "Keep the worker's learned VRAM footprints for this run. By default a corpus starts from an "
+            "empty store, so that one tier's measured peaks do not price the next. Keeping them gives a "
+            "warm start and less predictable results."
         ),
     )
     corpus.add_argument(
@@ -309,26 +329,27 @@ def _add_pricing_corpus_parser(subparsers: argparse._SubParsersAction) -> None:
         default=[],
         dest="heavy_models",
         metavar="MODEL",
-        help="Heavy tier only: restrict the tier to these models (repeatable) for a machine that holds only "
-        "some of them; default is every heavy model.",
+        help="Heavy tier only. Run these models only, for a machine that holds some of them. Repeatable. "
+        "The default is every heavy model.",
     )
     corpus.add_argument(
         "--job-budget",
         type=int,
         default=None,
-        help="Census tier only: jobs the run may spend, warmup included (default 950, about four hours). "
-        "The vocabulary sweeps are fixed; a smaller budget shrinks only the jointly-varied conflation block.",
+        help="Census tier only. The most jobs the run may use, warmup included (default 950, about four "
+        "hours). A smaller budget shortens only the part where several axes vary together. The per-axis "
+        "sweeps keep their size.",
     )
     corpus.add_argument(
         "--emit-definition",
         type=Path,
         default=None,
-        help="Write the definition artifact here instead of next to the session stats.",
+        help="Write the definition file here instead of next to the session stats.",
     )
     corpus.add_argument(
         "--dry-list",
         action="store_true",
-        help="Print the ordered cell ids and exit; nothing is run and no worker is started.",
+        help="Print the cell ids in run order and exit. Nothing is run and no worker is started.",
     )
     corpus.add_argument(
         "--lora-version-id",
@@ -345,8 +366,8 @@ def _add_pricing_corpus_parser(subparsers: argparse._SubParsersAction) -> None:
     corpus.add_argument(
         "--no-lora-eviction",
         action="store_true",
-        help="Skip evicting the pinned LoRAs before the run; any still cached turns its miss cell into a "
-        "hit measurement.",
+        help="Do not delete the corpus's LoRAs from the cache before the run. A LoRA still cached is then "
+        "measured as a cache hit in the cell meant to measure its download.",
     )
     corpus.add_argument("--out", type=Path, default=None, help="Output directory (default: benchmark_results/<ts>).")
     corpus.add_argument(
@@ -444,14 +465,14 @@ def _format_download_plan(
     tier_label = ", ".join(tier.value for tier in tiers)
     lines = [f"Models needed for tiers {tier_label}: {len(model_names)}"]
     if plan is None:
-        lines.append("  (could not size the on-disk picture; every model will be checked when downloading)")
+        lines.append("  (model sizes and on-disk state could not be read. Each model is checked when downloading.)")
         lines.extend(f"  [unknown ] {name}" for name in model_names)
         return "\n".join(lines)
 
     for info in plan.models:
         tag = "on disk " if info.on_disk else "download"
         size = f"{info.size_bytes / 1024**3:.1f} GB" if info.size_bytes else "size unknown"
-        path = info.target_path or "(path undetermined)"
+        path = info.target_path or "(path unknown)"
         lines.append(f"  [{tag}] {info.name} ({size})  ->  {path}")
 
     free = "unknown" if plan.free_disk_bytes is None else f"{plan.free_disk_bytes / 1024**3:.1f} GB free"
@@ -461,10 +482,10 @@ def _format_download_plan(
         f"  ·  Volume: {free}",
     )
     if not plan.fits:
-        lines.append(f"  WARNING: not enough free space: about {plan.shortfall_bytes / 1024**3:.1f} GB short.")
+        lines.append(f"  WARNING: not enough free disk space, about {plan.shortfall_bytes / 1024**3:.1f} GB short.")
     if annotator_row is not None:
         size = f"~{annotator_row.size_bytes / 1024**3:.1f} GB" if annotator_row.size_bytes else "size unknown"
-        lines.append(f"Controlnet annotators (lazy, fetched on first use): {size}")
+        lines.append(f"Controlnet annotators (downloaded on first use): {size}")
     return "\n".join(lines)
 
 
@@ -953,7 +974,7 @@ def _run_run(args: argparse.Namespace) -> int:
     print(f"\nBenchmark complete: {proven}/{len(report.probes)} probes proven.")  # noqa: T201
     print(f"Report: {out_dir / 'report.md'}")  # noqa: T201
     if report.findings:
-        print(f"Robustness findings: {len(report.findings)} (see the remediation queue in the report)")  # noqa: T201
+        print(f"Findings: {len(report.findings)} (see the Findings section of the report)")  # noqa: T201
     print("\nSuggested bridgeData:")  # noqa: T201
     print(report.suggested_bridge_data.as_yaml_block())  # noqa: T201
     return 0
@@ -1144,7 +1165,7 @@ def _run_pricing_corpus(args: argparse.Namespace) -> int:
             print(f"{job.position:4d}  {job.permutation:8s}  {job.cell_id}")  # noqa: T201
         print(  # noqa: T201
             f"\n{len(definition.jobs)} jobs ({definition.warmup_job_count} warmup) over "
-            f"{len(definition.cells)} cells; shuffle seeds {', '.join(definition.shuffle_seeds)}.",
+            f"{len(definition.cells)} cells. Shuffle seeds: {', '.join(definition.shuffle_seeds)}.",
         )
         return 0
 
@@ -1279,7 +1300,7 @@ def _print_soak_summary(report: SessionDutyReport, *, label: str, stats_paths: l
     arm = f" [{label}]" if label else ""
     print(  # noqa: T201
         f"soak{arm}: {report.completed_jobs} jobs completed, {sampling_seconds:.0f}s denoise "
-        f"(sampling slot-duty); kudos is not available offline.",
+        f"(sampling slot-duty). No kudos figure, because the horde did not price these jobs.",
     )
     other = sorted(
         ((name, seconds) for name, seconds in report.slot_duty_seconds.items() if name != "sampling"),
@@ -1481,7 +1502,10 @@ def _run_report(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
-    parser = argparse.ArgumentParser(prog="horde-benchmark", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="horde-benchmark",
+        description="A benchmark runs test jobs of increasing difficulty and suggests settings for bridgeData.yaml.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     _add_run_parser(subparsers)
@@ -1494,7 +1518,7 @@ def main(argv: list[str] | None = None) -> int:
     report = subparsers.add_parser("report", help="Re-render the markdown report from an output directory.")
     report.add_argument("out_dir", type=Path)
 
-    monitor = subparsers.add_parser("monitor", help="Tail a run's progress.jsonl live (attach or replay).")
+    monitor = subparsers.add_parser("monitor", help="Follow a run's progress.jsonl, live or as a replay.")
     monitor.add_argument("out_dir", type=Path)
     monitor.add_argument(
         "-v",
@@ -1503,7 +1527,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Show the per-process state summary on each progress line.",
     )
 
-    subparsers.add_parser("live", help="Open-loop load generation against a live API (not yet implemented).")
+    subparsers.add_parser("live", help="Generate load against a live AI Horde API (not implemented yet).")
 
     args = parser.parse_args(argv)
 

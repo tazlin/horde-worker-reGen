@@ -350,28 +350,27 @@ def synthesize_bridge_data(
         peak_vram = baseline.stats.vram_used_high_water_mb if baseline is not None and baseline.stats else None
         if not _fits_with_headroom(baseline_passed=True, peak_vram_mb=peak_vram, total_vram_mb=total_vram_mb):
             notes.append(
-                f"{BENCH_TIER_MODELS[tier]} omitted from models_to_load: its peak VRAM leaves under "
-                f"{_MIN_VRAM_HEADROOM_MB} MB headroom on this GPU.",
+                f"{BENCH_TIER_MODELS[tier]} is left out of models_to_load because its peak VRAM leaves "
+                f"under {_MIN_VRAM_HEADROOM_MB} MB free on this GPU.",
             )
             continue
         if tier in soak.unstable_tiers:
             notes.append(
-                f"{BENCH_TIER_MODELS[tier]} omitted from models_to_load: its sustained-load soak ran and did "
-                "not hold up.",
+                f"{BENCH_TIER_MODELS[tier]} is left out of models_to_load because its soak was unstable.",
             )
             continue
         if tier in soak.skipped_tiers:
             notes.append(
-                f"{BENCH_TIER_MODELS[tier]} omitted from models_to_load: its sustained-load soak was skipped, so "
-                "stability under combined load was never validated.",
+                f"{BENCH_TIER_MODELS[tier]} is left out of models_to_load because its soak was skipped, so it "
+                "was never tested under sustained load.",
             )
             continue
         if tier in soak.inconclusive_tiers:
             # The baseline passed and fits with headroom; the soak failure was not load instability, so
             # keep the model resident rather than zeroing out the recommendation, but say so plainly.
             notes.append(
-                f"{BENCH_TIER_MODELS[tier]} kept in models_to_load despite an inconclusive soak: "
-                f"{soak.inconclusive_reasons[tier]}.",
+                f"{BENCH_TIER_MODELS[tier]} is kept in models_to_load although its soak was inconclusive "
+                f"({soak.inconclusive_reasons[tier]}).",
             )
         models_to_load.append(BENCH_TIER_MODELS[tier])
     suggestion.models_to_load = models_to_load
@@ -385,7 +384,7 @@ def synthesize_bridge_data(
         suggestion.alchemy_allow_concurrent = False
         suggestion.alchemy_max_concurrency = 1
         concurrent_capped_by_soak = True
-        notes.append("Concurrent alchemy disabled: the sustained-load soak showed instability under combined load.")
+        notes.append("Concurrent alchemy is off because the soak was unstable with image jobs and alchemy together.")
 
     suggestion.notes = notes
     suggestion.decisions = _build_decisions(

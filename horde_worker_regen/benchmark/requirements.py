@@ -729,9 +729,11 @@ def requirement_skip_reason(
     # never downloads checkpoints, so there is nothing to run.
     if req.models_missing and _tier_is_huge(req.tier):
         beta_hint = (
-            " (a beta model: set HORDE_MODEL_REFERENCE_PRIMARY_API_URL and await publication)"
+            " (a beta model. Set HORDE_MODEL_REFERENCE_PRIMARY_API_URL, then download it once the beta "
+            "reference lists it)"
             if _tier_is_beta(req.tier)
-            else " (real-mode benchmarking does not download checkpoints; use Download models first)"
+            else " (the benchmark does not download models. Run `horde-benchmark download` or use Download "
+            "models in the dashboard first)"
         )
         missing = ", ".join(_missing_label(req, name) for name in req.models_missing)
         return f"{req.tier} model {missing} is not present on disk{beta_hint}"

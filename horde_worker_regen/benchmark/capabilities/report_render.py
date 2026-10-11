@@ -2,7 +2,7 @@
 
 The capability-engine port of ``report.render_markdown``: the same report shape (capability surface,
 suggested bridgeData with per-setting provenance, sustained-load soak, per-job time breakdown, and the
-remediation queue), read off ``report.probes`` (capability + verdict) instead of the old ``levels``.
+findings), read off ``report.probes`` (capability + verdict) instead of the old ``levels``.
 Kept separate from :mod:`recommendation` so the pure synthesis has no rendering concern, and torch-free
 so any surface can render a stored report without booting anything.
 """
@@ -69,8 +69,8 @@ def _render_capabilities(capabilities: WorkerCapabilities) -> list[str]:
         ("post-processing", capabilities.supports_post_processing),
         ("controlnet (SD1.5)", capabilities.supports_controlnet),
         ("qr-code workflow (SDXL controlnet)", capabilities.supports_qr_code),
-        ("alchemy CLIP lane", capabilities.supports_alchemy_clip),
-        ("alchemy graph lane", capabilities.supports_alchemy_graph),
+        ("alchemy caption, interrogation and NSFW forms", capabilities.supports_alchemy_clip),
+        ("alchemy upscale, face-fix and background-removal forms", capabilities.supports_alchemy_graph),
         ("concurrent alchemy", capabilities.supports_alchemy_concurrent),
         ("ad-hoc lora", capabilities.supports_lora),
     ]
@@ -86,7 +86,7 @@ def _render_provenance(decisions: list[SuggestionDecision]) -> list[str]:
     The point is to let an operator tell a capability that was *proven off* (tested and failed) from one
     that is merely *untested* (skipped or absent), which the YAML alone cannot convey.
     """
-    lines = ["Why each value (provenance):", "", "| Setting | Value | Basis | Detail |", "|---|---|---|---|"]
+    lines = ["Why each value:", "", "| Setting | Value | Basis | Detail |", "|---|---|---|---|"]
     for decision in decisions:
         value_text, label, detail = describe_decision(decision)
         lines.append(f"| {decision.setting} | {value_text} | {label} | {detail} |")
@@ -95,7 +95,7 @@ def _render_provenance(decisions: list[SuggestionDecision]) -> list[str]:
 
 
 def render_markdown(report: CapabilityReport) -> str:
-    """Render the human-readable report, ending with the remediation queue."""
+    """Render the human-readable report, ending with the findings section."""
     lines: list[str] = ["# Worker Benchmark Report", ""]
 
     if report.machine.gpu_name:
@@ -109,7 +109,7 @@ def render_markdown(report: CapabilityReport) -> str:
 
     lines.append("## Probes")
     lines.append("")
-    lines.append("| Probe | Verdict | it/s p50 | GPU busy % | VRAM HW (MB) | Notes |")
+    lines.append("| Probe | Verdict | it/s p50 | GPU busy % | Peak VRAM (MB) | Notes |")
     lines.append("|---|---|---|---|---|---|")
     for result in report.probes:
         stats = result.stats
@@ -127,9 +127,9 @@ def render_markdown(report: CapabilityReport) -> str:
     lines.append("## Suggested bridgeData")
     lines.append("")
     lines.append(
-        "A conservative recommendation: only models that fit with VRAM headroom are loaded, the batch "
-        "size is the largest that passed cleanly, and concurrent alchemy is enabled only if the soak held "
-        "up. See the capability table above for everything the worker *can* do.",
+        "These settings are conservative. Only models that fit with VRAM headroom are loaded. The batch "
+        "size is the largest that passed with no findings. Concurrent alchemy is on only if the soak was "
+        "stable. The capability table above lists everything the worker can do.",
     )
     lines.append("")
     lines.append("```yaml")
@@ -146,7 +146,7 @@ def render_markdown(report: CapabilityReport) -> str:
         lines.append("")
     inconsistencies = verify_suggestion_consistency(report)
     if inconsistencies:
-        lines.append("> **Consistency check flagged the recommendation:**")
+        lines.append("> **Some suggested settings are not backed by a passed probe:**")
         for problem in inconsistencies:
             lines.append(f"> - {problem}")
         lines.append("")
@@ -156,8 +156,8 @@ def render_markdown(report: CapabilityReport) -> str:
         lines.append("## Validation (sustained load)")
         lines.append("")
         lines.append(
-            "Soaks the recommended config above under continuous, mostly-max-config mixed traffic, "
-            "confirming throughput holds and nothing degrades over time.",
+            "The soak runs the suggested settings above under a continuous mix of jobs, most of them at the "
+            "limits those settings allow. It checks that throughput holds and nothing gets worse over time.",
         )
         lines.append("")
         lines.append("| Tier | Verdict | Duration (s) | Jobs done | GPU duty | it/s retained | Faults | Recoveries |")
@@ -188,12 +188,12 @@ def render_markdown(report: CapabilityReport) -> str:
         result for result in (soak_results or report.probes) if result.stats and result.stats.phase_breakdown_seconds
     ]
     if timed:
-        lines.append("## Where the time goes (per job, median seconds)")
+        lines.append("## Time per job by phase (median seconds)")
         lines.append("")
         lines.append(
-            "Median time a typical image job spends in each phase. `other_inference` is the inference time "
-            "outside model load, sampling and VAE (graph build, prompt encode, image encode, IPC); the prime "
-            "target for raising GPU duty.",
+            "Median time an image job spends in each phase. `other_inference` is the inference time "
+            "outside model load, sampling and VAE (graph build, prompt encode, image encode, IPC). "
+            "It is the first place to look when raising GPU duty.",
         )
         lines.append("")
         for result in timed:
@@ -216,15 +216,15 @@ def render_markdown(report: CapabilityReport) -> str:
             if no_jobs:
                 lines.append("")
                 lines.append(
-                    f"Plus ~{no_jobs:.0f}s of the run with no jobs available (horde demand, not the worker): "
-                    "demand-limited idle, separate from the per-job gaps above.",
+                    f"The run also spent ~{no_jobs:.0f}s with no jobs available. That idle time is from a "
+                    "lack of jobs, not from the worker, and is not part of the per-job times above.",
                 )
             lines.append("")
 
-    lines.append("## Remediation queue")
+    lines.append("## Findings")
     lines.append("")
     if not report.findings:
-        lines.append("No robustness findings; no crashes, hangs, lost jobs, or stalls observed.")
+        lines.append("No findings. No crashes, hangs, lost jobs or stalls were seen.")
     else:
         for finding in report.findings:
             lines.append(f"- **{finding.kind}** ({finding.level_id}): {finding.evidence}")

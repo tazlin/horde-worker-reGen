@@ -388,10 +388,10 @@ def format_sync_plan(plan: SyncPlan) -> str:
     lines = ["  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)) for row in rows]
 
     total = human_bytes(plan.total_download_bytes)
-    approx = "" if plan.sizes_complete else " (lower bound; some sizes unknown)"
-    owned = "owned" if plan.cache_is_owned else "shared/external"
+    approx = "" if plan.sizes_complete else " or more (some sizes are unknown)"
+    owned = "used only by this worker" if plan.cache_is_owned else "not the worker's, so it is never cleaned"
     lines.append("")
-    lines.append(f"Total download ~{total}{approx}; free {human_bytes(plan.free_disk_bytes)}.")
+    lines.append(f"Total download: about {total}{approx}. Free disk space: {human_bytes(plan.free_disk_bytes)}.")
     lines.append(f"Cache: {plan.cache_dir} ({owned}).")
     return "\n".join(lines)
 
@@ -425,7 +425,10 @@ def decide(
     if not plan.has_skippable_upgrade:
         if hold_requested:
             floor = ", ".join(c.name for c in plan.large_upgrades)
-            emit(f"This {floor} upgrade is mandatory (a dependency requires the newer version); cannot limp along.")
+            emit(
+                f"The {floor} upgrade is mandatory because a dependency requires the newer version, so the "
+                "installed version cannot be kept.",
+            )
         return "proceed_full"
 
     if hold_requested:
@@ -442,8 +445,8 @@ def decide(
 
     answer = (
         prompt(
-            f"This update downloads ~{human_bytes(plan.total_download_bytes)}. "
-            "[U]pgrade now / [H]old current versions / [C]ancel? ",
+            f"This update downloads about {human_bytes(plan.total_download_bytes)}. "
+            "[U]pgrade now / [H]old torch and update the rest / [C]ancel? ",
         )
         .strip()
         .lower()
