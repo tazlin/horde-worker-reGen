@@ -489,6 +489,8 @@ async def test_representative_worker_lifecycle_canaries(case_name: str) -> None:
             inference_fault_profile=case.inference_fault_profile,
             fake_initially_available_models=case.fake_initially_available_models,
             fake_download_delay_seconds=case.fake_download_delay_seconds,
+            # A case with a floor on disaggregated jobs must not lose its first job to a lane still starting.
+            hold_jobs_until_pipeline_lanes_ready=case.min_disaggregated_sample_stages > 0,
         ),
     )
 

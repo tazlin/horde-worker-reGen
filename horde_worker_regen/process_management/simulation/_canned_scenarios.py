@@ -75,6 +75,7 @@ class CannedJobSource:
     _cycle: bool
     _next_index: int
     _terminal_fault_ledger: set[str] | None
+    _release_gate: Callable[[], bool] | None = None
 
     def __init__(
         self,
@@ -100,6 +101,24 @@ class CannedJobSource:
         self._cycle = cycle
         self._next_index = 0
         self._terminal_fault_ledger = terminal_fault_ledger
+
+    def hold_until(self, ready: Callable[[], bool]) -> None:
+        """Answer every pop with the empty response until ``ready`` first returns true.
+
+        A harness uses this to keep a scenario back until the worker reaches a state the scenario
+        depends on. The worker keeps popping throughout and is told no job is available, as it would
+        be by a horde with nothing for it. Once ``ready`` has returned true it is not asked again.
+        """
+        self._release_gate = ready
+
+    def _held(self) -> bool:
+        """Whether the hold set by :meth:`hold_until` is still in force."""
+        if self._release_gate is None:
+            return False
+        if not self._release_gate():
+            return True
+        self._release_gate = None
+        return False
 
     @property
     def exhausted(self) -> bool:
@@ -133,7 +152,7 @@ class CannedJobSource:
         scan is bounded by the list length so a cycling source whose every job is refused reports no
         job available rather than spinning.
         """
-        if len(self._jobs) == 0:
+        if self._held() or len(self._jobs) == 0:
             return make_empty_pop_response()
 
         for _ in range(len(self._jobs)):
@@ -729,6 +748,8 @@ class GeneratingJobSource(CannedJobSource):
         reports no job available. This keeps pop-side governors (including LoRA intake caps, feature
         withholding, multi-GPU targeting, and the idle-fill model/size ladder) load-bearing in simulation.
         """
+        if self._held():
+            return make_empty_pop_response()
         if self._stopped:
             return make_empty_pop_response()
         templates, weights = self._eligible_templates(pop_request)
@@ -850,6 +871,9 @@ class TimedJobSource(CannedJobSource):
 
     def next_pop_response(self, pop_request: ImageGenerateJobPopRequest | None = None) -> ImageGenerateJobPopResponse:
         """Return the next job if its arrival time has passed, else a no-job response."""
+        # Before the clock starts, so a held scenario's arrival schedule runs from its release.
+        if self._held():
+            return make_empty_pop_response()
         if self._start_time is None:
             self._start_time = self._clock()
 

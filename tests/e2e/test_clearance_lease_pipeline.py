@@ -96,6 +96,8 @@ async def test_disaggregated_streak_grants_every_sampling_window(monkeypatch: py
             process_mode="fake",
             skip_api=True,
             job_delay_seconds=_SAMPLE_SECONDS,
+            # Every job is counted as a disaggregated one, so none may be released before the lanes are up.
+            hold_jobs_until_pipeline_lanes_ready=True,
             timeout_seconds=240.0,
             bridge_data_overrides={
                 "max_threads": 2,
@@ -180,6 +182,8 @@ async def test_single_model_streak_on_one_sampling_slot_stays_priced_and_drains(
             process_mode="fake",
             skip_api=True,
             job_delay_seconds=_SAMPLE_SECONDS,
+            # Every job is counted as a disaggregated one, so none may be released before the lanes are up.
+            hold_jobs_until_pipeline_lanes_ready=True,
             timeout_seconds=240.0,
             bridge_data_overrides={
                 "max_threads": 1,

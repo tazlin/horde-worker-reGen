@@ -13,6 +13,7 @@ from horde_worker_regen.benchmark.scenarios import (
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
+    CannedJobSource,
     GeneratingJobSource,
     TimedJobSource,
     make_alchemy_scenario,
@@ -344,6 +345,52 @@ class TestTimedJobSource:
         source = TimedJobSource(jobs, ArrivalSchedule(kind="all_at_once"), clock=lambda: 0.0)
         assert source.next_pop_response().id_ is not None
         assert source.next_pop_response().id_ is not None
+
+    def test_a_held_schedule_runs_from_its_release(self) -> None:
+        """A hold keeps every job back, and the arrival schedule starts when the hold lifts."""
+        now = [0.0]
+        ready = [False]
+        jobs = [make_canned_job() for _ in range(2)]
+        source = TimedJobSource(jobs, ArrivalSchedule(kind="steady", rate_per_minute=60), clock=lambda: now[0])
+        source.hold_until(lambda: ready[0])
+
+        assert source.next_pop_response().id_ is None
+        now[0] = 5.0
+        assert source.next_pop_response().id_ is None
+        ready[0] = True
+        assert source.next_pop_response().id_ == jobs[0].id_
+        # One second after the release, not one second after the first held pop.
+        assert source.next_pop_response().id_ is None
+        now[0] = 6.0
+        assert source.next_pop_response().id_ == jobs[1].id_
+
+
+class TestHeldJobSource:
+    """A source told to hold answers empty pops until its condition first holds."""
+
+    def test_no_job_is_released_until_the_condition_holds(self) -> None:
+        """The held source reports no job available and keeps its whole list for the release."""
+        ready = [False]
+        jobs = [make_canned_job() for _ in range(2)]
+        source = CannedJobSource(jobs)
+        source.hold_until(lambda: ready[0])
+
+        assert source.next_pop_response().id_ is None
+        assert source.jobs_emitted == 0
+        assert not source.exhausted
+        ready[0] = True
+        assert source.next_pop_response().id_ == jobs[0].id_
+
+    def test_the_condition_is_not_asked_again_after_the_release(self) -> None:
+        """A released source stays released if the condition later stops holding."""
+        ready = [True]
+        jobs = [make_canned_job() for _ in range(2)]
+        source = CannedJobSource(jobs)
+        source.hold_until(lambda: ready[0])
+
+        assert source.next_pop_response().id_ == jobs[0].id_
+        ready[0] = False
+        assert source.next_pop_response().id_ == jobs[1].id_
 
 
 class TestScenario:

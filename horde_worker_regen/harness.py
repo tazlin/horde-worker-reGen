@@ -238,6 +238,14 @@ class HarnessConfig:
     arrival: ArrivalSchedule | None = None
     """When set, image jobs are released to the popper on this schedule instead of all at once."""
 
+    hold_jobs_until_pipeline_lanes_ready: bool = False
+    """When set, no image job is released until every enabled pipeline lane has finished starting.
+
+    An inference process and the component lane start side by side, and either can be ready first. A
+    job dispatched before the component lane is ready runs monolithic, so a scenario that counts
+    disaggregated jobs gets a different count depending on which process won. The worker pops as
+    usual during the hold and is told no job is available."""
+
     process_mode: HarnessProcessMode = "fake"
     """Which child processes to launch: protocol-faithful fakes, real processes in
     dry-run mode, or fully real processes."""
@@ -1305,7 +1313,19 @@ def build_harness_process_manager(
             raise ValueError("control_loop_interval_seconds must be greater than zero")
         manager._loop_interval = config.control_loop_interval_seconds
 
+    if config.hold_jobs_until_pipeline_lanes_ready and canned_job_source is not None:
+        canned_job_source.hold_until(lambda: _pipeline_lanes_ready(manager))
+
     return manager, len(scenario)
+
+
+def _pipeline_lanes_ready(manager: HordeWorkerProcessManager) -> bool:
+    """Whether every enabled pipeline lane (component, VAE) has a process that has finished starting."""
+    lifecycle = manager._process_lifecycle
+    process_map = manager._process_map
+    if lifecycle.component_lane_enabled() and process_map.num_loaded_component_processes() == 0:
+        return False
+    return not (lifecycle.vae_lane_enabled() and process_map.num_loaded_vae_lane_processes() == 0)
 
 
 _HARNESS_STAGE_BUDGET_FIELDS: dict[JobStage, str] = {
