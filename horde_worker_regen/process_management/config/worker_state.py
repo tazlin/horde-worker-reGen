@@ -257,7 +257,7 @@ class WorkerState:
     process is draining."""
 
     post_processing_disabled_by_breaker: bool = False
-    """The post-processing fault breaker (or a whole-card residency conflict) has stopped advertising post-processing.
+    """The post-processing fault breaker has stopped advertising post-processing.
 
     Over-commit faults on accepted post-processing work feed the breaker; the faults the latch itself issues to
     drain pending work do not. While true the job popper stops advertising post-processing and the orchestrator
@@ -269,9 +269,9 @@ class WorkerState:
     """Whether the current ``post_processing_disabled_by_breaker`` latch clears on its own.
 
     True for the rolling-window fault-count breaker: it clears once the window holds no over-commit fault and
-    the offer probe finds a driven card the arbiter does not rule the post-processing peak out on, and a
-    whole-card residency restores a lane it paused under this latch. False for the structural whole-card
-    residency conflict, which holds until restart and keeps the lane paused. Read only while
+    the offer probe finds a driven card the arbiter does not rule the post-processing peak out on. A latch
+    set without the marker holds until restart. A whole-card residency that pauses the lane restores it at
+    release whatever this latch holds, since the latch withholds the offer by itself. Read only while
     ``post_processing_disabled_by_breaker`` is true."""
 
     post_processing_breaker_tripped_at: float = 0.0
@@ -280,9 +280,7 @@ class WorkerState:
     post_processing_disabled_reason: str = ""
     """Operator-facing reason post-processing was session-disabled; empty when still enabled.
 
-    The fault breaker and whole-card residency compatibility checks both use
-    ``post_processing_disabled_by_breaker`` to stop advertising post-processing. This detail tells the TUI and
-    logs which structural condition caused the session latch.
+    Set with ``post_processing_disabled_by_breaker``; it tells the TUI and the logs what tripped the latch.
     """
 
     post_processing_withheld_for_headroom: bool = False

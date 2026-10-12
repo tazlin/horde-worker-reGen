@@ -504,7 +504,6 @@ class TestWholeCardPostProcessLanePolicy:
 
         paused = scheduler._pause_post_process_for_residency_if_idle(
             None,
-            model_name=_FLUX_MODEL,
             forecast=forecast,
         )
 
@@ -513,8 +512,8 @@ class TestWholeCardPostProcessLanePolicy:
         assert lifecycle.is_post_process_gpu_paused is False
         assert state.post_processing_disabled_by_breaker is False
 
-    def test_context_incompatible_idle_lane_disables_pp_and_stops_lane(self) -> None:
-        """If the PP context itself cannot coexist with the whole-card model, PP is disabled for the session."""
+    def test_context_incompatible_idle_lane_pauses_the_lane_under_the_residency(self) -> None:
+        """If the PP context cannot coexist with the whole-card model, the residency pauses the lane and owns it."""
         scheduler, lifecycle, state, pp_process = _scheduler_with_post_process_lane()
         forecast = _forecast_16gb(
             weights_mb=_FLUX_WEIGHTS_MB,
@@ -525,38 +524,16 @@ class TestWholeCardPostProcessLanePolicy:
 
         paused = scheduler._pause_post_process_for_residency_if_idle(
             None,
-            model_name=_FLUX_MODEL,
             forecast=forecast,
         )
 
         assert paused is True
-        assert state.post_processing_disabled_by_breaker is True
-        assert _FLUX_MODEL in state.post_processing_disabled_reason
+        assert state.post_processing_disabled_by_breaker is False
         assert lifecycle.is_post_process_gpu_paused is True
         assert lifecycle.post_process_processes_should_be_replaced is True
         assert pp_process.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
-    def test_context_incompatible_promotes_a_fault_count_latch_to_structural(self) -> None:
-        """A structural conflict arriving under the self-clearing fault-count latch must outlive that latch."""
-        scheduler, lifecycle, state, _pp_process = _scheduler_with_post_process_lane()
-        state.post_processing_disabled_by_breaker = True
-        state.post_processing_breaker_auto_recoverable = True
-        state.post_processing_disabled_reason = "fault-count latch"
-        forecast = _forecast_16gb(
-            weights_mb=_FLUX_WEIGHTS_MB,
-            reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
-            free_now_mb=_FLUX16_ESTABLISH_FREE_NOW_MB,
-            wants_whole_card=True,
-        )
-
-        scheduler._pause_post_process_for_residency_if_idle(None, model_name=_FLUX_MODEL, forecast=forecast)
-
-        assert state.post_processing_disabled_by_breaker is True
-        assert state.post_processing_breaker_auto_recoverable is False
-        assert _FLUX_MODEL in state.post_processing_disabled_reason
-        assert lifecycle.is_post_process_gpu_paused is True
-
-    async def test_context_incompatible_backlog_disables_pp_but_leaves_lane_for_drain(self) -> None:
+    async def test_context_incompatible_backlog_leaves_lane_for_drain(self) -> None:
         """A queued PP job blocks stopping the lane; the orchestrator owns the bounded no-image fault."""
         tracker = JobTracker()
         pending_job = _make_pp_job_info()
@@ -571,34 +548,32 @@ class TestWholeCardPostProcessLanePolicy:
 
         paused = scheduler._pause_post_process_for_residency_if_idle(
             None,
-            model_name=_FLUX_MODEL,
             forecast=forecast,
         )
 
         assert paused is False
-        assert state.post_processing_disabled_by_breaker is True
+        assert state.post_processing_disabled_by_breaker is False
         assert pending_job in tracker.jobs_pending_post_processing
         assert lifecycle.is_post_process_gpu_paused is False
         assert lifecycle.post_process_processes_should_be_replaced is False
         assert pp_process.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
     @pytest.mark.parametrize(
-        ("auto_recoverable", "expect_restore"),
+        "auto_recoverable",
         [
-            pytest.param(True, True, id="fault_count_latch_restores_lane"),
-            pytest.param(False, False, id="structural_latch_keeps_lane_paused"),
+            pytest.param(True, id="fault_count_latch"),
+            pytest.param(False, id="latch_held_to_restart"),
         ],
     )
-    def test_residency_release_restores_lane_unless_latch_is_structural(
+    def test_residency_release_restores_the_lane_whatever_the_breaker_holds(
         self,
         *,
         auto_recoverable: bool,
-        expect_restore: bool,
     ) -> None:
-        """Only the structural whole-card latch keeps the lane paused when the residency releases.
+        """The residency brings back the lane it paused; the breaker latch withholds the offer on its own.
 
-        A lane paused while the fault-count breaker happened to be latched must come back at release: that
-        latch clears on its own, and a lane left off the card would outlive it.
+        A lane left off the card under a latch would outlive the latch, and the worker's other models lose
+        their post-processing for the rest of the session.
         """
         scheduler, lifecycle, state, _pp_process = _scheduler_with_post_process_lane()
         restore = Mock(return_value=True)
@@ -610,10 +585,7 @@ class TestWholeCardPostProcessLanePolicy:
 
         scheduler._restore_siblings_after_whole_card()
 
-        if expect_restore:
-            restore.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
-        else:
-            restore.assert_not_called()
+        restore.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
 
 
 class TestReservedHeadNeverWaitsIndefinitely:

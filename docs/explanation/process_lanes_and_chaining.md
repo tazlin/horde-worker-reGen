@@ -210,9 +210,9 @@ its post-processing weights offers the ones it holds rather than all or none.
 
 Both readings are **derived live** from whether a lane is up rather than latched at pause time. Restore
 ownership is the reason: whoever paused the lane owns bringing it back, and a latch would leave the offer gated
-on some other party clearing state it does not own. The whole-card residency path additionally sets its
-session-long post-processing disable, because that case is a structural incompatibility rather than a transient
-pause.
+on some other party clearing state it does not own. A whole-card model whose weights cannot coexist with the
+lane's context pauses the lane under the residency's own owner for the hold and restores it at release, so
+the offer closes while that model holds the card and reopens for the worker's other models once it drains.
 
 ### Decode-drain eligibility: a VAE-lane pause defers to a queued decode
 

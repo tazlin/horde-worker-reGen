@@ -6,7 +6,8 @@ self-protective breaker: a rolling-window counter fed by both fault sources (the
 faults and watchdog-reaped post-processing stalls), a trip when the count *exceeds* the threshold, and
 recovery once the window is quiet and the VRAM arbiter does not rule the peak out on every driven card. The
 pop-time offer is the same arbiter verdict: it is withheld only while every driven card returns DENY for the
-representative chain, never on a transient shortage. A structural whole-card disable never auto-recovers.
+representative chain, never on a transient shortage. A latch without the auto-recoverable marker never
+auto-recovers.
 """
 
 from __future__ import annotations
@@ -251,11 +252,11 @@ class TestPostProcessingBreakerAutoRecovery:
         manager._apply_post_processing_fault_breaker()
         assert manager._state.post_processing_disabled_by_breaker is False
 
-    def test_structural_whole_card_latch_never_auto_recovers(self) -> None:
-        """A latch set without the auto-recoverable marker (the whole-card conflict) stays disabled."""
+    def test_a_latch_without_the_auto_recoverable_marker_never_auto_recovers(self) -> None:
+        """A latch set without the auto-recoverable marker stays disabled until restart."""
         manager = make_testable_process_manager()
         _install_cycle(manager, {0: _roomy_card()})
-        # The scheduler's whole-card disable sets the latch but leaves ``auto_recoverable`` false (default).
+        # A latch set without the marker, as a caller that wants it held to restart would set it.
         manager._state.post_processing_disabled_by_breaker = True
         manager._state.post_processing_breaker_auto_recoverable = False
 

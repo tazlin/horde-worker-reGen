@@ -2322,47 +2322,23 @@ class InferenceScheduler:
             return True
         return post_process_context_fits(forecast, self._whole_card_ledger.target_process_count(forecast))
 
-    def _disable_post_processing_for_whole_card(self, model_name: str | None, forecast: StreamForecast) -> None:
-        """Session-disable post-processing because a whole-card model cannot fit beside the lane context.
-
-        A latch the fault-count breaker already holds is promoted rather than left alone: that latch clears on
-        its own, and a structural conflict recorded under it would clear with it and reopen the thrash.
-        """
-        already_structural = (
-            self._state.post_processing_disabled_by_breaker
-            and not self._state.post_processing_breaker_auto_recoverable
-        )
-        if already_structural:
-            return
-        model = model_name or "the whole-card model"
-        self._state.post_processing_disabled_by_breaker = True
-        self._state.post_processing_breaker_auto_recoverable = False
-        self._state.post_processing_breaker_tripped_at = time.time()
-        self._state.post_processing_disabled_reason = (
-            f"Disabled: {model} needs whole-card residency and cannot fit beside the dedicated "
-            "post-processing lane's GPU context. Disable post-processing or move this workload to a card "
-            "with more VRAM, then restart."
-        )
-        logger.warning(
-            f"Disabling post-processing for this session: {model} needs whole-card residency and cannot fit "
-            "beside the dedicated post-processing lane's GPU context. Keeping post-processing enabled would "
-            "thrash the large model in and out of VRAM for every post-processing job. To restore it, disable "
-            "whole-card models or post-processing for this worker, move the workload to a larger card, and restart.",
-        )
-
     def _pause_post_process_for_residency_if_idle(
         self,
         device_index: int | None,
         *,
-        model_name: str | None,
         forecast: StreamForecast,
     ) -> bool:
-        """Reclaim the post-processing lane for residency without stranding supported PP work."""
+        """Reclaim the post-processing lane for residency without stranding supported PP work.
+
+        A lane context that cannot coexist with the whole-card model is paused under the residency's own
+        owner, which is what brings it back at release; the offer follows the paused lane on its own, so no
+        post-processing work is accepted while the card is held. The pause is per residency, since the
+        conflict is with this model, and the worker's other models keep their post-processing once it drains.
+        """
         if not self._residency_should_pause_post_process(device_index):
             return False
         if self._post_process_context_fits_with_residency(forecast, device_index=device_index):
             return self.unload_post_process_models_from_vram(device_index=device_index)
-        self._disable_post_processing_for_whole_card(model_name, forecast)
         if self._process_lifecycle.is_post_process_gpu_paused or self._job_tracker.post_processing_backlog_depth > 0:
             return False
         return self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
@@ -2655,7 +2631,6 @@ class InferenceScheduler:
         )
         post_process_paused = self._pause_post_process_for_residency_if_idle(
             device_index,
-            model_name=job.model,
             forecast=forecast,
         )
         # The disaggregated pipeline's VAE lane holds an equivalent bare CUDA context; stop it off-GPU on the
@@ -2719,7 +2694,7 @@ class InferenceScheduler:
                     spared_process_id=state.prestage_process_id,
                 )
             if forecast is not None:
-                self._pause_post_process_for_residency_if_idle(device_index, model_name=model, forecast=forecast)
+                self._pause_post_process_for_residency_if_idle(device_index, forecast=forecast)
             self._pause_vae_lane_for_residency_if_drained(device_index)
             # The teardown gate holds the head until the component lane has left the card, so the pause has to
             # be ordered here as well as at establishment: a pre-staged head only ever claims the card through
@@ -3099,16 +3074,11 @@ class InferenceScheduler:
             self._min_hold_disclosed.pop(device_index, None)
             if self._reclaim_ladder is not None:
                 self._reclaim_ladder.discharge_context_reduction(device_index)
-            # Only the structural whole-card latch keeps the lane down: it means the lane cannot coexist with
-            # the residency model at all. The fault-count latch recovers on its own and withholds the offer by
-            # itself, so a lane left paused under it would stay off the card after that latch clears.
-            structural_post_processing_latch = (
-                self._state.post_processing_disabled_by_breaker
-                and not self._state.post_processing_breaker_auto_recoverable
-            )
+            # The lane comes back whatever the fault breaker holds: that latch withholds the offer by itself and
+            # clears on its own, so a lane left paused under it would stay off the card after it cleared.
             post_process_restored = (
                 self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
-                if self._residency_should_pause_post_process(device_index) and not structural_post_processing_latch
+                if self._residency_should_pause_post_process(device_index)
                 else False
             )
             vae_lane_restored = (

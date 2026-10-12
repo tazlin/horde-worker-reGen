@@ -2738,8 +2738,8 @@ class HordeWorkerProcessManager:
     def _maybe_reenable_post_processing_after_breaker(self, *, recent_faults: int) -> None:
         """Re-enable post-processing once the fault window is quiet and the offer probe finds a card for it.
 
-        Only the fault-count breaker's latch auto-recovers; a structural whole-card residency disable stays
-        latched to restart. Re-enable needs no over-commit fault within the window and the same probe the offer
+        Only a latch carrying the auto-recoverable marker recovers here; one set without it holds to restart.
+        Re-enable needs no over-commit fault within the window and the same probe the offer
         gate uses (:meth:`_post_processing_offer_denial`), so the breaker never re-opens what the offer would
         refuse. A host with no device reading has no card the probe can rule out and re-enables on the window
         alone. Edge-triggered: it runs only while the latch is set and clears it, so the log fires once.
