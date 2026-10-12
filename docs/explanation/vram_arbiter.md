@@ -55,7 +55,11 @@ runs. In-flight sampling is never touched by the growth hold.
 Reclaim is single-owner. The governor's SATURATED ladder and the arbiter's per-cycle DEFER actuations run
 through one engine, so the two triggers can never become two mechanisms evicting the same card by different
 rules. The engine reclaims in LIFO order (newest idle resident first, since the driver demotes the
-least-recently-touched allocator), and it **verifies**: after issuing a rung it compares the realized NVML
+least-recently-touched allocator). A reclaim issued for a known shortfall (a post-processing chain's deferral
+verdict, or a save-our-ship remedy whose head is held for a pending chain) first takes the smallest idle
+resident that covers the shortfall alone, so it never spends a rung on a resident too small to clear the
+block. LIFO order applies when no single resident covers the shortfall or pressure relief has no shortfall
+figure. The engine also **verifies** each issued rung by comparing the realized NVML
 device-free gain against the rung's promised figure on each following governor sample, escalating only once the
 rung has realized nothing further for a verification budget scaled by the memory it promised, and marking the
 episode *unresolved* only once every rung has run without relieving the card. Because the budget scales with

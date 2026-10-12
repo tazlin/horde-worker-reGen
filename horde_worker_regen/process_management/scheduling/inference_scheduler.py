@@ -81,6 +81,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRungKind,
     VerifiedReclaimLadder,
     build_reclaim_ladder,
+    smallest_covering_resident,
     teardown_verification_settle_seconds,
 )
 from horde_worker_regen.process_management.resources.resource_budget import (
@@ -4250,6 +4251,25 @@ class InferenceScheduler:
         """
         return self._head_admission.stall_reason
 
+    def head_reclaim_shortfall_mb(self) -> float | None:
+        """Return the room (MB) the head's current block lacks, or None when the block has no such figure.
+
+        Only a head held for a pending post-processing chain's drain window has one. That head starts once the
+        chain runs, so the room it waits on is the chain's estimated peak less the lane card's admission headroom.
+        None also when the chain already fits.
+        """
+        if not self._head_held_for_post_processing_drain():
+            return None
+        lane = self._process_map.get_first_available_post_process_process()
+        if lane is None:
+            return None
+        pending_chain_mb = self._pending_post_processing_reserve_mb(device_index=lane.device_index)
+        headroom_mb = self._head_admission.admission_headroom_mb(lane.device_index)
+        if pending_chain_mb <= 0 or headroom_mb is None:
+            return None
+        shortfall_mb = pending_chain_mb - headroom_mb
+        return shortfall_mb if shortfall_mb > 0 else None
+
     def _log_dispatch_stall_if_needed(
         self,
         stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
@@ -8224,6 +8244,50 @@ class InferenceScheduler:
         """
         now_monotonic = time.monotonic()
         now_wall = time.time()
+        idle_residents = self._idle_reclaim_residents(device_index, protected_models=protected_models)
+
+        idle_cache_ids, _busy = self._gpu_process_activity_ids(device_index)
+        cache_targets: list[CacheReleaseTarget] = []
+        for process_id in idle_cache_ids:
+            process_info = self._process_map.get(process_id)
+            if process_info is None or process_info.process_reserved_mb is None:
+                continue
+            reclaimable_mb = float(process_info.process_reserved_mb) - float(process_info.process_allocated_mb or 0)
+            cache_targets.append(
+                CacheReleaseTarget(
+                    process_id=process_id,
+                    tenant_label=f"{process_info.process_type.name.lower()}#{process_id}",
+                    materialized_monotonic=process_info.reclaim_recency_key(now_monotonic, now_wall),
+                    reclaimable_mb=reclaimable_mb,
+                ),
+            )
+
+        lanes = self._reclaim_lane_candidates(device_index)
+        safety = self._reclaim_safety_candidate(device_index)
+        return LadderCandidates(
+            device_index=device_index,
+            idle_residents=tuple(idle_residents),
+            cache_targets=tuple(cache_targets),
+            lanes=lanes,
+            safety_weights=self._reclaim_safety_weights_candidate(device_index),
+            safety=safety,
+        )
+
+    def _idle_reclaim_residents(
+        self,
+        device_index: int | None,
+        *,
+        protected_models: frozenset[str],
+    ) -> list[IdleResidentModel]:
+        """Return the idle inference residents on the card an unload could take, ranked by their recency key.
+
+        The reclaim ladder and the post-processing chain's single-step eviction share this exclusion rule. A slot
+        is skipped when it is busy, holds no model, has an unload outstanding, owns a dispatched job, or holds a
+        model a job in progress or a name in ``protected_models`` needs. Only inference slots are considered, so a
+        lane's models are never chosen.
+        """
+        now_monotonic = time.monotonic()
+        now_wall = time.time()
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
         idle_residents: list[IdleResidentModel] = []
         for process_info in self._process_map.values():
@@ -8260,33 +8324,7 @@ class InferenceScheduler:
                     footprint_mb=footprint_mb,
                 ),
             )
-
-        idle_cache_ids, _busy = self._gpu_process_activity_ids(device_index)
-        cache_targets: list[CacheReleaseTarget] = []
-        for process_id in idle_cache_ids:
-            process_info = self._process_map.get(process_id)
-            if process_info is None or process_info.process_reserved_mb is None:
-                continue
-            reclaimable_mb = float(process_info.process_reserved_mb) - float(process_info.process_allocated_mb or 0)
-            cache_targets.append(
-                CacheReleaseTarget(
-                    process_id=process_id,
-                    tenant_label=f"{process_info.process_type.name.lower()}#{process_id}",
-                    materialized_monotonic=process_info.reclaim_recency_key(now_monotonic, now_wall),
-                    reclaimable_mb=reclaimable_mb,
-                ),
-            )
-
-        lanes = self._reclaim_lane_candidates(device_index)
-        safety = self._reclaim_safety_candidate(device_index)
-        return LadderCandidates(
-            device_index=device_index,
-            idle_residents=tuple(idle_residents),
-            cache_targets=tuple(cache_targets),
-            lanes=lanes,
-            safety_weights=self._reclaim_safety_weights_candidate(device_index),
-            safety=safety,
-        )
+        return idle_residents
 
     def _reclaim_safety_weights_candidate(self, device_index: int | None) -> LaneReclaimCandidate | None:
         """Build the in-place safety weight demotion rung, promised at safety's measured reservation."""
@@ -8518,8 +8556,7 @@ class InferenceScheduler:
 
         Unloads the :meth:`_coldest_idle_resident` selection's weights to RAM (the RAM copy is retained, so a
         later job re-stages it cheaply). Returns the unloaded model's name, or None when there is no such
-        resident or the unload could not be sent. The safety process's return to the GPU and the
-        post-processing lane's ladder rung both buy their room here.
+        resident or the unload could not be sent. The safety process's return to the GPU frees its room here.
 
         ``device_index`` scopes the search to one card on a multi-GPU host; None considers every card.
         """
@@ -8532,51 +8569,70 @@ class InferenceScheduler:
 
     def has_evictable_idle_resident(self, device_index: int | None) -> bool:
         """Return whether :meth:`evict_coldest_idle_model` has a resident to unload on the card right now."""
-        return self._coldest_idle_resident(device_index) is not None
+        candidate = self._coldest_idle_resident(
+            device_index,
+            protect_queued_models=self._chain_reclaim_protects_queued_models(),
+        )
+        return candidate is not None
 
-    def evict_coldest_idle_model(self, device_index: int | None) -> bool:
-        """Unload the one coldest idle inference resident on the card (:class:`VramActuator`)."""
-        return self.reclaim_coldest_idle_resident(device_index=device_index) is not None
+    def evict_coldest_idle_model(self, device_index: int | None, *, shortfall_mb: float | None = None) -> bool:
+        """Unload one idle inference resident on the card for a post-processing chain (:class:`VramActuator`).
 
-    def _coldest_idle_resident(self, device_index: int | None) -> IdleResidentCandidate | None:
+        The arbiter issues this eviction only for a chain, so it applies the chain's protection rule
+        (:meth:`_chain_reclaim_protects_queued_models`) and covers ``shortfall_mb`` in one unload when a single
+        resident can.
+        """
+        candidate = self._coldest_idle_resident(
+            device_index,
+            protect_queued_models=self._chain_reclaim_protects_queued_models(),
+            shortfall_mb=shortfall_mb,
+        )
+        if candidate is None:
+            return False
+        return self.unload_idle_model(candidate.process_id, device_index=device_index)
+
+    def _chain_reclaim_protects_queued_models(self) -> bool:
+        """Whether a post-processing chain's reclaim spares an idle resident because a queued job names it.
+
+        False while the undispatched head is held for a pending chain's drain window. The protection spares a
+        reload, but in that state the queued job cannot start until the chain runs and the chain cannot run until
+        a copy leaves the card, so keeping the copy wedges both.
+        """
+        return not self._head_held_for_post_processing_drain()
+
+    def _head_held_for_post_processing_drain(self) -> bool:
+        """Whether the dispatch pass's post-processing co-residency gate is holding the undispatched head."""
+        head = self._job_tracker.undispatched_head()
+        return head is not None and head.id_ is not None and str(head.id_) in self._dispatch_holds.pp_defer_holds
+
+    def _coldest_idle_resident(
+        self,
+        device_index: int | None,
+        *,
+        protect_queued_models: bool = True,
+        shortfall_mb: float | None = None,
+    ) -> IdleResidentCandidate | None:
         """Return the least-recently-demanded idle inference resident no queued or running job needs, if any.
 
-        Skips busy slots, slots that own a dispatched job, slots already unloading, and any model a pending or
-        in-progress job needs, since yielding one of those would only force an immediate reload. Inference slots
-        only, so a lane's models are never chosen. ``device_index`` scopes the search to one card; None considers
-        every card.
+        Candidates come from :meth:`_idle_reclaim_residents`, the reclaim ladder's exclusion rule. Every model a
+        pending job names is protected unless ``protect_queued_models`` is False, since unloading one of those
+        would only force an immediate reload. With ``shortfall_mb``, the smallest resident that covers it alone
+        goes ahead of the coldest. ``device_index`` scopes the search to one card, and None considers every card.
         """
-        pending_models = {job.model for job in self._job_tracker.jobs_pending_inference}
-        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
-        now_monotonic = time.monotonic()
-        now_wall = time.time()
-
-        coldest_process_id: int | None = None
-        coldest_model_name: str | None = None
-        coldest_recency_key = float("inf")
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.is_process_busy() or process_info.loaded_horde_model_name is None:
-                continue
-            if process_info.current_inference_job() is not None:
-                continue
-            model_name = process_info.loaded_horde_model_name
-            if model_name in pending_models or model_name in in_progress_models:
-                continue
-            if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
-                continue
-            recency_key = process_info.reclaim_recency_key(now_monotonic, now_wall)
-            if recency_key < coldest_recency_key:
-                coldest_recency_key = recency_key
-                coldest_process_id = process_info.process_id
-                coldest_model_name = model_name
-
-        if coldest_process_id is None or coldest_model_name is None:
+        protected_models = (
+            frozenset(job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None)
+            if protect_queued_models
+            else frozenset()
+        )
+        residents = self._idle_reclaim_residents(device_index, protected_models=protected_models)
+        chosen = smallest_covering_resident(residents, shortfall_mb) or min(
+            residents,
+            key=lambda resident: resident.materialized_monotonic,
+            default=None,
+        )
+        if chosen is None:
             return None
-        return IdleResidentCandidate(process_id=coldest_process_id, model_name=coldest_model_name)
+        return IdleResidentCandidate(process_id=chosen.process_id, model_name=chosen.tenant_label)
 
     def release_idle_cache(self, process_id: int) -> bool:
         """Release an idle process's reclaimable allocator cache back to the card (reclaim-ladder actuator)."""
@@ -11002,14 +11058,13 @@ class InferenceScheduler:
         the maximum is taken, so the post-processing co-residency gate this feeds prices in-flight sampling from
         measured activation high-waters, not a seed the hardware has already overshot.
 
-        ``lane_holds_clearance`` says whether a job's lane has been cleared to sample. A dispatched job whose
-        lane holds no sampling slot has only its encode working set on the card, plus its weights when it holds
-        a two-phase stage grant, and its sample clearance waits for any pending post-processing chain to drain
-        first, so charging its full peak here would hold that chain behind a sample that cannot start until the
-        chain is done: a wait neither side ends, which the child's lease-acquire timeout breaks by sampling
-        unpriced. Such a job contributes nothing; the measured admission the chain takes next prices what the
-        staged child actually holds. None charges every in-progress job, the reading for a worker without the
-        clearance lease.
+        ``lane_holds_clearance`` reports whether a job's lane has been cleared to sample. A dispatched job whose
+        lane holds no sampling slot contributes nothing, because it has only its encode working set on the card
+        (plus its weights under a two-phase stage grant) and its sample clearance waits for any pending
+        post-processing chain to drain. Charging its full peak would hold that chain behind a sample that cannot
+        start until the chain is done, a mutual wait that only the child's lease-acquire timeout breaks by
+        sampling unpriced. The measured admission the chain takes next prices what the staged child holds. None
+        charges every in-progress job, which is the reading for a worker without the clearance lease.
         """
         peaks: list[float] = []
         for job in self._job_tracker.jobs_in_progress:

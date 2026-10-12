@@ -2799,6 +2799,7 @@ class TestGiveUpDefersToAuxPrefetch:
         # No reclaim candidates: this harness is about the aux-prefetch deferral, so the escalation must not be
         # diverted into a constructive remedy.
         scheduler.build_reclaim_ladder_candidates.return_value = LadderCandidates(device_index=None)
+        scheduler.head_reclaim_shortfall_mb.return_value = None
 
         bridge_data = Mock()
         bridge_data.max_threads = 1

@@ -795,6 +795,7 @@ def make_test_recovery_coordinator(
     # No reclaim candidates by default, so a test asserts against exactly the escalation it arranges. A test of
     # the constructive remedy cursor overrides this with the candidates it wants offered.
     scheduler.build_reclaim_ladder_candidates.return_value = LadderCandidates(device_index=None)
+    scheduler.head_reclaim_shortfall_mb.return_value = None
 
     bridge_data = make_mock_bridge_data(max_threads=1, preload_timeout=150.0)
 

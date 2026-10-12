@@ -7399,11 +7399,12 @@ async def test_z_a_stage_waits_while_the_running_jobs_reservation_still_stands()
 # Post-processing chain beside a staged lane
 
 _STAGED_PP_SIDE = 2048
-"""Both jobs' side: the finisher's face-fix and upscale chain is large, and so is the staged job's peak."""
+"""The side of both jobs, large enough to make the finisher's face-fix and upscale chain and the staged job's peak
+large."""
 
 _STAGED_PP_BATCH = 2
-"""The staged job's batch: its peak and a pending chain together exceed the card, while its weights and the
-chain fit it."""
+"""The staged job's batch, sized so its peak and a pending chain together exceed the card while its weights and
+the chain fit."""
 
 
 @dataclass(frozen=True)
@@ -7417,11 +7418,9 @@ class _StagedChainRun:
 async def _run_chain_beside_a_staged_lane() -> _StagedChainRun:
     """Finish a post-processed job while the next job holds a stage grant, under two-phase clearance.
 
-    The 24 GB two-phase world with one lease slot and the modelled chain. Two warm jobs measure a weight load,
-    without which nothing stages. The finisher samples on one lane while the next job, a large batch, waits
-    dispatched on the other. That job takes a stage grant as the finisher's sample ends, and the finisher's chain
-    becomes pending while it waits for its sample grant. The chain is charged to the card at what the parent
-    prices it, as an unlearned store does.
+    A 24 GB two-phase world with one lease slot first runs two warm jobs so a weight load is measured and staging
+    can occur. The large-batch job then takes a stage grant as the finisher's sample ends, and the finisher's
+    chain is pending while that job waits for its sample grant, with the card charged the chain's priced estimate.
     """
     finisher = make_job_pop_response(
         _SDXL.name,
@@ -7491,14 +7490,9 @@ def _stage_tick(world: _DispatchWorld, job: ImageGenerateJobPopResponse) -> int 
 async def test_z_a_staged_lane_does_not_hold_the_card_against_a_pending_chain() -> None:
     """A pending chain runs while a staged lane waits, and the staged lane's sample grant follows the chain.
 
-    The failure this encodes: the chain admission charged every lane holding any clearance grant its full
-    sampling peak, a lane holding only a stage grant included. That lane's sample grant waits for the pending
-    chain, and the chain waited for that lane's sample, so neither moved until the lease-acquire timeout let the
-    child sample unpriced.
-
-    A staged lane now holds no sampling slot for the chain's co-residency pricing, so the chain is priced
-    against what the staged child holds. Its consequences: no lane samples through the timeout, the chain is
-    dispatched and released while the staged lane waits, and the staged lane is cleared once the chain releases.
+    A lane holding only a stage grant is not charged its sampling peak in the chain's co-residency pricing,
+    because its sample grant waits for the chain and charging the peak would make each wait on the other. The
+    row asserts that no lane samples unpriced and that the staged lane is cleared only after the chain releases.
     """
     run = await _run_chain_beside_a_staged_lane()
     world = run.world
@@ -7530,9 +7524,9 @@ async def test_z_defect_reinjection_a_staged_lane_charged_its_peak_wedges_the_ch
 ) -> None:
     """With a staged lane counted as holding a sampling slot, the chain and the staged lane wait on each other.
 
-    Reinjected at the chain admission's clearance predicate alone, which reads any grant as holding the card:
-    the chain is held for the staged job's peak, the staged job's sample grant is held for the chain, and the
-    child samples through the lease-acquire timeout before the chain runs.
+    The defect is reinjected only at the chain admission's clearance predicate, which then reads any grant as
+    holding the card. The row asserts that the staged child samples through the lease-acquire timeout before the
+    chain is dispatched.
     """
 
     def any_grant_holds_the_card(world: _DispatchWorld, process_info: HordeProcessInfo) -> bool:
@@ -7552,4 +7546,177 @@ async def test_z_defect_reinjection_a_staged_lane_charged_its_peak_wedges_the_ch
     assert chain.dispatched_tick > timeout_tick, (
         f"the chain must wait out the staged job's timeout (dispatched on tick {chain.dispatched_tick}, timeout "
         f"on tick {timeout_tick}). {world.state_dump()}"
+    )
+
+
+# A pending chain and an idle copy the held head names
+
+_CHAIN_COPY_SIDE = 512
+"""The finisher's side, small enough to sample beside lane A's Krea2 copy while its face-fix and upscale chain
+does not fit beside that copy even after the finisher's own copy has left the card."""
+
+_CHAIN_COPY_LONG_STEPS = 30
+"""Steps of lane A's first job, long enough that the finisher's chain is pending before it finishes."""
+
+_CHAIN_COPY_HEAD_SIDE = 1536
+_CHAIN_COPY_HEAD_BATCH = 3
+"""The held head's shape, sized so its sampling peak and the pending chain cannot share the card and the dispatch
+pass holds it for the chain's drain window."""
+
+_CHAIN_COPY_MAX_TICKS = 120
+"""Ticks the row may take. The structural-wedge horizon is twenty one-second ticks, so a wedged run records one
+long before this."""
+
+
+@dataclass(frozen=True)
+class _ChainCopyRun:
+    """One run of the chain-versus-held-copy row and the readings its assertions need."""
+
+    world: _DispatchWorld
+    held_head_ticks: list[int]
+    """Ticks on which lane A sat idle on the Krea2 copy the held head names, with the chain pending."""
+    chain_evictions: list[tuple[int, str]]
+    """Every unload the chain's single-step eviction issued, as (tick, model)."""
+
+
+async def _run_chain_beside_a_copy_the_held_head_names() -> _ChainCopyRun:
+    """Finish a post-processed job while lane A holds a Krea2 copy the next, held, job names.
+
+    On a 24 GB card with two lanes and the measured chain admission, lane A samples a long Krea2 job while lane B
+    finishes a small SD1.5 job whose chain does not fit beside A's copy. Evicting B's copy leaves the chain short,
+    and when A finishes its copy stays for the queued Krea2 job, which is held for the chain's drain window.
+    """
+    finisher = make_job_pop_response(
+        _SD15.name,
+        width=_CHAIN_COPY_SIDE,
+        height=_CHAIN_COPY_SIDE,
+        ddim_steps=4,
+        post_processing=["GFPGAN", "RealESRGAN_x4plus"],
+    )
+    chain_mb = predict_job_post_processing_vram_mb(finisher, _SD15.baseline.value)
+    assert chain_mb is not None
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=3,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        service_contexts=True,
+        tick_seconds=1.0,
+        post_process_chain_peak_mb=chain_mb,
+        post_process_chain_allocation_lag_ticks=2,
+        post_process_chain_hold_ticks=5,
+        post_process_chain_measured_admission=True,
+    )
+    beside_copy_mb = world.card_free_mb(0) - _KREA2.weights_mb - admission_noise_buffer_mb(world.card.total_mb)
+    assert chain_mb > beside_copy_mb, (
+        f"precondition: the {chain_mb:.0f}MB chain must not fit the {beside_copy_mb:.0f}MB left beside lane A's "
+        f"copy, or the chain never waits on it. {world.state_dump()}"
+    )
+
+    scheduler = world.scheduler
+    chain_evictions: list[tuple[int, str]] = []
+    production_evict = scheduler.evict_coldest_idle_model
+    production_unload = scheduler.unload_idle_model
+    evicting_for_chain = False
+
+    def recording_unload(process_id: int, device_index: int | None = None) -> bool:
+        process_info = world._process_map.get(process_id)
+        model = process_info.loaded_horde_model_name if process_info is not None else None
+        acted = production_unload(process_id, device_index)
+        if acted and evicting_for_chain and model is not None:
+            chain_evictions.append((world.tick, model))
+        return acted
+
+    def recording_evict(device_index: int | None, *, shortfall_mb: float | None = None) -> bool:
+        nonlocal evicting_for_chain
+        evicting_for_chain = True
+        try:
+            return production_evict(device_index, shortfall_mb=shortfall_mb)
+        finally:
+            evicting_for_chain = False
+
+    scheduler.unload_idle_model = recording_unload  # type: ignore[method-assign]
+    scheduler.evict_coldest_idle_model = recording_evict  # type: ignore[method-assign]
+
+    await world.pop(make_job_pop_response(_KREA2.name, width=1024, height=1024, ddim_steps=_CHAIN_COPY_LONG_STEPS))
+    await world.pop(finisher)
+    held_head = make_job_pop_response(
+        _KREA2.name,
+        width=_CHAIN_COPY_HEAD_SIDE,
+        height=_CHAIN_COPY_HEAD_SIDE,
+        ddim_steps=4,
+        n_iter=_CHAIN_COPY_HEAD_BATCH,
+    )
+    await world.pop(held_head)
+    held_head_ticks: list[int] = []
+    for _ in range(_CHAIN_COPY_MAX_TICKS):
+        await world.step()
+        lane_a = world._process_map[0]
+        if (
+            world.job_tracker.jobs_pending_post_processing
+            and lane_a.loaded_horde_model_name == _KREA2.name
+            and not lane_a.is_process_busy()
+            and str(held_head.id_) in scheduler.dispatch_holds.pp_defer_holds
+        ):
+            held_head_ticks.append(world.tick)
+        if world.submitted_jobs >= 3:
+            break
+    return _ChainCopyRun(world=world, held_head_ticks=held_head_ticks, chain_evictions=chain_evictions)
+
+
+async def test_z_a_chain_evicts_the_idle_copy_its_held_head_names() -> None:
+    """A pending chain takes an idle copy a queued job names while that job is held for the chain.
+
+    Protecting that copy wedges both, because the job cannot start before the chain runs and the chain cannot run
+    before the copy leaves the card. The eviction is retaken once per settle, so a first eviction spent on another
+    copy still leaves one for this copy. The row asserts the chain evicts lane A's copy and runs, and the queue
+    deadlock never reaches the structural-wedge horizon.
+    """
+    run = await _run_chain_beside_a_copy_the_held_head_names()
+    world = run.world
+
+    context = "a pending chain beside an idle copy the held head names"
+    assert run.held_head_ticks, (
+        f"precondition: lane A must sit idle on its Krea2 copy with the queued Krea2 job held for the pending "
+        f"chain. {world.state_dump()}"
+    )
+    assert world.post_process_chains and world.post_process_chains[0].released_tick is not None, (
+        f"{context}: the chain never ran within {_CHAIN_COPY_MAX_TICKS} ticks; the run recorded "
+        f"{world.post_process_chains}. {world.state_dump()}"
+    )
+    assert any(model == _KREA2.name for _tick, model in run.chain_evictions), (
+        f"{context}: the chain's evictions were {run.chain_evictions}, none of lane A's copy. {world.state_dump()}"
+    )
+    assert world.submitted_jobs == 3, (
+        f"{context}: {world.submitted_jobs} of 3 jobs were submitted. {world.state_dump()}"
+    )
+    assert not world.structural_queue_wedges, (
+        f"{context}: the queue deadlock stood the structural-wedge horizon on tick(s) "
+        f"{world.structural_queue_wedges}, the state save-our-ship acts on. {world.state_dump()}"
+    )
+    _assert_no_lane_sampled_unpriced(world, context=context)
+
+
+async def test_z_defect_reinjection_a_protected_copy_wedges_the_chain_and_its_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the queued job's copy protected from the chain, the chain and the held head wait on each other.
+
+    The defect is reinjected only at the chain's protection rule. The row asserts the chain never runs and the
+    queue deadlock reaches the structural-wedge horizon.
+    """
+    monkeypatch.setattr(InferenceScheduler, "_chain_reclaim_protects_queued_models", lambda _self: True)
+    run = await _run_chain_beside_a_copy_the_held_head_names()
+    world = run.world
+
+    assert run.held_head_ticks, f"precondition: the head must be held for the chain. {world.state_dump()}"
+    assert not world.post_process_chains, (
+        f"the chain must never run while the copy is protected; the run recorded {world.post_process_chains}. "
+        f"{world.state_dump()}"
+    )
+    assert world.structural_queue_wedges, (
+        f"the queue deadlock must stand the structural-wedge horizon. {world.state_dump()}"
     )

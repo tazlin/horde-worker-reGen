@@ -128,6 +128,17 @@ class _TwoRungRig:
             MeasuredVramSnapshot(devices={self.lane.device_index or 0: card}),
         )
 
+    def assert_one_eviction_for_the_chain(self) -> None:
+        """Assert one single-step eviction on the lane's card, carrying the chain's shortfall.
+
+        The 4000 MB chain against the 2000 MB free card lacks at least the difference, since the noise margin
+        only adds to it.
+        """
+        self.actuator.evict_coldest_idle_model.assert_called_once()
+        call = self.actuator.evict_coldest_idle_model.call_args
+        assert call.args == (self.lane.device_index,)
+        assert call.kwargs["shortfall_mb"] >= 4000.0 - 2000.0
+
 
 class TestStartPostProcessing:
     """Dispatch of pending post-processing jobs to the lane."""
@@ -283,6 +294,7 @@ class TestStartPostProcessing:
         orchestrator._vram_actuator = Mock(pause_utilities_lane=Mock(return_value=True))
         verdict = Mock(
             required_actuations=(ActuatorCommand(kind=ActuatorCommandKind.PAUSE_UTILITIES_LANE, device_index=0),),
+            measured=Mock(headroom_mb=None),
         )
 
         acted = orchestrator._execute_next_actuation(
@@ -662,7 +674,10 @@ class TestStartPostProcessing:
 
         await process_manager.start_post_processing()
 
-        evict_spy.assert_called_once_with(lane.device_index)
+        evict_spy.assert_called_once()
+        assert evict_spy.call_args.args == (lane.device_index,)
+        # The 4000 MB chain against the 2000 MB free card lacks at least the difference, since noise only adds to it.
+        assert evict_spy.call_args.kwargs["shortfall_mb"] >= 4000.0 - 2000.0
         assert job_info in process_manager._job_tracker.jobs_pending_post_processing
         idle_inference.pipe_connection.send.assert_called_once()
         unload_message = idle_inference.pipe_connection.send.call_args.args[0]
@@ -703,7 +718,7 @@ class TestStartPostProcessing:
 
         rig.clock[0] += settle
         await rig.process_manager.start_post_processing()
-        rig.actuator.evict_coldest_idle_model.assert_called_once_with(rig.lane.device_index)
+        rig.assert_one_eviction_for_the_chain()
         rig.actuator.release_cache.assert_called_once_with(3)
         assert rig.job_info in rig.process_manager._job_tracker.jobs_pending_post_processing
 
@@ -728,7 +743,34 @@ class TestStartPostProcessing:
         await rig.process_manager.start_post_processing()
 
         rig.actuator.release_cache.assert_called_once_with(3)
-        rig.actuator.evict_coldest_idle_model.assert_called_once_with(rig.lane.device_index)
+        rig.assert_one_eviction_for_the_chain()
+
+    async def test_an_eviction_that_acted_is_retaken_after_the_settle(self, monkeypatch: object) -> None:
+        """Each acting eviction removes a different resident, so a job still short takes another one per settle."""
+        rig = await _TwoRungRig.build(monkeypatch, enable_vram_budget=True, release_acts=False)
+        settle = reclaim_ladder_module.verification_settle_seconds()
+
+        await rig.process_manager.start_post_processing()
+        rig.assert_one_eviction_for_the_chain()
+
+        rig.clock[0] += settle / 2
+        await rig.process_manager.start_post_processing()
+        assert rig.actuator.evict_coldest_idle_model.call_count == 1
+
+        rig.clock[0] += settle
+        await rig.process_manager.start_post_processing()
+        assert rig.actuator.evict_coldest_idle_model.call_count == 2
+
+    async def test_an_eviction_that_evicted_nothing_stays_tried(self, monkeypatch: object) -> None:
+        """An eviction that found nothing to unload is not retaken, so the deferral cannot spin on an empty card."""
+        rig = await _TwoRungRig.build(monkeypatch, enable_vram_budget=True, release_acts=False)
+        rig.actuator.evict_coldest_idle_model.return_value = False
+
+        await rig.process_manager.start_post_processing()
+        rig.clock[0] += 2 * reclaim_ladder_module.verification_settle_seconds()
+        await rig.process_manager.start_post_processing()
+
+        assert rig.actuator.evict_coldest_idle_model.call_count == 1
 
     async def test_chain_over_lane_cap_faults_clean_without_dispatch(self, monkeypatch: object) -> None:
         """A chain estimated above the lane's cap is faulted at the gate, never dispatched into an OOM.

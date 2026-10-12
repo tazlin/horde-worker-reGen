@@ -308,8 +308,12 @@ These fail as interactions, not as units, so component tests stay green through 
   `seed_ram_held_checkpoint` makes a lane report its seated checkpoint as a held component sized by its RAM
   pages with nothing of it on the device, the report of a pooled monolithic lane. `post_process_chain_peak_mb`
   gives the post-processing lane modelled chains that go through production's sampling co-residency check
-  against the lanes cleared to sample (a lane holding only a stage grant does not hold the card); the measured
-  arbiter admission of a chain is not modelled. Every run keeps
+  against the lanes cleared to sample, where a lane holding only a stage grant does not hold the card. With
+  `post_process_chain_measured_admission=True`, which is off by default, a real `PostProcessOrchestrator` prices
+  each chain against the tick's frozen measurement and runs a refused chain's reclaim plan through the
+  scheduler, one verified rung per settle. Every run records in `world.structural_queue_wedges` each queue
+  deadlock that production's detector held past the structural-wedge horizon, which is the state save-our-ship
+  acts on. Every run keeps
   `world.job_windows` (each job's dispatch, clearance, load and sampling instants, and what its load paid) and
   each lane's state on `tick_observations`, from which `_world_assertions.py` reads handoff gaps, the staging
   overlap share, the two-sampler share, dispatch-to-first-step seconds, each load's read split at clearance,

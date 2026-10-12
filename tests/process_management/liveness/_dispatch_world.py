@@ -56,7 +56,10 @@ from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent, SamplingStats
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
-from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.ipc.message_dispatcher import (
+    _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS,
+    MessageDispatcher,
+)
 from horde_worker_regen.process_management.ipc.messages import (
     HeldComponentSnapshot,
     HordeControlFlag,
@@ -836,6 +839,7 @@ class _DispatchWorld:
         post_process_chain_estimate_mb: float | None = None,
         post_process_chain_allocation_lag_ticks: int = 0,
         post_process_chain_hold_ticks: int = 1,
+        post_process_chain_measured_admission: bool = False,
         preload_ends_dispatch: bool = False,
         extra_model_classes: tuple[_ModelClass, ...] = (),
         host_ram: HostRamLedger | None = None,
@@ -1040,10 +1044,11 @@ class _DispatchWorld:
                 a real backlog, which is the only state in which a pending chain is owed a drain window.
             post_process_chain_peak_mb: The VRAM (MB) a chain on the post-processing lane allocates. None keeps the
                 lane hand-driven and free of any charge, the shape every row not about the lane's memory runs
-                against. Set, it needs ``service_contexts`` (the lane is a service process): the lane takes one
-                chain at a time, holds a chain production's sampling co-residency check defers, books it through
-                production's ``book_post_process_chain``, charges this peak to its card after the allocation lag,
-                and releases charge and reserve after the hold. The measured arbiter admission is not modelled.
+                against. Set, it needs ``service_contexts`` because the lane is a service process. The lane takes
+                one chain at a time, holds any chain production's sampling co-residency check defers, books it
+                through production's ``book_post_process_chain``, charges this peak to its card after the
+                allocation lag, and releases charge and reserve after the hold. The measured arbiter admission is
+                modelled only with ``post_process_chain_measured_admission``.
             post_process_chain_estimate_mb: The static estimate (MB) the parent books a chain from, priced through
                 production's ``learned_post_process_vram_mb`` against the learned store, while the card is charged
                 ``post_process_chain_peak_mb``. With ``learned_footprints`` the lane reports its reservation and
@@ -1051,6 +1056,11 @@ class _DispatchWorld:
             post_process_chain_allocation_lag_ticks: Ticks between the lane taking a chain and the chain's peak
                 landing on the card, the delay before a real chain's allocations reach the device-free reading.
             post_process_chain_hold_ticks: Ticks the chain's peak stays on the card once it has landed.
+            post_process_chain_measured_admission: Whether a modelled chain also passes production's measured
+                arbiter admission before the lane takes it. A real ``PostProcessOrchestrator`` prices the chain
+                against this tick's frozen measurement and, on a refusal, records the deferral and runs the
+                verdict's reclaim plan through the scheduler one verified rung at a time, as the running worker
+                does. Off, a chain is held only by the sampling co-residency check.
             preload_ends_dispatch: Whether a sent preload ends the tick before any dispatch is attempted. The
                 cycle shape a worker had before preload and dispatch were separated; kept as an opt-in so a
                 row can state what it costs, and off everywhere else because it is not what the control loop
@@ -1614,6 +1624,35 @@ class _DispatchWorld:
         self._governor = DeviceFreeGovernor()
         self._reclaim_ladder = VerifiedReclaimLadder(clock=lambda: self.now)
         self._actuator = _RecordingActuator(self)
+        self._chain_admission: post_process_orchestrator.PostProcessOrchestrator | None = None
+        """Production's chain admission and reclaim, wired as the manager wires it, when the row opts in."""
+        if post_process_chain_measured_admission:
+            scheduler = self._scheduler
+            self._chain_admission = post_process_orchestrator.PostProcessOrchestrator(
+                process_map=self._process_map,
+                job_tracker=self._job_tracker,
+                process_lifecycle=self._lifecycle,
+                runtime_config=runtime_config,
+                state=worker_state,
+                model_metadata=model_metadata,
+                reserve_ledger=self._reserve_ledger,
+                request_vram_reclaim=lambda process_info, device_index: scheduler.unload_models_from_vram(
+                    process_info,
+                    under_pressure=True,
+                    device_index=device_index,
+                ),
+                reclaim_ladder=self._reclaim_ladder,
+                vram_actuator=scheduler,
+            )
+            self._chain_admission._clock = lambda: self.now
+            self._chain_admission.set_idle_resident_probe(scheduler.has_evictable_idle_resident)
+        self.structural_queue_wedges: list[int] = []
+        """The tick on which each queue deadlock reached the structural-wedge horizon, once per episode.
+
+        Production's detector latches the deadlock, and the horizon is measured on the world's clock because the
+        detector stamps wall time. A recorded tick is the state that drives the save-our-ship remedy."""
+        self._queue_deadlock_since: float | None = None
+        self._queue_deadlock_recorded = False
         self._healthy_since: dict[int, float] = {}
         self.governor_states_by_card: dict[int, list[GovernorState]] = {index: [] for index in self._card_totals}
         """Each card's committed governor state at every tick of a closed-loop run, in order."""
@@ -2845,6 +2884,53 @@ class _DispatchWorld:
             self._sync_reported_vram()
             self._sample_card_overcommit()
 
+    def _chain_admitted_on_measurement(
+        self, lane: HordeProcessInfo, job_info: HordeJobInfo, reserve_mb: float
+    ) -> bool:
+        """Whether production's measured admission lets the lane take this chain now, True when not modelled.
+
+        A refusal goes through the orchestrator's deferral path, which runs the verdict's next reclaim rung.
+        The cycle is frozen first so the chain is priced on the card as this tick's child reports left it.
+        """
+        orchestrator = self._chain_admission
+        if orchestrator is None:
+            return True
+        self._begin_arbiter_cycle()
+        arbiter = self._scheduler._vram_arbiter
+        assert arbiter is not None
+        orchestrator.set_vram_arbiter(arbiter)
+        verdict = orchestrator._arbiter_admits_post_processing(
+            completed_job_info=job_info,
+            post_process_process=lane,
+            reserve_vram_mb=reserve_mb,
+        )
+        job_id = job_info.sdk_api_job_info.id_
+        if verdict is None or verdict.admits:
+            orchestrator._deferrals.pop(str(job_id), None)
+            return True
+        orchestrator._note_deferral(
+            job_id=job_id,
+            post_process_process=lane,
+            reserve_vram_mb=reserve_mb,
+            verdict=verdict,
+            now=self.now,
+        )
+        return False
+
+    def _record_structural_queue_wedge(self) -> None:
+        """Run production's deadlock detector and record a queue deadlock that outlasts the structural horizon."""
+        self._dispatcher.detect_deadlock()
+        if not self._dispatcher.get_deadlock_snapshot().in_queue_deadlock:
+            self._queue_deadlock_since = None
+            self._queue_deadlock_recorded = False
+            return
+        if self._queue_deadlock_since is None:
+            self._queue_deadlock_since = self.now
+        held_seconds = self.now - self._queue_deadlock_since
+        if held_seconds >= _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS and not self._queue_deadlock_recorded:
+            self._queue_deadlock_recorded = True
+            self.structural_queue_wedges.append(self.tick)
+
     def _post_process_chain_running(self) -> _PostProcessChain | None:
         """The chain the modelled lane holds, or None when it is free."""
         if self.post_process_chains and self.post_process_chains[-1].released_tick is None:
@@ -2887,6 +2973,8 @@ class _DispatchWorld:
                 ),
                 pp_reserve_mb=booked_mb,
             ):
+                continue
+            if not self._chain_admitted_on_measurement(lane, job_info, booked_mb):
                 continue
             self._chain_ready_at.pop(job_id, None)
             post_process_orchestrator.book_post_process_chain(
@@ -4217,6 +4305,7 @@ class _DispatchWorld:
         elif self.claim_ticks and self.claim_released_at == 0.0:
             self.claim_released_at = self.now
         self._observe_dispatch_tick()
+        self._record_structural_queue_wedge()
 
     # -- dispatch observation ------------------------------------------------------------------------------
 

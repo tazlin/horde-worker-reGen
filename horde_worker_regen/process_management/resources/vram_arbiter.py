@@ -270,6 +270,9 @@ class HeadReclaimContext:
     beneficiary: str | None = None
     """The id of the job a lane pause taken for this head serves; the reclaim ladder keeps the lane down until
     that job is served or gone. None books the pause with no beneficiary."""
+    shortfall_mb: float | None = None
+    """The room (MB) the head's verdict lacks, so an idle-model eviction for the head can cover it in one unload.
+    None when the verdict has no shortfall."""
 
 
 class VramActuator(Protocol):
@@ -295,12 +298,12 @@ class VramActuator(Protocol):
         """Evict an idle VRAM-resident model on the card to reclaim its weights, sparing ``head`` when given."""
         ...
 
-    def evict_coldest_idle_model(self, device_index: int | None) -> bool:
+    def evict_coldest_idle_model(self, device_index: int | None, *, shortfall_mb: float | None = None) -> bool:
         """Unload the one coldest idle inference resident on the card; report whether an unload was issued.
 
         Never a post-processing lane's models and never a busy or in-progress model. One verified step at a time
         is the ladder's style, and a lane tenant never needs a slot, so the head-shaped sweep is the wrong tool
-        for it.
+        for it. With ``shortfall_mb``, the smallest idle resident that covers it alone goes ahead of the coldest.
         """
         ...
 

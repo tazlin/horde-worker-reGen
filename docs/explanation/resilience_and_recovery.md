@@ -707,6 +707,9 @@ The escalation, in order:
    remaining idle-only rungs and allow each issued action a settling window. The candidate list is frozen per
    episode, its cursor only advances, and both its issue allotment and aggregate time are bounded. SOS protects
    models demanded by pending work, so the rung cannot unload the exact resident model the wedged head needs.
+   When the head is held for a pending post-processing chain's drain window, the scheduler reports the chain's
+   shortfall and the frozen ladder leads with the smallest idle resident that covers it alone. Any other block
+   has no shortfall figure, so the ladder keeps its LIFO order.
    A post-processing module unload has one independent wall-clock grace and is issued at most once per episode;
    it cannot reset its own deadline indefinitely. A rung whose own promised free is effectively zero is skipped
    rather than issued: it has nothing to give back, so spending a settling window on it is indistinguishable
@@ -919,7 +922,10 @@ DENY for a representative chain, meaning the peak exceeds the card's total less 
 noise buffer and the VRAM other processes hold. A transient shortage is a DEFER,
 which never closes the offer. Dispatch prices the real chain and the arbiter's
 reclaim ladder makes room for it, unloading the coldest idle model no queued or
-running job needs one step at a time. With `enable_vram_budget: false` that verdict is
+running job needs, one per verification settle while the chain is still short. While the head of the queue
+is held for the chain's drain window, a queued job's model is not protected, because the queued job cannot
+start before the chain runs and keeping its copy would hold both. The eviction takes the smallest idle model
+that covers the chain's shortfall alone ahead of the coldest. With `enable_vram_budget: false` that verdict is
 advisory. Its cheapest reclaim rung still runs and the chain dispatches on the same tick. There
 is no sustain window or margin. A host without a device reading has no card to deny
 on, so its offer stays open and its breaker recovers on the window alone.

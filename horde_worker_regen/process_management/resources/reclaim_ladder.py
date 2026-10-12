@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import enum
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -289,7 +289,27 @@ class LadderCandidates:
     safety: LaneReclaimCandidate | None = None
 
 
-def build_reclaim_ladder(candidates: LadderCandidates) -> tuple[ReclaimRung, ...]:
+def smallest_covering_resident(
+    residents: Iterable[IdleResidentModel],
+    shortfall_mb: float | None,
+) -> IdleResidentModel | None:
+    """Return the idle resident with the smallest footprint that alone covers ``shortfall_mb``, if any.
+
+    None when no shortfall is given, when it is not positive, or when no single resident covers it.
+    """
+    if shortfall_mb is None or shortfall_mb <= 0:
+        return None
+    covering = [resident for resident in residents if resident.footprint_mb >= shortfall_mb]
+    if not covering:
+        return None
+    return min(covering, key=lambda resident: resident.footprint_mb)
+
+
+def build_reclaim_ladder(
+    candidates: LadderCandidates,
+    *,
+    shortfall_mb: float | None = None,
+) -> tuple[ReclaimRung, ...]:
     """Order the candidates into the fixed reclaim sequence with LIFO ranking among like rungs.
 
     The sequence is: the newest idle resident model, then each reclaimable allocator cache (newest first),
@@ -298,19 +318,36 @@ def build_reclaim_ladder(candidates: LadderCandidates) -> tuple[ReclaimRung, ...
     likeliest WDDM squatter, first within each group. Every input is already idle-filtered, so an
     actively-sampling process can never appear as a rung.
 
+    Given ``shortfall_mb``, the smallest idle resident that covers it alone (:func:`smallest_covering_resident`)
+    leads the ladder ahead of that sequence, since LIFO order would spend a verification window on a small newest
+    resident that cannot clear the block. When no single resident covers the shortfall, the sequence is unchanged.
+
     Args:
         candidates: The idle-filtered reclaim inputs for one card.
+        shortfall_mb: The room (MB) the reclaim is issued to find, or None for pressure relief with no figure.
 
     Returns:
         The ordered rungs, empty when nothing on the card can be reclaimed.
     """
     device_index = candidates.device_index
+    covering = smallest_covering_resident(candidates.idle_residents, shortfall_mb)
     residents_newest_first = sorted(
-        candidates.idle_residents,
+        (resident for resident in candidates.idle_residents if resident is not covering),
         key=lambda resident: resident.materialized_monotonic,
         reverse=True,
     )
     rungs: list[ReclaimRung] = []
+
+    if covering is not None:
+        rungs.append(
+            ReclaimRung(
+                kind=ReclaimRungKind.UNLOAD_IDLE_MODEL,
+                device_index=device_index,
+                promised_freed_mb=covering.footprint_mb,
+                tenant_label=covering.tenant_label,
+                target_process_id=covering.process_id,
+            ),
+        )
 
     if residents_newest_first:
         newest = residents_newest_first[0]
@@ -1162,7 +1199,10 @@ class VerifiedReclaimLadder:
             elif command.kind is ActuatorCommandKind.EVICT_IDLE_MODEL:
                 acted = actuator.evict_idle_model(device_index, for_head_of_queue=for_head_of_queue, head=head)
             elif command.kind is ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL:
-                acted = actuator.evict_coldest_idle_model(device_index)
+                acted = actuator.evict_coldest_idle_model(
+                    device_index,
+                    shortfall_mb=head.shortfall_mb if head is not None else None,
+                )
             elif command.kind is ActuatorCommandKind.REDUCE_LIVE_CONTEXTS:
                 acted = actuator.reduce_live_contexts(device_index, head=head)
             elif command.kind is ActuatorCommandKind.PAUSE_VAE_LANE:

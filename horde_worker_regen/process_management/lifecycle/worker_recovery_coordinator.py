@@ -1384,7 +1384,8 @@ class WorkerRecoveryCoordinator:
 
         The list is snapshotted once and reused for the whole episode. Rebuilding it per tick would let a card
         whose idle tenants come and go regenerate candidates without limit, and an escalation reading a
-        never-shrinking candidate list would never reach its pool rebuild or its give-up backstop.
+        never-shrinking candidate list would never reach its pool rebuild or its give-up backstop. When the head's
+        block has a known shortfall, the smallest idle resident that covers it alone is the first rung.
         """
         if self.reclaim_rungs is None:
             protected_models = frozenset(
@@ -1395,6 +1396,7 @@ class WorkerRecoveryCoordinator:
                     None,
                     protected_models=protected_models,
                 ),
+                shortfall_mb=self._inference_scheduler.head_reclaim_shortfall_mb(),
             )
         return self.reclaim_rungs
 

@@ -124,6 +124,68 @@ class TestBuildReclaimLadder:
             (ReclaimRungKind.UNLOAD_IDLE_MODEL, 1),
         ]
 
+    def test_shortfall_takes_the_smallest_covering_resident_first(self) -> None:
+        """A known 5 GB shortfall takes the older 12 GB resident ahead of the newest 144 MB one."""
+        candidates = LadderCandidates(
+            device_index=0,
+            idle_residents=(
+                _resident(1, materialized=1.0, footprint=12288.0),
+                _resident(2, materialized=2.0, footprint=144.0),
+            ),
+        )
+        ladder = build_reclaim_ladder(candidates, shortfall_mb=5120.0)
+        assert [(r.kind, r.target_process_id) for r in ladder] == [
+            (ReclaimRungKind.UNLOAD_IDLE_MODEL, 1),
+            (ReclaimRungKind.UNLOAD_IDLE_MODEL, 2),
+        ]
+
+    def test_shortfall_prefers_the_smallest_of_several_covering_residents(self) -> None:
+        """Of two residents that each cover the shortfall, the smaller one is taken first."""
+        candidates = LadderCandidates(
+            device_index=0,
+            idle_residents=(
+                _resident(1, materialized=1.0, footprint=16384.0),
+                _resident(2, materialized=2.0, footprint=6144.0),
+                _resident(3, materialized=3.0, footprint=144.0),
+            ),
+        )
+        ladder = build_reclaim_ladder(candidates, shortfall_mb=5120.0)
+        assert [r.target_process_id for r in ladder] == [2, 3, 1]
+
+    def test_no_shortfall_keeps_the_newest_resident_first(self) -> None:
+        """Pressure relief with no shortfall figure keeps LIFO, so the newest 144 MB resident leads."""
+        candidates = LadderCandidates(
+            device_index=0,
+            idle_residents=(
+                _resident(1, materialized=1.0, footprint=12288.0),
+                _resident(2, materialized=2.0, footprint=144.0),
+            ),
+        )
+        ladder = build_reclaim_ladder(candidates)
+        assert [r.target_process_id for r in ladder] == [2, 1]
+
+    def test_shortfall_no_single_resident_covers_keeps_lifo(self) -> None:
+        """When no one resident covers the shortfall, the LIFO sequence stands unchanged."""
+        candidates = LadderCandidates(
+            device_index=0,
+            idle_residents=(
+                _resident(1, materialized=1.0, footprint=12288.0),
+                _resident(2, materialized=2.0, footprint=144.0),
+            ),
+            cache_targets=(
+                CacheReleaseTarget(
+                    process_id=7, tenant_label="lane#7", materialized_monotonic=1.5, reclaimable_mb=300.0
+                ),
+            ),
+        )
+        with_shortfall = build_reclaim_ladder(candidates, shortfall_mb=20480.0)
+        assert with_shortfall == build_reclaim_ladder(candidates)
+        assert [(r.kind, r.target_process_id) for r in with_shortfall] == [
+            (ReclaimRungKind.UNLOAD_IDLE_MODEL, 2),
+            (ReclaimRungKind.RELEASE_IDLE_CACHE, 7),
+            (ReclaimRungKind.UNLOAD_IDLE_MODEL, 1),
+        ]
+
     def test_full_sequence_order(self) -> None:
         """Order is newest model, then caches (LIFO), then older models (LIFO), then lanes, then safety."""
         candidates = LadderCandidates(
@@ -1274,9 +1336,32 @@ class TestArbiterCommandExecution:
             for_head_of_queue=True,
         )
 
-        actuator.evict_coldest_idle_model.assert_called_once_with(1)
+        actuator.evict_coldest_idle_model.assert_called_once_with(1, shortfall_mb=None)
         actuator.evict_idle_model.assert_not_called()
         assert applied == (command,)
+
+    def test_coldest_eviction_carries_the_heads_shortfall(self) -> None:
+        """The head's stated shortfall reaches ``evict_coldest_idle_model`` so it can pick a covering resident."""
+        actuator = Mock()
+        actuator.evict_coldest_idle_model.return_value = True
+        command = ActuatorCommand(kind=ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL, device_index=None)
+        head = HeadReclaimContext(
+            model=None,
+            target_process_id=9,
+            max_resident=None,
+            beneficiary="chain-job",
+            shortfall_mb=5120.0,
+        )
+
+        VerifiedReclaimLadder().execute_arbiter_commands(
+            (command,),
+            actuator,
+            device_index=0,
+            for_head_of_queue=True,
+            head=head,
+        )
+
+        actuator.evict_coldest_idle_model.assert_called_once_with(0, shortfall_mb=5120.0)
 
     def test_coldest_eviction_that_unloads_nothing_is_not_applied(self) -> None:
         """A rung whose actuator found no resident is left out of the receipt."""

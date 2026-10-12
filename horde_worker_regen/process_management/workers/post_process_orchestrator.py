@@ -410,11 +410,13 @@ class PostProcessOrchestrator:
         A lane job re-asks every tick, so it climbs one verified rung at a time in the plan's cheapest-first
         order, while a starved head takes the whole plan. Executing all of it at once would evict a resident
         that the cheaper rung already made unnecessary. A rung that reports it did nothing is marked tried and
-        the next is taken on the same call. A service-lane pause it acquires is recorded as a borrow so the
-        drain can return it.
+        the next is taken on the same call. The single-step eviction is the only rung retaken after it acts, at
+        most once per settle. A service-lane pause it acquires is recorded as a borrow so the drain can return it.
         """
         if self._vram_actuator is None:
             return None
+        headroom_mb = verdict.measured.headroom_mb
+        shortfall_mb = -headroom_mb if headroom_mb is not None and headroom_mb < 0 else None
         for command in verdict.required_actuations:
             if command in applied:
                 continue
@@ -430,6 +432,7 @@ class PostProcessOrchestrator:
                     target_process_id=post_process_process.process_id,
                     max_resident=None,
                     beneficiary=job_id,
+                    shortfall_mb=shortfall_mb,
                 )
             )
             acted = self._reclaim_ladder.execute_arbiter_commands(
@@ -441,6 +444,10 @@ class PostProcessOrchestrator:
             )
             if not acted:
                 continue
+            if command.kind is ActuatorCommandKind.EVICT_COLDEST_IDLE_MODEL:
+                # Each acting eviction removes a different resident, so the rung stays available for the next
+                # settle while the re-priced verdict still requires it. One that evicted nothing stays tried.
+                applied.discard(command)
             if command.kind in (ActuatorCommandKind.PAUSE_VAE_LANE, ActuatorCommandKind.PAUSE_COMPONENT_LANE):
                 self._borrowed_service_lane_actuations.add(command.kind)
                 # A borrow is only taken for a job that has not yet dispatched, so the lane is idle from the
