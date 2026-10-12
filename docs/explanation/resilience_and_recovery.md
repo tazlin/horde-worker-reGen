@@ -81,7 +81,9 @@ is never a resource failure, whatever its text says. See
 
 The backend's mapping guard raises `HostCommitError` when the host refuses to
 commit a checkpoint mapping, before any weight is adopted. At preload the child
-reports it under `HOST_COMMIT_FAILED_INFO` and stays up. Inside a running job the
+reports it under `HOST_COMMIT_FAILED_INFO` and stays up. A dispatch whose model
+preload the host refuses is faulted back with `host_commit_refused` set for
+re-admission, and the child never runs it. Inside a running job the
 child recognises the same error by type (directly, or as the pipeline error that
 names it) and sets `host_commit_refused` on the faulted result. The child does not
 retry the job.

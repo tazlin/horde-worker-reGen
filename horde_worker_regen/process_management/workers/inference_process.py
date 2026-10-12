@@ -845,6 +845,7 @@ class HordeInferenceProcess(HordeProcess):
                 the component and VAE lanes.
         """
         logger.debug(f"Currently active model is {self._active_model_name}. Requested model is {horde_model_name}")
+        self._last_preload_host_commit_refused = False
 
         if not horde_model_name or not horde_model_name.strip():
             # A blank name is a bad argument, not a sick process: nothing has been touched, so the backend and
@@ -923,6 +924,7 @@ class HordeInferenceProcess(HordeProcess):
                         # nothing against the model, and the slot stays available for the next load the
                         # admission lets through. The parent offers a load only to a slot reporting idle, and
                         # no later message of this handler reports it, so the idle report follows here.
+                        self._last_preload_host_commit_refused = True
                         self.on_horde_model_state_change(
                             process_state=HordeProcessState.PRELOADING_FAILED,
                             horde_model_name=horde_model_name,
@@ -1061,6 +1063,12 @@ class HordeInferenceProcess(HordeProcess):
 
     See ``_is_host_commit_error``. The parent requeues such a job against host memory, so the child never
     retries it itself."""
+    _last_preload_host_commit_refused: bool = False
+    """Whether the most recent preload failed because the host refused to commit the checkpoint mapping.
+
+    A dispatch that preloads its own model reads this to fault the job back for re-admission. Running the
+    pipeline instead would load the checkpoint inside the job without the mapping guard, under the same host
+    memory condition that refused the preload."""
 
     def _send_inference_memory_report(self) -> None:
         """Send a precise boundary VRAM report at a stage transition (sampling done, VAE decode).
@@ -1790,6 +1798,8 @@ class HordeInferenceProcess(HordeProcess):
         job_info: ImageGenerateJobPopResponse,
         results: list[ResultingImageReturn] | None,
         time_elapsed: float,
+        *,
+        report_model_state: bool = True,
     ) -> None:
         """Send an inference result message to the main process.
 
@@ -1798,6 +1808,9 @@ class HordeInferenceProcess(HordeProcess):
             job_info (ImageGenerateJobPopResponse): The job that was inferred.
             results (list[ResultingImageReturn] | None): The generated images, or None if inference failed.
             time_elapsed (float): The time elapsed during the last operation.
+            report_model_state (bool): Whether to follow the result with the active model's residency and an idle
+                report. False when the job never reached a loaded model, so no residency is restated for a model
+                the parent was told is gone.
         """
         all_image_results = []
 
@@ -1835,6 +1848,9 @@ class HordeInferenceProcess(HordeProcess):
             host_commit_refused=is_faulted and self._last_inference_host_commit_refused,
         )
         self.process_message_queue.put(message)
+
+        if not report_model_state:
+            return
 
         if self._active_model_name is None:
             logger.critical("No active model name, cannot update model state")
@@ -1874,6 +1890,38 @@ class HordeInferenceProcess(HordeProcess):
             time_elapsed=0.0,
         )
         self._last_inference_error = None
+        self.send_process_state_change_message(
+            HordeProcessState.WAITING_FOR_JOB,
+            info="Waiting for job",
+        )
+
+    def _fault_job_for_failed_dispatch_preload(
+        self,
+        job_info: ImageGenerateJobPopResponse,
+        error_message: str,
+    ) -> None:
+        """Report a job faulted because the preload its dispatch needed left another model active, then go idle.
+
+        The pipeline would otherwise load the checkpoint itself, outside the mapping guard, and under a host
+        refusal that load can end the process natively. The result carries ``host_commit_refused`` when the
+        preload failed on a host refusal, so the parent requeues the job against host memory without spending an
+        attempt. The preload already reported the model's failure, so no residency follows the result.
+
+        Args:
+            job_info (ImageGenerateJobPopResponse): The job whose model did not load.
+            error_message (str): The diagnostic carried as the faulted result's ``info``.
+        """
+        self._last_inference_error = error_message
+        self._last_inference_host_commit_refused = self._last_preload_host_commit_refused
+        self.send_inference_result_message(
+            process_state=HordeProcessState.INFERENCE_FAILED,
+            job_info=job_info,
+            results=None,
+            time_elapsed=0.0,
+            report_model_state=False,
+        )
+        self._last_inference_error = None
+        self._last_inference_host_commit_refused = False
         self.send_process_state_change_message(
             HordeProcessState.WAITING_FOR_JOB,
             info="Waiting for job",
@@ -1946,6 +1994,8 @@ class HordeInferenceProcess(HordeProcess):
                         process_state=HordeProcessState.INFERENCE_FAILED,
                         info=error_message,
                     )
+                    self._fault_job_for_failed_dispatch_preload(message.sdk_api_job_info, error_message)
+                    return
 
                 # Primed, not yet sampling: the model is IN_USE and the slot owns the job, but the denoise
                 # loop is entered inside start_inference() below (after acquiring the inference slot and the

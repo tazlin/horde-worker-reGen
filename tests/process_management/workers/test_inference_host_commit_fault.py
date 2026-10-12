@@ -12,6 +12,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from horde_sdk.ai_horde_api import GENERATION_STATE
 from hordelib.execution.interface import PipelineExecutionError
 from hordelib.execution.zero_copy_load import HostCommitError
 
@@ -19,6 +20,8 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
+    HordeProcessState,
+    ModelLoadState,
 )
 from horde_worker_regen.process_management.workers.inference_process import (
     HordeInferenceProcess,
@@ -132,3 +135,72 @@ def test_an_allocator_oom_is_not_marked_as_a_host_commit_refusal() -> None:
     result = _run_one_job(child, queue)
 
     assert result.host_commit_refused is False
+
+
+def _child_whose_dispatch_preload_raises(queue: _RecordingQueue, error: BaseException) -> HordeInferenceProcess:
+    """An inference child with no model loaded whose real preload runs over a backend raising ``error``."""
+    child = _child_whose_pipeline_raises(queue, RuntimeError("the pipeline must not run"))
+    child._active_model_name = None
+    child._is_busy = False
+    child._horde = Mock()  # type: ignore[assignment]
+    child._horde.preload_model.side_effect = error
+    child.clear_gc_and_torch_cache = Mock()  # type: ignore[method-assign]
+    del child.preload_model
+    return child
+
+
+def _dispatch_one_job(child: HordeInferenceProcess) -> None:
+    child._receive_and_handle_control_message(
+        HordeInferenceControlMessage(
+            control_flag=HordeControlFlag.START_INFERENCE,
+            horde_model_name=_MODEL,
+            sdk_api_job_info=make_job_pop_response(model=_MODEL),
+        ),
+    )
+
+
+def _reported_process_states(child: HordeInferenceProcess) -> list[HordeProcessState]:
+    return [
+        call.kwargs.get("process_state", call.args[0] if call.args else None)
+        for call in child.send_process_state_change_message.call_args_list  # type: ignore[attr-defined]
+    ]
+
+
+def test_a_dispatch_whose_preload_the_host_refuses_is_faulted_back_unrun() -> None:
+    """A refused mapping at dispatch faults the job for re-admission, and the pipeline never loads it itself."""
+    queue = _RecordingQueue()
+    child = _child_whose_dispatch_preload_raises(queue, HostCommitError("commit refused"))
+
+    _dispatch_one_job(child)
+
+    results = [message for message in queue.messages if isinstance(message, HordeInferenceResultMessage)]
+    assert len(results) == 1
+    assert results[0].state == GENERATION_STATE.faulted
+    assert results[0].host_commit_refused is True
+    assert child._run_typed_inference.call_count == 0  # type: ignore[attr-defined]
+    assert [call[0] for call in child._horde.method_calls] == ["preload_model"]  # type: ignore[attr-defined]
+    assert HordeProcessState.WAITING_FOR_JOB in _reported_process_states(child)
+    assert _reported_process_states(child)[-1] == HordeProcessState.WAITING_FOR_JOB
+
+    model_states = [
+        call.kwargs["horde_model_state"]
+        for call in child.on_horde_model_state_change.call_args_list  # type: ignore[attr-defined]
+    ]
+    assert model_states == [ModelLoadState.LOADING, ModelLoadState.FAILED]
+    assert child._last_inference_error is None
+
+
+def test_a_dispatch_whose_preload_fails_otherwise_still_ends_the_process() -> None:
+    """Any other preload failure leaves torch in an unknown state, so it escapes to the handler that ends it."""
+    queue = _RecordingQueue()
+    child = _child_whose_dispatch_preload_raises(queue, RuntimeError("corrupt checkpoint"))
+
+    with pytest.raises(RuntimeError, match="corrupt checkpoint"):
+        _dispatch_one_job(child)
+
+    assert [message for message in queue.messages if isinstance(message, HordeInferenceResultMessage)] == []
+    assert child._run_typed_inference.call_count == 0  # type: ignore[attr-defined]
+    assert HordeProcessState.WAITING_FOR_JOB not in _reported_process_states(child)
+    failed_report = child.on_horde_model_state_change.call_args_list[-1]  # type: ignore[attr-defined]
+    assert failed_report.kwargs["horde_model_state"] == ModelLoadState.FAILED
+    assert failed_report.kwargs.get("info") is None
