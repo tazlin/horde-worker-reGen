@@ -241,7 +241,12 @@ Lifecycle changes are cooperative state-machine intents owned by the same thread
 that calls `WorkerSupervisor.tick()`. Stop sends `SHUTDOWN` and returns; later
 ticks keep draining progress until the old PID exits or the 150-second outer
 deadline tree-kills it. Restart is the same stop followed by a spawn only after
-the old PID is confirmed dead. Either way the supervisor drops the outgoing
+the old PID is confirmed dead. The blocking `stop()` that runs when the
+dashboard closes also drains snapshots between short joins, so the worker's
+final frames are still read, and it tree-kills at once when `SHUTDOWN` cannot be
+sent. The worker reads commands independently of its own snapshot sends, so a
+send parked on a pipe the dashboard no longer reads does not hide the
+`SHUTDOWN`. For both stop and restart the supervisor drops the outgoing
 worker's snapshot and liveness stamp immediately and pins a status of its own,
 `STOPPING` or `RESTARTING`, so late frames from the draining process cannot
 change the display back to `RUNNING` or age into `UNRESPONSIVE`. The presentation

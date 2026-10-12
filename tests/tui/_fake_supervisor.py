@@ -57,6 +57,7 @@ class FakeSupervisor:
         self.stop_calls = 0
         self.restart_calls = 0
         self.close_calls = 0
+        self.force_kill_calls = 0
         self.tick_calls = 0
 
         self.requests: list[str] = []
@@ -135,6 +136,12 @@ class FakeSupervisor:
     def request_restart(self, *, timeout: float = 0.0) -> None:
         """Record the app's cooperative restart intent; the in-process fake completes it immediately."""
         self.restart()
+
+    def force_kill(self) -> None:
+        """Record an immediate kill and mark the worker not running."""
+        self.force_kill_calls += 1
+        self._alive = False
+        self._status = SupervisorStatus.STOPPED
 
     def close(self) -> None:
         """Record the frontend releasing the supervisor and mark the worker not running."""

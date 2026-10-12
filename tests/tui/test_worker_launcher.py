@@ -351,6 +351,83 @@ def test_graceful_stop_terminates_worker_that_overruns_deadline(monkeypatch: pyt
     assert supervisor.status is SupervisorStatus.STOPPED
 
 
+class _SlowExitProcess(_FakeProcess):
+    """A process stand-in that exits only after a set number of joins, each of which returns without it."""
+
+    def __init__(self, *, joins_before_exit: int) -> None:
+        super().__init__()
+        self.join_timeouts: list[float | None] = []
+        self._joins_before_exit = joins_before_exit
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeouts.append(timeout)
+        if len(self.join_timeouts) >= self._joins_before_exit:
+            self._alive = False
+
+
+class _UnsendableConn(_FakeConn):
+    """A pipe stand-in whose sends fail as a closed pipe's do."""
+
+    def send(self, obj: object) -> None:
+        raise OSError("the pipe is closed")
+
+
+def test_blocking_stop_drains_snapshots_while_it_waits() -> None:
+    """The blocking stop reads the worker's final frames instead of joining blind.
+
+    A worker writing to a pipe nobody reads blocks once the buffer fills, so the frame carrying
+    ``shutting_down`` would never arrive and the observer would never learn the exit was deliberate.
+    """
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    process = _SlowExitProcess(joins_before_exit=3)
+    process.start()
+    supervisor._process = process  # type: ignore[assignment]
+    final_frame = _stub_snapshot()
+    final_frame.shutting_down = True
+    supervisor._connection = _ScriptedConn([final_frame])  # type: ignore[assignment]
+    observed: list[WorkerStateSnapshot] = []
+    supervisor.on_snapshot = observed.append
+
+    supervisor.stop(timeout=10.0)
+
+    assert [snapshot.shutting_down for snapshot in observed] == [True]
+    assert len(process.join_timeouts) == 3
+    assert all(timeout is not None and timeout < 10.0 for timeout in process.join_timeouts)
+    assert supervisor.status is SupervisorStatus.STOPPED
+
+
+def test_blocking_stop_force_kills_when_the_shutdown_request_cannot_be_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no way to deliver ``SHUTDOWN`` there is nothing to wait for, so the tree is killed at once."""
+    ctx = _FakeCtx()
+    killed_pids: list[int] = []
+    monkeypatch.setattr(
+        worker_launcher,
+        "kill_process_tree",
+        lambda pid, **_kwargs: killed_pids.append(pid) or [pid],
+    )
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    process = _SlowExitProcess(joins_before_exit=1)
+    process.start()
+    supervisor._process = process  # type: ignore[assignment]
+    supervisor._connection = _UnsendableConn()  # type: ignore[assignment]
+
+    sink, sink_id = _capture_supervisor_logs()
+    try:
+        supervisor.stop(timeout=600.0)
+    finally:
+        logger.remove(sink_id)
+
+    assert killed_pids == [process.pid]
+    assert process.join_timeouts == [5.0]
+    assert "Could not send the shutdown request" in sink.getvalue()
+    assert supervisor.status is SupervisorStatus.STOPPED
+
+
 def test_restart_clears_stale_snapshot_and_shows_restarting() -> None:
     """A user restart drops the dead worker's last frame and presents a single RESTARTING phase.
 

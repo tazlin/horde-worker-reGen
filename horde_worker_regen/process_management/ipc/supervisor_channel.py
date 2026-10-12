@@ -2001,13 +2001,16 @@ class SupervisorChannel:
     Snapshots are sent on a daemon thread from a single latest-only slot: :meth:`send_snapshot` only
     updates the slot and returns immediately, so the worker's control loop never blocks on a slow or
     hung supervisor (it just sends the freshest state once the consumer catches up). :meth:`drain_commands`
-    is non-blocking and skips a tick rather than wait if the sender thread is mid-send. A dead pipe
-    marks the channel closed. Any other send failure skips that one frame and keeps the channel open,
-    because the launcher kills a worker whose frames stop, and a transient failure such as host commit
-    exhaustion failing a pickle or a pipe write would otherwise cost a healthy worker its liveness stream.
+    is non-blocking and independent of the sender thread. A dead pipe closes the channel. Any other send
+    failure skips that one frame and keeps the channel open, because the launcher kills a worker whose frames
+    stop, and a transient failure such as host commit exhaustion failing a pickle or a pipe write would
+    otherwise cost a healthy worker its liveness stream.
 
-    Send and receive on the one duplex connection are serialized by a lock, so the sender thread and
-    the control loop never touch the connection concurrently.
+    Thread Safety:
+        The sender thread only writes and the control loop only reads, each on its own direction of the duplex
+        connection. They run concurrently so that a send parked on a supervisor that stopped reading cannot
+        keep the worker from reading the ``SHUTDOWN`` that supervisor sent. A lock guards only the
+        dead-transport transition, which either direction may trigger.
     """
 
     _LIVENESS_INTERVAL = 1.0
@@ -2123,25 +2126,22 @@ class SupervisorChannel:
         return True
 
     def _send_frame(self, frame: WorkerStateSnapshot | WorkerLivenessFrame) -> bool:
-        """Send one frame under the connection lock. Returns whether the frame was sent.
+        """Send one frame. Returns whether the frame was sent.
 
+        The send runs outside :attr:`_lock` because it blocks for as long as the supervisor is not reading.
         The catch is broad because pickling a frame can raise nearly any exception. Every failure other than a
         dead pipe is transient, and the caller tells the two apart by :attr:`closed`.
         """
-        with self._lock:
-            if self._closed:
-                return False
-            try:
-                self._connection.send(frame)
-            except Exception as error:
-                if self._is_dead_pipe_error(error):
+        if self._closed:
+            return False
+        try:
+            self._connection.send(frame)
+        except Exception as error:
+            if self._is_dead_pipe_error(error):
+                with self._lock:
                     self._close_on_dead_transport(error)
-                    return False
-                send_error: Exception | None = error
-            else:
-                send_error = None
-        if send_error is not None:
-            self._note_skipped_frame(frame, send_error)
+                return False
+            self._note_skipped_frame(frame, error)
             return False
         self._note_send_succeeded()
         return True
@@ -2205,21 +2205,18 @@ class SupervisorChannel:
         self._last_send_failure_report_monotonic = 0.0
 
     def drain_commands(self) -> list[SupervisorControlMessage]:
-        """Return all control messages currently waiting, without blocking (skips if a send is in progress)."""
+        """Return all control messages currently waiting, without blocking. Call from one thread only."""
         if self._closed:
             return []
         commands: list[SupervisorControlMessage] = []
-        if not self._lock.acquire(blocking=False):
-            return commands
         try:
             while self._connection.poll():
                 message = self._connection.recv()
                 if isinstance(message, SupervisorControlMessage):
                     commands.append(message)
         except (EOFError, OSError) as error:
-            self._close_on_dead_transport(error)
-        finally:
-            self._lock.release()
+            with self._lock:
+                self._close_on_dead_transport(error)
         return commands
 
     def close(self) -> None:

@@ -712,6 +712,21 @@ class HordeWorkerTUI(App[None]):
         # this flag is set, the app escalates to force-kill the worker immediately instead of waiting
         # for the graceful drain deadline.
         self._graceful_quit_in_progress = False
+        self._logged_unhandled_exception = False
+
+    @property
+    def logged_unhandled_exception(self) -> bool:
+        """Whether an exception Textual caught inside the app has been written to the log."""
+        return self._logged_unhandled_exception
+
+    @override
+    def _handle_exception(self, error: Exception) -> None:
+        # Textual catches an exception raised in a handler, sets a non-zero return code and returns normally
+        # from run(), printing the traceback only to the terminal after the alternate screen closes. It has
+        # no public hook for that, so this private one is the only place the traceback can reach the log.
+        self._logged_unhandled_exception = True
+        logger.opt(exception=error).error("The worker TUI caught an unhandled exception and is exiting.")
+        super()._handle_exception(error)
 
     def compose(self) -> ComposeResult:
         """Lay out the header, status bar, tabbed views, and footer."""
@@ -2807,9 +2822,10 @@ def main(argv: list[str] | None = None) -> None:
     # default stderr sink would corrupt the display.
     setup_supervisor_file_logging("tui", quiet_console=True)
 
-    # Record an unhandled crash of the TUI process itself to bridge_tui.log. Textual lets such an
-    # exception propagate out here and its traceback would otherwise reach only stderr, which a
-    # double-click launch or the alternate-screen buffer discards, leaving no on-disk trace.
+    # Record an unhandled crash of the TUI process itself to bridge_tui.log. An exception raised outside
+    # Textual's message handlers propagates out here and its traceback would otherwise reach only stderr,
+    # which a double-click launch or the alternate-screen buffer discards, leaving no on-disk trace. One
+    # raised inside a handler is caught by Textual and logged by HordeWorkerTUI._handle_exception.
     try:
         _run_app(args)
     except Exception:
@@ -2845,6 +2861,8 @@ def _run_app(args: argparse.Namespace) -> None:
     )
     try:
         app.run()
+        if app.return_code and not app.logged_unhandled_exception:
+            logger.error(f"The worker TUI exited with return code {app.return_code}.")
     finally:
         # Safety net on unexpected exit. close() stops a locally-owned worker, but only detaches when
         # attached to a host, so an attached session never kills the shared worker.

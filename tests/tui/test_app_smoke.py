@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import time
 from pathlib import Path
 
 import pytest
+from loguru import logger
+from textual.app import App
 from textual.command import CommandPalette
 from textual.widgets import Button, Input, Static, TabbedContent, Tabs
 
@@ -24,6 +27,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
 )
 from horde_worker_regen.process_management.scheduling.workload_kind import WorkloadKind
 from horde_worker_regen.run_worker import WorkerLaunchOptions
+from horde_worker_regen.tui import app as app_module
 from horde_worker_regen.tui.app import (
     _COMPACT_TAB_LABELS,
     REMOTE_EXPOSED_CLASS,
@@ -60,6 +64,67 @@ def test_attached_launch_flow_waits_for_the_hosts_first_status() -> None:
 
     attached._lifecycle_resolved = True
     assert not HordeWorkerTUI._attached_lifecycle_pending(attached)
+
+
+def _capture_messages(level: str) -> tuple[list[tuple[str, bool]], int]:
+    """Attach a loguru sink recording ``(message, carries a traceback)`` and return it with its sink id."""
+    records: list[tuple[str, bool]] = []
+    sink_id = logger.add(
+        lambda message: records.append((message.record["message"], message.record["exception"] is not None)),
+        level=level,
+    )
+    return records, sink_id
+
+
+def test_an_exception_textual_catches_reaches_the_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A handler crash Textual absorbs is logged with its traceback before Textual's own handling runs.
+
+    Textual prints that traceback only to the terminal and returns normally from ``run()``, so without the
+    log line the worker is stopped with nothing on disk saying why.
+    """
+    delegated: list[Exception] = []
+    monkeypatch.setattr(App, "_handle_exception", lambda _app, error: delegated.append(error))
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    app = HordeWorkerTUI(FakeSupervisor(), config_path=tmp_path / "bridgeData.yaml", app_state_store=store)
+    error = RuntimeError("handler failed")
+
+    records, sink_id = _capture_messages("ERROR")
+    try:
+        app._handle_exception(error)
+    finally:
+        logger.remove(sink_id)
+
+    assert delegated == [error]
+    assert app.logged_unhandled_exception is True
+    assert records == [("The worker TUI caught an unhandled exception and is exiting.", True)]
+
+
+def test_a_non_zero_return_code_without_a_logged_exception_is_logged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An app that exits with a failure code by any other path still leaves a line in the log."""
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    supervisor = FakeSupervisor()
+
+    def _build_app(built_supervisor: FakeSupervisor, **_kwargs: object) -> HordeWorkerTUI:
+        app = HordeWorkerTUI(built_supervisor, config_path=tmp_path / "bridgeData.yaml", app_state_store=store)
+        monkeypatch.setattr(app, "run", lambda: setattr(app, "_return_code", 1))
+        return app
+
+    monkeypatch.setattr(app_module, "_build_supervisor", lambda _args: supervisor)
+    monkeypatch.setattr(app_module, "HordeWorkerTUI", _build_app)
+    args = argparse.Namespace(
+        config=tmp_path / "bridgeData.yaml", load_config_from_env_vars=False, remote_exposed=False
+    )
+
+    records, sink_id = _capture_messages("ERROR")
+    try:
+        app_module._run_app(args)
+    finally:
+        logger.remove(sink_id)
+
+    assert records == [("The worker TUI exited with return code 1.", False)]
 
 
 def test_title_uses_the_worker_session_start_instead_of_the_frontend_attach_time(tmp_path: Path) -> None:

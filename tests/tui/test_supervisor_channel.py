@@ -445,6 +445,69 @@ def test_closed_channel_emits_no_liveness_frame() -> None:
     child.close()
 
 
+class _SendTrackingConnection:
+    """Delegate to a real pipe end and record whether a send is in progress, so a test can wait for one to park."""
+
+    def __init__(self, connection: object) -> None:
+        self._connection = connection
+        self.in_send = threading.Event()
+
+    def send(self, obj: object) -> None:
+        """Send through the real connection, flagging the call while it runs."""
+        self.in_send.set()
+        try:
+            self._connection.send(obj)  # type: ignore[attr-defined]
+        finally:
+            self.in_send.clear()
+
+    def poll(self, timeout: float | None = 0.0) -> bool:
+        """Poll the real connection."""
+        return self._connection.poll(timeout)  # type: ignore[attr-defined]
+
+    def recv(self) -> object:
+        """Receive from the real connection."""
+        return self._connection.recv()  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        """Close the real connection."""
+        self._connection.close()  # type: ignore[attr-defined]
+
+
+def test_a_send_blocked_on_a_full_pipe_does_not_hide_commands() -> None:
+    """A supervisor that stops reading must still be able to tell the worker to shut down.
+
+    A dashboard that has stopped draining snapshots leaves the worker's send parked on a full pipe. If the
+    command read waited on that send, the worker would never see the ``SHUTDOWN`` sent alongside and would
+    run on until it was killed.
+    """
+    parent, child = multiprocessing.Pipe(duplex=True)
+    connection = _SendTrackingConnection(child)
+    channel = SupervisorChannel(connection)  # pyrefly: ignore
+    try:
+        oversized = _make_snapshot()
+        # Several megabytes is far past both the Windows named-pipe buffer and a POSIX socketpair buffer.
+        oversized.config.dreamer_name = "x" * (4 * 1024 * 1024)
+        channel.send_snapshot(oversized)
+        assert _wait_for(connection.in_send.is_set, timeout=3.0), "the sender never entered a send"
+        time.sleep(0.2)
+        assert connection.in_send.is_set(), "the send completed, so the pipe never filled"
+
+        parent.send(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN))
+        commands: list[SupervisorControlMessage] = []
+        deadline = time.time() + 3.0
+        while time.time() < deadline and not commands:
+            commands = channel.drain_commands()
+            time.sleep(0.05)
+
+        assert [command.command for command in commands] == [SupervisorCommand.SHUTDOWN]
+        assert connection.in_send.is_set(), "the command must arrive while the send is still parked"
+    finally:
+        channel.close()
+        parent.close()
+        channel._sender.join(5.0)
+        child.close()
+
+
 class _GatedConnection:
     """A connection stand-in whose first send parks until released, so close() can be raced into it.
 

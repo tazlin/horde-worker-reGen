@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import io
+import math
 import multiprocessing
 import os
 import sys
@@ -159,6 +160,13 @@ re-orphaned their subprocesses). That window is the worker's hard-capped drain g
 (``shutdown_manager.MAX_SHUTDOWN_GRACE_SECONDS``) plus the fault-report tail it spends reissuing still
 -outstanding jobs (``_FAULT_REPORT_GRACE_SECONDS``) before it self-exits; this value carries headroom
 over their sum."""
+
+_STOP_DRAIN_INTERVAL_SECONDS = 0.25
+"""How long each join inside the blocking :meth:`WorkerSupervisor.stop` lasts before the pipe is drained again.
+
+Matches the cadence owners call :meth:`WorkerSupervisor.tick` at. A worker writing to a pipe nobody reads
+blocks once the pipe buffer fills, so its final frames, the ``shutting_down`` one included, would otherwise
+wait out the whole stop."""
 
 
 @dataclass(frozen=True)
@@ -1022,6 +1030,10 @@ class WorkerSupervisor:
     def stop(self, *, timeout: float = GRACEFUL_STOP_TIMEOUT_SECONDS, set_stopped_status: bool = True) -> None:
         """Gracefully shut the worker down (blocking), terminating it if it overruns the timeout.
 
+        Snapshots are drained while it waits, so the worker's final frames reach :attr:`on_snapshot` and
+        :attr:`latest_snapshot` before the teardown drops them. A shutdown request that cannot be sent
+        leaves nothing to wait for, so the process tree is terminated at once.
+
         ``set_stopped_status=False`` lets :meth:`restart` keep the ``RESTARTING`` phase across the stop
         instead of briefly flashing ``STOPPED`` between the teardown and the relaunch.
         """
@@ -1029,16 +1041,38 @@ class WorkerSupervisor:
         self._restart_after_stop = False
         process = self._process
         if process is not None and process.is_alive():
-            self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN))
-            process.join(timeout)
-            if process.is_alive():
-                logger.warning("Worker did not exit after shutdown request; terminating its process tree.")
+            if not self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN)):
+                logger.warning(
+                    "Could not send the shutdown request because the worker pipe is unusable; "
+                    "terminating its process tree.",
+                )
                 self._force_kill_tree(process)
                 process.join(5.0)
+            else:
+                self._join_while_draining(process, timeout=timeout)
+                if process.is_alive():
+                    logger.warning("Worker did not exit after shutdown request; terminating its process tree.")
+                    self._force_kill_tree(process)
+                    process.join(5.0)
         self._cleanup_process()
         self._graceful_stop_deadline = 0.0
         if set_stopped_status:
             self._set_status(SupervisorStatus.STOPPED)
+
+    def _join_while_draining(self, process: BaseProcess, *, timeout: float) -> None:
+        """Wait up to ``timeout`` seconds for ``process`` to exit, draining snapshots between short joins.
+
+        The joins are also capped in number, so a process handle whose join returns before its timeout while
+        the process lives on ends the wait after as many joins as the timeout holds instead of spinning.
+        """
+        deadline = time.monotonic() + timeout
+        max_joins = max(1, math.ceil(timeout / _STOP_DRAIN_INTERVAL_SECONDS))
+        for _ in range(max_joins):
+            remaining = deadline - time.monotonic()
+            if not process.is_alive() or remaining <= 0.0:
+                return
+            process.join(min(_STOP_DRAIN_INTERVAL_SECONDS, remaining))
+            self.drain_snapshots()
 
     def force_kill(self) -> None:
         """Force-kill the worker process tree immediately, without waiting for a graceful drain.
