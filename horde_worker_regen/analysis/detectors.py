@@ -1390,6 +1390,154 @@ def detect_unpriced_sampling_windows(context: SessionContext) -> list[Finding]:
     ]
 
 
+_CLEARANCE_STAGE_GRANTED_RE = pattern_for("clearance_stage_granted")
+_CLEARANCE_SAMPLE_GRANTED_RE = pattern_for("clearance_sample_granted")
+_CLEARANCE_STAGE_REFUSED_RE = pattern_for("clearance_stage_refused")
+_CLEARANCE_STAGE_HOLD_RE = pattern_for("clearance_stage_hold")
+
+# Above this share of jobs refused an early load, "most" were refused, which on a large card points at the price.
+_STAGE_REFUSAL_MOST_SHARE = 0.5
+
+
+def detect_stage_outlived_sample_grant(context: SessionContext) -> list[Finding]:
+    """Early weight loads whose sample grant did not follow within the child's lease-acquire timeout.
+
+    A stage grant opens a window on its process. The next sample grant or stage grant on that process closes it,
+    as do a denoise loop entered without a recorded grant and the end of the log. The window outlived its sample
+    grant when it closed on an ungranted denoise loop, or when no sample grant came within the timeout. The
+    controller moves a staged child it finds sampling to sampling without a line of its own, so a missing sample
+    grant is the usual evidence.
+    """
+    from horde_worker_regen.process_management.scheduling.clearance_lease import (
+        CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+    )
+
+    records = _records_in_window(context.session.records, context.session.start_ts, context.session.end_ts)
+    timeout = timedelta(seconds=CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS)
+    open_stages: dict[str, LogRecord] = {}
+    late: list[LogRecord] = []
+    ungranted: list[LogRecord] = []
+    last_seen: datetime | None = None
+    for record in records:
+        if record.timestamp is None:
+            continue
+        last_seen = record.timestamp
+        if match := _CLEARANCE_STAGE_GRANTED_RE.search(record.message):
+            previous = open_stages.get(match["process"])
+            if (
+                previous is not None
+                and previous.timestamp is not None
+                and record.timestamp - previous.timestamp > timeout
+            ):
+                late.append(previous)
+            open_stages[match["process"]] = record
+        elif match := _CLEARANCE_SAMPLE_GRANTED_RE.search(record.message):
+            staged = open_stages.pop(match["process"], None)
+            if staged is not None and staged.timestamp is not None and record.timestamp - staged.timestamp > timeout:
+                late.append(staged)
+        elif match := _UNPRICED_SAMPLING_WINDOW_RE.search(record.message):
+            staged = open_stages.pop(match["process"], None)
+            if staged is not None:
+                ungranted.append(staged)
+    end = context.session.end_ts or last_seen
+    unresolved = [
+        staged
+        for staged in open_stages.values()
+        if end is not None and staged.timestamp is not None and end - staged.timestamp > timeout
+    ]
+    outlived = [*late, *ungranted, *unresolved]
+    if not outlived:
+        return []
+    first = min(outlived, key=lambda record: record.timestamp or datetime.min)
+    return [
+        Finding(
+            kind=FindingKind.STAGE_OUTLIVED_SAMPLE_GRANT,
+            severity=Severity.CRITICAL,
+            headline=(
+                "A job loaded its model early but got no grant to start generating within "
+                f"{CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:.0f} seconds, {_times_text(len(outlived))}."
+            ),
+            evidence=[
+                f"the start grant came after the limit: {len(late)}",
+                'generation began with no grant on record ("entered its denoise loop without a recorded grant"): '
+                f"{len(ungranted)}",
+                f"still waiting for the start grant when the log ends: {len(unresolved)}",
+                f"first early load: {_evidence(first)}",
+            ],
+        ),
+    ]
+
+
+def detect_stage_refusals(context: SessionContext) -> list[Finding]:
+    """Jobs refused an early weight load, as a share of the jobs that asked for one, with the commonest clause.
+
+    Counted per job, not per check: the controller asks again for the waiting job's stage every step, so the
+    duty line's running tally counts one job's wait many times. A job's span on its process ends at its sample
+    grant or at a denoise loop entered without one. The job was staged when a stage grant fell in the span, and
+    refused when only refusals did. The clause is the disposition the scheduler's stage hold line names.
+    """
+    records = _records_in_window(context.session.records, context.session.start_ts, context.session.end_ts)
+    staged: set[str] = set()
+    first_refusal: dict[str, LogRecord] = {}
+    staged_jobs = 0
+    refused_jobs: list[LogRecord] = []
+    clause_counts: dict[str, int] = {}
+    for record in records:
+        if match := _CLEARANCE_STAGE_GRANTED_RE.search(record.message):
+            staged.add(match["process"])
+        elif (match := _CLEARANCE_STAGE_REFUSED_RE.search(record.message)) or (
+            match := _CLEARANCE_STAGE_HOLD_RE.search(record.message)
+        ):
+            first_refusal.setdefault(match["process"], record)
+            if clause := match.groupdict().get("clause"):
+                clause_counts[clause] = clause_counts.get(clause, 0) + 1
+        elif (match := _CLEARANCE_SAMPLE_GRANTED_RE.search(record.message)) or (
+            match := _UNPRICED_SAMPLING_WINDOW_RE.search(record.message)
+        ):
+            process = match["process"]
+            if process in staged:
+                staged_jobs += 1
+            elif process in first_refusal:
+                refused_jobs.append(first_refusal[process])
+            staged.discard(process)
+            first_refusal.pop(process, None)
+    staged_jobs += len(staged)
+    refused_jobs.extend(record for process, record in first_refusal.items() if process not in staged)
+    if not refused_jobs:
+        return []
+    total = staged_jobs + len(refused_jobs)
+    share = len(refused_jobs) / total
+    if share > _STAGE_REFUSAL_MOST_SHARE:
+        action = "On a card under 20 GB this is expected. On a larger card, run `horde-log bundle` and report it."
+    else:
+        action = "No action needed."
+    evidence = [
+        f"jobs that loaded early: {staged_jobs}",
+        f"jobs refused an early load: {len(refused_jobs)}, {share:.0%} of those that asked",
+    ]
+    if clause_counts:
+        clause, count = max(clause_counts.items(), key=lambda entry: (entry[1], entry[0]))
+        evidence.append(
+            f'most common reason on the stage hold lines: "{clause}", {count} of {sum(clause_counts.values())}'
+        )
+    else:
+        evidence.append("no stage hold line names a reason")
+    first = min(refused_jobs, key=lambda record: record.timestamp or datetime.min)
+    evidence.append(f"first refusal: {_evidence(first)}")
+    return [
+        Finding(
+            kind=FindingKind.STAGE_REFUSALS,
+            severity=Severity.INFO,
+            headline=(
+                f"Early model loads were refused for {len(refused_jobs)} of {total} jobs that waited behind a "
+                "running job."
+            ),
+            action_addendum=action,
+            evidence=evidence,
+        ),
+    ]
+
+
 # Residency-reconciliation holds are benign at low volume; sustained, they are a real swap-churn duty cost.
 # A rate past this many holds per hour, or a cumulative parked share past this fraction of the session, is
 # worth a warning rather than the informational default.
@@ -5316,6 +5464,8 @@ DETECTORS: list[Detector] = [
     detect_service_lane_restart_churn,
     detect_lane_double_dispatch_signature,
     detect_unpriced_sampling_windows,
+    detect_stage_outlived_sample_grant,
+    detect_stage_refusals,
     detect_post_processing_deferral_starvation,
     detect_oom,
     detect_file_descriptor_exhaustion,

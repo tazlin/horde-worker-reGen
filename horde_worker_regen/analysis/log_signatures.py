@@ -111,6 +111,9 @@ _DEFERRED_GPU_START_NOT_EXERCISED = (
 )
 
 _RAM_NOT_EXERCISED = "the dry-run harness never drives the host below its RAM requirements"
+_CLEARANCE_LEASE_NOT_EXERCISED = (
+    "the dry-run harness runs with the clearance lease off, so no stage or sample grant is decided or logged"
+)
 
 _ABORT_SENTINEL_NAMES_PATTERN = "|".join(re.escape(abort_sentinel_name(kind)) for kind in AbortSentinelKind)
 
@@ -1612,6 +1615,41 @@ _SIGNATURE_LIST: list[LogSignature] = [
         sample="Clearance lease on device 0: process 2 entered its denoise loop without a recorded grant "
         "(unpriced sampling window); liveness preserved.",
         dry_run_reason=_NO_FAULT,
+    ),
+    _signature(
+        "clearance_stage_granted",
+        r"Clearance lease on device (?P<device>\d+): cleared process (?P<process>\d+) to stage its weights ahead "
+        r"of its sample window",
+        emitter="process_management.scheduling.clearance_lease:ClearanceController._clear_stage",
+        sample="Clearance lease on device 0: cleared process 2 to stage its weights ahead of its sample window.",
+        dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
+    ),
+    _signature(
+        "clearance_sample_granted",
+        r"Clearance lease on device (?P<device>\d+): cleared process (?P<process>\d+) into its load-and-sample "
+        r"window",
+        emitter="process_management.scheduling.clearance_lease:ClearanceController._clear",
+        sample="Clearance lease on device 0: cleared process 2 into its load-and-sample window.",
+        dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
+    ),
+    _signature(
+        "clearance_stage_refused",
+        r"Clearance lease on device (?P<device>\d+): stage grant for process (?P<process>\d+) refused by admission",
+        emitter="process_management.scheduling.clearance_lease:ClearanceController._note_stage_refusal",
+        sample="Clearance lease on device 0: stage grant for process 2 refused by admission.",
+        dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
+    ),
+    _signature(
+        "clearance_stage_hold",
+        r"Clearance held for process (?P<process>\d+) \((?P<model>.+?)\): stage (?P<clause>\w+);",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._log_clearance_hold",
+        sample=(
+            "Clearance held for process 2 (WAI-NSFW-illustrious-SDXL): stage defer; candidate 6600MB (child already "
+            "holds 2100MB) vs device free 9000MB, available 5200MB, reserve 1024MB, outstanding reservations "
+            "3300MB, noise buffer 500MB; reclaim run: none; outstanding by unit: none. The staged child waits for "
+            "room (or samples via its lease-acquire timeout); this repeats at most once per distinct cause."
+        ),
+        dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
     ),
 ]
 

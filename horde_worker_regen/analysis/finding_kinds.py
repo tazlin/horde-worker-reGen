@@ -92,6 +92,8 @@ class FindingKind(enum.StrEnum):
     DEVICE_READING_MISSING = "device_reading_missing"
     SCHEDULER_STARVATION_WEDGE = "scheduler_starvation_wedge"
     UNPRICED_SAMPLING_WINDOWS = "unpriced_sampling_windows"
+    STAGE_OUTLIVED_SAMPLE_GRANT = "stage_outlived_sample_grant"
+    STAGE_REFUSALS = "stage_refusals"
     UNSATISFIABLE_HEAD_STARVATION = "unsatisfiable_head_starvation"
     RESIDENCY_RECONCILIATION_HOLDS = "residency_reconciliation_holds"
     WHOLE_CARD_CONVERGENCE_WEDGE = "whole_card_convergence_wedge"
@@ -540,6 +542,35 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         ),
         see_also=FindingKind.SCHEDULER_STARVATION_WEDGE,
         reference_page="docs/explanation/admission_pipeline.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.STAGE_OUTLIVED_SAMPLE_GRANT,
+        title="A job loaded its model early and got no grant to start in time",
+        action=(
+            "Set `gpu_sampling_lease_two_phase` to false. "
+            "Then run `horde-log bundle` and report the log around the first time this happened."
+        ),
+        detail=(
+            "With two-phase clearance a waiting job loads its model while another job generates. "
+            "It then waits for a second memory grant before it starts generating. "
+            "Here that second grant did not come within the 60 second limit, or the process started without it. "
+            "The job then generated with memory nothing had priced, which can run the card out of memory. "
+            "Turning the setting off returns the worker to one grant per job."
+        ),
+        see_also=FindingKind.UNPRICED_SAMPLING_WINDOWS,
+        reference_page="docs/explanation/performance_and_backpressure.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.STAGE_REFUSALS,
+        title="Jobs were refused an early model load",
+        detail=(
+            "With two-phase clearance the worker lets the next job load its model while another job generates. "
+            "It does so only when the measured free memory holds the model beside the running job. "
+            "A refused early load is not an error. "
+            "That job loads at its normal turn, as it would with the setting off. "
+            "On a card over 20 GB most jobs should load early, so frequent refusals there are worth a report."
+        ),
+        reference_page="docs/explanation/performance_and_backpressure.md",
     ),
     FindingSpec(
         kind=FindingKind.UNSATISFIABLE_HEAD_STARVATION,

@@ -219,6 +219,30 @@ def _startup_line() -> str:
     return f"2026-06-24 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}"
 
 
+def _stage_granted(ts: str, *, process: int = 2) -> str:
+    """ClearanceController._clear_stage: a waiting process cleared to upload its weights early."""
+    return (
+        f"2026-06-24 {ts} | DEBUG | x:y:1 - Clearance lease on device 0: cleared process {process} to stage its "
+        "weights ahead of its sample window."
+    )
+
+
+def _sample_granted(ts: str, *, process: int = 2) -> str:
+    """ClearanceController._clear: a process cleared into its denoise window."""
+    return (
+        f"2026-06-24 {ts} | DEBUG | x:y:1 - Clearance lease on device 0: cleared process {process} into its "
+        "load-and-sample window."
+    )
+
+
+def _stage_refused(ts: str, *, process: int = 2) -> str:
+    """ClearanceController._note_stage_refusal: the scheduler's price refused a waiting process's early upload."""
+    return (
+        f"2026-06-24 {ts} | DEBUG | x:y:1 - Clearance lease on device 0: stage grant for process {process} refused "
+        "by admission."
+    )
+
+
 def _bridge(*lines: str) -> str:
     """A single-session bridge log: the startup boundary followed by the given lines."""
     return "\n".join([_startup_line(), *lines])
@@ -561,6 +585,25 @@ CONTRACTS: dict[str, Contract] = {
         ),
         severity=Severity.WARNING,
     ),
+    "detect_stage_outlived_sample_grant": Contract(
+        bridge=_bridge(
+            _stage_granted("18:00:00.000"),
+            _sample_granted("18:01:05.000"),
+        ),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_stage_refusals": Contract(
+        bridge=_bridge(
+            _stage_refused("18:00:00.000"),
+            "2026-06-24 18:00:00.500 | INFO | x:y:1 - Clearance held for process 2 (WAI-NSFW-illustrious-SDXL): "
+            "stage defer; candidate 6600MB (child already holds 2100MB) vs device free 9000MB, available 5200MB, "
+            "reserve 1024MB, outstanding reservations 3300MB, noise buffer 500MB; reclaim run: none; outstanding by "
+            "unit: none. The staged child waits for room (or samples via its lease-acquire timeout); this repeats "
+            "at most once per distinct cause.",
+            _sample_granted("18:00:20.000"),
+        ),
+        severity=Severity.INFO,
+    ),
     "detect_oom": Contract(
         bridge=_bridge(_oom("18:00:10.000")),
         severity=Severity.CRITICAL,
@@ -764,6 +807,26 @@ def test_an_emit_falls_back_to_the_declared_title_and_cross_reference() -> None:
     )
     assert overridden.title == "Head-of-queue job not dispatching (no blocking gate)"
     assert overridden.see_also is FindingKind.SCHEDULER_STARVATION_WEDGE
+
+
+def test_a_stage_whose_sample_grant_follows_in_time_is_not_reported(tmp_path: Path) -> None:
+    """A stage grant answered by its sample grant well inside the acquire timeout is the designed handoff."""
+    findings = _diagnose(tmp_path, _bridge(_stage_granted("18:00:00.000"), _sample_granted("18:00:05.000")))
+    assert "stage_outlived_sample_grant" not in findings
+
+
+def test_stages_that_were_all_granted_report_no_refusals(tmp_path: Path) -> None:
+    """Jobs that each loaded early leave nothing to report about refusals."""
+    findings = _diagnose(
+        tmp_path,
+        _bridge(
+            _stage_granted("18:00:00.000"),
+            _sample_granted("18:00:05.000"),
+            _stage_granted("18:00:30.000", process=3),
+            _sample_granted("18:00:40.000", process=3),
+        ),
+    )
+    assert "stage_refusals" not in findings
 
 
 def test_every_detector_has_a_contract_fixture() -> None:
