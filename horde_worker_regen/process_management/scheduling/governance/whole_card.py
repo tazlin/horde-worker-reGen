@@ -154,13 +154,15 @@ residency on it would pay a full teardown and regrowth for a lull of a few secon
 that cannot be produced by that ordinary spacing, and it is reached within seconds at any pop cadence, so the
 hysteresis costs the worker almost nothing when the demand really has gone."""
 
-_POP_CLAIM_EMPTY_POP_WINDOW_SECONDS = 30.0
+_POP_CLAIM_EMPTY_POP_WINDOW_SECONDS = 10.0
 """How long the run of empty pops must have spanned before it counts as the demand having dried up.
 
 The count alone is cadence-dependent: a worker popping every second reaches three empties in a gap far too
 short to conclude anything from. Requiring the run to also cover a span makes the evidence a statement about
-the horde's queue rather than about this worker's pop rate. Deliberately short next to the maximum hold, so
-an idle residency is given back long before the cap has to end it.
+the horde's queue rather than about this worker's pop rate. Sized to the ordinary pop cadence of a few
+seconds, so the run of three empties ends the claim about as soon as it is complete: every second the claim
+outlives its demand is a second the whole pool is withheld from an idle card, and a single-job residency
+already spends more time establishing and releasing than sampling.
 
 Both rails are fixed rather than operator-configured: they describe how much evidence is needed to believe a
 reading, which is not a preference, and the operator-facing lever over how long a residency may own the
