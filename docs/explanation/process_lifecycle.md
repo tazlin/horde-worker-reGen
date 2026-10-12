@@ -239,7 +239,11 @@ Deferred GPU starts apply to inference slots and GPU-resident auxiliary lanes
 (safety-on-GPU, post-processing, component, and VAE lanes). The admission floor is
 the device-free governor's soft floor plus one measured/estimated CUDA context
 cost, so a respawn waits until there is enough room both to stay out of the
-saturation band and to pay the context it is about to create. Missing device-free
+saturation band and to pay the context it is about to create. Each inference
+process on the card still in `PROCESS_STARTING` adds one more context to the
+floor, because its context forms after the start is granted and a free reading
+taken in between still counts that room as free. Without that charge a scale-up
+judged against one reading would admit several lanes onto room for one. Missing device-free
 telemetry is permissive: on hosts that cannot report a trustworthy device-level
 free value, lifecycle falls back to the old immediate-start behavior rather than
 inventing a floor. Each deferred start records `PROCESS_START_DEFERRED` in the

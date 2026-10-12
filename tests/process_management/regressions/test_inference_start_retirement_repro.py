@@ -21,6 +21,10 @@ Contracts:
    INFO line and one ledger event record it. This holds on a single card, where the lost lane is the second one
    on the only card. Room that comes and goes inside the dwell does not restore, and a card whose shortfall is
    structural never does.
+5. In-flight starts are charged. Each inference process on a card still in ``PROCESS_STARTING`` holds one
+   context of the card's free reading for itself, because its context has not formed on the card yet. A
+   scale-up onto room for one context starts one lane and defers the rest, and a start the raw reading would
+   admit defers while another lane on the card is still starting.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     ProcessLifecycleManager,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, soft_floor_mb
 from tests.process_management.conftest import (
     device_wide_reading_provider,
     make_test_card_runtimes,
@@ -75,6 +79,12 @@ _TRANSIENT_ROOM_CYCLES = max(1, math.floor(RETIRED_INFERENCE_SLOT_RESTORE_DWELL_
 
 _UNREACHABLE_FLOOR_MB = _CARD_TOTAL_MB
 """A standing floor that leaves the card no room a start could ever use: the shortfall is structural."""
+
+_CONTEXT_MB = 600.0
+"""The CUDA context one inference start is charged in the in-flight scenarios."""
+
+_ROOM_FOR_ONE_START_MB = soft_floor_mb(_CARD_TOTAL_MB) + 1.5 * _CONTEXT_MB
+"""A free reading one and a half contexts above the soft floor, which is room for one start and never two."""
 
 _STALLED_CARD = 0
 _SERVING_CARD = 1
@@ -162,6 +172,7 @@ def _lifecycle(
     *,
     device_indices: tuple[int, ...],
     target_process_count: int,
+    gpu_start_context_mb: float = 0.0,
 ) -> ProcessLifecycleManager:
     """Build a lifecycle over ``device_indices``, each planning ``target_process_count`` lanes, with spawns faked."""
     bridge_data = Mock()
@@ -211,7 +222,7 @@ def _lifecycle(
             lambda device_index: cards.free_mb.get(device_index), lambda _device_index: _CARD_TOTAL_MB
         ),
         device_governor_state_provider=lambda device_index: cards.governor[device_index],
-        gpu_start_context_mb_provider=lambda: 0.0,
+        gpu_start_context_mb_provider=lambda: gpu_start_context_mb,
     )
 
 
@@ -473,3 +484,64 @@ class TestRetiredSlotIsRestored:
         assert lifecycle.num_inference_slots_retired == 1
         assert lifecycle._card_runtimes[_STALLED_CARD].target_process_count == 0
         assert _restore_events(lifecycle) == []
+
+
+def _card_with_room_for_one_start() -> _Cards:
+    """Return readings where card 0 is healthy with room above its soft floor for one context."""
+    cards = _Cards()
+    cards.give_room(_STALLED_CARD)
+    cards.free_mb[_STALLED_CARD] = _ROOM_FOR_ONE_START_MB
+    return cards
+
+
+def _pending_inference_start_ids(lifecycle: ProcessLifecycleManager) -> list[int | None]:
+    """Return the slot ids of the deferred inference starts, in slot order."""
+    return sorted(
+        (pending.process_id for pending in lifecycle._pending_gpu_starts.values()),
+        key=lambda process_id: -1 if process_id is None else process_id,
+    )
+
+
+class TestInFlightStartsAreCharged:
+    """A start still forming its context holds that context's room against the next start on its card."""
+
+    def test_a_scale_up_onto_room_for_one_context_starts_one_lane_and_defers_the_rest(self) -> None:
+        """Of three lanes requested in one pass against one reading, one starts and two wait for the card to move."""
+        cards = _card_with_room_for_one_start()
+        lifecycle = _lifecycle(
+            cards,
+            device_indices=(_STALLED_CARD,),
+            target_process_count=3,
+            gpu_start_context_mb=_CONTEXT_MB,
+        )
+
+        lifecycle.scale_inference_processes(3, device_index=_STALLED_CARD)
+
+        assert _inference_lanes_on(lifecycle, _STALLED_CARD) == [1], (
+            "every lane of the scale-up was judged against the same free reading and admitted onto room for one"
+        )
+        assert lifecycle._process_map[1].last_process_state is HordeProcessState.PROCESS_STARTING
+        assert _pending_inference_start_ids(lifecycle) == [2, 3]
+
+    def test_a_start_the_raw_reading_admits_defers_while_another_lane_is_still_starting(self) -> None:
+        """The second start waits on the first lane's context and goes once that lane reports."""
+        cards = _card_with_room_for_one_start()
+        lifecycle = _lifecycle(
+            cards,
+            device_indices=(_STALLED_CARD,),
+            target_process_count=2,
+            gpu_start_context_mb=_CONTEXT_MB,
+        )
+        assert lifecycle._request_inference_process_start(1, device_index=_STALLED_CARD, reason="pool") is True
+        assert lifecycle._process_map[1].last_process_state is HordeProcessState.PROCESS_STARTING
+        assert cards.free_mb[_STALLED_CARD] >= lifecycle._gpu_start_required_free_mb(_STALLED_CARD)
+
+        assert lifecycle._request_inference_process_start(2, device_index=_STALLED_CARD, reason="pool") is False
+        assert lifecycle.drain_pending_gpu_starts() == 0
+        assert _pending_inference_start_ids(lifecycle) == [2]
+
+        # The first lane reports with its context formed, while the card's reading still shows room for one.
+        lifecycle._process_map[1].last_process_state = HordeProcessState.WAITING_FOR_JOB
+        assert lifecycle.drain_pending_gpu_starts() == 1
+        assert sorted(_inference_lanes_on(lifecycle, _STALLED_CARD)) == [1, 2]
+        assert lifecycle.has_pending_inference_starts() is False

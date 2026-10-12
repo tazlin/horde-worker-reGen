@@ -1175,12 +1175,25 @@ class ProcessLifecycleManager:
     def _gpu_start_required_free_mb(self, device_index: int) -> float:
         """Return the free-VRAM floor needed before starting another CUDA-bearing child."""
         total_mb = self._gpu_start_device_total_mb(device_index)
+        return soft_floor_mb(total_mb) + self._gpu_start_context_mb()
+
+    def _gpu_start_context_mb(self) -> float:
+        """Return the VRAM (MB) one child's CUDA context is expected to take, or 0 when no estimate is available."""
         try:
-            context_mb = max(0.0, float(self._gpu_start_context_mb_provider()))
+            return max(0.0, float(self._gpu_start_context_mb_provider()))
         except Exception as e:
             logger.debug(f"GPU-start context estimate unavailable: {type(e).__name__} {e}")
-            context_mb = 0.0
-        return soft_floor_mb(total_mb) + context_mb
+            return 0.0
+
+    def _inference_starts_in_flight(self, device_index: int) -> int:
+        """Return how many inference processes on the card were started and have not yet reported past starting."""
+        return sum(
+            1
+            for process_info in self._process_map.values()
+            if process_info.process_type is HordeProcessType.INFERENCE
+            and process_info.device_index == device_index
+            and process_info.last_process_state is HordeProcessState.PROCESS_STARTING
+        )
 
     def _gpu_start_has_headroom(
         self,
@@ -1194,26 +1207,37 @@ class ProcessLifecycleManager:
         ``extra_required_mb`` adds a per-process expected-footprint charge on top of the generic
         soft-floor + context requirement, for a lane (such as the image-utilities lane) whose own device
         footprint should be reserved before it is admitted.
+
+        Each inference process on the card still in ``PROCESS_STARTING`` is charged one more context, because a
+        child's context forms some time after it is granted and a free reading taken in between still counts that
+        room as free. Without the charge, several starts judged in one pass (a scale-up) are each admitted onto
+        the room for one, and the surplus children fail allocating their contexts.
         """
         if cpu_only:
             return True, ""
         free_mb = self._device_free_mb(device_index)
         if free_mb is None:
             return True, ""
-        required_mb = self._gpu_start_required_free_mb(device_index) + extra_required_mb
+        own_required_mb = self._gpu_start_required_free_mb(device_index) + extra_required_mb
+        starts_in_flight = self._inference_starts_in_flight(device_index)
+        required_mb = own_required_mb + starts_in_flight * self._gpu_start_context_mb()
         governor_state = self._device_governor_state_provider(device_index)
         if free_mb >= required_mb and governor_state == GovernorState.HEALTHY:
             return True, ""
         self._note_pending_gpu_start_sample(device_index, free_mb)
         room_mb = self._achievable_room_mb(device_index)
+        # The in-flight charge is transient, so only the start's own requirement can make a shortfall structural.
         structural_note = (
             f" (a structural shortfall, the card can give back at most {room_mb:.0f}MB beside its standing tenants)"
-            if room_mb is not None and required_mb > room_mb
+            if room_mb is not None and own_required_mb > room_mb
             else ""
+        )
+        in_flight_note = (
+            f", {starts_in_flight} inference start(s) still forming their contexts" if starts_in_flight else ""
         )
         return (
             False,
-            f"device {device_index} is {governor_state.value} with {free_mb:.0f}MB free; "
+            f"device {device_index} is {governor_state.value} with {free_mb:.0f}MB free{in_flight_note}; "
             f"waiting for at least {required_mb:.0f}MB before starting another GPU process{structural_note}",
         )
 
