@@ -648,6 +648,8 @@ class JobPopper:
         self._residency_bias_state = ResidencyBiasState()
         self._residency_bias_narrowing = False
         self._residency_bias_offered_count = 0
+        self._residency_bias_pop_narrowed = False
+        self._residency_bias_last_narrowed_pop_empty = False
         # Fixed-pool advertising: the seat provider and outcome sink are inert by default, so a popper wired
         # without them is byte-identical to the pre-pool worker. The lane state carries the fixed/free
         # interleave across pops; the narrowing latch anchors the edge log/ledger; the last-fixed count and
@@ -1136,9 +1138,13 @@ class JobPopper:
             resident_models=resident,
             staged_models=staged,
             offered_models=frozenset(models),
+            last_narrowed_pop_empty=self._residency_bias_last_narrowed_pop_empty,
         )
         self._residency_bias_state = decision.next_state
         self._residency_bias_offered_count = len(decision.advertised_models)
+        # The answer to this pop is recorded at the outcome sites against the narrowing it was made under.
+        self._residency_bias_pop_narrowed = decision.narrowed_offer
+        self._residency_bias_last_narrowed_pop_empty = False
         self._log_residency_bias_edge(decision)
         return set(decision.advertised_models)
 
@@ -2228,6 +2234,7 @@ class JobPopper:
         # card can run without a swap. Duty-cycled so the full set is periodically re-advertised, and skipped
         # entirely on an idle-fill pop, whose job is to grab the quickest available work regardless of model.
         on_fixed_lane = pool_lane is not None and pool_lane.lane is PopLane.FIXED
+        self._residency_bias_pop_narrowed = False
         if not idle_fill_wanted and not on_fixed_lane:
             models = self._apply_residency_advertising_bias(models)
 
@@ -2485,6 +2492,9 @@ class JobPopper:
 
         if job_pop_response.id_ is None:
             self._note_whole_card_pop_outcome(pop_claim, served=False)
+            if self._residency_bias_pop_narrowed:
+                # A narrowed offer the horde had nothing for: the next pop opens the offer again.
+                self._residency_bias_last_narrowed_pop_empty = True
             self._state.last_pop_no_jobs_available = True
             # A reduced-size pop asks for a different job range than the regular lane, so its skips are kept
             # apart: the operator reads why the constrained models find nothing without that answer

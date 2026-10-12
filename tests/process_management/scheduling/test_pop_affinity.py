@@ -17,6 +17,7 @@ def _run(
     offered: set[str] | None = None,
     narrow_cycles: int = 6,
     open_cycles: int = 2,
+    last_narrowed_pop_empty: bool = False,
 ) -> tuple[frozenset[str], bool, bool, ResidencyBiasState]:
     """Run one decision with compact defaults, returning the decision's fields as a tuple."""
     decision = decide_residency_advertising(
@@ -27,6 +28,7 @@ def _run(
         offered_models=offered if offered is not None else {"A", "B", "C"},
         narrow_cycles=narrow_cycles,
         open_cycles=open_cycles,
+        last_narrowed_pop_empty=last_narrowed_pop_empty,
     )
     return (
         decision.advertised_models,
@@ -204,3 +206,43 @@ class TestOffSwitch:
             assert not narrowed
             assert advertised == frozenset({"A", "B", "C"})
             assert state == ResidencyBiasState()
+
+
+class TestEmptyNarrowedPop:
+    """A narrowed pop the horde answered with nothing ends the narrow phase on the next cycle."""
+
+    def test_empty_narrowed_pop_opens_the_offer(self) -> None:
+        """The cycle after an empty narrowed pop advertises the full set and starts the open phase."""
+        _, _, _, state = _run(ResidencyBiasState(), swap_backlog=True)
+        assert state.narrowing
+        advertised, narrowing, narrowed_offer, state = _run(
+            state,
+            swap_backlog=True,
+            last_narrowed_pop_empty=True,
+        )
+        assert advertised == frozenset({"A", "B", "C"})
+        assert not narrowing
+        assert not narrowed_offer
+        assert state == ResidencyBiasState(active=True, narrowing=False, cycles_in_phase=1)
+
+    def test_open_phase_after_an_empty_pop_runs_its_length_before_narrowing_again(self) -> None:
+        """The open phase an empty pop started lasts its configured cycles, then the backlog narrows again."""
+        _, _, _, state = _run(ResidencyBiasState(), swap_backlog=True)
+        _, _, _, state = _run(state, swap_backlog=True, last_narrowed_pop_empty=True)
+        _, narrowing, _, state = _run(state, swap_backlog=True)
+        assert not narrowing
+        assert state == ResidencyBiasState(active=True, narrowing=True, cycles_in_phase=0)
+
+    def test_a_served_narrowed_pop_keeps_the_narrow_phase(self) -> None:
+        """A narrowed pop that returned work is no reason to open the offer."""
+        _, _, _, state = _run(ResidencyBiasState(), swap_backlog=True)
+        _, narrowing, narrowed_offer, _ = _run(state, swap_backlog=True, last_narrowed_pop_empty=False)
+        assert narrowing
+        assert narrowed_offer
+
+    def test_the_flag_is_ignored_outside_a_narrow_phase(self) -> None:
+        """An open-phase cycle advances as usual whatever the previous pop answered."""
+        state = ResidencyBiasState(active=True, narrowing=False, cycles_in_phase=0)
+        _, narrowing, _, next_state = _run(state, swap_backlog=True, last_narrowed_pop_empty=True)
+        assert not narrowing
+        assert next_state == ResidencyBiasState(active=True, narrowing=False, cycles_in_phase=1)

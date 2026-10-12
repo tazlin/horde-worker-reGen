@@ -10,7 +10,8 @@ return work the card can run without a swap.
 The narrowing is duty-cycled. It engages for a bounded run of pop cycles, then re-opens the full offered
 set for a run of cycles, so cold demand still reaches the worker and rare-model kudos stay reachable. The
 window is bounded by the duty cycle even if the backlog never clears; there is no path to a permanent
-narrowing. Two safety rails hold regardless of phase: the narrowed offer is floored at resident+staged
+narrowing. A narrowed pop the horde answers with no work ends the narrow phase early: the residents have
+no demand to feed, and holding the rest of the pool back from a card with nothing to do only starves it. Two safety rails hold regardless of phase: the narrowed offer is floored at resident+staged
 (and falls back to the full offered set when that floor is empty), and narrowing only ever removes models
 from the offer, never adds one the worker does not already offer, so an advertised model is always one the
 worker would serve.
@@ -101,6 +102,7 @@ def decide_residency_advertising(
     offered_models: Iterable[str],
     narrow_cycles: int = _RESIDENCY_BIAS_NARROW_CYCLES,
     open_cycles: int = _RESIDENCY_BIAS_OPEN_CYCLES,
+    last_narrowed_pop_empty: bool = False,
 ) -> ResidencyBiasDecision:
     """Decide this pop cycle's advertised model set and advance the duty cycle.
 
@@ -111,6 +113,11 @@ def decide_residency_advertising(
     offer is intersected with resident+staged, floored back to the full offered set when that intersection is
     empty so the offer is never emptied, and never expanded beyond the offered set.
 
+    A narrowed pop the horde answered with no work ends the narrow phase at once. The narrowing exists to
+    make the horde return resident work, and an empty answer says there is none to return, so every further
+    narrowed pop would only withhold the rest of the pool from a card with nothing to do. The open phase that
+    follows runs its ordinary length before the backlog may narrow the offer again.
+
     Args:
         state: The current duty-cycle state (the popper's stored ``ResidencyBiasState``).
         swap_backlog: Whether the worker is currently paying model swaps (a queued head needs a
@@ -120,6 +127,8 @@ def decide_residency_advertising(
         offered_models: The full eligible set this pop would otherwise advertise (assumed non-empty).
         narrow_cycles: Narrow-phase length in pop cycles; non-positive disables narrowing entirely.
         open_cycles: Open-phase length in pop cycles.
+        last_narrowed_pop_empty: Whether the previous pop was made under a narrowed offer and came back
+            with no work.
 
     Returns:
         The :class:`ResidencyBiasDecision` for this cycle.
@@ -138,6 +147,15 @@ def decide_residency_advertising(
         narrowing_now = True
         next_state = _advance_phase(
             narrowing=True,
+            cycles_consumed=1,
+            narrow_cycles=narrow_cycles,
+            open_cycles=open_cycles,
+        )
+    elif state.narrowing and last_narrowed_pop_empty:
+        # The narrow phase is spent: this cycle opens the offer and is the open phase's first cycle.
+        narrowing_now = False
+        next_state = _advance_phase(
+            narrowing=False,
             cycles_consumed=1,
             narrow_cycles=narrow_cycles,
             open_cycles=open_cycles,
