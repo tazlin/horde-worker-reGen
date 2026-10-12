@@ -163,6 +163,12 @@ The failures encoded here:
   single-image job at a batched decode peak. Two single-image SDXL jobs a 24 GB card holds at once were never
   admitted together and the lanes took turns. That is the ``job class`` scenario, and its reinjection prices
   from the pooled window alone.
+- **One permit priced the weights and the denoise together.** Under the clearance lease a staged job's weight
+  upload and its denoise loop were cleared as one, so the clearance priced the whole sampling peak. Beside a
+  running peak the second one did not fit, so the successor waited for the running sample to end and then
+  loaded its weights while the card idled. Two-phase clearance grants the weights alone while the running job
+  samples, priced against measured free net of every outstanding reservation, and starts the denoise when the
+  running peak releases. That is the ``two-phase clearance`` scenario, and its reinjection refuses every stage.
 
 The last scenario is not one failure but all of them at once: the ``bundle-shaped fleet`` row runs the
 multi-card rules together over the workload shape they were diagnosed from, eight cards of two lanes serving
@@ -210,6 +216,7 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import reclaim_ladder as reclaim_ladder_module
+from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
 from horde_worker_regen.process_management.resources.resource_budget import (
@@ -293,6 +300,7 @@ from tests.process_management.liveness._dispatch_world import (
     _UTILITIES_LANE_ID,
     _CardClass,
     _DispatchWorld,
+    _JobWindow,
     _model_by_name,
     _ModelClass,
 )
@@ -7008,3 +7016,379 @@ async def test_unretained_components_defect_reinjection_no_rung_returns_them(mon
     assert not any(record.inputs.get("reclaim_applied_kinds") for record in holds), (
         f"no rung may act for the head, since none can return the idle lanes' components. {holds}"
     )
+
+
+# --------------------------------------------------------------------------------------------------------
+# Two-phase clearance: the next job's weights land while one samples, and its denoise follows the release
+# --------------------------------------------------------------------------------------------------------
+
+_TWO_PHASE_TICK_SECONDS = 0.5
+_TWO_PHASE_WIDTH = 1536
+_TWO_PHASE_HEIGHT = 1536
+"""A 2.25 MP SDXL job. Beside the card's lane contexts, safety and the post-processing lane, one forecast peak and
+a second job's weights fit a 24 GB card and two forecast peaks do not, which is the shape that serialises the
+samples on the card and leaves the weight upload as the only work that can overlap."""
+
+_TWO_PHASE_STEPS = 30
+"""Steps that make one sample outlast its lane's decode, the redispatch onto that lane and the successor's weight
+load together, so a staged load can finish inside the sample it overlaps."""
+
+_TWO_PHASE_JOBS = 10
+_TWO_PHASE_MAX_TICKS = 1000
+
+_TWO_PHASE_UNMEASURED_JOBS = 2
+"""Jobs at the head of a run that cannot stage beside a sample: the first has nothing running beside it, and
+the second is dispatched before any job has reported a weight load, so dispatch prices it at its full peak."""
+
+_TWO_PHASE_DUTY_FLOOR = 0.9
+"""The share of wall time after the first job the card spends sampling when each successor's weights load
+inside the running sample and its denoise starts within a tick of that sample's end."""
+
+_LAGGING_GROWTH_UNDERSHOOT = 0.6
+"""What each job really costs the card against its forecast in the lagging-growth row: the running job's
+reported growth stays this far short of its forecast, so the parent's outstanding reservation keeps standing."""
+
+_LAGGING_GROWTH_BATCH = 2
+_LAGGING_GROWTH_STEPS = 20
+_LAGGING_GROWTH_JOBS = 4
+
+_SMALL_CARD_TWO_PHASE_JOBS = 6
+_SMALL_CARD_TWO_PHASE_WIDTH = 1024
+_SMALL_CARD_TWO_PHASE_HEIGHT = 1024
+
+
+def _two_phase_world(*, two_phase: bool, footprint_undershoot: float = 1.0) -> _DispatchWorld:
+    """A 24 GB card with two lanes, safety and the post-processing lane, under the lease with the tail overlap on.
+
+    The tail overlap is the lease's production default, and it is what reports each sampling lane's step position
+    and each paid load, which dispatch reads to stage a job beside a sample. The legacy unload hatch has every job
+    load its weights, as a card serving more checkpoints than it has lanes does, without changing the two-model
+    mix: with retention, each lane keeps its own model and the alternation stops loading anything.
+    """
+    return _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        closed_loop=True,
+        clearance_lease=True,
+        two_phase=two_phase,
+        service_contexts=True,
+        tail_overlap=True,
+        legacy_comfy_vram_unload=True,
+        footprint_undershoot=footprint_undershoot,
+        tick_seconds=_TWO_PHASE_TICK_SECONDS,
+    )
+
+
+def _two_phase_job(
+    model: _ModelClass,
+    *,
+    width: int = _TWO_PHASE_WIDTH,
+    height: int = _TWO_PHASE_HEIGHT,
+    steps: int = _TWO_PHASE_STEPS,
+    n_iter: int = 1,
+) -> ImageGenerateJobPopResponse:
+    return make_job_pop_response(model.name, width=width, height=height, ddim_steps=steps, n_iter=n_iter)
+
+
+async def _drive_two_phase_alternation(
+    world: _DispatchWorld,
+    *,
+    jobs: int,
+    width: int = _TWO_PHASE_WIDTH,
+    height: int = _TWO_PHASE_HEIGHT,
+    steps: int = _TWO_PHASE_STEPS,
+    n_iter: int = 1,
+    free_readings: list[tuple[float, float]] | None = None,
+) -> None:
+    """Alternate the two SDXL checkpoints with the queue held at two, and run until every job completes.
+
+    ``free_readings`` collects the card's device-free reading at the end of every tick, as (world clock, MB).
+    """
+    rotation = (_SDXL, _SDXL_OTHER)
+    popped = 0
+    for _ in range(_TWO_PHASE_MAX_TICKS):
+        while popped < jobs and len(world.job_tracker.jobs_pending_inference) < 2:
+            job = _two_phase_job(
+                rotation[popped % len(rotation)], width=width, height=height, steps=steps, n_iter=n_iter
+            )
+            await world.pop(job)
+            popped += 1
+        await world.step()
+        if free_readings is not None:
+            free_readings.append((world.now, world.card_free_mb(0)))
+        if world.completed_jobs >= jobs:
+            break
+    assert world.completed_jobs == jobs, world.state_dump()
+
+
+def _sampled_windows(world: _DispatchWorld) -> list[_JobWindow]:
+    """Every job window that reached and finished sampling, in the order the samples started."""
+    windows = [
+        window
+        for window in world.job_windows.values()
+        if window.sample_from is not None and window.sample_until is not None
+    ]
+    return sorted(windows, key=lambda window: window.sample_from or 0.0)
+
+
+def _sample_seconds(window: _JobWindow) -> float:
+    assert window.sample_from is not None and window.sample_until is not None
+    return window.sample_until - window.sample_from
+
+
+def _duty_after_first_job(world: _DispatchWorld) -> float:
+    """The share of wall time from the first job's sample end to the last one's that the card spent sampling."""
+    windows = _sampled_windows(world)
+    first, last = windows[0], windows[-1]
+    assert first.sample_until is not None and last.sample_until is not None
+    wall_seconds = last.sample_until - first.sample_until
+    return (world.sampling_slot_seconds - _sample_seconds(first)) / wall_seconds
+
+
+def _stage_room_mb(world: _DispatchWorld) -> float:
+    """What the card offers a job's whole need with only the lane contexts and service tenants on it."""
+    return world.card_free_mb(0) - admission_noise_buffer_mb(world.card.total_mb)
+
+
+def _forecast_peak_mb(world: _DispatchWorld, job: ImageGenerateJobPopResponse) -> float:
+    assert job.model is not None
+    peak_mb = predict_job_sampling_vram_mb(job, world.scheduler._model_metadata.get_baseline(job.model))
+    assert peak_mb is not None
+    return peak_mb
+
+
+def _staging_mb(world: _DispatchWorld) -> float:
+    return pricing_mod.staging_charge_mb(world.scheduler._model_metadata.get_baseline(_SDXL.name))
+
+
+def _assert_one_peak_and_the_next_weights_fit_but_not_two_peaks(world: _DispatchWorld) -> None:
+    """Precondition: only the weight stage can overlap a running sample, the premise of two-phase clearance."""
+    peak_mb = _forecast_peak_mb(world, _two_phase_job(_SDXL))
+    room_mb = _stage_room_mb(world)
+    assert 2 * peak_mb > room_mb, (
+        f"precondition: two {peak_mb:.0f}MB SDXL peaks must not fit the {room_mb:.0f}MB the card offers, or the "
+        f"successor's whole job clears beside the running one and nothing is staged. {world.state_dump()}"
+    )
+    stage_need_mb = peak_mb + _staging_mb(world) + _SDXL.weights_mb
+    assert stage_need_mb <= room_mb, (
+        f"precondition: a running {peak_mb:.0f}MB peak, the successor's encode set and its {_SDXL.weights_mb:.0f}MB "
+        f"of weights ({stage_need_mb:.0f}MB) must fit the {room_mb:.0f}MB the card offers. {world.state_dump()}"
+    )
+
+
+def _assert_no_lane_sampled_unpriced(world: _DispatchWorld, *, context: str) -> None:
+    assert not world.clearance_timeouts, (
+        f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout. "
+        f"{world.state_dump()}"
+    )
+    unpriced = {
+        index: controller.unpriced_sampling_windows for index, controller in world._clearance_controllers.items()
+    }
+    assert not any(unpriced.values()), (
+        f"{context}: the controller counted unpriced sampling windows {unpriced}. {world.state_dump()}"
+    )
+    assert not world.child_overcommits, (
+        f"{context}: a child committed past what the card had: {world.child_overcommits}. {world.state_dump()}"
+    )
+
+
+async def test_z_the_next_jobs_weights_load_while_one_samples_and_its_denoise_follows_the_release() -> None:
+    """On a 24 GB card, each successor's weights load inside the running sample and its denoise follows it at once.
+
+    The failure this encodes: one clearance permit covered both the weight upload and the denoise loop, so the
+    clearance priced the successor's whole sampling peak. The second peak does not fit beside the running one, so
+    the successor waited for the running sample to end and then loaded its weights while the card idled: one
+    weight upload of dead card time on every handoff.
+
+    Two-phase clearance grants the successor its weights alone while the running job samples, priced against the
+    card's measured free net of every outstanding reservation, and grants the denoise once the running peak has
+    released. Its consequences are that every stage grant lands inside the running job's sampling window, that
+    each staged successor's sample starts within one tick of the running sample's end, that the card spends at
+    least nine tenths of the wall time after the first job sampling, and that no lane samples unpriced or
+    commits past the card.
+    """
+    world = _two_phase_world(two_phase=True)
+    _assert_one_peak_and_the_next_weights_fit_but_not_two_peaks(world)
+
+    await _drive_two_phase_alternation(world, jobs=_TWO_PHASE_JOBS)
+
+    context = "two-phase clearance on a 24 GB card"
+    windows = _sampled_windows(world)
+    staged_job_ids = [job_id for _tick, _lane, job_id in world.stage_grants]
+    assert staged_job_ids == [window.job_id for window in windows[_TWO_PHASE_UNMEASURED_JOBS:]], (
+        f"{context}: stage grants went to {[job_id[:8] for job_id in staged_job_ids]}, where every job after the "
+        f"first {_TWO_PHASE_UNMEASURED_JOBS} should have staged its weights beside a running sample. "
+        f"{world.state_dump()}"
+    )
+    for running, staged in itertools.pairwise(windows[_TWO_PHASE_UNMEASURED_JOBS - 1 :]):
+        assert running.sample_from is not None and running.sample_until is not None, world.state_dump()
+        assert staged.load_from is not None and staged.sample_from is not None, world.state_dump()
+        assert running.sample_from <= staged.load_from <= running.sample_until, (
+            f"{context}: job {staged.job_id[:8]} took its stage grant at {staged.load_from:.2f}s, outside the "
+            f"running sample {running.sample_from:.2f}s..{running.sample_until:.2f}s. {world.state_dump()}"
+        )
+        assert staged.sample_from - running.sample_until <= world.tick_seconds, (
+            f"{context}: job {staged.job_id[:8]} began sampling {staged.sample_from - running.sample_until:.2f}s "
+            f"after the running sample ended, more than one {world.tick_seconds}s tick. {world.state_dump()}"
+        )
+    duty = _duty_after_first_job(world)
+    assert duty >= _TWO_PHASE_DUTY_FLOOR, (
+        f"{context}: the card sampled {duty:.0%} of the wall time after the first job, under the "
+        f"{_TWO_PHASE_DUTY_FLOOR:.0%} floor. {world.state_dump()}"
+    )
+    _assert_no_lane_sampled_unpriced(world, context=context)
+
+
+async def test_z_defect_reinjection_a_refused_stage_reads_the_single_clearance_duty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With every stage refused, each handoff pays the successor's whole weight load and the duty floor fails.
+
+    Reinjected at the scheduler's stage admission, which refuses every head. The successor is cleared once, after
+    the running sample releases its peak, and loads its weights then, so the card samples at most the share the
+    sampled seconds take of the sampled and loading seconds together.
+    """
+
+    def refuse_every_stage(self: InferenceScheduler, process_id: int) -> bool:
+        return False
+
+    monkeypatch.setattr(InferenceScheduler, "clearance_stage_admit_process", refuse_every_stage)
+    world = _two_phase_world(two_phase=True)
+
+    await _drive_two_phase_alternation(world, jobs=_TWO_PHASE_JOBS)
+
+    windows = _sampled_windows(world)[1:]
+    sampled_seconds = sum(_sample_seconds(window) for window in windows)
+    single_clearance_bound = sampled_seconds / (sampled_seconds + sum(window.load_seconds for window in windows))
+    duty = _duty_after_first_job(world)
+    assert world.stage_grants == [], world.state_dump()
+    assert duty <= single_clearance_bound, (
+        f"with every stage refused the card sampled {duty:.0%} of the wall time after the first job, above the "
+        f"{single_clearance_bound:.0%} a handoff that pays each successor's load allows. {world.state_dump()}"
+    )
+    assert duty < _TWO_PHASE_DUTY_FLOOR, world.state_dump()
+
+
+def _small_card_two_phase_world(*, two_phase: bool) -> _DispatchWorld:
+    """The lone-waiter world's shape on a 16 GB card with two lanes, under the lease with the tail overlap on."""
+    return _DispatchWorld(
+        card=_CARD_16GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        two_phase=two_phase,
+        tail_overlap=True,
+        tick_seconds=_TWO_PHASE_TICK_SECONDS,
+    )
+
+
+async def test_z_a_card_with_no_room_beside_a_peak_stages_nothing_and_serves_as_before() -> None:
+    """On a 16 GB card no stage is granted, and the run is the one the single clearance gives.
+
+    The weight stage is priced against measured free like any admission, which is the guard the single permit was
+    built for: a child loading its weights beside a running peak on a card that cannot hold both pages on WDDM.
+    On this card a successor's weights do not fit beside a running SDXL peak, so every stage the controller asks
+    for is refused, and the run uploads, clears and samples exactly as the same world does without two-phase
+    clearance.
+    """
+    world = _small_card_two_phase_world(two_phase=True)
+    probe = _two_phase_job(_SDXL, width=_SMALL_CARD_TWO_PHASE_WIDTH, height=_SMALL_CARD_TWO_PHASE_HEIGHT)
+    stage_need_mb = _forecast_peak_mb(world, probe) + _staging_mb(world) + _SDXL.weights_mb
+    assert stage_need_mb > _stage_room_mb(world), (
+        f"precondition: a running SDXL peak, the successor's encode set and its weights ({stage_need_mb:.0f}MB) must "
+        f"not fit the {_stage_room_mb(world):.0f}MB the card offers. {world.state_dump()}"
+    )
+    baseline = _small_card_two_phase_world(two_phase=False)
+
+    for each_world in (world, baseline):
+        await _drive_two_phase_alternation(
+            each_world,
+            jobs=_SMALL_CARD_TWO_PHASE_JOBS,
+            width=_SMALL_CARD_TWO_PHASE_WIDTH,
+            height=_SMALL_CARD_TWO_PHASE_HEIGHT,
+        )
+
+    context = "two-phase clearance on a 16 GB card"
+    assert world.stage_grants == [], f"{context}: stages were granted: {world.stage_grants}. {world.state_dump()}"
+    refusals = sum(controller.stage_refusals for controller in world._clearance_controllers.values())
+    assert refusals > 0, f"{context}: no stage was ever asked for, so the row proves nothing. {world.state_dump()}"
+    assert world.weight_uploads == baseline.weight_uploads, (world.weight_uploads, baseline.weight_uploads)
+    assert [(tick, lane) for tick, lane, _job in world.clearance_grants] == [
+        (tick, lane) for tick, lane, _job in baseline.clearance_grants
+    ], (world.clearance_grants, baseline.clearance_grants)
+    assert world.sampling_slot_seconds == baseline.sampling_slot_seconds, (
+        world.sampling_slot_seconds,
+        baseline.sampling_slot_seconds,
+    )
+    _assert_no_lane_sampled_unpriced(world, context=context)
+
+
+async def test_z_a_stage_waits_while_the_running_jobs_reservation_still_stands() -> None:
+    """A stage is refused while the running job's outstanding reservation claims the room, whatever free reads.
+
+    The running job's reported growth stays short of its forecast, so measured free shows room for the next
+    job's weights that the running job's forecast still claims. The stage is priced net of that reservation, so
+    no stage grant lands inside a running sample even though the measured reading alone would have admitted one,
+    and no child commits past the card.
+    """
+    world = _two_phase_world(two_phase=True, footprint_undershoot=_LAGGING_GROWTH_UNDERSHOOT)
+    probe = _two_phase_job(_SDXL, steps=_LAGGING_GROWTH_STEPS, n_iter=_LAGGING_GROWTH_BATCH)
+    forecast_need_mb = _forecast_peak_mb(world, probe) + _staging_mb(world) + _SDXL.weights_mb
+    assert forecast_need_mb > _stage_room_mb(world), (
+        f"precondition: the running job's forecast peak, the successor's encode set and its weights "
+        f"({forecast_need_mb:.0f}MB) must not fit the {_stage_room_mb(world):.0f}MB the card offers. "
+        f"{world.state_dump()}"
+    )
+    noise_mb = admission_noise_buffer_mb(world.card.total_mb)
+    free_readings: list[tuple[float, float]] = []
+
+    await _drive_two_phase_alternation(
+        world,
+        jobs=_LAGGING_GROWTH_JOBS,
+        steps=_LAGGING_GROWTH_STEPS,
+        n_iter=_LAGGING_GROWTH_BATCH,
+        free_readings=free_readings,
+    )
+
+    context = "a stage beside a running job whose growth lags its forecast"
+    windows = _sampled_windows(world)
+    waits_beside_a_sample = [
+        free_mb
+        for running in windows
+        for staged in windows
+        if staged.lane_id != running.lane_id
+        for now, free_mb in free_readings
+        if running.sample_from is not None
+        and running.sample_until is not None
+        and max(running.sample_from, staged.dispatched_at) <= now < running.sample_until
+        and (staged.load_from is None or now < staged.load_from)
+    ]
+    assert waits_beside_a_sample, f"{context}: no job ever waited beside a running sample. {world.state_dump()}"
+    assert max(waits_beside_a_sample) - noise_mb >= _SDXL.weights_mb, (
+        f"precondition: measured free alone must have had room for the next job's weights while it waited, or the "
+        f"refusal says nothing about the reservation (highest reading {max(waits_beside_a_sample):.0f}MB). "
+        f"{world.state_dump()}"
+    )
+    refusals = sum(controller.stage_refusals for controller in world._clearance_controllers.values())
+    assert refusals > 0, f"{context}: no stage was ever asked for. {world.state_dump()}"
+    for _tick, lane, job_id in world.stage_grants:
+        staged_at = world.job_windows[job_id].load_from
+        assert staged_at is not None, world.state_dump()
+        overlapped = [
+            running.job_id[:8]
+            for running in windows
+            if running.lane_id != lane
+            and running.sample_from is not None
+            and running.sample_until is not None
+            and running.sample_from <= staged_at < running.sample_until
+        ]
+        assert not overlapped, (
+            f"{context}: job {job_id[:8]} took its stage grant at {staged_at:.2f}s inside running sample(s) "
+            f"{overlapped}, whose outstanding reservation still claimed the room. {world.state_dump()}"
+        )
+    _assert_no_lane_sampled_unpriced(world, context=context)

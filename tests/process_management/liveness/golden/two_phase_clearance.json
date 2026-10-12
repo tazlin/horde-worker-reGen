@@ -1,0 +1,1372 @@
+{
+  "jobs": 4,
+  "scenario": "two_phase_clearance",
+  "schema": 2,
+  "ticks": [
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sdxl-checkpoint",
+            "process_id": 0
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-1",
+          "verdict": "admit"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-1",
+          "keep_model_resident_after": null,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "tick": 1
+    },
+    {
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-1",
+          "keep_model_resident_after": false,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "tick": 2
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 16133.2,
+            "candidate_delta_mb": 7783.0,
+            "candidate_held_mb": 2048.0,
+            "device_free_mb": 17362.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 0.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "granted by price",
+          "subject": "job-1",
+          "verdict": "admit"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "admit",
+            "model": "sdxl-checkpoint-b",
+            "process_id": 1
+          },
+          "kind": "vram_admission",
+          "reason": "preload sent",
+          "subject": "job-2",
+          "verdict": "admit"
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sdxl-checkpoint"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PRELOAD_MODEL",
+          "job": "job-2",
+          "keep_model_resident_after": null,
+          "model": "sdxl-checkpoint-b",
+          "process_id": 1
+        }
+      ],
+      "sampling_started": [
+        "job-1"
+      ],
+      "tick": 3
+    },
+    {
+      "messages": [
+        {
+          "control_flag": "WARM_MODEL",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": "sdxl-checkpoint-b",
+          "process_id": 1
+        }
+      ],
+      "tick": 4
+    },
+    {
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-2",
+          "keep_model_resident_after": false,
+          "model": "sdxl-checkpoint-b",
+          "process_id": 1
+        }
+      ],
+      "tick": 12
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 11233.2,
+            "candidate_delta_mb": 7783.0,
+            "candidate_held_mb": 2048.0,
+            "device_free_mb": 12462.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 0.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint-b",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 1,
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "granted by price",
+          "subject": "job-2",
+          "verdict": "admit"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-1",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 1,
+          "model": "sdxl-checkpoint-b"
+        }
+      ],
+      "sampling_started": [
+        "job-2"
+      ],
+      "tick": 13
+    },
+    {
+      "messages": [
+        {
+          "control_flag": "WARM_MODEL",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "tick": 14
+    },
+    {
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-3",
+          "keep_model_resident_after": false,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "tick": 17
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": true,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 6302.2,
+            "candidate_delta_mb": 7783.0,
+            "candidate_held_mb": 2048.0,
+            "device_free_mb": 7531.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 0.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "room_available_mb": 6302.2,
+            "room_candidate_mb": 7783.0,
+            "room_closable": false,
+            "room_deficit_mb": 1480.8,
+            "room_reclaimable_mb": 384.0,
+            "room_unpausable_mb": 14229.0,
+            "rung_post_process_lane_mb": 384.0,
+            "rung_post_process_lane_permitted": true,
+            "rung_safety_off_gpu_mb": 384.0,
+            "rung_safety_off_gpu_permitted": false,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 3630.0,
+            "tenancy_inference_busy_mb": 10215.0,
+            "tenancy_inference_target_mb": 2432.0,
+            "tenancy_post_process_mb": 384.0,
+            "tenancy_safety_mb": 384.0,
+            "waiting_can_help": false
+          },
+          "kind": "clearance",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        },
+        {
+          "inputs": {
+            "attempt_deadline_seconds": null,
+            "available_mb": 6302.2,
+            "candidate_delta_mb": 4900.0,
+            "candidate_held_mb": 0.0,
+            "device_free_mb": 7531.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": null,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaimable_idle_model": false,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "stage granted by price",
+          "subject": "job-3",
+          "verdict": "admit"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 18
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": true,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 1402.2,
+            "candidate_delta_mb": 2883.0,
+            "candidate_held_mb": 6948.0,
+            "device_free_mb": 2631.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 2.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "room_available_mb": 1402.2,
+            "room_candidate_mb": 2883.0,
+            "room_closable": false,
+            "room_deficit_mb": 1480.8,
+            "room_reclaimable_mb": 384.0,
+            "room_unpausable_mb": 14229.0,
+            "rung_post_process_lane_mb": 384.0,
+            "rung_post_process_lane_permitted": true,
+            "rung_safety_off_gpu_mb": 384.0,
+            "rung_safety_off_gpu_permitted": false,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 3630.0,
+            "tenancy_inference_busy_mb": 10215.0,
+            "tenancy_inference_target_mb": 7332.0,
+            "tenancy_post_process_mb": 384.0,
+            "tenancy_safety_mb": 384.0,
+            "waiting_can_help": false
+          },
+          "kind": "clearance",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 19
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": true,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 1402.2,
+            "candidate_delta_mb": 2883.0,
+            "candidate_held_mb": 6948.0,
+            "device_free_mb": 2631.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 4.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "room_available_mb": 1402.2,
+            "room_candidate_mb": 2883.0,
+            "room_closable": false,
+            "room_deficit_mb": 1480.8,
+            "room_reclaimable_mb": 384.0,
+            "room_unpausable_mb": 14229.0,
+            "rung_post_process_lane_mb": 384.0,
+            "rung_post_process_lane_permitted": true,
+            "rung_safety_off_gpu_mb": 384.0,
+            "rung_safety_off_gpu_permitted": false,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 3630.0,
+            "tenancy_inference_busy_mb": 10215.0,
+            "tenancy_inference_target_mb": 7332.0,
+            "tenancy_post_process_mb": 384.0,
+            "tenancy_safety_mb": 384.0,
+            "waiting_can_help": false
+          },
+          "kind": "clearance",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 20
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": true,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 1402.2,
+            "candidate_delta_mb": 2883.0,
+            "candidate_held_mb": 6948.0,
+            "device_free_mb": 2631.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 6.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "room_available_mb": 1402.2,
+            "room_candidate_mb": 2883.0,
+            "room_closable": false,
+            "room_deficit_mb": 1480.8,
+            "room_reclaimable_mb": 384.0,
+            "room_unpausable_mb": 14229.0,
+            "rung_post_process_lane_mb": 384.0,
+            "rung_post_process_lane_permitted": true,
+            "rung_safety_off_gpu_mb": 384.0,
+            "rung_safety_off_gpu_permitted": false,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 3630.0,
+            "tenancy_inference_busy_mb": 10215.0,
+            "tenancy_inference_target_mb": 7332.0,
+            "tenancy_post_process_mb": 384.0,
+            "tenancy_safety_mb": 384.0,
+            "waiting_can_help": false
+          },
+          "kind": "clearance",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-3",
+          "verdict": "defer"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 21
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 6333.2,
+            "candidate_delta_mb": 2883.0,
+            "candidate_held_mb": 6948.0,
+            "device_free_mb": 7562.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 8.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 0,
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "granted by price",
+          "subject": "job-3",
+          "verdict": "admit"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sdxl-checkpoint"
+        }
+      ],
+      "sampling_started": [
+        "job-3"
+      ],
+      "tick": 22
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-2",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 23
+    },
+    {
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-4",
+          "keep_model_resident_after": false,
+          "model": "sdxl-checkpoint-b",
+          "process_id": 1
+        }
+      ],
+      "tick": 24
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": true,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 6302.2,
+            "candidate_delta_mb": 7783.0,
+            "candidate_held_mb": 2048.0,
+            "device_free_mb": 7531.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 0.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint-b",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 1,
+            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "room_available_mb": 6302.2,
+            "room_candidate_mb": 7783.0,
+            "room_closable": false,
+            "room_deficit_mb": 1480.8,
+            "room_reclaimable_mb": 384.0,
+            "room_unpausable_mb": 14229.0,
+            "rung_post_process_lane_mb": 384.0,
+            "rung_post_process_lane_permitted": true,
+            "rung_safety_off_gpu_mb": 384.0,
+            "rung_safety_off_gpu_permitted": false,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 3630.0,
+            "tenancy_inference_busy_mb": 10215.0,
+            "tenancy_inference_target_mb": 2432.0,
+            "tenancy_post_process_mb": 384.0,
+            "tenancy_safety_mb": 384.0,
+            "waiting_can_help": false
+          },
+          "kind": "clearance",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-4",
+          "verdict": "defer"
+        },
+        {
+          "inputs": {
+            "attempt_deadline_seconds": null,
+            "available_mb": 6302.2,
+            "candidate_delta_mb": 4900.0,
+            "candidate_held_mb": 0.0,
+            "device_free_mb": 7531.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": null,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint-b",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 1,
+            "reclaimable_idle_model": false,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "stage granted by price",
+          "subject": "job-4",
+          "verdict": "admit"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 25
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": true,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 1402.2,
+            "candidate_delta_mb": 2883.0,
+            "candidate_held_mb": 6948.0,
+            "device_free_mb": 2631.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 2.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint-b",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 1,
+            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "room_available_mb": 1402.2,
+            "room_candidate_mb": 2883.0,
+            "room_closable": false,
+            "room_deficit_mb": 1480.8,
+            "room_reclaimable_mb": 384.0,
+            "room_unpausable_mb": 14229.0,
+            "rung_post_process_lane_mb": 384.0,
+            "rung_post_process_lane_permitted": true,
+            "rung_safety_off_gpu_mb": 384.0,
+            "rung_safety_off_gpu_permitted": false,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 3630.0,
+            "tenancy_inference_busy_mb": 10215.0,
+            "tenancy_inference_target_mb": 7332.0,
+            "tenancy_post_process_mb": 384.0,
+            "tenancy_safety_mb": 384.0,
+            "waiting_can_help": false
+          },
+          "kind": "clearance",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-4",
+          "verdict": "defer"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 26
+    },
+    {
+      "arbiter": [
+        {
+          "device_index": null,
+          "executed": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ],
+          "for_head_of_queue": true,
+          "requested": [
+            {
+              "device_index": null,
+              "kind": "evict_idle_model",
+              "target_process_id": null
+            }
+          ]
+        }
+      ],
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 1402.2,
+            "candidate_delta_mb": 2883.0,
+            "candidate_held_mb": 6948.0,
+            "device_free_mb": 2631.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 4.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint-b",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 1,
+            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "room_available_mb": 1402.2,
+            "room_candidate_mb": 2883.0,
+            "room_closable": false,
+            "room_deficit_mb": 1480.8,
+            "room_reclaimable_mb": 384.0,
+            "room_unpausable_mb": 14229.0,
+            "rung_post_process_lane_mb": 384.0,
+            "rung_post_process_lane_permitted": true,
+            "rung_safety_off_gpu_mb": 384.0,
+            "rung_safety_off_gpu_permitted": false,
+            "starved_seconds": 0.0,
+            "tenancy_foreign_mb": 3630.0,
+            "tenancy_inference_busy_mb": 10215.0,
+            "tenancy_inference_target_mb": 7332.0,
+            "tenancy_post_process_mb": 384.0,
+            "tenancy_safety_mb": 384.0,
+            "waiting_can_help": false
+          },
+          "kind": "clearance",
+          "reason": "the candidate does not fit the measured available room",
+          "subject": "job-4",
+          "verdict": "defer"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 200
+        }
+      ],
+      "tick": 27
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "attempt_deadline_seconds": 50.0,
+            "available_mb": 6333.2,
+            "candidate_delta_mb": 2883.0,
+            "candidate_held_mb": 6948.0,
+            "device_free_mb": 7562.0,
+            "device_index": null,
+            "idle_contexts_teardownable": false,
+            "lease_wait_seconds": 6.0,
+            "measured_attempt_spent": false,
+            "model": "sdxl-checkpoint-b",
+            "noise_buffer_mb": 1228.8,
+            "outstanding_reservations_mb": 0.0,
+            "partial_seat_mb": null,
+            "probe_after_seconds": 10.0,
+            "process_id": 1,
+            "reclaimable_idle_model": true,
+            "reclaimable_idle_tenancy": false,
+            "starved_seconds": 0.0
+          },
+          "kind": "clearance",
+          "reason": "granted by price",
+          "subject": "job-4",
+          "verdict": "admit"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 1,
+          "model": "sdxl-checkpoint-b"
+        }
+      ],
+      "sampling_started": [
+        "job-4"
+      ],
+      "tick": 28
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 29
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        },
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 30
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 31
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 32
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 33
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 34
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 35
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-4",
+          "verdict": "no_op"
+        }
+      ],
+      "tick": 36
+    }
+  ],
+  "ticks_driven": 40
+}

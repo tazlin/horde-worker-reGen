@@ -12,7 +12,8 @@ a row whose two runs disagree, so a trace that is not reproducible never reaches
 The catalog is chosen for coverage of the paths the admission redesign cuts through rather than for breadth:
 steady dispatch, retention grant and reuse, whole-card residency, a RAM-pressure defer, the clearance lease,
 two-card routing, the post-processing co-residency defer, a disaggregated head, a safety placement
-demotion, and a card packed with idle held components.
+demotion, a card packed with idle held components, and two-phase clearance staging the next job's weights
+beside a running sample.
 """
 
 from __future__ import annotations
@@ -287,6 +288,31 @@ async def _build_held_components() -> _DispatchWorld:
     return world
 
 
+async def _build_two_phase_clearance() -> _DispatchWorld:
+    """Two-phase clearance: the next job's weights are staged beside a running sample and its denoise follows.
+
+    Safety and the post-processing lane share the card, so one SDXL peak and the next job's weights fit beside
+    them and two peaks do not. The tail overlap reports each sampler's steps and each paid load, which dispatch
+    reads to stage a job beside a sample, and the legacy unload hatch has every job load its weights.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=4,
+        tick_seconds=_TICK_SECONDS,
+        closed_loop=True,
+        clearance_lease=True,
+        two_phase=True,
+        service_contexts=True,
+        tail_overlap=True,
+        legacy_comfy_vram_unload=True,
+    )
+    _pin_host_ram(world)
+    await _pop_queue(world, [_SDXL, _SDXL_OTHER, _SDXL, _SDXL_OTHER], width=1536, height=1536)
+    return world
+
+
 @dataclass(frozen=True)
 class _Scenario:
     """One traced row: how to build its world and how many ticks to drive it for.
@@ -313,6 +339,7 @@ _SCENARIOS: tuple[_Scenario, ...] = (
     _Scenario("disaggregated_head", _build_disaggregated_head, 32),
     _Scenario("safety_placement", _build_safety_placement, 40),
     _Scenario("held_components", _build_held_components, 32),
+    _Scenario("two_phase_clearance", _build_two_phase_clearance, 40),
 )
 
 

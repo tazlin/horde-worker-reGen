@@ -121,6 +121,7 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     ClearanceController,
     ClearanceLeaseProxy,
+    ClearanceStageLease,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import offer_under_pop_claim
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -435,6 +436,35 @@ class _StagedPrefetch:
     """The disk read the checkpoint needed when the prefetch began."""
     staged_at: float | None
     """When a job was staged on the lane; None while an idle lane's warm waits for its dispatch."""
+
+
+@dataclass(frozen=True)
+class _LoadPhase:
+    """Represents what a job's device load costs in world seconds, and the disk reads that make it up."""
+
+    load_seconds: float
+    """Seconds from the weights' commit to the end of their load, unfinished disk read included."""
+    warm_read_seconds: float = 0.0
+    staged_read_seconds: float = 0.0
+    cleared_read_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class _StagedWeights:
+    """Represents a job's weights committed at its stage grant, waiting for the sample grant that starts its denoise.
+
+    Under two-phase clearance the child uploads its diffusion weights on the stage permit and blocks on the sample
+    permit for its activation. The load runs from the stage grant, so a sample grant that comes after
+    ``loaded_until`` starts the denoise at once.
+    """
+
+    job_id: str
+    model: str
+    loaded_now: bool
+    """Whether the stage paid a host-to-device load, or found the weights already on the device."""
+    load: _LoadPhase
+    loaded_until: float
+    """The world clock at which the staged load finishes."""
 
 
 @dataclass
@@ -774,6 +804,7 @@ class _DispatchWorld:
         disaggregated: bool = False,
         closed_loop: bool = False,
         clearance_lease: bool = False,
+        two_phase: bool = False,
         staged_lane_prefetch: bool = False,
         idle_lane_warm: bool = False,
         unretained_components_pinned: bool = False,
@@ -876,6 +907,13 @@ class _DispatchWorld:
                 production's. A lane the controller holds for the whole lease-acquire timeout samples anyway
                 (liveness over pricing) and the world records the degradation. Off, dispatch is the VRAM
                 moment, which is what every row that does not vary this runs against.
+            two_phase: Whether the lease grants a job in two permits, as the spawn site builds a lane's proxy under
+                ``gpu_sampling_lease_two_phase``. Each lane's proxy carries a stage permit, and each controller
+                step is given the scheduler's stage admission, so the head waiter of a card whose sampler is
+                running may upload its weights alone while that sampler runs. The weights land at the stage grant
+                and load while the lane reads ``INFERENCE_PRIMED``; the activation and the sampling window start
+                at the sample grant. A lane cleared by one grant takes both permits at once and runs as it does
+                without this. Needs the lease; off, no proxy has a stage permit.
             staged_lane_prefetch: Whether a lane staged under the lease reads its checkpoint's reclaimed pages
                 while it waits for clearance, as hordelib's prefetch-and-touch does from the moment the job
                 starts on the lane, and keeps them resident each staged tick. The commit then pays only the
@@ -1032,6 +1070,9 @@ class _DispatchWorld:
         self.clearance_lease = clearance_lease
         if clearance_lease and not closed_loop:
             raise ValueError("the clearance lease is a claim about time, so it needs the closed-loop fidelity")
+        if two_phase and not clearance_lease:
+            raise ValueError("two-phase clearance splits the lease's grant, so it needs the lease")
+        self.two_phase = two_phase
         if (staged_lane_prefetch or tail_overlap) and not clearance_lease:
             raise ValueError("a staged prefetch and the tail overlap both act on staged lanes, so they need the lease")
         if idle_lane_warm and not clearance_lease:
@@ -1151,6 +1192,11 @@ class _DispatchWorld:
         """Per cleared lane under the lease, the instant its device load ends and its first step is taken.
 
         Until then the lane reads ``INFERENCE_PRIMED``, as a production child does through its load."""
+        self._staged_weights: dict[int, _StagedWeights] = {}
+        """Per lane under two-phase clearance, the weights its job committed at a stage grant, until its sample grant.
+
+        The lane holds them on the card and reports them from the stage grant, and stays ``INFERENCE_PRIMED``
+        through their load and the wait for the sample permit that follows."""
         self._staged_prefetch: dict[str, _StagedPrefetch] = {}
         """Per staged job, the checkpoint read its lane began at dispatch, until the clearance that commits it."""
         self._idle_lane_warms: dict[int, _StagedPrefetch] = {}
@@ -1380,6 +1426,7 @@ class _DispatchWorld:
             unload_models_from_vram_often=unload_models_from_vram_often,
             legacy_comfy_vram_unload=legacy_comfy_vram_unload,
             gpu_sampling_lease_enabled=clearance_lease,
+            gpu_sampling_lease_two_phase=two_phase,
             image_models_to_load=[model.name for model in self._model_classes],
         )
         self.offers: dict[int, frozenset[str]] = {}
@@ -1522,6 +1569,12 @@ class _DispatchWorld:
         waiter for room the card already had imposes on every job."""
         self.clearance_grants: list[tuple[int, int, str]] = []
         """Every lane the controller cleared into its load-and-sample window, as (tick, lane, job)."""
+        self._clearance_stage_semaphores: dict[int, synchronize.Semaphore] = {}
+        """Per lane under two-phase clearance, the stage permit the parent grants, held empty as the clearance is."""
+        self.stage_grants: list[tuple[int, int, str]] = []
+        """Every lane that took a stage permit alone and uploaded its weights ahead of its sample grant, as
+        (tick, lane, job). A single clear that releases both permits at once is recorded in ``clearance_grants``
+        only."""
         if clearance_lease:
             for device_index in self._card_totals:
                 self._clearance_controllers[device_index] = ClearanceController(
@@ -1536,10 +1589,19 @@ class _DispatchWorld:
                 clearance.acquire()
                 done = mp_context.Semaphore(0)
                 self._clearance_semaphores[lane_id] = clearance
+                stage = None
+                staged_device_free = None
+                if two_phase:
+                    stage = mp_context.BoundedSemaphore(1)
+                    stage.acquire()
+                    staged_device_free = mp_context.Value("d", math.nan)
+                    self._clearance_stage_semaphores[lane_id] = stage
                 proxy = ClearanceLeaseProxy(
                     clearance=clearance,
                     done=done,
                     cleared_device_free=mp_context.Value("d", math.nan),
+                    stage=stage,
+                    staged_device_free=staged_device_free,
                 )
                 self._clearance_proxies[lane_id] = proxy
                 self._clearance_controllers[self._lane_cards[lane_id]].register(lane_id, proxy)
@@ -2998,7 +3060,22 @@ class _DispatchWorld:
 
         The VRAM moment: without the clearance lease it is the dispatch, and under the lease it is the
         clearance. Both charge the card the same way, which is why it is one step here rather than two
-        descriptions of one.
+        descriptions of one. A two-phase stage grant commits the weights alone through :meth:`_commit_weights`
+        and opens the occupancy at its sample grant.
+        """
+        loaded_now = self._commit_weights(admitted, lane_id=lane_id)
+        if self.closed_loop:
+            self._begin_occupancy(
+                admitted,
+                lane_id=lane_id,
+                loaded_now=loaded_now,
+                encode_seconds=encode_seconds,
+            )
+
+    def _commit_weights(self, admitted: ImageGenerateJobPopResponse, *, lane_id: int) -> bool:
+        """Charge the card a lane's staged weights for ``admitted`` and report them; return whether any loaded.
+
+        A lane already holding the job's weights on the device commits nothing and loads nothing.
         """
         job_id = str(admitted.id_)
         staged_mb = self._staged_mb.pop(lane_id, None)
@@ -3028,13 +3105,34 @@ class _DispatchWorld:
             if admitted.model is not None:
                 self._resident_model[lane_id] = admitted.model
             self._sync_reported_vram()
-        if self.closed_loop:
-            self._begin_occupancy(
-                admitted,
-                lane_id=lane_id,
-                loaded_now=loaded_now,
-                encode_seconds=encode_seconds,
-            )
+        return loaded_now
+
+    def _stage_weights(self, job: ImageGenerateJobPopResponse, *, lane_id: int) -> None:
+        """Commit a two-phase job's weights at its stage grant and start their load, leaving the activation unpaid.
+
+        The weight phase of the commit: the card is charged the weights and the lane reports them from this
+        tick, so the parent's outstanding reservation for the job decays by the growth and its sample admission
+        credits the resident weights. The load counts as the job's upload, and its seconds run from here.
+        """
+        job_id = str(job.id_)
+        model = job.model
+        assert model is not None
+        loaded_now = self._commit_weights(job, lane_id=lane_id)
+        if loaded_now:
+            self.weight_uploads += 1
+        model_class = _model_by_name(model)
+        weights_mb = self._actual_charge_mb(model_class.weights_mb if model_class is not None else 0.0)
+        load = self._load_phase(job, lane_id=lane_id, loaded_now=loaded_now, weights_mb=weights_mb)
+        self._staged_weights[lane_id] = _StagedWeights(
+            job_id=job_id,
+            model=model,
+            loaded_now=loaded_now,
+            load=load,
+            loaded_until=self.now + load.load_seconds,
+        )
+        window = self.job_windows.get(job_id)
+        if window is not None:
+            self._record_load_on_window(window, loaded_now=loaded_now, load=load)
 
     def _begin_staged_prefetch(self, admitted: ImageGenerateJobPopResponse, *, lane_id: int) -> None:
         """Start a staged lane's read of whatever of its checkpoint the host has reclaimed.
@@ -3198,12 +3296,15 @@ class _DispatchWorld:
 
         The parent's own advance: the scheduler builds the snapshot, the controller decides, and the
         scheduler's full-price admission is what each chosen waiter is put through. A no-op when the lease is
-        off, exactly as the manager's is when no card has a controller.
+        off, exactly as the manager's is when no card has a controller. Under two-phase clearance the scheduler's
+        stage admission is passed as the step's ``stage_admit_fn``, as the manager passes it.
         """
+        stage_admit_fn = self._scheduler.clearance_stage_admit_process if self.two_phase else None
         for device_index, controller in self._clearance_controllers.items():
             controller.step(
                 self._scheduler.build_clearance_inputs(device_index=device_index),
                 admit_fn=self._scheduler.clearance_admit_process,
+                stage_admit_fn=stage_admit_fn,
             )
         self._open_cleared_windows()
 
@@ -3219,6 +3320,12 @@ class _DispatchWorld:
         The acquire goes through the lane's real lease proxy. A granted child rebases its free-VRAM view on the
         device free the grant carries and counts its own growth from that instant, as hordelib's clamp does at
         lease acquire; a child that waited out the timeout keeps its dispatch figure.
+
+        Under two-phase clearance the child takes the stage permit first, as hordelib's lease hook does. A lane
+        whose stage permit arrived alone commits its weights and waits on for its sample permit, still
+        ``INFERENCE_PRIMED``; the sample grant then opens the window on weights already loading or loaded. A lane
+        whose two permits arrived together takes both and runs as a single clear. The stage and the sample share
+        the job's one acquire deadline.
         """
         for lane in list(self._process_map.values()):
             if lane.last_process_state != HordeProcessState.INFERENCE_PRIMED:
@@ -3234,13 +3341,35 @@ class _DispatchWorld:
             proxy = self._clearance_proxies.get(lane.process_id)
             if semaphore is None or proxy is None:
                 continue
+            staged = self._staged_weights.get(lane.process_id)
+            if staged is not None and staged.job_id != job_id:
+                self._staged_weights.pop(lane.process_id, None)
+                staged = None
             waiting_since = self._clearance_waiting_since.get(job_id, self.now)
             # The child's acquire blocks until the permit arrives or its timeout ends, and the proxy counts
             # any completed acquire as the job's one wait. A tick is not the end of that wait, so the permit is
             # looked for without being taken, and the proxy acquires only once the wait is over.
-            if semaphore.acquire(False):
-                semaphore.release()
-            elif (self.now - waiting_since) < CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS - _CLOCK_EPSILON:
+            sample_permit_available = _permit_available(semaphore)
+            stage_semaphore = self._clearance_stage_semaphores.get(lane.process_id)
+            stage_lease = proxy.stage_lease
+            stage_permit_available = (
+                staged is None
+                and stage_semaphore is not None
+                and stage_lease is not None
+                and _permit_available(stage_semaphore)
+            )
+            if stage_permit_available and stage_lease is not None:
+                # Taken whether or not the sample permit came with it: hordelib acquires the stage first either
+                # way, so a single clear leaves no stage permit behind for the controller to reclaim.
+                stage_lease.acquire(False)
+                if not sample_permit_available:
+                    self._stage_lane(job, lane_id=lane.process_id, stage_lease=stage_lease)
+                    continue
+                stage_lease.take_cleared_device_free_mb()
+            if (
+                not sample_permit_available
+                and (self.now - waiting_since) < CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS - _CLOCK_EPSILON
+            ):
                 continue
             if proxy.acquire(False):
                 self.clearance_grants.append((self.tick, lane.process_id, job_id))
@@ -3258,12 +3387,32 @@ class _DispatchWorld:
             window = self.job_windows.get(job_id)
             if window is not None:
                 window.cleared_at = self.now
-            self._commit_staged_weights(job, lane_id=lane.process_id, encode_seconds=0.0)
+            self._staged_weights.pop(lane.process_id, None)
+            if staged is None:
+                self._commit_staged_weights(job, lane_id=lane.process_id, encode_seconds=0.0)
+            else:
+                self._begin_occupancy(job, lane_id=lane.process_id, loaded_now=staged.loaded_now, staged=staged)
             occupancy = self._occupancy.get(job_id)
             if occupancy is not None and occupancy.sample_from > self.now + _CLOCK_EPSILON:
                 self._cleared_load_until[lane.process_id] = occupancy.sample_from
             else:
                 self._report_first_step(lane.process_id)
+
+    def _stage_lane(self, job: ImageGenerateJobPopResponse, *, lane_id: int, stage_lease: ClearanceStageLease) -> None:
+        """Take a stage grant on ``lane_id``: rebase the child's view on its figure and commit the weights alone.
+
+        The child's clamp is rebased on the stage grant's device free before the upload, as hordelib rebases it
+        before its early ``load_models_gpu``, so the weight load is judged against what the parent admitted it
+        against. The encode working set stays on the card until the sample grant, which is where the full
+        commit takes it off.
+        """
+        job_id = str(job.id_)
+        self.stage_grants.append((self.tick, lane_id, job_id))
+        staged_free_mb = stage_lease.take_cleared_device_free_mb()
+        if staged_free_mb is not None and self._dispatch_device_truth_mb.get(job_id) is not None:
+            self._dispatch_device_truth_mb[job_id] = staged_free_mb
+            self._lane_charge_at_dispatch[job_id] = self._lane_charge_mb(lane_id)
+        self._stage_weights(job, lane_id=lane_id)
 
     # -- closed-loop occupancy ----------------------------------------------------------------------------
 
@@ -3274,6 +3423,7 @@ class _DispatchWorld:
         lane_id: int,
         loaded_now: bool,
         encode_seconds: float = 0.0,
+        staged: _StagedWeights | None = None,
     ) -> None:
         """Give a dispatched job its load, sample and decode phases and charge its sampling transient.
 
@@ -3282,12 +3432,15 @@ class _DispatchWorld:
         first tick that observes the sampling window, because a window shorter than one tick would otherwise
         never be seen on the card at all; it is released when sampling ends, so the decode tail carries only
         the weights, plus the VAE's decode spike where the row models per-phase residency.
+
+        ``staged`` is the onset phase of a two-phase clearance: the weights were committed, counted and timed at
+        the stage grant, so this charges the activation alone and starts sampling once the staged load is done.
         """
         job_id = str(job.id_)
         model = job.model
         assert model is not None
         self.dispatch_lanes.append((model, lane_id))
-        if loaded_now:
+        if loaded_now and staged is None:
             self.weight_uploads += 1
         model_class = _model_by_name(model)
         predicted_weights_mb = model_class.weights_mb if model_class is not None else 0.0
@@ -3302,26 +3455,11 @@ class _DispatchWorld:
         transient_mb = self._actual_charge_mb(max(0.0, predicted_peak_mb - predicted_weights_mb))
         decode_spike_mb = self._actual_charge_mb(predict_job_decode_spike_mb(job, baseline) or 0.0) if phased else 0.0
         megapixels = float(job.payload.width * job.payload.height * (job.payload.n_iter or 1)) / (1024.0 * 1024.0)
-        load_seconds = 0.0 if not loaded_now else (weights_mb / 1024.0) * _LOAD_SECONDS_PER_GB
-        warm_read_seconds = 0.0
-        staged_read_seconds = 0.0
-        cleared_read_seconds = 0.0
-        if loaded_now and self.host_ram is not None and model_class is not None:
-            # The weights come from the lane's mapped checkpoint, so pages the host reclaimed while the lane
-            # idled are read from disk first, less whatever a warm or a staged prefetch already read; a
-            # monolithic job also brings its text encoder and VAE across.
-            checkpoint_mb, _private_mb = self._host_model_ram(model_class)
-            warm_read_seconds, staged_read_seconds, cleared_read_seconds = self._checkpoint_read_seconds(
-                job_id,
-                model=model,
-                checkpoint_mb=checkpoint_mb,
-            )
-            support_mb = (
-                0.0 if self._scheduler._is_disaggregation_class_eligible(job) else _support_component_mb(model_class)
-            )
-            load_seconds += cleared_read_seconds + (support_mb / 1024.0) * _LOAD_SECONDS_PER_GB
+        if staged is None:
+            load = self._load_phase(job, lane_id=lane_id, loaded_now=loaded_now, weights_mb=weights_mb)
+            loaded_at = self.now + load.load_seconds
         else:
-            self._staged_prefetch.pop(job_id, None)
+            loaded_at = max(self.now, staged.loaded_until)
         per_step = _SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL.get(
             str(baseline),
             _DEFAULT_SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL,
@@ -3346,7 +3484,7 @@ class _DispatchWorld:
             sample_seconds *= 1.0 + _OFFLOAD_SAMPLING_PENALTY * min(1.0, offloaded_mb / weights_mb)
         # A disaggregated sampler's window opens only once the encode lane hands it the conditioning, so the
         # encode wait sits between the dispatch and the first step rather than inside the sampling figure.
-        sample_from = self.now + load_seconds + encode_seconds
+        sample_from = loaded_at + encode_seconds
         sample_until = sample_from + sample_seconds
         total_steps = max(0, int(job.payload.ddim_steps or 0))
         occupancy = _SlotOccupancy(
@@ -3367,16 +3505,58 @@ class _DispatchWorld:
         self._transient_mb[lane_id] = self._transient_mb.get(lane_id, 0.0) + occupancy.transient_mb
         window = self.job_windows.get(job_id)
         if window is not None:
-            window.load_from = self.now
             window.sample_from = sample_from
             window.sample_until = sample_until
-            window.loaded_now = loaded_now
-            window.load_seconds = load_seconds
-            window.disk_read_seconds = warm_read_seconds + staged_read_seconds + cleared_read_seconds
-            window.warm_read_seconds = warm_read_seconds
-            window.staged_read_seconds = staged_read_seconds
-            window.cleared_read_seconds = cleared_read_seconds
+            if staged is None:
+                self._record_load_on_window(window, loaded_now=loaded_now, load=load)
         self._sync_reported_vram()
+
+    def _load_phase(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        lane_id: int,
+        loaded_now: bool,
+        weights_mb: float,
+    ) -> _LoadPhase:
+        """Return how long committing ``job``'s weights on ``lane_id`` takes, and the disk reads inside it.
+
+        A job whose weights were already on the device pays nothing, and forgets any prefetch its lane began.
+        """
+        job_id = str(job.id_)
+        model_class = _model_by_name(job.model or "")
+        if not loaded_now or self.host_ram is None or model_class is None:
+            self._staged_prefetch.pop(job_id, None)
+            return _LoadPhase(load_seconds=0.0 if not loaded_now else (weights_mb / 1024.0) * _LOAD_SECONDS_PER_GB)
+        # The weights come from the lane's mapped checkpoint, so pages the host reclaimed while the lane idled
+        # are read from disk first, less whatever a warm or a staged prefetch already read; a monolithic job
+        # also brings its text encoder and VAE across.
+        checkpoint_mb, _private_mb = self._host_model_ram(model_class)
+        warm_read_seconds, staged_read_seconds, cleared_read_seconds = self._checkpoint_read_seconds(
+            job_id,
+            model=model_class.name,
+            checkpoint_mb=checkpoint_mb,
+        )
+        support_mb = (
+            0.0 if self._scheduler._is_disaggregation_class_eligible(job) else _support_component_mb(model_class)
+        )
+        return _LoadPhase(
+            load_seconds=(weights_mb / 1024.0) * _LOAD_SECONDS_PER_GB
+            + (cleared_read_seconds + (support_mb / 1024.0) * _LOAD_SECONDS_PER_GB),
+            warm_read_seconds=warm_read_seconds,
+            staged_read_seconds=staged_read_seconds,
+            cleared_read_seconds=cleared_read_seconds,
+        )
+
+    def _record_load_on_window(self, window: _JobWindow, *, loaded_now: bool, load: _LoadPhase) -> None:
+        """Mutate ``window`` to record the load its job's weights began at this instant."""
+        window.load_from = self.now
+        window.loaded_now = loaded_now
+        window.load_seconds = load.load_seconds
+        window.disk_read_seconds = load.warm_read_seconds + load.staged_read_seconds + load.cleared_read_seconds
+        window.warm_read_seconds = load.warm_read_seconds
+        window.staged_read_seconds = load.staged_read_seconds
+        window.cleared_read_seconds = load.cleared_read_seconds
 
     async def _advance_occupancy(self) -> None:
         """Advance each held lane through its phases, crediting duty and completing the jobs that finished."""
@@ -3749,6 +3929,7 @@ class _DispatchWorld:
         self._granted_resident_evicted.discard(lane_id)
         self._release_sampler_pin(lane_id)
         self._cleared_load_until.pop(lane_id, None)
+        self._staged_weights.pop(lane_id, None)
         for job_id, occupancy in list(self._occupancy.items()):
             if occupancy.lane_id == lane_id:
                 self._occupancy.pop(job_id, None)
@@ -4535,9 +4716,11 @@ class _DispatchWorld:
             f"{index}:{self.card_free_mb(index):.0f}/{total_mb:.0f}MB"
             for index, total_mb in sorted(self._card_totals.items())
         )
+        staged = ", ".join(f"{lane_id}:{weights.model}" for lane_id, weights in sorted(self._staged_weights.items()))
         return (
             f"tick={self.tick} free=[{cards}] "
-            f"lanes=[{lanes}] pending=[{pending}] in_progress={len(self._job_tracker.jobs_in_progress)} "
+            f"lanes=[{lanes}] staged=[{staged}] pending=[{pending}] "
+            f"in_progress={len(self._job_tracker.jobs_in_progress)} "
             f"residency_active={self._scheduler.is_whole_card_residency_active()} "
             f"planned={self.planned_overlay_mb():.0f}MB "
             f"reclaims={self.reclaim_commands} defer_reason={self._scheduler._last_budget_defer_reason!r}"
@@ -4591,3 +4774,11 @@ def _model_by_name(name: str) -> _ModelClass | None:
         if model.name == name:
             return model
     return None
+
+
+def _permit_available(semaphore: synchronize.Semaphore) -> bool:
+    """Return whether the parent has released ``semaphore``'s permit, leaving it for the child to take."""
+    if not semaphore.acquire(False):
+        return False
+    semaphore.release()
+    return True

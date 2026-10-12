@@ -258,7 +258,7 @@ These fail as interactions, not as units, so component tests stay green through 
   collaborator or sends a message. Where a decision needs to see an action's result, re-snapshot behind
   the action instead of reading live state. See [Admission pipeline](docs/explanation/admission_pipeline.md).
 - **The golden traces are the parity gate for scheduler refactors.**
-  `tests/process_management/liveness/test_golden_traces.py` diffs ten dispatch-world scenarios against
+  `tests/process_management/liveness/test_golden_traces.py` diffs eleven dispatch-world scenarios against
   `golden/*.json`; an intended behaviour change regenerates them with `-m golden_regen` and explains the
   diff in the commit. Anything else the diff surfaces is a regression.
 - **Test in the simulator first.** `tests/process_management/liveness/_dispatch_world.py` runs the
@@ -275,6 +275,9 @@ These fail as interactions, not as units, so component tests stay green through 
   `clearance_admit_process` as its `admit_fn`, the weights land at clearance, and the lane stays
   `INFERENCE_PRIMED` through their load until its first step, as a production child does), and a lane held for
   `CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS` samples unpriced and is recorded in `world.clearance_timeouts`.
+  `two_phase=True` (with the lease) gives each lane a stage permit and steps the controller with the scheduler's
+  `clearance_stage_admit_process`: a stage grant commits the lane's weights alone while another lane samples
+  (recorded in `world.stage_grants`), and the activation and sampling window land at the sample grant.
   The child acquires through a real `ClearanceLeaseProxy` built with a shared device-free figure, so a granted
   child rebases its free-VRAM view on the figure its grant carries and ages it from the grant, as hordelib's
   clamp does; a lane that times out keeps its dispatch figure.
