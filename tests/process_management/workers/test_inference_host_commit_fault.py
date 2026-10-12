@@ -204,3 +204,28 @@ def test_a_dispatch_whose_preload_fails_otherwise_still_ends_the_process() -> No
     failed_report = child.on_horde_model_state_change.call_args_list[-1]  # type: ignore[attr-defined]
     assert failed_report.kwargs["horde_model_state"] == ModelLoadState.FAILED
     assert failed_report.kwargs.get("info") is None
+
+
+def test_a_failed_run_unloads_and_goes_idle_without_reloading() -> None:
+    """A failed run leaves the slot empty, so the retry's load goes through the parent's preload admission."""
+    queue = _RecordingQueue()
+    child = _child_whose_pipeline_raises(queue, _pipeline_error(_HOST_COMMIT_ERROR_NAME))
+    child._is_busy = False
+    child._horde = Mock()  # type: ignore[assignment]
+    child.clear_gc_and_torch_cache = Mock()  # type: ignore[method-assign]
+    del child.preload_model
+    del child.unload_models_from_ram
+
+    result = _run_one_job(child, queue)
+
+    assert result.state == GENERATION_STATE.faulted
+    assert child._run_typed_inference.call_count == 1  # type: ignore[attr-defined]
+    assert child._horde.backend.free_ram.call_count == 1  # type: ignore[attr-defined]
+    assert child._horde.preload_model.call_count == 0  # type: ignore[attr-defined]
+    assert child._active_model_name is None
+    model_states = [
+        call.kwargs["horde_model_state"]
+        for call in child.on_horde_model_state_change.call_args_list  # type: ignore[attr-defined]
+    ]
+    assert model_states[-1] == ModelLoadState.ON_DISK
+    assert _reported_process_states(child)[-1] == HordeProcessState.WAITING_FOR_JOB

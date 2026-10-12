@@ -87,6 +87,9 @@ re-admission, and the child never runs it. Inside a running job the
 child recognises the same error by type (directly, or as the pipeline error that
 names it) and sets `host_commit_refused` on the faulted result. The child does not
 retry the job.
+After any failed run the child unloads the model from RAM and reports idle with
+no model loaded. It does not load the model back, so the retry's load goes
+through the parent's preload admission.
 
 The refusal is a capacity result, so the parent resolves it through
 [`JobTracker.handle_host_commit_refusal`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker.handle_host_commit_refusal]

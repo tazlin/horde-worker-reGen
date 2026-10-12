@@ -2024,23 +2024,14 @@ class HordeInferenceProcess(HordeProcess):
                         time_elapsed=time.time() - time_start,
                     )
 
-                    active_model_name = self._active_model_name
+                    # The backend may be in an indeterminate state after a failed run, so the weights are dropped.
+                    # The model is not loaded back, because the parent's preload admission prices every checkpoint
+                    # load and a reload here would map the checkpoint again unadmitted, including on a host that
+                    # has just refused the mapping.
                     logger.debug("Unloading models from RAM")
                     self.unload_models_from_ram()
                     logger.debug("Unloaded models from RAM")
                     self.send_memory_report_message(include_vram=True)
-
-                    if active_model_name is None:
-                        logger.critical("No active model name, cannot update model state")
-
-                    else:
-                        self.preload_model(
-                            active_model_name,
-                            will_load_loras=True,
-                            seamless_tiling_enabled=False,
-                            job_info=message.sdk_api_job_info,
-                        )
-                        logger.warning("A non-blocking LoRas/TIs preload didn't occur!. This is a bug.")
 
                     self.send_process_state_change_message(
                         process_state=HordeProcessState.WAITING_FOR_JOB,
