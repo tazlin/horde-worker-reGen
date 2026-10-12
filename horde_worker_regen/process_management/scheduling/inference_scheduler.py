@@ -1885,7 +1885,11 @@ class InferenceScheduler:
         ledger.clear_backlog_exclusion(depth=safety_backlog_depth)
 
         residency_veto = self._held_residency_requests_safety_off_gpu()
-        residency_may_initiate = residency_veto and (safety_paused or safety_backlog_depth == 0)
+        # The move waits for the residency's siblings to drain as well as for the safety backlog: their jobs
+        # end with safety checks that the CPU process would stretch, and the residency waits on that drain.
+        residency_may_initiate = residency_veto and (
+            safety_paused or (safety_backlog_depth == 0 and not self._held_residency_siblings_busy())
+        )
 
         transition_pending = self._process_lifecycle.safety_placement_transition_pending is True
         if transition_pending:
@@ -2266,6 +2270,29 @@ class InferenceScheduler:
             self._residency_should_pause_safety(device_index) for device_index, _ in self._whole_card_ledger.held()
         )
 
+    def _held_residency_siblings_busy(self) -> bool:
+        """Whether a held residency still has a sibling inference process on its card with work in hand.
+
+        The residency cannot claim the card until those siblings drain, and their jobs end with a safety
+        check. Moving safety to the CPU before they drain makes each of those checks take tens of seconds
+        in place of a fraction of one, which lengthens the very drain the residency is waiting on. The
+        residency's own holder and its pre-stage target are not siblings: they are busy loading the model
+        the residency is for.
+        """
+        for device_index, state in self._whole_card_ledger.held():
+            if state.model is None or not self._residency_should_pause_safety(device_index):
+                continue
+            for process in self._process_map.values():
+                if process.process_type is not HordeProcessType.INFERENCE:
+                    continue
+                if device_index is not None and process.device_index != device_index:
+                    continue
+                if process.loaded_horde_model_name == state.model or process.process_id == state.prestage_process_id:
+                    continue
+                if process.is_process_busy():
+                    return True
+        return False
+
     def _residency_should_pause_post_process(self, device_index: int | None) -> bool:
         """Whether a whole-card residency on this card should also stop the dedicated post-processing lane.
 
@@ -2627,6 +2654,7 @@ class InferenceScheduler:
         safety_pause_requested = (
             self._residency_should_pause_safety(device_index)
             and self._job_tracker.safety_backlog_depth == 0
+            and not self._held_residency_siblings_busy()
             and not self._process_lifecycle.is_safety_gpu_paused
         )
         post_process_paused = self._pause_post_process_for_residency_if_idle(

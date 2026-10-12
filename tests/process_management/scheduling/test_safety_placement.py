@@ -721,6 +721,37 @@ class TestRestoreForecastDwell:
         assert harness.scheduler.safety_placement.demotions == 0
         harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
 
+    def test_a_residency_moves_safety_only_once_its_siblings_have_drained(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sibling still sampling holds the whole-card safety move; the move follows once it is idle.
+
+        The sibling's job ends with a safety check the residency is waiting on, and a CPU safety process
+        turns that check from a fraction of a second into tens of seconds of establishment.
+        """
+        harness = _placement_harness(monkeypatch)
+        harness.scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        harness.scheduler._whole_card_ledger.record_grant(
+            None,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=harness.clock() + 10_000.0,
+            now=harness.clock(),
+        )
+        holder = make_mock_process_info(1, model_name="heavy-model")
+        holder.last_process_state = HordeProcessState.PRELOADING_MODEL
+        sibling = make_mock_process_info(2, model_name="light-model")
+        sibling.last_process_state = HordeProcessState.INFERENCE_STARTING
+        harness.scheduler._process_map = ProcessMap({1: holder, 2: sibling})
+
+        harness.reconcile()
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+
+        sibling.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        harness.reconcile()
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
+
 
 class TestTransitionFreeze:
     """Evidence does not accrue across an intentional rebuild, and restarts from scratch after it.
