@@ -176,6 +176,28 @@ class TestLogDutyCycleSummary:
         text = " ".join(message for _, message in messages)
         assert "tail-overlap: 0 granted / 2 denied (no-waiter 100%)" in text
 
+    def test_stage_tallies_named_on_the_line(self) -> None:
+        """Two-phase clearance's stage grants and refusals, summed across cards, ride the same duty line."""
+        manager = make_testable_process_manager()
+        controllers = {
+            0: ClearanceController(device_index=0, slot_cap=1, tail_overlap=False),
+            1: ClearanceController(device_index=1, slot_cap=1, tail_overlap=False),
+        }
+        controllers[0]._stage_grants_issued = 2
+        controllers[0]._stage_refusals = 1
+        controllers[1]._stage_grants_issued = 1
+        controllers[1]._stage_refusals = 4
+        manager._clearance_controllers = controllers
+
+        summary = summarize_duty_cycle([_job_with_gaps()], window_seconds=180.0, nvml_mean_percent=60.0)
+        messages, handler_id = _capture_logs()
+        try:
+            manager._log_duty_cycle_summary(summary, "inf#0=WAITING_FOR_JOB")
+        finally:
+            logger.remove(handler_id)
+        text = " ".join(message for _, message in messages)
+        assert "stage: 3 granted / 5 refused" in text
+
     def test_demand_limited_is_info_and_blames_the_horde(self) -> None:
         """A worker the horde left idle reads as demand-limited at INFO, never as a worker fault."""
         manager = make_testable_process_manager()

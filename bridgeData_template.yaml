@@ -722,6 +722,13 @@ gpu_sampling_lease_enabled: false
 # finishes. Defaults to true; set false to keep a strict per-slot denoise gate with no overlap.
 # gpu_sampling_lease_tail_overlap: true
 
+# Clear each job in two steps: upload its diffusion weights while another job samples, then start its
+# denoise once the room for its activation is free. Only meaningful when `gpu_sampling_lease_enabled` is
+# true. The weight upload is granted only when the weights fit beside the running job's measured peak, so
+# a card without that room is cleared once, as before. While this is on the tail-overlap handoff does not
+# run. Defaults to true; set false to clear each job's weights and denoise together.
+# gpu_sampling_lease_two_phase: true
+
 #############################
 ## VRAM / RAM Budget       ##
 #############################

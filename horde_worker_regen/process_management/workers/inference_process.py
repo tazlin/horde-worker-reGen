@@ -376,6 +376,17 @@ class HordeInferenceProcess(HordeProcess):
                     gpu_sampling_lease,
                     acquire_timeout_seconds=CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
                 )
+                # The parent builds the proxy with a stage permit only under two-phase clearance. A hordelib
+                # without the stage lease keeps loading the weights inside the sample window.
+                stage_lease = gpu_sampling_lease.stage_lease
+                if stage_lease is not None:
+                    try:
+                        from hordelib.api import set_gpu_stage_lease
+                    except ImportError:
+                        logger.info("hordelib has no stage lease; clearing each job's weights and denoise together")
+                    else:
+                        set_gpu_stage_lease(stage_lease)
+                        logger.info("Registered GPU weight-stage lease for two-phase clearance")
                 # A staged child blocks holding its encode working set, and clearance prices the job net of the
                 # child's last reported reservation; a report as the wait begins keeps that reading current.
                 gpu_sampling_lease.set_wait_entry_callback(self._send_clearance_wait_entry_report)

@@ -11,7 +11,9 @@ import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from loguru import logger
 
+from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeImageResult, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -27,11 +29,14 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     ActuatorCommandKind,
 )
+from horde_worker_regen.process_management.scheduling.admission import clearance as clearance_module
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
     ClearanceDecision,
     StagedWaiterClock,
     decide_clearance_admit,
+    decide_clearance_stage_admit,
+    stage_weights_delta_mb,
     staged_attempt_deadline_seconds,
     staged_held_mb,
     staged_materialization_delta_mb,
@@ -52,6 +57,7 @@ from tests.process_management.conftest import (
     make_mock_model_reference_record,
     make_mock_process_info,
     make_test_model_metadata,
+    make_testable_process_manager,
     mark_job_in_progress_async,
     track_popped_job_async,
 )
@@ -1155,3 +1161,185 @@ async def test_a_clearance_grant_records_how_the_job_was_granted() -> None:
     assert [(record["subject"], record["verdict"], record["reason"]) for record in records] == [
         (str(job.id_), DecisionVerdict.ADMIT, "granted by price"),
     ]
+
+
+def _decide_stage(scheduler: InferenceScheduler, process_id: int):  # noqa: ANN202
+    arbiter = scheduler._ensure_preload_arbiter()  # type: ignore[attr-defined]
+    return decide_clearance_stage_admit(scheduler.snapshot(), process_id, arbiter=arbiter)
+
+
+def _dispatch_charge_mb(scheduler: InferenceScheduler, job_id: str, reserved_by_pid: dict[int, float]) -> float:
+    """The job's outstanding dispatch reservation against the given per-process reports."""
+    ledger = scheduler._reserve_ledger  # type: ignore[attr-defined]
+    return ledger.planned_charge_for_unit(DISPATCH_ADMISSION_FLOW, job_id, reserved_by_pid)
+
+
+def _capture_log_messages() -> tuple[list[str], int]:
+    messages: list[str] = []
+    handler_id = logger.add(lambda message: messages.append(message.record["message"]), level="DEBUG")
+    return messages, handler_id
+
+
+async def _waiter_beside_a_sampler() -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, HordeProcessInfo]:
+    """The staged waiter on process 0 beside process 1 sampling a job whose peak has not yet materialised."""
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    sampler = make_mock_process_info(1, model_name=_JOB_MODEL, state=HordeProcessState.INFERENCE_STARTING)
+    sampler.total_vram_mb = 16000
+    sampler.process_reserved_mb = 900
+    sampler.last_process_state_started_at = time.time()
+    scheduler._process_map[1] = sampler
+    sampler_job = make_job_pop_response(_JOB_MODEL)
+    await track_popped_job_async(scheduler._job_tracker, sampler_job)  # type: ignore[attr-defined]
+    await mark_job_in_progress_async(scheduler._job_tracker, sampler_job)  # type: ignore[attr-defined]
+    sampler.last_job_referenced = sampler_job
+    baseline = scheduler._model_metadata.get_baseline(_JOB_MODEL)  # type: ignore[attr-defined]
+    scheduler._record_dispatch_reservation(sampler_job, sampler, baseline=baseline)  # type: ignore[attr-defined]
+    return scheduler, job, waiter
+
+
+async def test_a_stage_that_fits_is_granted_and_books_the_weights() -> None:
+    """A staged waiter whose weights fit is staged, and its encode booking is re-booked at the weights.
+
+    The booking decays against the lane's report, so it is spent once the weights land.
+    """
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    job_id = str(job.id_)
+    weights_mb = stage_weights_delta_mb(scheduler.snapshot(), job_id, 0)
+    assert weights_mb is not None and weights_mb > 0.0
+    assert weights_mb == predict_job_weight_mb(job, scheduler.snapshot().queue.jobs[job_id].baseline)
+
+    plan = _decide_stage(scheduler, 0)
+    assert plan.decision is ClearanceDecision.ADMIT
+    assert plan.candidate_delta_mb == weights_mb
+    assert plan.priced is not None and plan.priced.request.own_dispatch_unmaterialized_mb > 0.0
+
+    assert scheduler.clearance_stage_admit_process(0) is True
+
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == weights_mb
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0 + weights_mb}) == 0.0
+    assert job_id in scheduler.snapshot().ledgers.dispatch_holds.clearance_granted_ids
+
+
+async def test_a_stage_short_of_an_in_flight_reservation_is_refused_without_eviction() -> None:
+    """Weights that fit the device free but not beside the running job's outstanding reservation wait.
+
+    The stage runs no eviction and logs its hold as a stage hold, so the single clear decides as before.
+    """
+    scheduler, job, _waiter = await _waiter_beside_a_sampler()
+    job_id = str(job.id_)
+    ample = _decide_stage(scheduler, 0)
+    assert ample.decision is ClearanceDecision.ADMIT and ample.verdict is not None
+    weights_mb = ample.candidate_delta_mb
+    in_flight_mb = ample.verdict.measured.outstanding_reservations_mb
+    noise_mb = ample.verdict.measured.noise_buffer_mb
+    assert weights_mb is not None and in_flight_mb > 500.0
+    scheduler.set_device_reading_provider(
+        device_wide_reading_provider(lambda _device_index: weights_mb + noise_mb + in_flight_mb - 500.0)
+    )
+    scheduler._actuate_materialization_verdict = Mock(return_value=())  # type: ignore[method-assign]
+    staging_charge_mb = _dispatch_charge_mb(scheduler, job_id, {0: 900.0})
+
+    plan = _decide_stage(scheduler, 0)
+    assert plan.decision is ClearanceDecision.HOLD
+    assert plan.verdict is not None and plan.verdict.measured.available_mb is not None
+    assert plan.verdict.measured.available_mb + in_flight_mb >= weights_mb, "fits without the in-flight charge"
+
+    messages, handler_id = _capture_log_messages()
+    try:
+        assert scheduler.clearance_stage_admit_process(0) is False
+    finally:
+        logger.remove(handler_id)
+
+    scheduler._actuate_materialization_verdict.assert_not_called()  # type: ignore[attr-defined]
+    holds = [message for message in messages if message.startswith("Clearance held for process 0")]
+    assert len(holds) == 1 and ": stage " in holds[0]
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == staging_charge_mb
+    assert job_id not in scheduler.snapshot().ledgers.dispatch_holds.clearance_granted_ids
+
+
+async def test_unpriceable_weights_grant_no_stage_and_log_no_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job whose weights cannot be estimated is left to the single clear, with no hold logged or recorded."""
+    scheduler, job, _waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    monkeypatch.setattr(clearance_module, "predict_job_weight_mb", lambda *_args: None)
+    sink = Mock()
+    scheduler._decision_sink = sink  # type: ignore[attr-defined]
+    staging_charge_mb = _dispatch_charge_mb(scheduler, str(job.id_), {0: 900.0})
+
+    plan = _decide_stage(scheduler, 0)
+    assert plan.decision is ClearanceDecision.UNPRICED and plan.verdict is None
+
+    messages, handler_id = _capture_log_messages()
+    try:
+        assert scheduler.clearance_stage_admit_process(0) is False
+    finally:
+        logger.remove(handler_id)
+
+    assert not [message for message in messages if message.startswith("Clearance held")]
+    assert _clearance_records(sink) == []
+    assert _dispatch_charge_mb(scheduler, str(job.id_), {0: 900.0}) == staging_charge_mb
+
+
+async def test_a_retention_resident_model_stages_at_no_charge() -> None:
+    """Weights already resident on the slot upload nothing, so the stage is priced at zero and admits."""
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=100.0, model_metadata=_two_model_metadata())
+    waiter.retained_resident_model = _JOB_MODEL
+    job_id = str(job.id_)
+    assert pricing.candidate_weights_resident(scheduler.snapshot(), _JOB_MODEL, 0)
+    assert stage_weights_delta_mb(scheduler.snapshot(), job_id, 0) == 0.0
+
+    plan = _decide_stage(scheduler, 0)
+    assert plan.decision is ClearanceDecision.ADMIT
+    assert plan.candidate_delta_mb == 0.0
+
+    assert scheduler.clearance_stage_admit_process(0) is True
+    assert _dispatch_charge_mb(scheduler, job_id, {0: 900.0}) == 0.0
+
+
+async def test_the_sample_clearance_after_a_stage_prices_the_activation_alone() -> None:
+    """Once the lane reports its staged weights, the sample clearance charges the peak net of them.
+
+    The slot's model is not marked resident: the report alone carries the weights, as the lane reports them.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    job_id = str(job.id_)
+    snapshot = scheduler.snapshot()
+    baseline = snapshot.queue.jobs[job_id].baseline
+    gross_mb = pricing.candidate_delta_mb(snapshot, job, baseline, process_id=0, disaggregated=False)
+    weights_mb = predict_job_weight_mb(job, baseline)
+    assert gross_mb is not None and weights_mb is not None
+    assert scheduler.clearance_stage_admit_process(0) is True
+
+    landed_mb = 900 + int(weights_mb)
+    waiter.process_reserved_mb = landed_mb
+    snapshot = scheduler.snapshot()
+    assert not pricing.candidate_weights_resident(snapshot, _JOB_MODEL, 0)
+    activation_mb = gross_mb - landed_mb
+    assert staged_materialization_delta_mb(snapshot, job_id, 0) == activation_mb
+    assert activation_mb == pytest.approx(gross_mb - weights_mb - 900.0, abs=1.0)
+
+    plan = _decide(scheduler, 0)
+    assert plan.decision is ClearanceDecision.ADMIT
+    assert plan.candidate_delta_mb == activation_mb
+    assert scheduler.clearance_admit_process(0) is True
+    assert _dispatch_charge_mb(scheduler, job_id, {0: float(landed_mb)}) == activation_mb
+
+
+@pytest.mark.parametrize("two_phase", [True, False])
+def test_the_manager_passes_the_stage_admission_only_under_two_phase(two_phase: bool) -> None:
+    """The controller is stepped with the scheduler's stage admission when two-phase is on, and None when off.
+
+    None is what keeps the tail-overlap handoff running for a worker that turned two-phase off.
+    """
+    assert reGenBridgeData.model_fields["gpu_sampling_lease_two_phase"].default is True
+    manager = make_testable_process_manager(gpu_sampling_lease_two_phase=two_phase)
+    controller = Mock()
+    manager._clearance_controllers = {0: controller}
+    manager._inference_scheduler.build_clearance_inputs = Mock()  # type: ignore[method-assign]
+
+    manager._advance_clearance()
+
+    stage_admit_fn = controller.step.call_args.kwargs["stage_admit_fn"]
+    if two_phase:
+        assert stage_admit_fn == manager._inference_scheduler.clearance_stage_admit_process
+    else:
+        assert stage_admit_fn is None

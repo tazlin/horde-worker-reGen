@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import math
 import multiprocessing
+import os
+import pickle
+import sys
 import uuid
 from collections.abc import Callable
+from multiprocessing.context import set_spawning_popen
+from multiprocessing.reduction import ForkingPickler
 from multiprocessing.sharedctypes import Synchronized
 from types import SimpleNamespace
 
@@ -225,6 +230,23 @@ class TestProxyWaitEntryCallback:
 
         assert "_wait_entry_callback" not in vars(proxy)
         assert proxy._wait_entry_callback is None
+
+    def test_the_stage_acquire_runs_the_callback_before_a_blocking_wait(self) -> None:
+        """Under two-phase clearance the child first waits on its stage, so the report is sent there.
+
+        Left on the sample acquire alone, the parent prices the stage on a reading from before the child staged.
+        """
+        stage = _TimeoutRecordingSemaphore(0, bound=1)
+        proxy = ClearanceLeaseProxy(clearance=_held_empty_clearance(), done=_FakeSemaphore(), stage=stage)
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        calls: list[int] = []
+        proxy.set_wait_entry_callback(lambda: calls.append(stage.value))
+        proxy.begin_job()
+
+        assert stage_lease.acquire(True, 5.0) is False
+        assert calls == [0]
+        assert len(stage.blocking_timeouts) == 1, "the stage acquire must still block after the callback"
 
 
 def _inputs(
@@ -447,16 +469,28 @@ class TestTailOverlapTimeTrigger:
 class _StubProxy(ClearanceLeaseProxy):
     """A proxy backed by fake semaphores, so the controller drives real grant/done edges under test."""
 
-    def __init__(self, *, cleared_device_free: Synchronized[float] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cleared_device_free: Synchronized[float] | None = None,
+        with_stage: bool = False,
+        staged_device_free: Synchronized[float] | None = None,
+    ) -> None:
         super().__init__(
             clearance=_held_empty_clearance(),
             done=_FakeSemaphore(),
             cleared_device_free=cleared_device_free,
+            stage=_held_empty_clearance() if with_stage else None,
+            staged_device_free=staged_device_free,
         )
 
     @property
     def clearance_value(self) -> int:
         return self._clearance.value  # type: ignore[attr-defined]
+
+    @property
+    def stage_value(self) -> int:
+        return self._stage.value  # type: ignore[union-attr]
 
     def child_signal_done(self) -> None:
         self._done.release()  # type: ignore[attr-defined]
@@ -953,6 +987,18 @@ class TestTailOverlapTallyFormatting:
         """Nothing granted and nothing denied means the handoff never applied, so no tally is composed."""
         assert format_tail_overlap_tally(0, {}) is None
 
+    def test_stage_figures_share_the_line(self) -> None:
+        """Stage grants and refusals follow the tail-overlap figures, and stand alone when it never applied."""
+        assert format_tail_overlap_tally(
+            1,
+            {TailOverlapDenialReason.PAGING_ACTIVE: 1},
+            stage_grants_issued=3,
+            stage_refusals=2,
+        ) == ("tail-overlap: 1 granted / 1 denied (paging 100%); stage: 3 granted / 2 refused")
+        assert format_tail_overlap_tally(0, {}, stage_grants_issued=0, stage_refusals=4) == (
+            "stage: 0 granted / 4 refused"
+        )
+
 
 class TestControllerLiveness:
     """A controller that never clears must not wedge the pool: children still sample via the timeout path."""
@@ -974,6 +1020,378 @@ class TestControllerLiveness:
         proxy.child_signal_done()
         controller.step(_inputs(), admit_fn=_never_admit)
         assert controller.grant_state(2) is GrantState.IDLE
+
+
+class TestStageLeaseProxy:
+    """The stage view takes its permit once per job and carries the stage grant's figure once."""
+
+    def _proxy(self) -> tuple[ClearanceLeaseProxy, _FakeSemaphore, Synchronized[float]]:
+        stage = _held_empty_clearance()
+        figure = _shared_figure()
+        proxy = ClearanceLeaseProxy(
+            clearance=_held_empty_clearance(),
+            done=_FakeSemaphore(),
+            stage=stage,
+            staged_device_free=figure,
+        )
+        return proxy, stage, figure
+
+    def test_stage_acquire_consumes_the_permit_and_carries_its_figure_once(self) -> None:
+        """A granted stage acquire takes the permit, reads the figure once, and passes later acquires through."""
+        proxy, stage, _figure = self._proxy()
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        proxy.begin_job()
+        proxy._parent_grant_stage(device_free_mb=9000.0)
+
+        assert stage_lease.acquire(True, 5.0) is True
+        assert stage.value == 0
+        assert stage_lease.take_cleared_device_free_mb() == 9000.0
+        assert stage_lease.take_cleared_device_free_mb() is None
+        assert stage_lease.acquire(True, 0.0) is True, "a later stage acquire of the same job passes through"
+        assert proxy.acquire(True, 0.0) is False, "the stage permit grants no sample window"
+
+    def test_begin_job_resets_the_stage_permit(self) -> None:
+        """The next job waits for its own stage grant, and an unconsumed grant's figure is unset."""
+        proxy, _stage, figure = self._proxy()
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        proxy.begin_job()
+        proxy._parent_grant_stage(device_free_mb=9000.0)
+        assert stage_lease.acquire(True, 0.0) is True
+
+        proxy._parent_grant_stage(device_free_mb=7000.0)
+        proxy.begin_job()
+        assert math.isnan(figure.value)
+        assert stage_lease.acquire(True, 0.0) is True  # the late permit is still there
+        assert stage_lease.take_cleared_device_free_mb() is None, "a late permit carries no figure"
+
+        proxy.begin_job()
+        assert stage_lease.acquire(True, 0.0) is False
+
+    def test_reclaim_returns_true_exactly_when_the_stage_permit_is_unconsumed(self) -> None:
+        """Reclaim takes back an untaken stage permit and finds nothing once the child took it."""
+        proxy, stage, _figure = self._proxy()
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        proxy.begin_job()
+        assert proxy._parent_reclaim_unconsumed_stage_permit() is False
+
+        proxy._parent_grant_stage(device_free_mb=None)
+        assert proxy._parent_reclaim_unconsumed_stage_permit() is True
+        assert stage.value == 0
+
+        proxy._parent_grant_stage(device_free_mb=None)
+        assert stage_lease.acquire(True, 0.0) is True
+        assert proxy._parent_reclaim_unconsumed_stage_permit() is False
+
+    def test_a_proxy_without_a_stage_semaphore_has_no_stage_lease(self) -> None:
+        """A proxy built without a stage semaphore exposes no stage lease and has nothing to reclaim."""
+        proxy = ClearanceLeaseProxy(clearance=_held_empty_clearance(), done=_FakeSemaphore())
+        assert proxy.stage_lease is None
+        assert proxy._parent_reclaim_unconsumed_stage_permit() is False
+
+    def test_a_proxy_handed_over_by_spawn_keeps_a_working_stage_view(self) -> None:
+        """The child's copy of the proxy, as spawn pickles it, stages on the parent's permit and figure.
+
+        The proxy reaches the child as an inference process argument, which the spawn context pickles while it
+        launches the child; multiprocessing primitives refuse to pickle anywhere else. The stage view refers back
+        to its proxy, so the copy must rebind it to the copy rather than to a stray proxy of its own.
+        """
+        context = multiprocessing.get_context("spawn")
+        stage = context.BoundedSemaphore(1)
+        stage.acquire(False)
+        clearance = context.BoundedSemaphore(1)
+        clearance.acquire(False)
+        proxy = ClearanceLeaseProxy(
+            clearance=clearance,
+            done=context.Semaphore(0),
+            cleared_device_free=context.Value("d", math.nan),
+            stage=stage,
+            staged_device_free=context.Value("d", math.nan),
+        )
+
+        # pyrefly: ignore[bad-argument-type] - a stand-in for the launcher, with the two methods pickling calls
+        set_spawning_popen(_InProcessSpawningPopen())
+        try:
+            payload = bytes(ForkingPickler.dumps(proxy))
+        finally:
+            set_spawning_popen(None)
+        child_proxy = pickle.loads(payload)
+
+        child_stage_lease = child_proxy.stage_lease
+        assert child_stage_lease is not None
+        assert child_stage_lease._proxy is child_proxy
+        child_proxy.begin_job()
+        assert child_stage_lease.acquire(False) is False, "the parent holds the stage permit empty"
+
+        child_proxy.begin_job()
+        proxy._parent_grant_stage(device_free_mb=8192.0)
+        assert child_stage_lease.acquire(False) is True
+        assert child_stage_lease.take_cleared_device_free_mb() == 8192.0
+        assert proxy._parent_reclaim_unconsumed_stage_permit() is False, "the child took the parent's permit"
+
+
+class _DetachableFd:
+    """The duplicated descriptor ``multiprocessing.reduction.DupFd`` hands the pickler on POSIX."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def detach(self) -> int:
+        return self._fd
+
+
+class _InProcessSpawningPopen:
+    """Stands in for the spawn launcher so primitives pickle as they do into a child, rebuilt in this process.
+
+    The launcher duplicates each handle into the child; here the duplicate lands in this process, so the rebuilt
+    primitive is the same kernel object the parent holds, as the child's is.
+    """
+
+    def duplicate_for_child(self, handle: int) -> int:
+        if sys.platform == "win32":
+            import _winapi
+
+            current = _winapi.GetCurrentProcess()
+            return _winapi.DuplicateHandle(current, handle, current, 0, False, _winapi.DUPLICATE_SAME_ACCESS)
+        return os.dup(handle)
+
+    def DupFd(self, fd: int) -> _DetachableFd:  # noqa: N802 - the name multiprocessing.reduction.DupFd calls
+        return _DetachableFd(fd)
+
+
+def _job_waiter(process_id: int, priority: int) -> ClearanceWaiter:
+    return ClearanceWaiter(process_id=process_id, priority=priority, job_id=f"job-{process_id}")
+
+
+def _sampler(process_id: int) -> ActiveSampler:
+    return ActiveSampler(process_id=process_id, job_id=f"job-{process_id}", progress_fraction=0.5)
+
+
+class _RecordingAdmit:
+    """A stage admission that records each process it was asked about and answers a fixed verdict."""
+
+    def __init__(self, verdict: bool) -> None:
+        self.verdict = verdict
+        self.asked: list[int] = []
+
+    def __call__(self, process_id: int) -> bool:
+        self.asked.append(process_id)
+        return self.verdict
+
+
+def _one_sampling(controller: ClearanceController, waiter_ids: tuple[int, ...]) -> dict[int, _StubProxy]:
+    """Register process 1 and the waiters, all with stage permits, and clear process 1 for its job."""
+    proxies = {process_id: _StubProxy(with_stage=True) for process_id in (1, *waiter_ids)}
+    for process_id, proxy in proxies.items():
+        controller.register(process_id, proxy)
+        proxy.begin_job()
+    controller.step(_inputs(staged=(_job_waiter(1, 0),)), admit_fn=_always_admit)
+    assert controller.grant_state(1) is GrantState.CLEARED
+    return proxies
+
+
+class TestControllerStageGrant:
+    """The controller stages the head waiter's weights beside a running sampler and clears it later."""
+
+    def test_a_single_clear_grants_both_permits(self) -> None:
+        """An idle waiter cleared by the sample pass gets its stage and sample permits together."""
+        controller = _controller(tail=False)
+        proxy = _StubProxy(with_stage=True)
+        controller.register(2, proxy)
+        stage_admit = _RecordingAdmit(True)
+
+        result = controller.step(
+            _inputs(staged=(_job_waiter(2, 1),)),
+            admit_fn=_always_admit,
+            stage_admit_fn=stage_admit,
+        )
+
+        assert result.cleared_process_ids == (2,)
+        assert controller.grant_state(2) is GrantState.CLEARED
+        assert proxy.clearance_value == 1
+        assert proxy.stage_value == 1
+        assert controller.grants_issued == 1
+        assert controller.stage_grants_issued == 0
+        assert stage_admit.asked == []
+
+    def test_the_stage_pass_stages_only_the_head_waiter(self) -> None:
+        """Beside one sampler, only the head idle waiter is asked and staged, and only one per card."""
+        controller = _controller(slot_cap=1, tail=False)
+        proxies = _one_sampling(controller, (2, 3))
+        stage_admit = _RecordingAdmit(True)
+        inputs = _inputs(staged=(_job_waiter(3, 2), _job_waiter(2, 1)), active=(_sampler(1),))
+
+        controller.step(inputs, admit_fn=_always_admit, stage_admit_fn=stage_admit)
+
+        assert controller.grant_state(1) is GrantState.SAMPLING
+        assert stage_admit.asked == [2]
+        assert controller.grant_state(2) is GrantState.STAGED
+        assert proxies[2].stage_value == 1
+        assert proxies[2].clearance_value == 0
+        assert controller.held_grant_count == 1
+
+        controller.step(inputs, admit_fn=_always_admit, stage_admit_fn=stage_admit)
+        assert stage_admit.asked == [2], "a card with a staged waiter stages no other"
+        assert controller.grant_state(3) is GrantState.IDLE
+        assert proxies[3].stage_value == 0
+        assert controller.stage_grants_issued == 1
+
+    def test_a_staged_waiter_is_cleared_with_only_its_sample_permit(self) -> None:
+        """When the sampler retires, the staged waiter is cleared by the sample pass and then samples."""
+        controller = _controller(slot_cap=1, tail=False)
+        proxies = _one_sampling(controller, (2,))
+        stage_admit = _RecordingAdmit(True)
+        controller.step(
+            _inputs(staged=(_job_waiter(2, 1),), active=(_sampler(1),)),
+            admit_fn=_always_admit,
+            stage_admit_fn=stage_admit,
+        )
+        assert controller.grant_state(2) is GrantState.STAGED
+        stage_lease = proxies[2].stage_lease
+        assert stage_lease is not None
+        assert stage_lease.acquire(True, 0.0) is True  # the child uploads its weights
+        grants_before = controller.grants_issued
+
+        result = controller.step(
+            _inputs(staged=(_job_waiter(2, 1),)),
+            admit_fn=_always_admit,
+            stage_admit_fn=stage_admit,
+        )
+        assert result.cleared_process_ids == (2,)
+        assert controller.grant_state(1) is GrantState.IDLE
+        assert proxies[1].stage_value == 0, "the retired sampler's untaken stage permit is taken back"
+        assert controller.grant_state(2) is GrantState.CLEARED
+        assert proxies[2].clearance_value == 1
+        assert proxies[2].stage_value == 0, "the staged child is not granted a second stage permit"
+
+        controller.step(_inputs(active=(_sampler(2),)), admit_fn=_always_admit, stage_admit_fn=stage_admit)
+        assert controller.grant_state(2) is GrantState.SAMPLING
+        assert controller.grants_issued == grants_before + 1
+        assert controller.stage_grants_issued == 1
+
+    def test_a_staged_child_seen_sampling_is_an_unpriced_window(self) -> None:
+        """A staged child that samples before its sample grant is flagged once: its activation was never priced."""
+        from loguru import logger
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda record: messages.append(record.record["message"]), level="WARNING")
+        try:
+            controller = _controller(slot_cap=1, tail=False)
+            _one_sampling(controller, (2,))
+            controller.step(
+                _inputs(staged=(_job_waiter(2, 1),), active=(_sampler(1),)),
+                admit_fn=_always_admit,
+                stage_admit_fn=_always_admit,
+            )
+            assert controller.grant_state(2) is GrantState.STAGED
+            windows_before = controller.unpriced_sampling_windows
+
+            controller.step(
+                _inputs(active=(_sampler(1), _sampler(2))),
+                admit_fn=_always_admit,
+                stage_admit_fn=_always_admit,
+            )
+            assert controller.grant_state(2) is GrantState.SAMPLING
+            assert controller.unpriced_sampling_windows == windows_before + 1
+            assert sum("without a recorded grant for its sample window" in m for m in messages) == 1
+
+            controller.step(
+                _inputs(active=(_sampler(1), _sampler(2))),
+                admit_fn=_always_admit,
+                stage_admit_fn=_always_admit,
+            )
+            assert controller.unpriced_sampling_windows == windows_before + 1, "flagged once per window"
+        finally:
+            logger.remove(sink_id)
+
+    def test_a_staged_grant_retires_when_its_child_moves_to_another_job(self) -> None:
+        """A staged child that picks up a different job retires its grant and loses the untaken stage permit."""
+        controller = _controller(slot_cap=1, tail=False)
+        proxies = _one_sampling(controller, (2,))
+        controller.step(
+            _inputs(staged=(_job_waiter(2, 1),), active=(_sampler(1),)),
+            admit_fn=_always_admit,
+            stage_admit_fn=_always_admit,
+        )
+        assert controller.grant_state(2) is GrantState.STAGED
+        assert proxies[2].stage_value == 1
+
+        moved_on = ClearanceWaiter(process_id=2, priority=1, job_id="job-other")
+        controller.step(_inputs(staged=(moved_on,), active=(_sampler(1),)), admit_fn=_always_admit)
+        assert controller.grant_state(2) is GrantState.IDLE
+        assert proxies[2].stage_value == 0
+
+    def test_a_refused_stage_leaves_the_waiter_idle_and_is_asked_again(self) -> None:
+        """A refusal is counted and logged once per waiter and job; the next step asks again."""
+        from loguru import logger
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda record: messages.append(record), level="DEBUG")
+        try:
+            controller = _controller(slot_cap=1, tail=False, clock=lambda: 100.0)
+            proxies = _one_sampling(controller, (2,))
+            stage_admit = _RecordingAdmit(False)
+            inputs = _inputs(staged=(_job_waiter(2, 1),), active=(_sampler(1),))
+            controller.step(inputs, admit_fn=_always_admit, stage_admit_fn=stage_admit)
+            assert controller.stage_refusals == 1
+            assert controller.grant_state(2) is GrantState.IDLE
+            assert proxies[2].stage_value == 0
+
+            controller.step(inputs, admit_fn=_always_admit, stage_admit_fn=stage_admit)
+        finally:
+            logger.remove(sink_id)
+
+        assert stage_admit.asked == [2, 2]
+        assert controller.stage_refusals == 2
+        assert controller.stage_grants_issued == 0
+        refusal_lines = [m for m in messages if "stage grant for process 2 refused" in m]
+        assert len(refusal_lines) == 1
+
+    def test_the_tail_overlap_runs_only_without_a_stage_admission(self) -> None:
+        """No stage admission keeps the tail-overlap handoff; a stage admission turns it off."""
+        for stage_admit_fn, expected_tail_grants in ((None, 1), (_never_admit, 0)):
+            controller = _controller(slot_cap=1, tail=True)
+            controller.register(1, _StubProxy(with_stage=True))
+            controller.register(2, _StubProxy(with_stage=True))
+            controller.step(
+                _inputs(staged=(ClearanceWaiter(process_id=1, priority=0, job_id="job-a"),)),
+                admit_fn=_always_admit,
+                stage_admit_fn=stage_admit_fn,
+            )
+            result = controller.step(
+                _inputs(staged=(ClearanceWaiter(process_id=2, priority=1),), active=(_tailing(),)),
+                admit_fn=_always_admit,
+                stage_admit_fn=stage_admit_fn,
+            )
+            assert controller.tail_overlap_grant_count == expected_tail_grants
+            assert result.cleared_process_ids == ((2,) if expected_tail_grants else ())
+            if stage_admit_fn is not None:
+                assert sum(controller.tail_overlap_denial_counts.values()) == 0
+                assert controller.stage_refusals == 1
+
+    def test_a_staged_grant_holds_no_sampling_slot(self) -> None:
+        """With one slot and a staged waiter, a different idle waiter can still be sample-cleared."""
+        controller = _controller(slot_cap=1, tail=False)
+        proxies = _one_sampling(controller, (2, 3))
+        controller.step(
+            _inputs(staged=(_job_waiter(2, 1),), active=(_sampler(1),)),
+            admit_fn=_always_admit,
+            stage_admit_fn=_always_admit,
+        )
+        assert controller.grant_state(2) is GrantState.STAGED
+
+        result = controller.step(
+            _inputs(staged=(_job_waiter(2, 2), _job_waiter(3, 1))),
+            admit_fn=_always_admit,
+            stage_admit_fn=_always_admit,
+        )
+        assert result.cleared_process_ids == (3,)
+        assert controller.grant_state(3) is GrantState.CLEARED
+        assert controller.grant_state(2) is GrantState.STAGED
+        assert proxies[2].clearance_value == 0
+        assert controller.held_grant_count == 1
 
 
 class TestRemainingSamplingEstimate:

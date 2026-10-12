@@ -591,6 +591,7 @@ class ProcessLifecycleManager:
     _disk_lock: Lock_MultiProcessing
     _download_bandwidth_semaphore: Semaphore
     _gpu_sampling_lease_enabled: bool
+    _gpu_sampling_lease_two_phase: bool
     _runtime_config: RuntimeConfig
     _max_inference_processes: int
     _max_safety_processes: int
@@ -654,6 +655,7 @@ class ProcessLifecycleManager:
         disk_lock: Lock_MultiProcessing,
         download_bandwidth_semaphore: Semaphore,
         gpu_sampling_lease_enabled: bool = False,
+        gpu_sampling_lease_two_phase: bool = False,
         runtime_config: RuntimeConfig,
         max_safety_processes: int,
         amd_gpu: bool,
@@ -701,6 +703,7 @@ class ProcessLifecycleManager:
         self._disk_lock = disk_lock
         self._download_bandwidth_semaphore = download_bandwidth_semaphore
         self._gpu_sampling_lease_enabled = gpu_sampling_lease_enabled
+        self._gpu_sampling_lease_two_phase = gpu_sampling_lease_two_phase
         self._runtime_config = runtime_config
         # Total inference processes across all driven cards. Single-GPU = that one card's count, identical
         # to the old global value.
@@ -959,6 +962,7 @@ class ProcessLifecycleManager:
             f"ProcessLifecycleManager config: max_inference_processes={self._max_inference_processes}, "
             f"max_safety_processes={self._max_safety_processes}, "
             f"gpu_sampling_lease_enabled={self._gpu_sampling_lease_enabled}, "
+            f"gpu_sampling_lease_two_phase={self._gpu_sampling_lease_two_phase}, "
             f"amd_gpu={self._amd_gpu}, directml={self._directml}, "
             f"runtime_config={self._runtime_config}"
         )
@@ -3328,16 +3332,27 @@ class ProcessLifecycleManager:
         # clears it) and a done semaphore the child signals on release, wraps them in a picklable proxy shared
         # into the child by spawn inheritance, and registers it with the card's controller so the parent can
         # grant and observe this child specifically. A shared float beside them carries the device free each
-        # grant was admitted against. Disabled: no proxy is created and the child gets None.
+        # grant was admitted against. Disabled: no proxy is created and the child gets None. Under two-phase
+        # clearance the child also gets a stage semaphore, held empty the same way, so its weight upload can be
+        # granted ahead of its sample window; without one the child's stage view is None and hordelib loads
+        # inside the sample permit as before.
         gpu_sampling_lease: ClearanceLeaseProxy | None = None
         if self._gpu_sampling_lease_enabled:
             clearance_semaphore = BoundedSemaphore_MultiProcessing(1, ctx=self._ctx)
             clearance_semaphore.acquire(block=False)  # hold it empty: the child waits for the parent's grant
             done_semaphore = Semaphore(0, ctx=self._ctx)
+            stage_semaphore = None
+            staged_device_free = None
+            if self._gpu_sampling_lease_two_phase:
+                stage_semaphore = BoundedSemaphore_MultiProcessing(1, ctx=self._ctx)
+                stage_semaphore.acquire(block=False)
+                staged_device_free = self._ctx.Value("d", math.nan)
             gpu_sampling_lease = ClearanceLeaseProxy(
                 clearance=clearance_semaphore,
                 done=done_semaphore,
                 cleared_device_free=self._ctx.Value("d", math.nan),
+                stage=stage_semaphore,
+                staged_device_free=staged_device_free,
             )
             self._clearance_proxy_registrar(card.device_index, pid, gpu_sampling_lease)
 

@@ -8,6 +8,12 @@ in as a verdict callable; this module only decides when to ask it and how its an
 
 A pairing with an extra-large side is priced by the overlap of the two jobs' phases
 (:func:`prices_sampler_only_beside`), so the admission seams and this rule agree on which pairings that is.
+
+The headway fractions below apply only where a dispatch is the moment a job loads and samples. Under two-phase
+clearance a dispatched job only stages its encode working set; its weight upload is priced at the stage grant and
+its activation onset at the sample grant, each against measured free VRAM. The stacking the headway guards
+against is then priced at the grants, so the caller passes ``headway_priced_by_clearance`` and the progress test
+is skipped. The extra-large pairing rule, the confirmed-room requirement and the memory veto still apply.
 """
 
 from __future__ import annotations
@@ -95,6 +101,7 @@ def concurrent_overlap_permitted(
     running: Sequence[RunningSampler],
     headway_scale: float,
     memory_verdict: Callable[[], bool | None],
+    headway_priced_by_clearance: bool = False,
 ) -> bool:
     """Whether a candidate may start beside ``running`` samplers.
 
@@ -108,6 +115,10 @@ def concurrent_overlap_permitted(
     copies of one or two different ones. A pairing with one extra-large side, and a batched side, multiply what
     a misjudged overlap costs, so each needs confirmed room and is then bounded by the strictest headway rather
     than the relaxed one.
+
+    With ``headway_priced_by_clearance`` the required headway is zero for every pairing: the stage and sample
+    grants price the candidate's load and onset, so only the pairing rule, the confirmed-room requirement and
+    the memory verdict decide.
     """
     if not running:
         return True
@@ -134,9 +145,11 @@ def concurrent_overlap_permitted(
         confirmed_room_required = (
             candidate_batched or candidate_extra_large or sampler.batched or sampler.tier >= ModelSizeTier.EXTRA_LARGE
         )
+        if confirmed_room_required and not memory_ample():
+            return False
+        if headway_priced_by_clearance:
+            continue
         if confirmed_room_required:
-            if not memory_ample():
-                return False
             required_headway = OVERLAP_HEADWAY_BOTH_HEAVY
         else:
             required_headway = required_overlap_headway(sampler.tier, candidate_tier)

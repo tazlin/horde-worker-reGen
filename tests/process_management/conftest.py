@@ -263,6 +263,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.gpu_sampling_lease_enabled = False
     bd.gpu_sampling_lease_slots = None
     bd.gpu_sampling_lease_tail_overlap = True
+    bd.gpu_sampling_lease_two_phase = False
     bd.vram_admission_noise_mb = None
     bd.measured_load_probe_seconds = 10
     bd.starved_head_lane_reclaim = True

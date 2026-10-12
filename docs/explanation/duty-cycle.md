@@ -259,6 +259,10 @@ a slot that retains its model's weights is priced at its activation delta alone,
 not held for weights the card is already carrying. It clears once
 eviction frees room, or the child samples anyway through its bounded lease-acquire timeout (liveness over
 pricing), so like the other gate buckets it is a named, real head-park rather than the gate-less stall.
+Under two-phase clearance (`gpu_sampling_lease_two_phase`) the dispatch-time overlap headway is not applied to
+leased jobs, because the stage and sample grants price the weight load and the denoise onset. `overlap_headway`
+therefore reads zero there, and the scheduler logs once per overlap episode on a card that the headway is not
+applied.
 `unexplained`
 growing is itself a finding: an empty slot with queued work that no gate claims (and no reconcile hold
 explains) is the scheduler-bug-shaped case. The cumulative totals also ride every stats sample (`slot_duty_totals`),
@@ -434,7 +438,17 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
     binding clause rather than only as missing overlap. The parent takes the permit back the moment the
     outgoing sampler leaves its loop, restoring the steady-state slot count. It shrinks the inter-sampling
     gap without paying for sustained concurrent denoise, so it is the right shape even on no-MPS hardware;
-    disable it only to restore the strict per-slot denoise gate.
+    disable it only to restore the strict per-slot denoise gate. Where `gpu_sampling_lease_two_phase` is on,
+    the controller does not run this handoff, and the stage grant does its work on measured fit.
+  - **`gpu_sampling_lease_two_phase`** (on by default when the lease is enabled) splits the clearance into a
+    stage grant for the weight upload and a sample grant for the denoise loop. While one job samples, the head
+    waiter on the card may upload its weights when they fit beside the running peak, so the next denoise starts
+    one grant latency after the running one ends. On a card too small to hold the weights beside a running
+    peak, every stage is refused and the behaviour is the single clearance's. The duty-cycle summary line
+    carries the session's tally as `stage: N granted / M refused`, after any tail-overlap figures. The refused
+    count rises on every check of a waiting job, so one job held for many seconds counts many times.
+    `horde-log diagnose` reports refusals per job as `stage_refusals`. Set the key to false to return to one
+    grant per job, which is what `stage_outlived_sample_grant` asks for.
 
 ## The disagg A/B gate driver
 

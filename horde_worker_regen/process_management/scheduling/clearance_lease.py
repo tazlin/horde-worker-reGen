@@ -16,6 +16,12 @@ waiter once its full materialisation fits.
 A multi-sample job (hires-fix, refiner) consumes one grant for its whole job: the second and later
 ``acquire`` calls pass through so a single job never blocks twice.
 
+A proxy built with a ``stage`` semaphore also carries a stage permit, taken by the child before its sample
+permit to upload the diffusion weights ahead of the denoise loop. The weights alone fit beside a running
+sampler's peak where the whole sampling peak does not, so the parent can grant the stage permit to the head
+waiter while another child samples and the denoise onset waits only on the sample permit. A single clear
+grants both permits, so a child never waits on a stage permit longer than on today's clearance.
+
 The decision of *which* child to clear and *when* is split house-style: :func:`decide_clearances` is a pure
 function of a per-tick snapshot, and :class:`ClearanceController` owns the semaphore edge, the per-process
 grant state, and the degradation latches. Liveness beats pricing: hordelib's bounded lease-acquire timeout
@@ -109,9 +115,13 @@ class ClearanceLeaseProxy:
     takes the permit the parent rewrites the figure from each control step's reading, since the child can reach
     its sample call seconds after the grant, by which time it has moved its own encoder off the card.
 
-    The child can also register a wait-entry callback (:meth:`set_wait_entry_callback`), run once per job just
-    before the acquire blocks. The parent prices a staged child net of its last reported reservation, so the
+    The child can also register a wait-entry callback (:meth:`set_wait_entry_callback`), run before a job's first
+    acquire of each permit blocks. The parent prices a staged child net of its last reported reservation, so the
     child reports memory there rather than leaving the parent on a reading from before it staged.
+
+    Built with a ``stage`` semaphore, the proxy also exposes :attr:`stage_lease`, the view the child registers
+    as hordelib's stage lease. The stage permit, its consumed flag and its shared figure follow the clearance
+    permit's rules and are reset by the same :meth:`begin_job`.
     """
 
     _wait_entry_callback: Callable[[], None] | None = None
@@ -125,8 +135,10 @@ class ClearanceLeaseProxy:
         clearance: _ClearanceSemaphore,
         done: _ClearanceSemaphore,
         cleared_device_free: _SharedFigure | None = None,
+        stage: _ClearanceSemaphore | None = None,
+        staged_device_free: _SharedFigure | None = None,
     ) -> None:
-        """Wrap the parent-created clearance and done semaphores.
+        """Wrap the parent-created clearance and done semaphores, and the stage semaphore when there is one.
 
         Args:
             clearance: A bounded semaphore the parent holds empty (its single permit acquired at creation) and
@@ -135,12 +147,27 @@ class ClearanceLeaseProxy:
                 non-blockingly) learns the grant was consumed and retired.
             cleared_device_free: A parent-created shared float the parent sets to the admitted device free
                 (MB) before each grant, NaN when it had no reading. None carries no figure with any grant.
+            stage: A bounded semaphore the parent holds empty and releases to let the child upload its weights
+                ahead of its sample window. None gives the proxy no stage lease, and the child loads inside
+                its sample window.
+            staged_device_free: The stage grant's shared figure, set the way ``cleared_device_free`` is. None
+                carries no figure with any stage grant.
         """
         self._clearance = clearance
         self._done = done
         self._cleared_device_free = cleared_device_free
         self._grant_consumed = False
         self._granted_device_free_mb: float | None = None
+        self._stage = stage
+        self._staged_device_free = staged_device_free
+        self._stage_consumed = False
+        self._stage_granted_device_free_mb: float | None = None
+        self._stage_lease = ClearanceStageLease(self) if stage is not None else None
+
+    @property
+    def stage_lease(self) -> ClearanceStageLease | None:
+        """The child-facing stage lease to register with hordelib, or None when the proxy has no stage permit."""
+        return self._stage_lease
 
     def acquire(self, block: bool = True, timeout: float | None = None) -> bool:
         """Wait for the parent's clearance grant, or pass through if this job already consumed one.
@@ -166,26 +193,30 @@ class ClearanceLeaseProxy:
         return acquired
 
     def set_wait_entry_callback(self, callback: Callable[[], None] | None) -> None:
-        """Register (or clear) the child-local callback run before a job's first acquire blocks.
+        """Register (or clear) the child-local callback run before a job's first acquire of either permit blocks.
 
         Set in the child after the proxy crossed the spawn boundary; it is never pickled.
         """
         self._wait_entry_callback = callback
 
     def _acquire_clearance(self, block: bool, timeout: float | None) -> bool:
-        """Take the clearance permit, running the wait-entry callback only when the acquire is about to block.
+        """Take the clearance permit, running the wait-entry callback only when the acquire is about to block."""
+        return self._acquire_with_wait_entry(self._clearance, block, timeout)
+
+    def _acquire_with_wait_entry(self, permit: _ClearanceSemaphore, block: bool, timeout: float | None) -> bool:
+        """Take ``permit``, running the wait-entry callback only when the acquire is about to block.
 
         Without a callback the permit is taken in the single call the semaphore was always given; the probe
         exists only to tell a waiting grant from a wait.
         """
         if not block or self._wait_entry_callback is None:
-            return bool(self._clearance.acquire(block, timeout))
+            return bool(permit.acquire(block, timeout))
         started_at = time.monotonic()
-        if self._clearance.acquire(False):
+        if permit.acquire(False):
             return True
         self._notify_wait_entry()
         remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started_at))
-        return bool(self._clearance.acquire(True, remaining))
+        return bool(permit.acquire(True, remaining))
 
     def _notify_wait_entry(self) -> None:
         """Run the wait-entry callback; a failure is logged and never reaches the acquire."""
@@ -224,20 +255,42 @@ class ClearanceLeaseProxy:
 
         The shared figure is unset here too. A permit the parent released after the previous job had already
         timed out is still available to this job's acquire, and the figure written with it describes the card
-        before the previous job sampled.
+        before the previous job sampled. The stage permit's flag and figure are reset by the same rules.
         """
         self._grant_consumed = False
         self._granted_device_free_mb = None
         if self._cleared_device_free is not None:
             self._cleared_device_free.value = math.nan
+        self._stage_consumed = False
+        self._stage_granted_device_free_mb = None
+        if self._staged_device_free is not None:
+            self._staged_device_free.value = math.nan
 
     def _read_cleared_device_free_mb(self) -> float | None:
         """Child-side: the figure the parent wrote with the grant just acquired, or None when unset."""
-        if self._cleared_device_free is None:
-            return None
-        figure = float(self._cleared_device_free.value)
-        if math.isnan(figure):
-            return None
+        return _read_shared_figure(self._cleared_device_free)
+
+    def _acquire_stage(self, block: bool, timeout: float | None) -> bool:
+        """Child-side: take the stage permit once per job; see :meth:`ClearanceStageLease.acquire`.
+
+        A blocking acquire runs the wait-entry callback before it waits, as the clearance acquire does, since
+        under two-phase clearance the child's first wait is here and the parent prices the stage against the
+        report it sends.
+        """
+        if self._stage_consumed:
+            return True
+        if self._stage is None:
+            return False
+        acquired = self._acquire_with_wait_entry(self._stage, block, timeout)
+        self._stage_consumed = True
+        if acquired:
+            self._stage_granted_device_free_mb = _read_shared_figure(self._staged_device_free)
+        return acquired
+
+    def _take_staged_device_free_mb(self) -> float | None:
+        """Child-side: return the stage grant's figure once, then clear it."""
+        figure = self._stage_granted_device_free_mb
+        self._stage_granted_device_free_mb = None
         return figure
 
     def _parent_grant(self, *, device_free_mb: float | None) -> None:
@@ -275,9 +328,83 @@ class ClearanceLeaseProxy:
         """Parent-side: non-blockingly take back a granted permit the child never consumed; return whether one was."""
         return bool(self._clearance.acquire(False))
 
+    def _parent_grant_stage(self, *, device_free_mb: float | None) -> None:
+        """Parent-side: release the stage permit so the child may upload its weights ahead of its sample window.
+
+        The figure is written before the release, as :meth:`_parent_grant` writes its own. A bounded stage
+        semaphore raises ``ValueError`` when a permit is already available, which the controller treats as
+        already staged. Raises ``ValueError`` too when the proxy has no stage semaphore; the controller checks
+        :attr:`stage_lease` first.
+        """
+        if self._stage is None:
+            raise ValueError("this proxy carries no stage permit")
+        if self._staged_device_free is not None:
+            self._staged_device_free.value = math.nan if device_free_mb is None else device_free_mb
+        self._stage.release()
+
+    def _parent_refresh_stage_figure(self, *, device_free_mb: float) -> bool:
+        """Parent-side: rewrite an unconsumed stage grant's figure, as :meth:`_parent_refresh_grant_figure` does."""
+        if self._stage is None or self._staged_device_free is None:
+            return False
+        if not self._stage.acquire(False):
+            return False
+        try:
+            self._staged_device_free.value = device_free_mb
+        finally:
+            self._stage.release()
+        return True
+
+    def _parent_reclaim_unconsumed_stage_permit(self) -> bool:
+        """Parent-side: non-blockingly take back a stage permit the child never consumed; return whether one was."""
+        if self._stage is None:
+            return False
+        return bool(self._stage.acquire(False))
+
     def _parent_drain_done(self) -> bool:
         """Parent-side: non-blockingly take one done signal, returning whether one was present."""
         return bool(self._done.acquire(False))
+
+
+def _read_shared_figure(shared_figure: _SharedFigure | None) -> float | None:
+    """Return a shared figure's value, or None when there is no figure or it is unset (NaN)."""
+    if shared_figure is None:
+        return None
+    figure = float(shared_figure.value)
+    if math.isnan(figure):
+        return None
+    return figure
+
+
+class ClearanceStageLease:
+    """The child-side stage lease: block on the parent's stage grant before uploading the weights.
+
+    A view over one :class:`ClearanceLeaseProxy`, which owns the permit and its per-job state, registered with
+    hordelib as its stage lease. It satisfies hordelib's ``SamplingLease`` and ``ClearanceTruthLease``
+    protocols. The parent reconciles a stage grant by job correlation, so :meth:`release` signals nothing.
+    """
+
+    def __init__(self, proxy: ClearanceLeaseProxy) -> None:
+        """Bind the view to the proxy that owns the stage permit."""
+        self._proxy = proxy
+
+    def acquire(self, block: bool = True, timeout: float | None = None) -> bool:
+        """Wait for the parent's stage grant, or pass through if this job already took one.
+
+        Follows the clearance permit's per-job rule: the first acquire of a job blocks up to ``timeout`` and
+        marks the stage taken whether it was granted or timed out, and a later acquire of the same job returns
+        True at once. :meth:`ClearanceLeaseProxy.begin_job` clears the flag for the next job.
+        """
+        return self._proxy._acquire_stage(block, timeout)
+
+    def release(self) -> None:
+        """End the stage window; the parent retires the stage grant by job correlation, so nothing is signalled."""
+
+    def take_cleared_device_free_mb(self) -> float | None:
+        """Return the device free VRAM (MB) the parent admitted this child's stage grant against, once.
+
+        None when the last stage acquire timed out or passed through, or the parent had no reading.
+        """
+        return self._proxy._take_staged_device_free_mb()
 
 
 class GrantState(enum.Enum):
@@ -285,10 +412,20 @@ class GrantState(enum.Enum):
 
     IDLE = "idle"
     """No grant outstanding: the child holds no window and does not occupy a steady-state slot."""
+    STAGED = "staged"
+    """The parent released this child's stage permit, so its weights may land on the card; its sample permit is
+    not yet released. Holds no steady-state sampling slot."""
     CLEARED = "cleared"
     """The parent released this child's clearance permit; the child has not yet entered its denoise loop."""
     SAMPLING = "sampling"
     """The child consumed its grant and is inside its denoise loop (observed in ``INFERENCE_STARTING``)."""
+
+
+_SLOT_HOLDING_STATES = frozenset({GrantState.CLEARED, GrantState.SAMPLING})
+"""Grant states that occupy a steady-state sampling slot."""
+
+_CLEARABLE_STATES = frozenset({GrantState.IDLE, GrantState.STAGED})
+"""Grant states from which a child may be granted its sample permit."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -354,6 +491,7 @@ class ClearanceInputs:
 
 
 _TAIL_DENIAL_DIAGNOSTIC = "tail_overlap_denial"
+_STAGE_REFUSAL_DIAGNOSTIC = "stage_refusal"
 
 
 class TailOverlapDenialReason(enum.Enum):
@@ -573,7 +711,9 @@ class ClearanceController:
     degraded timeout path) with a single edge warning; :func:`decide_clearances` then chooses staged waiters to
     clear, and each chosen child is admitted through the injected ``admit_fn`` (the scheduler's full-price fit
     against measured device truth, running eviction as needed). A child that fits is cleared once; a child that
-    does not is held, and its wait is reported so the scheduler attributes the empty slot.
+    does not is held, and its wait is reported so the scheduler attributes the empty slot. Given a stage
+    admission, the tick then stages the head idle waiter's weights while another child samples, and that
+    waiter's later sample grant releases only its sample permit.
 
     The controller owns its grant accounting for the session and self-heals rather than propagating: a
     double-clear is guarded, a replaced child's state is discarded, and a grant the child never consumed has
@@ -624,6 +764,11 @@ class ClearanceController:
         self._unpriced_sampling_windows = 0
         self._tail_overlap_denials: collections.Counter[TailOverlapDenialReason] = collections.Counter()
         self._tail_denial_diagnostics = DiagnosticThrottle(self._clock)
+        # Session tallies for the stage grant: weights staged ahead of a sample window, and head waiters the
+        # stage admission refused.
+        self._stage_grants_issued = 0
+        self._stage_refusals = 0
+        self._stage_refusal_diagnostics = DiagnosticThrottle(self._clock)
 
     def register(self, process_id: int, proxy: ClearanceLeaseProxy) -> None:
         """Register a freshly spawned child's proxy so its clearance can be granted and its done drained."""
@@ -650,16 +795,20 @@ class ClearanceController:
 
     @property
     def held_grant_count(self) -> int:
-        """How many registered children currently hold a grant (cleared or sampling)."""
-        return sum(1 for state in self._grant_state.values() if state is not GrantState.IDLE)
+        """How many registered children currently hold a sampling slot (cleared or sampling).
+
+        A staged child is not counted: its weights hold no sampling slot until its sample permit is granted.
+        """
+        return sum(1 for state in self._grant_state.values() if state in _SLOT_HOLDING_STATES)
 
     def step(
         self,
         inputs: ClearanceInputs,
         *,
         admit_fn: Callable[[int], bool],
+        stage_admit_fn: Callable[[int], bool] | None = None,
     ) -> ClearanceStepResult:
-        """Retire completed windows, reconcile sampling onset, and clear the chosen staged waiters.
+        """Retire completed windows, reconcile sampling onset, clear the chosen staged waiters, then stage one.
 
         Args:
             inputs: The per-tick snapshot; its ``active_grants`` is derived from this controller's own held
@@ -667,6 +816,9 @@ class ClearanceController:
             admit_fn: The scheduler's full-price admission for a chosen child: returns whether the child's job
                 materialisation fits the card now (running eviction as a side effect), so clearance is the true
                 VRAM moment. A child that does not fit is held, not cleared.
+            stage_admit_fn: The scheduler's admission for staging a child's weights ahead of its sample window.
+                None issues no stage grant and keeps the tail-overlap handoff; a callable replaces the handoff
+                with the stage pass (see :meth:`_stage_head_waiter`).
 
         Returns:
             Which children were cleared and which were held, for slot-duty attribution.
@@ -676,22 +828,22 @@ class ClearanceController:
         self._prune_tail_dedup(inputs)
         self._refresh_unconsumed_grant_figures(inputs.device_free_mb)
 
-        # Only children the controller still holds IDLE are clearable; a cleared-but-not-yet-sampling child is
-        # still reported as a primed waiter by the scheduler snapshot, so filter it out here rather than let a
+        # Only children the controller holds IDLE or STAGED are clearable; a cleared-but-not-yet-sampling child
+        # is still reported as a primed waiter by the scheduler snapshot, so filter it out here rather than let a
         # slot pick be wasted on it (the per-child clear guard below would skip it anyway).
         job_id_by_pid = {waiter.process_id: waiter.job_id for waiter in inputs.staged_waiters}
-        idle_waiters = tuple(
+        clearable_waiters = tuple(
             waiter
             for waiter in inputs.staged_waiters
-            if self._grant_state.get(waiter.process_id, GrantState.IDLE) is GrantState.IDLE
+            if self._grant_state.get(waiter.process_id, GrantState.IDLE) in _CLEARABLE_STATES
         )
-        effective_inputs = dataclasses.replace(inputs, staged_waiters=idle_waiters)
+        effective_inputs = dataclasses.replace(inputs, staged_waiters=clearable_waiters)
 
         plan = decide_clearances(
             effective_inputs,
             slot_cap=self._slot_cap,
             held_grant_count=self.held_grant_count,
-            tail_overlap_enabled=self._tail_overlap,
+            tail_overlap_enabled=self._tail_overlap and stage_admit_fn is None,
             tail_overlap_pad_seconds=self._tail_overlap_pad_seconds,
             tail_overlap_margin_mb=self._tail_overlap_margin_mb,
             already_tail_cleared_job_ids=frozenset(self._tail_cleared_job_ids),
@@ -702,8 +854,8 @@ class ClearanceController:
         cleared: list[int] = []
         held: list[int] = []
         for process_id in plan.clear_process_ids:
-            if self._grant_state.get(process_id, GrantState.IDLE) is not GrantState.IDLE:
-                # Already holds a grant; do not clear twice.
+            if self._grant_state.get(process_id, GrantState.IDLE) not in _CLEARABLE_STATES:
+                # Already holds a sample grant; do not clear twice.
                 continue
             if admit_fn(process_id):
                 if self._clear(process_id, job_id_by_pid.get(process_id), device_free_mb=inputs.device_free_mb):
@@ -717,7 +869,89 @@ class ClearanceController:
             else:
                 held.append(process_id)
 
+        if stage_admit_fn is not None:
+            self._stage_head_waiter(inputs, stage_admit_fn=stage_admit_fn, job_id_by_pid=job_id_by_pid)
+
         return ClearanceStepResult(cleared_process_ids=tuple(cleared), held_process_ids=tuple(held))
+
+    def _stage_head_waiter(
+        self,
+        inputs: ClearanceInputs,
+        *,
+        stage_admit_fn: Callable[[int], bool],
+        job_id_by_pid: Mapping[int, str | None],
+    ) -> None:
+        """Grant the head idle waiter its stage permit while another child samples, if the stage admission fits.
+
+        At most one child per card is staged ahead: the pass runs only while a grant on the card is sampling and
+        no grant is staged or cleared, so the staged weights land beside a running peak and the next sample
+        grant goes to the child already holding them. The head is the lowest priority value, the order
+        :func:`decide_clearances` uses. A refused head is asked again on the next step.
+        """
+        states = self._grant_state.values()
+        if not any(state is GrantState.SAMPLING for state in states):
+            return
+        if any(state in (GrantState.STAGED, GrantState.CLEARED) for state in states):
+            return
+        idle_waiters = [
+            waiter
+            for waiter in inputs.staged_waiters
+            if self._grant_state.get(waiter.process_id, GrantState.IDLE) is GrantState.IDLE
+        ]
+        if not idle_waiters:
+            return
+        head = min(idle_waiters, key=lambda waiter: waiter.priority)
+        proxy = self._proxies.get(head.process_id)
+        if proxy is None or proxy.stage_lease is None:
+            return
+        if stage_admit_fn(head.process_id):
+            self._clear_stage(
+                head.process_id, job_id_by_pid.get(head.process_id), device_free_mb=inputs.device_free_mb
+            )
+            self._stage_refusal_diagnostics.forget(_STAGE_REFUSAL_DIAGNOSTIC)
+            return
+        self._note_stage_refusal(head)
+
+    def _note_stage_refusal(self, waiter: ClearanceWaiter) -> None:
+        """Tally a refused stage grant and log it once per refused waiter and job, restated periodically."""
+        self._stage_refusals += 1
+        suppressed = self._stage_refusal_diagnostics.suppressed_count(
+            _STAGE_REFUSAL_DIAGNOSTIC,
+            (waiter.process_id, waiter.job_id),
+        )
+        if suppressed is None:
+            return
+        logger.debug(
+            f"Clearance lease on device {self._device_index}: stage grant for process {waiter.process_id} "
+            f"refused by admission.{suppressed_suffix(suppressed)}",
+        )
+
+    def _clear_stage(self, process_id: int, job_id: str | None, *, device_free_mb: float | None) -> bool:
+        """Release one child's stage permit so its weights may land ahead of its sample window. Returns success.
+
+        Records the job the grant is issued for, so a staged grant retires by the same job correlation as a
+        cleared one. ``device_free_mb`` carries the same meaning as in :meth:`_clear`.
+        """
+        proxy = self._proxies.get(process_id)
+        if proxy is None or proxy.stage_lease is None:
+            return False
+        try:
+            proxy._parent_grant_stage(device_free_mb=device_free_mb)
+        except ValueError:
+            # The stage permit is already available (one the child has not consumed); treat it as staged.
+            self._grant_state[process_id] = GrantState.STAGED
+            if job_id is not None:
+                self._granted_job_id[process_id] = job_id
+            return False
+        self._grant_state[process_id] = GrantState.STAGED
+        if job_id is not None:
+            self._granted_job_id[process_id] = job_id
+        self._stage_grants_issued += 1
+        logger.debug(
+            f"Clearance lease on device {self._device_index}: cleared process {process_id} to stage its weights "
+            f"ahead of its sample window.",
+        )
+        return True
 
     def _clear(self, process_id: int, job_id: str | None, *, device_free_mb: float | None) -> bool:
         """Release one child's clearance permit exactly once, guarding a double clear. Returns success.
@@ -728,10 +962,23 @@ class ClearanceController:
         ``device_free_mb`` is the measured device free the admission priced against, before any charge for
         this child's materialisation. The child's clamp subtracts its own allocator growth from the figure, so
         a figure already net of the child's charge would count that charge twice.
+
+        An idle child with a stage permit is granted it in the same clear, so a single clear lets the child
+        stage and sample without a second wait; a staged child already holds its stage permit and is granted
+        only the sample permit. A stage permit already available is left as it is.
         """
         proxy = self._proxies.get(process_id)
         if proxy is None:
             return False
+        if self._grant_state.get(process_id, GrantState.IDLE) is GrantState.IDLE and proxy.stage_lease is not None:
+            try:
+                proxy._parent_grant_stage(device_free_mb=device_free_mb)
+            except ValueError:
+                # The stage permit is already available (one the child has not consumed); the child takes it.
+                logger.debug(
+                    f"Clearance lease on device {self._device_index}: process {process_id} already holds an "
+                    f"unconsumed stage permit.",
+                )
         try:
             proxy._parent_grant(device_free_mb=device_free_mb)
         except ValueError:
@@ -756,15 +1003,19 @@ class ClearanceController:
 
         Between the grant and the child's sample call the child releases its encoder to host RAM and siblings
         unload, so the figure frozen at the grant tick understates the card the child loads into. A step with no
-        reading leaves the last figure in place.
+        reading leaves the last figure in place. A staged child's stage figure is refreshed the same way, and a
+        cleared child's stage figure too while its stage permit is untaken.
         """
         if device_free_mb is None:
             return
         for process_id, state in self._grant_state.items():
-            if state is not GrantState.CLEARED:
+            if state not in (GrantState.STAGED, GrantState.CLEARED):
                 continue
             proxy = self._proxies.get(process_id)
-            if proxy is not None:
+            if proxy is None:
+                continue
+            proxy._parent_refresh_stage_figure(device_free_mb=device_free_mb)
+            if state is GrantState.CLEARED:
                 proxy._parent_refresh_grant_figure(device_free_mb=device_free_mb)
 
     def _log_tail_overlap_clear(self, inputs: ClearanceInputs, *, outgoing_job_id: str) -> None:
@@ -807,6 +1058,19 @@ class ClearanceController:
         nonzero tally means the clearance handshake is not bracketing the work it is meant to bracket.
         """
         return self._unpriced_sampling_windows
+
+    @property
+    def stage_grants_issued(self) -> int:
+        """How many stage permits this controller has granted ahead of a sample window this session.
+
+        A stage permit granted together with its sample permit in a single clear is not counted.
+        """
+        return self._stage_grants_issued
+
+    @property
+    def stage_refusals(self) -> int:
+        """How many steps the stage admission refused the head waiter this session."""
+        return self._stage_refusals
 
     @property
     def tail_overlap_grant_count(self) -> int:
@@ -885,6 +1149,18 @@ class ClearanceController:
                 continue
             if in_sampling and state is GrantState.CLEARED:
                 self._grant_state[process_id] = GrantState.SAMPLING
+            elif in_sampling and state is GrantState.STAGED:
+                # A staged child seen sampling waited out its sample acquire: its weights were priced, its
+                # activation was not. Flag the window once and hold the slot like any sampler.
+                self._grant_state[process_id] = GrantState.SAMPLING
+                if process_id not in self._unpriced_flagged:
+                    self._unpriced_flagged.add(process_id)
+                    self._unpriced_sampling_windows += 1
+                    logger.warning(
+                        f"Clearance lease on device {self._device_index}: process {process_id} entered its "
+                        f"denoise loop without a recorded grant for its sample window (unpriced sampling window "
+                        f"after its stage grant); liveness preserved.",
+                    )
 
         # A child sampling with no recorded grant sampled through its lease-acquire timeout (unpriced). Flag it
         # once (edge) and account it as a held slot so the slot cap is not overshot while it samples.
@@ -911,11 +1187,17 @@ class ClearanceController:
         the next job on the slot sample unpriced, so the controller takes it back and the semaphore stays matched
         to this ledger. A child already inside its acquire may win the permit and sample on it, which the
         controller then flags as an unpriced window, as before.
+
+        An untaken stage permit is taken back by the same rule, whatever state the grant retires from: a child
+        whose hordelib registered no stage lease samples on its sample permit alone and leaves the stage permit
+        of its single clear untaken, which the next job's stage acquire would otherwise pass on unpriced.
         """
-        if self._grant_state.get(process_id) is GrantState.CLEARED:
-            proxy = self._proxies.get(process_id)
-            if proxy is not None:
+        state = self._grant_state.get(process_id)
+        proxy = self._proxies.get(process_id)
+        if proxy is not None:
+            if state is GrantState.CLEARED:
                 proxy._parent_reclaim_unconsumed_permit()
+            proxy._parent_reclaim_unconsumed_stage_permit()
         self._grant_state[process_id] = GrantState.IDLE
         self._granted_job_id.pop(process_id, None)
         self._unpriced_flagged.discard(process_id)
@@ -933,15 +1215,22 @@ def format_tail_overlap_tally(
     denials: Mapping[TailOverlapDenialReason, int],
     *,
     max_reasons: int = 3,
+    stage_grants_issued: int = 0,
+    stage_refusals: int = 0,
 ) -> str | None:
-    """A compact handoff tally for the duty-cycle line, or None when the gate was never applicable.
+    """A compact handoff tally for the duty-cycle line, or None when neither handoff ever applied.
 
     Reports grants against refusals and the share each clause took of those refusals, largest first, so a duty
     figure short of target can be read straight across to the clause holding the handoff shut.
     :attr:`TailOverlapDenialReason.BONUS_SLOT_UNUSED` is kept out of that arithmetic and trails the line in
     brackets: it records a tick where every clause passed and the steady slots simply covered the queue, so
     counting it as a refusal would drown the shares that name a starver on any lightly loaded worker.
+
+    The stage grant does the tail overlap's work where it is on, so its grants and refusals
+    (:attr:`ClearanceController.stage_grants_issued`, :attr:`ClearanceController.stage_refusals`) share the
+    line, after the tail-overlap figures when both are present.
     """
+    parts: list[str] = []
     slot_unused = denials.get(TailOverlapDenialReason.BONUS_SLOT_UNUSED, 0)
     refusals = {
         reason: count
@@ -949,13 +1238,17 @@ def format_tail_overlap_tally(
         if reason is not TailOverlapDenialReason.BONUS_SLOT_UNUSED and count
     }
     denied = sum(refusals.values())
-    if granted == 0 and denied == 0 and slot_unused == 0:
+    if granted or denied or slot_unused:
+        line = f"tail-overlap: {granted} granted / {denied} denied"
+        if denied:
+            ranked = sorted(refusals.items(), key=lambda entry: (-entry[1], entry[0].value))[:max_reasons]
+            shares = ", ".join(f"{reason.value} {count / denied:.0%}" for reason, count in ranked)
+            line = f"{line} ({shares})"
+        if slot_unused:
+            line = f"{line} [slot-unused {slot_unused}]"
+        parts.append(line)
+    if stage_grants_issued or stage_refusals:
+        parts.append(f"stage: {stage_grants_issued} granted / {stage_refusals} refused")
+    if not parts:
         return None
-    line = f"tail-overlap: {granted} granted / {denied} denied"
-    if denied:
-        ranked = sorted(refusals.items(), key=lambda entry: (-entry[1], entry[0].value))[:max_reasons]
-        shares = ", ".join(f"{reason.value} {count / denied:.0%}" for reason, count in ranked)
-        line = f"{line} ({shares})"
-    if slot_unused:
-        line = f"{line} [slot-unused {slot_unused}]"
-    return line
+    return "; ".join(parts)

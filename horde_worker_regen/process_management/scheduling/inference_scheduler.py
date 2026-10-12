@@ -151,6 +151,7 @@ from horde_worker_regen.process_management.scheduling.admission.clearance import
     StagedWaiterClock,
     StarvedLaneRungEpisode,
     decide_clearance_admit,
+    decide_clearance_stage_admit,
 )
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob
 from horde_worker_regen.process_management.scheduling.admission.executor import PlanExecutor
@@ -676,6 +677,9 @@ class InferenceScheduler:
         # clearance clock, so the next rung is spaced by this rung's grade. It ends with the episode, wherever
         # the clock is stopped for anything other than the job's own reclaim.
         self._lane_rung_episodes: dict[str, StarvedLaneRungEpisode] = {}
+        # Card scopes whose current overlap episode has already logged that two-phase clearance replaces the
+        # overlap headway. A scope leaves the set when the gate next finds nothing sampling there.
+        self._headway_priced_by_clearance_noted: set[int | None] = set()
 
         # When the exclusive-admit dispatch hold last disclosed itself, per card scope. The hold is re-evaluated
         # every dispatch selection, so the notice is throttled to keep a sustained hold from repeating a line
@@ -5914,6 +5918,11 @@ class InferenceScheduler:
             )
             for job in in_progress_jobs
         )
+        headway_priced_by_clearance = self._two_phase_clearance_active()
+        if not running:
+            self._headway_priced_by_clearance_noted.discard(target_device_index)
+        elif headway_priced_by_clearance:
+            self._note_headway_priced_by_clearance(target_device_index)
         return concurrent_overlap_permitted(
             candidate_tier=self._model_size_tier(candidate_job.model),
             candidate_batched=job_batch_amount(candidate_job) > 1,
@@ -5922,6 +5931,24 @@ class InferenceScheduler:
             memory_verdict=lambda: self._overlap_memory_verdict(
                 candidate_job, target_device_index=target_device_index
             ),
+            headway_priced_by_clearance=headway_priced_by_clearance,
+        )
+
+    def _note_headway_priced_by_clearance(self, device_index: int | None) -> None:
+        """Log once per overlap episode on a card scope that two-phase clearance replaces the overlap headway.
+
+        Under two-phase clearance the ``overlap_headway`` duty bucket reads zero because the gate no longer
+        holds on progress; the line states that, so a reader does not take the empty bucket for a gate that
+        stopped binding on its own.
+        """
+        if device_index in self._headway_priced_by_clearance_noted:
+            return
+        self._headway_priced_by_clearance_noted.add(device_index)
+        scope = "worker-wide" if device_index is None else f"device {device_index}"
+        logger.debug(
+            f"Overlap headway is not applied {scope}: two-phase clearance prices a dispatched job's weight "
+            "load at its stage grant and its denoise onset at its sample grant, so the arbiter's memory verdict "
+            "alone decides the overlap.",
         )
 
     def set_vram_growth_hold(self, device_index: int, active: bool) -> None:
@@ -6051,6 +6078,14 @@ class InferenceScheduler:
         false the whole-job inference semaphore is the sole denoise gate and dispatch is the VRAM moment.
         """
         return bool(self._runtime_config.bridge_data.gpu_sampling_lease_enabled)
+
+    def _two_phase_clearance_active(self) -> bool:
+        """Whether the clearance lease grants each job a stage permit for its weights ahead of its sample permit.
+
+        When true, dispatch only stages a job and both its weight load and its denoise onset are priced at
+        clearance, so the dispatch-time overlap headway is not applied.
+        """
+        return self._clearance_lease_active() and self._runtime_config.bridge_data.gpu_sampling_lease_two_phase is True
 
     def _max_jobs_in_progress_allowed(
         self,
@@ -6400,6 +6435,41 @@ class InferenceScheduler:
             applied=applied,
             waiting_can_help=waiting_can_help,
         )
+        return False
+
+    def clearance_stage_admit_process(self, process_id: int) -> bool:
+        """Price a staged child's weight upload ahead of its sample window, granting it only on a measured fit.
+
+        The injected ``stage_admit_fn`` the clearance controller calls for the head waiter of a card whose sampler
+        is running. The decision is :func:`decide_clearance_stage_admit` over this cycle's snapshot. A fit re-books
+        the job's dispatch reservation from its encode charge to the weights against the lane's current report,
+        so the booking decays as the weights land and the sample clearance then books the activation. The job is
+        also recorded as granted, so another waiter priced beside it keeps its whole charge rather than netting it
+        as an encode already inside the device-free reading.
+
+        A refusal runs no eviction: the stage is an optimisation, and a waiter whose weights do not fit beside the
+        running peak waits for the single clear, which runs the reclaim ladder as it always has. The refusal is
+        logged through the clearance-hold throttle with "stage" in its reason, so it reads apart from a sample
+        hold. An unpriceable job is refused silently, as it is no hold.
+        """
+        process_info = self._process_map.get(process_id)
+        job = process_info.current_inference_job() if process_info is not None else None
+        if process_info is None or job is None or job.id_ is None:
+            return False
+        plan = decide_clearance_stage_admit(self.snapshot(), process_id, arbiter=self._ensure_preload_arbiter())
+        if plan.decision is ClearanceDecision.ADMIT:
+            self._dispatch_holds.note_clearance_granted(str(job.id_))
+            self._upgrade_dispatch_reservation_to_full(job, process_info, remaining_mb=plan.booking_mb)
+            self._record_clearance_decision(job, plan, DecisionVerdict.ADMIT, "stage granted by price")
+            return True
+        if plan.decision is ClearanceDecision.HOLD and plan.verdict is not None:
+            self._log_clearance_hold(
+                process_id,
+                job,
+                reason=f"stage {plan.reason}",
+                verdict=plan.verdict,
+                candidate_mb=plan.candidate_delta_mb,
+            )
         return False
 
     def _record_clearance_decision(
@@ -7762,6 +7832,8 @@ class InferenceScheduler:
 
         ``remaining_mb`` is the clearance price, ``staged_materialization_delta_mb``: the full peak net of
         what the lane already reports, capped at the granted room for a job admitted at its partial-load seat.
+        A stage grant books its weights (``stage_weights_delta_mb``) here first, and the sample clearance
+        re-books the same entry at the peak net of the report that by then carries them.
         The booking decays by growth past that same report, so it reaches zero as the job reaches its peak.
         Booked gross against that baseline, the staged holdings would stay outstanding
         through the whole sample and be charged against the next waiter. Re-registering the same

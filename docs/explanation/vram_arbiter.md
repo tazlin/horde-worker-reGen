@@ -433,6 +433,18 @@ activation-only delta against the other job's live reservation. Ordinary residen
 no-materialisation fast path; this narrower rule prevents auxiliary preparation from hiding a second peak
 behind resident-weight credit.
 
+Under two-phase clearance (`gpu_sampling_lease_two_phase`) a leased job is priced at clearance twice. The stage
+grant prices the job's predicted diffusion weights (`stage_weights_delta_mb`), zero when
+`candidate_weights_resident` credits them to the target slot, through the same identity as the head of its
+queue, with its own dispatch reservation netted and the staged-sibling relief applied. The running sampler's
+outstanding reservation stays in the overlay, so a stage is never priced against room the running job will
+still take, and a measured-load attempt never grants a stage. A granted stage re-books the job's dispatch
+reservation from the encode charge to the weights and records the job as granted, so a sibling waiter priced
+beside it keeps the staged job's whole charge as it would a cleared one. The sample grant that follows is the
+clearance re-price above: the slot's reported reservation now carries the landed weights and is netted from
+the peak, so the sample grant prices the activation. Retention credit therefore lands at the stage. A
+same-model streak stages at no charge and pays only its activation at the sample grant.
+
 Before reclaim is consulted, a non-fitting request is checked against the **phantom-ledger** judgement. The
 committed floor is bookkeeping, and the worker cannot hold more device VRAM than the device itself reports
 used: when committed exceeds the truthful device-used reading beyond a tolerance
@@ -1420,7 +1432,9 @@ after the parent has just admitted the full load. The grant therefore carries th
 admission priced against, and hordelib rebases the clamp on it at the acquire. The new figure replaces the
 dispatch reading and the child's growth is counted from that moment, since its earlier allocations are already
 absent from the newer measurement. A grant with no reading, a timed-out acquire, and a run without the lease
-keep the dispatch figure. The figure always comes from the parent. A child-side read of device free is the
+keep the dispatch figure. Under two-phase clearance the stage grant carries the device free its own admission
+priced against, and hordelib rebases the clamp on it before the early weight upload. The sample grant's figure
+then replaces it at the sample acquire. The figure always comes from the parent. A child-side read of device free is the
 untruthful view the clamp exists to correct. The scenarios in
 `tests/process_management/liveness/test_incident_scenarios.py` hold this: a streak whose true footprint nearly
 fills the card keeps its margin and its duty when the reading is on the dispatch, and craters when it is not.

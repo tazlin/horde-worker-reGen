@@ -930,6 +930,16 @@ class reGenBridgeData(CombinedHordeBridgeData):
     sampler leaves its loop. Leave enabled to keep the GPU busy across job boundaries; disable to restore the
     strict per-slot denoise gate with no handoff overlap."""
 
+    gpu_sampling_lease_two_phase: bool = Field(default=True)
+    """Clear each job in two steps: upload its diffusion weights while another job samples, then start its
+    denoise once the room for its activation is free. Only meaningful when `gpu_sampling_lease_enabled` is true.
+
+    The single clearance prices a job's whole sampling peak, weights and activation together, so where two peaks
+    do not fit the card the next job waits for the running one to end and then uploads its weights with the GPU
+    idle. With two-phase clearance the parent grants the waiting job's weight upload as soon as the weights alone
+    fit beside the running job's measured peak, and grants the denoise priced at the activation. A card where the
+    weights do not fit is cleared once, as before. While this is on the tail-overlap handoff does not run."""
+
     capture_kudos_training_data: bool = Field(default=False)
 
     kudos_training_data_file: str | None = Field(default=None)

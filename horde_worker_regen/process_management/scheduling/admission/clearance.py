@@ -4,6 +4,9 @@ Under the clearance lease a dispatch only stages the job (checkpoint disk load, 
 the VRAM moment: the child's full materialisation is priced here through the shared MONOLITHIC_DISPATCH
 identity. The decision is built from the snapshot and the frozen arbiter; the scheduler executes it (the hold
 records, the reservation upgrade, the eviction the verdict describes, the log line).
+
+Under two-phase clearance a staged child may first be granted a stage, the upload of its weights ahead of its
+sample window, priced by :func:`decide_clearance_stage_admit` against the same identity.
 """
 
 from __future__ import annotations
@@ -353,4 +356,72 @@ def decide_clearance_admit(
     )
     verdict = arbiter.evaluate(priced.request)
     decision = ClearanceDecision.ADMIT if verdict.admits else ClearanceDecision.HOLD
+    return ClearancePlan(decision, process_id, job_id, job.model, priced, verdict)
+
+
+def stage_weights_delta_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
+    """The weights (MB) a stage grant puts on the card for the staged job, net of resident credit.
+
+    The stage uploads the diffusion model alone: the text encoder and VAE are on the card from the encode or load
+    at decode, and a disaggregated sampler holds the same core weights, so one figure serves both of
+    :func:`pricing.candidate_delta_mb`'s pricing branches. Weights already resident on the slot upload nothing.
+    None when the weights cannot be estimated.
+    """
+    job = snapshot.queue.jobs[job_id]
+    weights_mb = predict_job_weight_mb(snapshot.queue.payloads[job_id], job.baseline)
+    if weights_mb is None:
+        return None
+    if pricing.candidate_weights_resident(snapshot, job.model, process_id):
+        return 0.0
+    return max(0.0, weights_mb)
+
+
+def decide_clearance_stage_admit(
+    snapshot: SchedulingSnapshot,
+    process_id: int,
+    *,
+    arbiter: VramArbiter,
+) -> ClearancePlan:
+    """Decide whether the staged child on ``process_id`` may upload its weights ahead of its sample window.
+
+    The single clearance prices the whole sampling peak, weights and activation together, so on a card where two
+    peaks do not fit the successor waits for the running job to end and then pays its weight upload with the
+    card idle. The weights alone often fit beside a running peak. A stage grant therefore prices only
+    :func:`stage_weights_delta_mb`, and the later sample clearance prices the peak net of what the slot then
+    reports holding, which by then includes the landed weights, so it is charged the activation alone.
+
+    The fit is the identity :func:`decide_clearance_admit` prices against: the job's own dispatch reservation is
+    netted, other staged waiters' staging relief applies, and every other outstanding reservation is charged,
+    including the running job's reservation that has not yet materialised, so a stage is never priced against
+    room the running peak will still take. Only :attr:`ClearanceDecision.ADMIT` grants a stage, and only on a
+    priced fit: a measured-load attempt is the sample clearance's recovery and never a stage. ``UNPRICED`` and
+    ``BUDGET_INACTIVE`` leave the job to the single clear, since a stage is an optimisation. A ``HOLD`` keeps
+    its verdict for the log, and its evictions are not for the stage to run.
+    """
+    slot = snapshot.slots.get(process_id)
+    if slot is None:
+        return ClearancePlan(ClearanceDecision.NO_PROCESS, process_id, None, None, None, None)
+    job_id = slot.current_job_id
+    job = snapshot.queue.jobs.get(job_id) if job_id is not None else None
+    if job_id is None or job is None or job.model is None:
+        return ClearancePlan(ClearanceDecision.UNPRICED, process_id, job_id, None, None, None)
+    weights_mb = stage_weights_delta_mb(snapshot, job_id, process_id)
+    if weights_mb is None:
+        return ClearancePlan(ClearanceDecision.UNPRICED, process_id, job_id, job.model, None, None)
+    if not snapshot.budget_active:
+        return ClearancePlan(ClearanceDecision.BUDGET_INACTIVE, process_id, job_id, job.model, None, None)
+    priced = build_materialization_request(
+        snapshot,
+        job_id,
+        process_id,
+        arbiter=arbiter,
+        is_head_of_queue=True,
+        head_outstanding_mb=None,
+        candidate_delta_override_mb=weights_mb,
+        nets_own_dispatch_reservation=True,
+        sibling_staging_relief_mb=sibling_staging_relief_mb(snapshot, job_id, process_id),
+    )
+    verdict = arbiter.evaluate(priced.request)
+    priced_fit = verdict.admits and not verdict.measured_attempt
+    decision = ClearanceDecision.ADMIT if priced_fit else ClearanceDecision.HOLD
     return ClearancePlan(decision, process_id, job_id, job.model, priced, verdict)

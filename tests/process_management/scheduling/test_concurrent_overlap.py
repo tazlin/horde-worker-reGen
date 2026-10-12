@@ -32,6 +32,7 @@ def _permitted(
     running: tuple[RunningSampler, ...] = (),
     headway_scale: float = 1.0,
     verdict: _Verdict | None = None,
+    headway_priced_by_clearance: bool = False,
 ) -> bool:
     return concurrent_overlap_permitted(
         candidate_tier=candidate_tier,
@@ -39,6 +40,7 @@ def _permitted(
         running=running,
         headway_scale=headway_scale,
         memory_verdict=verdict if verdict is not None else _Verdict(None),
+        headway_priced_by_clearance=headway_priced_by_clearance,
     )
 
 
@@ -160,6 +162,60 @@ class TestBatches:
         assert _permitted(candidate_tier=ModelSizeTier.LIGHT, running=running, verdict=_Verdict(True)) is False
         running = (_running(ModelSizeTier.LIGHT, OVERLAP_HEADWAY_BOTH_HEAVY, batched=True),)
         assert _permitted(candidate_tier=ModelSizeTier.LIGHT, running=running, verdict=_Verdict(True)) is True
+
+
+class TestHeadwayPricedByClearance:
+    """Under two-phase clearance the grants price the load and onset, so progress no longer holds a newcomer."""
+
+    def test_headway_is_skipped_when_the_grants_price_the_load(self) -> None:
+        """Two heavy jobs share the card at zero progress once clearance prices the newcomer's load and onset."""
+        running = (_running(ModelSizeTier.HEAVY, 0.0),)
+        assert _permitted(running=running, verdict=_Verdict(None), headway_priced_by_clearance=True) is True
+
+    def test_headway_is_kept_without_two_phase_clearance(self) -> None:
+        """The same pairing waits for the strict headway when clearance does not price the load."""
+        running = (_running(ModelSizeTier.HEAVY, 0.0),)
+        assert _permitted(running=running, verdict=_Verdict(None)) is False
+
+    def test_two_extra_large_jobs_are_still_never_paired(self) -> None:
+        """The extra-large pairing rule holds whatever prices the load."""
+        running = (_running(ModelSizeTier.EXTRA_LARGE, 1.0),)
+        assert (
+            _permitted(
+                candidate_tier=ModelSizeTier.EXTRA_LARGE,
+                running=running,
+                verdict=_Verdict(True),
+                headway_priced_by_clearance=True,
+            )
+            is False
+        )
+
+    def test_an_extra_large_side_still_needs_confirmed_room(self) -> None:
+        """An extra-large pairing joins at zero progress only on confirmed room."""
+        running = (_running(ModelSizeTier.HEAVY, 0.0),)
+        assert (
+            _permitted(
+                candidate_tier=ModelSizeTier.EXTRA_LARGE,
+                running=running,
+                verdict=_Verdict(None),
+                headway_priced_by_clearance=True,
+            )
+            is False
+        )
+        assert (
+            _permitted(
+                candidate_tier=ModelSizeTier.EXTRA_LARGE,
+                running=running,
+                verdict=_Verdict(True),
+                headway_priced_by_clearance=True,
+            )
+            is True
+        )
+
+    def test_a_memory_denial_still_vetoes(self) -> None:
+        """The arbiter's denial withholds the overlap with the headway skipped."""
+        running = (_running(ModelSizeTier.HEAVY, 1.0),)
+        assert _permitted(running=running, verdict=_Verdict(False), headway_priced_by_clearance=True) is False
 
 
 def test_memory_verdict_is_consulted_at_most_once() -> None:

@@ -598,6 +598,16 @@ weight-load seconds must fit the timeout twice over. A staged child that waits o
 a grant, so behind a longer sample, a sampler with no trusted rate yet, or a card with no measured load, the
 full price stands. Without the lease the dispatch is the VRAM moment and the full price always stands.
 
+Under two-phase clearance (`gpu_sampling_lease_two_phase`, on by default with the lease) the headway is not
+applied to a leased dispatch. The dispatch only stages the job's encode working set. Its weight upload waits for
+the stage grant and its denoise onset waits for the sample grant, and each grant prices its part against
+measured free VRAM (see the next section). The stacking the headway exists to prevent is therefore priced at
+clearance, so the scheduler passes `headway_priced_by_clearance` to `concurrent_overlap_permitted` and the
+progress test is skipped. The extra-large pairing rule, the confirmed-room requirement for an extra-large or
+batched side, and the arbiter's memory veto still apply. The scheduler logs once per overlap episode on a card
+that the headway is not applied, so a reader of the `overlap_headway` slot-duty bucket can tell that its zero
+share means the gate stood aside. With the lease off or two-phase off, the headway applies as described above.
+
 The required headway is finally scaled by the worker's performance mode
 (`performance_mode_headway_scale`): high-performance mode multiplies it by `0.5` and moderate-performance
 mode by `0.75`, so an operator who has provisioned the card for aggressive co-sampling brings the next
@@ -618,7 +628,9 @@ disk load, prompt encode) while another process samples, then hold at the sample
 clears it into the weight-load-plus-denoise window. Left to grab a freed slot autonomously (the earlier
 shared per-card semaphore), a staged child would load 8-10GB of weights while the outgoing job's weights were
 still resident and tip a heavy pair into WDDM demand-paging; the per-process clearance handshake gives the
-parent a checkpoint at the true VRAM moment.
+parent a checkpoint at the true VRAM moment. Two-phase clearance (below) keeps that guard, because its stage
+grant is priced against measured device free like any admission, so a tight card refuses it and the child
+waits for the single clearance as before.
 
 Two admission consequences follow. First, staging is cheap: a staged job's device footprint is only its
 encode working set (`pricing.staging_charge_mb`: the family's text-encoder and VAE weights from hordelib's
@@ -672,8 +684,31 @@ trigger cannot do this job, because a fixed fraction opens a window whose width 
 own duration, starving the handoff on exactly the fast jobs whose loads dominate their wall time. Every
 tick the handoff is applicable and does not fire records a denial reason (no staged waiter, paging,
 progress not yet estimable, remaining time above the window, headroom short), tallied on the duty-cycle
-summary line so a starved handoff names its binding clause. With the lease disabled the whole-job inference semaphore is the sole denoise gate and
-dispatch is the VRAM moment exactly as before.
+summary line so a starved handoff names its binding clause. Where two-phase clearance is on, the controller
+does not run the tail-overlap pass. The stage grant hides the incoming job's weight load behind the running job
+on measured fit, which is the work the time-based handoff did on an estimate. With the lease disabled the
+whole-job inference semaphore is the sole denoise gate and dispatch is the VRAM moment exactly as before.
+
+**Two-phase clearance** (`gpu_sampling_lease_two_phase`, on by default when the lease is enabled) gives each
+child two permits the parent holds empty. The stage permit lets hordelib upload the job's diffusion weights
+early, with the same `load_models_gpu` call ComfyUI's `prepare_sampling` makes, so the sampling call later finds
+the model loaded. The sample permit lets the child enter its denoise loop. A single clear releases both at once,
+so a child never waits longer at the stage than it would have waited for the one clearance, and the
+lease-acquire timeout and the unpriced-window fallback are unchanged. While a job samples on the card, the
+controller runs a second pass after the sample pass and offers at most one stage grant per card, to the head
+waiter. The scheduler prices it at the job's predicted diffusion weights, zero where the target slot already
+holds them, through the same `MONOLITHIC_DISPATCH` identity with the running job's outstanding reservation still
+in the overlay, so a stage is never priced against room the running job will still take. A fit re-books the
+job's dispatch reservation from the encode charge to the weights. A refusal runs no eviction and logs its hold as
+`Clearance held for process N (model): stage <disposition>; ...`, and the waiter is asked again on the next
+step. The sample grant that follows prices the activation alone, since the child's report already carries the
+landed weights. The next denoise therefore starts one grant latency after the running one ends where the
+weights fit beside the running peak. On a card where they do not fit, every stage is refused and the behaviour
+is the single clearance's. The stage grant carries its own measured device free, which hordelib rebases its
+clamp on before the upload. The duty-cycle summary line carries the session's stage grants and refusals (see
+[GPU duty cycle](duty-cycle.md)). `horde-log diagnose` reports `stage_outlived_sample_grant` when a staged
+child got no sample grant within the lease-acquire timeout, and `stage_refusals` for the share of waiting jobs
+refused an early load.
 
 On a multi-GPU worker both this gate and the in-flight **count** cap (`_max_jobs_in_progress_allowed`) are
 scoped to the card the candidate would run on: each card is its own sampling and VRAM domain, so the count

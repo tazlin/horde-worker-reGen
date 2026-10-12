@@ -1541,6 +1541,7 @@ class HordeWorkerProcessManager:
             disk_lock=self._disk_lock,
             download_bandwidth_semaphore=self._download_bandwidth_semaphore,
             gpu_sampling_lease_enabled=self.bridge_data.gpu_sampling_lease_enabled,
+            gpu_sampling_lease_two_phase=self.bridge_data.gpu_sampling_lease_two_phase is True,
             runtime_config=self._runtime_config,
             max_safety_processes=self.max_safety_processes,
             amd_gpu=self._amd_gpu,
@@ -4401,7 +4402,9 @@ class HordeWorkerProcessManager:
         Each controller reads the scheduler's per-tick snapshot of staged waiters and active samplers plus the
         measured free/reserve/paging truth, retires completed windows, and clears the best staged waiters whose
         full materialisation fits measured device truth (the scheduler's injected admit function runs the
-        fit-or-evict and upgrades the reservation on a grant). No-op when the clearance lease is disabled (the
+        fit-or-evict and upgrades the reservation on a grant). With ``gpu_sampling_lease_two_phase`` set the
+        scheduler's stage admission is passed too, so a waiter's weights can be staged beside a running sampler;
+        the controller then runs no tail-overlap handoff. No-op when the clearance lease is disabled (the
         controllers map is empty).
 
         Clearance is a throughput mechanism layered over the child's own bounded lease-acquire timeout, never a
@@ -4409,10 +4412,20 @@ class HordeWorkerProcessManager:
         once for that card, and the controller is disarmed (dropped from the map) so the card degrades to
         children sampling through their lease-acquire timeout instead of a defect killing the whole loop.
         """
+        # Compared against ``is True`` so a Mock/truthy config value never silently enables it.
+        stage_admit_fn = (
+            self._inference_scheduler.clearance_stage_admit_process
+            if self.bridge_data.gpu_sampling_lease_two_phase is True
+            else None
+        )
         for device_index, controller in list(self._clearance_controllers.items()):
             try:
                 inputs = self._inference_scheduler.build_clearance_inputs(device_index=device_index)
-                controller.step(inputs, admit_fn=self._inference_scheduler.clearance_admit_process)
+                controller.step(
+                    inputs,
+                    admit_fn=self._inference_scheduler.clearance_admit_process,
+                    stage_admit_fn=stage_admit_fn,
+                )
             except Exception:
                 if device_index not in self._clearance_disarmed_devices:
                     self._clearance_disarmed_devices.add(device_index)
@@ -6473,16 +6486,26 @@ class HordeWorkerProcessManager:
 
         Session-cumulative rather than windowed: the handoff fires rarely by construction, so a per-window
         count would read as zero on most lines while the denial shares are what identify the clause holding
-        it shut. Summed across cards, since the tally names clauses rather than devices.
+        it shut. Summed across cards, since the tally names clauses rather than devices. The stage grants and
+        refusals of two-phase clearance share the line.
         """
         if not self._clearance_controllers:
             return None
         granted = 0
         denials: collections.Counter[TailOverlapDenialReason] = collections.Counter()
+        stage_grants_issued = 0
+        stage_refusals = 0
         for controller in self._clearance_controllers.values():
             granted += controller.tail_overlap_grant_count
             denials.update(controller.tail_overlap_denial_counts)
-        return format_tail_overlap_tally(granted, denials)
+            stage_grants_issued += controller.stage_grants_issued
+            stage_refusals += controller.stage_refusals
+        return format_tail_overlap_tally(
+            granted,
+            denials,
+            stage_grants_issued=stage_grants_issued,
+            stage_refusals=stage_refusals,
+        )
 
     def _build_stage_age_line(self) -> str | None:
         """A one-line per-stage census with the oldest age in each stage, or None when nothing is tracked.
