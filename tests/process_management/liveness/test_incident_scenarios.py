@@ -222,6 +222,7 @@ from horde_worker_regen.process_management.resources.reclaim_ladder import Recla
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     predict_job_decode_spike_mb,
+    predict_job_post_processing_vram_mb,
     predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
 )
@@ -246,6 +247,7 @@ from horde_worker_regen.process_management.scheduling.admission import pricing a
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+    GrantState,
 )
 from horde_worker_regen.process_management.scheduling.concurrent_overlap import OVERLAP_HEADWAY_AMPLE_VRAM
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import card_preload_order
@@ -7392,3 +7394,162 @@ async def test_z_a_stage_waits_while_the_running_jobs_reservation_still_stands()
             f"{overlapped}, whose outstanding reservation still claimed the room. {world.state_dump()}"
         )
     _assert_no_lane_sampled_unpriced(world, context=context)
+
+
+# Post-processing chain beside a staged lane
+
+_STAGED_PP_SIDE = 2048
+"""Both jobs' side: the finisher's face-fix and upscale chain is large, and so is the staged job's peak."""
+
+_STAGED_PP_BATCH = 2
+"""The staged job's batch: its peak and a pending chain together exceed the card, while its weights and the
+chain fit it."""
+
+
+@dataclass(frozen=True)
+class _StagedChainRun:
+    """One run of the staged-lane chain row and the readings its assertions need."""
+
+    world: _DispatchWorld
+    staged_job: ImageGenerateJobPopResponse
+
+
+async def _run_chain_beside_a_staged_lane() -> _StagedChainRun:
+    """Finish a post-processed job while the next job holds a stage grant, under two-phase clearance.
+
+    The 24 GB two-phase world with one lease slot and the modelled chain. Two warm jobs measure a weight load,
+    without which nothing stages. The finisher samples on one lane while the next job, a large batch, waits
+    dispatched on the other. That job takes a stage grant as the finisher's sample ends, and the finisher's chain
+    becomes pending while it waits for its sample grant. The chain is charged to the card at what the parent
+    prices it, as an unlearned store does.
+    """
+    finisher = make_job_pop_response(
+        _SDXL.name,
+        width=_STAGED_PP_SIDE,
+        height=_STAGED_PP_SIDE,
+        ddim_steps=_TWO_PHASE_STEPS,
+        post_processing=["GFPGAN", "RealESRGAN_x4plus"],
+    )
+    staged_job = _two_phase_job(_SDXL_OTHER, width=_STAGED_PP_SIDE, height=_STAGED_PP_SIDE, n_iter=_STAGED_PP_BATCH)
+    chain_mb = predict_job_post_processing_vram_mb(finisher, _SDXL.baseline.value)
+    assert chain_mb is not None
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=2,
+        gpu_sampling_lease_slots=1,
+        closed_loop=True,
+        clearance_lease=True,
+        two_phase=True,
+        service_contexts=True,
+        tail_overlap=True,
+        legacy_comfy_vram_unload=True,
+        tick_seconds=_TWO_PHASE_TICK_SECONDS,
+        post_process_chain_peak_mb=chain_mb,
+        post_process_chain_allocation_lag_ticks=2,
+        post_process_chain_hold_ticks=10,
+    )
+    staged_peak_mb = _forecast_peak_mb(world, staged_job)
+    assert staged_peak_mb + chain_mb > world.card.total_mb, (
+        f"precondition: the staged job's {staged_peak_mb:.0f}MB peak and the {chain_mb:.0f}MB chain must not "
+        f"share the {world.card.total_mb:.0f}MB card, or neither waits for the other. {world.state_dump()}"
+    )
+    beside_weights_mb = chain_mb + _SDXL_OTHER.weights_mb + _staging_mb(world)
+    assert beside_weights_mb <= _stage_room_mb(world), (
+        f"precondition: the chain beside the staged job's weights and encode set ({beside_weights_mb:.0f}MB) must "
+        f"fit the {_stage_room_mb(world):.0f}MB the card offers. {world.state_dump()}"
+    )
+
+    for job in (_two_phase_job(_SDXL), _two_phase_job(_SDXL_OTHER)):
+        await world.pop(job)
+    for _ in range(_TWO_PHASE_MAX_TICKS):
+        await world.step()
+        if world.submitted_jobs >= 2:
+            break
+    assert world.submitted_jobs == 2, f"the warm jobs never completed. {world.state_dump()}"
+
+    await world.pop(finisher)
+    await world.pop(staged_job)
+    for _ in range(_TWO_PHASE_MAX_TICKS):
+        await world.step()
+        if world.submitted_jobs >= 4:
+            break
+    assert world.submitted_jobs == 4, f"{world.submitted_jobs} of 4 jobs were submitted. {world.state_dump()}"
+    assert len(world.post_process_chains) == 1, (
+        f"the finisher's result must reach the post-processing lane as one chain; the run recorded "
+        f"{world.post_process_chains}. {world.state_dump()}"
+    )
+    return _StagedChainRun(world=world, staged_job=staged_job)
+
+
+def _stage_tick(world: _DispatchWorld, job: ImageGenerateJobPopResponse) -> int | None:
+    """The tick ``job`` took a stage grant alone, or None when it never did."""
+    return next((tick for tick, _lane, job_id in world.stage_grants if job_id == str(job.id_)), None)
+
+
+async def test_z_a_staged_lane_does_not_hold_the_card_against_a_pending_chain() -> None:
+    """A pending chain runs while a staged lane waits, and the staged lane's sample grant follows the chain.
+
+    The failure this encodes: the chain admission charged every lane holding any clearance grant its full
+    sampling peak, a lane holding only a stage grant included. That lane's sample grant waits for the pending
+    chain, and the chain waited for that lane's sample, so neither moved until the lease-acquire timeout let the
+    child sample unpriced.
+
+    A staged lane now holds no sampling slot for the chain's co-residency pricing, so the chain is priced
+    against what the staged child holds. Its consequences: no lane samples through the timeout, the chain is
+    dispatched and released while the staged lane waits, and the staged lane is cleared once the chain releases.
+    """
+    run = await _run_chain_beside_a_staged_lane()
+    world = run.world
+
+    context = "a pending chain beside a staged lane"
+    _assert_no_lane_sampled_unpriced(world, context=context)
+    assert not world.card_overcommits, (
+        f"{context}: the card was committed past its total at {world.card_overcommits}. {world.state_dump()}"
+    )
+    chain = world.post_process_chains[0]
+    stage_tick = _stage_tick(world, run.staged_job)
+    grant_tick = _grant_tick(world, run.staged_job)
+    assert stage_tick is not None and stage_tick <= chain.dispatched_tick, (
+        f"precondition: the staged job must hold its stage grant when the chain is dispatched (staged on tick "
+        f"{stage_tick}, chain dispatched on tick {chain.dispatched_tick}). {world.state_dump()}"
+    )
+    assert chain.released_tick is not None and grant_tick is not None, (
+        f"{context}: the chain released on tick {chain.released_tick} and the staged job was cleared on tick "
+        f"{grant_tick}. {world.state_dump()}"
+    )
+    assert grant_tick >= chain.released_tick, (
+        f"{context}: the staged job was cleared on tick {grant_tick}, before the chain released on tick "
+        f"{chain.released_tick}. {world.state_dump()}"
+    )
+
+
+async def test_z_defect_reinjection_a_staged_lane_charged_its_peak_wedges_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a staged lane counted as holding a sampling slot, the chain and the staged lane wait on each other.
+
+    Reinjected at the chain admission's clearance predicate alone, which reads any grant as holding the card:
+    the chain is held for the staged job's peak, the staged job's sample grant is held for the chain, and the
+    child samples through the lease-acquire timeout before the chain runs.
+    """
+
+    def any_grant_holds_the_card(world: _DispatchWorld, process_info: HordeProcessInfo) -> bool:
+        controller = world._clearance_controllers[process_info.device_index]
+        return controller.grant_state(process_info.process_id) is not GrantState.IDLE
+
+    monkeypatch.setattr(_DispatchWorld, "_lane_holds_clearance", any_grant_holds_the_card)
+    run = await _run_chain_beside_a_staged_lane()
+    world = run.world
+
+    chain = world.post_process_chains[0]
+    assert [job_id for _tick, _lane, job_id in world.clearance_timeouts] == [str(run.staged_job.id_)], (
+        "the staged job must reach its denoise loop through the lease-acquire timeout while the chain waits on "
+        f"it; the run recorded {world.clearance_timeouts}. {world.state_dump()}"
+    )
+    timeout_tick = world.clearance_timeouts[0][0]
+    assert chain.dispatched_tick > timeout_tick, (
+        f"the chain must wait out the staged job's timeout (dispatched on tick {chain.dispatched_tick}, timeout "
+        f"on tick {timeout_tick}). {world.state_dump()}"
+    )

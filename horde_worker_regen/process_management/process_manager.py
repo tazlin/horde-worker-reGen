@@ -258,7 +258,6 @@ from horde_worker_regen.process_management.scheduling import pool_ranker
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceController,
     ClearanceLeaseProxy,
-    GrantState,
     TailOverlapDenialReason,
     format_tail_overlap_tally,
 )
@@ -4459,14 +4458,16 @@ class HordeWorkerProcessManager:
     def _lane_holds_clearance(self, process_info: HordeProcessInfo) -> bool:
         """Whether an inference lane has been cleared to materialise its job, or is sampling it.
 
-        Read from the card's clearance controller: a registered child holds a grant once cleared and keeps it
-        through its denoise loop. A card with no controller (the lease disabled or disarmed) materialises at
-        dispatch, so every dispatched lane holds the card there.
+        A child registered with the card's clearance controller holds a sampling slot from clearance through its
+        denoise loop. A staged child (two-phase clearance) holds none even with its weights on the card, because
+        its sample grant waits on any pending post-processing chain and counting it would hold that chain behind a
+        sample that cannot start until the chain drains. A card with no controller (the lease disabled or
+        disarmed) materialises at dispatch, so every dispatched lane holds the card there.
         """
         controller = self._clearance_controllers.get(process_info.device_index)
         if controller is None:
             return True
-        return controller.grant_state(process_info.process_id) is not GrantState.IDLE
+        return controller.holds_sampling_slot(process_info.process_id)
 
     def _note_clearance_child_replaced(self, device_index: int, process_id: int) -> None:
         """Notify a card's clearance controller that an inference child was replaced or died.

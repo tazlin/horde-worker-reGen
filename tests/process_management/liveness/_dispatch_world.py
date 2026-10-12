@@ -1041,8 +1041,9 @@ class _DispatchWorld:
             post_process_chain_peak_mb: The VRAM (MB) a chain on the post-processing lane allocates. None keeps the
                 lane hand-driven and free of any charge, the shape every row not about the lane's memory runs
                 against. Set, it needs ``service_contexts`` (the lane is a service process): the lane takes one
-                chain at a time, books it through production's ``book_post_process_chain``, charges this peak to
-                its card after the allocation lag, and releases charge and reserve after the hold.
+                chain at a time, holds a chain production's sampling co-residency check defers, books it through
+                production's ``book_post_process_chain``, charges this peak to its card after the allocation lag,
+                and releases charge and reserve after the hold. The measured arbiter admission is not modelled.
             post_process_chain_estimate_mb: The static estimate (MB) the parent books a chain from, priced through
                 production's ``learned_post_process_vram_mb`` against the learned store, while the card is charged
                 ``post_process_chain_peak_mb``. With ``learned_footprints`` the lane reports its reservation and
@@ -2850,14 +2851,23 @@ class _DispatchWorld:
             return self.post_process_chains[-1]
         return None
 
+    def _lane_holds_clearance(self, process_info: HordeProcessInfo) -> bool:
+        """The parent's clearance predicate for the chain admission, read from the card's controller."""
+        controller = self._clearance_controllers.get(process_info.device_index)
+        if controller is None:
+            return True
+        return controller.holds_sampling_slot(process_info.process_id)
+
     async def _take_post_process_chain(self, lane: HordeProcessInfo, peak_mb: float) -> _PostProcessChain | None:
-        """Dispatch the oldest drainable pending chain to the modelled lane and book it, or return None."""
+        """Dispatch the oldest drainable pending chain to the modelled lane and book it, or return None.
+
+        A chain the card cannot hold beside the sampling in progress is skipped, as the orchestrator defers it.
+        """
         for job_info in self._job_tracker.jobs_pending_post_processing:
             job_id = str(job_info.sdk_api_job_info.id_)
             ready_at = self._chain_ready_at.setdefault(job_id, self.tick + self.post_processing_chain_ticks)
             if self.tick < ready_at:
                 continue
-            self._chain_ready_at.pop(job_id, None)
             booked_mb = peak_mb
             if self.post_process_chain_estimate_mb is not None:
                 booked_mb = (
@@ -2868,6 +2878,17 @@ class _DispatchWorld:
                     )
                     or 0.0
                 )
+            # The parent wires this same query and predicate into the orchestrator's sampling co-residency check.
+            if self._process_map.num_busy_with_inference(
+                device_index=lane.device_index
+            ) > 0 and not self._scheduler.pp_sampling_coresidency_affordable(
+                sampling_peak_mb=self._scheduler.max_in_progress_sampling_peak_mb(
+                    lane_holds_clearance=self._lane_holds_clearance,
+                ),
+                pp_reserve_mb=booked_mb,
+            ):
+                continue
+            self._chain_ready_at.pop(job_id, None)
             post_process_orchestrator.book_post_process_chain(
                 self._reserve_ledger,
                 job_id=job_id,

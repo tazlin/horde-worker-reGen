@@ -11002,13 +11002,14 @@ class InferenceScheduler:
         the maximum is taken, so the post-processing co-residency gate this feeds prices in-flight sampling from
         measured activation high-waters, not a seed the hardware has already overshot.
 
-        ``lane_holds_clearance`` says whether a job's lane has been cleared to materialise. A dispatched job
-        whose lane holds no clearance has only its encode working set on the card, and its clearance waits for
-        any pending post-processing chain to drain first, so charging its full peak here would hold that chain
-        behind a sample that cannot start until the chain is done: a wait neither side ends, which the child's
-        lease-acquire timeout breaks by sampling unpriced. Such a job contributes nothing; the measured
-        admission the chain takes next prices what the staged child actually holds. None charges every
-        in-progress job, the reading for a worker without the clearance lease.
+        ``lane_holds_clearance`` says whether a job's lane has been cleared to sample. A dispatched job whose
+        lane holds no sampling slot has only its encode working set on the card, plus its weights when it holds
+        a two-phase stage grant, and its sample clearance waits for any pending post-processing chain to drain
+        first, so charging its full peak here would hold that chain behind a sample that cannot start until the
+        chain is done: a wait neither side ends, which the child's lease-acquire timeout breaks by sampling
+        unpriced. Such a job contributes nothing; the measured admission the chain takes next prices what the
+        staged child actually holds. None charges every in-progress job, the reading for a worker without the
+        clearance lease.
         """
         peaks: list[float] = []
         for job in self._job_tracker.jobs_in_progress:

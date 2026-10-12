@@ -306,7 +306,10 @@ These fail as interactions, not as units, so component tests stay green through 
   `phase_resident_components=True` charges a sampling job its sampler-only footprint and a decode tail its
   weights plus the decode spike, as ComfyUI loads components separately; the encode phase is not modelled.
   `seed_ram_held_checkpoint` makes a lane report its seated checkpoint as a held component sized by its RAM
-  pages with nothing of it on the device, the report of a pooled monolithic lane. Every run keeps
+  pages with nothing of it on the device, the report of a pooled monolithic lane. `post_process_chain_peak_mb`
+  gives the post-processing lane modelled chains that go through production's sampling co-residency check
+  against the lanes cleared to sample (a lane holding only a stage grant does not hold the card); the measured
+  arbiter admission of a chain is not modelled. Every run keeps
   `world.job_windows` (each job's dispatch, clearance, load and sampling instants, and what its load paid) and
   each lane's state on `tick_observations`, from which `_world_assertions.py` reads handoff gaps, the staging
   overlap share, the two-sampler share, dispatch-to-first-step seconds, each load's read split at clearance,

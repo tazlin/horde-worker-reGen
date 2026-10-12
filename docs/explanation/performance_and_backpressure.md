@@ -543,8 +543,11 @@ state. Set `idle_fill_threshold_seconds` to unset to disable it.
 
 Already-popped post-processing work has priority over a speculative dispatch while a head waits on its load.
 The post-processing overlap gate waits for active sampling on the PP lane's card, not for the broader
-in-progress job stage, so a lane that is not sampling does not make the PP lane idle. The control loop
-drains pending PP work first; a line-skip or fill job is then free to use the card once the lane has no
+in-progress job stage, so a lane that is not sampling does not make the PP lane idle. Under the clearance
+lease a lane holds the card against a chain once it is cleared to sample. A lane holding only a two-phase stage
+grant does not, because its sample grant waits for the pending chain. The chain's measured admission prices the
+weights that lane has staged. The control loop drains pending PP work first; a line-skip or fill job is then
+free to use the card once the lane has no
 immediately admissible image post-processing work. When pending PP chains cannot co-run with sampling, the
 next sampler that would also be non-co-resident waits, including just after the current sampler finishes, so
 the lane gets the next drain window instead of extending the PP backlog. Speculative preloads yield to that

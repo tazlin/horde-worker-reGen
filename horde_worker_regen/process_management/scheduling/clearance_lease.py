@@ -793,13 +793,17 @@ class ClearanceController:
         """The current grant state for a registered child, or ``IDLE`` when unknown."""
         return self._grant_state.get(process_id, GrantState.IDLE)
 
+    def holds_sampling_slot(self, process_id: int) -> bool:
+        """Whether a child holds a sampling slot (cleared or sampling), False when unknown.
+
+        A staged child holds none, since its sample permit is not granted even with its weights on the card.
+        """
+        return self.grant_state(process_id) in _SLOT_HOLDING_STATES
+
     @property
     def held_grant_count(self) -> int:
-        """How many registered children currently hold a sampling slot (cleared or sampling).
-
-        A staged child is not counted: its weights hold no sampling slot until its sample permit is granted.
-        """
-        return sum(1 for state in self._grant_state.values() if state in _SLOT_HOLDING_STATES)
+        """How many registered children currently hold a sampling slot (see :meth:`holds_sampling_slot`)."""
+        return sum(1 for process_id in self._grant_state if self.holds_sampling_slot(process_id))
 
     def step(
         self,

@@ -1238,6 +1238,22 @@ class TestControllerStageGrant:
         assert proxies[3].stage_value == 0
         assert controller.stage_grants_issued == 1
 
+    def test_the_slot_query_reads_a_staged_waiter_as_holding_none(self) -> None:
+        """A staged child reads as holding no sampling slot, and the sampler beside it reads as holding one."""
+        controller = _controller(slot_cap=1, tail=False)
+        _one_sampling(controller, (2,))
+        controller.step(
+            _inputs(staged=(_job_waiter(2, 1),), active=(_sampler(1),)),
+            admit_fn=_always_admit,
+            stage_admit_fn=_RecordingAdmit(True),
+        )
+
+        assert controller.grant_state(1) is GrantState.SAMPLING
+        assert controller.grant_state(2) is GrantState.STAGED
+        assert controller.holds_sampling_slot(1) is True
+        assert controller.holds_sampling_slot(2) is False
+        assert controller.holds_sampling_slot(99) is False, "an unregistered child holds nothing"
+
     def test_a_staged_waiter_is_cleared_with_only_its_sample_permit(self) -> None:
         """When the sampler retires, the staged waiter is cleared by the sample pass and then samples."""
         controller = _controller(slot_cap=1, tail=False)
