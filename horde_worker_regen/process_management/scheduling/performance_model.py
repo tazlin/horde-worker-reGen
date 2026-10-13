@@ -13,6 +13,12 @@ resolution/steps/batch buckets + controlnet/hires flags). Two sources feed it:
   rolling window for its signature. Once a signature has enough samples its learned median takes over
   from the seed, and signatures the benchmark never covered become answerable too.
 
+Beside the sampling rate, each finished job also contributes its dispatch-to-first-step seconds (model load,
+auxiliary resolve, conditioning) to a rolling window per signature and per lane residency at dispatch, read
+through :meth:`PerformanceModel.expected_overhead_seconds`. A resident and a cold lane differ by several
+seconds for one signature, so the two are never pooled. That figure has no seed: it is a property of the card
+and the host, and only measurement answers it.
+
 Nothing is enforced until a signature has a seed or enough samples, so a cold start raises no false
 alarms. The learned table persists to ``.horde_worker_regen/perf_model.json`` so calibration survives
 restarts. We use :meth:`PerformanceModel.expected_sampling_seconds` elsewhere to grade a running job;
@@ -49,6 +55,12 @@ PERF_MODEL_SCHEMA_VERSION = 1
 """Bumped when the persisted schema changes incompatibly; an older file is discarded on read."""
 
 PERF_MODEL_FILENAME = "perf_model.json"
+
+DISPATCH_OVERHEAD_SAMPLES_KEY = "dispatch_overhead_samples"
+"""Top-level key of the persisted dispatch-to-first-step windows, keyed by residency then signature key.
+
+A file without it (written before the overhead was recorded) loads with no overhead learned, so adding it
+needs no schema bump."""
 
 BENCHMARK_BASELINE_STEPS = 30
 """Steps the stage-A baseline levels sample at (mirrors ``CannedImageJobSpec.steps``). Used to build the
@@ -96,6 +108,18 @@ class BatchBucket(enum.StrEnum):
     PAIR = "2"
     SMALL = "3-4"
     LARGE = "5+"
+
+
+class DispatchResidency(enum.StrEnum):
+    """Whether the lane already held the job's model in VRAM when the job was dispatched to it."""
+
+    RESIDENT = "resident"
+    COLD = "cold"
+
+    @classmethod
+    def from_resident(cls, resident: bool) -> DispatchResidency:
+        """Convert a resident-at-dispatch flag to its residency band."""
+        return cls.RESIDENT if resident else cls.COLD
 
 
 def _resolution_bucket(width: int, height: int) -> ResolutionBucket:
@@ -277,6 +301,11 @@ class PerformanceModel:
     finalization (:meth:`on_job_finalized`, which pairs that it/s with the job's signature and learns
     from it). Consumers ask :meth:`expected_sampling_seconds` / :meth:`expected_its`.
 
+    The dispatch-to-first-step overhead follows the same cache-then-learn path: the lane's residency at
+    dispatch (:meth:`note_dispatch_residency`) and the overhead at the first sampling step
+    (:meth:`note_first_step`) are held by job id until finalization files them under the job's signature.
+    Consumers ask :meth:`expected_overhead_seconds`.
+
     Thread safety: not internally synchronized; like the rest of the process-manager collaborators it is
     only touched from the main control loop's thread.
     """
@@ -310,6 +339,11 @@ class PerformanceModel:
 
         self._calibration_samples: dict[str, collections.deque[float]] = {}
         self._its_by_job_id: dict[str, float] = {}
+        self._overhead_samples: dict[DispatchResidency, dict[str, collections.deque[float]]] = {
+            residency: {} for residency in DispatchResidency
+        }
+        self._overhead_seconds_by_job_id: dict[str, float] = {}
+        self._resident_at_dispatch_by_job_id: dict[str, bool] = {}
         self._observations_since_save = 0
         self._file_disabled = False
 
@@ -345,6 +379,22 @@ class PerformanceModel:
         samples = self._calibration_samples.get(signature.key)
         return len(samples) if samples is not None else 0
 
+    def expected_overhead_seconds(self, signature: JobSignature, *, resident: bool) -> float | None:
+        """Return the median dispatch-to-first-step seconds for this signature and residency, or ``None``.
+
+        ``None`` until the window holds ``min_samples`` observations. This is the time
+        :meth:`expected_sampling_seconds` excludes on purpose: model load, auxiliary resolve and
+        conditioning ahead of the first sampling step.
+
+        Args:
+            signature: The job's signature.
+            resident: Whether the lane held the job's model in VRAM at dispatch.
+        """
+        samples = self._overhead_samples[DispatchResidency.from_resident(resident)].get(signature.key)
+        if samples is None or len(samples) < self._min_samples:
+            return None
+        return statistics.median(samples)
+
     # endregion
 
     # region feeds
@@ -353,12 +403,32 @@ class PerformanceModel:
         """Fold one observed sampling it/s into the rolling window for ``signature``."""
         if observed_its <= 0:
             return
-        samples = self._calibration_samples.get(signature.key)
+        self._append_bounded(self._calibration_samples, signature.key, observed_its)
+        self._count_observation()
+
+    def observe_overhead(self, signature: JobSignature, overhead_seconds: float, *, resident: bool) -> None:
+        """Fold one dispatch-to-first-step observation into the window for ``signature`` and residency."""
+        if overhead_seconds < 0:
+            return
+        residency_table = self._overhead_samples[DispatchResidency.from_resident(resident)]
+        self._append_bounded(residency_table, signature.key, overhead_seconds)
+        self._count_observation()
+
+    def _append_bounded(
+        self,
+        table: dict[str, collections.deque[float]],
+        signature_key: str,
+        sample: float,
+    ) -> None:
+        """Append ``sample`` to the rolling window for ``signature_key``, creating the window on first use."""
+        samples = table.get(signature_key)
         if samples is None:
             samples = collections.deque(maxlen=self._max_samples)
-            self._calibration_samples[signature.key] = samples
-        samples.append(observed_its)
+            table[signature_key] = samples
+        samples.append(sample)
 
+    def _count_observation(self) -> None:
+        """Count one new observation and persist once the throttle is reached."""
         self._observations_since_save += 1
         if self._observations_since_save >= _PERSIST_EVERY_N_OBSERVATIONS:
             self.save()
@@ -376,21 +446,48 @@ class PerformanceModel:
         if sampling is not None and sampling.iterations_per_second > 0:
             self._its_by_job_id[message.job_id] = sampling.iterations_per_second
 
+    def note_dispatch_residency(self, job_id: str, *, resident: bool) -> None:
+        """Cache whether the lane held the job's model in VRAM when this attempt was dispatched.
+
+        A dispatch opens a new pre-sampling window, so any overhead cached for an earlier attempt of the same
+        job is dropped here.
+
+        Args:
+            job_id: The dispatched job's id.
+            resident: Whether the model map read the job's model as loaded in VRAM on the lane at dispatch.
+        """
+        job_key = str(job_id)
+        self._resident_at_dispatch_by_job_id[job_key] = resident
+        self._overhead_seconds_by_job_id.pop(job_key, None)
+
+    def note_first_step(self, job_id: str, *, overhead_seconds: float) -> None:
+        """Cache the seconds from dispatch to the job's first sampling step until the job finalizes.
+
+        Args:
+            job_id: The job whose first sampling step arrived.
+            overhead_seconds: First-step instant minus dispatch instant.
+        """
+        self._overhead_seconds_by_job_id[str(job_id)] = overhead_seconds
+
     def on_job_finalized(self, tracked: TrackedJob, completed_job_info: HordeJobInfo) -> None:
-        """Learn from a finalized image job: pair its cached sampling it/s with its signature.
+        """Learn from a finalized image job: pair its cached it/s and overhead with its signature.
 
         Logs the prediction-vs-actual it/s at debug (the model's prior expectation, computed before this
-        sample is folded in) so a slow job is visible in the logs even before we act on it.
+        sample is folded in) so a slow job is visible in the logs even before we act on it, and the observed
+        overhead with its residency so a bundle shows that figure being learned. An overhead whose dispatch
+        residency was never recorded is dropped, since it cannot be filed under either window.
         """
         from horde_sdk.ai_horde_api import GENERATION_STATE
 
         job_id = str(tracked.job_id)
         observed_its = self._its_by_job_id.pop(job_id, None)
-        if observed_its is None:
+        overhead_seconds = self._overhead_seconds_by_job_id.pop(job_id, None)
+        resident = self._resident_at_dispatch_by_job_id.pop(job_id, None)
+        if observed_its is None and overhead_seconds is None:
             return
 
-        # A faulted job's sampling rate is from a failed or partial run (e.g. an OOM mid-sample); folding
-        # it into calibration would teach the model a wrong, usually too-slow, expectation. Drop it.
+        # A faulted job's figures are from a failed or partial run (e.g. an OOM mid-sample); folding them
+        # into calibration would teach the model a wrong, usually too-slow, expectation. Drop them.
         if completed_job_info.state == GENERATION_STATE.faulted:
             return
 
@@ -400,19 +497,31 @@ class PerformanceModel:
         if signature is None:
             return
 
-        expected_its = self.expected_its(signature)
-        if expected_its is not None and expected_its > 0:
-            ratio = observed_its / expected_its
-            logger.debug(
-                f"Job {job_id[:8]} sampled at {observed_its:.2f} it/s vs expected {expected_its:.2f} "
-                f"({ratio:.0%}) for signature {signature.key}",
-            )
+        if observed_its is not None:
+            expected_its = self.expected_its(signature)
+            if expected_its is not None and expected_its > 0:
+                ratio = observed_its / expected_its
+                logger.debug(
+                    f"Job {job_id[:8]} sampled at {observed_its:.2f} it/s vs expected {expected_its:.2f} "
+                    f"({ratio:.0%}) for signature {signature.key}",
+                )
 
-        self.observe(signature, observed_its)
+            self.observe(signature, observed_its)
+
+        if overhead_seconds is not None and resident is not None:
+            residency = DispatchResidency.from_resident(resident)
+            logger.debug(
+                f"Job {job_id[:8]} took {overhead_seconds:.2f}s from dispatch to first step "
+                f"({residency.value}) for signature {signature.key}",
+            )
+            self.observe_overhead(signature, overhead_seconds, resident=resident)
 
     def forget_job(self, job_id: str) -> None:
-        """Drop any cached it/s for a job that will not finalize (faulted/abandoned), bounding the cache."""
-        self._its_by_job_id.pop(str(job_id), None)
+        """Drop any cached figures for a job that will not finalize (faulted/abandoned), bounding the caches."""
+        job_key = str(job_id)
+        self._its_by_job_id.pop(job_key, None)
+        self._overhead_seconds_by_job_id.pop(job_key, None)
+        self._resident_at_dispatch_by_job_id.pop(job_key, None)
 
     # endregion
 
@@ -428,6 +537,10 @@ class PerformanceModel:
             payload = {
                 "schema_version": PERF_MODEL_SCHEMA_VERSION,
                 "samples": {key: list(values) for key, values in self._calibration_samples.items()},
+                DISPATCH_OVERHEAD_SAMPLES_KEY: {
+                    residency.value: {key: list(values) for key, values in table.items()}
+                    for residency, table in self._overhead_samples.items()
+                },
             }
             _atomic_write_text(self._path, json.dumps(payload))
         except OSError as write_error:
@@ -450,13 +563,28 @@ class PerformanceModel:
         samples = raw.get("samples")
         if not isinstance(samples, dict):
             return
+        self._load_windows(samples, self._calibration_samples)
 
-        for key, values in samples.items():
+        overhead_samples = raw.get(DISPATCH_OVERHEAD_SAMPLES_KEY)
+        if not isinstance(overhead_samples, dict):
+            return
+        for residency, table in self._overhead_samples.items():
+            persisted_table = overhead_samples.get(residency.value)
+            if isinstance(persisted_table, dict):
+                self._load_windows(persisted_table, table)
+
+    def _load_windows(
+        self,
+        persisted: Mapping[object, object],
+        table: dict[str, collections.deque[float]],
+    ) -> None:
+        """Fill ``table`` with the bounded windows of a persisted ``{signature key: [samples]}`` mapping."""
+        for key, values in persisted.items():
             if not isinstance(key, str) or not isinstance(values, list):
                 continue
             floats = [float(value) for value in values if isinstance(value, (int, float))]
             if floats:
-                self._calibration_samples[key] = collections.deque(
+                table[key] = collections.deque(
                     floats[-self._max_samples :],
                     maxlen=self._max_samples,
                 )

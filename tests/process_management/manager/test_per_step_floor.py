@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import (
+    HordeHeartbeatType,
+    HordeProcessHeartbeatMessage,
+    HordeProcessState,
+)
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -114,3 +119,64 @@ def test_single_slow_step_does_not_trip() -> None:
     assert proc.consecutive_slow_per_steps == 1
     assert proc.current_job_per_step_floor_tripped is False
     assert pm._per_step_floor_triggers == 0
+
+
+def _seat_staged_slot_and_step(
+    *,
+    dispatched_at: float | None,
+    first_step_at: float | None,
+) -> tuple[HordeWorkerProcessManager, str]:
+    """Seat an inference slot owning a job with the given stamps, then deliver one INFERENCE_STEP beat.
+
+    The beat goes through the dispatcher's heartbeat handler, the path that stamps the first step and then calls
+    the step observer. Returns the manager and the owned job's id.
+    """
+    pm = make_testable_process_manager()
+    proc = make_mock_process_info(1, model_name="Flux.1", state=HordeProcessState.INFERENCE_PRIMED)
+    proc.process_type = HordeProcessType.INFERENCE
+    job = make_job_pop_response(model="Flux.1", ddim_steps=30)
+    assert job.id_ is not None
+    proc.record_inference_ownership(job, attempt_ordinal=1)
+    proc.current_inference_started_at = dispatched_at
+    proc.current_first_step_at = first_step_at
+    pm._process_map[1] = proc
+    pm._message_dispatcher._handle_heartbeat(_inference_step_beat())
+    return pm, str(job.id_)
+
+
+def _inference_step_beat() -> HordeProcessHeartbeatMessage:
+    """Build one INFERENCE_STEP heartbeat from process 1."""
+    return HordeProcessHeartbeatMessage(
+        process_id=1,
+        process_launch_identifier=0,
+        info="",
+        heartbeat_type=HordeHeartbeatType.INFERENCE_STEP,
+        current_step=1,
+        total_steps=30,
+    )
+
+
+def test_first_step_caches_dispatch_overhead_for_the_job() -> None:
+    """The first step hands the performance model the seconds from dispatch to that step, keyed by job id."""
+    pm, job_id = _seat_staged_slot_and_step(dispatched_at=100.0, first_step_at=102.5)
+
+    assert pm._performance_model._overhead_seconds_by_job_id == {job_id: 2.5}
+
+
+def test_first_step_without_dispatch_stamp_caches_nothing() -> None:
+    """A slot with no dispatch instant (a pinned disaggregated sampler, a reset slot) yields no overhead."""
+    pm, _job_id = _seat_staged_slot_and_step(dispatched_at=None, first_step_at=None)
+
+    assert pm._performance_model._overhead_seconds_by_job_id == {}
+
+
+def test_later_step_leaves_cached_overhead_unchanged() -> None:
+    """Steps after the first do not re-read the stamps, so a moved first-step instant changes nothing."""
+    pm, job_id = _seat_staged_slot_and_step(dispatched_at=100.0, first_step_at=102.5)
+    proc = pm._process_map[1]
+    proc.current_first_step_at = 200.0
+
+    pm._message_dispatcher._handle_heartbeat(_inference_step_beat())
+
+    assert proc.heartbeats_inference_steps == 2
+    assert pm._performance_model._overhead_seconds_by_job_id == {job_id: 2.5}

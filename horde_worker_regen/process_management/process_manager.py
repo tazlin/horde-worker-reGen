@@ -4150,10 +4150,29 @@ class HordeWorkerProcessManager:
         cycle (via a per-card latch the governor tick consumes) and counts a trigger. A step back under the
         floor clears the crawl, so a slot that recovers in place (the squatter freed) is no longer a kill
         candidate.
+
+        A job's first step also hands the performance model the seconds since its dispatch, which it files
+        under the job's signature at finalization.
         """
         process_info = self._process_map.get(process_id)
         if process_info is None or process_info.process_type != HordeProcessType.INFERENCE:
             return
+        if process_info.heartbeats_inference_steps <= 1:
+            # The step counter restarts after any non-step beat, so this can run again within one attempt. Both
+            # stamps are fixed per attempt, so a repeat caches the same figure.
+            inference_job = process_info.current_inference_job()
+            dispatched_at = process_info.current_inference_started_at
+            first_step_at = process_info.current_first_step_at
+            if (
+                inference_job is not None
+                and inference_job.id_ is not None
+                and dispatched_at is not None
+                and first_step_at is not None
+            ):
+                self._performance_model.note_first_step(
+                    str(inference_job.id_),
+                    overhead_seconds=first_step_at - dispatched_at,
+                )
         ownership = process_info.inference_ownership
         job = ownership.job if ownership is not None else None
         expected_total = process_info.current_job_expected_sampling_seconds

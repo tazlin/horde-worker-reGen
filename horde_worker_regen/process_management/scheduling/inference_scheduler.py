@@ -12779,13 +12779,25 @@ class InferenceScheduler:
                 f"{process_with_model.process_id} ahead of job {line_skip.displaced_job.id_}: {skip_detail}.",
             )
 
+        # The lane's residency at this dispatch, for the performance model's overhead figure. Read from the map
+        # before any eviction this commit sends: the child reports an eviction only later, so the map would still
+        # say resident for a lane that is about to load cold.
+        model_entry = self._horde_model_map.root.get(next_job.model) if next_job.model is not None else None
+        resident_at_dispatch = (
+            model_entry is not None
+            and model_entry.horde_model_load_state is ModelLoadState.LOADED_IN_VRAM
+            and model_entry.process_id == process_with_model.process_id
+        )
+
         if bridge_data.unload_models_from_vram_often:
             self.unload_models_from_vram(process_with_model)
+            resident_at_dispatch = False
 
         if degraded_dispatch:
             # Reclaim VRAM from idle slots before the degraded retry so the job has the best chance to
             # fit, independent of the unload_models_from_vram_often setting.
             self.unload_models_from_vram(process_with_model)
+            resident_at_dispatch = False
 
         if next_job.model is None:
             raise ValueError(f"next_job.model is None ({next_job})")
@@ -12810,6 +12822,8 @@ class InferenceScheduler:
             message=f"Starting inference for job {str(next_job.id_)[:8]} on process {process_with_model.process_id}",
         )
         self._log_job_dispatch_details(next_job)
+        if self._performance_model is not None and next_job.id_ is not None:
+            self._performance_model.note_dispatch_residency(str(next_job.id_), resident=resident_at_dispatch)
 
         await self._dispatch_inference_message(
             next_job,

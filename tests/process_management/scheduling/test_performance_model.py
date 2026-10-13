@@ -7,8 +7,10 @@ from pathlib import Path
 
 from horde_worker_regen.process_management.scheduling.performance_model import (
     BENCHMARK_BASELINE_STEPS,
+    DISPATCH_OVERHEAD_SAMPLES_KEY,
     PERF_MODEL_SCHEMA_VERSION,
     BatchBucket,
+    JobSignature,
     PerformanceModel,
     ResolutionBucket,
     StepsBucket,
@@ -251,3 +253,144 @@ def test_forget_job_drops_cached_rate() -> None:
 
     model.forget_job("job-9")
     assert "job-9" not in model._its_by_job_id
+
+
+def _finalize_with_overhead(
+    model: PerformanceModel,
+    *,
+    resident: bool | None,
+    overhead_seconds: float,
+    faulted: bool = False,
+) -> JobSignature:
+    """Dispatch, first-step and finalize one canned SD1.5 job through the model's hooks; return its signature."""
+    from unittest.mock import Mock
+
+    from horde_sdk.ai_horde_api import GENERATION_STATE
+
+    from horde_worker_regen.process_management.jobs.job_tracker import JobStage, TrackedJob
+
+    job = make_canned_job(width=512, height=512, ddim_steps=30, n_iter=1)
+    assert job.id_ is not None
+    job_id = str(job.id_)
+    if resident is not None:
+        model.note_dispatch_residency(job_id, resident=resident)
+    model.note_first_step(job_id, overhead_seconds=overhead_seconds)
+
+    completed_job_info = Mock()
+    completed_job_info.state = GENERATION_STATE.faulted if faulted else GENERATION_STATE.ok
+    tracked = TrackedJob(job_id=job.id_, sdk_api_job_info=job, stage=JobStage.PENDING_SUBMIT)
+    model.on_job_finalized(tracked, completed_job_info)
+
+    signature = signature_from_job(job, _SD15_BASELINE)
+    assert signature is not None
+    return signature
+
+
+def test_resident_dispatch_overhead_is_learned_under_its_signature() -> None:
+    """A job whose lane held its model at dispatch is learned as resident overhead, and only as that."""
+    model = PerformanceModel(baseline_resolver=lambda _name: _SD15_BASELINE, min_samples=1)
+
+    signature = _finalize_with_overhead(model, resident=True, overhead_seconds=2.2)
+
+    assert model.expected_overhead_seconds(signature, resident=True) == 2.2
+    assert model.expected_overhead_seconds(signature, resident=False) is None
+
+
+def test_cold_dispatch_overhead_is_learned_apart_from_resident() -> None:
+    """A job whose lane had to load its model is learned as cold overhead, and only as that."""
+    model = PerformanceModel(baseline_resolver=lambda _name: _SD15_BASELINE, min_samples=1)
+
+    signature = _finalize_with_overhead(model, resident=False, overhead_seconds=9.1)
+
+    assert model.expected_overhead_seconds(signature, resident=False) == 9.1
+    assert model.expected_overhead_seconds(signature, resident=True) is None
+
+
+def test_overhead_answers_none_below_min_samples() -> None:
+    """The overhead median is withheld until the window holds ``min_samples`` observations."""
+    model = PerformanceModel(baseline_resolver=lambda _name: _SD15_BASELINE, min_samples=3)
+
+    signature = _finalize_with_overhead(model, resident=True, overhead_seconds=2.0)
+    _finalize_with_overhead(model, resident=True, overhead_seconds=4.0)
+    assert model.expected_overhead_seconds(signature, resident=True) is None
+
+    _finalize_with_overhead(model, resident=True, overhead_seconds=3.0)
+    assert model.expected_overhead_seconds(signature, resident=True) == 3.0
+
+
+def test_overhead_window_is_bounded() -> None:
+    """The overhead window keeps only the most recent ``max_samples_per_signature`` observations."""
+    model = PerformanceModel(
+        baseline_resolver=lambda _name: _SD15_BASELINE,
+        min_samples=1,
+        max_samples_per_signature=3,
+    )
+
+    signature = _finalize_with_overhead(model, resident=True, overhead_seconds=1.0)
+    for overhead_seconds in (2.0, 3.0, 4.0, 5.0):
+        _finalize_with_overhead(model, resident=True, overhead_seconds=overhead_seconds)
+
+    assert model.expected_overhead_seconds(signature, resident=True) == 4.0
+
+
+def test_faulted_job_overhead_is_not_learned() -> None:
+    """A faulted job's dispatch-to-first-step time is dropped, as its sampling rate is."""
+    model = PerformanceModel(baseline_resolver=lambda _name: _SD15_BASELINE, min_samples=1)
+
+    signature = _finalize_with_overhead(model, resident=True, overhead_seconds=2.0, faulted=True)
+
+    assert model.expected_overhead_seconds(signature, resident=True) is None
+    assert model.expected_overhead_seconds(signature, resident=False) is None
+
+
+def test_overhead_without_dispatch_residency_is_not_learned() -> None:
+    """An overhead whose dispatch residency was never recorded cannot be filed, so it is dropped."""
+    model = PerformanceModel(baseline_resolver=lambda _name: _SD15_BASELINE, min_samples=1)
+
+    signature = _finalize_with_overhead(model, resident=None, overhead_seconds=2.0)
+
+    assert model.expected_overhead_seconds(signature, resident=True) is None
+    assert model.expected_overhead_seconds(signature, resident=False) is None
+
+
+def test_forget_job_drops_cached_overhead() -> None:
+    """A job that will not finalize leaves no cached overhead or residency behind."""
+    model = PerformanceModel()
+    model.note_dispatch_residency("job-9", resident=True)
+    model.note_first_step("job-9", overhead_seconds=2.0)
+
+    model.forget_job("job-9")
+
+    assert "job-9" not in model._overhead_seconds_by_job_id
+    assert "job-9" not in model._resident_at_dispatch_by_job_id
+
+
+def test_overhead_persistence_round_trip(tmp_path: Path) -> None:
+    """Learned overhead windows reload, per residency, from the same file as the it/s calibration."""
+    path = tmp_path / "perf_model.json"
+    model = PerformanceModel(path=path, baseline_resolver=lambda _name: _SD15_BASELINE, min_samples=1)
+    signature = _finalize_with_overhead(model, resident=True, overhead_seconds=2.2)
+    _finalize_with_overhead(model, resident=False, overhead_seconds=9.1)
+    model.save()
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == PERF_MODEL_SCHEMA_VERSION
+    assert DISPATCH_OVERHEAD_SAMPLES_KEY in payload
+
+    reloaded = PerformanceModel(path=path, min_samples=1)
+    assert reloaded.expected_overhead_seconds(signature, resident=True) == 2.2
+    assert reloaded.expected_overhead_seconds(signature, resident=False) == 9.1
+
+
+def test_file_without_overhead_key_loads(tmp_path: Path) -> None:
+    """A file written before overhead was recorded keeps its it/s calibration and answers no overhead."""
+    path = tmp_path / "perf_model.json"
+    signature = baseline_signature(baseline=_SD15_BASELINE, resolution=512)
+    payload = {"schema_version": PERF_MODEL_SCHEMA_VERSION, "samples": {signature.key: [6.0, 8.0]}}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    model = PerformanceModel(path=path, min_samples=2)
+
+    assert model.expected_its(signature) == 7.0
+    assert model.expected_overhead_seconds(signature, resident=True) is None
+    assert model.expected_overhead_seconds(signature, resident=False) is None

@@ -395,6 +395,13 @@ The scheduler attaches `expected_sampling_seconds` to each dispatch; this module
 only *measures*, the grading happens elsewhere (see
 [Resilience and Recovery](resilience_and_recovery.md)).
 
+The same store learns a second figure per signature: the seconds from a job's dispatch to its first sampler
+step (graph build, component loads and the weight upload), kept apart for a lane that already held the model
+in VRAM at dispatch and for one that loaded it, under `dispatch_overhead_samples` in the same file.
+`expected_overhead_seconds` answers the median once a signature has enough samples and has no seed, since the
+figure is per card. It is the lead a dispatch needs ahead of the running window's end if the core is not to
+idle between samplers; sampling seconds deliberately exclude it.
+
 ### Model affinity (high-throughput regime)
 
 When the worker serves at least as many inference processes as distinct models,
