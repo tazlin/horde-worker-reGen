@@ -41,7 +41,7 @@ import multiprocessing
 import queue
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from multiprocessing import synchronize
 from pathlib import Path
@@ -140,6 +140,7 @@ from horde_worker_regen.process_management.scheduling.workload_flow import (
     POST_PROCESS_RESERVE_FLOW,
     SAFETY_CHECK_FLOW,
 )
+from horde_worker_regen.process_management.worker_entry_points import FORCE_LOAD_SKIP_BASELINES
 from horde_worker_regen.process_management.workers import post_process_orchestrator
 from tests.process_management.conftest import (
     make_mock_bridge_data,
@@ -429,6 +430,8 @@ class _SlotOccupancy:
     step_seconds: float = 0.0
     """Seconds one sampling step takes, so the lane's step position can be reported as the window advances."""
     total_steps: int = 0
+    copy_mb: float = 0.0
+    """The job's whole weight copy (MB), its device and host-RAM parts together. Set only under ``partial_loads``."""
 
 
 @dataclass
@@ -518,6 +521,8 @@ class _PostProcessChain:
     """The tick the chain's peak landed on the card; None while its allocations are still to come."""
     released_tick: int | None = None
     """The tick the chain completed and its charge and reserve came off; None while it runs."""
+    lane_absent_ticks: int = 0
+    """Ticks the chain held, with no progress, while the post-processing lane was paused or had exited."""
 
 
 @dataclass
@@ -558,6 +563,14 @@ class _JobWindow:
     """The free VRAM the card really had at the child's load decision."""
     load_offloaded_mb: float = 0.0
     """The weights the child left in host RAM at its load decision to relieve a believed shortfall."""
+    load_moved_mb: float = 0.0
+    """The weights (MB) the job's load put on the card under ``partial_loads``, a fresh load's or a return's."""
+    load_returned_mb: float = 0.0
+    """The part of ``load_moved_mb`` returning weights an earlier job on the lane had left in host RAM."""
+    decode_unloads: int = 0
+    """How many times the decode tail unloaded part of the lane's own weights to fund its spike."""
+    decode_unloaded_mb: float = 0.0
+    """The weights (MB) the decode tail moved from the card to the lane's host-RAM remainder."""
     retention_granted: bool | None = None
     """Whether the job ended under a retention grant for its model; None until it completes."""
 
@@ -776,6 +789,11 @@ class _RecordingActuator:
         acted = self._scheduler.pause_component_lane(device_index)
         return self._record(ReclaimRungKind.PAUSE_COMPONENT_LANE, "component_lane", None, acted)
 
+    def pause_utilities_lane(self, device_index: int | None) -> bool:
+        """Pause the image-utilities lane, recording the rung when the scheduler acted."""
+        acted = self._scheduler.pause_utilities_lane(device_index)
+        return self._record(ReclaimRungKind.PAUSE_UTILITIES_LANE, "utilities_lane", None, acted)
+
     def demote_safety_weights(self, device_index: int | None) -> bool:
         """Move safety's weights to host RAM in place, recording the rung when the scheduler acted."""
         acted = self._scheduler.demote_safety_weights(device_index)
@@ -797,6 +815,10 @@ class _RecordingActuator:
     def restore_component_lane(self, device_index: int | None) -> bool:
         """Restore the component/text-encode lane the ladder paused."""
         return self._scheduler.restore_component_lane(device_index)
+
+    def restore_utilities_lane(self, device_index: int | None) -> bool:
+        """Restore the image-utilities lane the ladder paused."""
+        return self._scheduler.restore_utilities_lane(device_index)
 
     def restore_live_contexts(self, device_index: int | None) -> bool:
         """Regrow the inference pool a reclaim reduction shrank."""
@@ -882,6 +904,14 @@ class _DispatchWorld:
         safety_check_ticks: int = 1,
         safety_check_allocation_lag_ticks: int = 1,
         safety_cpu_check_ticks: int = 3,
+        true_footprint_mb: Callable[[ImageGenerateJobPopResponse], tuple[float, float]] | None = None,
+        sample_seconds_by_job: Mapping[str, float] | None = None,
+        decode_seconds_by_job: Mapping[str, float] | None = None,
+        footprint_store: LearnedFootprintStore | None = None,
+        partial_loads: bool = False,
+        lane_reports_carry_context: bool = False,
+        admission_noise_mb: float | None = None,
+        load_seconds_per_gb: float = _LOAD_SECONDS_PER_GB,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -1112,11 +1142,60 @@ class _DispatchWorld:
                 does.
             extra_model_classes: Classes this row serves beyond the default pool, so a row needing more
                 distinct models than the pool holds can have them without widening every other row's
-                advertised and served sets. Empty is the pool every other row runs on.
+                advertised and served sets. Empty is the pool every other row runs on. A served class is
+                charged its own ``weights_mb`` whether or not the module lists it among the known classes.
             staged_encode_mb_by_model: The encode working set (MB) a staged job of each named model holds on
                 the card under the lease. A model it does not name holds the staging charge, so the charge and the
                 encode agree and nothing a staged job holds is ever priced twice. A smaller figure is a real
                 encode that leaves part of its staging charge describing nothing on the card.
+            true_footprint_mb: What a job really costs the card, as (resident weights MB, sampling transient MB
+                beyond the weights). Set, a job's weight load and its activation are charged from it instead
+                of the class's ``weights_mb`` and the static predictors, so a row can run a workload whose
+                footprints were measured rather than forecast. ``footprint_undershoot`` still scales both, so a
+                row can state a misprice over true figures. Under ``phase_resident_components`` the decode
+                spike stays the predictor's. None prices every job from its class and the predictors.
+            sample_seconds_by_job: Sampling seconds per job id, used in place of the per-baseline rate for the
+                jobs it names. The offload penalty still applies on top.
+            decode_seconds_by_job: Decode seconds per job id, used in place of the per-baseline rate for the
+                jobs it names.
+            footprint_store: The parent's learned-footprint store at startup, so a row can begin from a prior
+                such as a worker's persisted file. With ``learned_footprints`` the children keep feeding it,
+                and a store built with a path writes back to that path as it learns. None starts empty.
+            partial_loads: Whether a lane's partial load outlives its job, as ComfyUI's loaded-model state does.
+                With it, the weights a lane left in host RAM stay there across same-model jobs, and the next load
+                of that model returns them through the child's shortfall arithmetic. Any load pays load time
+                only for the bytes it puts on the card. A decode tail funds its spike from the lane's own
+                diffusion weights before anything else, as ComfyUI's free-memory pass does inside one process,
+                and the job's window counts each such unload. A model on the worker's force-load skip list
+                loads into believed free less the child margin and frees nothing else its process holds. Under
+                ``phase_resident_components`` a monolithic job's text encoder and VAE are a tenant of its lane
+                from its commit, in the lane's reservation, kept while retention keeps the model and released
+                with it. With ``child_evicts_granted_resident`` the decode still takes its own weights first, so
+                a decode tail never frees the whole granted copy. Needs ``closed_loop``. Off, every job forgets
+                its offload at its end.
+            lane_reports_carry_context: Whether each process's reservation carries its share of the card's
+                context charge, as a live NVML per-process figure does. The parent adds one resolved context
+                constant per reporting process, while the world charges a card 1354 MB for its first context, 384
+                MB for each further one and safety's whole-process figure. So each process reports its own
+                context less that constant: 384 MB for an inference lane, the post-processing lane or the
+                utilities lane, and safety's weights, any restore transient and any check growth for safety. The
+                lowest-id inference lane on the card, or the lowest-id process where the card has none, also
+                carries the rest of the card's charge, which is the first-context premium of 970 MB plus the
+                context of any process the parent's ledger no longer counts. That lane carries it because the
+                world charges the premium once per card for its inference pool. The sum then equals the
+                card's context charge less the constant per counted process, and the parent's instantaneous
+                foreign reading equals ``foreign_vram_mb_by_tick``. A counted process with no context on the card
+                (safety paused but not yet exited) reports zero, so the constant it is charged reads as
+                foreign. Off, a process reports its tenants alone, and the parent's foreign reading runs above
+                the scripted figure by the gap between the two context accounts.
+            load_seconds_per_gb: Seconds a lane spends moving one gigabyte of weights from host RAM onto the
+                card, so a row calibrated against a measured session can state its host's transfer rate. The
+                default is the consumer PCIe figure every other row is written against.
+            admission_noise_mb: The admission margin every pricing frame subtracts from device-free room, in
+                place of the conservative WDDM buffer the world pins by default. A replay of a session recorded
+                on a platform with a device-wide free reading passes that platform's figure
+                (``admission_margin_mb(total, platform="linux")``), since the margin sits inside every hold the
+                replay is compared against. None keeps the pinned buffer.
         """
         self.card = card
         self.tick_seconds = tick_seconds
@@ -1154,11 +1233,20 @@ class _DispatchWorld:
         self.parent_device_reading = parent_device_reading
         self.child_report_platform = child_report_platform
         self.footprint_undershoot = footprint_undershoot
+        self.true_footprint_mb = true_footprint_mb
+        self.sample_seconds_by_job: Mapping[str, float] = dict(sample_seconds_by_job or {})
+        self.decode_seconds_by_job: Mapping[str, float] = dict(decode_seconds_by_job or {})
         self.child_reports_card_sized_peaks = child_reports_card_sized_peaks
         self.phase_resident_components = phase_resident_components
         self.learned_footprints = learned_footprints
         self.unload_release_delay_seconds = unload_release_delay_seconds
         self.child_evicts_granted_resident = child_evicts_granted_resident
+        if partial_loads and not closed_loop:
+            raise ValueError("a partial load carried across jobs is a claim about job phases, so it needs closed_loop")
+        self.partial_loads = partial_loads
+        self.lane_reports_carry_context = lane_reports_carry_context
+        noise_mb = admission_noise_mb if admission_noise_mb is not None else admission_noise_buffer_mb(card.total_mb)
+        self.load_seconds_per_gb = load_seconds_per_gb
         self.child_unload_leaks_mb = child_unload_leaks_mb
         self.preload_report_latency_seconds = preload_report_latency_seconds
         self.host_ram = host_ram
@@ -1247,6 +1335,15 @@ class _DispatchWorld:
         the message itself."""
         self._offloaded_mb: dict[int, float] = {}
         """Per-lane weights the child kept in host RAM rather than commit, to relieve its own shortfall."""
+        self._support_resident_mb: dict[int, float] = {}
+        """Per-lane text-encoder and VAE weights a monolithic job holds on the card beside its diffusion weights.
+
+        Charged at the job's commit under ``partial_loads`` with ``phase_resident_components``, kept while
+        retention keeps the lane's model, as hordelib's component cache keeps them, and released with the model."""
+        self._lane_copy_mb: dict[int, float] = {}
+        """Per lane under ``partial_loads``, the whole weight copy its latest commit settled, until its occupancy."""
+        self._pending_load_mb: dict[str, float] = {}
+        """Per job under ``partial_loads``, the weights its commit put on the card, until its load phase is timed."""
         self._ram_held_checkpoint_lanes: set[int] = set()
         """Lanes that report their seated checkpoint as a held component while it sits in host RAM.
 
@@ -1397,6 +1494,8 @@ class _DispatchWorld:
         """Per lane, a modelled chain's peak while it is on the card. Only the post-processing lane holds one."""
         self.post_process_chains: list[_PostProcessChain] = []
         """Every chain the modelled lane took, in order, kept after it completes."""
+        self.post_process_lane_absent_ticks: list[int] = []
+        """Ticks a modelled chain, running or queued, waited because the post-processing lane was paused or gone."""
         self.card_overcommits: list[tuple[int, int, float]] = []
         """Every observation of a card whose tenants exceeded its total, as (tick, card, MB over).
 
@@ -1477,8 +1576,9 @@ class _DispatchWorld:
             safety_on_gpu=service_contexts,
             vram_reserve_mb=0,
             # These are virtual-card scenarios, not host-platform scenarios. Pin the WDDM/conservative
-            # physics the world was authored against so its holds and golden traces are identical on Linux.
-            vram_admission_noise_mb=admission_noise_buffer_mb(card.total_mb),
+            # physics the world was authored against so its holds and golden traces are identical on Linux,
+            # unless a row replaying a recorded session states the margin that session ran under.
+            vram_admission_noise_mb=noise_mb,
             ram_reserve_mb=ram_reserve_mb,
             ram_pressure_pause_percent=ram_pause_percent if host_ram is not None else 85.0,
             ram_per_process_max_mb=18432,
@@ -1510,7 +1610,7 @@ class _DispatchWorld:
                     image_models_to_load=[model.name for model in self._model_classes],
                     max_pixels=max_pixels,
                     # Keep a routed card on the same explicit virtual-card physics as the global config.
-                    vram_admission_noise_mb=admission_noise_buffer_mb(card.total_mb),
+                    vram_admission_noise_mb=noise_mb,
                     # safety_on_gpu is a per-card permission read off the effective card config, so a card
                     # here carries the same answer the global config gives (no per-card delta in this world).
                     safety_on_gpu=service_contexts,
@@ -1588,8 +1688,9 @@ class _DispatchWorld:
             self._lifecycle._replace_inference_process = self._host_recycle
         # The learned-footprint feed, through the production observers: the children's per-tick memory reports
         # go through the real dispatcher into a store the scheduler prices from, so a row can say what the
-        # parent learns from what its children report, and what that learning does to admission.
-        self._footprint_store = LearnedFootprintStore()
+        # parent learns from what its children report, and what that learning does to admission. A row may
+        # hand in the store the parent starts from, which is what a restarted worker loads from its file.
+        self._footprint_store = footprint_store if footprint_store is not None else LearnedFootprintStore()
         self._dispatcher = MessageDispatcher(
             process_map=self._process_map,
             horde_model_map=self._model_map,
@@ -1659,28 +1760,8 @@ class _DispatchWorld:
                     tail_overlap=tail_overlap,
                     clock=lambda: self.now,
                 )
-            mp_context = multiprocessing.get_context()
             for lane_id in range(lane_count):
-                clearance = mp_context.BoundedSemaphore(1)
-                clearance.acquire()
-                done = mp_context.Semaphore(0)
-                self._clearance_semaphores[lane_id] = clearance
-                stage = None
-                staged_device_free = None
-                if two_phase:
-                    stage = mp_context.BoundedSemaphore(1)
-                    stage.acquire()
-                    staged_device_free = mp_context.Value("d", math.nan)
-                    self._clearance_stage_semaphores[lane_id] = stage
-                proxy = ClearanceLeaseProxy(
-                    clearance=clearance,
-                    done=done,
-                    cleared_device_free=mp_context.Value("d", math.nan),
-                    stage=stage,
-                    staged_device_free=staged_device_free,
-                )
-                self._clearance_proxies[lane_id] = proxy
-                self._clearance_controllers[self._lane_cards[lane_id]].register(lane_id, proxy)
+                self._register_clearance_lane(lane_id)
 
         self.first_dispatch: dict[str, int] = {}
         self._dispatched_at: dict[str, int] = {}
@@ -1762,7 +1843,7 @@ class _DispatchWorld:
 
     def _host_checkpoint_path(self, model_name: str) -> Path | None:
         """Supply virtual file metadata while production computes the static and learned RAM price."""
-        model = _model_by_name(model_name)
+        model = self._model_class(model_name)
         if model is None:
             return None
         checkpoint, _private = self._host_model_ram(model)
@@ -1989,6 +2070,7 @@ class _DispatchWorld:
                 self._unretained_component_mb,
                 self._encode_staging_mb,
                 self._post_process_chain_mb,
+                self._support_resident_mb,
             )
             for lane_id, charge_mb in charges.items()
             if self._card_of(lane_id) == device_index
@@ -2062,6 +2144,24 @@ class _DispatchWorld:
         """
         return predicted_mb * self.footprint_undershoot
 
+    def _model_class(self, name: str) -> _ModelClass | None:
+        """Resolve a model class from its reference name, the classes this row serves before every known one.
+
+        A class passed in ``extra_model_classes`` is served like the pool's own, so it resolves, and is charged
+        its weights, without being listed among the module's known classes.
+        """
+        for model in self._model_classes:
+            if model.name == name:
+                return model
+        return _model_by_name(name)
+
+    def _job_weights_mb(self, job: ImageGenerateJobPopResponse) -> float:
+        """The resident weights (MB) ``job`` costs the card before any undershoot, from the truth hook or its class."""
+        if self.true_footprint_mb is not None:
+            return self.true_footprint_mb(job)[0]
+        model_class = self._model_class(job.model or "")
+        return model_class.weights_mb if model_class is not None else 0.0
+
     @staticmethod
     def _dispatched_device_truth_mb(lane: HordeProcessInfo) -> float | None:
         """The device-free figure the last inference dispatch to ``lane`` carried, or None when it carried none.
@@ -2086,6 +2186,7 @@ class _DispatchWorld:
             + self._unretained_component_mb.get(lane_id, 0.0)
             + self._encode_staging_mb.get(lane_id, 0.0)
             + self._post_process_chain_mb.get(lane_id, 0.0)
+            + self._support_resident_mb.get(lane_id, 0.0)
         )
 
     def _child_believed_free_mb(self, lane_id: int, job_id: str) -> float:
@@ -2165,8 +2266,11 @@ class _DispatchWorld:
         if shortfall_mb <= 0.0:
             return charge_mb
 
+        # A load the worker does not force is sized by ComfyUI's partial load, which evicts nothing else the
+        # process holds, so it goes only into what the child believes is free less the margin.
+        keeps_process_residents = weight_load and self.partial_loads and self._skips_force_load(model)
         stale_model = self._resident_model.get(lane_id)
-        if stale_model is not None and stale_model != model:
+        if not keeps_process_residents and stale_model is not None and stale_model != model:
             freed_mb = self._resident_mb.pop(lane_id, 0.0)
             self._resident_model.pop(lane_id, None)
             entry = self._model_map.root.get(stale_model)
@@ -2180,6 +2284,20 @@ class _DispatchWorld:
             shortfall_mb = (charge_mb + _CHILD_FREE_MARGIN_MB) - self._child_believed_free_mb(lane_id, job_id)
             if shortfall_mb <= 0.0:
                 return charge_mb
+
+        if weight_load and self.partial_loads and not keeps_process_residents:
+            # A forced full load frees the process's other models first, the encode's support components
+            # among them, before it gives up any of the weights it is loading.
+            support_freed_mb = min(shortfall_mb, self._support_resident_mb.get(lane_id, 0.0))
+            if support_freed_mb > 0.0:
+                self._release_support_components(lane_id, support_freed_mb)
+                self.child_shortfall_frees.append(
+                    f"tick {self.tick}: lane {lane_id} returned {support_freed_mb:.0f}MB of support components "
+                    f"toward a {shortfall_mb:.0f}MB shortfall loading {model}",
+                )
+                shortfall_mb = (charge_mb + _CHILD_FREE_MARGIN_MB) - self._child_believed_free_mb(lane_id, job_id)
+                if shortfall_mb <= 0.0:
+                    return charge_mb
 
         # Nothing else on this lane belongs to another job, so what is left to give is part of the running
         # job's own weights: a weight load brings less of the checkpoint onto the card, and an activation
@@ -2206,6 +2324,24 @@ class _DispatchWorld:
                 f"fund a {charge_mb:.0f}MB activation",
             )
         return charge_mb
+
+    def _skips_force_load(self, model: str) -> bool:
+        """Return whether the worker tells hordelib not to force-load ``model``'s diffusion weights.
+
+        ComfyUI sizes a partial load for such a model from free VRAM and evicts nothing else the process holds.
+        The set is the worker's own outside low-memory mode, which the world does not model.
+        """
+        model_class = self._model_class(model)
+        return model_class is not None and model_class.baseline in FORCE_LOAD_SKIP_BASELINES
+
+    def _release_support_components(self, lane_id: int, release_mb: float) -> None:
+        """Take ``release_mb`` of ``lane_id``'s support components off the card."""
+        remaining = self._support_resident_mb.get(lane_id, 0.0) - release_mb
+        if remaining > 1.0:
+            self._support_resident_mb[lane_id] = remaining
+        else:
+            self._support_resident_mb.pop(lane_id, None)
+        self._sync_reported_vram()
 
     def _evict_granted_resident(self, lane_id: int, shortfall_mb: float, *, model: str) -> bool:
         """Free the whole of ``lane_id``'s device copy when nothing but its own weights can cover a shortfall.
@@ -2248,6 +2384,8 @@ class _DispatchWorld:
         publish_ram = self.host_ram is not None and (
             self._ram_reported_at is None or self.now - self._ram_reported_at >= self.ram_report_interval_seconds
         )
+        context_shares = self._context_report_shares() if self.lane_reports_carry_context else {}
+        context_constant_mb = self._scheduler.resolved_context_constant_mb() if context_shares else 0.0
         for lane in self._process_map.values():
             if self.host_ram is not None:
                 ledger = self.host_ram
@@ -2290,10 +2428,63 @@ class _DispatchWorld:
                 # check, plus the growth of a check in flight.
                 reported_mb += SAFETY_GPU_LOAD_CHARGE_MB - self._scheduler.resolved_context_constant_mb()
                 reported_mb += self._safety_check_growth_on_card_mb()
+            if lane.process_id in context_shares:
+                # Safety's weights are inside its context share, so its tenant-only report is rebuilt here.
+                reported_mb = (
+                    self._lane_charge_mb(lane.process_id) + context_shares[lane.process_id] - context_constant_mb
+                )
             lane.process_reserved_mb = int(max(0.0, reported_mb))
             self._lane_peak_mb[lane.process_id] = max(self._lane_peak_mb.get(lane.process_id, 0.0), reported_mb)
         if self.host_ram is not None and publish_ram:
             self._ram_reported_at = self.now
+
+    def _context_report_shares(self) -> dict[int, float]:
+        """Return, per process the parent's committed ledger counts, its share of its card's context charge.
+
+        Each process's own context as :meth:`_context_charge_mb` charges it, and the remainder of the card's
+        charge on the lowest-id inference lane (the lowest-id process where the card has no inference lane), so
+        the shares on a card sum to its context charge exactly.
+        """
+        shares: dict[int, float] = {}
+        for device_index in self._card_totals:
+            counted = [
+                process
+                for process in self._process_map.values()
+                if process.device_index == device_index
+                and process.last_process_state
+                not in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
+            ]
+            if not counted:
+                continue
+            card_shares: dict[int, float] = {}
+            for process in counted:
+                process_id = process.process_id
+                if process_id == _SAFETY_PROCESS_ID:
+                    on_card = (
+                        self._service_contexts
+                        and self._safety_card_index == device_index
+                        and self._safety_context_on_card()
+                    )
+                    own_mb = 0.0
+                    if on_card:
+                        own_mb = SAFETY_GPU_LOAD_CHARGE_MB + self._safety_check_growth_on_card_mb()
+                        if self._safety_transition_until is not None:
+                            own_mb += self.safety_load_transient_mb
+                elif process_id == _POST_PROCESS_LANE_ID:
+                    on_card = self._service_contexts and self._service_lane_on_card(_POST_PROCESS_LANE_ID)
+                    own_mb = _MARGINAL_CONTEXT_MB if on_card else 0.0
+                elif process_id == _UTILITIES_LANE_ID:
+                    own_mb = _MARGINAL_CONTEXT_MB if self._service_contexts else 0.0
+                else:
+                    own_mb = _MARGINAL_CONTEXT_MB
+                card_shares[process_id] = own_mb
+            inference_ids = [
+                process.process_id for process in counted if process.process_type == HordeProcessType.INFERENCE
+            ]
+            carrier = min(inference_ids) if inference_ids else min(card_shares)
+            card_shares[carrier] += self._context_charge_mb(device_index) - sum(card_shares.values())
+            shares.update(card_shares)
+        return shares
 
     def _report_load_completion(self, lane: HordeProcessInfo) -> None:
         """Send the memory report a child sends as a preload completes, carrying the load's private peak."""
@@ -2438,7 +2629,7 @@ class _DispatchWorld:
 
     def _ram_held_checkpoint_report(self, lane: HordeProcessInfo) -> list[HeldComponentSnapshot] | None:
         """The held-component report of a lane whose seated checkpoint sits in host RAM, or None when empty."""
-        model = _model_by_name(lane.loaded_horde_model_name or "")
+        model = self._model_class(lane.loaded_horde_model_name or "")
         if model is None:
             return None
         checkpoint_mb, _private_mb = self._host_model_ram(model)
@@ -2574,11 +2765,16 @@ class _DispatchWorld:
         lane_id = lane.process_id
         freed_model = self._resident_model.pop(lane_id, None)
         freed_mb = self._resident_mb.pop(lane_id, 0.0) + self._held_component_mb.pop(lane_id, 0.0)
+        if self.partial_loads:
+            # The whole-device free takes the support components with the weights, and the host part of the
+            # copy goes back to being the RAM cache a fresh load reads from.
+            freed_mb += self._support_resident_mb.pop(lane_id, 0.0)
+            self._offloaded_mb.pop(lane_id, None)
         lane.held_components = None
         self._granted_resident_evicted.discard(lane_id)
         if freed_mb <= 0.0:
             return
-        seated_model = _model_by_name(freed_model or "")
+        seated_model = self._model_class(freed_model or "")
         if freed_model == lane.loaded_horde_model_name and lane_id not in self._staged_mb and seated_model is not None:
             self._staged_mb[lane_id] = self._actual_charge_mb(seated_model.weights_mb)
             self._staged_model[lane_id] = seated_model.name
@@ -2624,6 +2820,7 @@ class _DispatchWorld:
         self._transient_mb.pop(lane.process_id, None)
         self._encode_staging_mb.pop(lane.process_id, None)
         self._offloaded_mb.pop(lane.process_id, None)
+        self._support_resident_mb.pop(lane.process_id, None)
         # Device-warm components are returned by the same actuation and by nothing else: they outlive every
         # job boundary, so an unload the parent ordered is the only thing that gives the card them back.
         self._held_component_mb.pop(lane.process_id, None)
@@ -2650,23 +2847,29 @@ class _DispatchWorld:
 
         The child's own report after a device unload, ``LOADED_IN_RAM``, is applied through the same
         production reconciliation a job-end eviction uses, so the parent can still price a swap against the
-        model's pages and ask for them back with a RAM unload.
+        model's pages and ask for them back with a RAM unload. The unload's flag stays on the slot, as production
+        keeps it until the slot materialises VRAM again.
         """
         lane_id = lane.process_id
-        model = _model_by_name(name)
+        model = self._model_class(name)
         self._resident_mb.pop(lane_id, None)
         self._resident_model.pop(lane_id, None)
         self._loading.pop(lane_id, None)
         self._transient_mb.pop(lane_id, None)
         self._encode_staging_mb.pop(lane_id, None)
         self._offloaded_mb.pop(lane_id, None)
+        self._support_resident_mb.pop(lane_id, None)
         self._held_component_mb.pop(lane_id, None)
         lane.held_components = None
         self._granted_resident_evicted.discard(lane_id)
         if model is not None:
             self._staged_mb[lane_id] = self._actual_charge_mb(model.weights_mb)
             self._staged_model[lane_id] = name
-        lane.last_control_flag = None
+        # The parent retires an outstanding unload only when the slot materialises VRAM again, so the flag stands
+        # while the model sits in RAM, which keeps the lane out of the idle-eviction mirror. The lane has served
+        # the unload, so the flag is not a fresh command to act on.
+        lane.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        self._unload_served.add(lane_id)
         lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
         self._process_map.on_model_vram_clear(lane_id)
         entry = self._model_map.root.get(name)
@@ -2692,6 +2895,7 @@ class _DispatchWorld:
         self._transient_mb.pop(lane.process_id, None)
         self._encode_staging_mb.pop(lane.process_id, None)
         self._offloaded_mb.pop(lane.process_id, None)
+        self._support_resident_mb.pop(lane.process_id, None)
         self._held_component_mb.pop(lane.process_id, None)
         lane.held_components = None
         self._granted_resident_evicted.discard(lane.process_id)
@@ -2732,7 +2936,7 @@ class _DispatchWorld:
         for name, info in list(self._model_map.root.items()):
             if info.horde_model_load_state != ModelLoadState.LOADING or info.process_id is None:
                 continue
-            model = _model_by_name(name)
+            model = self._model_class(name)
             if model is None:
                 continue
             command = (info.process_id, name)
@@ -2815,7 +3019,7 @@ class _DispatchWorld:
             lane.last_process_state = HordeProcessState.PRELOADED_MODEL
             lane.last_control_flag = None
             self._model_map.update_entry(pending.model, load_state=ModelLoadState.LOADED_IN_RAM, process_id=lane_id)
-            loaded = _model_by_name(pending.model)
+            loaded = self._model_class(pending.model)
             if self.host_ram is not None and loaded is not None:
                 # A load allocates as it reads the checkpoint, so its pages appear when it completes; the
                 # admission that preceded it is what has to hold that room in the meantime.
@@ -3004,8 +3208,11 @@ class _DispatchWorld:
         share. After ``post_process_chain_hold_ticks`` the peak comes off the card, the reserve is released as
         the parent's result path releases it, and the job moves on to safety.
         """
-        lane = self._process_map[_POST_PROCESS_LANE_ID]
+        lane = self._process_map.get(_POST_PROCESS_LANE_ID)
         chain = self._post_process_chain_running()
+        if lane is None or self._lifecycle.is_post_process_gpu_paused is True:
+            self._hold_post_process_chain(chain)
+            return
         chain_finished = (
             chain is not None
             and chain.charged_tick is not None
@@ -3027,6 +3234,31 @@ class _DispatchWorld:
             chain.charged_tick = self.tick
             self._sync_reported_vram()
             self._sample_card_overcommit()
+
+    def _hold_post_process_chain(self, chain: _PostProcessChain | None) -> None:
+        """Hold the lane's work while the lane is paused or gone, as a queued chain waits for the lane's restore.
+
+        Pending chains stay queued. A running chain makes no progress. Once the lane's process has exited, its
+        allocations are gone, so its charge comes off the card and lands again an allocation lag after the lane is
+        back, and its hold restarts then. While the lane is only paused, its process keeps the charge and the hold
+        clock stands still. Each held tick is recorded in ``post_process_lane_absent_ticks``.
+        """
+        if chain is None and not self._job_tracker.jobs_pending_post_processing:
+            return
+        self.post_process_lane_absent_ticks.append(self.tick)
+        if chain is None:
+            return
+        chain.lane_absent_ticks += 1
+        if chain.charged_tick is None:
+            chain.charge_at_tick = self.tick + 1 + self.post_process_chain_allocation_lag_ticks
+        elif _POST_PROCESS_LANE_ID in self._process_map:
+            # A paused lane's process still holds the chain's allocations, so its hold clock stands still.
+            chain.charged_tick += 1
+        else:
+            self._post_process_chain_mb.pop(_POST_PROCESS_LANE_ID, None)
+            chain.charged_tick = None
+            chain.charge_at_tick = self.tick + 1 + self.post_process_chain_allocation_lag_ticks
+            self._sync_reported_vram()
 
     def _chain_admitted_on_measurement(
         self, lane: HordeProcessInfo, job_info: HordeJobInfo, reserve_mb: float
@@ -3288,9 +3520,24 @@ class _DispatchWorld:
                 # state production stamped on it at dispatch, which is what makes it a clearance waiter.
                 admitted_record = self._reference.get(admitted.model) if admitted.model is not None else None
                 admitted_baseline = admitted_record.baseline if admitted_record is not None else None
-                self._encode_staging_mb[lanes[0]] = self.staged_encode_mb_by_model.get(
+                encode_mb = self.staged_encode_mb_by_model.get(
                     admitted.model or "", staging_charge_mb(admitted_baseline)
                 )
+                # The encode working set is the text encoder a retained support tenant already holds, and
+                # ComfyUI's component cache allocates nothing for a resident encoder, so the child commits only
+                # the part the tenant does not cover. The parent's price is left as it is.
+                encode_mb = max(0.0, encode_mb - self._support_resident_mb.get(lanes[0], 0.0))
+                if self.partial_loads and encode_mb > 0.0 and admitted.model is not None:
+                    # ComfyUI's free-memory pass makes room for the encoder as for any other allocation, by
+                    # unloading the process's own diffusion weights, which the next load of the model returns.
+                    encode_mb = self._child_admit_charge(
+                        lane_id=lanes[0],
+                        job_id=job_id,
+                        model=admitted.model,
+                        charge_mb=encode_mb,
+                        weight_load=False,
+                    )
+                self._encode_staging_mb[lanes[0]] = encode_mb
                 self._clearance_waiting_since[job_id] = self.now
                 # The world's encode lands with the dispatch, so the child begins its clearance wait at once and
                 # its wait-entry report reaches the parent's record as the production dispatcher stamps it, on
@@ -3341,6 +3588,16 @@ class _DispatchWorld:
             f"lane {lane_id} would commit {self._staged_model.get(lane_id)}'s staged weights for {admitted.model}"
         )
         if staged_mb is not None:
+            if self.true_footprint_mb is not None:
+                # The staged figure was booked from the class before any job named its footprint, and the
+                # load this job pays is the weights the hook states for it.
+                staged_mb = self._actual_charge_mb(self.true_footprint_mb(admitted)[0])
+            copy_mb = staged_mb
+            if self.partial_loads:
+                # The lane loads its model afresh from the RAM cache, so whatever an earlier copy left in host
+                # RAM is not this load's to return.
+                self._offloaded_mb.pop(lane_id, None)
+                self._charge_support_components(admitted, lane_id=lane_id)
             if admitted.model is not None:
                 # The load is the child's first allocation for this job, so it passes the child's own
                 # shortfall arithmetic and commits only what that arithmetic let it bring onto the card.
@@ -3361,8 +3618,73 @@ class _DispatchWorld:
                 self._resident_mb[lane_id] = staged_mb
             if admitted.model is not None:
                 self._resident_model[lane_id] = admitted.model
+            if self.partial_loads:
+                self._lane_copy_mb[lane_id] = copy_mb
+                self._record_moved_weights(admitted, moved_mb=staged_mb, returned_mb=0.0)
             self._sync_reported_vram()
+        elif self.partial_loads and admitted.model is not None and self._resident_model.get(lane_id) == admitted.model:
+            self._charge_support_components(admitted, lane_id=lane_id)
+            self._return_offloaded_weights(admitted, lane_id=lane_id)
         return loaded_now
+
+    def _charge_support_components(self, job: ImageGenerateJobPopResponse, *, lane_id: int) -> None:
+        """Hold ``job``'s text encoder and VAE on its lane from its commit, as the encode left them there.
+
+        A tenant partly freed since its last commit loads its missing part through the child's shortfall relief.
+        Only a monolithic job under ``phase_resident_components`` carries them as a tenant of their own. The
+        whole-job sampling figure already includes them, and a disaggregated sampler never loads them.
+        """
+        if not self.phase_resident_components or self._scheduler._is_disaggregation_class_eligible(job):
+            return
+        model_class = self._model_class(job.model or "")
+        if model_class is None or job.model is None:
+            return
+        held_mb = self._support_resident_mb.get(lane_id, 0.0)
+        # Only the part the lane no longer holds is loaded again. Like any other allocation it passes the child's
+        # shortfall relief, which unloads the lane's own diffusion weights to make room.
+        reload_mb = max(0.0, _support_component_mb(model_class) - held_mb)
+        if reload_mb > 0.0:
+            reload_mb = self._child_admit_charge(
+                lane_id=lane_id,
+                job_id=str(job.id_),
+                model=job.model,
+                charge_mb=reload_mb,
+                weight_load=False,
+            )
+        self._support_resident_mb[lane_id] = held_mb + reload_mb
+        self._sync_reported_vram()
+
+    def _return_offloaded_weights(self, job: ImageGenerateJobPopResponse, *, lane_id: int) -> None:
+        """Bring back what an earlier job of the same model left in host RAM, as far as the child's arithmetic lets.
+
+        ComfyUI's sampling load of a model it holds partially loads the offloaded part again when the room
+        exists. The return passes the same shortfall relief a fresh load does, charged only the bytes it moves,
+        and what still does not fit stays offloaded and keeps its sampling penalty.
+        """
+        offloaded_mb = self._offloaded_mb.pop(lane_id, 0.0)
+        resident_mb = self._resident_mb.get(lane_id, 0.0)
+        self._lane_copy_mb[lane_id] = resident_mb + offloaded_mb
+        if offloaded_mb <= 0.0 or job.model is None:
+            return
+        returned_mb = self._child_admit_charge(
+            lane_id=lane_id,
+            job_id=str(job.id_),
+            model=job.model,
+            charge_mb=offloaded_mb,
+            weight_load=True,
+        )
+        self._resident_mb[lane_id] = self._resident_mb.get(lane_id, 0.0) + returned_mb
+        self._record_moved_weights(job, moved_mb=returned_mb, returned_mb=returned_mb)
+        self._sync_reported_vram()
+
+    def _record_moved_weights(self, job: ImageGenerateJobPopResponse, *, moved_mb: float, returned_mb: float) -> None:
+        """Note the weights ``job``'s commit put on the card, for its load phase and on its window."""
+        job_id = str(job.id_)
+        self._pending_load_mb[job_id] = moved_mb
+        window = self.job_windows.get(job_id)
+        if window is not None:
+            window.load_moved_mb = moved_mb
+            window.load_returned_mb = returned_mb
 
     def _stage_weights(self, job: ImageGenerateJobPopResponse, *, lane_id: int) -> None:
         """Commit a two-phase job's weights at its stage grant and start their load, leaving the activation unpaid.
@@ -3377,8 +3699,7 @@ class _DispatchWorld:
         loaded_now = self._commit_weights(job, lane_id=lane_id)
         if loaded_now:
             self.weight_uploads += 1
-        model_class = _model_by_name(model)
-        weights_mb = self._actual_charge_mb(model_class.weights_mb if model_class is not None else 0.0)
+        weights_mb = self._actual_charge_mb(self._job_weights_mb(job))
         load = self._load_phase(job, lane_id=lane_id, loaded_now=loaded_now, weights_mb=weights_mb)
         self._staged_weights[lane_id] = _StagedWeights(
             job_id=job_id,
@@ -3405,7 +3726,7 @@ class _DispatchWorld:
             return
         if not self.staged_lane_prefetch or self.host_ram is None or lane_id not in self._staged_mb:
             return
-        model_class = _model_by_name(admitted.model or "")
+        model_class = self._model_class(admitted.model or "")
         if model_class is None:
             return
         checkpoint_mb, _private_mb = self._host_model_ram(model_class)
@@ -3458,7 +3779,7 @@ class _DispatchWorld:
         assert self.host_ram is not None
         if lane_id in self._idle_lane_warms or not self._lane_idles_holding(lane_id, model=model):
             return
-        model_class = _model_by_name(model)
+        model_class = self._model_class(model)
         if model_class is None:
             return
         checkpoint_mb, _private_mb = self._host_model_ram(model_class)
@@ -3699,17 +4020,22 @@ class _DispatchWorld:
         self.dispatch_lanes.append((model, lane_id))
         if loaded_now and staged is None:
             self.weight_uploads += 1
-        model_class = _model_by_name(model)
-        predicted_weights_mb = model_class.weights_mb if model_class is not None else 0.0
+        predicted_weights_mb = self._job_weights_mb(job)
         weights_mb = self._actual_charge_mb(predicted_weights_mb)
         baseline = self._scheduler._model_metadata.get_baseline(model)
-        # Both halves of the footprint are priced off what the scheduler's own forecast predicted, so an
-        # undershoot is the single factor between that forecast and what the card is really asked to hold.
+        # Both halves of the footprint are priced off what the scheduler's own forecast predicted, or off the
+        # row's stated truth where it gives one, so an undershoot is the single factor between that figure and
+        # what the card is really asked to hold.
         phased = self.phase_resident_components and not self._scheduler._is_disaggregation_class_eligible(job)
-        predicted_peak_mb = (
-            predict_job_sampler_only_vram_mb(job, baseline) if phased else predict_job_sampling_vram_mb(job, baseline)
-        ) or predicted_weights_mb
-        transient_mb = self._actual_charge_mb(max(0.0, predicted_peak_mb - predicted_weights_mb))
+        if self.true_footprint_mb is not None:
+            transient_mb = self._actual_charge_mb(max(0.0, self.true_footprint_mb(job)[1]))
+        else:
+            predicted_peak_mb = (
+                predict_job_sampler_only_vram_mb(job, baseline)
+                if phased
+                else predict_job_sampling_vram_mb(job, baseline)
+            ) or predicted_weights_mb
+            transient_mb = self._actual_charge_mb(max(0.0, predicted_peak_mb - predicted_weights_mb))
         decode_spike_mb = self._actual_charge_mb(predict_job_decode_spike_mb(job, baseline) or 0.0) if phased else 0.0
         megapixels = float(job.payload.width * job.payload.height * (job.payload.n_iter or 1)) / (1024.0 * 1024.0)
         if staged is None:
@@ -3721,10 +4047,14 @@ class _DispatchWorld:
             str(baseline),
             _DEFAULT_SAMPLE_SECONDS_PER_STEP_PER_MEGAPIXEL,
         )
-        sample_seconds = max(0.0, float(job.payload.ddim_steps or 0)) * per_step * megapixels
-        decode_seconds = (
-            _DECODE_SECONDS_PER_MEGAPIXEL.get(str(baseline), _DEFAULT_DECODE_SECONDS_PER_MEGAPIXEL) * megapixels
-        )
+        sample_seconds = self.sample_seconds_by_job.get(job_id)
+        if sample_seconds is None:
+            sample_seconds = max(0.0, float(job.payload.ddim_steps or 0)) * per_step * megapixels
+        decode_seconds = self.decode_seconds_by_job.get(job_id)
+        if decode_seconds is None:
+            decode_seconds = (
+                _DECODE_SECONDS_PER_MEGAPIXEL.get(str(baseline), _DEFAULT_DECODE_SECONDS_PER_MEGAPIXEL) * megapixels
+            )
         # The activation is the child's second allocation for this job, so it passes the same shortfall
         # arithmetic the load did, against a believed free the load has already eaten into. It cannot be
         # streamed, so what relief it gets comes out of weights, and every megabyte of weights left off the
@@ -3744,6 +4074,14 @@ class _DispatchWorld:
         sample_from = loaded_at + encode_seconds
         sample_until = sample_from + sample_seconds
         total_steps = max(0, int(job.payload.ddim_steps or 0))
+        copy_mb = 0.0
+        if self.partial_loads:
+            settled_copy_mb = self._lane_copy_mb.pop(lane_id, None)
+            copy_mb = (
+                settled_copy_mb
+                if settled_copy_mb is not None
+                else self._resident_mb.get(lane_id, weights_mb) + self._offloaded_mb.get(lane_id, 0.0)
+            )
         occupancy = _SlotOccupancy(
             job_id=job_id,
             lane_id=lane_id,
@@ -3757,6 +4095,7 @@ class _DispatchWorld:
             decode_spike_mb=decode_spike_mb,
             step_seconds=sample_seconds / total_steps if total_steps > 0 else 0.0,
             total_steps=total_steps,
+            copy_mb=copy_mb,
         )
         self._occupancy[job_id] = occupancy
         self._transient_mb[lane_id] = self._transient_mb.get(lane_id, 0.0) + occupancy.transient_mb
@@ -3779,12 +4118,20 @@ class _DispatchWorld:
         """Return how long committing ``job``'s weights on ``lane_id`` takes, and the disk reads inside it.
 
         A job whose weights were already on the device pays nothing, and forgets any prefetch its lane began.
+        Under ``partial_loads`` the weights term is what the commit put on the card, so a partial load pays for
+        its loaded part and a job on weights already there pays for any offload it returned.
         """
         job_id = str(job.id_)
-        model_class = _model_by_name(job.model or "")
+        moved_mb = self._pending_load_mb.pop(job_id, None)
+        if moved_mb is not None:
+            weights_mb = moved_mb
+            if not loaded_now:
+                self._staged_prefetch.pop(job_id, None)
+                return _LoadPhase(load_seconds=(moved_mb / 1024.0) * self.load_seconds_per_gb)
+        model_class = self._model_class(job.model or "")
         if not loaded_now or self.host_ram is None or model_class is None:
             self._staged_prefetch.pop(job_id, None)
-            return _LoadPhase(load_seconds=0.0 if not loaded_now else (weights_mb / 1024.0) * _LOAD_SECONDS_PER_GB)
+            return _LoadPhase(load_seconds=0.0 if not loaded_now else (weights_mb / 1024.0) * self.load_seconds_per_gb)
         # The weights come from the lane's mapped checkpoint, so pages the host reclaimed while the lane idled
         # are read from disk first, less whatever a warm or a staged prefetch already read; a monolithic job
         # also brings its text encoder and VAE across.
@@ -3798,8 +4145,8 @@ class _DispatchWorld:
             0.0 if self._scheduler._is_disaggregation_class_eligible(job) else _support_component_mb(model_class)
         )
         return _LoadPhase(
-            load_seconds=(weights_mb / 1024.0) * _LOAD_SECONDS_PER_GB
-            + (cleared_read_seconds + (support_mb / 1024.0) * _LOAD_SECONDS_PER_GB),
+            load_seconds=(weights_mb / 1024.0) * self.load_seconds_per_gb
+            + (cleared_read_seconds + (support_mb / 1024.0) * self.load_seconds_per_gb),
             warm_read_seconds=warm_read_seconds,
             staged_read_seconds=staged_read_seconds,
             cleared_read_seconds=cleared_read_seconds,
@@ -3873,7 +4220,8 @@ class _DispatchWorld:
         One event covers the whole load the cleared window paid (unfinished read, weights and support
         components), so the card's learned load figure is the time a handoff has to hide.
         """
-        if not window.loaded_now or window.load_seconds <= 0.0:
+        moved_weights = window.loaded_now or window.load_returned_mb > 0.0
+        if not moved_weights or window.load_seconds <= 0.0:
             return
         self._process_map.on_job_metrics(
             lane_id,
@@ -3932,6 +4280,8 @@ class _DispatchWorld:
         """Charge the VAE decode activation for the decode tail, through the child's shortfall arithmetic."""
         if occupancy.decode_spike_mb <= 0.0 or occupancy.decode_charged_mb > 0.0:
             return
+        if self.partial_loads:
+            self._unload_own_weights_for_decode(occupancy)
         committed_mb = self._child_admit_charge(
             lane_id=occupancy.lane_id,
             job_id=occupancy.job_id,
@@ -3941,6 +4291,32 @@ class _DispatchWorld:
         )
         occupancy.decode_charged_mb = committed_mb
         self._transient_mb[occupancy.lane_id] = self._transient_mb.get(occupancy.lane_id, 0.0) + committed_mb
+
+    def _unload_own_weights_for_decode(self, occupancy: _SlotOccupancy) -> None:
+        """Fund a decode spike from the lane's own diffusion weights before anything else, and count the unload.
+
+        The VAE load asks ComfyUI for the decode working set, and ComfyUI frees it by partially unloading the
+        diffusion model its own process holds. hordelib's CPU-origin retention makes that unload a release, so it
+        costs no time. The weights join the lane's host-RAM remainder, and the next job of the model pays to
+        return them.
+        """
+        lane_id = occupancy.lane_id
+        believed_free_mb = self._child_believed_free_mb(lane_id, occupancy.job_id)
+        shortfall_mb = (occupancy.decode_spike_mb + _CHILD_FREE_MARGIN_MB) - believed_free_mb
+        unloaded_mb = min(shortfall_mb, self._resident_mb.get(lane_id, 0.0))
+        if unloaded_mb <= 0.0:
+            return
+        self._resident_mb[lane_id] = self._resident_mb.get(lane_id, 0.0) - unloaded_mb
+        self._offloaded_mb[lane_id] = self._offloaded_mb.get(lane_id, 0.0) + unloaded_mb
+        window = self.job_windows.get(occupancy.job_id)
+        if window is not None:
+            window.decode_unloads += 1
+            window.decode_unloaded_mb += unloaded_mb
+        self.child_shortfall_frees.append(
+            f"tick {self.tick}: lane {lane_id} unloaded {unloaded_mb:.0f}MB of {occupancy.model} to fund a "
+            f"{occupancy.decode_spike_mb:.0f}MB decode",
+        )
+        self._sync_reported_vram()
 
     def _release_decode_spike(self, occupancy: _SlotOccupancy) -> None:
         """Give the card back the decode activation a finished job was holding."""
@@ -3952,6 +4328,28 @@ class _DispatchWorld:
             self._transient_mb[occupancy.lane_id] = remaining
         else:
             self._transient_mb.pop(occupancy.lane_id, None)
+
+    def _retained_weights_mb(self, occupancy: _SlotOccupancy) -> float:
+        """Return what a retained job leaves of its model's weights on the card.
+
+        Off ``partial_loads`` the device copy the job began sampling with. Under it, the copy less whatever stays
+        in host RAM, so an offload and a decode unload survive into the next job on the lane.
+        """
+        if not self.partial_loads:
+            return occupancy.weights_mb
+        return max(0.0, occupancy.copy_mb - self._offloaded_mb.get(occupancy.lane_id, 0.0))
+
+    def _copy_to_ram_mb(self, occupancy: _SlotOccupancy) -> float:
+        """Return the staged figure for a model that leaves the card at its job's end.
+
+        Under ``partial_loads`` the whole copy goes back to the RAM cache, its offloaded part included, and the
+        support components leave with the model.
+        """
+        if not self.partial_loads:
+            return occupancy.weights_mb
+        self._offloaded_mb.pop(occupancy.lane_id, None)
+        self._support_resident_mb.pop(occupancy.lane_id, None)
+        return occupancy.copy_mb
 
     async def _complete_occupancy(self, occupancy: _SlotOccupancy) -> None:
         """Finish one job: hand it onward, settle its retention grant, and apply the grant to the card.
@@ -3967,9 +4365,10 @@ class _DispatchWorld:
         self._occupancy.pop(job_id, None)
         self._dispatch_device_truth_mb.pop(job_id, None)
         self._lane_charge_at_dispatch.pop(job_id, None)
-        # A streaming decision belongs to the job that made it: the next job on this lane runs the shortfall
-        # arithmetic afresh against whatever the card then holds.
-        self._offloaded_mb.pop(occupancy.lane_id, None)
+        if not self.partial_loads:
+            # A streaming decision belongs to the job that made it: the next job on this lane runs the shortfall
+            # arithmetic afresh against whatever the card then holds.
+            self._offloaded_mb.pop(occupancy.lane_id, None)
         self._release_transient(occupancy)
         self._release_decode_spike(occupancy)
         job = next((tracked for tracked in self._job_tracker.jobs_in_progress if str(tracked.id_) == job_id), None)
@@ -4030,7 +4429,7 @@ class _DispatchWorld:
             # empty device and the rest of the session is priced, held and routed against a phantom.
             self._resident_mb.pop(occupancy.lane_id, None)
             self._resident_model.pop(occupancy.lane_id, None)
-            self._staged_mb[occupancy.lane_id] = occupancy.weights_mb
+            self._staged_mb[occupancy.lane_id] = self._copy_to_ram_mb(occupancy)
             self._staged_model[occupancy.lane_id] = occupancy.model
             self._process_map.on_model_vram_clear(occupancy.lane_id)
             if lane.retained_resident_model is None:
@@ -4049,7 +4448,7 @@ class _DispatchWorld:
         if retained:
             # The explicit end-of-job evictor returns everything the grant does not cover, so a slot that
             # loaded beside stale weights is back to carrying exactly the model it retains.
-            self._resident_mb[occupancy.lane_id] = occupancy.weights_mb
+            self._resident_mb[occupancy.lane_id] = self._retained_weights_mb(occupancy)
             self._resident_model[occupancy.lane_id] = occupancy.model
             self._model_map.update_entry(
                 occupancy.model,
@@ -4059,7 +4458,7 @@ class _DispatchWorld:
             return
         self._resident_mb.pop(occupancy.lane_id, None)
         self._resident_model.pop(occupancy.lane_id, None)
-        self._staged_mb[occupancy.lane_id] = occupancy.weights_mb
+        self._staged_mb[occupancy.lane_id] = self._copy_to_ram_mb(occupancy)
         self._staged_model[occupancy.lane_id] = occupancy.model
         self._model_map.update_entry(
             occupancy.model,
@@ -4070,6 +4469,42 @@ class _DispatchWorld:
     def _legacy_unload_regime(self) -> bool:
         """Whether the escape hatch has the child returning the card at the end of every prompt."""
         return self._scheduler._runtime_config.bridge_data.legacy_comfy_vram_unload is True
+
+    def _register_clearance_lane(self, lane_id: int) -> None:
+        """Give ``lane_id`` a fresh clearance proxy and register it with its card's controller.
+
+        The spawn site builds every inference child its own proxy, whether the lane is part of the first pool or
+        a lane a residency's teardown later regrows, so a lane the world adds is clearable like any other.
+        """
+        mp_context = multiprocessing.get_context()
+        clearance = mp_context.BoundedSemaphore(1)
+        clearance.acquire()
+        self._clearance_semaphores[lane_id] = clearance
+        stage = None
+        staged_device_free = None
+        if self.two_phase:
+            stage = mp_context.BoundedSemaphore(1)
+            stage.acquire()
+            staged_device_free = mp_context.Value("d", math.nan)
+            self._clearance_stage_semaphores[lane_id] = stage
+        proxy = ClearanceLeaseProxy(
+            clearance=clearance,
+            done=mp_context.Semaphore(0),
+            cleared_device_free=mp_context.Value("d", math.nan),
+            stage=stage,
+            staged_device_free=staged_device_free,
+        )
+        self._clearance_proxies[lane_id] = proxy
+        self._clearance_controllers[self._card_of(lane_id)].register(lane_id, proxy)
+
+    def _forget_clearance_lane(self, lane_id: int) -> None:
+        """Drop a retired lane's proxy and permits, and its grant state, as the parent does for a replaced child."""
+        controller = self._clearance_controllers.get(self._card_of(lane_id))
+        if controller is not None:
+            controller.note_child_replaced(lane_id)
+        self._clearance_proxies.pop(lane_id, None)
+        self._clearance_semaphores.pop(lane_id, None)
+        self._clearance_stage_semaphores.pop(lane_id, None)
 
     def scale_inference_processes(
         self,
@@ -4119,6 +4554,8 @@ class _DispatchWorld:
                 state=HordeProcessState.WAITING_FOR_JOB,
                 device_index=self._lane_cards.get(lane_id, self._safety_card_index),
             )
+            if self.clearance_lease:
+                self._register_clearance_lane(lane_id)
         self._sync_reported_vram()
         return len(self._inference_lanes())
 
@@ -4138,12 +4575,15 @@ class _DispatchWorld:
         self._transient_mb.pop(lane_id, None)
         self._encode_staging_mb.pop(lane_id, None)
         self._offloaded_mb.pop(lane_id, None)
+        self._support_resident_mb.pop(lane_id, None)
         self._held_component_mb.pop(lane_id, None)
         self._unretained_component_mb.pop(lane_id, None)
         self._granted_resident_evicted.discard(lane_id)
         self._unload_due_at.pop(lane_id, None)
         self._unload_leaked.discard(lane_id)
         self._drop_occupancy_on(lane_id)
+        if self.clearance_lease:
+            self._forget_clearance_lane(lane_id)
         if lane is None:
             return
         name = lane.loaded_horde_model_name
@@ -4223,6 +4663,7 @@ class _DispatchWorld:
         self._transient_mb.pop(victim, None)
         self._encode_staging_mb.pop(victim, None)
         self._offloaded_mb.pop(victim, None)
+        self._support_resident_mb.pop(victim, None)
         self._held_component_mb.pop(victim, None)
         self._unretained_component_mb.pop(victim, None)
         self._granted_resident_evicted.discard(victim)
@@ -4423,6 +4864,9 @@ class _DispatchWorld:
             dispatched = 0
         else:
             dispatched = await self._dispatch_until_full()
+        # The control loop prices the tick's slot time after the dispatch pass, so a head the pass dispatched
+        # counts as in progress and each decline it recorded carries its gate.
+        self._scheduler.record_slot_duty(self._reference)
         # After the dispatch pass, which is the only point that knows which pending jobs this tick left unseated,
         # as the parent's control loop orders it.
         self._scheduler.warm_idle_lanes()

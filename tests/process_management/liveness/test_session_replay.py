@@ -1,0 +1,312 @@
+"""A live session's job stream replayed through the dispatch world, read back as the live duty report reads it.
+
+The fixture is one 191-minute session on a 24 GB card (see ``_session_replay.py``). Each row builds the world
+with the session's configuration, seeds the parent's learned footprints from the session's store, offers the
+session's jobs as they were popped, and reads back the slot-duty sampling share, the sampling concurrency, the
+hold buckets and the handoff gaps. The live figures calibrate the replay. They say whether the world reproduces
+the session's duty shape, and a scheduling change is judged by how it moves the replay against the replay at
+the change's parent, never by a live figure.
+
+Values chosen without a live figure: the host's foreign RAM, the service-lane exit time, the safety placement
+readiness (the world's default of zero), and the jobs in flight at a window's start, which are not replayed.
+"""
+
+from __future__ import annotations
+
+import math
+import statistics
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
+from tests.process_management.liveness._dispatch_world import _CARD_24GB, _DispatchWorld, _ModelClass
+from tests.process_management.liveness._host_ram import HostRamLedger
+from tests.process_management.liveness._session_replay import (
+    SESSION_FOOTPRINTS_PATH,
+    SESSION_JOBS_PATH,
+    PopDriverRecord,
+    ReplayJob,
+    calibrated_load_seconds_per_gb,
+    chain_seconds,
+    decode_seconds_by_job,
+    load_footprint_keys,
+    load_footprint_store,
+    load_session_jobs,
+    median_chain_peak_mb,
+    median_seconds_in_ticks,
+    model_classes,
+    pop_driver,
+    safety_check_growth_mb,
+    safety_seconds,
+    sample_seconds_by_job,
+    true_footprint,
+)
+from tests.process_management.liveness._world_assertions import (
+    SAMPLING_CONCURRENCY_TOP,
+    concurrency_shares,
+    handoff_gap_segments,
+    pop_to_start_seconds,
+    slot_duty_shares,
+)
+
+pytestmark = pytest.mark.closed_loop
+
+_TICK_SECONDS = 1.0
+"""A second per tick, so a phase of a few seconds is observed at the stats stream's own cadence."""
+
+_LANE_COUNT = 4
+"""The session's inference lanes, process ids 3 to 6, which served inference for the whole session."""
+_MAX_THREADS = 2
+"""The session's ``max_threads``."""
+_QUEUE_SIZE = 2
+"""The session's ``queue_size``."""
+_POP_BUDGET = _QUEUE_SIZE + _MAX_THREADS
+"""How many jobs the popper keeps pending or in progress on one card: ``queue_size`` plus ``max_threads``."""
+_LEASE_SLOTS = 3
+"""The session's ``gpu_sampling_lease_slots``."""
+
+_HOST_RAM_MB = 65_536.0
+"""The session host's physical RAM."""
+_FOREIGN_RAM_MB = 8192.0
+"""Host RAM held outside the lanes: the parent, the service lanes' host pages and the operating system.
+
+Chosen, since the recorded session has no host RAM reading."""
+_RAM_RESERVE_MB = 0.0
+"""The session's ``ram_reserve_mb``."""
+_RAM_PAUSE_PERCENT = 95.0
+"""The session's ``ram_pressure_pause_percent``."""
+_FOREIGN_VRAM_MB = 3300.0
+"""Device memory on the session's card that no lane's report accounts for, held for the whole session."""
+_SERVICE_LANE_EXIT_SECONDS = 1.0
+"""How long a paused service lane's process takes to exit. Chosen as one tick, with no measured figure recorded."""
+
+_SESSION_START_CLOCK_SECONDS = 13 * 3600 + 49 * 60 + 37.58
+"""The session's start on the host's local clock (13:49:37.58), from which the fixture's offsets run."""
+_W3_START_CLOCK_SECONDS = 15 * 3600 + 5 * 60
+"""The start of the session's weakest middle stretch, 15:05 on the host's local clock."""
+_W3_START_OFFSET_SECONDS = _W3_START_CLOCK_SECONDS - _SESSION_START_CLOCK_SECONDS
+_W3_SECONDS = 1200.0
+"""The stretch runs 15:05 to 15:25."""
+_W3_RESIDENTS: tuple[tuple[str, bool] | None, ...] = (
+    ("CyberRealistic Pony", True),
+    ("Flux.1-Schnell fp8 (Compact)", False),
+    ("Anima-Turbo-v1.1", True),
+    None,
+)
+"""What each inference lane held at 15:05, in lane order (process ids 3 to 6), and whether it was on the card.
+
+Process 3 and 5 were sampling CyberRealistic Pony and Anima, process 4 had just moved Flux to RAM and process 6
+had just dropped its model to disk."""
+
+_LIVE_SLOT_DUTY_SAMPLING_SHARE = 0.39
+"""The session's slot-duty sampling share over its whole length."""
+_SAMPLING_SHARE_BAND = 0.15
+"""How far the replay's sampling share may sit from the live share and still count as the same duty shape.
+
+Wide because the replay omits what the module's known mismatches list, each of which moves the share by some
+points. A replay outside it is reproducing a different session."""
+_TWO_SAMPLER_SHARE_CEILING = 0.30
+"""The share of ticks with two lanes sampling the replay stays below.
+
+The session sat at two samplers for 13.7% of its samples. Above twice that, the world is overlapping work the
+session's scheduler could not, a fidelity gap in the world."""
+_ADMISSION_NOISE_MB = admission_margin_mb(_CARD_24GB.total_mb, platform="linux")
+"""The admission margin the session ran under on Linux, where it is the device-wide fraction of the card."""
+
+
+@dataclass(frozen=True)
+class _ReplayFigures:
+    """Represents a finished replay's figures, read as the live duty report reads a session."""
+
+    sampling_share: float
+    concurrency: dict[int, float]
+    slot_duty: dict[str, float]
+    gap_segments: dict[str, float]
+    pop_to_start_median_seconds: float | None
+    completed_jobs: int
+    overcommit_ticks: int
+    overcommit_max_mb: float
+    driver: PopDriverRecord
+
+    def describe(self) -> str:
+        """Return the figures as text a failing row prints, so a regression shows where the slot time went."""
+        concurrency = ", ".join(
+            f"{lanes}{'+' if lanes == SAMPLING_CONCURRENCY_TOP else ''}: {share:.1%}"
+            for lanes, share in self.concurrency.items()
+        )
+        holds = ", ".join(
+            f"{bucket} {share:.1%}" for bucket, share in sorted(self.slot_duty.items(), key=lambda item: -item[1])
+        )
+        gaps = ", ".join(f"{segment} {seconds:.0f} s" for segment, seconds in self.gap_segments.items())
+        pop_to_start = (
+            "none" if self.pop_to_start_median_seconds is None else f"{self.pop_to_start_median_seconds:.1f} s"
+        )
+        return (
+            f"sampling share {self.sampling_share:.1%}; lanes sampling {concurrency}; slot duty {holds}; "
+            f"handoff gaps {gaps}; median pop to start {pop_to_start}; {self.completed_jobs} jobs completed; "
+            f"{self.overcommit_ticks} over-committed ticks (at most {self.overcommit_max_mb:.0f} MB); "
+            f"offered {self.driver.offered}, "
+            f"left {self.driver.remaining}, refused offers {self.driver.refused_offers}"
+        )
+
+
+def _replay_world(jobs: list[ReplayJob], *, scratch_directory: Path) -> tuple[_DispatchWorld, list[_ModelClass]]:
+    """Build the session's world: its card, lanes and flags, its learned store, and the stream's measured figures.
+
+    ``jobs`` is the whole session's stream, whatever part of it a row offers, so the world serves every model the
+    session served and the load rate and the median durations are the session's. The world learns into its own
+    store. The truth hook reads a second store loaded from the same fixture, so what a job really costs does not
+    follow what the world taught its parent.
+    """
+    keys = load_footprint_keys(SESSION_FOOTPRINTS_PATH)
+    truth_store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=scratch_directory / "truth")
+    parent_store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=scratch_directory / "parent")
+    classes = model_classes(jobs, truth_store, keys)
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=_LANE_COUNT,
+        max_threads=_MAX_THREADS,
+        queue_depth=_QUEUE_SIZE,
+        gpu_sampling_lease_slots=_LEASE_SLOTS,
+        tick_seconds=_TICK_SECONDS,
+        high_performance_mode=True,
+        closed_loop=True,
+        clearance_lease=True,
+        two_phase=True,
+        tail_overlap=True,
+        staged_lane_prefetch=True,
+        idle_lane_warm=True,
+        service_contexts=True,
+        service_lane_exit_seconds=_SERVICE_LANE_EXIT_SECONDS,
+        safety_off_gpu_allowed=True,
+        safety_check_growth_mb=safety_check_growth_mb(truth_store),
+        safety_check_ticks=median_seconds_in_ticks(safety_seconds(jobs), tick_seconds=_TICK_SECONDS),
+        safety_cpu_check_ticks=median_seconds_in_ticks(safety_seconds(jobs), tick_seconds=_TICK_SECONDS),
+        post_process_chain_peak_mb=median_chain_peak_mb(truth_store, keys),
+        post_process_chain_hold_ticks=median_seconds_in_ticks(chain_seconds(jobs), tick_seconds=_TICK_SECONDS),
+        post_process_chain_measured_admission=True,
+        learned_footprints=True,
+        footprint_store=parent_store,
+        phase_resident_components=True,
+        partial_loads=True,
+        lane_reports_carry_context=True,
+        admission_noise_mb=_ADMISSION_NOISE_MB,
+        host_ram=HostRamLedger(_HOST_RAM_MB, _FOREIGN_RAM_MB),
+        ram_reserve_mb=_RAM_RESERVE_MB,
+        ram_pause_percent=_RAM_PAUSE_PERCENT,
+        foreign_vram_mb_by_tick={1: _FOREIGN_VRAM_MB},
+        extra_model_classes=tuple(classes),
+        true_footprint_mb=true_footprint(truth_store, classes),
+        sample_seconds_by_job=sample_seconds_by_job(jobs),
+        decode_seconds_by_job=decode_seconds_by_job(jobs),
+        load_seconds_per_gb=calibrated_load_seconds_per_gb(jobs, classes),
+    )
+    # The parent's foreign floor ages its readings on its own clock. A replay runs far faster than the world
+    # clock, so the floor is put on the world clock for its window to mean simulated seconds.
+    world.scheduler._foreign_floor_clock = lambda: world.now
+    return world, classes
+
+
+def _figures(world: _DispatchWorld, driver: PopDriverRecord) -> _ReplayFigures:
+    """Read a finished replay's figures."""
+    slot_duty = slot_duty_shares(world)
+    waits = pop_to_start_seconds(world)
+    return _ReplayFigures(
+        sampling_share=slot_duty.get("sampling", 0.0),
+        concurrency=concurrency_shares(world),
+        slot_duty=slot_duty,
+        gap_segments={str(segment): seconds for segment, seconds in handoff_gap_segments(world).items()},
+        pop_to_start_median_seconds=statistics.median(waits) if waits else None,
+        completed_jobs=world.completed_jobs,
+        overcommit_ticks=len({tick for tick, _card, _over_mb in world.card_overcommits}),
+        overcommit_max_mb=max((over_mb for _tick, _card, over_mb in world.card_overcommits), default=0.0),
+        driver=driver,
+    )
+
+
+async def _replay_w3_window(scratch_directory: Path) -> _ReplayFigures:
+    """Replay 15:05 to 15:25 from the residents the lanes held at 15:05, and read the figures back."""
+    window_end = _W3_START_OFFSET_SECONDS + _W3_SECONDS
+    session_jobs = load_session_jobs(SESSION_JOBS_PATH)
+    jobs = [
+        job
+        for job in session_jobs
+        if job.offset_seconds < window_end
+        and (job.dispatch_offset_seconds or job.offset_seconds) >= _W3_START_OFFSET_SECONDS
+    ]
+    world, classes = _replay_world(session_jobs, scratch_directory=scratch_directory)
+    classes_by_name = {model_class.name: model_class for model_class in classes}
+    for lane_id, resident in zip(world.inference_lane_ids(), _W3_RESIDENTS, strict=True):
+        if resident is None:
+            continue
+        model_name, on_card = resident
+        world.seed_resident(lane_id, classes_by_name[model_name], in_vram=on_card)
+    driver = await pop_driver(
+        world,
+        jobs,
+        queue_size=_POP_BUDGET,
+        start_offset_seconds=_W3_START_OFFSET_SECONDS,
+        seconds=_W3_SECONDS,
+    )
+    return _figures(world, driver)
+
+
+async def _replay_whole_session(scratch_directory: Path) -> _ReplayFigures:
+    """Replay the whole stream from a cold pool, for as long as the session ran, and read the figures back."""
+    jobs = load_session_jobs(SESSION_JOBS_PATH)
+    world, _classes = _replay_world(jobs, scratch_directory=scratch_directory)
+    session_seconds = math.ceil(max(job.finalized_offset_seconds or job.offset_seconds for job in jobs))
+    driver = await pop_driver(
+        world,
+        jobs,
+        queue_size=_POP_BUDGET,
+        start_offset_seconds=0.0,
+        seconds=float(session_seconds),
+    )
+    return _figures(world, driver)
+
+
+def _assert_live_duty_shape(figures: _ReplayFigures, *, context: str) -> None:
+    """Assert the replay's duty shape sits inside the calibration band around the live session's."""
+    description = figures.describe()
+    # An over-commit inside the admission margin is what the margin exists to absorb, and the live session's
+    # decode tails ran there too. One beyond it is a pricing decision that admitted room the card did not have.
+    assert figures.overcommit_max_mb <= _ADMISSION_NOISE_MB, (
+        f"{context}: the card was over-committed beyond the admission margin ({_ADMISSION_NOISE_MB:.0f} MB). "
+        f"{description}"
+    )
+    assert abs(figures.sampling_share - _LIVE_SLOT_DUTY_SAMPLING_SHARE) <= _SAMPLING_SHARE_BAND, (
+        f"{context}: sampling share {figures.sampling_share:.1%} is more than {_SAMPLING_SHARE_BAND:.0%} from the "
+        f"live {_LIVE_SLOT_DUTY_SAMPLING_SHARE:.0%}. {description}"
+    )
+    two_sampler_share = figures.concurrency[SAMPLING_CONCURRENCY_TOP]
+    assert two_sampler_share < _TWO_SAMPLER_SHARE_CEILING, (
+        f"{context}: two lanes sampled on {two_sampler_share:.1%} of ticks, at or above "
+        f"{_TWO_SAMPLER_SHARE_CEILING:.0%}. {description}"
+    )
+
+
+async def test_replay_w3_window_reproduces_the_live_duty_shape(tmp_path: Path) -> None:
+    """The 15:05 to 15:25 stretch, replayed, keeps the live session's duty shape and never over-commits the card.
+
+    The stretch is the session's weakest middle span. Flux and Z-Image held most of the in-flight seconds and the
+    clearance hold took 854 of its 1,200 seconds. The band is the calibration this replay is held to: a sampling
+    share within 15 points of the session's 39%, fewer than 30% of ticks with two lanes sampling against the
+    session's 13.7%, and no tick over the card by more than the admission margin. The share is the session's
+    because the stretch alone has too few jobs to fix a figure. The band is wide for the same reason and for the
+    mismatches the fixture module lists.
+    """
+    figures = await _replay_w3_window(tmp_path)
+    _assert_live_duty_shape(figures, context="15:05 to 15:25 window")
+
+
+@pytest.mark.slow
+async def test_replay_whole_session(tmp_path: Path) -> None:
+    """The whole session, replayed from a cold pool, keeps the same duty shape as its middle stretch.
+
+    It runs for the session's whole length and is held to the window row's band.
+    """
+    figures = await _replay_whole_session(tmp_path)
+    _assert_live_duty_shape(figures, context="whole session")

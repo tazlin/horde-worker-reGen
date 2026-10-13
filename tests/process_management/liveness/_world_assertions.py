@@ -21,6 +21,7 @@ means the same thing in both places.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
@@ -124,7 +125,8 @@ def handoff_gaps_by_card(world: _DispatchWorld) -> dict[int, list[float]]:
     for window in world.job_windows.values():
         if window.sample_from is None or window.sample_until is None:
             continue
-        windows_by_card.setdefault(world.card_of_lane(window.lane_id), []).append(window)
+        # The pool may shrink mid-run, so read through the pinning the world keeps for retired lanes too.
+        windows_by_card.setdefault(world._card_of(window.lane_id), []).append(window)
     gaps: dict[int, list[float]] = {}
     for card, windows in windows_by_card.items():
         for window in windows:
@@ -186,7 +188,7 @@ def two_sampler_share(world: _DispatchWorld) -> float:
         samplers_by_card: dict[int, int] = {}
         for lane in observation.lane_states:
             if lane.sampling:
-                card = world.card_of_lane(lane.lane_id)
+                card = world._card_of(lane.lane_id)
                 samplers_by_card[card] = samplers_by_card.get(card, 0) + 1
         if not samplers_by_card:
             continue
@@ -282,6 +284,121 @@ def dispatch_to_first_step_seconds(world: _DispatchWorld) -> list[float]:
         for window in world.job_windows.values()
         if window.sample_from is not None
     ]
+
+
+SAMPLING_CONCURRENCY_TOP = 2
+"""Ticks with this many lanes sampling or more are counted together, as the live duty report's ``2+`` row is."""
+
+
+def concurrency_shares(world: _DispatchWorld) -> dict[int, float]:
+    """Return the share of all ticks on which 0, 1, or 2 or more inference lanes were sampling.
+
+    A lane counts as sampling while it reports ``INFERENCE_STARTING``, the state the live duty report counts from
+    each stats sample (``session_duty._sampling_concurrency``), and the state the scheduler's slot duty counts a
+    busy slot by under the lease. Every tick is in the denominator, idle ones included, so the three shares sum to
+    one and read against the live report's rows directly. The top key holds every tick at or above
+    :data:`SAMPLING_CONCURRENCY_TOP`.
+    """
+    counts = dict.fromkeys(range(SAMPLING_CONCURRENCY_TOP + 1), 0)
+    for observation in world.tick_observations:
+        sampling = sum(1 for lane in observation.lane_states if lane.state == HordeProcessState.INFERENCE_STARTING)
+        counts[min(sampling, SAMPLING_CONCURRENCY_TOP)] += 1
+    total = len(world.tick_observations)
+    return {lanes: (count / total if total else 0.0) for lanes, count in counts.items()}
+
+
+def pop_to_start_seconds(world: _DispatchWorld) -> list[float]:
+    """Return, per dispatched job, the seconds from its pop to its dispatch.
+
+    The live report's pop-to-start wait runs to the ``INFERENCE_IN_PROGRESS`` stamp, which the scheduler sets at
+    dispatch, so the world's dispatch instant is the same end point.
+    """
+    return [
+        window.dispatched_at - world.popped_at[job_id]
+        for job_id, window in world.job_windows.items()
+        if job_id in world.popped_at
+    ]
+
+
+def slot_duty_shares(world: _DispatchWorld) -> dict[str, float]:
+    """Return each slot-duty bucket's share of the slot-seconds the scheduler's own accumulator attributed.
+
+    Read from :meth:`InferenceScheduler.slot_duty_snapshot`, which the world feeds once per tick after its
+    dispatch pass and which observes on the world clock, so the totals are simulated slot-seconds. The shares sum
+    to one, as the live report's slot-duty line does. An empty run returns an empty mapping.
+    """
+    totals, _capacity, _hold = world.scheduler.slot_duty_snapshot()
+    slot_seconds = sum(totals.values())
+    if slot_seconds <= 0.0:
+        return {}
+    return {bucket: seconds / slot_seconds for bucket, seconds in totals.items()}
+
+
+class HandoffGapSegment(StrEnum):
+    """What the successor of a sampling handoff was doing during part of the gap before it sampled.
+
+    The segments follow one job through pop, dispatch, clearance and load, so a gap splits into the stage the
+    successor was waiting in, as the live duty analysis splits its gaps by filler.
+    """
+
+    NOT_POPPED = "successor not yet popped"
+    """The successor had not arrived, so the gap was the workload's or the pop budget was full."""
+    DISPATCH_HELD = "successor popped, not dispatched"
+    """The successor was queued and a dispatch gate held it."""
+    CLEARANCE_HELD = "successor dispatched, clearance held"
+    """The successor was staged on its lane and the clearance controller held its sample grant."""
+    LOADING = "successor cleared, loading"
+    """The successor was cleared and had not yet taken its first step. The segment is its load, or under two-phase
+    clearance the activation after a stage grant had already moved its weights."""
+
+
+def handoff_gap_segments(world: _DispatchWorld) -> dict[HandoffGapSegment, float]:
+    """Return the seconds of every sampling handoff gap, split by what the successor was waiting in.
+
+    A handoff pairs each sampling start with the latest sampling end on the same card before it, as
+    :func:`handoff_gaps_by_card` does, and a start made while another window on the card was sampling is no gap.
+    Each gap is split at the successor's pop, dispatch and clearance instants, clipped to the gap.
+    """
+    totals = dict.fromkeys(HandoffGapSegment, 0.0)
+    windows_by_card: dict[int, list[_JobWindow]] = {}
+    for window in world.job_windows.values():
+        if window.sample_from is not None and window.sample_until is not None:
+            # The pool may shrink mid-run, so read through the pinning the world keeps for retired lanes too.
+            windows_by_card.setdefault(world._card_of(window.lane_id), []).append(window)
+    for windows in windows_by_card.values():
+        for successor in windows:
+            start = successor.sample_from
+            assert start is not None
+            if any(
+                other is not successor
+                and other.sample_from is not None
+                and other.sample_until is not None
+                and other.sample_from < start < other.sample_until
+                for other in windows
+            ):
+                continue
+            earlier_ends = [
+                other.sample_until
+                for other in windows
+                if other is not successor and other.sample_until is not None and other.sample_until <= start
+            ]
+            if not earlier_ends:
+                continue
+            gap_start = max(earlier_ends)
+            popped_at = world.popped_at.get(successor.job_id, successor.dispatched_at)
+            cleared_at = successor.cleared_at if successor.cleared_at is not None else successor.dispatched_at
+            boundaries = (
+                (HandoffGapSegment.NOT_POPPED, popped_at),
+                (HandoffGapSegment.DISPATCH_HELD, successor.dispatched_at),
+                (HandoffGapSegment.CLEARANCE_HELD, cleared_at),
+                (HandoffGapSegment.LOADING, start),
+            )
+            segment_start = gap_start
+            for segment, segment_end in boundaries:
+                clipped_end = min(max(segment_end, segment_start), start)
+                totals[segment] += clipped_end - segment_start
+                segment_start = clipped_end
+    return totals
 
 
 def assert_duty_floor(world: _DispatchWorld, floor: float, *, context: str) -> None:

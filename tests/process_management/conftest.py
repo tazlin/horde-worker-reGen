@@ -429,6 +429,7 @@ def make_job_pop_response(
     post_processing: list[str] | None = None,
     workflow: str | None = None,
     use_nsfw_censor: bool = False,
+    hires_fix: bool = False,
 ) -> ImageGenerateJobPopResponse:
     """Create a real ImageGenerateJobPopResponse for testing."""
     job_id = uuid.uuid4()
@@ -449,6 +450,8 @@ def make_job_pop_response(
         "skipped": {},
         "source_processing": "txt2img",
     }
+    if hires_fix:
+        data["payload"]["hires_fix"] = True  # pyrefly: ignore - validated by pydantic
     if workflow is not None:
         data["payload"]["workflow"] = workflow  # pyrefly: ignore - validated by pydantic
     if post_processing is not None:
