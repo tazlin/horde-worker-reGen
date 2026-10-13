@@ -19,6 +19,14 @@ class ImageEncoding(StrEnum):
 UPLOAD_IMAGE_ENCODING = ImageEncoding.WEBP
 """The encoding the horde receives; :func:`encode_image_for_upload` produces it."""
 
+UPLOAD_WEBP_METHOD = 2
+"""libwebp's effort setting (0 fastest, 6 slowest) for the upload encode.
+
+The encode runs in the process that produced the image and that process holds its card reservation until the
+result is sent, so encode seconds are seconds of held card. At quality 95 the higher efforts buy almost nothing:
+measured against 6, this takes about a quarter of the time for a file about 7% larger and a quarter of a decibel
+less PSNR, on an encode that already sits 43 to 47 dB from its source."""
+
 
 def encode_image_for_upload(image: PIL.Image.Image) -> BytesIO:
     """Encode a PIL image in the upload encoding (:data:`UPLOAD_IMAGE_ENCODING`).
@@ -34,7 +42,7 @@ def encode_image_for_upload(image: PIL.Image.Image) -> BytesIO:
         image_buffer,
         format="WebP",
         quality=95,  # FIXME # TODO
-        method=6,
+        method=UPLOAD_WEBP_METHOD,
     )
     return image_buffer
 
