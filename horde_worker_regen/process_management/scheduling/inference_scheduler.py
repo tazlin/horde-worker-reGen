@@ -8859,8 +8859,12 @@ class InferenceScheduler:
         residency advertises its model alone, so the next job is another whole-card job on the same lane, and a
         lane context restored between two of them is reclaimed again before the next can clear. The ladder keeps
         the obligation and restores the lane once the residency has drained.
+
+        The stand-down holds only while nothing is waiting for or on the post-processing lane. Jobs in that backlog
+        are the residency's own and cannot drain without the lane, so refusing the restore would keep the residency
+        from ever draining.
         """
-        if self._whole_card_ledger.any_held():
+        if self._whole_card_ledger.any_held() and self._job_tracker.post_processing_backlog_depth == 0:
             return False
         return self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 
@@ -8879,9 +8883,10 @@ class InferenceScheduler:
     def restore_utilities_lane(self, device_index: int | None) -> bool:
         """Restart a ladder-paused image-utilities lane once the card has recovered (reclaim-ladder actuator).
 
-        Stands down under a held whole-card residency for the reason :meth:`restore_post_process_lane` gives.
+        Stands down under a held whole-card residency, and restores under one while post-processing waits, for
+        the reasons :meth:`restore_post_process_lane` gives.
         """
-        if self._whole_card_ledger.any_held():
+        if self._whole_card_ledger.any_held() and self._job_tracker.post_processing_backlog_depth == 0:
             return False
         return self._process_lifecycle.restore_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 

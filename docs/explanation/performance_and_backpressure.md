@@ -1026,7 +1026,10 @@ When a card's episode ends and it returns fully **HEALTHY**
 (the actions are held through the intermediate PRESSURE band, since restarting a CUDA context while the card
 is still tight would risk re-crossing the cliff), the ladder **unwinds** its own **restore obligations** in
 reverse order (LIFO): the last thing taken is the first given back. Safety is excluded from the unwind on
-purpose, because the placement reconciler owns its restore.
+purpose, because the placement reconciler owns its restore. The post-processing and image-utilities lane
+restores stand down while a whole-card residency holds the card, since a context restored between two of its
+jobs is reclaimed again before the next clears. They proceed under the residency once post-processing is
+waiting for or on the lane, because that backlog is the residency's own and cannot drain without it.
 
 The **live-context reduction** the per-cycle admission path takes (the arbiter's `REDUCE_LIVE_CONTEXTS`
 actuation, which stops idle inference processes so the VRAM a live process retains for its context returns to

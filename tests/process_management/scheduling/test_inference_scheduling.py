@@ -3480,7 +3480,25 @@ class TestACycleBothPreloadsAndDispatches:
 
 
 class TestLadderLaneRestoreUnderWholeCard:
-    """A ladder-paused service lane is not restored while a whole-card residency holds the card."""
+    """A ladder-paused service lane is not restored under a held whole-card residency unless post-processing waits."""
+
+    @pytest.mark.parametrize("restore", ["restore_utilities_lane", "restore_post_process_lane"])
+    async def test_lane_restore_proceeds_under_a_residency_while_post_processing_waits(self, restore: str) -> None:
+        """The residency's own jobs wait on the lane, so standing down would hold the residency open forever."""
+        job_tracker = JobTracker()
+        await _queue_pending_chain(job_tracker)
+        sched = _make_inference_scheduler(job_tracker=job_tracker)
+        lifecycle_restore = Mock(return_value=True)
+        lifecycle_name = {
+            "restore_utilities_lane": "restore_utilities_off_gpu",
+            "restore_post_process_lane": "restore_post_process_off_gpu",
+        }[restore]
+        setattr(sched._process_lifecycle, lifecycle_name, lifecycle_restore)
+        sched._whole_card_ledger.any_held = Mock(return_value=True)  # type: ignore[method-assign]
+        assert job_tracker.post_processing_backlog_depth == 1
+
+        assert getattr(sched, restore)(0) is True
+        lifecycle_restore.assert_called_once()
 
     @pytest.mark.parametrize("restore", ["restore_utilities_lane", "restore_post_process_lane"])
     def test_lane_restore_stands_down_while_a_residency_is_held(self, restore: str) -> None:
