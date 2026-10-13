@@ -4600,7 +4600,7 @@ class InferenceScheduler:
                         hold = SlotDutyBucket.UNEXPLAINED
             self._slot_duty_current_hold = hold
             self._slot_duty.observe(
-                time.time(),
+                self._clock(),
                 capacity=capacity,
                 busy_slots=busy,
                 waiting_jobs=max(waiting, 0),
@@ -4621,7 +4621,7 @@ class InferenceScheduler:
         self._slot_duty_current_hold = hold
 
         self._slot_duty.observe(
-            time.time(),
+            self._clock(),
             capacity=capacity,
             busy_slots=busy,
             waiting_jobs=max(waiting, 0),
