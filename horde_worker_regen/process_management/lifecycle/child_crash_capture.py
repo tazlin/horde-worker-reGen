@@ -24,6 +24,16 @@ This module installs two cross-platform, loguru-independent backstops so that wi
 Both are deliberately stdlib-only and swallow their own errors: crash capture must never be the reason a
 worker fails to start, and it must keep working on Windows and Linux alike (faulthandler and plain file
 writes behave the same on both; there are no POSIX-only paths here).
+
+On Windows, :func:`enable_child_faulthandler` also clears the process's fault dialog. An unhandled native
+fault (an access violation in a torch kernel) otherwise ends in a modal "Application Error" box when
+Windows Error Reporting cannot run, which is exactly the case under host commit exhaustion, the condition
+most likely to have caused the fault: the faulting thread then blocks on the box with the process's whole
+commit charge still held, the parent only learns of the death from its step timeout minutes later, and the
+host stays pinned at zero commit for the whole wait. With the dialog cleared the process terminates on the
+fault with its exception code, which the parent reads as a crash at once. faulthandler's dump is written
+first either way. The error mode is inherited by every process this one spawns, so the main process sets
+it too.
 """
 
 from __future__ import annotations
@@ -100,9 +110,28 @@ def enable_child_faulthandler(role: str) -> None:
         role: Short identifier for the writing process (e.g. ``"main"``, ``"inference_0"``), used to
             name the per-process file so concurrent children never write to the same handle.
     """
+    suppress_native_fault_dialog()
     if not _arm_faulthandler(role):
         return
     _start_fault_file_watch(role)
+
+
+def suppress_native_fault_dialog() -> None:
+    """Make an unhandled native fault terminate this process instead of blocking on a Windows dialog.
+
+    The box is the kernel's fallback when Windows Error Reporting cannot run, and it holds the faulting thread
+    (and so the process's commit charge) until an operator dismisses it. A python started from a shell runs
+    with the box enabled (``SEM_NOGPFAULTERRORBOX`` clear); the bits are added to the mode the process already
+    has, so nothing a launcher set is removed. A no-op off Windows, and any failure is swallowed.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import msvcrt
+
+        msvcrt.SetErrorMode(msvcrt.GetErrorMode() | msvcrt.SEM_FAILCRITICALERRORS | msvcrt.SEM_NOGPFAULTERRORBOX)
+    except Exception:  # noqa: BLE001 - crash capture must never block the worker from starting
+        return
 
 
 def _fault_path(role: str) -> Path:

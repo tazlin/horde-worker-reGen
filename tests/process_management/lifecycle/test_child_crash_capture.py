@@ -204,6 +204,33 @@ def test_enable_child_faulthandler_opens_file_and_enables(monkeypatch: pytest.Mo
         faulthandler.disable()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the fault dialog is a Windows error-mode setting")
+def test_enable_child_faulthandler_clears_the_windows_fault_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A native fault terminates the process rather than blocking on the kernel's fault box.
+
+    The box holds the faulting thread, and with it the process's commit charge, until an operator dismisses it;
+    under commit exhaustion Windows Error Reporting cannot run and the box is what appears.
+    """
+    import msvcrt
+
+    monkeypatch.chdir(tmp_path)
+    original = msvcrt.GetErrorMode()
+    # The mode is inherited from the launcher, so a test runner may already carry the bit; clear it first.
+    msvcrt.SetErrorMode(original & ~(msvcrt.SEM_NOGPFAULTERRORBOX | msvcrt.SEM_FAILCRITICALERRORS))
+    try:
+        assert not msvcrt.GetErrorMode() & msvcrt.SEM_NOGPFAULTERRORBOX
+        enable_child_faulthandler("inference_0")
+        mode = msvcrt.GetErrorMode()
+        assert mode & msvcrt.SEM_NOGPFAULTERRORBOX
+        assert mode & msvcrt.SEM_FAILCRITICALERRORS
+    finally:
+        faulthandler.disable()
+        msvcrt.SetErrorMode(original)
+
+
 def test_enable_child_faulthandler_writes_a_dated_banner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Each arming writes an identifying, dated banner so a dump can be attributed to a launch.
 

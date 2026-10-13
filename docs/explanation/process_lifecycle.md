@@ -53,6 +53,18 @@ launch identifier, name this one. The file is appended across launches, and a
 replaced child can still write to it after its successor started, so an older or
 foreign record is never attributed to the slot being replaced.
 
+A native fault (an access violation inside a torch kernel) is dumped to
+`logs/bridge_<role>.faulthandler` and must end the process at once. On Windows the
+same call that arms that dump (`child_crash_capture.enable_child_faulthandler`) clears
+the process's fault dialog: when Windows Error Reporting cannot run, which is the case
+under host commit exhaustion, the kernel otherwise shows a modal "Application Error"
+box that holds the faulting thread, and with it the process's whole commit charge,
+until an operator dismisses it. The parent would then learn of the death only from
+its step timeout, with the host pinned at zero commit for the whole wait. With the
+dialog cleared the process exits with its exception code (`0xC0000005`), which the
+parent reads as a crash on its next tick. Children inherit the mode from the main
+process and also set it themselves.
+
 Inference processes are started up to `max_inference_processes` (derived
 `queue_size + max_threads`). Safety processes are started up to
 `max_safety_processes` (typically 1).
