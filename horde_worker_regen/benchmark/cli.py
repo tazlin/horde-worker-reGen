@@ -614,8 +614,9 @@ def _download_category_models(
     from horde_worker_regen.benchmark.download_progress import DownloadEvent
     from horde_worker_regen.model_download_core import ModelProgress, ensure_models_present
 
+    SharedModelManager(do_not_load_model_mangers=True)
     SharedModelManager.load_model_managers()
-    manager = getattr(SharedModelManager.manager, category, None)
+    manager = SharedModelManager.manager.get_model_manager_instance(category)
     if manager is None:
         logger.error(f"Failed to load the {category!r} model manager; cannot download {model_names}.")
         return len(model_names)

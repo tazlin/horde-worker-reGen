@@ -58,11 +58,27 @@ def _record(base_url: str) -> ImageGenerationModelRecord:
 
 def _inject_fake_hordelib(monkeypatch: pytest.MonkeyPatch, compvis: RealDownloadCompVis) -> None:
     """Make ``from hordelib.api import SharedModelManager`` resolve to a fake backed by *compvis*."""
+
+    class _FakeModelManager:
+        """Stands in for hordelib's ``ModelManager``, the object ``SharedModelManager.manager`` holds."""
+
+        def get_model_manager_instance(self, category: str) -> RealDownloadCompVis | None:
+            return compvis if category == "compvis" else None
+
+    class _FakeSharedModelManager:
+        """Keeps the real singleton's contract: ``manager`` exists only once the class has been constructed."""
+
+        manager: _FakeModelManager
+
+        def __init__(self, do_not_load_model_mangers: bool = True) -> None:
+            type(self).manager = _FakeModelManager()
+
+        @classmethod
+        def load_model_managers(cls, *args: object, **kwargs: object) -> None:
+            _ = cls.manager
+
     fake_api = types.ModuleType("hordelib.api")
-    fake_api.SharedModelManager = SimpleNamespace(  # type: ignore[attr-defined]
-        load_model_managers=lambda *args, **kwargs: None,
-        manager=SimpleNamespace(compvis=compvis),
-    )
+    fake_api.SharedModelManager = _FakeSharedModelManager  # type: ignore[attr-defined]
     hordelib_stub = sys.modules.get("hordelib") or types.ModuleType("hordelib")
     monkeypatch.setattr(hordelib_stub, "api", fake_api, raising=False)
     monkeypatch.setitem(sys.modules, "hordelib", hordelib_stub)
