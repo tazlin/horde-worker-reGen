@@ -416,3 +416,56 @@ def test_a_demotion_that_runs_out_of_device_memory_leaves_the_child_demoted_and_
     assert child.interrogator.clip_offloaded is True
     assert child.interrogator.clip_model.device == "cpu"
     assert child.events[-1] == "memory_report:vram=True"
+
+
+def _evaluate_on_cpu(child: _Child) -> GenerationID:
+    """Hand the child one job the parent has marked for the CPU."""
+    job_id = GenerationID(root=uuid.uuid4())
+    child.send(
+        HordeSafetyControlMessage(
+            control_flag=HordeControlFlag.EVALUATE_SAFETY,
+            job_id=job_id,
+            prompt="a test prompt",
+            censor_nsfw=False,
+            sfw_worker=False,
+            images_bytes=[make_dummy_png_bytes()],
+            horde_model_info=None,
+            evaluate_on_cpu=True,
+        ),
+    )
+    return job_id
+
+
+def test_a_check_the_parent_sends_to_the_cpu_never_tries_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The check runs once, on the CPU, and the result says so. The child is an on-GPU child again after."""
+    child = _Child(monkeypatch)
+
+    job_id = _evaluate_on_cpu(child)
+
+    assert child.process._end_process is False
+    assert child.checks() == ["check:cpu:clip_on_cpu"]
+    results = child.results()
+    assert [result.job_id for result in results] == [job_id]
+    assert results[0].evaluated_on_cpu is True
+    assert child.residency.resident is True
+    assert child.interrogator.device == "cuda"
+
+
+def test_a_device_check_reports_that_it_ran_on_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A check that ran on the device is not counted as a CPU check, including the one after a CPU check."""
+    child = _Child(monkeypatch)
+
+    _evaluate_on_cpu(child)
+    child.evaluate()
+
+    assert [result.evaluated_on_cpu for result in child.results()] == [True, False]
+
+
+def test_a_fallen_back_check_reports_that_it_ran_on_the_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A check the device refused is reported as a CPU check, so its duration feeds the CPU average."""
+    child = _Child(monkeypatch)
+    child.checker.errors = [RuntimeError(_DEVICE_OOM_MESSAGE)]
+
+    child.evaluate()
+
+    assert child.results()[0].evaluated_on_cpu is True

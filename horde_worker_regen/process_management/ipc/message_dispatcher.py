@@ -78,7 +78,11 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     plausible_sampling_peak_mb,
     post_process_footprint_key,
 )
-from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW, WorkloadKind
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    POST_PROCESS_RESERVE_FLOW,
+    SAFETY_CHECK_FLOW,
+    WorkloadKind,
+)
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.telemetry_spans import (
     inference_duration_histogram,
@@ -1199,6 +1203,7 @@ class MessageDispatcher:
         self._observe_chain_peak(message)
         self._observe_resident_footprint(message)
         self._observe_safety_footprint(message)
+        self._observe_safety_check_peak(message)
 
     def _note_clearance_wait_entered(self, message: HordeProcessMemoryMessage) -> None:
         """Stamp the child's clearance wait entry on its record, at the instant the child sampled the report.
@@ -1496,6 +1501,29 @@ class MessageDispatcher:
             stage=FootprintStage.SAFETY,
         )
         store.observe_peak(key, platform_context_constant_mb() + float(allocated_mb))
+
+    def _observe_safety_check_peak(self, message: HordeProcessMemoryMessage) -> None:
+        """Record the safety process's device footprint at the peak of an evaluation.
+
+        The allocator's peak counter covers the interval since the child's previous report, and the child
+        reports as each evaluation ends, so the report that follows a check carries that check's high
+        water. Its excess over the at-rest footprint is the room a check needs while it runs, which the
+        scheduler books before sending the next one.
+        """
+        store = self._footprint_store
+        peak_reserved_mb = message.process_peak_reserved_mb
+        if store is None or peak_reserved_mb is None or peak_reserved_mb <= 0:
+            return
+        process_info = self._process_map.get(message.process_id)
+        if process_info is None or process_info.process_type is not HordeProcessType.SAFETY:
+            return
+        key = FootprintKey(
+            model_baseline=SAFETY_PROCESS_BASELINE,
+            resolution_bucket=None,
+            platform=sys.platform,
+            stage=FootprintStage.SAFETY_CHECK,
+        )
+        store.observe_peak(key, platform_context_constant_mb() + float(peak_reserved_mb))
 
     def _handle_process_state_change(self, message: HordeProcessStateChangeMessage) -> None:
         """Handle a process state change message."""
@@ -2227,6 +2255,10 @@ class MessageDispatcher:
         safety_elapsed = message.time_elapsed
         if safety_elapsed is not None:
             self._state.record_safety_duration(safety_elapsed)
+            if message.evaluated_on_cpu:
+                self._state.record_safety_cpu_duration(safety_elapsed)
+        # The check has run, so the room booked for it on the card is no longer owed.
+        self._reserve_ledger.release(SAFETY_CHECK_FLOW, str(message.job_id))
 
         completed_job_info = await self._job_tracker.take_being_safety_checked(message.job_id)
 

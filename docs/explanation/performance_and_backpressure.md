@@ -163,11 +163,14 @@ card for a whole-card residency and does not gate this step. Demoted weights ret
 VRAM arbiter admits safety's load, with no restore dwell, because the demotion dwell already bounds how often
 the weights can flip. A whole-card residency or the reclaim ladder still moves the process directly.
 
-Neither step reserves the memory a check needs while it runs, so a check can still find the card full. The
-safety process then releases what it holds on the device and reruns that one job on the CPU without ending.
-The job costs a CPU check instead of a GPU one, and that duration enters the measured safety average the
-backlog cap above is derived from. See
-[Resilience and recovery](resilience_and_recovery.md#a-safety-check-that-runs-out-of-device-memory).
+A check needs more of the card while it runs than the safety process holds at rest. That growth is booked
+before the check is sent, and a check whose growth does not fit waits with the booking standing, which keeps
+new samplers out of that room until the check has run (see
+[VRAM arbiter](vram_arbiter.md)). A check that has waited as long as a CPU check takes is sent to the CPU. A
+check that finds the card full anyway releases what it holds on the device and reruns on the CPU without
+ending the process (see
+[Resilience and recovery](resilience_and_recovery.md#a-safety-check-that-runs-out-of-device-memory)). A CPU
+check's duration enters the measured safety average the backlog cap above is derived from.
 
 Throttling belongs to this backlog gate alone. The `no_safety_process` pop gate counts a safety process
 that is busy with a check as serving, so intake continues behind it up to the

@@ -265,6 +265,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import
     ReuseCreditDiscrepancy,
     ReuseCreditKind,
 )
+from horde_worker_regen.process_management.scheduling.ledgers.safety_check_window import SafetyCheckWindow
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     SAFETY_BACKLOG_PRIORITY_DEPTH,
     SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR,
@@ -8027,3 +8028,128 @@ async def test_z_defect_reinjection_nothing_is_offered_behind_a_held_head(
     assert run.head_held_with_followers_queued and run.chain_released_at is not None
     started = _followers_sampling_before(run, run.chain_released_at)
     assert not started, f"no follower may sample before the chain releases; {started} did. {run.world.state_dump()}"
+
+
+# A safety check sent in the same pass as a sampler's clearance
+
+_SAFETY_WINDOW_GROWTH_MB = 5000.0
+"""How much more than it holds at rest the modelled safety process needs on the card while a check runs.
+
+Sized against this row's card and jobs: more than the card has free once the large job's successor is cleared,
+and less than it has free before that clearance. So a check sent in the same pass as the clearance fits when it
+is sent and no longer fits when its allocations land."""
+
+_SAFETY_WINDOW_JOBS = 8
+_SAFETY_WINDOW_MAX_TICKS = 700
+
+
+@dataclass(frozen=True)
+class _SafetyWindowRun:
+    """One run of the safety-window row and the readings its assertions need."""
+
+    world: _DispatchWorld
+    job_count: int
+
+
+async def _run_safety_checks_beside_a_cleared_sampler() -> _SafetyWindowRun:
+    """Finish jobs on a 24 GB card where each result's safety check is sent as the next sampler is cleared.
+
+    A large-batch Krea2 job and three small SDXL jobs repeat on two lanes. When a job finishes, its check is
+    sent and the lane's next job is cleared in the same control-loop pass. The check's allocations reach the
+    card a tick later, after the cleared sampler's.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=2,
+        queue_depth=_SAFETY_WINDOW_JOBS + 4,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        service_contexts=True,
+        tick_seconds=1.0,
+        safety_check_growth_mb=_SAFETY_WINDOW_GROWTH_MB,
+    )
+    for index in range(_SAFETY_WINDOW_JOBS):
+        if index % 4 == 0:
+            job = make_job_pop_response(
+                _KREA2.name,
+                width=_CHAIN_COPY_HEAD_SIDE,
+                height=_CHAIN_COPY_HEAD_SIDE,
+                ddim_steps=40,
+                n_iter=_CHAIN_COPY_HEAD_BATCH,
+            )
+        else:
+            job = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=8)
+        await world.pop(job)
+    for _ in range(_SAFETY_WINDOW_MAX_TICKS):
+        await world.step()
+        if world.submitted_jobs >= _SAFETY_WINDOW_JOBS:
+            break
+    return _SafetyWindowRun(world=world, job_count=_SAFETY_WINDOW_JOBS)
+
+
+def _describe_safety_checks(world: _DispatchWorld) -> str:
+    """Each modelled check as (sent, landed, on CPU, free as it landed, starved), for an assertion message."""
+    return str(
+        [
+            (check.started_tick, check.charged_tick, check.on_cpu, check.free_before_mb, check.starved)
+            for check in world.safety_checks
+        ],
+    )
+
+
+async def test_z_a_safety_check_keeps_its_room_from_a_sampler_cleared_beside_it() -> None:
+    """A safety check's growth is booked when it is sent, so a sampler cleared in the same pass waits for it.
+
+    The failure this encodes: an on-GPU safety process holds its weights at rest and needs more for the length
+    of a check. Nothing reserved the difference, and a check's allocations reach the card after it is sent, so
+    a sampler cleared in the same pass was priced against room the check was about to take. The check then
+    found the card full. The row asserts no check's growth lands on a card with less free memory than that,
+    every job is submitted, the card is never committed past its total, and every check runs on the device.
+    """
+    run = await _run_safety_checks_beside_a_cleared_sampler()
+    world = run.world
+
+    context = "safety checks sent as the next sampler is cleared"
+    assert world.submitted_jobs == run.job_count, (
+        f"{context}: {world.submitted_jobs} of {run.job_count} jobs were submitted. "
+        f"checks={_describe_safety_checks(world)} {world.state_dump()}"
+    )
+    starved = [check for check in world.safety_checks if check.starved]
+    assert not starved, (
+        f"{context}: {len(starved)} device check(s) landed without room for their "
+        f"{_SAFETY_WINDOW_GROWTH_MB:.0f}MB. checks={_describe_safety_checks(world)} {world.state_dump()}"
+    )
+    on_device = [check for check in world.safety_checks if not check.on_cpu]
+    assert len(on_device) == len(world.safety_checks) == run.job_count, (
+        f"{context}: {len(on_device)} of {len(world.safety_checks)} checks ran on the device. "
+        f"checks={_describe_safety_checks(world)} {world.state_dump()}"
+    )
+    assert not world.card_overcommits, (
+        f"{context}: the card was committed past its total at {world.card_overcommits}. {world.state_dump()}"
+    )
+    assert not world.structural_queue_wedges, (
+        f"{context}: the queue deadlock stood the structural-wedge horizon on tick(s) "
+        f"{world.structural_queue_wedges}. {world.state_dump()}"
+    )
+    _assert_no_lane_sampled_unpriced(world, context=context)
+
+
+async def test_z_defect_reinjection_an_unbooked_safety_check_finds_the_card_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With every check sent at once and nothing booked for it, a check lands on a card with no room.
+
+    The defect is reinjected only at the parent's window, which then opens for every check and books nothing.
+    The row asserts a check's growth lands without room and the card is committed past its total.
+    """
+    monkeypatch.setattr(InferenceScheduler, "safety_check_window", lambda _self, _job_id: SafetyCheckWindow.OPEN)
+    run = await _run_safety_checks_beside_a_cleared_sampler()
+    world = run.world
+
+    starved = [check for check in world.safety_checks if check.starved]
+    assert starved and world.card_overcommits, (
+        "without the window a check must land without room and over-commit the card; "
+        f"overcommits={world.card_overcommits} checks={_describe_safety_checks(world)} {world.state_dump()}"
+    )

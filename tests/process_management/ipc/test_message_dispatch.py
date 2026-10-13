@@ -904,6 +904,45 @@ class TestHandleSafetyResult:
         assert job_info in job_tracker.jobs_pending_submit
         assert job_info not in job_tracker.jobs_being_safety_checked
 
+    async def test_safety_result_releases_the_room_booked_for_its_check(self) -> None:
+        """The verdict ends the check, so its booking on the card is dropped and a CPU check is measured."""
+        from horde_worker_regen.process_management.scheduling.workload_flow import SAFETY_CHECK_FLOW
+
+        job_tracker = JobTracker()
+        job = Mock()
+        job.id_ = "window-test-id"
+        image_result = Mock()
+        image_result.generation_faults = []
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        job_info.job_image_results = [image_result]
+        await move_job_to_being_safety_checked_async(job_tracker, job_info)
+        message_dispatcher = _make_dispatcher(job_tracker=job_tracker)
+        ledger = message_dispatcher._reserve_ledger
+        ledger.set_planned(
+            SAFETY_CHECK_FLOW,
+            "window-test-id",
+            vram_mb=2000.0,
+            target_process_id=0,
+            reserved_at_admit_mb=0.0,
+        )
+        assert ledger.planned_charge_for_unit(SAFETY_CHECK_FLOW, "window-test-id", {}) == 2000.0
+        message_dispatcher._state.avg_safety_cpu_seconds = 0.0
+
+        safety_eval = Mock()
+        safety_eval.failed = False
+        safety_eval.replacement_image_bytes = None
+        safety_eval.is_csam = False
+        safety_eval.is_nsfw = False
+        safety_eval.aesthetic_score = None
+
+        await message_dispatcher._handle_safety_result(
+            Mock(job_id=job.id_, safety_evaluations=[safety_eval], time_elapsed=4.0, evaluated_on_cpu=True),
+        )
+
+        assert ledger.planned_charge_for_unit(SAFETY_CHECK_FLOW, "window-test-id", {}) == 0.0
+        assert message_dispatcher._state.avg_safety_cpu_seconds == 4.0
+
     async def test_a_censored_image_is_replaced_whole_with_its_own_encoding(self) -> None:
         """The censor replacement is PNG, so the replaced result must not keep the checked image's encoding.
 

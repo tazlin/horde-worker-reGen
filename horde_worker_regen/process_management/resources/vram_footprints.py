@@ -280,6 +280,11 @@ class FootprintStage(enum.StrEnum):
     Prices the non-weight term of a partial-load seat."""
     DECODE = "decode"
     """The VAE-decode stage."""
+    SAFETY_CHECK = "safety_check"
+    """The safety process's whole device footprint at the peak of an evaluation: its context, its resident
+    weights and the evaluation's transient models and activations. Kept apart from :attr:`SAFETY`, which is
+    the at-rest footprint, because the difference between the two is the room a check needs for as long as
+    it runs."""
     ENCODE = "encode"
     """The text-encode (or VAE-encode) stage."""
     POST_PROCESS = "post_process"

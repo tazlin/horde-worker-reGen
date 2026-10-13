@@ -193,6 +193,8 @@ class VramRequestKind(StrEnum):
     """A post-processing chain on the dedicated post-processing lane."""
     SAFETY_LOAD = "safety_load"
     """A safety-model load onto the GPU safety context."""
+    SAFETY_CHECK = "safety_check"
+    """One safety evaluation's transient growth on an on-GPU safety process already holding its weights."""
 
 
 class LaneRungGrade(StrEnum):

@@ -1806,6 +1806,7 @@ class HordeWorkerProcessManager:
             runtime_config=self._runtime_config,
             state=self._state,
             model_metadata=self._model_metadata,
+            safety_check_window=lambda job_id: self._inference_scheduler.safety_check_window(job_id),
         )
 
         self._shutdown_manager = ShutdownManager(
@@ -3043,7 +3044,12 @@ class HordeWorkerProcessManager:
         self._inference_scheduler.unload_models_from_vram(process_with_model)
 
     async def start_evaluate_safety(self) -> None:
-        """Start evaluating the safety of the next job pending a safety check, if any."""
+        """Start evaluating the safety of the next job pending a safety check, if any.
+
+        The arbiter's device picture is refreshed first, because the check's room on the card is priced
+        against it.
+        """
+        self._begin_vram_arbiter_cycle()
         await self._safety_orchestrator.start_evaluate_safety()
 
     async def start_post_processing(self) -> None:

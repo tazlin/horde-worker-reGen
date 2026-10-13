@@ -39,6 +39,7 @@ from __future__ import annotations
 import math
 import multiprocessing
 import queue
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -116,6 +117,9 @@ from horde_worker_regen.process_management.resources.run_metrics import (
 )
 from horde_worker_regen.process_management.resources.vram_arbiter import MeasuredVramSnapshot
 from horde_worker_regen.process_management.resources.vram_footprints import (
+    SAFETY_PROCESS_BASELINE,
+    FootprintKey,
+    FootprintStage,
     LearnedFootprintStore,
     learned_post_process_vram_mb,
 )
@@ -128,10 +132,14 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import offer_under_pop_claim
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.ledgers.safety_check_window import SafetyCheckWindow
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SAFETY_GPU_LOAD_CHARGE_MB
 from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
-from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    POST_PROCESS_RESERVE_FLOW,
+    SAFETY_CHECK_FLOW,
+)
 from horde_worker_regen.process_management.workers import post_process_orchestrator
 from tests.process_management.conftest import (
     make_mock_bridge_data,
@@ -468,6 +476,27 @@ class _StagedWeights:
     load: _LoadPhase
     loaded_until: float
     """The world clock at which the staged load finishes."""
+
+
+@dataclass
+class _SafetyCheck:
+    """One modelled safety check, from the tick it started to the tick its verdict landed."""
+
+    job_id: str
+    job_info: HordeJobInfo
+    started_tick: int
+    charge_at_tick: int
+    """The tick the check's growth reaches the card, some time after the parent sent it."""
+    finish_at_tick: int
+    on_cpu: bool
+    """Whether the parent sent it to the CPU, where it charges the card nothing."""
+    free_before_mb: float | None = None
+    """The card's true free memory the instant before the check's growth landed, or None until it has."""
+    starved: bool = False
+    """Whether a device check's growth landed on a card with less free memory than that, which a live child
+    meets as an allocation failure."""
+    charged_tick: int | None = None
+    finished_tick: int | None = None
 
 
 @dataclass
@@ -849,6 +878,10 @@ class _DispatchWorld:
         staged_encode_mb_by_model: Mapping[str, float] | None = None,
         service_lane_exit_seconds: float | None = None,
         foreign_vram_mb_by_tick: Mapping[int, float] | None = None,
+        safety_check_growth_mb: float | None = None,
+        safety_check_ticks: int = 1,
+        safety_check_allocation_lag_ticks: int = 1,
+        safety_cpu_check_ticks: int = 3,
     ) -> None:
         """Build the process pool, the model map, and the scheduler for one row.
 
@@ -989,6 +1022,18 @@ class _DispatchWorld:
                 whole window and the lifecycle reports a placement transition pending throughout it. Zero
                 collapses the flip to an instant, which no worker's safety process ever does, and leaves the
                 placement policy free to decide its next flip on the cycle after the last one.
+            safety_check_growth_mb: How much more than its at-rest footprint the safety process holds on the
+                card for the length of a check. None keeps the hand-driven safety stage, which passes every
+                finished job on the tick it arrives and charges nothing. Set, one check runs at a time for
+                ``safety_check_ticks``, the parent's ``InferenceScheduler.safety_check_window`` is asked before
+                each, safety reports its at-rest weights as its reservation, and the footprint store is told
+                the check's peak. A device check that starts with less free memory than it grows by is
+                recorded as starved in ``safety_checks``. Needs ``service_contexts``.
+            safety_check_ticks: How long a modelled device check holds its growth.
+            safety_check_allocation_lag_ticks: How long after the parent sends a check its growth reaches the
+                card. A child allocates after it has read the message, so an admission priced in the same
+                control-loop pass as the send reads a card that does not show the check yet.
+            safety_cpu_check_ticks: How long a modelled check sent to the CPU takes.
             safety_load_transient_mb: How much more than its at-rest footprint safety charges the card while a
                 restore is materialising. The classifier weights are read and copied before the process settles,
                 so the peak a restore imposes is above the figure a fit priced, and a restore onto a card with
@@ -1077,6 +1122,14 @@ class _DispatchWorld:
         self.tick_seconds = tick_seconds
         self.safety_readiness_seconds = safety_readiness_seconds
         self.safety_load_transient_mb = safety_load_transient_mb
+        if safety_check_growth_mb is not None and not service_contexts:
+            raise ValueError("a modelled safety check needs the safety process on the card (service_contexts)")
+        self.safety_check_growth_mb = safety_check_growth_mb
+        self.safety_check_ticks = safety_check_ticks
+        self.safety_check_allocation_lag_ticks = safety_check_allocation_lag_ticks
+        self.safety_cpu_check_ticks = safety_cpu_check_ticks
+        self.safety_checks: list[_SafetyCheck] = []
+        """Every modelled safety check, in the order it started, kept after its verdict."""
         self.closed_loop = closed_loop
         self.clearance_lease = clearance_lease
         if clearance_lease and not closed_loop:
@@ -1551,6 +1604,18 @@ class _DispatchWorld:
         )
         self._dispatcher.set_footprint_store(self._footprint_store)
         self._scheduler.set_footprint_store(self._footprint_store)
+        if self.safety_check_growth_mb is not None:
+            # A live safety child's memory reports carry each check's allocator peak, which is how the parent
+            # comes to know what a check needs.
+            self._footprint_store.observe_peak(
+                FootprintKey(
+                    model_baseline=SAFETY_PROCESS_BASELINE,
+                    resolution_bucket=None,
+                    platform=sys.platform,
+                    stage=FootprintStage.SAFETY_CHECK,
+                ),
+                SAFETY_GPU_LOAD_CHARGE_MB + self.safety_check_growth_mb,
+            )
         self._lane_peak_mb: dict[int, float] = {}
         """Per lane, the allocator high-water since its last memory report: what a child's peak counter holds."""
         self._lane_model_state_seen: dict[int, tuple[str | None, ModelLoadState | None]] = {}
@@ -1756,7 +1821,21 @@ class _DispatchWorld:
                     # A restore is still materialising: the classifier weights are being read and copied, so the
                     # card carries the load peak rather than the at-rest footprint until the process settles.
                     charge += self.safety_load_transient_mb
+                charge += self._safety_check_growth_on_card_mb()
         return charge
+
+    def _safety_check_running(self) -> _SafetyCheck | None:
+        """The modelled safety check in flight, or None when the safety process is free."""
+        if self.safety_checks and self.safety_checks[-1].finished_tick is None:
+            return self.safety_checks[-1]
+        return None
+
+    def _safety_check_growth_on_card_mb(self) -> float:
+        """What a device check in flight adds to safety's charge on its card."""
+        running = self._safety_check_running()
+        if running is None or running.on_cpu or running.charged_tick is None or self.safety_check_growth_mb is None:
+            return 0.0
+        return self.safety_check_growth_mb
 
     def safety_is_off_gpu(self) -> bool:
         """Whether the safety context is currently paused off the card."""
@@ -2202,6 +2281,15 @@ class _DispatchWorld:
             ):
                 # Safety's classifier weights sit beside its context, and a live safety child reports them.
                 reported_mb += SAFETY_GPU_LOAD_CHARGE_MB - _MARGINAL_CONTEXT_MB
+            elif (
+                lane.process_id == _SAFETY_PROCESS_ID
+                and self.safety_check_growth_mb is not None
+                and self._safety_context_on_card()
+            ):
+                # The same report, taken against the context figure the parent subtracts when it prices a
+                # check, plus the growth of a check in flight.
+                reported_mb += SAFETY_GPU_LOAD_CHARGE_MB - self._scheduler.resolved_context_constant_mb()
+                reported_mb += self._safety_check_growth_on_card_mb()
             lane.process_reserved_mb = int(max(0.0, reported_mb))
             self._lane_peak_mb[lane.process_id] = max(self._lane_peak_mb.get(lane.process_id, 0.0), reported_mb)
         if self.host_ram is not None and publish_ram:
@@ -2823,13 +2911,68 @@ class _DispatchWorld:
 
         Draining is what keeps a finished job from reading as a safety backlog, which the residency
         convergence treats as work not to disturb; leaving it queued would make the queue's own completions
-        look like a reason to hold the card.
+        look like a reason to hold the card. With ``safety_check_growth_mb`` set the stage is modelled instead
+        (:meth:`_advance_safety_check`).
         """
+        if self.safety_check_growth_mb is not None:
+            await self._advance_safety_check(self.safety_check_growth_mb)
+            return
         for job_info in list(self._job_tracker.jobs_pending_safety_check):
             await self._job_tracker.begin_safety_check(job_info)
             await self._job_tracker.queue_for_submit(job_info)
             await self._job_tracker.finalize_submitted(job_info)
             self.submitted_jobs += 1
+
+    async def _advance_safety_check(self, growth_mb: float) -> None:
+        """Land the running check's verdict, then start the next one the parent's window lets through.
+
+        One check runs at a time, as on the one safety process. The parent's window is asked exactly as
+        ``SafetyOrchestrator`` asks it, over a freshly frozen measurement. A check it holds stays queued. A device
+        check charges the card its growth until its verdict, when the booking is released as the result handler
+        releases it. A check sent to the CPU charges nothing and takes longer. The growth lands
+        ``safety_check_allocation_lag_ticks`` after the send, and whether the card had room for it is read at
+        that moment.
+        """
+        running = self._safety_check_running()
+        if running is not None:
+            if not running.on_cpu and running.charged_tick is None and self.tick >= running.charge_at_tick:
+                running.free_before_mb = self.card_free_mb(self._safety_card_index)
+                running.starved = running.free_before_mb < growth_mb
+                running.charged_tick = self.tick
+                self._sync_reported_vram()
+                self._sample_card_overcommit()
+            if self.tick < running.finish_at_tick:
+                return
+            running.finished_tick = self.tick
+            self._reserve_ledger.release(SAFETY_CHECK_FLOW, running.job_id)
+            await self._job_tracker.queue_for_submit(running.job_info)
+            await self._job_tracker.finalize_submitted(running.job_info)
+            self.submitted_jobs += 1
+            self._sync_reported_vram()
+        pending = self._job_tracker.jobs_pending_safety_check
+        if not pending:
+            return
+        job_info = pending[0]
+        job_id = str(job_info.sdk_api_job_info.id_)
+        self._begin_arbiter_cycle()
+        window = self._scheduler.safety_check_window(job_id)
+        if window is SafetyCheckWindow.WAIT:
+            return
+        on_cpu = window is SafetyCheckWindow.CPU or self.safety_is_off_gpu()
+        await self._job_tracker.begin_safety_check(job_info)
+        charge_at_tick = self.tick + self.safety_check_allocation_lag_ticks
+        self.safety_checks.append(
+            _SafetyCheck(
+                job_id=job_id,
+                job_info=job_info,
+                started_tick=self.tick,
+                charge_at_tick=charge_at_tick,
+                finish_at_tick=(
+                    self.tick + self.safety_cpu_check_ticks if on_cpu else charge_at_tick + self.safety_check_ticks
+                ),
+                on_cpu=on_cpu,
+            ),
+        )
 
     async def _drain_post_processing(self) -> None:
         """Complete pending post-processing on the hand-driven lane and pass its result to safety.

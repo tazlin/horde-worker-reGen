@@ -280,6 +280,11 @@ from horde_worker_regen.process_management.scheduling.ledgers.retention import (
     sibling_context_count,
     sibling_retained_resident_present,
 )
+from horde_worker_regen.process_management.scheduling.ledgers.safety_check_window import (
+    SAFETY_CHECK_CPU_SECONDS_SEED,
+    SafetyCheckWindow,
+    SafetyCheckWindowLedger,
+)
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import (
     MEMORY_PRESSURE_PAUSE_OWNERS,
     SAFETY_BACKLOG_PRIORITY_DEPTH,
@@ -296,6 +301,7 @@ from horde_worker_regen.process_management.scheduling.workload_flow import (
     GPU_START_FLOW,
     POST_PROCESS_RESERVE_FLOW,
     PRELOAD_ADMISSION_FLOW,
+    SAFETY_CHECK_FLOW,
     WorkloadKind,
 )
 from horde_worker_regen.telemetry_spans import span_preload_model
@@ -788,6 +794,9 @@ class InferenceScheduler:
         # reconciler is the only code that turns a request into a lifecycle pause or restore, so reclaim,
         # residency and the policy cannot issue overlapping safety rebuilds.
         self._safety_placement = SafetyPlacementLedger(ledger_clock)
+        # How long each queued safety check has waited for room on its card. The booking that keeps new
+        # work out of that room lives in the reserve ledger under SAFETY_CHECK_FLOW.
+        self._safety_check_window = SafetyCheckWindowLedger(ledger_clock)
         # The most recent host-RAM verdict, kept so a pop-hold edge can be logged with the reading behind it.
         self._last_ram_verdict: RamPressureVerdict | None = None
         self._last_ram_headroom: RamHeadroom | None = None
@@ -1615,6 +1624,165 @@ class InferenceScheduler:
             ),
         )
         return verdict.admits
+
+    def _safety_check_process(self) -> HordeProcessInfo | None:
+        """The live on-GPU safety process a check's growth can be priced on, or None when there is none.
+
+        None while safety is on the CPU, paused off the card, mid-rebuild or absent. Nothing is booked then,
+        so a claim can never stand in the way of the safety process's own start.
+        """
+        if (
+            not self._safety_on_gpu_permitted
+            or self._process_lifecycle.is_safety_gpu_paused
+            or self._process_lifecycle.safety_placement_transition_pending is True
+        ):
+            return None
+        safety_process = self._process_map.get_safety_process()
+        if safety_process is None or safety_process.last_process_state == HordeProcessState.PROCESS_STARTING:
+            return None
+        return safety_process
+
+    def _safety_check_peak_mb(self) -> float:
+        """The safety process's whole device footprint (MB) at the peak of an evaluation.
+
+        Seeded at :data:`SAFETY_GPU_LOAD_CHARGE_MB` and raised by the allocator peaks the child's memory
+        reports carry (:attr:`FootprintStage.SAFETY_CHECK`).
+        """
+        store = self._footprint_store
+        if store is None:
+            return SAFETY_GPU_LOAD_CHARGE_MB
+        return store.estimate_mb(
+            FootprintKey(
+                model_baseline=SAFETY_PROCESS_BASELINE,
+                resolution_bucket=None,
+                platform=sys.platform,
+                stage=FootprintStage.SAFETY_CHECK,
+            ),
+            static_seed_mb=SAFETY_GPU_LOAD_CHARGE_MB,
+        )
+
+    def _safety_check_growth_mb(self, safety_process: HordeProcessInfo) -> float:
+        """How much more than it holds now the safety process needs on the card for one evaluation (MB).
+
+        The peak footprint less the context and what the process reports reserved, so the figure follows the
+        process whether its weights are resident or demoted.
+        """
+        held_mb = self.resolved_context_constant_mb() + float(safety_process.process_reserved_mb or 0.0)
+        return max(0.0, self._safety_check_peak_mb() - held_mb)
+
+    def _safety_check_units(self) -> set[str]:
+        """The jobs whose safety check may still hold a booking: those waiting for or in a check.
+
+        Empty while no on-GPU safety process is live, which drops every booking by omission.
+        """
+        if self._safety_check_process() is None:
+            self._safety_check_window.prune(())
+            return set()
+        waiting = {
+            str(job_info.sdk_api_job_info.id_)
+            for job_info in self._job_tracker.jobs_pending_safety_check
+            if job_info.sdk_api_job_info.id_ is not None
+        }
+        self._safety_check_window.prune(waiting)
+        checking = {
+            str(job_info.sdk_api_job_info.id_)
+            for job_info in self._job_tracker.jobs_being_safety_checked
+            if job_info.sdk_api_job_info.id_ is not None
+        }
+        return waiting | checking
+
+    def safety_check_patience_seconds(self) -> float:
+        """How long a safety check waits for room on the card before it is sent to the CPU.
+
+        As long as a CPU check takes on this worker. A longer wait costs more than the fallback it avoids.
+        """
+        measured = self._state.avg_safety_cpu_seconds
+        return measured if measured > 0 else SAFETY_CHECK_CPU_SECONDS_SEED
+
+    def safety_check_window(self, job_id: str) -> SafetyCheckWindow:
+        """Decide whether the safety check for ``job_id`` may run on the device now, and book its room.
+
+        An evaluation grows the on-GPU safety process by more than it holds at rest, and no other reservation
+        covers that growth, so samplers are admitted into it and the check then finds the card full. The check
+        asks here first. Its growth is booked under :data:`SAFETY_CHECK_FLOW` from this call until the
+        dispatcher handles its verdict, which keeps every preload, dispatch and clearance out of that room. A
+        check that does not fit waits with its booking standing, so the card drains to it as running jobs
+        finish. After
+        :meth:`safety_check_patience_seconds` it is sent to the CPU, where it needs no room.
+
+        Unpriced cases open at once with nothing booked: safety off the card, no arbiter cycle, or a process
+        that already holds its peak.
+        """
+        safety_process = self._safety_check_process()
+        arbiter = self._vram_arbiter
+        if safety_process is None or arbiter is None or not arbiter.has_cycle:
+            self._release_safety_check_claim(job_id, on_cpu=False)
+            return SafetyCheckWindow.OPEN
+        growth_mb = self._safety_check_growth_mb(safety_process)
+        if growth_mb <= 0:
+            self._release_safety_check_claim(job_id, on_cpu=False)
+            return SafetyCheckWindow.OPEN
+
+        device_index = safety_process.device_index
+        own_planned_mb = self._reserve_ledger.planned_charge_for_unit(
+            SAFETY_CHECK_FLOW,
+            job_id,
+            self._process_map.reserved_by_pid(device_index),
+        )
+        verdict = arbiter.evaluate(
+            VramRequest(
+                kind=VramRequestKind.SAFETY_CHECK,
+                job_label="safety_check",
+                baseline=None,
+                device_index=device_index,
+                candidate_delta_mb=growth_mb,
+                own_planned_unmaterialized_mb=own_planned_mb,
+            ),
+        )
+        if own_planned_mb <= 0:
+            self._reserve_ledger.set_planned(
+                SAFETY_CHECK_FLOW,
+                job_id,
+                vram_mb=growth_mb,
+                target_process_id=safety_process.process_id,
+                reserved_at_admit_mb=float(safety_process.process_reserved_mb or 0.0),
+            )
+        if verdict.admits:
+            waited = self._safety_check_window.resolve(job_id, on_cpu=False)
+            if waited is not None:
+                logger.info(
+                    f"Safety check for job {job_id[:8]} has room on the card after waiting {waited:.1f}s.",
+                )
+            self._diagnostics.forget("safety_check_wait")
+            return SafetyCheckWindow.OPEN
+
+        waited = self._safety_check_window.waited(job_id)
+        patience = self.safety_check_patience_seconds()
+        if waited >= patience:
+            self._release_safety_check_claim(job_id, on_cpu=True)
+            self._diagnostics.forget("safety_check_wait")
+            logger.info(
+                f"Safety check for job {job_id[:8]} waited {waited:.1f}s for {growth_mb:.0f}MB on the card and "
+                f"runs on the CPU, which takes about {patience:.1f}s.",
+            )
+            return SafetyCheckWindow.CPU
+        suppressed = self._diagnostics.suppressed_count("safety_check_wait", job_id)
+        if suppressed is not None:
+            logger.info(
+                f"Safety check for job {job_id[:8]} waits for {growth_mb:.0f}MB on the card. Its room is booked, "
+                f"so no new work is admitted into it while running jobs finish.{suppressed_suffix(suppressed)}",
+            )
+        return SafetyCheckWindow.WAIT
+
+    def _release_safety_check_claim(self, job_id: str, *, on_cpu: bool) -> None:
+        """Drop ``job_id``'s booking and close its wait."""
+        self._reserve_ledger.release(SAFETY_CHECK_FLOW, job_id)
+        self._safety_check_window.resolve(job_id, on_cpu=on_cpu)
+
+    @property
+    def safety_check_window_ledger(self) -> SafetyCheckWindowLedger:
+        """The wait records and counts for safety checks, for tests and the stats export."""
+        return self._safety_check_window
 
     @property
     def _safety_permitted_cards(self) -> frozenset[int]:
@@ -4962,6 +5130,7 @@ class InferenceScheduler:
         self._reserve_ledger.reconcile_planned(PRELOAD_ADMISSION_FLOW, self._in_flight_admitted_planned_units())
         self._reserve_ledger.reconcile_planned(DISPATCH_ADMISSION_FLOW, self._in_flight_dispatch_units(device_index))
         self._reserve_ledger.reconcile_planned(GPU_START_FLOW, self._gpu_start_units())
+        self._reserve_ledger.reconcile_planned(SAFETY_CHECK_FLOW, self._safety_check_units())
         return self._reserve_ledger.effective_planned_vram_mb(
             self._process_map.reserved_by_pid(device_index),
             target_process_ids=self._process_ids_on_card(device_index),

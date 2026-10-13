@@ -343,6 +343,7 @@ class HordeSafetyProcess(HordeProcess):
     _clip_residency: "_ClipResidency | None" = None
     """Where CLIP lives between evaluations; None until the interrogator is built (or in dry-run)."""
     _evaluating_on_cpu_now: bool = False
+    _evaluation_ran_on_cpu: bool = False
     """Whether an evaluation that ran out of device memory is being rerun on the CPU."""
     _evaluation_stage: SafetyEvaluationStage = SafetyEvaluationStage.CLIP_STAGING
     """The step the evaluation in hand has reached, so a device failure can be attributed to it."""
@@ -1014,6 +1015,7 @@ class HordeSafetyProcess(HordeProcess):
         then ends, as any failed evaluation does.
         """
         rerun_start = time.time()
+        self._evaluation_ran_on_cpu = True
         with self._evaluating_on_cpu():
             safety_evaluations = self._evaluate_images(message)
         free_figure = f"{device_failure.free_figure} free" if device_failure.free_figure else "free figure not stated"
@@ -1126,7 +1128,10 @@ class HordeSafetyProcess(HordeProcess):
         # during which the process loop publishes nothing. Without a beat the watchdog cannot tell a slow
         # check from a wedged one, so it reads a legitimately long CPU check as a hang.
         with self.periodic_heartbeat(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE):
-            staging_failure = self._stage_clip_for_evaluation()
+            # The parent sends a check that waited out its window on a full card straight to the CPU.
+            run_on_cpu = message.evaluate_on_cpu and self._safety_device != "cpu" and self._clip_residency is not None
+            self._evaluation_ran_on_cpu = self._safety_device == "cpu"
+            staging_failure = None if run_on_cpu else self._stage_clip_for_evaluation()
 
             time_start = time.time()
 
@@ -1136,7 +1141,12 @@ class HordeSafetyProcess(HordeProcess):
 
             # A CPU rerun is timed with the device attempt it replaces, so the parent's backpressure and
             # grace models read what the job really cost.
-            safety_evaluations = self._evaluate_images_with_cpu_fallback(message, staging_failure)
+            if run_on_cpu:
+                self._evaluation_ran_on_cpu = True
+                with self._evaluating_on_cpu():
+                    safety_evaluations = self._evaluate_images(message)
+            else:
+                safety_evaluations = self._evaluate_images_with_cpu_fallback(message, staging_failure)
 
             # Measured inside the heartbeat window: leaving the context joins the reporter thread, and that
             # join must not land in the duration the parent's backpressure and grace models read.
@@ -1153,6 +1163,7 @@ class HordeSafetyProcess(HordeProcess):
                 time_elapsed=time_elapsed,
                 job_id=message.job_id,
                 safety_evaluations=safety_evaluations,
+                evaluated_on_cpu=self._evaluation_ran_on_cpu,
             ),
         )
         # The evaluation's activation cache is reclaimable, not fixed safety residency. Trim before WAITING

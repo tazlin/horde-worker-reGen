@@ -18,6 +18,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeSafetyResultMessage,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.scheduling.ledgers.safety_check_window import SafetyCheckWindow
 from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 from horde_worker_regen.process_management.workers.safety_process import HordeSafetyProcess
 from tests.process_management.conftest import (
@@ -298,6 +299,69 @@ class TestStartEvaluateSafety:
         # The job was never moved into being_safety_checked (the send failed), so it
         # must remain pending so a replacement safety process can pick it up.
         assert job_info in process_manager._job_tracker.jobs_pending_safety_check
+
+
+class TestSafetyCheckWindowAtDispatch:
+    """The orchestrator asks for the check's room on the card before it sends a check."""
+
+    @staticmethod
+    async def _manager_with_a_pending_check(window: SafetyCheckWindow) -> tuple[object, object, Mock, list[str]]:
+        process_manager = make_testable_process_manager()
+        safety_proc = make_mock_process_info(
+            10,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.SAFETY,
+        )
+        process_manager._process_map.clear()
+        process_manager._process_map.update({10: safety_proc})
+        process_manager.stable_diffusion_reference = {
+            "stable_diffusion": make_mock_model_reference_record("stable_diffusion"),
+        }
+        asked: list[str] = []
+
+        def _window(job_id: str) -> SafetyCheckWindow:
+            asked.append(job_id)
+            return window
+
+        process_manager._safety_orchestrator._safety_check_window = _window
+        job_info = _completed_job_info()
+        await queue_job_for_safety_async(process_manager._job_tracker, job_info)
+        return process_manager, safety_proc, job_info, asked
+
+    async def test_a_check_told_to_wait_stays_queued(self) -> None:
+        """Nothing is sent and the job stays pending, so the next pass asks again."""
+        process_manager, safety_proc, job_info, asked = await self._manager_with_a_pending_check(
+            SafetyCheckWindow.WAIT,
+        )
+
+        await process_manager.start_evaluate_safety()  # type: ignore[attr-defined]
+
+        assert asked == [str(job_info.sdk_api_job_info.id_)]
+        safety_proc.pipe_connection.send.assert_not_called()  # type: ignore[attr-defined]
+        assert job_info in process_manager._job_tracker.jobs_pending_safety_check  # type: ignore[attr-defined]
+
+    async def test_an_open_window_sends_the_check_to_the_device(self) -> None:
+        """The check goes out without the CPU flag."""
+        process_manager, safety_proc, job_info, _asked = await self._manager_with_a_pending_check(
+            SafetyCheckWindow.OPEN,
+        )
+
+        await process_manager.start_evaluate_safety()  # type: ignore[attr-defined]
+
+        assert _sent_safety_message(safety_proc).evaluate_on_cpu is False  # type: ignore[attr-defined]
+        assert job_info in process_manager._job_tracker.jobs_being_safety_checked  # type: ignore[attr-defined]
+
+    async def test_a_check_that_waited_too_long_is_sent_to_the_cpu(self) -> None:
+        """The check goes out with the CPU flag set."""
+        process_manager, safety_proc, job_info, _asked = await self._manager_with_a_pending_check(
+            SafetyCheckWindow.CPU,
+        )
+
+        await process_manager.start_evaluate_safety()  # type: ignore[attr-defined]
+
+        assert _sent_safety_message(safety_proc).evaluate_on_cpu is True  # type: ignore[attr-defined]
+        assert job_info in process_manager._job_tracker.jobs_being_safety_checked  # type: ignore[attr-defined]
 
 
 class TestOneSafetyJobInFlight:

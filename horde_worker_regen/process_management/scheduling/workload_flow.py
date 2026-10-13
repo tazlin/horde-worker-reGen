@@ -67,6 +67,17 @@ reservation grows. The entries are pruned each scheduling cycle from the process
 omission."""
 
 
+SAFETY_CHECK_FLOW = "safety_check"
+"""Reservation-ledger flow name for the device memory a safety evaluation grows by while it runs.
+
+An on-GPU safety process holds its weights at rest and needs more for the length of a check. Nothing else
+reserves that difference, so an admission priced between checks reads it as free. A check books it under
+this flow keyed by its job id and targeting the safety process, from the moment the check is found to
+need the room until its verdict lands, so no preload, dispatch or clearance is admitted into it. The
+entries are pruned each scheduling cycle from the jobs still waiting for or in a check (see
+``InferenceScheduler._safety_check_units``)."""
+
+
 _WORKLOAD_CAPABILITIES: dict[WorkloadKind, WorkerCapability] = {
     WorkloadKind.IMAGE_GENERATION: WorkerCapability.IMAGE_GEN,
     WorkloadKind.ALCHEMY: WorkerCapability.ALCHEMY_GRAPH | WorkerCapability.ALCHEMY_CLIP,

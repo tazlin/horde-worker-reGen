@@ -440,6 +440,8 @@ class WorkerState:
     """
 
     avg_safety_seconds: float = 0.0
+    avg_safety_cpu_seconds: float = 0.0
+    """The measured cost (seconds) of a safety check that ran on the CPU, 0.0 until one has."""
     """Exponential moving average of the measured wall-clock per safety check (0 until first sample).
 
     The safety stage is a single (often CPU-bound) process downstream of inference, and nothing bounded
@@ -492,6 +494,16 @@ class WorkerState:
             self.avg_safety_seconds = seconds
         else:
             self.avg_safety_seconds = (1 - alpha) * self.avg_safety_seconds + alpha * seconds
+
+    def record_safety_cpu_duration(self, seconds: float) -> None:
+        """Fold one safety check that ran on the CPU into the average a waiting check's patience is set from."""
+        if seconds <= 0:
+            return
+        alpha = 0.2
+        if self.avg_safety_cpu_seconds <= 0:
+            self.avg_safety_cpu_seconds = seconds
+        else:
+            self.avg_safety_cpu_seconds = (1 - alpha) * self.avg_safety_cpu_seconds + alpha * seconds
 
     def note_first_kudos_event(self, now: float) -> None:
         """Record the first successful submit, which starts the kudos/hr measurement window (idempotent)."""

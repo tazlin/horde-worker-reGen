@@ -605,6 +605,9 @@ class HordeSafetyResultMessage(HordeProcessMessage):
     """The ID of the job that was evaluated."""
     safety_evaluations: list[HordeSafetyEvaluation]
     """A list of safety evaluations for each image in the job."""
+    evaluated_on_cpu: bool = False
+    """Whether the evaluations were computed on the CPU, because the parent asked or the device ran out of
+    memory. ``time_elapsed`` is then what a CPU check costs on this machine."""
 
 
 class HordeControlFlag(enum.Enum):
@@ -1111,6 +1114,9 @@ class HordeSafetyControlMessage(HordeControlMessage):
     include_aesthetic_score: bool = False
     """If set, the safety pass also scores each image with the LAION aesthetic head and returns the
     score on each evaluation, to be attached as per-generation ``gen_metadata`` (worker-configurable)."""
+    evaluate_on_cpu: bool = False
+    """If set, an on-GPU safety process runs this evaluation on the CPU without trying the device. The
+    parent sets it for a check that waited out its window on a full card."""
 
     @model_validator(mode="after")
     def validate_censor_flags_logical(self) -> HordeSafetyControlMessage:

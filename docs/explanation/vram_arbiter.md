@@ -362,6 +362,27 @@ reported peak less its lowest reservation while the chain ran, the quantity the 
 on the lane's first report after the result, since each report's peak covers the time since the one before. The
 scheduler's dispatch-side post-processing charges read the same figure.
 
+A safety check is an anchor from before it is sent. An on-GPU safety process holds its weights at rest and
+grows by more for the length of an evaluation, and its allocations reach the card after the check is sent. With
+nothing booked, a sampler cleared in the same pass was priced against room the check was about to take.
+`InferenceScheduler.safety_check_window` prices the growth as a `SAFETY_CHECK` request and books it under
+`SAFETY_CHECK_FLOW` on the safety process, and `SafetyOrchestrator` asks it before every send. The growth is the
+check's peak footprint less what the process holds now (its context and reported reservation). The peak is
+`FootprintStage.SAFETY_CHECK`, seeded at the safety load charge and raised by the allocator peaks the child's
+memory reports carry.
+
+- **It fits.** The check is sent and its booking stands until the dispatcher handles the verdict.
+- **It does not fit.** The check stays queued with its booking standing, so no preload, dispatch or clearance is
+  admitted into that room and the card drains to it as running jobs finish.
+- **It has waited as long as a CPU check takes.** The booking is dropped and the check is sent with
+  `evaluate_on_cpu`, which the child runs on the CPU in process. The bound is the measured cost of a CPU check
+  on this worker (`WorkerState.avg_safety_cpu_seconds`), seeded until one has run.
+
+Nothing is booked while safety is off the card or mid-rebuild, and every booking is dropped when it leaves, so a
+claim never stands against the safety process's own start. A check that still finds the card full falls back to
+the CPU by itself (see
+[Resilience and recovery](resilience_and_recovery.md#a-safety-check-that-runs-out-of-device-memory)).
+
 A request's own footprint counts at most once in the identity. Two adjustments enforce this so a head can
 never wedge on state it alone produced. First, the request nets its own target process's outstanding planned
 charge out of the overlay before the inequality: that charge is the same load the candidate delta already

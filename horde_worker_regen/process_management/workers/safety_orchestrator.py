@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from loguru import logger
 
 from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
@@ -14,6 +16,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.scheduling.ledgers.safety_check_window import SafetyCheckWindow
 from horde_worker_regen.server_capabilities import server_supports_generation_metadata_type
 from horde_worker_regen.telemetry_spans import span_safety_check
 
@@ -36,6 +39,7 @@ class SafetyOrchestrator:
         runtime_config: RuntimeConfig,
         model_metadata: ModelMetadata,
         state: WorkerState,
+        safety_check_window: Callable[[str], SafetyCheckWindow] | None = None,
     ) -> None:
         """Initialize the orchestrator with references to its dependencies.
 
@@ -48,6 +52,8 @@ class SafetyOrchestrator:
             runtime_config (RuntimeConfig): Holds the current bridge configuration snapshot.
             model_metadata (ModelMetadata): Provides lookups against the stable-diffusion model reference.
             state (WorkerState): The worker state to check for dry-run mode.
+            safety_check_window: Given a job id, whether its check may run on the device now, must wait
+                for room on the card, or goes to the CPU. None sends every check to the device at once.
         """
         self._process_map = process_map
         self._job_tracker = job_tracker
@@ -55,6 +61,7 @@ class SafetyOrchestrator:
         self._runtime_config = runtime_config
         self._model_metadata = model_metadata
         self._state = state
+        self._safety_check_window = safety_check_window
 
     async def start_evaluate_safety(self) -> None:
         """Start evaluating the safety of the next job pending a safety check, if any."""
@@ -108,6 +115,15 @@ class SafetyOrchestrator:
             # For static type checking the use below; this should never be hit at runtime, see above
             raise ValueError("completed_job_info.sdk_api_job_info.payload.prompt is None")
 
+        # An evaluation grows the on-GPU safety process past what it holds at rest. The scheduler books
+        # that growth and says whether it fits now. A check that does not fit stays queued with its room
+        # booked, and one that has waited as long as a CPU check takes runs there.
+        window = SafetyCheckWindow.OPEN
+        if self._safety_check_window is not None:
+            window = self._safety_check_window(str(completed_job_info.sdk_api_job_info.id_))
+        if window is SafetyCheckWindow.WAIT:
+            return
+
         model_info = None
         if completed_job_info.sdk_api_job_info.model in stable_diffusion_reference:
             model_info = stable_diffusion_reference[completed_job_info.sdk_api_job_info.model]
@@ -128,6 +144,7 @@ class SafetyOrchestrator:
                         bridge_data.aesthetic_scoring_enabled
                         and server_supports_generation_metadata_type(AESTHETIC_METADATA_TYPE)
                     ),
+                    evaluate_on_cpu=window is SafetyCheckWindow.CPU,
                 ),
             )
 
