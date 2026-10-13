@@ -1910,6 +1910,9 @@ class HordeWorkerProcessManager:
                     pp_reserve_mb=pp_reserve_mb,
                 )
             ),
+            lane_yields_turn=lambda device_index: self._inference_scheduler.post_processing_lane_yields_turn(
+                device_index=device_index,
+            ),
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
             decision_sink=self._run_metrics.record_decision,
         )

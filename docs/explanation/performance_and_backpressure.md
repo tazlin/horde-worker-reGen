@@ -444,14 +444,15 @@ on how many copies the loading model ends with is `duplicate_copies_permitted` a
 ### The line-skip cache
 
 `get_next_job_and_process` is called twice per cycle: once to peek and once to
-launch. It can let a later job skip ahead of the queue head for three healthy
+launch. It can let a later job skip ahead of the queue head for four healthy
 reasons: the head's model is still loading (or is resident only on a
 disaggregation-pinned lane it is waiting to reuse), so an already-resident
 distinct-model job runs on the free process in the meantime (`resident_bypass`);
 the head's own process is busy sampling, so a distinct already-resident model
-fills the otherwise-idle slot (`diversity`); or, on a worker driving several
+fills the otherwise-idle slot (`diversity`); on a worker driving several
 cards, the head's card cannot seat it at all and another card can run a later job
-right now (`cross_card`). All three depend on transient process state, so the
+right now (`cross_card`); or the head is held for the post-processing lane and a
+later job fits beside the lane's work (`post_processing_hold`). All four depend on transient process state, so the
 chosen skip is cached in `_pending_line_skip` and returned on the launch call.
 Without this cache the launch call could pick a different job and waste the
 peek's decision. The head keeps its queue position and dispatches once its
@@ -568,6 +569,21 @@ immediately admissible image post-processing work. When pending PP chains cannot
 next sampler that would also be non-co-resident waits, including just after the current sampler finishes, so
 the lane gets the next drain window instead of extending the PP backlog. Speculative preloads yield to that
 pending chain as well; otherwise a later model load can consume the very headroom the chain is waiting for.
+
+The lane and a job that cannot share the card with a chain take the card in turns. A job a running chain held
+is owed the turn after that chain (`DispatchHoldLedger.pp_turn`): the lane takes no pending chain
+(`InferenceScheduler.post_processing_lane_yields_turn`) until that job has its sampling window, and the pending
+chain's claim on the drain window does not hold that job again. From the sampling window on, the lane's own
+co-residency check keeps the next chain off the card until the job finishes, and the next held job waits for
+that chain. A lane that took each chain as the last one released would hold such a job for its whole backlog.
+The lane stops waiting once it has waited on the job as long as the job waited on the lane, with a floor of
+`DISPATCH_STALL_MIN_SECONDS`, because a job given the card that still has not started is waiting on something
+else. While the head is held for a running chain, later jobs that fit beside the chain are loaded and
+dispatched behind it (see [Admission pipeline](admission_pipeline.md)).
+
+A chain's patience window (`_ADMISSION_PATIENCE_SECONDS`) counts time the card could not host it. Time the lane
+spent on another chain or waiting out a turn is taken off the clock of a chain that was only queued, while a
+chain the arbiter has refused on its own price keeps aging, so chains flowing past it cannot park it.
 Both holds are the lane's card's, matching each other: on a multi-GPU worker a load whose target lands on
 another card proceeds (the gate ladder's `DEFER_POST_PROCESSING` names the lane's card), and only a single-GPU
 worker sees the hold stop every preload, because there the lane's card is the only one.

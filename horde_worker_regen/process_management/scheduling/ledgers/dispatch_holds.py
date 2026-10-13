@@ -87,6 +87,35 @@ class DispatchDecline:
     successive cycles can be compared for a changed cause."""
 
 
+@dataclass
+class PostProcessingTurn:
+    """The card's next turn, owed to a job that a running post-processing chain held.
+
+    A job that cannot share the card with a chain and the lane's chains take the card in turns. The job a running
+    chain held goes next, and the lane leaves its pending chains waiting until that job has its sampling window.
+    """
+
+    job_id: str
+    device_index: int | None
+    """The card the held job would sample on; None where its slot names no device."""
+    claimed_at: float
+    """When a running chain first held the job."""
+    yield_began_at: float | None = None
+    """When the lane first left a pending chain waiting for the job, or None while a chain still runs."""
+
+    def yield_expired(self, now: float, *, floor_seconds: float) -> bool:
+        """Whether the lane has waited on the job at least as long as the job waited on the lane.
+
+        A job that is given the turn and still cannot start is waiting on something other than the lane, so the
+        lane stops waiting once the two waits are even. ``floor_seconds`` covers a job the chain held only
+        briefly, which still needs time to be dispatched and cleared.
+        """
+        if self.yield_began_at is None:
+            return False
+        waited_on_lane = max(0.0, self.yield_began_at - self.claimed_at)
+        return (now - self.yield_began_at) > max(floor_seconds, waited_on_lane)
+
+
 class DispatchHoldLedger:
     """Per-job hold records and session counters for the dispatch, post-processing defer and clearance gates."""
 
@@ -111,6 +140,8 @@ class DispatchHoldLedger:
         self.released_by_natural_free = 0
         self.pp_defer_holds: set[str] = set()
         """Heads the post-processing co-residency gate is deferring right now."""
+        self.pp_turn: PostProcessingTurn | None = None
+        """The turn a running chain's held job is owed, or None when the lane owes none."""
         self.clearance_hold_ids: set[str] = set()
         """Staged, primed job ids the clearance gate is currently withholding the grant from."""
         self.clearance_hold_spans: dict[str, tuple[float, float | None]] = {}
@@ -216,6 +247,24 @@ class DispatchHoldLedger:
             self.pp_defer_holds.add(job_id)
         else:
             self.pp_defer_holds.discard(job_id)
+
+    def claim_pp_turn(self, job_id: str, device_index: int | None) -> None:
+        """Owe the card's next turn to ``job_id`` unless another held job already has it."""
+        if self.pp_turn is None:
+            self.pp_turn = PostProcessingTurn(job_id=job_id, device_index=device_index, claimed_at=self._clock())
+
+    def begin_pp_yield(self) -> None:
+        """Start the owed turn's clock at the first pass where the lane leaves a chain waiting for it."""
+        if self.pp_turn is not None and self.pp_turn.yield_began_at is None:
+            self.pp_turn.yield_began_at = self._clock()
+
+    def pp_yield_expired(self, *, floor_seconds: float) -> bool:
+        """Whether the lane has waited out the owed turn (see :meth:`PostProcessingTurn.yield_expired`)."""
+        return self.pp_turn is not None and self.pp_turn.yield_expired(self._clock(), floor_seconds=floor_seconds)
+
+    def clear_pp_turn(self) -> None:
+        """Forget the owed turn: its job has its sampling window, left the queue, or was waited out."""
+        self.pp_turn = None
 
     # ---- clearance holds
 

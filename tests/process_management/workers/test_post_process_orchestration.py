@@ -388,6 +388,81 @@ class TestStartPostProcessing:
         sent = lane.pipe_connection.send.call_args.args[0]
         assert sent.job_id == fittable_job.sdk_api_job_info.id_
 
+    async def test_lane_takes_no_chain_while_it_owes_the_turn(self) -> None:
+        """With the card's next turn owed to a held job, the idle lane leaves its pending chain waiting.
+
+        The wait is queueing, so it arms no patience record, and the chain is dispatched on the first scan
+        after the turn is spent.
+        """
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+        orchestrator = process_manager._post_process_orchestrator
+        asked_about: list[int | None] = []
+        owed = True
+
+        def _lane_yields_turn(device_index: int | None) -> bool:
+            asked_about.append(device_index)
+            return owed
+
+        orchestrator._lane_yields_turn = _lane_yields_turn
+
+        job_info = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        assert asked_about == [lane.device_index]
+        assert job_info in process_manager._job_tracker.jobs_pending_post_processing
+        lane.pipe_connection.send.assert_not_called()
+        assert str(job_info.sdk_api_job_info.id_) not in orchestrator._deferrals
+
+        owed = False
+        await process_manager.start_post_processing()
+
+        assert job_info in process_manager._job_tracker.jobs_being_post_processed
+
+    async def test_time_spent_queued_for_the_lane_is_not_counted_against_a_chain(self) -> None:
+        """A chain that waited for a sampler keeps its patience while the lane yields a turn or runs a chain.
+
+        A chain the arbiter refused on its own price keeps aging through the same stretch, so it still reaches
+        its fault while other work holds the lane.
+        """
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+        orchestrator = process_manager._post_process_orchestrator
+        orchestrator._lane_yields_turn = lambda _device_index: True
+        clock = [100.0]
+        orchestrator._clock = lambda: clock[0]
+
+        queued = _make_pp_job_info()
+        refused = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(queued)
+        await process_manager._job_tracker.queue_for_post_processing(refused)
+        queued_key = str(queued.sdk_api_job_info.id_)
+        refused_key = str(refused.sdk_api_job_info.id_)
+        orchestrator._deferrals[queued_key] = post_process_orchestrator_module._DeferralRecord(
+            first_deferred_at=100.0,
+            last_logged_at=100.0,
+        )
+        orchestrator._deferrals[refused_key] = post_process_orchestrator_module._DeferralRecord(
+            first_deferred_at=100.0,
+            last_logged_at=100.0,
+            refused_by_arbiter=True,
+        )
+
+        await process_manager.start_post_processing()
+        clock[0] += post_process_orchestrator_module._ADMISSION_PATIENCE_SECONDS + 1.0
+        await process_manager.start_post_processing()
+
+        assert queued in process_manager._job_tracker.jobs_pending_post_processing
+        assert orchestrator._deferrals[queued_key].first_deferred_at == clock[0]
+        assert refused not in process_manager._job_tracker.jobs_pending_post_processing
+        assert refused_key not in orchestrator._deferrals
+
     async def test_chain_dispatches_when_coresidency_affordable(self) -> None:
         """On a card that can hold both peaks, sampling in progress does not delay the chain."""
         process_manager = make_testable_process_manager()

@@ -305,6 +305,7 @@ from tests.process_management.liveness._dispatch_world import (
     _JobWindow,
     _model_by_name,
     _ModelClass,
+    _PostProcessChain,
 )
 from tests.process_management.liveness._host_ram import HostRamLedger
 from tests.process_management.liveness._world_assertions import (
@@ -7723,3 +7724,306 @@ async def test_z_defect_reinjection_a_protected_copy_wedges_the_chain_and_its_he
     assert world.structural_queue_wedges, (
         f"the queue deadlock must stand the structural-wedge horizon. {world.state_dump()}"
     )
+
+
+# A chain backlog beside a head that cannot share the card
+
+_BACKLOG_CHAIN_TICKS = 24
+"""Ticks a chain holds the lane, several times a finisher's sampling window, so finished jobs queue chains faster
+than the lane drains them."""
+
+_BACKLOG_FINISHERS = 4
+_BACKLOG_MAX_TICKS = 400
+
+
+def _backlog_finisher() -> ImageGenerateJobPopResponse:
+    """A job that samples beside a running chain and leaves a chain of its own."""
+    return make_job_pop_response(
+        _SDXL.name,
+        width=1024,
+        height=1024,
+        ddim_steps=8,
+        post_processing=["CodeFormers", "RealESRGAN_x4plus"],
+    )
+
+
+def _backlog_held_head() -> ImageGenerateJobPopResponse:
+    """A job whose sampling peak and one chain cannot share the card."""
+    return make_job_pop_response(
+        _KREA2.name,
+        width=_CHAIN_COPY_HEAD_SIDE,
+        height=_CHAIN_COPY_HEAD_SIDE,
+        ddim_steps=4,
+        n_iter=_CHAIN_COPY_HEAD_BATCH,
+    )
+
+
+def _backlog_world(*, chain_mb: float, chain_ticks: int) -> _DispatchWorld:
+    """A 24 GB card with four lanes, two sampling threads, the clearance lease and a modelled lane."""
+    return _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=4,
+        max_threads=2,
+        queue_depth=10,
+        whole_card_enabled=False,
+        closed_loop=True,
+        clearance_lease=True,
+        service_contexts=True,
+        tick_seconds=1.0,
+        post_process_chain_peak_mb=chain_mb,
+        post_process_chain_allocation_lag_ticks=2,
+        post_process_chain_hold_ticks=chain_ticks,
+    )
+
+
+def _chain_clock(world: _DispatchWorld, chain: _PostProcessChain, tick: int) -> float:
+    """The world clock at ``tick``, read against ``chain``'s own dispatch instant."""
+    return chain.dispatched_at + (tick - chain.dispatched_tick) * world.tick_seconds
+
+
+@dataclass(frozen=True)
+class _ChainBacklogRun:
+    """One run of the chain-backlog row and the readings its assertions need."""
+
+    world: _DispatchWorld
+    head: ImageGenerateJobPopResponse
+    first_hold_at: float | None
+    """The world clock when the post-processing gate first held the head, or None when it never did."""
+    job_count: int
+
+
+async def _run_chain_backlog_beside_a_held_head() -> _ChainBacklogRun:
+    """Queue four chains behind one lane while a job that cannot share the card with a chain waits.
+
+    Four finishers sample back to back on one lane, each leaving a chain several times longer than its sampling
+    window. The job behind them becomes the head while the first chain runs and three more are pending.
+    """
+    finishers = [_backlog_finisher() for _ in range(_BACKLOG_FINISHERS)]
+    chain_mb = predict_job_post_processing_vram_mb(finishers[0], _SDXL.baseline.value)
+    assert chain_mb is not None
+    world = _backlog_world(chain_mb=chain_mb, chain_ticks=_BACKLOG_CHAIN_TICKS)
+    head = _backlog_held_head()
+    for job in (*finishers, head):
+        await world.pop(job)
+
+    first_hold_at: float | None = None
+    job_count = len(finishers) + 1
+    for _ in range(_BACKLOG_MAX_TICKS):
+        await world.step()
+        if first_hold_at is None and str(head.id_) in world.scheduler.dispatch_holds.pp_defer_holds:
+            first_hold_at = world.now
+        if world.submitted_jobs >= job_count:
+            break
+    return _ChainBacklogRun(world=world, head=head, first_hold_at=first_hold_at, job_count=job_count)
+
+
+def _chains_taken_while_the_head_waited(run: _ChainBacklogRun) -> list[_PostProcessChain]:
+    """The chains the lane took between the head's first hold and the head's dispatch."""
+    window = run.world.job_windows.get(str(run.head.id_))
+    assert run.first_hold_at is not None and window is not None
+    return [
+        chain
+        for chain in run.world.post_process_chains
+        if run.first_hold_at < chain.dispatched_at <= window.dispatched_at
+    ]
+
+
+async def test_z_a_held_head_takes_the_turn_after_the_running_chain() -> None:
+    """A job held for a running chain is dispatched when that chain ends, ahead of the chains still pending.
+
+    The failure this encodes: the lane took each pending chain the moment the last one released, so a job that
+    could not share the card with a chain waited for the whole backlog while its lane sat idle. The row asserts
+    the lane takes no chain between the head's first hold and its dispatch, that every chain still runs, and
+    that nothing is faulted or sampled unpriced.
+    """
+    run = await _run_chain_backlog_beside_a_held_head()
+    world = run.world
+
+    context = "a chain backlog beside a head that cannot share the card"
+    assert run.first_hold_at is not None, (
+        f"precondition: the post-processing gate must hold the head while a chain runs. {world.state_dump()}"
+    )
+    assert world.submitted_jobs == run.job_count, (
+        f"{context}: {world.submitted_jobs} of {run.job_count} jobs were submitted. {world.state_dump()}"
+    )
+    taken = _chains_taken_while_the_head_waited(run)
+    assert not taken, (
+        f"{context}: the lane took {len(taken)} chain(s) on tick(s) {[chain.dispatched_tick for chain in taken]} "
+        f"while the head waited from {run.first_hold_at}. {world.state_dump()}"
+    )
+    assert len(world.post_process_chains) == _BACKLOG_FINISHERS and all(
+        chain.released_tick is not None for chain in world.post_process_chains
+    ), f"{context}: the run recorded {world.post_process_chains}. {world.state_dump()}"
+    assert not world.card_overcommits, (
+        f"{context}: the card was committed past its total at {world.card_overcommits}. {world.state_dump()}"
+    )
+    assert not world.structural_queue_wedges, (
+        f"{context}: the queue deadlock stood the structural-wedge horizon on tick(s) "
+        f"{world.structural_queue_wedges}. {world.state_dump()}"
+    )
+    _assert_no_lane_sampled_unpriced(world, context=context)
+
+
+async def test_z_defect_reinjection_a_lane_that_never_yields_drains_its_backlog_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the lane never yielding its turn, the held head waits for every pending chain.
+
+    The defect is reinjected only at the lane's turn rule. The row asserts the lane takes the rest of the
+    backlog while the head waits.
+    """
+    monkeypatch.setattr(
+        InferenceScheduler,
+        "post_processing_lane_yields_turn",
+        lambda _self, *, device_index: False,
+    )
+    run = await _run_chain_backlog_beside_a_held_head()
+    world = run.world
+
+    assert run.first_hold_at is not None, f"precondition: the head must be held for a chain. {world.state_dump()}"
+    taken = _chains_taken_while_the_head_waited(run)
+    assert len(taken) == _BACKLOG_FINISHERS - 1, (
+        f"the lane must take the remaining {_BACKLOG_FINISHERS - 1} chains ahead of the head; it took "
+        f"{[chain.dispatched_tick for chain in taken]}. {world.state_dump()}"
+    )
+
+
+# Work that fits beside a chain, queued behind a head that does not
+
+_FILL_CHAIN_TICKS = 40
+"""Ticks the one chain holds the lane, long enough for the followers to load and sample inside it."""
+
+_FILL_FOLLOWERS = 2
+_FILL_MAX_TICKS = 300
+
+
+@dataclass(frozen=True)
+class _ChainFillRun:
+    """One run of the fill row and the readings its assertions need."""
+
+    world: _DispatchWorld
+    head: ImageGenerateJobPopResponse
+    followers: list[ImageGenerateJobPopResponse]
+    chain_released_at: float | None
+    head_held_with_followers_queued: bool
+
+
+async def _run_followers_behind_a_head_held_for_a_chain() -> _ChainFillRun:
+    """Hold a head for one long chain, then queue jobs for another model that fit beside that chain.
+
+    One finisher leaves a long chain. The head, which cannot share the card with it, is queued behind the
+    finisher and is held once the chain runs. Two jobs for a model no lane holds arrive once the hold stands.
+    """
+    finisher = _backlog_finisher()
+    chain_mb = predict_job_post_processing_vram_mb(finisher, _SDXL.baseline.value)
+    assert chain_mb is not None
+    world = _backlog_world(chain_mb=chain_mb, chain_ticks=_FILL_CHAIN_TICKS)
+    head = _backlog_held_head()
+    followers = [
+        make_job_pop_response(_SDXL_OTHER.name, width=1024, height=1024, ddim_steps=8) for _ in range(_FILL_FOLLOWERS)
+    ]
+    await world.pop(finisher)
+    await world.pop(head)
+
+    followers_popped = False
+    held_with_followers = False
+    job_count = 2 + _FILL_FOLLOWERS
+    for _ in range(_FILL_MAX_TICKS):
+        await world.step()
+        head_held = str(head.id_) in world.scheduler.dispatch_holds.pp_defer_holds
+        if head_held and not followers_popped:
+            followers_popped = True
+            for job in followers:
+                await world.pop(job)
+        elif head_held and followers_popped:
+            held_with_followers = True
+        if world.submitted_jobs >= job_count:
+            break
+    assert world.submitted_jobs == job_count, (
+        f"{world.submitted_jobs} of {job_count} jobs were submitted. {world.state_dump()}"
+    )
+    assert len(world.post_process_chains) == 1, f"the run recorded {world.post_process_chains}. {world.state_dump()}"
+    chain = world.post_process_chains[0]
+    released_at = None if chain.released_tick is None else _chain_clock(world, chain, chain.released_tick)
+    return _ChainFillRun(
+        world=world,
+        head=head,
+        followers=followers,
+        chain_released_at=released_at,
+        head_held_with_followers_queued=held_with_followers,
+    )
+
+
+def _followers_sampling_before(run: _ChainFillRun, instant: float) -> list[str]:
+    """The followers whose sampling began before ``instant``, by job id."""
+    started: list[str] = []
+    for job in run.followers:
+        window = run.world.job_windows.get(str(job.id_))
+        if window is not None and window.sample_from is not None and window.sample_from < instant:
+            started.append(str(job.id_))
+    return started
+
+
+async def test_z_jobs_that_fit_beside_a_chain_run_behind_a_head_held_for_it() -> None:
+    """Jobs that fit beside a running chain load and sample while the head ahead of them is held for it.
+
+    The failure this encodes: a head held for a chain kept its model on a free lane, which the preload pass read
+    as a head about to dispatch and so loaded nothing else, and the dispatch pass offered nothing behind a
+    withheld head on the same card. Every lane idled for the length of the hold. The row asserts both followers
+    sample before the chain releases and the head still dispatches.
+    """
+    run = await _run_followers_behind_a_head_held_for_a_chain()
+    world = run.world
+
+    context = "followers behind a head held for a chain"
+    assert run.head_held_with_followers_queued and run.chain_released_at is not None, (
+        f"precondition: the head must still be held for the chain after the followers are queued. {world.state_dump()}"
+    )
+    started = _followers_sampling_before(run, run.chain_released_at)
+    assert len(started) == _FILL_FOLLOWERS, (
+        f"{context}: {len(started)} of {_FILL_FOLLOWERS} followers sampled before the chain released at "
+        f"{run.chain_released_at}; the windows were "
+        f"{[world.job_windows.get(str(job.id_)) for job in run.followers]}. {world.state_dump()}"
+    )
+    assert not world.card_overcommits, (
+        f"{context}: the card was committed past its total at {world.card_overcommits}. {world.state_dump()}"
+    )
+    assert not world.structural_queue_wedges, (
+        f"{context}: the queue deadlock stood the structural-wedge horizon on tick(s) "
+        f"{world.structural_queue_wedges}. {world.state_dump()}"
+    )
+    _assert_no_lane_sampled_unpriced(world, context=context)
+
+
+async def test_z_defect_reinjection_a_held_head_read_as_dispatchable_stops_every_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a held head still read as about to dispatch, no follower loads until the chain releases.
+
+    The defect is reinjected only at the preload pass's read of the head.
+    """
+    monkeypatch.setattr(InferenceScheduler, "_post_processing_hold_frees_preload", lambda _self, _head: False)
+    run = await _run_followers_behind_a_head_held_for_a_chain()
+
+    assert run.head_held_with_followers_queued and run.chain_released_at is not None
+    started = _followers_sampling_before(run, run.chain_released_at)
+    assert not started, f"no follower may sample before the chain releases; {started} did. {run.world.state_dump()}"
+
+
+async def test_z_defect_reinjection_nothing_is_offered_behind_a_held_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With nothing offered behind a head held for a chain, loaded followers wait for the chain to release.
+
+    The defect is reinjected only at the dispatch pass's selection behind the held head.
+    """
+    monkeypatch.setattr(
+        InferenceScheduler,
+        "_select_job_behind_post_processing_hold",
+        lambda _self, _head, _candidates: None,
+    )
+    run = await _run_followers_behind_a_head_held_for_a_chain()
+
+    assert run.head_held_with_followers_queued and run.chain_released_at is not None
+    started = _followers_sampling_before(run, run.chain_released_at)
+    assert not started, f"no follower may sample before the chain releases; {started} did. {run.world.state_dump()}"

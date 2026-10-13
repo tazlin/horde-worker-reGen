@@ -129,6 +129,10 @@ class _DeferralRecord:
     first_deferred_at: float
     last_logged_at: float
     reclaim_requested: bool = False
+    refused_by_arbiter: bool = False
+    """Whether the arbiter has refused this chain on its own price. Such a chain ages toward its fault
+    whatever the lane is doing, while a chain that has only waited for a sampler or for the lane does not
+    age while the lane is unavailable to it."""
     applied_actuations: set[ActuatorCommand] = field(default_factory=set)
     """Every plan command tried this episode, whether or not it acted, so no rung is taken twice."""
     last_step_at: float | None = None
@@ -166,6 +170,7 @@ class PostProcessOrchestrator:
         reclaim_ladder: VerifiedReclaimLadder,
         vram_actuator: VramActuator | None = None,
         sampling_coresidency_check: Callable[[float], bool] | None = None,
+        lane_yields_turn: Callable[[int | None], bool] | None = None,
         whole_card_residency_active: Callable[[], bool] = lambda: False,
         decision_sink: DecisionSink | None = None,
         footprint_store: LearnedFootprintStore | None = None,
@@ -188,6 +193,8 @@ class PostProcessOrchestrator:
             vram_actuator: Optional shared actuator used to execute the arbiter's complete reclaim plan.
             sampling_coresidency_check: Given a chain's estimated peak (MB), whether the card can run it
                 alongside the sampling currently in progress. None (unit tests) allows co-running always.
+            lane_yields_turn: Given the idle lane's card, whether the lane leaves its pending chains
+                waiting because a job a running chain held is owed the card next. None never yields.
             whole_card_residency_active: Whether a whole-card residency still owns the lane pause.
             decision_sink: Optional callback the manager injects to record the lane's admission decisions
                 (deferrals and their resolution) to the stats export. None in unit tests and until wired.
@@ -205,6 +212,7 @@ class PostProcessOrchestrator:
         self._reclaim_ladder = reclaim_ladder
         self._vram_actuator = vram_actuator
         self._sampling_coresidency_check = sampling_coresidency_check
+        self._lane_yields_turn = lane_yields_turn
         self._whole_card_residency_active = whole_card_residency_active
         # Injected by the manager: records the lane's admission decisions (deferrals and their resolution)
         # to the stats export, coalesced on the receiving side. None in unit tests and until wired.
@@ -214,6 +222,9 @@ class PostProcessOrchestrator:
         # keeps the window immune to wall-clock jumps.
         self._clock = time.monotonic
         self._deferrals: dict[str, _DeferralRecord] = {}
+        # When the pending queue was last scanned, so time the lane was unavailable can be taken off the
+        # patience clocks of chains that were only waiting for it. None until the first scan.
+        self._last_scan_at: float | None = None
         # Service-lane pauses this PP drain actually acquired through the shared reclaim actuator. The receipt
         # from execute_arbiter_commands excludes no-ops, so restoring these can never lift a same-owner pause an
         # independent governor episode already held. Kept across adjacent dispatched jobs (avoiding pause/restore
@@ -479,6 +490,7 @@ class PostProcessOrchestrator:
         if record is None:
             record = _DeferralRecord(first_deferred_at=now, last_logged_at=now - _DEFER_LOG_INTERVAL_SECONDS)
             self._deferrals[key] = record
+        record.refused_by_arbiter = True
 
         issued_reclaim = False
         reclaim_action_available = False
@@ -599,10 +611,26 @@ class PostProcessOrchestrator:
             return
 
         now = self._clock()
+        since_last_scan = 0.0 if self._last_scan_at is None else max(0.0, now - self._last_scan_at)
+        self._last_scan_at = now
 
         self._ensure_lane_liveness_for_pending_work()
 
         post_process_process = self._process_map.get_first_available_post_process_process()
+        lane_yields = (
+            post_process_process is not None
+            and self._lane_yields_turn is not None
+            and self._lane_yields_turn(post_process_process.device_index)
+        )
+        lane_running_a_chain = post_process_process is None and self._process_map.num_post_process_processes() > 0
+        if lane_yields or lane_running_a_chain:
+            self._hold_patience_of_queued_chains(since_last_scan)
+        if lane_yields:
+            # A job that cannot share the card with a chain was held by the chain that just ran, and
+            # the two take the card in turns. The pending chains wait for that job's sampling window.
+            await self._age_out_unfittable(now=now)
+            return
+
         if post_process_process is not None and await self._try_dispatch_first_fittable(
             pending=pending,
             post_process_process=post_process_process,
@@ -639,6 +667,20 @@ class PostProcessOrchestrator:
         # A no-image fault needs no lane, so age out unservable jobs whether or not the lane is free: a
         # busy or unfittable head must never hold a long-waiting job past its patience window.
         await self._age_out_unfittable(now=now)
+
+    def _hold_patience_of_queued_chains(self, seconds: float) -> None:
+        """Take ``seconds`` the lane was unavailable off the patience clock of each chain only queued for it.
+
+        The patience window faults a chain the card cannot host. A chain waiting behind another chain, or
+        for a job taking its turn on the card, is hostable and merely queued, so that time is not counted.
+        A chain the arbiter has refused on its own price keeps aging, so chains flowing past it cannot
+        park it.
+        """
+        if seconds <= 0:
+            return
+        for record in self._deferrals.values():
+            if not record.refused_by_arbiter:
+                record.first_deferred_at += seconds
 
     def is_service_lane_borrowed(self, kind: ActuatorCommandKind) -> bool:
         """Whether this PP drain currently holds a receipt for a service-lane pause of ``kind``.

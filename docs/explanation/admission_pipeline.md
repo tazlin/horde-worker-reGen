@@ -146,13 +146,24 @@ walk resumes and the first job another card can serve immediately is dispatched 
 queued for. A cold head names no card of its own, but a cycle preloads *and* dispatches, so a card carrying
 an in-flight load of the head's model is excluded too: seating other work there could put it at its cap just
 as the head's weights land. Cards with no copy of the head's model in flight withhold nothing from it and
-stay available. The three line-skip reasons differ in what they cost the head:
+stay available.
+
+A head withheld for the post-processing lane is the one case where its own card keeps taking work. That head
+waits for a chain to finish, and a later job that fits beside the lane's work delays neither the chain nor the
+head's lane, so the walk offers the first such job resident on a free lane
+(`_select_job_behind_post_processing_hold`, `LineSkip(reason="post_processing_hold")`). A job for the head's own
+model is not offered, since it would be seated on the lane the head is waiting to use. The preload pass reads
+the same hold: a head the gate is holding is not about to dispatch, so the loads behind it go ahead
+(`_post_processing_hold_frees_preload`), and head protection reserves no room for it while the hold stands.
+
+The four line-skip reasons differ in what they cost the head:
 
 | Reason | When | Effect on the head's affinity skip window |
 | --- | --- | --- |
 | `resident_bypass` | the head's model is not resident and a resident-model job passes it | counted; bounded by the skip budget and the anti-starvation override |
 | `diversity` | the head's own lane is busy sampling its model, and a distinct model is resident and idle | untouched |
 | `cross_card` | the head's card cannot seat it, and another card can run a later job now | untouched: the dispatch takes nothing the head is waiting for |
+| `post_processing_hold` | the head cannot share the card with the post-processing lane's work, and a later job can | untouched: the head waits for the lane, which the dispatch does not delay |
 
 A single-GPU worker takes none of the per-card branches: the cap is the worker-wide one it always was, and
 `cross_card` never arises.

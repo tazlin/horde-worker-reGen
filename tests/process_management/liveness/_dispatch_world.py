@@ -2949,7 +2949,11 @@ class _DispatchWorld:
         """Dispatch the oldest drainable pending chain to the modelled lane and book it, or return None.
 
         A chain the card cannot hold beside the sampling in progress is skipped, as the orchestrator defers it.
+        The lane takes none while the scheduler says it owes the card's next turn to a held job, which the
+        parent wires into the orchestrator as its turn question.
         """
+        if self._scheduler.post_processing_lane_yields_turn(device_index=lane.device_index):
+            return None
         for job_info in self._job_tracker.jobs_pending_post_processing:
             job_id = str(job_info.sdk_api_job_info.id_)
             ready_at = self._chain_ready_at.setdefault(job_id, self.tick + self.post_processing_chain_ticks)

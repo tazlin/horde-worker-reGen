@@ -244,6 +244,7 @@ from horde_worker_regen.process_management.scheduling.ledgers.dispatch_holds imp
     DISPATCH_HOLD_LIVENESS_SECONDS,
     DispatchDecline,
     DispatchHoldLedger,
+    PostProcessingTurn,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import (
     DISPATCH_STALL_MIN_SECONDS,
@@ -430,6 +431,35 @@ class IdleResidentCandidate:
 
     process_id: int
     model_name: str
+
+
+@dataclass(frozen=True)
+class _PostProcessingOverlap:
+    """One job's sampling peak priced against the post-processing lane's work on its card."""
+
+    chain_running: bool
+    """Whether a chain is running. False prices the smallest pending chain against an idle lane."""
+    chain_mb: float
+    """The running chain's committed VRAM, or the pending chain's estimate."""
+    sampling_peak_mb: float | None
+    static_affordable: bool
+    """Whether the peak, the chain and the live contexts fit the card's reported total."""
+    unmaterialized_chain_mb: float
+    """The part of the chain the measured device-free reading does not yet show."""
+
+    def hold_message(self, model: str | None) -> str:
+        """The gate's log line for a job this overlap holds."""
+        if self.chain_running:
+            return (
+                f"Holding dispatch of {model}: an in-flight post-processing chain "
+                f"({self.chain_mb:.0f}MB committed) and this job's sampling peak cannot share the card; "
+                "dispatching when the chain finishes."
+            )
+        return (
+            f"Holding dispatch of {model}: pending post-processing "
+            f"({self.chain_mb:.0f}MB estimated) needs the next drain window and this job's "
+            "sampling peak cannot share the card; dispatching after the lane gets its turn."
+        )
 
 
 @dataclass(frozen=True)
@@ -8008,7 +8038,9 @@ class InferenceScheduler:
         queue position and first claim on the next opportunity; it simply stops blocking work in the meantime.
 
         It is released while every lane on the card holding the head's model is running a job
-        (:meth:`_head_waits_on_its_busy_lane`): that head cannot take the room before its lane frees.
+        (:meth:`_head_waits_on_its_busy_lane`): that head cannot take the room before its lane frees. The same
+        holds while the post-processing gate is holding the head, which cannot take the room before the lane's
+        chain finishes.
 
         It is released the same way while a churn governor is deferring this head's whole-card establishment
         on this card. For the length of that deferral the head is not asking for the card at all (normal
@@ -8025,6 +8057,8 @@ class InferenceScheduler:
             self._note_head_protection_released(displaced_head)
             return None
         if self._head_waits_on_its_busy_lane(displaced_head, device_index=device_index):
+            return None
+        if displaced_head.id_ is not None and str(displaced_head.id_) in self._dispatch_holds.pp_defer_holds:
             return None
         baseline = self._model_metadata.get_baseline(displaced_head.model)
         return self._measured_admission_candidate_delta_mb(
@@ -9095,8 +9129,18 @@ class InferenceScheduler:
         return post_process_process.device_index if post_process_process is not None else None
 
     def _resident_head_should_dispatch_before_preload(self, head_job: ImageGenerateJobPopResponse | None) -> bool:
-        """Whether the queue head can already try dispatch, so speculative preloading should yield."""
-        return head_job is not None and self._job_dispatchable_now(head_job)
+        """Whether the queue head can already try dispatch, so speculative preloading should yield.
+
+        A head the post-processing gate is holding is not about to dispatch however ready its lane is, and it
+        can stay held for a whole chain. The loads behind it go ahead in that case.
+        """
+        if head_job is None or not self._job_dispatchable_now(head_job):
+            return False
+        return not self._post_processing_hold_frees_preload(head_job)
+
+    def _post_processing_hold_frees_preload(self, head_job: ImageGenerateJobPopResponse) -> bool:
+        """Whether the post-processing gate is holding ``head_job``, so loads behind it need not wait for it."""
+        return head_job.id_ is not None and str(head_job.id_) in self._dispatch_holds.pp_defer_holds
 
     def _job_dispatchable_now(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``job`` could be dispatched this cycle: its model is resident on a free slot under the cap.
@@ -9515,6 +9559,41 @@ class InferenceScheduler:
         if not self._concurrent_overlap_allowed(candidate_job, target_device_index=candidate_device_index):
             return None
         return candidate_process
+
+    def _select_job_behind_post_processing_hold(
+        self,
+        head_job: ImageGenerateJobPopResponse,
+        candidates: list[ImageGenerateJobPopResponse],
+    ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
+        """A pending job that can be seated now and fits beside the post-processing lane's work.
+
+        Offered when the head was withheld for the lane. The head waits for a chain to finish, and a job that
+        shares the card with that chain neither delays the chain nor takes the head's lane, so every other lane
+        need not idle for the length of the hold. A job for the head's own model is left alone, because it would
+        be seated on the lane the head is waiting to use. A degraded retry must run isolated and is never
+        seated beside other work.
+        """
+        for candidate_job in candidates:
+            if candidate_job is head_job or candidate_job.model is None or candidate_job.model == head_job.model:
+                continue
+            if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
+                continue
+            candidate_process = self._seatable_resident_process(candidate_job)
+            if candidate_process is None:
+                continue
+            if not self._multi_gpu_routing_active and len(
+                self._job_tracker.jobs_in_progress,
+            ) >= self._max_jobs_in_progress_allowed(card=None, job=candidate_job):
+                continue
+            overlap = self._post_processing_overlap(candidate_job, candidate_process.device_index)
+            if overlap is not None and not self._post_processing_overlap_fits(
+                candidate_job,
+                overlap,
+                device_index=candidate_process.device_index,
+            ):
+                continue
+            return candidate_job, candidate_process
+        return None
 
     def _select_cross_card_job(
         self,
@@ -10206,6 +10285,19 @@ class InferenceScheduler:
             # The head's own dispatch was withheld this cycle, which is a fact about the card it would have
             # landed on. Resume the placement-order walk for work another card can take now, exactly as the
             # cap and cold-head sites do; the head's own gates are not re-asked, so nothing is charged twice.
+            if declined_head.bucket is SlotDutyBucket.POST_PROCESSING_DEFER:
+                # The head waits for the post-processing lane, which a job that fits beside the lane's work
+                # does not delay, so its own card can still take such a job.
+                behind = self._select_job_behind_post_processing_hold(next_job, next_n_jobs)
+                if behind is not None:
+                    behind_job, behind_process = behind
+                    selection = NextJobAndProcess(
+                        next_job=behind_job,
+                        process_with_model=behind_process,
+                        line_skip=LineSkip(displaced_job=next_job, reason="post_processing_hold"),
+                    )
+                    self._pending_line_skip = selection
+                    return selection
             return self._cross_card_selection(
                 next_job,
                 next_n_jobs,
@@ -11483,9 +11575,45 @@ class InferenceScheduler:
         :meth:`_pp_overlap_measured_admits`): measured truth reflects an active chain's real allocations and
         so admits overlaps the ledger's worst-case reserve would needlessly hold, without over-committing
         the card or trusting the driver's free figure while it is paging.
+
+        The two sides take the card in turns. A job a running chain held is owed the turn after that chain
+        (:meth:`post_processing_lane_yields_turn`), so a pending chain does not hold it again.
         """
         device_index = process_with_model.device_index if process_with_model is not None else None
+        overlap = self._post_processing_overlap(next_job, device_index)
+        if overlap is None:
+            self._forget_pp_mutex_diagnostics()
+            return False
 
+        if not overlap.chain_running and self._holds_post_processing_turn(next_job):
+            # A running chain held this job and has since finished. The lane leaves its pending chains waiting
+            # for it, so the pending chain's claim on the next drain window does not apply.
+            self._forget_pp_mutex_diagnostics()
+            return False
+
+        held = self._resolve_pp_coresidency_hold(
+            next_job,
+            static_affordable=overlap.static_affordable,
+            sampling_peak_mb=overlap.sampling_peak_mb,
+            pending_pp_reserve_mb=overlap.unmaterialized_chain_mb,
+            device_index=device_index,
+            static_hold_message=overlap.hold_message(next_job.model),
+        )
+        if held and overlap.chain_running and next_job.id_ is not None:
+            self._dispatch_holds.claim_pp_turn(str(next_job.id_), device_index)
+        return held
+
+    def _post_processing_overlap(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        device_index: int | None,
+    ) -> _PostProcessingOverlap | None:
+        """Price ``next_job``'s sampling against the lane's work on ``device_index``, or None when it has none.
+
+        A running chain is priced at what the lane has committed for it. With the lane idle, the smallest
+        pending chain is priced instead. Nothing is logged or recorded, so the dispatch gate and the selection
+        of work behind a held head read one answer.
+        """
         pp_committed_mb = self._reserve_ledger.total_vram_mb() - self._reserve_ledger.total_vram_mb_excluding(
             POST_PROCESS_RESERVE_FLOW,
         )
@@ -11497,54 +11625,108 @@ class InferenceScheduler:
         )
         if pp_committed_mb > 0 and pp_busy:
             sampling_peak_mb = self._sampling_peak_mb(next_job)
-            affordable = self.pp_sampling_coresidency_affordable(
+            return _PostProcessingOverlap(
+                chain_running=True,
+                chain_mb=pp_committed_mb,
                 sampling_peak_mb=sampling_peak_mb,
-                pp_reserve_mb=pp_committed_mb,
-                device_index=device_index,
-            )
-            return self._resolve_pp_coresidency_hold(
-                next_job,
-                static_affordable=affordable,
-                sampling_peak_mb=sampling_peak_mb,
+                static_affordable=self.pp_sampling_coresidency_affordable(
+                    sampling_peak_mb=sampling_peak_mb,
+                    pp_reserve_mb=pp_committed_mb,
+                    device_index=device_index,
+                ),
                 # The measured free reflects only what the chain has allocated so far, so charge the part of
                 # its planned reserve that has not yet materialised.
-                pending_pp_reserve_mb=self._reserve_ledger.effective_planned_vram_mb_for_flow(
+                unmaterialized_chain_mb=self._reserve_ledger.effective_planned_vram_mb_for_flow(
                     POST_PROCESS_RESERVE_FLOW,
                     self._process_map.reserved_by_pid(device_index),
                     target_process_ids=self._process_ids_on_card(device_index),
-                ),
-                device_index=device_index,
-                static_hold_message=(
-                    f"Holding dispatch of {next_job.model}: an in-flight post-processing chain "
-                    f"({pp_committed_mb:.0f}MB committed) and this job's sampling peak cannot share the card; "
-                    "dispatching when the chain finishes."
                 ),
             )
 
         pending_pp_reserve_mb = self._pending_post_processing_reserve_mb(device_index=device_index)
         if pending_pp_reserve_mb <= 0:
-            self._forget_pp_mutex_diagnostics()
-            return False
+            return None
 
         sampling_peak_mb = self._sampling_peak_mb(next_job)
-        affordable = self.pp_sampling_coresidency_affordable(
+        return _PostProcessingOverlap(
+            chain_running=False,
+            chain_mb=pending_pp_reserve_mb,
             sampling_peak_mb=sampling_peak_mb,
-            pp_reserve_mb=pending_pp_reserve_mb,
-            device_index=device_index,
-        )
-        return self._resolve_pp_coresidency_hold(
-            next_job,
-            static_affordable=affordable,
-            sampling_peak_mb=sampling_peak_mb,
-            # The pending chain has not allocated yet, so its predicted reserve must still be charged.
-            pending_pp_reserve_mb=pending_pp_reserve_mb,
-            device_index=device_index,
-            static_hold_message=(
-                f"Holding dispatch of {next_job.model}: pending post-processing "
-                f"({pending_pp_reserve_mb:.0f}MB estimated) needs the next drain window and this job's "
-                "sampling peak cannot share the card; dispatching after the lane gets its turn."
+            static_affordable=self.pp_sampling_coresidency_affordable(
+                sampling_peak_mb=sampling_peak_mb,
+                pp_reserve_mb=pending_pp_reserve_mb,
+                device_index=device_index,
             ),
+            # The pending chain has not allocated yet, so its predicted reserve must still be charged.
+            unmaterialized_chain_mb=pending_pp_reserve_mb,
         )
+
+    def _post_processing_overlap_fits(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        overlap: _PostProcessingOverlap,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Whether ``next_job`` may sample beside the lane's work: the static price, then the measured one."""
+        return overlap.static_affordable or self._pp_overlap_measured_admits(
+            sampling_peak_mb=overlap.sampling_peak_mb,
+            pending_pp_reserve_mb=overlap.unmaterialized_chain_mb,
+            device_index=device_index,
+            margin_mb=self._pp_overlap_margin_mb(next_job),
+        )
+
+    def _live_post_processing_turn(self) -> PostProcessingTurn | None:
+        """The turn the lane owes a held job, after dropping one that is spent.
+
+        The turn is spent once its job has its sampling window (cleared under the lease, dispatched without
+        it), once the job has left the queue, or once the lane has waited on the job as long as the job waited
+        on the lane. From the sampling window on, the lane's own co-residency check keeps a chain off the card.
+        """
+        turn = self._dispatch_holds.pp_turn
+        if turn is None:
+            return None
+        job = next(
+            (job for job in self._job_tracker.jobs_pending_inference if str(job.id_) == turn.job_id),
+            None,
+        )
+        if job is None:
+            self._dispatch_holds.clear_pp_turn()
+            return None
+        if job in self._job_tracker.jobs_in_progress and (
+            not self._clearance_lease_active() or turn.job_id in self._dispatch_holds.clearance_granted_ids
+        ):
+            self._dispatch_holds.clear_pp_turn()
+            return None
+        if self._dispatch_holds.pp_yield_expired(floor_seconds=DISPATCH_STALL_MIN_SECONDS):
+            logger.info(
+                f"The post-processing lane stops waiting for job {turn.job_id[:8]} ({job.model}): the job was "
+                "given the card after a chain and has not started sampling, so the next chain runs first.",
+            )
+            self._dispatch_holds.clear_pp_turn()
+            return None
+        return turn
+
+    def _holds_post_processing_turn(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``job`` is the one the lane owes the card's next turn."""
+        turn = self._live_post_processing_turn()
+        return turn is not None and job.id_ is not None and turn.job_id == str(job.id_)
+
+    def post_processing_lane_yields_turn(self, *, device_index: int | None) -> bool:
+        """Whether the idle post-processing lane on ``device_index`` leaves its pending chains waiting.
+
+        A job that cannot share the card with a chain and the lane's chains take the card in turns. Asked by the
+        lane before it takes a chain: while a job a running chain held is still owed its turn, the lane takes
+        none, so that job is dispatched and cleared ahead of the backlog. A lane that took each chain as the
+        last one released would hold such a job for the whole backlog.
+        """
+        turn = self._live_post_processing_turn()
+        if turn is None:
+            return False
+        if device_index is not None and turn.device_index is not None and turn.device_index != device_index:
+            return False
+        self._dispatch_holds.begin_pp_yield()
+        return True
 
     def note_wddm_paging(self, elevated_shared_mb_by_pid: dict[int, float], *, active: bool) -> None:
         """Record the parent's WDDM demand-paging verdict and reclaim idle VRAM on its rising edge.
@@ -12599,7 +12781,8 @@ class InferenceScheduler:
         withheld selection is recorded and the walk resumes for work another card can take, rather than
         reading as "nothing more can start" and idling the fleet behind one held head. On a single-GPU host
         the resumed walk has nowhere else to look and returns nothing, which is the original behaviour: a
-        held head ends the loop.
+        held head ends the loop. The one exception there is a job withheld for the post-processing lane, since
+        work that fits beside the lane's chain can still run on the same card.
         """
         next_job_and_process = await self.get_next_job_and_process()
 
@@ -12609,7 +12792,7 @@ class InferenceScheduler:
                 await self._commit_dispatch(next_job_and_process)
                 return True
             self._dispatch_holds.note_decline(withheld)
-            if not self._multi_gpu_routing_active:
+            if not self._multi_gpu_routing_active and withheld.bucket is not SlotDutyBucket.POST_PROCESSING_DEFER:
                 return False
             next_job_and_process = await self.get_next_job_and_process()
 
@@ -12806,6 +12989,10 @@ class InferenceScheduler:
                 skip_detail = (
                     "the displaced job's card cannot seat it right now, and this job runs on a different card "
                     "whose capacity the displaced job is not waiting for"
+                )
+            elif line_skip.reason == "post_processing_hold":
+                skip_detail = (
+                    "the displaced job cannot share the card with the post-processing lane's work, and this job can"
                 )
             else:
                 skip_detail = "the displaced job's process is busy sampling its own model"

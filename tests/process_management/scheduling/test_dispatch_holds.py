@@ -131,3 +131,44 @@ class TestClearanceHolds:
         ledger.forget_clearance(["live"])
         assert ledger.clearance_hold_ids == {"live"}
         assert set(ledger.clearance_hold_spans) == {"live"}
+
+
+class TestPostProcessingTurn:
+    """The turn a running chain's held job is owed, and how long the lane waits on it."""
+
+    def test_the_first_held_job_keeps_the_turn(self) -> None:
+        """A later claim does not displace the job a running chain held first."""
+        ledger, clock = _ledger()
+        ledger.claim_pp_turn("first", 0)
+        clock.now += 3.0
+        ledger.claim_pp_turn("second", 0)
+        assert ledger.pp_turn is not None
+        assert (ledger.pp_turn.job_id, ledger.pp_turn.claimed_at) == ("first", 1_000.0)
+
+    def test_the_lane_waits_as_long_as_the_job_waited(self) -> None:
+        """A job held twenty seconds is waited on for twenty, counted from the first pass the lane yields."""
+        ledger, clock = _ledger()
+        ledger.claim_pp_turn("j", None)
+        assert ledger.pp_yield_expired(floor_seconds=5.0) is False, "no yield has begun while the chain runs"
+        clock.now += 20.0
+        ledger.begin_pp_yield()
+        clock.now += 4.0
+        ledger.begin_pp_yield()
+        clock.now += 16.0
+        assert ledger.pp_yield_expired(floor_seconds=5.0) is False
+        clock.now += 0.5
+        assert ledger.pp_yield_expired(floor_seconds=5.0) is True
+
+    def test_a_briefly_held_job_is_waited_on_for_the_floor(self) -> None:
+        """A job held for a moment still gets the floor to be dispatched and cleared."""
+        ledger, clock = _ledger()
+        ledger.claim_pp_turn("j", None)
+        clock.now += 1.0
+        ledger.begin_pp_yield()
+        clock.now += 5.0
+        assert ledger.pp_yield_expired(floor_seconds=5.0) is False
+        clock.now += 0.5
+        assert ledger.pp_yield_expired(floor_seconds=5.0) is True
+        ledger.clear_pp_turn()
+        assert ledger.pp_turn is None
+        assert ledger.pp_yield_expired(floor_seconds=5.0) is False
