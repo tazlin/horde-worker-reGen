@@ -259,6 +259,13 @@ a slot that retains its model's weights is priced at its activation delta alone,
 not held for weights the card is already carrying. It clears once
 eviction frees room, or the child samples anyway through its bounded lease-acquire timeout (liveness over
 pricing), so like the other gate buckets it is a named, real head-park rather than the gate-less stall.
+The bucket is keyed on the lane state, and a cleared child stays `INFERENCE_PRIMED` until its first denoise
+step, so `clearance_hold` also carries the weight upload and prompt encode that run *after* the grant. On a
+card where the next model cannot stage beside the running one, that post-clearance load is most of the bucket
+and none of it is the arbiter holding. Read the bucket beside the `Clearance held` and `cleared process`
+lines. The seconds between a job's dispatch and its clearance are the gate, and the seconds between its
+clearance and its first step are the child's load. Only the first is a pricing question. The offline `horde-log
+duty` report carries the same bucket, so its `clearance_hold` share over-reads the gate by the same amount.
 Under two-phase clearance (`gpu_sampling_lease_two_phase`) the dispatch-time overlap headway is not applied to
 leased jobs, because the stage and sample grants price the weight load and the denoise onset. `overlap_headway`
 therefore reads zero there, and the scheduler logs once per overlap episode on a card that the headway is not
@@ -324,7 +331,12 @@ the GPU was mostly not doing work, attributed to demand limits, scheduler waits,
 backoff, safety/submit queues, recovery, or `unknown`. Partial-utilization seconds are the remaining
 shortfall when the GPU was active but the mean utilization stayed below the target; those are attributed
 to the dominant phase or worker state (for example `model_load`, `vram_transfer`, `safety`, `submit`,
-`post_processing`, `vae_decode`, or `text_encode`).
+`post_processing`, `vae_decode`, or `text_encode`). That attribution is an order of precedence. A pending
+submit outranks a pending safety check, which outranks every lane state, so a second below target while any
+job waited on the safety process is labelled `safety` whatever the lanes were doing. With the safety check on
+the CPU and a job almost always in it, the label takes most of the below-target seconds. The cost of a phase
+is the per-job median on the next line and the summed phase metrics in the `job_completed` rows. The label
+reads as "what was outstanding" and the metric as "what it took".
 
 Worker-state attribution reads each lane's own state out of `process_state_summary`, which names *every*
 lane on every sample (`post_process#1=WAITING_FOR_JOB vae_lane#3=POST_PROCESSING ...`). An idle lane
