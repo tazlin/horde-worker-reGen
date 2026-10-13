@@ -458,7 +458,8 @@ class VramRequest:
     head is then queued behind live work, not starved).
 
     For an undispatched head it is the head-starvation clock. For a staged waiter at clearance it is the
-    clearance clock: seconds held with no other grant on its card and no reclaim in flight."""
+    clearance clock: seconds held with no other grant on its card and no eviction in flight. A rung applied for
+    the waiter leaves it running until the rung's room shows in the card's measured free, which restarts it."""
     probe_after_seconds: float = _FIRST_PARTY_TEARDOWN_GRACE_SECONDS
     """How long the head must have starved before the measured-load probe may fire at a converged-empty card.
     The teardown grace by default (once the ladder is empty, waiting longer buys nothing); the scheduler sets
@@ -469,7 +470,7 @@ class VramRequest:
     with no lease timeout."""
     lease_wait_seconds: float | None = None
     """For a staged waiter, seconds since its child first asked for clearance, the clock its lease-acquire timeout
-    runs on. A reclaim leaves it running, where it stops :attr:`starved_seconds`. None outside clearance."""
+    runs on. Nothing but the grant stops it. None outside clearance."""
     sampling_peak_mb: float | None = None
     active_sampling_peaks_total_mb: float | None = None
     """The live sum (MB) of the in-flight disaggregated sampling peaks at the moment of this request, for
@@ -1354,9 +1355,9 @@ class VramArbiter:
         """Whether the head has waited long enough for its one real load.
 
         It has once it has starved for its probe delay. A staged waiter also has once its lease wait reaches
-        its deadline while it is starved, however often a reclaim has restarted its starved clock, because its
-        child's timeout counts from the start of the wait. A waiter whose starved clock is stopped is queued
-        behind work that can still free room, and the deadline does not admit it beside that work.
+        its deadline while it is starved, however often room a rung returned has restarted its starved clock,
+        because its child's timeout counts from the start of the wait. A waiter whose starved clock is stopped is
+        queued behind work that can still free room, and the deadline does not admit it beside that work.
         """
         if request.starved_seconds >= cls._probe_delay_seconds(request, measured):
             return True

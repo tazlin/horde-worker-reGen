@@ -486,6 +486,16 @@ class _MaterializationOutcome:
     actuations_applied: tuple[ActuatorCommand, ...]
 
 
+@dataclass(frozen=True)
+class _ClearanceRungAwaitingRoom:
+    """Represents a reclaim rung clearance applied for a staged waiter whose room has not yet arrived."""
+
+    device_index: int | None
+    """The card the rung acted on, whose measured free is read for the room."""
+    device_free_at_send_mb: float | None
+    """The card's measured free (MB) when the first unrealised rung was sent, or None when it was unread."""
+
+
 def _round_or_none(value: float | None) -> float | None:
     """``value`` rounded to one decimal for a decision record, or None when there is no figure."""
     return None if value is None else round(value, 1)
@@ -705,15 +715,20 @@ class InferenceScheduler:
         # but not yet the card, with their session counters.
         self._dispatch_holds = DispatchHoldLedger(ledger_clock)
         # The clearance clock per staged job: when clearance began holding it while waiting could not help (no
-        # other grant on its card, no reclaim in flight). Absent while either holds. It times the waiter's
-        # measured-load probe, which must come before the child's lease-acquire timeout samples it unpriced.
+        # other grant on its card, no eviction in flight). Absent while either holds. It times the waiter's
+        # measured-load probe, which must come before the child's lease-acquire timeout samples it unpriced. A
+        # rung that clearance applies leaves the clock running. The room the rung returns restarts it from the
+        # moment that room arrives.
         self._clearance_starved_since: dict[str, float] = {}
+        # The rung clearance last applied per staged job whose room has not yet arrived. An accepted command frees
+        # nothing by itself, so only a rise in the card's measured free restarts the clock.
+        self._clearance_rungs_awaiting_room: dict[str, _ClearanceRungAwaitingRoom] = {}
         # When each staged job's child first asked for clearance, which bounds the waiter's measured-load probe. A
         # reclaim never stops it, since the child's lease-acquire timeout runs from the start of its wait.
         self._clearance_held_since: dict[str, float] = {}
-        # The lane rung last applied per staged job in its current starvation episode. Applying a rung stops the
-        # clearance clock, so the next rung is spaced by this rung's grade. It ends with the episode, wherever
-        # the clock is stopped for anything other than the job's own reclaim.
+        # The lane rung last applied per staged job in its current starvation episode. The next rung is spaced by
+        # this rung's grade. It ends with the episode, wherever the clock is stopped for anything other than the
+        # job's own reclaim.
         self._lane_rung_episodes: dict[str, StarvedLaneRungEpisode] = {}
         # Card scopes whose current overlap episode has already logged that two-phase clearance replaces the
         # overlap headway. A scope leaves the set when the gate next finds nothing sampling there.
@@ -6665,8 +6680,10 @@ class InferenceScheduler:
         The co-residency mutex is read here too, since clearance is the VRAM moment for a leased job.
 
         The waiter's clearance clock runs from the first hold at which waiting could not help and stops at any
-        pass where it could: a grant, a post-processing hold, reclaim run or still in flight, or another lane's
-        work on the card.
+        pass where it could: a grant, a post-processing hold, an eviction still in flight, or another lane's work
+        on the card. A reclaim rung this pass applies leaves it running, since an accepted command frees nothing
+        until its room arrives. :meth:`_settle_staged_waiter_clocks` restarts the clock when the card's measured
+        free shows that room.
         """
         process_info = self._process_map.get(process_id)
         job = process_info.current_inference_job() if process_info is not None else None
@@ -6694,7 +6711,7 @@ class InferenceScheduler:
             return plan.grants
         if plan.decision is ClearanceDecision.HOLD_POST_PROCESSING:
             self._stop_staged_waiter_clock(job)
-            self._note_clearance_hold(job, reclaim_applied=False)
+            self._note_clearance_hold(job)
             self._log_clearance_hold(process_id, job, reason=plan.reason, verdict=None)
             self._record_clearance_decision(job, plan, DecisionVerdict.DEFER, "held beside a post-processing chain")
             return False
@@ -6731,7 +6748,7 @@ class InferenceScheduler:
         waiting_can_help = not applied and self._waiting_can_help_staged_waiter(process_info)
         if applied:
             self._note_lane_rung_applied(job, applied)
-            self._clearance_starved_since.pop(str(job.id_), None)
+            self._note_clearance_rung_applied(job, process_info)
         elif waiting_can_help:
             self._stop_staged_waiter_clock(job)
         elif (terminal_evidence := self._terminal_refusal_evidence(plan, job.model)) is not None:
@@ -6762,7 +6779,7 @@ class InferenceScheduler:
             return False
         elif job.id_ is not None:
             self._clearance_starved_since.setdefault(str(job.id_), self._clock())
-        self._note_clearance_hold(job, reclaim_applied=bool(applied))
+        self._note_clearance_hold(job)
         self._log_clearance_hold(
             process_id,
             job,
@@ -6970,7 +6987,47 @@ class InferenceScheduler:
         """
         if job is not None and job.id_ is not None:
             self._clearance_starved_since.pop(str(job.id_), None)
+            self._clearance_rungs_awaiting_room.pop(str(job.id_), None)
             self._lane_rung_episodes.pop(str(job.id_), None)
+
+    def _note_clearance_rung_applied(self, job: ImageGenerateJobPopResponse, process_info: HordeProcessInfo) -> None:
+        """Keep the waiter's clock running past a rung just applied for it, and await the rung's room.
+
+        The clock starts at the send if it was not already running, unless something else on the card can still
+        change the waiter's fit. A rung re-sent before its room arrives is the same request, so the reading at the
+        first unrealised send stays the baseline and room that lands gradually across several sends still counts.
+        """
+        if job.id_ is None:
+            return
+        job_id = str(job.id_)
+        self._clearance_rungs_awaiting_room.setdefault(
+            job_id,
+            _ClearanceRungAwaitingRoom(
+                device_index=process_info.device_index,
+                device_free_at_send_mb=self._measured_device_free_mb(process_info.device_index),
+            ),
+        )
+        if self._waiting_can_help_staged_waiter(process_info):
+            self._clearance_starved_since.pop(job_id, None)
+        else:
+            self._clearance_starved_since.setdefault(job_id, self._clock())
+
+    def _settle_clearance_rung_room(self) -> None:
+        """Restart the clock of each waiter whose applied rung's room has arrived, from the moment it is seen.
+
+        The room has arrived once the card's measured free has risen by the drain logic's progress epsilon since
+        the rung was sent. Read every tick, so the restart lands on the tick the room shows. A waiter whose clock
+        is stopped keeps it stopped. The record is retired either way.
+        """
+        for job_id, awaiting in list(self._clearance_rungs_awaiting_room.items()):
+            free_now_mb = self._measured_device_free_mb(awaiting.device_index)
+            if free_now_mb is None or awaiting.device_free_at_send_mb is None:
+                continue
+            if free_now_mb < awaiting.device_free_at_send_mb + PENDING_GPU_START_PROGRESS_EPSILON_MB:
+                continue
+            del self._clearance_rungs_awaiting_room[job_id]
+            if job_id in self._clearance_starved_since:
+                self._clearance_starved_since[job_id] = self._clock()
 
     def _note_lane_rung_applied(
         self,
@@ -7036,10 +7093,16 @@ class InferenceScheduler:
         return False
 
     def _settle_staged_waiter_clocks(self, device_index: int) -> None:
-        """Stop the clocks of the card's waiters that waiting can help, and drop those of jobs no longer staged."""
+        """Stop the clocks of the card's waiters that waiting can help, and drop those of jobs no longer staged.
+
+        A waiter whose applied rung's room has arrived has its clock restarted first.
+        """
         in_progress_ids = {str(job.id_) for job in self._job_tracker.jobs_in_progress if job.id_ is not None}
         for job_id in [job_id for job_id in self._clearance_starved_since if job_id not in in_progress_ids]:
             del self._clearance_starved_since[job_id]
+        for job_id in [job_id for job_id in self._clearance_rungs_awaiting_room if job_id not in in_progress_ids]:
+            del self._clearance_rungs_awaiting_room[job_id]
+        self._settle_clearance_rung_room()
         for job_id in [job_id for job_id in self._clearance_held_since if job_id not in in_progress_ids]:
             del self._clearance_held_since[job_id]
         for job_id in [job_id for job_id in self._lane_rung_episodes if job_id not in in_progress_ids]:
@@ -7111,12 +7174,12 @@ class InferenceScheduler:
             f"for room (or samples via its lease-acquire timeout); this repeats at most once per distinct cause.",
         )
 
-    def _note_clearance_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_applied: bool) -> None:
+    def _note_clearance_hold(self, job: ImageGenerateJobPopResponse) -> None:
         """Record that ``job``'s clearance was withheld this pass, so the empty sampling slot is attributed.
 
         The clearance counterpart of :meth:`_note_dispatch_hold`, keyed on the primed in-progress job rather
-        than a pending head. ``reclaim_applied`` (unused for now beyond symmetry) records that an actuator
-        accepted at least one eviction command, matching the dispatch gate's release attribution.
+        than a pending head. The clearance clock tracks what a rung applied for the job returned
+        (:meth:`_settle_clearance_rung_room`).
         """
         if job.id_ is not None:
             self._dispatch_holds.note_clearance_hold(str(job.id_))

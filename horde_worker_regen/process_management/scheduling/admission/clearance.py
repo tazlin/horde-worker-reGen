@@ -117,7 +117,8 @@ class StagedWaiterClock:
 
     starved_seconds: float
     """Seconds clearance has held the waiter while waiting could not help: no other grant on its card and no
-    reclaim in flight. Zero while either holds."""
+    eviction in flight. Zero while either holds. An applied reclaim rung does not stop it. Room that measurably
+    arrives restarts it."""
     load_seconds: float | None
     """The card's measured RAM-to-VRAM load seconds, or None when none is measured yet."""
     lane_rung_grade: LaneRungGrade = LaneRungGrade.NO_RUNG

@@ -640,7 +640,7 @@ class TestClearanceHoldGraceAccounting:
         now = [1000.0]
         scheduler, job, process_id = self._held_scheduler_and_job(lambda: now[0])
 
-        scheduler._note_clearance_hold(job, reclaim_applied=False)
+        scheduler._note_clearance_hold(job)
         now[0] += 70.0
         assert scheduler.clearance_held_seconds_for_process(process_id) == pytest.approx(70.0)
 
@@ -648,7 +648,7 @@ class TestClearanceHoldGraceAccounting:
         now[0] += 30.0
         assert scheduler.clearance_held_seconds_for_process(process_id) == pytest.approx(70.0)
 
-        scheduler._note_clearance_hold(job, reclaim_applied=False)
+        scheduler._note_clearance_hold(job)
         now[0] += 20.0
         assert scheduler.clearance_held_seconds_for_process(process_id) == pytest.approx(90.0)
 
@@ -657,9 +657,9 @@ class TestClearanceHoldGraceAccounting:
         now = [1000.0]
         scheduler, job, process_id = self._held_scheduler_and_job(lambda: now[0])
 
-        scheduler._note_clearance_hold(job, reclaim_applied=False)
+        scheduler._note_clearance_hold(job)
         now[0] += 40.0
-        scheduler._note_clearance_hold(job, reclaim_applied=False)
+        scheduler._note_clearance_hold(job)
         now[0] += 40.0
         assert scheduler.clearance_held_seconds_for_process(process_id) == pytest.approx(80.0)
 
@@ -685,7 +685,7 @@ class TestClearanceHoldGraceAccounting:
 
         now = [1000.0]
         pm._inference_scheduler._clock = lambda: now[0]
-        pm._inference_scheduler._note_clearance_hold(job, reclaim_applied=False)
+        pm._inference_scheduler._note_clearance_hold(job)
         now[0] += 159.0
 
         widened = pm._process_lifecycle._effective_first_step_timeout(pm.bridge_data, proc, 90)

@@ -1003,9 +1003,8 @@ The room is also what the other frames read, so they cannot disagree with the ve
   post-processing drain borrows are not booked there; the drain returns them. `starved_head_lane_reclaim` withholds the rungs; `starved_head_utilities_pause`
   withholds the last one.
 - **Lane rungs are spaced by their grade.** The first lane rung of a starvation episode waits the teardown
-  grace from the head's first hold. Applying a rung stops a staged waiter's clearance clock, so clearance
-  records the rung (`StarvedLaneRungEpisode` in `scheduling/admission/clearance.py`) and passes its grade on
-  the request as `VramRequest.lane_rung_grade`. A rung is graded once every process of its lane present at the
+  grace from the head's first hold. Clearance records the rung (`StarvedLaneRungEpisode` in
+  `scheduling/admission/clearance.py`) and passes its grade on the request as `VramRequest.lane_rung_grade`. A rung is graded once every process of its lane present at the
   pause has left the process map (safety returns under a new launch) and a later evaluation has read the card.
   The next rung is offered on that evaluation without a second grace. A lane that never exits is graded at
   `teardown_verification_settle_seconds()`, the verified ladder's teardown budget base, on whatever the card
@@ -1021,13 +1020,18 @@ The room is also what the other frames read, so they cannot disagree with the ve
   never answers for a job in progress. At clearance the probe reads the scheduler's clearance clock instead:
   seconds the waiter has been held while waiting could not help. A sampler or any other lane past its own
   clearance on the card, a post-processing chain running on the card, an eviction issued and not yet
-  evidenced, a hold that ran reclaim, a grant and a post-processing hold each stop it, and the next hold where
-  nothing helps starts it again. A staged waiter takes `measured_load_probe_seconds` at any shortfall, without
+  evidenced, a grant and a post-processing hold each stop it, and the next hold where nothing helps starts it
+  again. A rung the hold applies does not stop it. An accepted command frees nothing yet, and a rung re-sent
+  on every pass that frees nothing would otherwise restart the clock each time and hold the waiter to its
+  lease-acquire timeout. Once the card's measured free has risen by
+  `PENDING_GPU_START_PROGRESS_EPSILON_MB` since the first unrealised send, the clock restarts from
+  the tick that rise is seen, so a waiter whose reclaim is working waits a whole probe delay after the room
+  arrives. A staged waiter takes `measured_load_probe_seconds` at any shortfall, without
   the longer horizon. At its lease-acquire timeout its child makes the same load unpriced, so the horizon would
   only idle the card for the same outcome. The scheduler also keeps the waiter's lease wait, seconds since its
   child first asked for clearance, which no reclaim stops. Once that reaches the lease-acquire timeout less the longer
   of the probe delay and the card's measured load seconds, the probe is due while the waiter is starved, however
-  often a rung restarted its clearance clock. Reclaim keeps its turn, since the probe still needs a converged
+  often a rung's room restarted its clearance clock. Reclaim keeps its turn, since the probe still needs a converged
   card with no rung left that could close the deficit.
 - **A refusal past the deadline holds the waiter unless its sample is known to crash.** The unpriced sample
   at the lease-acquire timeout can succeed, since clearance prices the whole weights and ComfyUI can load
