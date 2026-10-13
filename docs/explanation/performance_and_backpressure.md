@@ -860,7 +860,11 @@ back for within the falsification horizon, without waiting for either
 unused hold therefore costs only the interval until the next dispatch. The sweep spares the resident copy of a model still in the queue lookahead, but only when the card
 can statically afford that copy alongside the head-of-queue job's sampling peak; on a card where they cannot
 coexist, keeping the copy warm would force silent driver demand-paging during sampling, which costs far more
-than the one reload the protection saves.
+than the one reload the protection saves. A ready seat outranks both: an idle lane holding the model a pending
+job will start on this cycle keeps its copy, since unloading it only for the job to reload it a tick later is the
+worst exchange the sweep can make. The head escalation keeps only the head's own seat, and a job a dispatch gate
+is holding claims none. One rule owns all of this
+([`sweep_spares_idle_copy`][horde_worker_regen.process_management.scheduling.admission.pricing.sweep_spares_idle_copy]).
 
 Underneath the scheduler's retention lever sits ComfyUI's own model management. ComfyUI's *smart memory*
 keeps a just-used model resident in VRAM across executions; disabling it (`--disable-smart-memory`) makes

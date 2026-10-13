@@ -5538,7 +5538,9 @@ class InferenceScheduler:
         process is never a target. When the in-use allocation has not yet been reported the reclaimable margin
         cannot be measured, so the process is not targeted rather than assumed to hold cache. A process with a
         release outstanding is not targeted again, and one whose release returned nothing is not a target until it
-        loads or unloads a model (:meth:`_release_cache_grade`).
+        loads or unloads a model (:meth:`_release_cache_grade`). A lane that owns a dispatched job is counted busy
+        whatever it last reported. It is committed to that job until its first step, and a release queued ahead
+        of the job's start drops the split components the job is about to load.
         """
         cache_bearing = (
             HordeProcessType.INFERENCE,
@@ -5553,7 +5555,7 @@ class InferenceScheduler:
                 continue
             if device_index is not None and process_info.device_index != device_index:
                 continue
-            if process_info.is_process_busy():
+            if process_info.is_process_busy() or process_info.current_inference_job() is not None:
                 busy.add(process_info.process_id)
                 continue
             if process_info.loaded_horde_model_name is not None:
@@ -5636,15 +5638,20 @@ class InferenceScheduler:
         The admission room permits only this much of such a lane, since the context teardown never takes it. An
         eviction or a cache release returns its reservation; a lane whose model is in host RAM and which is not
         a release target holds nothing a rung returns, unless its release is still inside the settle. A lane
-        whose unload the device refused returns nothing either: the ladder passes it over until it next
-        materialises weights (:attr:`HordeProcessInfo.vram_unload_refused`). Bare contexts are left out: their
-        whole tenancy is the teardown's.
+        whose unload the device refused returns nothing either. The ladder passes it over until it next
+        materialises weights (:attr:`HordeProcessInfo.vram_unload_refused`). A lane that owns a dispatched job
+        returns nothing, bare or not. It is committed to that job until its first step, so every reclaim
+        actuator declines it and the room lists its tenancy as a rung that is not permitted. Other bare
+        contexts are left out, since their whole tenancy is the teardown's.
         """
         returns: dict[int, float] = {}
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE or process_info.is_process_busy():
                 continue
             if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.current_inference_job() is not None:
+                returns[process_info.process_id] = 0.0
                 continue
             if pricing.is_bare_context(
                 model=process_info.loaded_horde_model_name,
@@ -8452,8 +8459,12 @@ class InferenceScheduler:
         return bool(self._card_bridge_data(device_index).starved_head_utilities_pause)
 
     def release_cache(self, process_id: int) -> bool:
-        """Return an idle lane's cached allocator reservation to the device (:class:`VramActuator`)."""
-        return self.release_allocator_cache(process_id)
+        """Return an idle lane's cached allocator reservation to the device (:class:`VramActuator`).
+
+        The arbiter's release and the ladder's are one actuation, so this declines what
+        :meth:`release_idle_cache` declines.
+        """
+        return self.release_idle_cache(process_id)
 
     def evict_idle_model(
         self,
@@ -9044,7 +9055,14 @@ class InferenceScheduler:
         return IdleResidentCandidate(process_id=chosen.process_id, model_name=chosen.tenant_label)
 
     def release_idle_cache(self, process_id: int) -> bool:
-        """Release an idle process's reclaimable allocator cache back to the card (reclaim-ladder actuator)."""
+        """Release an idle process's reclaimable allocator cache back to the card (reclaim-ladder actuator).
+
+        Declines a lane that owns a dispatched job, as :meth:`unload_idle_model` does. The lane is committed to
+        that job until its first step, and the release would queue ahead of its start.
+        """
+        process_info = self._process_map.get(process_id)
+        if process_info is not None and process_info.current_inference_job() is not None:
+            return False
         return self.release_allocator_cache(process_id)
 
     def pause_post_process_lane(self, device_index: int | None) -> bool:
@@ -11451,32 +11469,6 @@ class InferenceScheduler:
 
     # ---- end VRAM retention -----------------------------------------------------------------------------
 
-    def _coresident_lookahead_affordable(self, resident_model: str, *, device_index: int | None) -> bool:
-        """Whether an idle resident copy of a queued model can coexist with the imminent job's sampling.
-
-        Static accounting against the card's reported total (a constant the driver cannot misreport
-        under memory pressure): the resident's full weight footprint plus the head-of-queue job's
-        sampling peak plus the configured reserve must fit. On a card where they cannot, keeping the
-        copy warm forces driver demand-paging during the head's sampling, which costs far more than the
-        one reload the protection would have saved. Unknown figures (no total reported, no head job, no
-        estimate) keep the protection: the affordability gate only ever *removes* protection on
-        evidence.
-        """
-        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
-        if total_vram_mb is None:
-            return True
-        pending = self._job_tracker.jobs_pending_inference
-        head_job = pending[0] if len(pending) > 0 else None
-        if head_job is None or head_job.model is None:
-            return True
-        head_peak_mb = predict_job_sampling_vram_mb(head_job, self._model_metadata.get_baseline(head_job.model))
-        # The footprint estimator keys on the baseline alone (weights do not scale with job shape); the
-        # job argument only satisfies its signature.
-        resident_footprint_mb = predict_job_footprint_mb(head_job, self._model_metadata.get_baseline(resident_model))
-        if head_peak_mb is None or resident_footprint_mb is None:
-            return True
-        return total_vram_mb - self._vram_budget.reserve_mb - head_peak_mb - resident_footprint_mb >= 0
-
     def pp_sampling_coresidency_affordable(
         self,
         *,
@@ -13551,6 +13543,8 @@ class InferenceScheduler:
         )
 
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
+        # Frozen once, before any unload this sweep sends, so every copy is judged against the same queue and lanes.
+        sweep_snapshot = self.snapshot()
 
         unloaded_any = False
         for process_info in self._process_map.values():
@@ -13612,21 +13606,13 @@ class InferenceScheduler:
                 if process_info.loaded_horde_model_name in in_progress_models:
                     continue
 
-                # Spare the resident copy of ANY model in the queue lookahead, not just one of them:
-                # evicting a queued model's weights trades the room gained for a guaranteed reload when
-                # its job's turn comes. The protection is affordability-gated: on a card that cannot
-                # physically hold the resident's footprint alongside the imminent job's sampling peak,
-                # sparing it would force driver demand-paging (far costlier than the reload it saves),
-                # so the copy is evicted. The head-of-queue escalation overrides the protection outright
-                # (the head has priority for the room when every idle resident copy is another queued
-                # job's model).
-                if (
-                    process_info.loaded_horde_model_name in next_n_models
-                    and not for_head_of_queue
-                    and self._coresident_lookahead_affordable(
-                        process_info.loaded_horde_model_name,
-                        device_index=device_index,
-                    )
+                slot = sweep_snapshot.slots.get(process_info.process_id)
+                if slot is not None and pricing.sweep_spares_idle_copy(
+                    sweep_snapshot,
+                    slot,
+                    target_process_id=process_with_model.process_id,
+                    for_head_of_queue=for_head_of_queue,
+                    device_index=device_index,
                 ):
                     continue
 

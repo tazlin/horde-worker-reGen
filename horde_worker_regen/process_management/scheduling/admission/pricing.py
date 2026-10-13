@@ -8,7 +8,7 @@ records anything.
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -735,6 +735,123 @@ def coresident_lookahead_affordable(
     return total_vram_mb - snapshot.vram_reserve_mb - head_peak_mb - resident_footprint_mb >= 0
 
 
+def card_concurrency_cap(snapshot: SchedulingSnapshot, device_index: int | None) -> int:
+    """How many inference jobs the card may run at once: its own cap, else the worker-wide ceiling."""
+    card = snapshot.cards.get(device_index)
+    if card is None or card.max_concurrent_inference is None:
+        return snapshot.max_concurrent_inference_processes
+    return card.max_concurrent_inference
+
+
+def card_running_job_count(snapshot: SchedulingSnapshot, device_index: int | None) -> int:
+    """How many in-progress jobs the card's inference lanes are running: the count dispatch holds to its cap.
+
+    ``device_index`` is a routing key, so None counts the whole worker where routing is card-agnostic.
+    """
+    in_progress = frozenset(snapshot.queue.in_progress)
+    return sum(
+        1
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE
+        and snapshot.routing_device_index(slot) == device_index
+        and slot.current_job_id in in_progress
+    )
+
+
+def cards_able_to_start_job(snapshot: SchedulingSnapshot) -> frozenset[int | None]:
+    """The routing keys running fewer jobs than their sampling cap, so an idle lane there can start one this cycle.
+
+    Each card on a multi-GPU host, else the one worker-wide key, None. Busy lanes are a different count. A lane
+    loading or holding a freshly loaded model counts as busy while running nothing, so it keeps placement from
+    stacking copies on its card, but it does not stop dispatch seating a job on the card's other lane.
+    """
+    return frozenset(
+        device_index
+        for device_index in snapshot.cards
+        if (device_index is not None) is snapshot.multi_gpu_routing_active
+        and card_running_job_count(snapshot, device_index) < card_concurrency_cap(snapshot, device_index)
+    )
+
+
+def ready_seat_process_ids(snapshot: SchedulingSnapshot, claimants: Iterable[str] | None = None) -> frozenset[int]:
+    """The idle lanes a pending job could be dispatched onto this cycle with no load, by process id.
+
+    A ready seat holds the model a pending job names, can take work, is not a pinned disaggregation sampler,
+    and sits where that job may run and a job can start now (:func:`cards_able_to_start_job`), which on a
+    multi-GPU host is a card eligible for the job and otherwise the worker. Dispatch runs after the preload pass
+    in the same cycle and seats that job at once. Jobs awaiting auxiliary preparation are invisible to dispatch and
+    claim no seat, and so are jobs a dispatch gate is holding (a residency hold or the post-processing hold), which
+    will not start this cycle whatever their lane holds. ``claimants`` restricts the jobs that may claim a seat, and
+    None lets every pending job claim one.
+    """
+    startable_cards = cards_able_to_start_job(snapshot)
+    in_progress = frozenset(snapshot.queue.in_progress)
+    holds = snapshot.ledgers.dispatch_holds
+    seat_cards_by_model: dict[str, set[int | None]] = {}
+    job_ids = snapshot.queue.pending_in_placement_order if claimants is None else tuple(claimants)
+    for job_id in job_ids:
+        job = snapshot.queue.jobs[job_id]
+        if job_id in in_progress or job.model is None or job.requires_aux_preparation:
+            continue
+        if job_id in holds.hold_since or job_id in holds.pp_defer_holds:
+            continue
+        allowed: frozenset[int | None] = (
+            frozenset(job.eligible_cards) if snapshot.multi_gpu_routing_active else frozenset({None})
+        )
+        seat_cards_by_model.setdefault(job.model, set()).update(allowed & startable_cards)
+    return frozenset(
+        slot.process_id
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE
+        and slot.model is not None
+        and slot.can_accept_job
+        and not slot.reserved_for_disaggregation
+        and snapshot.routing_device_index(slot) in seat_cards_by_model.get(slot.model, ())
+    )
+
+
+def sweep_spares_idle_copy(
+    snapshot: SchedulingSnapshot,
+    slot: SlotSnapshot,
+    *,
+    target_process_id: int,
+    for_head_of_queue: bool,
+    device_index: int | None,
+) -> bool:
+    """Whether a VRAM sweep leaves an idle lane's resident copy where it is.
+
+    The eviction (`unload_models_from_vram`) and its read-only mirror (:func:`has_reclaimable_idle_model`) both
+    ask it, so the sweep's protection of queued models has one owner.
+
+    A ready seat (:func:`ready_seat_process_ids`) is spared first. Dispatch runs later in the same cycle and
+    starts its job there with no load. Unloading the copy frees room the reload takes back a tick later, and
+    the job's start pays a load it did not need.
+    The head escalation keeps only the seat the head itself (the first queued job not yet dispatched) claims, so
+    the head's model is never unloaded from the lane about to receive it, while a follower's warm start yields to
+    a starved head. A seat whose job a dispatch gate holds is claimed by no one, because that job will not start
+    and a copy spared for it would hold back a staged job's room until the lease times it out. The lane the sweep
+    is clearing for its beneficiary is not spared as a seat, since :func:`target_slot_is_spared` alone decides
+    it.
+
+    Any other copy of a model in the queue's lookahead is spared while it can share the card with the head's
+    sampling (:func:`coresident_lookahead_affordable`). On a card that cannot hold both, keeping it forces
+    demand-paging during the head's sampling, which costs more than the reload. The head escalation overrides
+    this protection outright.
+    """
+    if slot.model is None:
+        return False
+    in_progress = frozenset(snapshot.queue.in_progress)
+    head_id = next((job_id for job_id in snapshot.queue.pending_in_pop_order if job_id not in in_progress), None)
+    claimants = None if not for_head_of_queue else (head_id,) if head_id is not None else ()
+    if slot.process_id != target_process_id and slot.process_id in ready_seat_process_ids(snapshot, claimants):
+        return True
+    if for_head_of_queue:
+        return False
+    return slot.model in next_models(snapshot, snapshot.max_inference_processes) and coresident_lookahead_affordable(
+        snapshot, slot.model, device_index=device_index
+    )
+
+
 def has_reclaimable_idle_model(
     snapshot: SchedulingSnapshot,
     target_process_id: int,
@@ -747,9 +864,9 @@ def has_reclaimable_idle_model(
 
     A read-only mirror of the pressure eviction's targeting: an idle post-processing lane not already
     unloading, or an inference slot holding a model that is idle or parked on a stale preload, owns no
-    dispatched job, is not in progress, not spared by the lookahead or whole-card guards (which the head
-    escalation overrides), and not already unloading. The head's own target slot is excluded on the terms
-    :func:`target_slot_is_spared` sets.
+    dispatched job, is not in progress, not spared by :func:`sweep_spares_idle_copy` or the whole-card guard
+    (which the head escalation overrides), and not already unloading. The head's own target slot is excluded
+    on the terms :func:`target_slot_is_spared` sets.
 
     The busy-or-parked and job-ownership terms are the actuator's own (`unload_models_from_vram` skips a busy
     slot that is not a parked preload, and a slot that owns a dispatched job). A mirror that counted either as
@@ -757,7 +874,6 @@ def has_reclaimable_idle_model(
     behind it would never be offered.
     """
     running = in_progress_models(snapshot)
-    lookahead = next_models(snapshot, snapshot.max_inference_processes)
     for slot in card_slots(snapshot, device_index):
         if slot.process_id == target_process_id and target_slot_is_spared(
             slot, make_room_for_model=make_room_for_model
@@ -775,10 +891,12 @@ def has_reclaimable_idle_model(
             continue
         if slot.model in running:
             continue
-        if (
-            slot.model in lookahead
-            and not for_head_of_queue
-            and coresident_lookahead_affordable(snapshot, slot.model, device_index=device_index)
+        if sweep_spares_idle_copy(
+            snapshot,
+            slot,
+            target_process_id=target_process_id,
+            for_head_of_queue=for_head_of_queue,
+            device_index=device_index,
         ):
             continue
         if not for_head_of_queue and slot.model in snapshot.whole_card_held_models:
@@ -792,7 +910,11 @@ def has_reclaimable_idle_model(
 def teardownable_idle_contexts(
     snapshot: SchedulingSnapshot, head_process_id: int, *, device_index: int | None
 ) -> tuple[SlotSnapshot, ...]:
-    """The idle inference slots on the card, other than the head's own, not serving an in-progress model."""
+    """The idle inference slots on the card, other than the head's own, not serving an in-progress model.
+
+    A slot that owns a dispatched job reads idle until its child reports the job. It is left out because the
+    scale-down that performs the teardown never takes it, and counting it would price room no rung returns.
+    """
     running = in_progress_models(snapshot)
     return tuple(
         slot
@@ -800,6 +922,7 @@ def teardownable_idle_contexts(
         if slot.process_type is HordeProcessType.INFERENCE
         and slot.process_id != head_process_id
         and not slot.is_busy
+        and slot.current_job_id is None
         and not (slot.model is not None and slot.model in running)
     )
 

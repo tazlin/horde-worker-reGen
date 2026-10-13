@@ -16,7 +16,7 @@ from horde_worker_regen.analysis.log_signatures import pattern_for
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.scheduling.admission import preload
+from horde_worker_regen.process_management.scheduling.admission import preload, pricing
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob, ReplaceProcess
 from horde_worker_regen.process_management.scheduling.admission.preload import (
     PreloadPassControl,
@@ -371,7 +371,7 @@ class TestReadySeats:
         """Card 0's copy of ``a`` is a ready seat; card 1's waits out the job beside it and is not."""
         scheduler, _ = await self._two_card_pool(pending=["d", "a"])
 
-        assert preload.ready_seat_process_ids(scheduler.snapshot()) == frozenset({2})
+        assert pricing.ready_seat_process_ids(scheduler.snapshot()) == frozenset({2})
 
     async def test_the_head_loads_past_a_lane_a_pending_job_can_start_on(self) -> None:
         """The head's load goes to the lane nothing queued wants, so the ``a`` job still starts this cycle.
@@ -390,7 +390,7 @@ class TestReadySeats:
         scheduler, jobs = await self._two_card_pool(pending=["d"])
         snapshot = scheduler.snapshot()
 
-        assert preload.ready_seat_process_ids(snapshot) == frozenset()
+        assert pricing.ready_seat_process_ids(snapshot) == frozenset()
         assert _decide(scheduler, jobs[0]).target_process_id == 2
 
 
@@ -459,7 +459,7 @@ class TestFollowerRoomSelection:
         )
         snapshot = scheduler.snapshot()
 
-        assert 1 in preload.ready_seat_process_ids(snapshot)
+        assert 1 in pricing.ready_seat_process_ids(snapshot)
         assert preload.select_follower_room_target(snapshot, str(jobs[1].id_), head_job_id=None) is None
 
     async def test_an_equally_wanted_idle_copy_is_left_alone(self) -> None:

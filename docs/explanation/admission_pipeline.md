@@ -91,6 +91,25 @@ stops at the first warm whose checkpoint does not fit. Each (lane, job) pair is 
 nothing: it sets no control flag, leaves the model map alone, and charges no planned RAM or VRAM. Without the
 lease a dispatch is the load, and the job-start prefetch already covers the read.
 
+A child reads its control messages one at a time, so anything the parent sends a lane waits behind what it was
+sent before, and a job's start waits behind all of it. A lane is therefore committed to work it has been sent
+and not yet begun. A lane that owns a dispatched job is committed to that job until its first step, and a lane
+the model map records as loading a model is committed to that load until the child reports it or the map expires
+the entry. The parent books a preload at the send, while the child goes on reporting idle until it reaches the
+message, so without the commitment a later pass could aim another model's preload at the same lane, expire the
+first model's entry as displaced, and aim the first model back, filling the pipe with alternating loads ahead of
+the job the first load was for. No preload selector takes a committed lane
+([`lanes_committed_elsewhere`][horde_worker_regen.process_management.scheduling.admission.preload.lanes_committed_elsewhere]),
+and unlike the displacement guards no fallback overrides it. A preload of the model the lane is already loading
+is that same load. Reclaim declines a lane that owns a dispatched job whatever state it last reported. No eviction,
+cache release or context teardown targets it, and the admission room lists its tenancy as a rung that is not
+permitted, so the ladder moves to the next tenant. A ready seat, an idle lane holding the model of a pending job
+that can start on it this cycle and is not held by a dispatch gate
+([`ready_seat_process_ids`][horde_worker_regen.process_management.scheduling.admission.pricing.ready_seat_process_ids]),
+is committed to that job in the same way. The VRAM sweeps spare it unless the head escalation is clearing room and
+the seat is not the head's own
+([`sweep_spares_idle_copy`][horde_worker_regen.process_management.scheduling.admission.pricing.sweep_spares_idle_copy]).
+
 ## Where each decision lives
 
 | Decision | Function | Reads | Returns | Acted on by |
@@ -98,7 +117,7 @@ lease a dispatch is the load, and the job-start prefetch already covers the read
 | Preload gate ladder (serviceable, quarantined, already resident, RAM floor, target, exclusive hold, pending post-processing on the lane's card, growth hold, model change, load serialization) | [`decide_preload_gates`][horde_worker_regen.process_management.scheduling.admission.preload.decide_preload_gates] | `SchedulingSnapshot` | `PreloadGatePlan`: an `AdmissionDecision`, the target slot, `FaultJob` / `ReplaceProcess` commands, a once-per-episode notice | `InferenceScheduler._run_preload_plan`, `PlanExecutor.execute_commands` |
 | Preload target choice (sticky unless that card is at its sampling cap, then least loaded, sparing the head's own copy) | [`select_preload_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_preload_target], [`select_head_room_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_head_room_target] | snapshot | a process id or None | the gate ladder |
 | Room for a follower a protected pool leaves no target for: displace one idle lane whose resident model has strictly less outstanding demand (multi-GPU, never live work, a capped card or a head's copy) | [`select_follower_room_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_follower_room_target] over [`select_follower_room_process_id`][horde_worker_regen.process_management.scheduling.governance.preload_admission.select_follower_room_process_id] | snapshot | a process id or None | the gate ladder, after the head-room fallback |
-| Which slots a preload may not displace (queued-model guard, affinity protection, RAM draining; on a multi-GPU host also every ready seat, an idle lane a pending job can start on this cycle because its card runs fewer jobs than its cap) | [`compute_preload_disallowed_processes`][horde_worker_regen.process_management.scheduling.governance.preload_admission.compute_preload_disallowed_processes] over [`wanted_models`][horde_worker_regen.process_management.scheduling.admission.pricing.wanted_models], plus [`ready_seat_process_ids`][horde_worker_regen.process_management.scheduling.admission.preload.ready_seat_process_ids] | snapshot | a set of process ids | `select_preload_target` |
+| Which slots a preload may not displace (queued-model guard, affinity protection, RAM draining; on a multi-GPU host also every ready seat, an idle lane a pending job can start on this cycle because its card runs fewer jobs than its cap) | [`compute_preload_disallowed_processes`][horde_worker_regen.process_management.scheduling.governance.preload_admission.compute_preload_disallowed_processes] over [`wanted_models`][horde_worker_regen.process_management.scheduling.admission.pricing.wanted_models], plus [`ready_seat_process_ids`][horde_worker_regen.process_management.scheduling.admission.pricing.ready_seat_process_ids] | snapshot | a set of process ids | `select_preload_target` |
 | Whether a model may hold a second copy, and how many (no eligible copy can start the job now, none loading, inside the demand-and-card-count ceiling; a free copy beside a sibling running a job on a card capped at one cannot start it) | [`duplicate_copy_may_serve`][horde_worker_regen.process_management.scheduling.admission.preload.duplicate_copy_may_serve], [`duplicate_copies_permitted`][horde_worker_regen.process_management.scheduling.admission.preload.duplicate_copies_permitted] | snapshot | a predicate and a count | the gate ladder's already-resident exit |
 | Preload budget pricing (predictive verdict, context-reduction depth, arbiter request) | [`price_preload`][horde_worker_regen.process_management.scheduling.admission.preload.price_preload] | snapshot, the frozen arbiter, the streaming forecast | `PricedPreload` | `_admit_preload_under_budget`, which evaluates through the arbiter and runs the RAM verdict or the actuations |
 | RAM staging verdict (whole checkpoint, page-reuse credit, or the UNet-only component charge), with the checkpoint mapping judged against available commit | [`decide_ram_admission`][horde_worker_regen.process_management.scheduling.admission.preload.decide_ram_admission] over [`decide_commit_admission`][horde_worker_regen.process_management.scheduling.admission.preload.decide_commit_admission] | snapshot | `RamAdmission` | `_apply_ram_verdict`, which records the accounting on a fit and runs the reclaim sequence on a miss |
