@@ -21,10 +21,11 @@ Contracts:
    INFO line and one ledger event record it. This holds on a single card, where the lost lane is the second one
    on the only card. Room that comes and goes inside the dwell does not restore, and a card whose shortfall is
    structural never does.
-5. In-flight starts are charged. Each inference process on a card still in ``PROCESS_STARTING`` holds one
-   context of the card's free reading for itself, because its context has not formed on the card yet. A
-   scale-up onto room for one context starts one lane and defers the rest, and a start the raw reading would
-   admit defers while another lane on the card is still starting.
+5. In-flight starts are charged. Each admitted start books one context in the reservation ledger, held while
+   its process is ``PROCESS_STARTING`` because its context has not formed on the card yet, and the start gate
+   nets the card's outstanding reservations from its free reading. A scale-up onto room for one context starts
+   one lane and defers the rest, and a start the raw reading would admit defers while another lane on the card
+   is still starting.
 """
 
 from __future__ import annotations
@@ -50,6 +51,8 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, soft_floor_mb
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.scheduling.workload_flow import GPU_START_FLOW
 from tests.process_management.conftest import (
     device_wide_reading_provider,
     make_test_card_runtimes,
@@ -197,7 +200,7 @@ def _lifecycle(
     fake_ctx.Process.return_value.pid = 12345
     fake_ctx.Process.return_value.exitcode = None
 
-    return ProcessLifecycleManager(
+    lifecycle = ProcessLifecycleManager(
         ctx=fake_ctx,  # type: ignore[arg-type]
         process_map=ProcessMap({}),
         horde_model_map=Mock(),
@@ -224,6 +227,49 @@ def _lifecycle(
         device_governor_state_provider=lambda device_index: cards.governor[device_index],
         gpu_start_context_mb_provider=lambda: gpu_start_context_mb,
     )
+    _book_gpu_starts_in_a_ledger(lifecycle)
+    return lifecycle
+
+
+def _book_gpu_starts_in_a_ledger(lifecycle: ProcessLifecycleManager) -> CommittedReserveLedger:
+    """Book each admitted start in a reservation ledger and net it from the start gate, as the scheduler does.
+
+    A booking lasts while its process is ``PROCESS_STARTING`` and decays as the process's reported reservation
+    grows; the gate reads the card's overlay. No other flow books here, so the overlay is the starts alone.
+    """
+    ledger = CommittedReserveLedger()
+    process_map = lifecycle._process_map
+
+    def book(process_id: int, context_mb: float) -> None:
+        ledger.set_planned(
+            GPU_START_FLOW,
+            str(process_id),
+            vram_mb=context_mb,
+            target_process_id=process_id,
+            reserved_at_admit_mb=0.0,
+        )
+
+    def outstanding_mb(device_index: int) -> float:
+        ledger.reconcile_planned(
+            GPU_START_FLOW,
+            {
+                str(process_id)
+                for process_id, process_info in process_map.items()
+                if process_info.last_process_state is HordeProcessState.PROCESS_STARTING
+            },
+        )
+        return ledger.effective_planned_vram_mb(
+            process_map.reserved_by_pid(device_index),
+            target_process_ids=frozenset(
+                process_id
+                for process_id, process_info in process_map.items()
+                if process_info.device_index == device_index
+            ),
+        )
+
+    lifecycle.set_gpu_start_booking(book)
+    lifecycle.set_outstanding_reservations_mb_provider(outstanding_mb)
+    return ledger
 
 
 def _bring_up_the_pool(lifecycle: ProcessLifecycleManager) -> None:

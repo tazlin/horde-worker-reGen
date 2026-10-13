@@ -292,6 +292,7 @@ from horde_worker_regen.process_management.scheduling.performance_model import P
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator, SlotDutyBucket
 from horde_worker_regen.process_management.scheduling.workload_flow import (
     DISPATCH_ADMISSION_FLOW,
+    GPU_START_FLOW,
     POST_PROCESS_RESERVE_FLOW,
     PRELOAD_ADMISSION_FLOW,
     WorkloadKind,
@@ -809,6 +810,10 @@ class InferenceScheduler:
         # placement reconciler pushes.
         self._process_lifecycle.set_standing_floor_provider(self.current_foreign_floor_mb)
         self._process_lifecycle.set_safety_card_chooser(self._choose_safety_gpu_card)
+        # A GPU start is booked in the reservation ledger the admissions price against, and the start gate nets
+        # the same outstanding reservations out of its free reading.
+        self._process_lifecycle.set_gpu_start_booking(self.book_gpu_start)
+        self._process_lifecycle.set_outstanding_reservations_mb_provider(self.gpu_start_outstanding_reservations_mb)
         # One-shot log throttle, keyed by model, for the "declined a whole-card residency" notice (a teardown
         # demand the warrant gate did not trust; see _whole_card_warranted / _log_whole_card_declined).
         self._whole_card_declined_notified: dict[str, bool] = {}
@@ -4863,6 +4868,56 @@ class InferenceScheduler:
         )
         return {str(job.id_) for job in jobs if job.id_ is not None}
 
+    def _gpu_start_units(self) -> set[str]:
+        """Return the process ids (as reservation units) whose admitted GPU start has not yet reported.
+
+        Derived from the process map like :meth:`_in_flight_admitted_planned_units`: a child is counted while its
+        last state is ``PROCESS_STARTING``, and one that reports, ends or leaves the map drops its booking at the
+        next :meth:`CommittedReserveLedger.reconcile_planned`. Worker-wide, because the reconcile prunes the whole
+        flow; each card's overlay keeps only the entries that target its own processes.
+        """
+        return {
+            str(process_id)
+            for process_id, process_info in self._process_map.items()
+            if process_info.last_process_state is HordeProcessState.PROCESS_STARTING
+        }
+
+    def _outstanding_planned_vram_mb(self, device_index: int | None) -> float:
+        """Return the admitted VRAM (MB) on a card its free reading does not yet show, each flow reconciled first.
+
+        The overlay the arbiter's measured terms carry as ``planned_unmaterialized_mb``. ``device_index`` is
+        None for the worker-wide single-card answer.
+        """
+        self._reserve_ledger.reconcile_planned(PRELOAD_ADMISSION_FLOW, self._in_flight_admitted_planned_units())
+        self._reserve_ledger.reconcile_planned(DISPATCH_ADMISSION_FLOW, self._in_flight_dispatch_units(device_index))
+        self._reserve_ledger.reconcile_planned(GPU_START_FLOW, self._gpu_start_units())
+        return self._reserve_ledger.effective_planned_vram_mb(
+            self._process_map.reserved_by_pid(device_index),
+            target_process_ids=self._process_ids_on_card(device_index),
+        )
+
+    def book_gpu_start(self, process_id: int, context_mb: float) -> None:
+        """Book an admitted GPU start's context (MB) as a reservation on the starting process.
+
+        Booked against no reservation at admission, so the charge decays one-for-one as the child's own reported
+        reservation grows, and it is pruned once the child leaves ``PROCESS_STARTING`` (:meth:`_gpu_start_units`).
+        """
+        self._reserve_ledger.set_planned(
+            GPU_START_FLOW,
+            str(process_id),
+            vram_mb=context_mb,
+            target_process_id=process_id,
+            reserved_at_admit_mb=0.0,
+        )
+
+    def gpu_start_outstanding_reservations_mb(self, device_index: int) -> float:
+        """Return the outstanding reservations (MB) a GPU start on the card is priced against.
+
+        The arbiter's net reservations for a request with no planned charge of its own, which is the card's whole
+        overlay (:meth:`_outstanding_planned_vram_mb`), keyed as the arbiter's device state keys the card.
+        """
+        return self._outstanding_planned_vram_mb(device_index if self._multi_gpu_routing_active else None)
+
     def _measured_admission_candidate_delta_mb(
         self,
         job: ImageGenerateJobPopResponse,
@@ -5376,9 +5431,10 @@ class InferenceScheduler:
         and staleness are still assembled for diagnostics and telemetry but the admission path no longer reads
         them. No NVML read and no torch import; the measurement is the parent's already-reconciled state.
 
-        Both admission-reservation flows are reconciled by omission before the outstanding total is read: a
-        preload whose process finished, faulted, or died, or an in-progress job that finalised or died, drops
-        its reservation here so a re-ask is never blocked by a dead unit's stale reservation. The preload
+        The admission-reservation flows are reconciled by omission before the outstanding total is read
+        (:meth:`_outstanding_planned_vram_mb`): a preload whose process finished, faulted, or died, an in-progress
+        job that finalised or died, or a child that left ``PROCESS_STARTING`` drops its reservation here so a
+        re-ask is never blocked by a dead unit's stale reservation. The preload
         flow's share is also carried separately, so the arbiter can price drain-side requests (post-processing)
         net of RAM-staged loads whose VRAM claim waits on that very drain completing.
         """
@@ -5406,14 +5462,9 @@ class InferenceScheduler:
             device_index=device_index,
         )
         committed_is_stale = oldest_report_age is not None and oldest_report_age > _REPORT_STALENESS_SECONDS
-        self._reserve_ledger.reconcile_planned(PRELOAD_ADMISSION_FLOW, self._in_flight_admitted_planned_units())
-        self._reserve_ledger.reconcile_planned(DISPATCH_ADMISSION_FLOW, self._in_flight_dispatch_units(device_index))
+        planned_mb = self._outstanding_planned_vram_mb(device_index)
         per_process_reserved = self._process_map.reserved_by_pid(device_index)
         card_process_ids = self._process_ids_on_card(device_index)
-        planned_mb = self._reserve_ledger.effective_planned_vram_mb(
-            per_process_reserved,
-            target_process_ids=card_process_ids,
-        )
         preload_planned_mb = self._reserve_ledger.effective_planned_vram_mb_for_flow(
             PRELOAD_ADMISSION_FLOW,
             per_process_reserved,

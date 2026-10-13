@@ -763,6 +763,11 @@ class ProcessLifecycleManager:
         # this manager and registers them; the defaults (no floor, no chooser) keep every deferred start
         # drainable and a rebuild on the recorded pin in standalone tests.
         self._standing_floor_mb_provider: Callable[[int], float | None] = lambda _device_index: None
+        # The reservation ledger every admission prices against belongs to the scheduler, which registers the
+        # booking of an admitted GPU start's context and the card's outstanding reservations. The defaults (no
+        # booking, nothing outstanding) judge a start on the free reading alone in standalone tests.
+        self._gpu_start_booking: Callable[[int, float], None] = lambda _process_id, _context_mb: None
+        self._outstanding_reservations_mb_provider: Callable[[int], float] = lambda _device_index: 0.0
         self._safety_card_chooser: Callable[[], int | None] | None = None
         self._safety_rebuild_places_afresh = False
         # Register a freshly spawned inference child's clearance proxy with its card's controller, and notify
@@ -1185,15 +1190,17 @@ class ProcessLifecycleManager:
             logger.debug(f"GPU-start context estimate unavailable: {type(e).__name__} {e}")
             return 0.0
 
-    def _inference_starts_in_flight(self, device_index: int) -> int:
-        """Return how many inference processes on the card were started and have not yet reported past starting."""
-        return sum(
-            1
-            for process_info in self._process_map.values()
-            if process_info.process_type is HordeProcessType.INFERENCE
-            and process_info.device_index == device_index
-            and process_info.last_process_state is HordeProcessState.PROCESS_STARTING
-        )
+    def _outstanding_reservations_mb(self, device_index: int) -> float:
+        """Return the VRAM (MB) admitted on the card whose allocation its free reading does not yet show."""
+        return max(0.0, self._outstanding_reservations_mb_provider(device_index))
+
+    def _book_gpu_start(self, process_info: HordeProcessInfo) -> None:
+        """Book a just-admitted GPU start's context as a reservation every admission on its card prices against.
+
+        The context forms some time after the start, and a free reading taken in between still counts that room
+        as free, so without the booking a second start, a preload or a dispatch is admitted onto the same room.
+        """
+        self._gpu_start_booking(process_info.process_id, self._gpu_start_context_mb())
 
     def _gpu_start_has_headroom(
         self,
@@ -1208,10 +1215,10 @@ class ProcessLifecycleManager:
         soft-floor + context requirement, for a lane (such as the image-utilities lane) whose own device
         footprint should be reserved before it is admitted.
 
-        Each inference process on the card still in ``PROCESS_STARTING`` is charged one more context, because a
-        child's context forms some time after it is granted and a free reading taken in between still counts that
-        room as free. Without the charge, several starts judged in one pass (a scale-up) are each admitted onto
-        the room for one, and the surplus children fail allocating their contexts.
+        The requirement is compared with the free reading net of the card's outstanding reservations, the figure
+        the preload, dispatch and clearance admissions read. Those include the context of every start still
+        forming one (:meth:`_book_gpu_start`), so several starts judged in one pass are not each admitted onto
+        the room for one.
         """
         if cpu_only:
             return True, ""
@@ -1219,26 +1226,25 @@ class ProcessLifecycleManager:
         if free_mb is None:
             return True, ""
         own_required_mb = self._gpu_start_required_free_mb(device_index) + extra_required_mb
-        starts_in_flight = self._inference_starts_in_flight(device_index)
-        required_mb = own_required_mb + starts_in_flight * self._gpu_start_context_mb()
+        reserved_mb = self._outstanding_reservations_mb(device_index)
         governor_state = self._device_governor_state_provider(device_index)
-        if free_mb >= required_mb and governor_state == GovernorState.HEALTHY:
+        if free_mb - reserved_mb >= own_required_mb and governor_state == GovernorState.HEALTHY:
             return True, ""
         self._note_pending_gpu_start_sample(device_index, free_mb)
         room_mb = self._achievable_room_mb(device_index)
-        # The in-flight charge is transient, so only the start's own requirement can make a shortfall structural.
+        # Reservations are transient, so only the start's own requirement can make a shortfall structural.
         structural_note = (
             f" (a structural shortfall, the card can give back at most {room_mb:.0f}MB beside its standing tenants)"
             if room_mb is not None and own_required_mb > room_mb
             else ""
         )
-        in_flight_note = (
-            f", {starts_in_flight} inference start(s) still forming their contexts" if starts_in_flight else ""
-        )
+        reserved_note = f", {reserved_mb:.0f}MB reserved" if reserved_mb > 0.0 else ""
+        unreserved_note = " unreserved" if reserved_mb > 0.0 else ""
         return (
             False,
-            f"device {device_index} is {governor_state.value} with {free_mb:.0f}MB free{in_flight_note}; "
-            f"waiting for at least {required_mb:.0f}MB before starting another GPU process{structural_note}",
+            f"device {device_index} is {governor_state.value} with {free_mb:.0f}MB free{reserved_note}; "
+            f"waiting for at least {own_required_mb:.0f}MB{unreserved_note} before starting another GPU process"
+            f"{structural_note}",
         )
 
     def _achievable_room_mb(self, device_index: int) -> float | None:
@@ -1862,6 +1868,8 @@ class ProcessLifecycleManager:
                 device_index=safety_card.device_index,
             )
             self._register_owned(self._process_map[pid])
+            if not cpu_only:
+                self._book_gpu_start(self._process_map[pid])
 
             self._safety_start_initiated_at = time.time()
             # Log contract: analysis/log_signatures.py (safety_lane_started).
@@ -2041,6 +2049,7 @@ class ProcessLifecycleManager:
             device_index=lane_card.device_index,
         )
         self._register_owned(self._process_map[pid])
+        self._book_gpu_start(self._process_map[pid])
 
         self._post_process_pinned_card = lane_card.device_index
 
@@ -2348,6 +2357,7 @@ class ProcessLifecycleManager:
             device_index=lane_card.device_index,
         )
         self._register_owned(self._process_map[pid])
+        self._book_gpu_start(self._process_map[pid])
 
         self._utilities_pinned_card = lane_card.device_index
 
@@ -2528,6 +2538,7 @@ class ProcessLifecycleManager:
             device_index=lane_card.device_index,
         )
         self._register_owned(self._process_map[pid])
+        self._book_gpu_start(self._process_map[pid])
 
         logger.info(f"Started component lane (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
@@ -2747,6 +2758,7 @@ class ProcessLifecycleManager:
             device_index=lane_card.device_index,
         )
         self._register_owned(self._process_map[pid])
+        self._book_gpu_start(self._process_map[pid])
 
         logger.info(f"Started VAE lane (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
@@ -3420,6 +3432,7 @@ class ProcessLifecycleManager:
         )
         self._process_map[pid] = process_info
         self._register_owned(process_info)
+        self._book_gpu_start(process_info)
         self.num_processes_launched += 1
         return process_info
 
@@ -3976,6 +3989,21 @@ class ProcessLifecycleManager:
         None while neither is known. Until registered no shortfall is structural.
         """
         self._standing_floor_mb_provider = provider
+
+    def set_gpu_start_booking(self, booking: Callable[[int, float], None]) -> None:
+        """Register the call that books an admitted GPU start's context, given its process id and the context (MB).
+
+        The scheduler's :meth:`InferenceScheduler.book_gpu_start`. Until registered nothing is booked.
+        """
+        self._gpu_start_booking = booking
+
+    def set_outstanding_reservations_mb_provider(self, provider: Callable[[int], float]) -> None:
+        """Register the source of each card's outstanding reservations (MB), which the GPU start gate nets out.
+
+        The scheduler's :meth:`InferenceScheduler.gpu_start_outstanding_reservations_mb`, the figure the arbiter
+        prices the card's admissions against. Until registered nothing is outstanding.
+        """
+        self._outstanding_reservations_mb_provider = provider
 
     def set_safety_card_chooser(self, chooser: Callable[[], int | None]) -> None:
         """Register the headroom-aware safety card choice a supervised safety rebuild re-runs.

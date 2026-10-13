@@ -40,6 +40,7 @@ from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator
     WorkerRecoveryCoordinator,
 )
 from horde_worker_regen.process_management.models.aux_prefetch_coordinator import AuxPrefetchCoordinator
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.reclaim_ladder import LadderCandidates
@@ -3378,3 +3379,130 @@ class TestInferenceLaneFaultStreak:
         plm.replace_hung_processes()
 
         plm._replace_inference_process.assert_called_once_with(lane, lane_fault_reason="CUDA context fault")
+
+
+class TestGpuStartReadsOutstandingReservations:
+    """A GPU start is priced on the free reading net of outstanding reservations, and books its own context.
+
+    A start judged on the raw free reading takes room another admission has already been granted and has not
+    yet allocated, and an admission judged after the start cannot see the context the child is about to form.
+    Each admitted start therefore holds one context in the shared reservation ledger until its child reports or
+    its own reported reservation has grown by that much.
+    """
+
+    _CARD_TOTAL_MB = 24_564.0
+    _CONTEXT_MB = 243.0
+
+    def _post_process_plm(self, *, free_mb: float, outstanding_mb: float) -> ProcessLifecycleManager:
+        fake_ctx = Mock()
+        fake_ctx.get_start_method.return_value = "spawn"
+        fake_ctx.Pipe.return_value = (Mock(), Mock())
+        fake_ctx.Process.return_value.pid = 12345
+        fake_ctx.Process.return_value.exitcode = None
+        plm = _make_plm(
+            ctx=fake_ctx,
+            device_free_mb_provider=lambda _device_index: free_mb,
+            device_total_vram_mb_provider=lambda _device_index: self._CARD_TOTAL_MB,
+            gpu_start_context_mb_provider=lambda: self._CONTEXT_MB,
+        )
+        plm._runtime_config.bridge_data.post_processing_lane_available = True
+        plm._runtime_config.bridge_data.dry_run_skip_post_processing = False
+        plm.set_outstanding_reservations_mb_provider(lambda _device_index: outstanding_mb)
+        return plm
+
+    def test_a_post_process_start_defers_on_room_a_reservation_holds(self) -> None:
+        """Free VRAM well above the requirement is not room when an outstanding reservation claims it."""
+        probe = self._post_process_plm(free_mb=0.0, outstanding_mb=0.0)
+        required_mb = probe._gpu_start_required_free_mb(0)
+        plm = self._post_process_plm(free_mb=required_mb + 2000.0, outstanding_mb=2500.0)
+
+        assert plm.start_post_process_processes() is False
+
+        assert plm._process_map.num_post_process_processes() == 0
+        (pending,) = plm._pending_gpu_starts.values()
+        assert pending.process_type is HordeProcessType.POST_PROCESS
+        assert "2500MB reserved" in pending.reason
+
+    def test_a_post_process_start_goes_with_no_reservation(self) -> None:
+        """The same reading with nothing reserved starts the lane."""
+        probe = self._post_process_plm(free_mb=0.0, outstanding_mb=0.0)
+        required_mb = probe._gpu_start_required_free_mb(0)
+        plm = self._post_process_plm(free_mb=required_mb + 2000.0, outstanding_mb=0.0)
+
+        assert plm.start_post_process_processes() is True
+
+        assert plm._process_map.num_post_process_processes() == 1
+        assert plm._pending_gpu_starts == {}
+
+    @staticmethod
+    def _manager_with_post_process_lane(free_mb: float) -> tuple[HordeWorkerProcessManager, HordeProcessInfo]:
+        """Return a manager whose post-processing lane was just admitted, and the starting lane."""
+        manager = make_testable_process_manager(device_free_mb=free_mb)
+        fake_ctx = manager._process_lifecycle._ctx
+        fake_ctx.Pipe.return_value = (Mock(), Mock())  # type: ignore[attr-defined]
+        fake_ctx.Process.return_value.pid = 12345  # type: ignore[attr-defined]
+        fake_ctx.Process.return_value.exitcode = None  # type: ignore[attr-defined]
+        bridge_data = manager._process_lifecycle._runtime_config.bridge_data
+        bridge_data.post_processing_lane_available = True
+        bridge_data.dry_run_skip_post_processing = False
+        assert manager._process_lifecycle.start_post_process_processes() is True
+        (lane,) = [
+            process_info
+            for process_info in manager._process_map.values()
+            if process_info.process_type is HordeProcessType.POST_PROCESS
+        ]
+        assert lane.last_process_state is HordeProcessState.PROCESS_STARTING
+        return manager, lane
+
+    @staticmethod
+    def _planned_overlay_mb(manager: HordeWorkerProcessManager) -> float:
+        """Return the outstanding reservations the arbiter prices card 0's admissions against this cycle."""
+        return manager._inference_scheduler.build_vram_arbiter_device_state(
+            None,
+            device_reading=manager.latest_device_reading(0),
+        ).planned_unmaterialized_mb
+
+    def test_an_admitted_start_is_outstanding_until_its_reservation_grows_by_a_context(self) -> None:
+        """The arbiter and the start gate both see the lane's context until the child's own report covers it."""
+        manager, lane = self._manager_with_post_process_lane(free_mb=20_000.0)
+        context_mb = manager._process_lifecycle._gpu_start_context_mb()
+        assert context_mb > 0.0
+
+        assert self._planned_overlay_mb(manager) == pytest.approx(context_mb)
+        assert manager._process_lifecycle._outstanding_reservations_mb(0) == pytest.approx(context_mb)
+
+        lane.process_reserved_mb = int(context_mb / 2)
+        assert self._planned_overlay_mb(manager) == pytest.approx(context_mb - int(context_mb / 2))
+
+        lane.process_reserved_mb = int(context_mb) + 1
+        assert self._planned_overlay_mb(manager) == pytest.approx(0.0)
+        assert manager._process_lifecycle._outstanding_reservations_mb(0) == pytest.approx(0.0)
+
+    def test_an_admitted_start_stops_being_outstanding_once_the_child_reports(self) -> None:
+        """A child past starting drops its booking by omission, with no reservation reported at all."""
+        manager, lane = self._manager_with_post_process_lane(free_mb=20_000.0)
+        context_mb = manager._process_lifecycle._gpu_start_context_mb()
+        assert self._planned_overlay_mb(manager) == pytest.approx(context_mb)
+
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+
+        assert manager._process_lifecycle._outstanding_reservations_mb(0) == pytest.approx(0.0)
+        assert self._planned_overlay_mb(manager) == pytest.approx(0.0)
+
+    def test_an_inference_start_waits_on_a_starting_post_process_lane(self) -> None:
+        """Room for one context goes to the lane admitted first; the inference start waits until the lane reports."""
+        probe = make_testable_process_manager(device_free_mb=20_000.0)
+        context_mb = probe._process_lifecycle._gpu_start_context_mb()
+        required_mb = probe._process_lifecycle._gpu_start_required_free_mb(0)
+        manager, lane = self._manager_with_post_process_lane(free_mb=required_mb + 0.5 * context_mb)
+        lifecycle = manager._process_lifecycle
+        inference_pid = lifecycle._allocate_inference_pid()
+
+        assert lifecycle._request_inference_process_start(inference_pid, device_index=0, reason="pool") is False, (
+            "the inference start was priced on the raw free reading and took the starting lane's context"
+        )
+        assert inference_pid not in manager._process_map
+
+        lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        assert lifecycle.drain_pending_gpu_starts() == 1
+        assert manager._process_map[inference_pid].process_type is HordeProcessType.INFERENCE

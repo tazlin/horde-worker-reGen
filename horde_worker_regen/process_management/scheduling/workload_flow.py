@@ -55,6 +55,18 @@ the same physical room. The entries are pruned each scheduling cycle from the in
 and its reservation drops by omission; the job-finalize hook tightens that latency."""
 
 
+GPU_START_FLOW = "gpu_process_start"
+"""Reservation-ledger flow name for the CUDA context of an admitted GPU process start.
+
+A child's context forms some time after its start is admitted, and a free reading taken in between still
+counts that room as free. Each admitted start on a card (inference, safety on a GPU, and every auxiliary lane)
+registers one context as a reservation under this flow keyed by its process id and targeting that process, so
+a later start, preload, dispatch or clearance on the card sees it; the charge decays as the child's own reported
+reservation grows. The entries are pruned each scheduling cycle from the process map (see
+``InferenceScheduler._gpu_start_units``): a child that leaves ``PROCESS_STARTING`` drops its reservation by
+omission."""
+
+
 _WORKLOAD_CAPABILITIES: dict[WorkloadKind, WorkerCapability] = {
     WorkloadKind.IMAGE_GENERATION: WorkerCapability.IMAGE_GEN,
     WorkloadKind.ALCHEMY: WorkerCapability.ALCHEMY_GRAPH | WorkerCapability.ALCHEMY_CLIP,

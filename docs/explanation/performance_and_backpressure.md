@@ -899,6 +899,15 @@ once per monitor tick per card:
 - **SATURATED** — device-free is below the *hard floor* (`max(256MB, 0.5x` the noise buffer`)`). The card is
   at or past the cliff, so a reclaim pass runs immediately on the same tick.
 
+The GPU start check reads device-free net of the card's outstanding reservations, the figure the preload,
+dispatch and clearance admissions read (`InferenceScheduler.gpu_start_outstanding_reservations_mb`). A child's
+CUDA context forms some time after its start, and a reading taken in between still counts that room as free.
+Each admitted start on a card (inference, safety on a GPU, and every auxiliary lane) therefore books one context
+in the reservation ledger under `GPU_START_FLOW`, keyed by its process id. The booking decays as the child's own
+reported reservation grows and is dropped once the child leaves `PROCESS_STARTING`. A second start, a preload
+or a dispatch on the card prices the forming context before it shows in the reading. A start deferred on
+reservations says so: its reason carries the reserved figure.
+
 The floors scale with card capacity through the same proportional noise buffer admission uses, so a large
 card keeps proportional headroom and a small card is never starved below an absolute floor. State changes
 are debounced over two consecutive samples: NVML is stable, but the confirm removes any chance a lone
