@@ -252,6 +252,11 @@
               "device_index": null,
               "kind": "evict_idle_model",
               "target_process_id": null
+            },
+            {
+              "device_index": null,
+              "kind": "demote_safety_weights",
+              "target_process_id": null
             }
           ],
           "for_head_of_queue": true,
@@ -259,6 +264,11 @@
             {
               "device_index": null,
               "kind": "evict_idle_model",
+              "target_process_id": null
+            },
+            {
+              "device_index": null,
+              "kind": "demote_safety_weights",
               "target_process_id": null
             }
           ]
@@ -282,7 +292,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 0,
-            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaim_applied_kinds": "evict_idle_model,demote_safety_weights",
             "reclaimable_idle_model": true,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 6302.2,
@@ -370,6 +380,20 @@
       ],
       "messages": [
         {
+          "control_flag": "DEMOTE_SAFETY_WEIGHTS",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 100
+        },
+        {
+          "control_flag": "PROMOTE_SAFETY_WEIGHTS",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 100
+        },
+        {
           "control_flag": "UNLOAD_MODELS_FROM_VRAM",
           "job": null,
           "keep_model_resident_after": null,
@@ -388,6 +412,11 @@
               "device_index": null,
               "kind": "evict_idle_model",
               "target_process_id": null
+            },
+            {
+              "device_index": null,
+              "kind": "demote_safety_weights",
+              "target_process_id": null
             }
           ],
           "for_head_of_queue": true,
@@ -395,6 +424,11 @@
             {
               "device_index": null,
               "kind": "evict_idle_model",
+              "target_process_id": null
+            },
+            {
+              "device_index": null,
+              "kind": "demote_safety_weights",
               "target_process_id": null
             }
           ]
@@ -418,7 +452,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 0,
-            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaim_applied_kinds": "evict_idle_model,demote_safety_weights",
             "reclaimable_idle_model": true,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 1402.2,
@@ -479,6 +513,13 @@
         }
       ],
       "messages": [
+        {
+          "control_flag": "DEMOTE_SAFETY_WEIGHTS",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 100
+        },
         {
           "control_flag": "UNLOAD_MODELS_FROM_VRAM",
           "job": null,
@@ -828,6 +869,13 @@
           "keep_model_resident_after": false,
           "model": "sdxl-checkpoint-b",
           "process_id": 1
+        },
+        {
+          "control_flag": "PROMOTE_SAFETY_WEIGHTS",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 100
         }
       ],
       "tick": 24
@@ -841,6 +889,11 @@
               "device_index": null,
               "kind": "evict_idle_model",
               "target_process_id": null
+            },
+            {
+              "device_index": null,
+              "kind": "demote_safety_weights",
+              "target_process_id": null
             }
           ],
           "for_head_of_queue": true,
@@ -848,6 +901,11 @@
             {
               "device_index": null,
               "kind": "evict_idle_model",
+              "target_process_id": null
+            },
+            {
+              "device_index": null,
+              "kind": "demote_safety_weights",
               "target_process_id": null
             }
           ]
@@ -871,7 +929,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 1,
-            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaim_applied_kinds": "evict_idle_model,demote_safety_weights",
             "reclaimable_idle_model": true,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 6302.2,
@@ -948,6 +1006,20 @@
       ],
       "messages": [
         {
+          "control_flag": "DEMOTE_SAFETY_WEIGHTS",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 100
+        },
+        {
+          "control_flag": "PROMOTE_SAFETY_WEIGHTS",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 100
+        },
+        {
           "control_flag": "UNLOAD_MODELS_FROM_VRAM",
           "job": null,
           "keep_model_resident_after": null,
@@ -966,6 +1038,11 @@
               "device_index": null,
               "kind": "evict_idle_model",
               "target_process_id": null
+            },
+            {
+              "device_index": null,
+              "kind": "demote_safety_weights",
+              "target_process_id": null
             }
           ],
           "for_head_of_queue": true,
@@ -973,6 +1050,11 @@
             {
               "device_index": null,
               "kind": "evict_idle_model",
+              "target_process_id": null
+            },
+            {
+              "device_index": null,
+              "kind": "demote_safety_weights",
               "target_process_id": null
             }
           ]
@@ -996,7 +1078,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 1,
-            "reclaim_applied_kinds": "evict_idle_model",
+            "reclaim_applied_kinds": "evict_idle_model,demote_safety_weights",
             "reclaimable_idle_model": true,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 1402.2,
@@ -1046,6 +1128,13 @@
         }
       ],
       "messages": [
+        {
+          "control_flag": "DEMOTE_SAFETY_WEIGHTS",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 100
+        },
         {
           "control_flag": "UNLOAD_MODELS_FROM_VRAM",
           "job": null,
@@ -1283,6 +1372,15 @@
           "reason": "model already resident or loading",
           "subject": "job-4",
           "verdict": "no_op"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "PROMOTE_SAFETY_WEIGHTS",
+          "job": null,
+          "keep_model_resident_after": null,
+          "model": null,
+          "process_id": 100
         }
       ],
       "tick": 31

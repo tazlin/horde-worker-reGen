@@ -1851,6 +1851,9 @@ class InferenceScheduler:
         seconds against what the flip costs, and restores only once that card's measured free covers safety
         beside the peak it is committed to, sustained for the longer restore dwell. Every owner's restore earns
         that same forecast, so a residency or ladder pause is not handed back into the pressure that took it.
+        The policy's own demotion takes safety's weights first. A dwell of pressure demotes them to host RAM in
+        place where :meth:`_safety_weights_demotable` allows, and the process leaves the card only when pressure
+        outlasts another dwell with the weights already demoted. The ladder orders its rungs the same way.
         Whole-card and reclaim requests do not wait for the demotion dwell. The reclaim request is one-shot and
         is consumed only after an off-GPU safety process reaches readiness. No placement flip is issued while a
         prior intentional rebuild remains unready, and no evidence accrues across that window either, so the
@@ -1897,7 +1900,7 @@ class InferenceScheduler:
             self._reconcile_safety_backlog_exclusion(safety_card, depth=safety_backlog_depth)
             ledger.freeze_evidence()
             ledger.reclaim_pause_requested = False
-            self._promote_safety_weights_if_room(safety_card, residency_veto=False)
+            self._promote_safety_weights_if_room(safety_card, inputs=inputs, residency_veto=False)
             return
         ledger.clear_backlog_exclusion(depth=safety_backlog_depth)
 
@@ -2025,9 +2028,25 @@ class InferenceScheduler:
             return
 
         if requested_owner is None:
-            self._promote_safety_weights_if_room(safety_card, residency_veto=residency_veto)
+            self._promote_safety_weights_if_room(safety_card, inputs=inputs, residency_veto=residency_veto)
             return
         pressure_since = ledger.pressure_since or self._clock()
+        # Demotable weights are by definition not yet demoted, so the dwell after this one reaches the move.
+        # A demotion the child never received falls through to the move rather than retrying it every cycle.
+        weights_first = requested_owner is PauseOwner.RUNTIME_SAFETY_PLACEMENT and self._safety_weights_demotable(
+            safety_card
+        )
+        if weights_first and self.demote_safety_weights(safety_card):
+            ledger.pressure_since = None
+            ledger.weight_demotions += 1
+            logger.info(
+                f"Runtime safety placement: demoting safety's weights to host RAM on card {safety_card} after "
+                f"{self._clock() - pressure_since:.0f}s of sustained memory pressure there "
+                f"({inputs.describe()}). The process and its context stay on the card. Moving it off would cost "
+                f"about {self._safety_placement_dwell_seconds():.0f}s of safety unavailability and happens only if "
+                "the pressure outlasts another dwell.",
+            )
+            return
         if not self._process_lifecycle.pause_safety_on_gpu(owner=requested_owner):
             return
         ledger.pressure_since = None
@@ -2041,12 +2060,24 @@ class InferenceScheduler:
                 f"this pressure had to outlast.",
             )
 
-    def _promote_safety_weights_if_room(self, device_index: int | None, *, residency_veto: bool) -> None:
-        """Promote demoted safety weights back onto the device once the card has durably had room for them.
+    def _promote_safety_weights_if_room(
+        self,
+        device_index: int | None,
+        *,
+        inputs: SafetyPlacementInputs,
+        residency_veto: bool,
+    ) -> None:
+        """Promote demoted safety weights back onto the device on a cycle the card measurably has room for them.
 
-        Uses the same admission and headroom-dwell evidence the process-level restore does, so the weights are
-        never handed back into the pressure that demoted them. Staying demoted costs each evaluation only a
-        re-stage, so a card that never earns the restore keeps working at that small latency.
+        Room is the arbiter admitting safety's load now on a card that is not pressured this cycle. No headroom
+        dwell is read: that clock runs only while the process is off the card, and a flip that keeps the process
+        and its context costs too little to earn a forecast. The demotion dwell bounds the flip rate instead,
+        since promoted weights are demoted again only after sustained pressure.
+
+        Args:
+            device_index: The card safety occupies.
+            inputs: This cycle's placement evidence for that card.
+            residency_veto: Whether a held whole-card residency keeps safety's footprint off the card.
         """
         if not self._safety_placement.weights_demoted or residency_veto:
             return
@@ -2054,11 +2085,10 @@ class InferenceScheduler:
             # A rebuilt safety process starts resident; the demotion died with the old one.
             self._safety_placement.weights_demoted = False
             return
-        if self.is_vram_growth_held(device_index) or not self._arbiter_admits_safety_gpu_load(device_index):
-            return
-        if not self._safety_placement.dwell_met(
-            self._safety_placement.headroom_since,
-            self._safety_placement_restore_dwell_seconds(),
+        if (
+            inputs.is_pressured()
+            or self.is_vram_growth_held(device_index)
+            or not self._arbiter_admits_safety_gpu_load(device_index)
         ):
             return
         safety_process = self._process_map.get_safety_process()
@@ -8267,15 +8297,16 @@ class InferenceScheduler:
     def _safety_weights_demotable(self, device_index: int | None) -> bool:
         """Whether safety's resident weights can be demoted to host RAM in place right now.
 
-        Gated on the same operator permission as moving safety off the card, on a live on-GPU safety process
-        that is not mid-rebuild, and on an empty safety backlog (queued checks would only re-stage them). A
-        fixed residency (:meth:`_safety_residency_fixed`) withholds this rung as it withholds the process-level
-        one: the card owes safety its whole footprint for the session, so the weights are part of what it owes.
+        Gated on ``safety_on_gpu`` alone among the operator settings, on a live on-GPU safety process that is
+        not mid-rebuild, and on an empty safety backlog (queued checks would only re-stage them).
+        ``whole_card_residency_safety_off_gpu`` governs only whether the process may leave the card for a
+        residency, and this rung keeps the process on the card. A fixed residency
+        (:meth:`_safety_residency_fixed`) withholds it as it withholds the process-level one: the card owes
+        safety its whole footprint for the session, so the weights are part of what it owes.
         """
         if (
             not self._safety_on_gpu_permitted
             or self._safety_residency_fixed_on(device_index)
-            or not self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu
             or self._safety_placement.weights_demoted
             or self._process_lifecycle.is_safety_gpu_paused
             or self._process_lifecycle.safety_placement_transition_pending is True

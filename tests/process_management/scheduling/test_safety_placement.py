@@ -28,7 +28,7 @@ import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
-from horde_worker_regen.process_management.ipc.messages import HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeImageResult, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
@@ -844,6 +844,157 @@ class TestPlacementRequestOwnership:
 
         harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RECLAIM_LADDER)
         assert harness.scheduler.safety_placement.pressure_since is None
+
+
+def _seat_safety_process(harness: _PlacementHarness, *, whole_card_safety_off_gpu: bool) -> Mock:
+    """Give the harness a live on-GPU safety process and return the mock its control messages are sent through."""
+    harness.scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = whole_card_safety_off_gpu
+    safety = make_mock_process_info(9, model_name=None, process_type=HordeProcessType.SAFETY)
+    harness.scheduler._process_map[9] = safety
+    send = safety.pipe_connection.send
+    assert isinstance(send, Mock)
+    return send
+
+
+def _sent_control_flags(send: Mock) -> list[HordeControlFlag]:
+    """The control flags sent to the safety process, in order."""
+    return [call.args[0].control_flag for call in send.call_args_list]
+
+
+class TestWeightDemotionFirst:
+    """Sustained pressure demotes safety's weights in place before it moves the process off the card.
+
+    The weight demotion keeps the process and its context on the card and costs each later check a re-stage of
+    the weights, a fraction of the CPU placement's per-check cost and of a process rebuild. It is gated by
+    ``safety_on_gpu`` alone: the whole-card setting governs whether safety's process may leave the card for a
+    residency, never this cheaper rung. The weights come back on the cycle the card measurably has room for
+    them, and the demotion dwell bounds how often that flip can repeat.
+    """
+
+    def test_sustained_pressure_demotes_the_weights_and_keeps_the_process(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With the whole-card setting off, the first sustained-pressure dwell demotes the weights only."""
+        harness = _placement_harness(monkeypatch)
+        send = _seat_safety_process(harness, whole_card_safety_off_gpu=False)
+        _pin_evidence(harness, pressured=True)
+
+        harness.reconcile_over(harness.demotion_dwell_seconds + 4.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+        assert _sent_control_flags(send) == [HordeControlFlag.DEMOTE_SAFETY_WEIGHTS]
+        placement = harness.scheduler.safety_placement
+        assert placement.weights_demoted is True
+        assert placement.weight_demotions == 1
+        assert placement.demotions == 0
+
+    def test_pressure_outlasting_a_second_dwell_moves_the_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the weights already demoted, another dwell of pressure takes the full move."""
+        harness = _placement_harness(monkeypatch)
+        send = _seat_safety_process(harness, whole_card_safety_off_gpu=False)
+        _pin_evidence(harness, pressured=True)
+
+        harness.reconcile_over(harness.demotion_dwell_seconds + 4.0)
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+
+        harness.reconcile_over(harness.demotion_dwell_seconds + 4.0)
+
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RUNTIME_SAFETY_PLACEMENT)
+        assert _sent_control_flags(send) == [HordeControlFlag.DEMOTE_SAFETY_WEIGHTS]
+        placement = harness.scheduler.safety_placement
+        assert placement.weight_demotions == 1
+        assert placement.demotions == 1
+        # The demotion lived in the process the move ended; its replacement starts resident.
+        assert placement.weights_demoted is False
+
+    def test_demoted_weights_return_on_measured_room_without_a_dwell(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unpressured card the arbiter admits safety onto gets the weights back on the next reconcile.
+
+        The restore forecast is deliberately failing here: the promotion is a cheap flip and needs measured room
+        now, never the forecast the process-level restore earns.
+        """
+        harness = _placement_harness(monkeypatch)
+        send = _seat_safety_process(harness, whole_card_safety_off_gpu=False)
+        harness.scheduler.safety_placement.weights_demoted = True
+        _pin_evidence(harness, pressured=False, headroom_fits=False)
+
+        harness.reconcile()
+
+        assert _sent_control_flags(send) == [HordeControlFlag.PROMOTE_SAFETY_WEIGHTS]
+        assert harness.scheduler.safety_placement.weights_demoted is False
+
+    def test_a_pressured_cycle_keeps_the_weights_demoted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pressure this cycle withholds the promotion, however long the weights have been in host RAM."""
+        harness = _placement_harness(monkeypatch)
+        send = _seat_safety_process(harness, whole_card_safety_off_gpu=False)
+        harness.scheduler.safety_placement.weights_demoted = True
+        _pin_evidence(harness, pressured=True)
+
+        harness.reconcile_over(harness.demotion_dwell_seconds / 3.0)
+
+        assert _sent_control_flags(send) == []
+        assert harness.scheduler.safety_placement.weights_demoted is True
+
+    def test_an_arbiter_refusal_keeps_the_weights_demoted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A card the arbiter will not seat safety's load on keeps the weights in host RAM."""
+        harness = _placement_harness(monkeypatch)
+        send = _seat_safety_process(harness, whole_card_safety_off_gpu=False)
+        harness.scheduler.safety_placement.weights_demoted = True
+        harness.scheduler._arbiter_admits_safety_gpu_load = lambda device_index: False  # type: ignore[method-assign]
+        _pin_evidence(harness, pressured=False)
+
+        harness.reconcile()
+
+        assert _sent_control_flags(send) == []
+        assert harness.scheduler.safety_placement.weights_demoted is True
+
+    def test_promotion_fires_while_safety_is_resident(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A resident process with demoted weights is promoted, where it used to wait on a clock never set.
+
+        The promotion used to require the restore dwell on the forecast-headroom clock, which the placement
+        evidence clears on every cycle safety is resident, so a demoted process kept its weights in host RAM
+        until a full move ended it, however much room the card had for the whole restore dwell.
+        """
+        harness = _placement_harness(monkeypatch)
+        send = _seat_safety_process(harness, whole_card_safety_off_gpu=True)
+        harness.scheduler.safety_placement.weights_demoted = True
+        _pin_evidence(harness, headroom_fits=True)
+
+        harness.reconcile_over(harness.restore_dwell_seconds * 2.0)
+
+        assert _sent_control_flags(send) == [HordeControlFlag.PROMOTE_SAFETY_WEIGHTS]
+        harness.lifecycle.pause_safety_on_gpu.assert_not_called()
+
+    def test_a_whole_card_residency_still_moves_the_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A residency's request takes the process move directly, with no weight demotion ahead of it."""
+        harness = _placement_harness(monkeypatch)
+        send = _seat_safety_process(harness, whole_card_safety_off_gpu=True)
+        harness.scheduler._whole_card_ledger.record_grant(
+            None,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=harness.clock() + 10_000.0,
+            now=harness.clock(),
+        )
+        _pin_evidence(harness, pressured=True)
+
+        harness.reconcile()
+
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
+        assert _sent_control_flags(send) == []
+        assert harness.scheduler.safety_placement.weight_demotions == 0
+
+    def test_a_reclaim_request_still_moves_the_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ladder's safety move is its own rung and is applied as the process move it asked for."""
+        harness = _placement_harness(monkeypatch)
+        send = _seat_safety_process(harness, whole_card_safety_off_gpu=True)
+        _pin_evidence(harness, pressured=True)
+
+        assert harness.scheduler.safety_off_gpu(None) is True
+
+        harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.RECLAIM_LADDER)
+        assert _sent_control_flags(send) == []
 
 
 class TestPostProcessingRestoreBound:

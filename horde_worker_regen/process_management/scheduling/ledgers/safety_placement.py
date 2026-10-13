@@ -166,6 +166,8 @@ class SafetyPlacementLedger:
         """Whether the on-GPU safety process holds its CLIP weights in host RAM at the parent's request."""
         self.demotions = 0
         """Policy-initiated moves of safety off the GPU this run (not the whole-card residency's own pauses)."""
+        self.weight_demotions = 0
+        """Policy-initiated demotions of safety's weights to host RAM in place this run (not the ladder's)."""
         self.promotions = 0
         """Policy-initiated restores of safety onto the GPU this run."""
         self._backlog_excluded_card: int | None = None

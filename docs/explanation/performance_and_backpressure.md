@@ -154,6 +154,15 @@ slower CPU path. On multi-GPU workers the same headroom-aware card choice is use
 second card with room can take the safety context; on single-GPU workers the same rule
 applies to the one card.
 
+Sustained memory pressure on safety's card demotes in two steps. The first dwell of pressure demotes the
+safety process's weights to host RAM in place. The process and its CUDA context stay on the card, and each
+later check re-stages the weights, which costs a small fraction of a CPU check. Only pressure that outlasts
+another dwell with the weights already demoted moves the process off the card. The weight demotion needs only
+`safety_on_gpu`. The `whole_card_residency_safety_off_gpu` setting governs whether the process may leave the
+card for a whole-card residency and does not gate this step. Demoted weights return on the first cycle the card is unpressured and the
+VRAM arbiter admits safety's load, with no restore dwell, because the demotion dwell already bounds how often
+the weights can flip. A whole-card residency or the reclaim ladder still moves the process directly.
+
 Throttling belongs to this backlog gate alone. The `no_safety_process` pop gate counts a safety process
 that is busy with a check as serving, so intake continues behind it up to the
 cap above. The gate also stays open while the lifecycle manager rebuilds the safety pool on

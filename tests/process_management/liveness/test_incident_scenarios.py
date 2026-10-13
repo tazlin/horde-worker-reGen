@@ -1428,10 +1428,13 @@ def _escalations_while_a_release_is_in_flight(world: _DispatchWorld) -> list[str
         )
         if landed_at is not None:
             in_flight.append((actuation.tick, landed_at, actuation.target_process_id or -1))
-    teardown_kinds = LANE_TEARDOWN_RUNGS | {SAFETY_TEARDOWN_RUNG}
+    # The rungs the ladder reaches only by escalating past its idle-resident releases: the lane pauses, the
+    # safety move, and the in-place safety weight demotion that sits just before it. Any of them issued while
+    # an ordered unload is still landing is the engine grading that unload on a clock the hardware cannot meet.
+    escalation_kinds = LANE_TEARDOWN_RUNGS | {SAFETY_TEARDOWN_RUNG, ReclaimRungKind.DEMOTE_SAFETY_WEIGHTS}
     breaches: list[str] = []
     for actuation in world.ladder_actuations:
-        if actuation.kind not in teardown_kinds:
+        if actuation.kind not in escalation_kinds:
             continue
         for issued_at, landed_at, lane in in_flight:
             if issued_at < actuation.tick < landed_at:
