@@ -1576,6 +1576,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason="the dry-run harness's canned horde skips no job for the models offered",
     ),
     _signature(
+        "reclaim_ladder_reread_before_teardown",
+        r"Reclaim ladder: re-read device (?P<device>\d+) before the (?P<rung>[\w_]+) rung and added "
+        r"(?P<added>\d+) cheaper rung\(s\) ahead of it, first (?P<first_kind>[\w_]+) on (?P<tenant>.+)\.",
+        emitter="process_management.resources.reclaim_ladder:VerifiedReclaimLadder._issue_next",
+        sample=(
+            "Reclaim ladder: re-read device 0 before the pause_pp_lane rung and added 1 cheaper rung(s) ahead of "
+            "it, first unload_idle_model on model#5."
+        ),
+        dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
+    ),
+    _signature(
         "service_lane_stopped",
         r"(?P<owner>Reclaim ladder|Whole-card residency[^:]*): stopping the (?P<lane>[\w-]+) lane to free its VRAM "
         r"context\.",

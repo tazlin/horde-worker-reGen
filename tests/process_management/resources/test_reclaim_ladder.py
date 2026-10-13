@@ -6,6 +6,8 @@ import functools
 import time
 from unittest.mock import Mock
 
+from loguru import logger
+
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     _SAFETY_RUNG_COOLDOWN_SECONDS,
     _TEARDOWN_VERIFICATION_BASE_SECONDS,
@@ -640,6 +642,81 @@ class TestTeardownRungSaturationDwell:
         )
         assert actuator.calls == [("demote_safety", None), ("pp", None), ("safety", None)]
         assert engine.is_saturation_unresolved(0) is False
+
+    def test_a_resident_that_went_idle_during_the_dwell_is_unloaded_before_the_lane_stops(self) -> None:
+        """A sampler that finishes inside the dwell leaves an idle resident, which is spent before the lane pause.
+
+        The ladder froze while that model was still sampling, so it was never a rung. Stopping the lane beside
+        it pays a process exit and a cold start for memory an in-place unload returns, and puts the lane's CUDA
+        init back onto a card a dispatch may have filled by then.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        pause = _pause_rung(ReclaimRungKind.PAUSE_PP_LANE)
+        current_ladder = [_ladder(pause)]
+
+        def _build() -> tuple[ReclaimRung, ...]:
+            return current_ladder[0]
+
+        engine.on_tick(0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=_build, now=0.0)
+        assert actuator.calls == []
+
+        # The sampling lane finishes inside the dwell: its model is now an idle resident on the fresh ladder.
+        current_ladder[0] = _ladder(_unload_rung(5, 4000.0), pause)
+        past_dwell = _TEARDOWN_VERIFICATION_BASE_SECONDS + 1.0
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+        try:
+            engine.on_tick(
+                0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=_build, now=past_dwell
+            )
+        finally:
+            logger.remove(sink_id)
+        assert actuator.calls == [("unload", 5)], "the lane was stopped beside an idle resident the unload frees"
+        assert engine.episode_holds_paused_lane(0) is False
+        assert [message for message in messages if message.startswith("Reclaim ladder: re-read")] == [
+            "Reclaim ladder: re-read device 0 before the pause_pp_lane rung and added 1 cheaper rung(s) ahead "
+            "of it, first unload_idle_model on model#5.",
+        ]
+
+        # The unload verifies but the card is still saturated and the fresh ladder is unchanged: the lane stops.
+        engine.on_tick(
+            0, saturated=True, device_free_mb=2500.0, actuator=actuator, ladder_builder=_build, now=past_dwell + 1.0
+        )
+        assert actuator.calls == [("unload", 5), ("pp", None)]
+        assert engine.episode_holds_paused_lane(0) is True
+
+    def test_a_resident_already_spent_in_the_episode_is_not_reissued_by_the_re_read(self) -> None:
+        """The re-read adds only rungs the episode has not spent, so a still-listed resident is not unloaded twice."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        ladder = _ladder(_unload_rung(1, 1000.0), _pause_rung(ReclaimRungKind.PAUSE_PP_LANE))
+
+        engine.on_tick(
+            0, saturated=True, device_free_mb=100.0, actuator=actuator, ladder_builder=lambda: ladder, now=0.0
+        )
+        assert actuator.calls == [("unload", 1)]
+        # The unload verifies inside the dwell; the held lane pause waits.
+        engine.on_tick(
+            0, saturated=True, device_free_mb=700.0, actuator=actuator, ladder_builder=lambda: ladder, now=1.0
+        )
+        assert actuator.calls == [("unload", 1)]
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+        try:
+            engine.on_tick(
+                0,
+                saturated=True,
+                device_free_mb=700.0,
+                actuator=actuator,
+                ladder_builder=lambda: ladder,
+                now=_TEARDOWN_VERIFICATION_BASE_SECONDS + 1.0,
+            )
+        finally:
+            logger.remove(sink_id)
+        assert actuator.calls == [("unload", 1), ("pp", None)]
+        assert not [message for message in messages if message.startswith("Reclaim ladder: re-read")]
 
 
 class TestReclaimLadderVerifiedRestore:

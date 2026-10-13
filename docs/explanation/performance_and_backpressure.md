@@ -939,7 +939,11 @@ Both candidate assembly and the targeted action re-check liveness, so immunity h
 pauses and the safety move are also held until the saturation has persisted for the teardown verification
 base (twelve seconds): a sampler's activation peak can cross the hard floor and end within a sample or two,
 and stopping a lane for that frees nothing in time while still paying the cold start. The cheaper rungs act
-on the first saturated sample.
+on the first saturated sample. The rungs are built once, when the episode opens, so each spent rung's promised
+and realised free are judged against one topology; the one exception is the tick that would spend a lane
+pause or the safety move, when the candidates are read again and any idle resident or cache release that
+appeared since the cliff (a sampler that finished during the dwell) is spent ahead of it. Stopping a lane
+beside an idle copy would trade a process exit and a cold start for memory an in-place unload returns.
 
 SOS recovery adds one further protection when it borrows this ladder for a structural wedge: models demanded
 by accepted pending work are not idle-resident unload candidates. In particular, it never unloads the model

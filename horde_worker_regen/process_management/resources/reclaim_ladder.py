@@ -14,6 +14,8 @@ so there are never two mechanisms independently evicting against the same card. 
   down would trade a slow job for a faulted one. The teardown rungs (the lane pauses and safety off the GPU)
   are held until the episode's saturation has persisted for a dwell, so a transient activation peak that
   clears on its own never costs a service lane its restart; the cheaper rungs past them still act at once.
+  Before a teardown rung is spent the candidates are read again, and any idle resident or cache release that
+  appeared since the cliff (a sampler that finished during the dwell) is spent ahead of it.
 
 - It verifies. Freeing on WDDM is externally checkable: NVML device-used drops once a real release lands.
   After issuing a rung the engine watches the following governor samples and compares the realized device-free
@@ -202,6 +204,15 @@ def _paused_lane_name(kind: ReclaimRungKind) -> str:
 
 _TEARDOWN_RUNG_KINDS = LANE_PAUSE_RUNG_KINDS | frozenset({ReclaimRungKind.SAFETY_OFF_GPU})
 """Rung kinds whose memory is freed by a process exiting, so they get the longer verification budget."""
+
+
+def _rung_target(rung: ReclaimRung) -> tuple[ReclaimRungKind, int | None, str]:
+    """The action and tenant a rung names, which identify it across two builds of the same card's ladder.
+
+    The promised figure is excluded: a fresh build re-prices the same tenant, and that re-pricing is not a
+    new rung.
+    """
+    return (rung.kind, rung.target_process_id, rung.tenant_label)
 
 
 @dataclass(frozen=True)
@@ -582,6 +593,8 @@ class _Episode:
 
     ``ladder`` is built lazily on the first SATURATED tick, so the rungs stay frozen against the topology at
     the moment the card crossed the cliff even when the episode was opened earlier by a recorded obligation.
+    The one exception is the re-read before a teardown rung, which splices newly idle cheaper rungs in front
+    of it and leaves every rung already spent where it was.
     """
 
     ladder: tuple[ReclaimRung, ...] | None = None
@@ -688,8 +701,10 @@ class VerifiedReclaimLadder:
             device_free_mb: The card's NVML device-level free VRAM (MB) this sample.
             actuator: The surface that performs each rung, restores paused lanes, and records calibration
                 shortfalls.
-            ladder_builder: Builds the ordered rungs when a new episode begins; called at most once per
-                episode so the ladder is frozen against the topology at the moment the card crossed the cliff.
+            ladder_builder: Builds the ordered rungs for this card's current topology. Called when a new
+                episode begins, so the ladder is frozen against the topology at the moment the card crossed the
+                cliff, and again each tick the engine would otherwise spend a teardown rung, so cheaper rungs
+                that appeared since are spent first.
             context_restore_ready: Whether a live-context reduction may be unwound this sample. A lane pause
                 is cheap to undo, but regrowing the pool costs a full process cold start, and the freed VRAM
                 is exactly why the card reads HEALTHY: unwinding on the first healthy sample regrows the
@@ -748,7 +763,14 @@ class VerifiedReclaimLadder:
         if episode.pending is not None and not self._verify(episode, device_free_mb, actuator, now):
             return
 
-        self._issue_next(episode, device_free_mb, actuator, device_index=device_index, now=now)
+        self._issue_next(
+            episode,
+            device_free_mb,
+            actuator,
+            ladder_builder=ladder_builder,
+            device_index=device_index,
+            now=now,
+        )
 
     def record_context_reduction(self, device_index: int | None, *, beneficiary: str | None = None) -> None:
         """Record that a card's live inference-context count was reduced under admission pressure.
@@ -963,6 +985,7 @@ class VerifiedReclaimLadder:
         device_free_mb: float,
         actuator: ReclaimLadderActuator,
         *,
+        ladder_builder: Callable[[], tuple[ReclaimRung, ...]],
         device_index: int | None,
         now: float,
     ) -> None:
@@ -979,6 +1002,15 @@ class VerifiedReclaimLadder:
         :data:`_TEARDOWN_VERIFICATION_BASE_SECONDS` is held rather than spent: the scan passes over it to the
         cheaper rungs behind it, and the held rungs are kept, in their order, at the head of what remains so a
         later tick past the dwell issues them. An episode with only held rungs left is waiting, not unresolved.
+
+        Past the dwell, the first teardown rung the scan reaches triggers one re-read of ``ladder_builder``. Its
+        idle-resident unloads and cache releases that this episode has not spent are spliced in front of the
+        teardown rung, in the fresh ladder's order, and the scan spends them first; a matching rung further down
+        the frozen ladder is dropped so it is not issued twice. The ladder froze while some lanes were still
+        sampling; one that finished during the dwell left a resident that was never a rung, and stopping a lane
+        beside it trades a process exit and a cold start for memory an in-place unload returns. The teardown
+        rungs keep their place behind the spliced rungs and are reached on a later tick if those do not clear
+        the saturation. The rungs already spent are untouched, so their verification records stay consistent.
         """
         ladder = episode.ladder or ()
         start_index = episode.next_index
@@ -989,13 +1021,38 @@ class VerifiedReclaimLadder:
             episode.saturated_since is not None
             and (now - episode.saturated_since) < _TEARDOWN_VERIFICATION_BASE_SECONDS
         )
+        reread = False
         issued = False
         while scan_index < len(ladder):
             rung = ladder[scan_index]
-            scan_index += 1
             if inside_dwell and rung.kind in _TEARDOWN_RUNG_KINDS:
                 held.append(rung)
+                scan_index += 1
                 continue
+            if rung.kind in _TEARDOWN_RUNG_KINDS and not reread:
+                # Once per tick: the spliced rungs are spent or no-ops by the time the scan reaches the
+                # teardown rung again, and a second read would only repeat the first.
+                reread = True
+                added = self._cheaper_rungs_since_the_cliff(
+                    ladder_builder,
+                    already_spent=(*ladder[:start_index], *spent),
+                )
+                if added:
+                    added_targets = {_rung_target(added_rung) for added_rung in added}
+                    remaining = tuple(
+                        later_rung
+                        for later_rung in ladder[scan_index:]
+                        if _rung_target(later_rung) not in added_targets
+                    )
+                    ladder = (*ladder[:scan_index], *added, *remaining)
+                    episode.ladder = ladder
+                    logger.info(
+                        f"Reclaim ladder: re-read device {device_index} before the {rung.kind.value} rung and added "
+                        f"{len(added)} cheaper rung(s) ahead of it, first {added[0].kind.value} on "
+                        f"{added[0].tenant_label}.",
+                    )
+                    continue
+            scan_index += 1
             spent.append(rung)
             if rung.kind is ReclaimRungKind.SAFETY_OFF_GPU and self._safety_rung_in_cooldown(device_index, now):
                 continue
@@ -1019,6 +1076,20 @@ class VerifiedReclaimLadder:
         episode.next_index = start_index + len(spent)
         if not issued and not held:
             episode.unresolved = True
+
+    @staticmethod
+    def _cheaper_rungs_since_the_cliff(
+        ladder_builder: Callable[[], tuple[ReclaimRung, ...]],
+        *,
+        already_spent: Iterable[ReclaimRung],
+    ) -> tuple[ReclaimRung, ...]:
+        """Return the fresh ladder's non-teardown rungs whose target this episode has not spent, in its order."""
+        spent_targets = {_rung_target(spent_rung) for spent_rung in already_spent}
+        return tuple(
+            fresh_rung
+            for fresh_rung in ladder_builder()
+            if fresh_rung.kind not in _TEARDOWN_RUNG_KINDS and _rung_target(fresh_rung) not in spent_targets
+        )
 
     def _safety_rung_in_cooldown(self, device_index: int | None, now: float) -> bool:
         """Whether ``device_index``'s last safety actuation is recent enough to refuse another one.
