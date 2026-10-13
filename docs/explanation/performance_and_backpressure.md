@@ -607,8 +607,12 @@ the stage grant and its denoise onset waits for the sample grant, and each grant
 measured free VRAM (see the next section). The stacking the headway exists to prevent is therefore priced at
 clearance, so the scheduler passes `headway_priced_by_clearance` to `concurrent_overlap_permitted` and the
 progress test is skipped. The extra-large pairing rule, the confirmed-room requirement for an extra-large or
-batched side, and the arbiter's memory veto still apply. The scheduler logs once per overlap episode on a card
-that the headway is not applied, so a reader of the `overlap_headway` slot-duty bucket can tell that its zero
+batched side, and the arbiter's memory veto still apply. They read only the lanes that are sampling, as does
+the staging charge's remaining-seconds term. A lane counts while it holds a sampling slot on its card's
+clearance controller and its progress is below 1.0. A staged lane holds no slot until its sample grant, and a
+lane at full progress has released its slot and is decoding. The clearance and the lease price both, so neither
+holds an extra-large head under the pairing rule or keeps the full price on the memory verdict. The scheduler
+logs once per session on a card that the headway is not applied, so a reader of the `overlap_headway` slot-duty bucket can tell that its zero
 share means the gate stood aside. With the lease off or two-phase off, the headway applies as described above.
 
 The required headway is finally scaled by the worker's performance mode

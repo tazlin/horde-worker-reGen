@@ -513,3 +513,106 @@ class TestOverlapPricesWhatALeasedDispatchPutsOnTheCard:
         )
 
         assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
+
+    async def _with_sibling_on_lane_two(
+        self,
+        job_tracker: JobTracker,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        two_phase: bool,
+        sibling_holds_slot: bool,
+    ) -> InferenceScheduler:
+        """The leased scheduler beside a second dispatched job on lane 2 that has not entered its denoise loop."""
+        scheduler = await self._leased_scheduler(job_tracker, monkeypatch, lease=True, remaining_seconds=5.0)
+        scheduler._runtime_config.bridge_data.gpu_sampling_lease_two_phase = two_phase
+        sibling_job = await _running(job_tracker, _HEAVY_A)
+        sibling_lane = scheduler._process_map[2]
+        sibling_lane.record_inference_ownership(sibling_job, attempt_ordinal=1)
+        sibling_lane.last_process_state = HordeProcessState.INFERENCE_PRIMED
+        scheduler.set_sampling_slot_provider(
+            lambda process_info: sibling_holds_slot or process_info.process_id != sibling_lane.process_id
+        )
+        return scheduler
+
+    async def test_under_two_phase_a_staged_sibling_leaves_the_staging_charge(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A staged lane holds no sampling slot, so it is not a running sampler whose hand-over time is unknown."""
+        scheduler = await self._with_sibling_on_lane_two(
+            job_tracker, monkeypatch, two_phase=True, sibling_holds_slot=False
+        )
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0)
+
+    async def test_under_two_phase_a_cleared_lane_still_loading_keeps_the_full_price(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lane cleared to sample holds its slot while its weights land, and its remaining time is unknown."""
+        scheduler = await self._with_sibling_on_lane_two(
+            job_tracker, monkeypatch, two_phase=True, sibling_holds_slot=True
+        )
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
+
+    async def test_without_two_phase_a_staged_sibling_keeps_the_full_price(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: single-phase dispatch is the load-and-sample window, so every in-flight job is in the set."""
+        scheduler = await self._with_sibling_on_lane_two(
+            job_tracker, monkeypatch, two_phase=False, sibling_holds_slot=False
+        )
+
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
+
+
+class TestTwoPhaseRunningSetIsTheSamplingLanes:
+    """Under two-phase clearance the pairing rule reads only the lanes that are sampling.
+
+    A lane at full progress has released its sampling slot and is decoding; the clearance and the lease price
+    its remaining work, so it does not hold an extra-large head the way a sampler does.
+    """
+
+    async def _extra_large_on_lane_one(
+        self,
+        job_tracker: JobTracker,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        two_phase: bool,
+        steps_done: int,
+    ) -> InferenceScheduler:
+        """A leased scheduler with an extra-large job on lane 1 at ``steps_done`` of 20 steps."""
+        tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _EXTRA_LARGE_OTHER: ModelSizeTier.EXTRA_LARGE}
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
+        scheduler._runtime_config.bridge_data.gpu_sampling_lease_enabled = True
+        scheduler._runtime_config.bridge_data.gpu_sampling_lease_two_phase = two_phase
+        running_job = await _running(job_tracker, _EXTRA_LARGE)
+        lane = scheduler._process_map[1]
+        lane.record_inference_ownership(running_job, attempt_ordinal=1)
+        lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+        lane.last_total_steps = 20
+        lane.last_current_step = steps_done
+        return scheduler
+
+    async def test_a_decoding_extra_large_lane_does_not_hold_an_extra_large_head(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A finished sampler decoding its result is not a running sampler under two-phase clearance."""
+        scheduler = await self._extra_large_on_lane_one(job_tracker, monkeypatch, two_phase=True, steps_done=20)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE_OTHER)) is True
+
+    async def test_a_sampling_extra_large_lane_still_holds_an_extra_large_head(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two extra-large samplers never share a card, however close the running one is to done."""
+        scheduler = await self._extra_large_on_lane_one(job_tracker, monkeypatch, two_phase=True, steps_done=19)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE_OTHER)) is False
+
+    async def test_without_two_phase_a_decoding_extra_large_lane_holds_the_head(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: single-phase dispatch loads and samples in one window, so every in-flight job is in the set."""
+        scheduler = await self._extra_large_on_lane_one(job_tracker, monkeypatch, two_phase=False, steps_done=20)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE_OTHER)) is False

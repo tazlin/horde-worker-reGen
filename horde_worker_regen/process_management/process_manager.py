@@ -1875,6 +1875,9 @@ class HordeWorkerProcessManager:
         # The measured-truth identity's primary input for any snapshot the scheduler self-primes outside the
         # manager-driven cycle; the per-tick cycle passes the same readings map explicitly.
         self._inference_scheduler.set_device_reading_provider(self._last_device_reading_by_device.get)
+        # The overlap rule's running set is the lanes that hold a sampling slot, read from the same clearance
+        # query the post-processing co-residency check reads.
+        self._inference_scheduler.set_sampling_slot_provider(self._lane_holds_clearance)
         # The managed text backend is a known tenant of its card: its measured launch footprint is a standing
         # floor there from the moment it serves, before the learned foreign floor has observed it.
         self._inference_scheduler.set_managed_tenant_provider(self._managed_text_backend_tenant)

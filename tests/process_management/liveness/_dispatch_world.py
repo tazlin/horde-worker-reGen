@@ -1682,6 +1682,7 @@ class _DispatchWorld:
         # debounced-HEALTHY signal the ladder's lane pauses are; an open-loop world books obligations it never
         # unwinds, exactly as a worker whose governor never samples HEALTHY would.
         self._scheduler.set_reclaim_ladder(self._reclaim_ladder)
+        self._scheduler.set_sampling_slot_provider(self._lane_holds_clearance)
 
     # -- card model ---------------------------------------------------------------------------------------
 

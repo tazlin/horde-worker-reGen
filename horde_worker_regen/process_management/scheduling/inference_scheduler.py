@@ -801,6 +801,9 @@ class InferenceScheduler:
         # release are logged once, on the edge.
         self._managed_tenant_provider: Callable[[], ManagedVramTenant | None] = lambda: None
         self._charged_tenant_mb_by_device: dict[int, float] = {}
+        # Whether a lane holds a sampling slot on its card's clearance controller, which the manager owns. Until
+        # wired every lane reads as holding one, the answer for a card with no controller.
+        self._lane_holds_sampling_slot: Callable[[HordeProcessInfo], bool] = lambda _process_info: True
         # The job tracker lifts a conditional ceiling hold by re-reading the card's current achievable ceiling;
         # wire that read here (the scheduler owns the foreign-floor tracker) so the tracker's live predicate
         # need not reach back into the scheduler.
@@ -894,6 +897,14 @@ class InferenceScheduler:
         footprint, or None while no managed backend is serving with a measured footprint on a known card.
         """
         self._managed_tenant_provider = provider
+
+    def set_sampling_slot_provider(self, lane_holds_sampling_slot: Callable[[HordeProcessInfo], bool]) -> None:
+        """Register the source of whether an inference lane holds a sampling slot on its card's clearance controller.
+
+        Read by the overlap rule under two-phase clearance to tell a sampling lane from a staged one
+        (:meth:`_running_sampler_jobs`).
+        """
+        self._lane_holds_sampling_slot = lane_holds_sampling_slot
 
     def serviceability_baseline_mb(self, device_index: int | None) -> float | None:
         """Return the unreclaimable device load (MB) model serviceability judges a card against.
@@ -5949,14 +5960,37 @@ class InferenceScheduler:
             return self._jobs_in_progress_on_card(target_device_index)
         return self._job_tracker.jobs_in_progress
 
-    def _running_remaining_sampling_seconds(self, target_device_index: int | None) -> tuple[float | None, ...]:
-        """Each in-flight job's remaining sampling seconds, None for one that is not inside its denoise loop.
+    def _running_sampler_jobs(self, target_device_index: int | None) -> tuple[ImageGenerateJobPopResponse, ...]:
+        """Return the running samplers an overlap onto ``target_device_index`` shares the card with.
 
-        A job whose lane is staged, loading or not yet past the estimate's progress floor reads None, so the
-        caller cannot treat a sampler with no trusted rate as about to finish.
+        Under two-phase clearance a job is a running sampler while its lane holds a sampling slot and its progress
+        is below 1.0. A staged lane holds no slot until its sample grant, and a lane at full progress has released
+        its slot and is decoding; the clearance and the lease price both. A job no lane owns is kept, since its
+        slot cannot be asked. Without two-phase clearance every in-flight job is one: the dispatch opens the
+        load-and-sample window, and the overlap headway reads each in-flight job's progress.
+        """
+        in_progress_jobs = tuple(self._overlap_scope_jobs(target_device_index))
+        if not self._two_phase_clearance_active():
+            return in_progress_jobs
+        running_samplers: list[ImageGenerateJobPopResponse] = []
+        for job in in_progress_jobs:
+            process_info = self._process_map.process_running_job(job)
+            if process_info is not None and not self._lane_holds_sampling_slot(process_info):
+                continue
+            if self._in_flight_progress_fraction(job) >= 1.0:
+                continue
+            running_samplers.append(job)
+        return tuple(running_samplers)
+
+    def _running_remaining_sampling_seconds(self, target_device_index: int | None) -> tuple[float | None, ...]:
+        """Each running sampler's remaining sampling seconds, None for one that is not inside its denoise loop.
+
+        The samplers are :meth:`_running_sampler_jobs`. A job whose lane is staged, loading or not yet past the
+        estimate's progress floor reads None, so the caller cannot treat a sampler with no trusted rate as about
+        to finish.
         """
         remaining: list[float | None] = []
-        for job in self._overlap_scope_jobs(target_device_index):
+        for job in self._running_sampler_jobs(target_device_index):
             process_info = self._process_map.process_running_job(job)
             if process_info is None or process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
                 remaining.append(None)
@@ -5973,11 +6007,12 @@ class InferenceScheduler:
         """Whether ``candidate_job`` may start while other jobs are already sampling.
 
         Gathers the running samplers (those on ``target_device_index`` when multi-GPU routing is active, else
-        worker-wide) and defers to :func:`concurrent_overlap_permitted`, with the VRAM arbiter's dispatch
-        verdict as the memory answer. No actuations run on a DEFER; reclaim is driven only by the preload path.
-        A blocked job keeps its queue position and is re-asked on the next scheduling pass.
+        worker-wide; under two-phase clearance only the lanes that are sampling, see :meth:`_running_sampler_jobs`)
+        and defers to :func:`concurrent_overlap_permitted`, with the VRAM arbiter's dispatch verdict as the memory
+        answer. No actuations run on a DEFER; reclaim is driven only by the preload path. A blocked job keeps its
+        queue position and is re-asked on the next scheduling pass.
         """
-        in_progress_jobs = self._overlap_scope_jobs(target_device_index)
+        in_progress_jobs = self._running_sampler_jobs(target_device_index)
 
         running = tuple(
             RunningSampler(
@@ -5988,9 +6023,7 @@ class InferenceScheduler:
             for job in in_progress_jobs
         )
         headway_priced_by_clearance = self._two_phase_clearance_active()
-        if not running:
-            self._headway_priced_by_clearance_noted.discard(target_device_index)
-        elif headway_priced_by_clearance:
+        if running and headway_priced_by_clearance:
             self._note_headway_priced_by_clearance(target_device_index)
         return concurrent_overlap_permitted(
             candidate_tier=self._model_size_tier(candidate_job.model),
@@ -6004,11 +6037,12 @@ class InferenceScheduler:
         )
 
     def _note_headway_priced_by_clearance(self, device_index: int | None) -> None:
-        """Log once per overlap episode on a card scope that two-phase clearance replaces the overlap headway.
+        """Log once per session on a card scope that two-phase clearance replaces the overlap headway.
 
         Under two-phase clearance the ``overlap_headway`` duty bucket reads zero because the gate no longer
         holds on progress; the line states that, so a reader does not take the empty bucket for a gate that
-        stopped binding on its own.
+        stopped binding on its own. Once per session, not per overlap episode: on short jobs the card is
+        momentarily idle between most samples, and a per-episode line repeats every few seconds.
         """
         if device_index in self._headway_priced_by_clearance_noted:
             return
