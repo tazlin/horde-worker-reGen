@@ -61,6 +61,9 @@ from tests.analysis.test_detectors import (
     _pop_claim_released,
     _post_processing_offer,
     _recovery,
+    _safety_checked_job,
+    _safety_cpu_fallback,
+    _safety_job_id,
     _safety_lost_result,
     _safety_requeue,
     _safety_start_escalated,
@@ -458,6 +461,25 @@ CONTRACTS: dict[str, Contract] = {
         # finished->safety wait growing past the time the same jobs spent generating.
         bridge=_safety_stage_session(waits=[2.0 + index * 1.5 for index in range(40)]),
         severity=Severity.CRITICAL,
+    ),
+    "detect_safety_check_cpu_fallback": Contract(
+        # Three checks rerun on the CPU that together took longer than the session's five checks on the GPU.
+        bridge=_bridge(
+            *[
+                _safety_checked_job(f"13:0{index}:10.000", job_id=_safety_job_id(index), seconds=0.11)
+                for index in range(5)
+            ],
+            *[
+                _safety_checked_job(f"13:1{index}:06.000", job_id=_safety_job_id(100 + index), seconds=5.9)
+                for index in range(3)
+            ],
+        ),
+        child_logs={
+            "bridge_0.log": "\n".join(
+                _safety_cpu_fallback(f"13:1{index}:05.000", job_id=_safety_job_id(100 + index)) for index in range(3)
+            ),
+        },
+        severity=Severity.WARNING,
     ),
     "detect_head_dispatch_stall": Contract(
         bridge=_bridge(_dispatch_stall("13:01:00.000", reason=_DISPATCH_BUG_REASON)),

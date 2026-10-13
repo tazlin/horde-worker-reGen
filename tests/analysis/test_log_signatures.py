@@ -18,6 +18,7 @@ import pytest
 
 from horde_worker_regen.analysis import detectors, job_lifecycle
 from horde_worker_regen.analysis.log_signatures import SIGNATURES, LogSignature, pattern_for
+from horde_worker_regen.process_management.workers.safety_process import SafetyEvaluationStage
 
 # Patterns detectors.py compiles on its own rather than drawing from the registry, each for a reason the
 # fence below accepts: a fragment read out of a message another (registered) pattern already matched, a
@@ -145,3 +146,34 @@ def test_buffer_patterns_claim_their_own_device_lines_and_no_others() -> None:
     assert matched["text_backend_model_buffer"] == ["CUDA0", "CUDA_Host"]
     assert matched["text_backend_kv_buffer"] == ["CUDA0"]
     assert matched["text_backend_compute_buffer"] == ["CUDA0", "CUDA_Host"]
+
+
+@pytest.mark.parametrize("stage", list(SafetyEvaluationStage), ids=lambda stage: stage.name)
+@pytest.mark.parametrize("free_figure", ["0 bytes", "12.50 MiB", None], ids=["bytes", "mebibytes", "not_stated"])
+def test_safety_cpu_fallback_reads_every_stage_and_free_form(
+    stage: SafetyEvaluationStage,
+    free_figure: str | None,
+) -> None:
+    """The rerun line parses for each evaluation stage, with and without the allocator's free figure."""
+    free = f"{free_figure} free" if free_figure else "free figure not stated"
+    line = (
+        f"Safety job 9c46c418-81a8-4727-b8c5-495da36f9efd ran out of device memory during {stage} ({free}). "
+        "The check was rerun on the CPU in 5.73 seconds and the process stays up."
+    )
+
+    rerun = pattern_for("safety_check_cpu_fallback").search(line)
+
+    assert rerun is not None
+    assert rerun.group("job") == "9c46c418-81a8-4727-b8c5-495da36f9efd"
+    assert rerun.group("stage") == stage
+    assert rerun.group("free") == free_figure
+    assert float(rerun.group("seconds")) == 5.73
+
+
+def test_safety_cpu_fallback_refuses_a_stage_the_safety_process_does_not_have() -> None:
+    """A stage outside the safety process's enum is a reworded emit, which must not parse as a known one."""
+    line = (
+        "Safety job 9c46c418-81a8-4727-b8c5-495da36f9efd ran out of device memory during captioning "
+        "(0 bytes free). The check was rerun on the CPU in 5.73 seconds and the process stays up."
+    )
+    assert pattern_for("safety_check_cpu_fallback").search(line) is None

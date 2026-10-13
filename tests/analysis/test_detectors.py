@@ -25,6 +25,7 @@ from horde_worker_regen.analysis.detectors import (
 from horde_worker_regen.analysis.log_ingest import LogRecord
 from horde_worker_regen.analysis.sessions import segment_sessions
 from horde_worker_regen.process_management.jobs import job_popper
+from horde_worker_regen.process_management.workers.safety_process import SafetyEvaluationStage
 
 
 def _diagnose(tmp_path: Path, bridge_log: str, child_logs: dict[str, str] | None = None) -> dict[str, Finding]:
@@ -1577,6 +1578,237 @@ class TestSafetyStageStall:
             ],
         )
         assert "safety_stage_stall" not in _diagnose(tmp_path, bridge)
+
+
+def _safety_job_id(index: int) -> str:
+    """A stable synthetic job UUID for the nth safety check of a fixture."""
+    return f"{index:08x}-0000-4000-8000-000000000000"
+
+
+def _safety_checked_job(ts: str, *, job_id: str, seconds: float) -> str:
+    """message_dispatcher._handle_safety_result: the parent's per-job safety line, with the check's duration."""
+    return (
+        f"2026-06-25 {ts} | DEBUG    | horde_worker_regen.process_management.ipc.message_dispatcher:"
+        f"_handle_safety_result:801 - Job {job_id} had 0 images censored and took {seconds} seconds to check safety"
+    )
+
+
+def _safety_cpu_fallback(
+    ts: str,
+    *,
+    job_id: str,
+    seconds: float = 5.73,
+    stage: SafetyEvaluationStage = SafetyEvaluationStage.NSFW_CHECK,
+    free_figure: str | None = "0 bytes",
+) -> str:
+    """safety_process._evaluate_images_on_cpu: a check that found the card full, in the safety process's log."""
+    free = f"{free_figure} free" if free_figure else "free figure not stated"
+    return (
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.workers.safety_process:"
+        f"_evaluate_images_on_cpu:1020 - Safety job {job_id} ran out of device memory during {stage} ({free}). "
+        f"The check was rerun on the CPU in {seconds:.2f} seconds and the process stays up."
+    )
+
+
+def _safety_weights_release_out_of_memory(ts: str) -> str:
+    """safety_process.demote_safety_weights: the release after a demotion running out of device memory."""
+    return (
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.workers.safety_process:"
+        "demote_safety_weights:540 - Releasing the demoted safety weights ran out of device memory. CLIP is "
+        "held in host RAM and the process stays up."
+    )
+
+
+def _safety_weights_promotion_out_of_memory(ts: str) -> str:
+    """safety_process.promote_safety_weights: a promotion running out of device memory."""
+    return (
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.workers.safety_process:"
+        "promote_safety_weights:567 - Promoting the safety weights ran out of device memory. They stay demoted "
+        "in host RAM and the process stays up."
+    )
+
+
+_SAFETY_GPU_CHECK_SECONDS = 0.11
+"""What a fixture's safety check takes when it runs on the GPU."""
+
+
+class TestSafetyCheckCpuFallback:
+    """Safety checks on the GPU that found the card full and were rerun on the CPU in the same process."""
+
+    @staticmethod
+    def _bundle(
+        reruns: list[tuple[SafetyEvaluationStage, float]],
+        *,
+        other_checks: int,
+        parent_logs_checks: bool = True,
+        extra_child_lines: tuple[str, ...] = (),
+    ) -> tuple[str, dict[str, str]]:
+        """Return the bridge log and the safety process's log of a session with these reruns.
+
+        The reruns are a minute apart from 13:01:00 and the parent logs each rerun job a second later. The
+        other checks all land in the session's first minute.
+        """
+        child = [
+            _safety_cpu_fallback(
+                f"13:{1 + index:02d}:00.000",
+                job_id=_safety_job_id(1000 + index),
+                seconds=seconds,
+                stage=stage,
+            )
+            for index, (stage, seconds) in enumerate(reruns)
+        ]
+        checks: list[str] = []
+        if parent_logs_checks:
+            checks += [
+                _safety_checked_job(
+                    f"13:00:{10 + index % 50:02d}.{index // 50:03d}",
+                    job_id=_safety_job_id(index),
+                    seconds=_SAFETY_GPU_CHECK_SECONDS,
+                )
+                for index in range(other_checks)
+            ]
+            checks += [
+                _safety_checked_job(
+                    f"13:{1 + index:02d}:01.000",
+                    job_id=_safety_job_id(1000 + index),
+                    seconds=round(seconds + 0.2, 2),
+                )
+                for index, (_stage, seconds) in enumerate(reruns)
+            ]
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                *sorted(checks),
+                _session_line("13:59:30.000"),
+            ],
+        )
+        return bridge, {"bridge_0.log": "\n".join([*child, *extra_child_lines])}
+
+    def test_silent_without_a_rerun(self, tmp_path: Path) -> None:
+        """A session whose safety checks all ran on the GPU has no such finding."""
+        bridge, child_logs = self._bundle([], other_checks=20)
+        child_logs["bridge_0.log"] = _session_line("13:05:00.000")
+
+        assert "safety_check_cpu_fallback" not in _diagnose(tmp_path, bridge, child_logs)
+
+    def test_a_few_reruns_are_a_note(self, tmp_path: Path) -> None:
+        """Two reruns among hundreds of checks are the containment working, so nothing is asked of the reader."""
+        reruns = [(SafetyEvaluationStage.NSFW_CHECK, 5.73), (SafetyEvaluationStage.NSFW_CHECK, 6.10)]
+        bridge, child_logs = self._bundle(reruns, other_checks=200)
+
+        finding = _diagnose(tmp_path, bridge, child_logs)["safety_check_cpu_fallback"]
+
+        assert finding.severity is Severity.INFO
+        assert finding.headline == (
+            "2 of 202 safety checks found the card full and reran on the CPU, taking a median 5.9 seconds where "
+            "others took 0.11."
+        )
+        assert finding.action == "No action needed."
+        assert finding.evidence[0] == "reruns: 2 of 202 safety checks (1.0%), over 1 minute from 13:01:00 to 13:02:00"
+
+    def test_many_reruns_are_reported_with_their_counts_and_split(self, tmp_path: Path) -> None:
+        """Reruns that outweigh the session's other checks are worth a bundle, with the split by stage."""
+        reruns = [
+            (SafetyEvaluationStage.CLIP_STAGING, 5.0),
+            *[(SafetyEvaluationStage.NSFW_CHECK, 6.0)] * 9,
+            (SafetyEvaluationStage.CLIP_STAGING, 5.0),
+            (SafetyEvaluationStage.AESTHETIC_SCORE, 9.1),
+        ]
+        bridge, child_logs = self._bundle(reruns, other_checks=288)
+
+        finding = _diagnose(tmp_path, bridge, child_logs)["safety_check_cpu_fallback"]
+
+        assert finding.severity is Severity.WARNING
+        assert finding.headline == (
+            "12 of 300 safety checks found the card full and reran on the CPU, taking a median 6.0 seconds where "
+            "others took 0.11."
+        )
+        assert "`horde-log bundle`" in finding.action
+        assert finding.see_also is FindingKind.SAFETY_STAGE_STALL
+        assert finding.evidence[:4] == [
+            "reruns: 12 of 300 safety checks (4.0%), over 11 minutes from 13:01:00 to 13:12:00",
+            f"by stage: 2 during {SafetyEvaluationStage.CLIP_STAGING}, 9 during {SafetyEvaluationStage.NSFW_CHECK}, "
+            f"1 during {SafetyEvaluationStage.AESTHETIC_SCORE}",
+            "rerun time: median 6.00s, longest 9.10s, 73.1s in total against 31.7s for the other 288 checks",
+            "safety weight moves that ran out of card memory: 0 releasing after a demotion, 0 promoting",
+        ]
+        first, longest = finding.evidence[4], finding.evidence[5]
+        assert first.startswith("first: 13:01:00  bridge_0.log:")
+        assert first.endswith(
+            f"job 000003e8 during {SafetyEvaluationStage.CLIP_STAGING}, 0 bytes free, rerun in 5.00s"
+        )
+        assert longest.startswith("longest: 13:12:00  bridge_0.log:")
+        assert longest.endswith("rerun in 9.10s")
+
+    def test_many_cheap_reruns_stay_a_note(self, tmp_path: Path) -> None:
+        """Reruns that cost less than the session's other checks are a note, however many there were."""
+        reruns = [(SafetyEvaluationStage.NSFW_CHECK, 0.5)] * 4
+        bridge, child_logs = self._bundle(reruns, other_checks=400)
+
+        finding = _diagnose(tmp_path, bridge, child_logs)["safety_check_cpu_fallback"]
+
+        assert finding.severity is Severity.INFO
+        assert "2.0s in total against 44.0s for the other 400 checks" in finding.evidence[2]
+
+    def test_two_costly_reruns_stay_a_note(self, tmp_path: Path) -> None:
+        """Fewer reruns than the floor are not a pattern, however long they took."""
+        reruns = [(SafetyEvaluationStage.NSFW_CHECK, 30.0)] * 2
+        bridge, child_logs = self._bundle(reruns, other_checks=10)
+
+        assert _diagnose(tmp_path, bridge, child_logs)["safety_check_cpu_fallback"].severity is Severity.INFO
+
+    def test_a_capture_without_the_parents_check_lines_stays_a_note(self, tmp_path: Path) -> None:
+        """With no check count to compare against, the headline gives the count alone and asks nothing."""
+        reruns = [(SafetyEvaluationStage.NSFW_CHECK, 5.73)] * 4
+        bridge, child_logs = self._bundle(reruns, other_checks=0, parent_logs_checks=False)
+
+        finding = _diagnose(tmp_path, bridge, child_logs)["safety_check_cpu_fallback"]
+
+        assert finding.severity is Severity.INFO
+        assert finding.headline == (
+            "Safety checks found the card full and reran on the CPU 4 times, taking a median 5.7 seconds."
+        )
+        assert finding.evidence[0].startswith("reruns: 4, over 3 minutes from 13:01:00 to 13:04:00.")
+
+    def test_failed_weight_moves_are_counted_and_quoted(self, tmp_path: Path) -> None:
+        """A release or a promotion that ran out of device memory is counted beside the reruns."""
+        bridge, child_logs = self._bundle(
+            [(SafetyEvaluationStage.NSFW_CHECK, 5.73)],
+            other_checks=50,
+            extra_child_lines=(
+                _safety_weights_release_out_of_memory("13:20:00.000"),
+                _safety_weights_promotion_out_of_memory("13:21:00.000"),
+                _safety_weights_promotion_out_of_memory("13:22:00.000"),
+            ),
+        )
+
+        finding = _diagnose(tmp_path, bridge, child_logs)["safety_check_cpu_fallback"]
+
+        assert finding.headline == (
+            "1 of 51 safety checks found the card full and reran on the CPU, taking 5.7 seconds where others took "
+            "0.11."
+        )
+        assert finding.evidence[0] == "reruns: 1 of 51 safety checks (2.0%), at 13:01:00"
+        assert (
+            finding.evidence[3]
+            == "safety weight moves that ran out of card memory: 1 releasing after a demotion, 2 promoting"
+        )
+        assert "Releasing the demoted safety weights ran out of device memory." in finding.evidence[5]
+        assert "Promoting the safety weights ran out of device memory." in finding.evidence[6]
+
+    def test_a_rerun_without_a_free_figure_is_read(self, tmp_path: Path) -> None:
+        """The allocator does not always state what was free, and the line still counts."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _session_line("13:59:30.000"),
+            ],
+        )
+        child = _safety_cpu_fallback("13:01:00.000", job_id=_safety_job_id(1), free_figure=None)
+
+        finding = _diagnose(tmp_path, bridge, {"bridge_0.log": child})["safety_check_cpu_fallback"]
+
+        assert finding.evidence[4].endswith("free figure not stated, rerun in 5.73s")
 
 
 class TestWholeCardConvergenceWedge:

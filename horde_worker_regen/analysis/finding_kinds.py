@@ -110,6 +110,7 @@ class FindingKind(enum.StrEnum):
     POST_PROCESSING_DEFERRAL_STARVATION = "post_processing_deferral_starvation"
     SAFETY_STAGE_STALL = "safety_stage_stall"
     SAFETY_STAGE_CAPACITY = "safety_stage_capacity"
+    SAFETY_CHECK_CPU_FALLBACK = "safety_check_cpu_fallback"
     POP_LIVENESS_FULL_QUEUE = "pop_liveness_full_queue"
     PARENT_LOOP_STALL = "parent_loop_stall"
     LANE_PLACEMENT = "lane_placement"
@@ -771,6 +772,20 @@ FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
         ),
         see_also=FindingKind.SAFETY_STAGE_STALL,
         reference_page="docs/explanation/process_lanes_and_chaining.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.SAFETY_CHECK_CPU_FALLBACK,
+        title="Safety checks reran on the CPU because the card was full",
+        detail=(
+            "A safety check needs about 2 GB more card memory while it runs than the safety process holds "
+            "between checks. The worker sets that room aside before it sends a check. When the room is gone "
+            "anyway, the check finds the card full. The worker reruns that one check on the CPU and keeps the "
+            "safety process running. A rerun takes seconds where a check on the GPU takes a fraction of one, "
+            "and the finished image waits for it. A few reruns are expected. Many mean the worker gave out "
+            "more of the card than it had around the check, which lowers throughput."
+        ),
+        see_also=FindingKind.SAFETY_STAGE_STALL,
+        reference_page="docs/explanation/resilience_and_recovery.md",
     ),
     FindingSpec(
         kind=FindingKind.POP_LIVENESS_FULL_QUEUE,

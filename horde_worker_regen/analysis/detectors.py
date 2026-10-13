@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 
 import yaml
 
+from horde_worker_regen.process_management.workers.safety_process import SafetyEvaluationStage
 from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
 
 from .correlate import RecoveryDiagnostic, SessionContext, find_child_crash
@@ -265,6 +266,14 @@ _POP_API_ERROR_CODE_RE = pattern_for("pop_api_error_code")
 # so the pair together is an attribution rather than a guess.
 _SAFETY_PLACEMENT_CYCLE_RE = pattern_for("safety_placement_cycle")
 _RETIRED_SAFETY_RESULT_RE = pattern_for("retired_safety_result")
+# A safety check that found the card full and was rerun on the CPU, and the two residency commands that ran
+# out of device memory. Producers: ``safety_process._evaluate_images_on_cpu``, ``demote_safety_weights`` and
+# ``promote_safety_weights``, all written to the safety process's log. The parent's per-job safety line
+# carries the job id and the duration of every check of the session, which the reruns are compared against.
+_SAFETY_CPU_FALLBACK_RE = pattern_for("safety_check_cpu_fallback")
+_SAFETY_WEIGHTS_RELEASE_OOM_RE = pattern_for("safety_weights_release_out_of_memory")
+_SAFETY_WEIGHTS_PROMOTION_OOM_RE = pattern_for("safety_weights_promotion_out_of_memory")
+_SAFETY_CHECKED_RE = pattern_for("safety_checked")
 # A deferred GPU start that gave up on its card. Producers: ``process_lifecycle._escalate_safety_start_off_gpu``
 # (safety moves to the CPU), ``_retire_stalled_inference_start`` (the inference slot leaves the card's plan)
 # and ``_restore_retired_inference_slot`` (it rejoins the plan). Each gives-up line has a stalled-wait and a
@@ -5419,6 +5428,155 @@ def detect_safety_stage_capacity(context: SessionContext) -> list[Finding]:
     ]
 
 
+_SAFETY_CPU_FALLBACK_MIN_RERUNS = 3
+"""How many reruns a session needs before their cost is compared with the rest of its checks.
+
+Below this, one rerun in a short session outweighs the few checks around it and would read as a pattern."""
+
+
+@dataclass(frozen=True)
+class _SafetyCpuFallback:
+    """One safety check that ran out of device memory and was rerun on the CPU."""
+
+    record: LogRecord
+    job_id: str
+    stage: SafetyEvaluationStage
+    free_figure: str | None
+    """The allocator's free figure as logged ("0 bytes"), or None when the error did not state one."""
+    rerun_seconds: float
+
+
+def _safety_cpu_fallbacks(records: list[LogRecord]) -> list[_SafetyCpuFallback]:
+    """Return the safety checks among ``records`` that were rerun on the CPU, oldest first."""
+    fallbacks: list[_SafetyCpuFallback] = []
+    for record in records:
+        rerun = _SAFETY_CPU_FALLBACK_RE.search(record.message)
+        if rerun is None:
+            continue
+        fallbacks.append(
+            _SafetyCpuFallback(
+                record=record,
+                job_id=rerun.group("job"),
+                stage=SafetyEvaluationStage(rerun.group("stage")),
+                free_figure=rerun.group("free"),
+                rerun_seconds=float(rerun.group("seconds")),
+            ),
+        )
+    fallbacks.sort(key=lambda fallback: _window_key(fallback.record))
+    return fallbacks
+
+
+def _safety_cpu_fallback_evidence(label: str, fallback: _SafetyCpuFallback) -> str:
+    """Return one rerun as an evidence line with its log location.
+
+    The line is rebuilt from its fields because the rerun time sits past the length evidence lines are
+    clipped to.
+    """
+    record = fallback.record
+    free = f"{fallback.free_figure} free" if fallback.free_figure else "free figure not stated"
+    return (
+        f"{label}: {_clock_text(record.timestamp)}  {record.source_path.name}:{record.raw_lineno}  job "
+        f"{fallback.job_id[:8]} during {fallback.stage}, {free}, rerun in {fallback.rerun_seconds:.2f}s"
+    )
+
+
+def detect_safety_check_cpu_fallback(context: SessionContext) -> list[Finding]:
+    """Safety checks on the GPU that found the card full and were rerun on the CPU.
+
+    A rerun keeps the safety process up, so a few are the containment working and the finding is a note.
+    It is a warning when at least :data:`_SAFETY_CPU_FALLBACK_MIN_RERUNS` reruns together took as long as
+    every other safety check of the session, which is when they have doubled what the safety stage costs.
+    Both sides of that comparison are the session's own timings, so a slow CPU reaches it at a lower rerun
+    rate than a fast one. A capture without the parent's per-job safety lines has nothing to compare against
+    and stays a note.
+    """
+    child_records = _child_records_in_session(context)
+    fallbacks = _safety_cpu_fallbacks(child_records)
+    if not fallbacks:
+        return []
+    failed_releases = _matching(child_records, _SAFETY_WEIGHTS_RELEASE_OOM_RE)
+    failed_promotions = _matching(child_records, _SAFETY_WEIGHTS_PROMOTION_OOM_RE)
+
+    rerun_job_ids = {fallback.job_id for fallback in fallbacks}
+    checked_count = 0
+    other_check_seconds: list[float] = []
+    for record in context.session.records:
+        checked = _SAFETY_CHECKED_RE.search(record.message)
+        if checked is None:
+            continue
+        checked_count += 1
+        if checked.group("job") not in rerun_job_ids:
+            other_check_seconds.append(float(checked.group("seconds")))
+
+    count = len(fallbacks)
+    rerun_seconds = [fallback.rerun_seconds for fallback in fallbacks]
+    total_rerun_seconds = sum(rerun_seconds)
+    median_rerun_seconds = statistics.median(rerun_seconds)
+    longest = max(fallbacks, key=lambda fallback: fallback.rerun_seconds)
+    total_other_seconds = sum(other_check_seconds)
+    session_checks_known = checked_count >= count
+    reruns_outweigh_other_checks = session_checks_known and total_rerun_seconds >= total_other_seconds
+    reportable = count >= _SAFETY_CPU_FALLBACK_MIN_RERUNS and reruns_outweigh_other_checks
+
+    took = (
+        f"taking {median_rerun_seconds:.1f} seconds"
+        if count == 1
+        else f"taking a median {median_rerun_seconds:.1f} seconds"
+    )
+    median_other_seconds = _median(other_check_seconds)
+    if session_checks_known:
+        subject = f"{count} of {_count_text(checked_count, 'safety check')} found the card full and reran on the CPU"
+        usual = f" where others took {median_other_seconds:.2f}" if median_other_seconds is not None else ""
+    else:
+        subject = f"Safety checks found the card full and reran on the CPU {_times_text(count)}"
+        usual = ""
+
+    first, last = fallbacks[0], fallbacks[-1]
+    if count == 1:
+        span = f"at {_clock_text(first.record.timestamp)}"
+    else:
+        span = (
+            f"over {_span_text(_seconds_between(first.record.timestamp, last.record.timestamp))} from "
+            f"{_clock_text(first.record.timestamp)} to {_clock_text(last.record.timestamp)}"
+        )
+    if session_checks_known:
+        reruns_line = f"reruns: {count} of {checked_count} safety checks ({count / checked_count:.1%}), {span}"
+        against = f" against {total_other_seconds:.1f}s for the other {len(other_check_seconds)} checks"
+    else:
+        reruns_line = f"reruns: {count}, {span}. The main log has no safety check lines to compare them with."
+        against = ""
+    by_stage = [
+        f"{stage_count} during {stage}"
+        for stage in SafetyEvaluationStage
+        if (stage_count := sum(1 for fallback in fallbacks if fallback.stage is stage))
+    ]
+
+    return [
+        Finding(
+            kind=FindingKind.SAFETY_CHECK_CPU_FALLBACK,
+            severity=Severity.WARNING if reportable else Severity.INFO,
+            headline=f"{subject}, {took}{usual}.",
+            action_addendum=(
+                "Run `horde-log bundle` and send it to the worker maintainers. No setting fixes this. The worker "
+                "keeps checking every image meanwhile."
+                if reportable
+                else "No action needed."
+            ),
+            evidence=[
+                reruns_line,
+                f"by stage: {', '.join(by_stage)}",
+                f"rerun time: median {median_rerun_seconds:.2f}s, longest {longest.rerun_seconds:.2f}s, "
+                f"{total_rerun_seconds:.1f}s in total{against}",
+                f"safety weight moves that ran out of card memory: {len(failed_releases)} releasing after a "
+                f"demotion, {len(failed_promotions)} promoting",
+                _safety_cpu_fallback_evidence("first", first),
+                *([] if longest is first else [_safety_cpu_fallback_evidence("longest", longest)]),
+                *(_evidence(record) for record in failed_releases[:1] + failed_promotions[:1]),
+            ],
+        ),
+    ]
+
+
 DETECTORS: list[Detector] = [
     detect_crash_on_start_loop,
     detect_empty_model_pop_cascade,
@@ -5443,6 +5601,7 @@ DETECTORS: list[Detector] = [
     detect_supervisor_channel_lost,
     detect_safety_stage_stall,
     detect_safety_stage_capacity,
+    detect_safety_check_cpu_fallback,
     detect_whole_card_convergence_wedge,
     detect_whole_card_nonhead_residency_starvation,
     detect_whole_card_residency_churn,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from horde_worker_regen.process_management.workers.safety_process import SafetyEvaluationStage
 from horde_worker_regen.run_root import AbortSentinelKind, abort_sentinel_name
 
 
@@ -93,7 +94,11 @@ _EARLIER_WORKER_VERSIONS_ONLY = (
 _HORDELIB_READOUT_NOT_EXERCISED = (
     "the dry-run harness's fake inference children never call hordelib's free-VRAM readout"
 )
-_CHILD_LOG_NOT_READ = "written to an inference process's own log, and the dry-run contract reads only the parent's log"
+_CHILD_LOG_NOT_READ = "written to an inference process's log, and the dry-run contract reads only the parent's log"
+_SAFETY_DEVICE_MEMORY_NOT_EXHAUSTED = (
+    "written to the safety process's log when the device runs out of memory under it, and the dry-run "
+    "contract reads only the parent's log beside a fake safety process that allocates nothing on a device"
+)
 _TEXT_BACKEND_NOT_LAUNCHED = (
     "printed once by the text backend into its own `logs/text_backend.log`, which a dry run never launches"
 )
@@ -116,6 +121,7 @@ _CLEARANCE_LEASE_NOT_EXERCISED = (
 )
 
 _ABORT_SENTINEL_NAMES_PATTERN = "|".join(re.escape(abort_sentinel_name(kind)) for kind in AbortSentinelKind)
+_SAFETY_EVALUATION_STAGES_PATTERN = "|".join(re.escape(stage.value) for stage in SafetyEvaluationStage)
 
 _SIGNATURE_LIST: list[LogSignature] = [
     _signature(
@@ -821,6 +827,39 @@ _SIGNATURE_LIST: list[LogSignature] = [
         emitter="process_management.ipc.message_dispatcher:_classify_retired_launch_message",
         sample="Ignoring result message from retired safety process (launch retired by a placement cycle).",
         dry_run_reason=_SAFETY_PLACEMENT_NOT_EXERCISED,
+    ),
+    # --- Safety running out of device memory and staying up, written to the safety process's log ---
+    _signature(
+        "safety_check_cpu_fallback",
+        rf"Safety job (?P<job>\S+) ran out of device memory during (?P<stage>{_SAFETY_EVALUATION_STAGES_PATTERN}) "
+        r"\((?:(?P<free>[\d.]+ \w+) free|free figure not stated)\)\. The check was rerun on the CPU in "
+        r"(?P<seconds>[\d.]+) seconds",
+        emitter="process_management.workers.safety_process:_evaluate_images_on_cpu",
+        sample=(
+            "Safety job 9c46c418-81a8-4727-b8c5-495da36f9efd ran out of device memory during NSFW check "
+            "(0 bytes free). The check was rerun on the CPU in 5.73 seconds and the process stays up."
+        ),
+        dry_run_reason=_SAFETY_DEVICE_MEMORY_NOT_EXHAUSTED,
+    ),
+    _signature(
+        "safety_weights_release_out_of_memory",
+        r"Releasing the demoted safety weights ran out of device memory\.",
+        emitter="process_management.workers.safety_process:demote_safety_weights",
+        sample=(
+            "Releasing the demoted safety weights ran out of device memory. CLIP is held in host RAM and the "
+            "process stays up."
+        ),
+        dry_run_reason=_SAFETY_DEVICE_MEMORY_NOT_EXHAUSTED,
+    ),
+    _signature(
+        "safety_weights_promotion_out_of_memory",
+        r"Promoting the safety weights ran out of device memory\.",
+        emitter="process_management.workers.safety_process:promote_safety_weights",
+        sample=(
+            "Promoting the safety weights ran out of device memory. They stay demoted in host RAM and the "
+            "process stays up."
+        ),
+        dry_run_reason=_SAFETY_DEVICE_MEMORY_NOT_EXHAUSTED,
     ),
     # --- Deferred GPU starts: a safety start moved to the CPU, an inference start retired and restored ---
     _signature(
