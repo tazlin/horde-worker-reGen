@@ -10,6 +10,7 @@ except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 from multiprocessing.synchronize import Lock, Semaphore
 
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from loguru import logger
 
 from horde_worker_regen.alchemy_forms import DEFAULT_AUXILIARY_FETCH_NEEDS, AuxiliaryFetchNeeds
@@ -35,6 +36,24 @@ WORKER_LOG_VERBOSITY_ENV = "AIWORKER_PROCESS_LOG_VERBOSITY"
 _DEFAULT_WORKER_LOG_VERBOSITY = 4
 
 _SPAWN_TIMING_ENV = "AIWORKER_SPAWN_TIMING"
+
+FORCE_LOAD_SKIP_BASELINES: frozenset[KNOWN_IMAGE_GENERATION_BASELINE] = frozenset(
+    {KNOWN_IMAGE_GENERATION_BASELINE.flux_1},
+)
+"""Baselines whose diffusion model hordelib is told not to force-load whole.
+
+Force-load policy is expressed in horde baselines, and hordelib owns the mapping to comfy model class names.
+For a listed model ComfyUI sizes a partial load from free VRAM and evicts nothing else the process holds, so
+its text encoder stays resident beside it. The dispatch-world simulator reads this set, so its class-list rule
+cannot drift from the worker's."""
+
+LOW_MEMORY_FORCE_LOAD_SKIP_BASELINES: frozenset[KNOWN_IMAGE_GENERATION_BASELINE] = frozenset(
+    {
+        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+        KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade,
+    },
+)
+"""Baselines added to :data:`FORCE_LOAD_SKIP_BASELINES` under ``low_memory_mode``."""
 
 
 def _apply_device_pin(
@@ -431,20 +450,11 @@ def start_inference_process(
                 if directml is not None:
                     extra_comfyui_args.append(f"--directml={directml}")
 
-                from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
-
-                # Force-load policy is expressed in horde baselines; hordelib owns the
-                # mapping to comfy model class names.
-                models_not_to_force_load: list[str] = [KNOWN_IMAGE_GENERATION_BASELINE.flux_1]
+                models_not_to_force_load: list[str] = sorted(FORCE_LOAD_SKIP_BASELINES)
 
                 if low_memory_mode:
                     extra_comfyui_args.append("--novram")
-                    models_not_to_force_load.extend(
-                        [
-                            KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
-                            KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade,
-                        ],
-                    )
+                    models_not_to_force_load.extend(sorted(LOW_MEMORY_FORCE_LOAD_SKIP_BASELINES))
                 elif not vram_heavy_models:
                     logger.info("Reserving 1.4GB VRAM.")
                     extra_comfyui_args.extend(["--reserve-vram", "1.4"])
