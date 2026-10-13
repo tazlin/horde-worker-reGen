@@ -3,11 +3,18 @@
 The safety process also serves the CLIP-stack alchemy forms (caption, interrogation, nsfw):
 it already owns the CLIP interrogator and NSFW checker, so those forms run here rather than
 in the (comfy-loaded) inference processes.
+
+An on-GPU safety process shares its card with samplers it does not schedule, so an evaluation can find the
+device full. That evaluation is rerun on the CPU in the same process (see ``_evaluating_on_cpu``) and the
+process stays an on-GPU safety process for the next one.
 """
 
 import enum
 import gc
+import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from enum import auto
 from io import BytesIO
 from typing import TYPE_CHECKING
@@ -28,6 +35,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
     is_nsfw_detector_form,
 )
 from loguru import logger
+from pydantic import BaseModel, ConfigDict
 
 from horde_worker_regen import ASSETS_FOLDER_PATH
 from horde_worker_regen.consts import is_aesthetic_form, is_describe_form, is_palette_form, is_vectorize_form
@@ -46,11 +54,13 @@ from horde_worker_regen.process_management.ipc.messages import (
     UnsupportedControlMessageError,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
+from horde_worker_regen.utils.oom_signature import is_resource_class_exception
 
 if TYPE_CHECKING:
     from horde_safety.deep_danbooru_model import DeepDanbooruModel
     from horde_safety.interrogate import Interrogator
     from horde_safety.nsfw_checker_class import NSFWChecker, NSFWResult
+    from torch import Tensor
 
     from horde_worker_regen.process_management.workers.aesthetic_predictor import AestheticScorer
 else:
@@ -134,6 +144,91 @@ def _clear_safety_accelerator_cache() -> None:
     clear_accelerator_cache()
 
 
+_DEVICE_FREE_FIGURE_RE = re.compile(r"of which (?P<free>[\d.]+ \w+) is free")
+"""The device-free figure the CUDA allocator states in its out-of-memory text."""
+
+
+class SafetyEvaluationStage(enum.StrEnum):
+    """The steps of a safety evaluation that allocate on the device."""
+
+    CLIP_STAGING = "CLIP staging"
+    NSFW_CHECK = "NSFW check"
+    AESTHETIC_SCORE = "aesthetic score"
+
+
+class _DeviceOutOfMemory(BaseModel):
+    """A device out-of-memory failure of one evaluation, reduced to what the CPU rerun reports."""
+
+    model_config = ConfigDict(frozen=True)
+
+    stage: SafetyEvaluationStage
+    free_figure: str | None
+    """The allocator's device-free figure, or None when the error text carries none."""
+
+
+type _TextFeatureCaches = tuple[list[tuple[Tensor, Tensor]], dict[tuple[str, ...], Tensor], dict[str, Tensor]]
+
+
+def _safety_text_feature_caches() -> _TextFeatureCaches:
+    """Return horde_safety's process-wide CLIP text caches: encoded tokens, per-list and per-text embeddings.
+
+    horde_safety keys these by text alone and exposes no accessor, so its module globals are read directly.
+    """
+    from horde_safety import interrogate
+
+    return (
+        interrogate._cached_tokens,  # noqa: SLF001
+        interrogate._cached_text_array_features,  # noqa: SLF001
+        interrogate._cached_text_features,  # noqa: SLF001
+    )
+
+
+class _TextFeatureCacheSides:
+    """Keep horde_safety's CLIP text caches apart for the device and for the CPU.
+
+    The caches are keyed by text alone, so an embedding computed on the device in half precision would be
+    handed to a CPU evaluation, which then fails on the device mismatch (and would otherwise score against
+    embeddings a CPU process never computes). One side is live in horde_safety and the other is parked
+    here, and ``swap`` exchanges them. The CPU side is kept between fallbacks so only the first one pays for
+    encoding the predicate texts.
+    """
+
+    def __init__(self) -> None:
+        self._parked: _TextFeatureCaches = ([], {}, {})
+
+    def swap(self) -> None:
+        """Mutate horde_safety's caches in place so the parked side is live and the live side is parked."""
+        tokens, text_array_features, text_features = _safety_text_feature_caches()
+        parked_tokens, parked_text_array_features, parked_text_features = self._parked
+        self._parked = (list(tokens), dict(text_array_features), dict(text_features))
+        tokens[:] = parked_tokens
+        text_array_features.clear()
+        text_array_features.update(parked_text_array_features)
+        text_features.clear()
+        text_features.update(parked_text_features)
+
+
+def _tensor_dtypes(model: object) -> dict[str, object]:
+    """Return the dtype of every parameter and buffer of a torch module, by name."""
+    return {
+        name: tensor.dtype
+        for name, tensor in (*model.named_parameters(), *model.named_buffers())  # type: ignore[attr-defined]
+    }
+
+
+def _restore_tensor_dtypes(model: object, dtypes: dict[str, object]) -> None:
+    """Mutate a torch module so each parameter and buffer has the dtype recorded for it.
+
+    CLIP on CUDA is a mixed-precision module: open_clip halves the convolution, linear, attention and
+    projection weights and leaves the rest in single precision. A blanket ``half()`` would not rebuild that
+    layout, so each tensor goes back to its recorded dtype.
+    """
+    for name, tensor in (*model.named_parameters(), *model.named_buffers()):  # type: ignore[attr-defined]
+        recorded = dtypes.get(name)
+        if recorded is not None and tensor.dtype != recorded:
+            tensor.data = tensor.data.to(dtype=recorded)
+
+
 class _OnDemandDeepDanbooruModel:
     """Keep DeepDanbooru off-GPU between anime checks while preserving its public surface.
 
@@ -167,6 +262,11 @@ class _OnDemandDeepDanbooruModel:
         self._model.to("cpu")  # type: ignore[attr-defined]
         self._model._initial_device = "cpu"  # type: ignore[attr-defined]  # noqa: SLF001
         self._resident_device = "cpu"
+
+    def run_on(self, execution_device: str) -> None:
+        """Mutate where later evaluations run, returning any staged weights to CPU first."""
+        self.offload()
+        self._execution_device = execution_device
 
 
 class _ClipResidency:
@@ -242,6 +342,12 @@ class HordeSafetyProcess(HordeProcess):
     """Latched once the aesthetic weight cannot be obtained, so the cheap per-image path stops retrying."""
     _clip_residency: "_ClipResidency | None" = None
     """Where CLIP lives between evaluations; None until the interrogator is built (or in dry-run)."""
+    _evaluating_on_cpu_now: bool = False
+    """Whether an evaluation that ran out of device memory is being rerun on the CPU."""
+    _evaluation_stage: SafetyEvaluationStage = SafetyEvaluationStage.CLIP_STAGING
+    """The step the evaluation in hand has reached, so a device failure can be attributed to it."""
+    _text_feature_cache_sides: "_TextFeatureCacheSides | None" = None
+    """The parked side of horde_safety's text caches, built on the first CPU rerun."""
 
     def __init__(
         self,
@@ -405,23 +511,135 @@ class HordeSafetyProcess(HordeProcess):
         if self._clip_residency is not None:
             self._clip_residency.stage()
 
+    def _park_clip_in_host_ram(self) -> None:
+        """Mutate the interrogator so every CLIP weight is in host RAM and it is marked offloaded.
+
+        ``Module.to`` moves parameters one at a time, so a device move that runs out of memory part-way
+        leaves the model split across devices with the interrogator's offload flag never updated.
+        """
+        self._interrogator.clip_model = self._interrogator.clip_model.to("cpu")  # type: ignore[attr-defined]
+        self._interrogator.clip_offloaded = True  # type: ignore[attr-defined]
+
     def demote_safety_weights(self) -> None:
-        """Hold CLIP in host RAM between evaluations, returning its device memory now; the process stays up."""
+        """Hold CLIP in host RAM between evaluations, returning its device memory now. The process stays up.
+
+        A release that itself runs out of device memory still ends demoted with a memory report sent.
+        """
         if self._clip_residency is None or self._safety_device == "cpu":
             self.send_memory_report_message(include_vram=self._safety_device != "cpu")
             return
         self._clip_residency.resident = False
         logger.info("Safety weights demoted to host RAM; CLIP is staged onto the device per evaluation.")
-        self.release_allocator_cache()
+        try:
+            self.release_allocator_cache()
+        except Exception as e:
+            if not is_resource_class_exception(e):
+                raise
+        else:
+            return
+        logger.warning(
+            "Releasing the demoted safety weights ran out of device memory. CLIP is held in host RAM and the "
+            "process stays up.",
+        )
+        self._park_clip_in_host_ram()
+        self.send_memory_report_message(include_vram=True)
 
     def promote_safety_weights(self) -> None:
-        """Keep CLIP resident on the device again after a demotion."""
+        """Keep CLIP resident on the device again after a demotion.
+
+        A promotion that runs out of device memory leaves the weights demoted, which needs no device
+        memory at rest, and reports memory the way a demotion does.
+        """
         if self._clip_residency is None or self._safety_device == "cpu":
             return
         self._clip_residency.resident = True
-        self._clip_residency.stage()
-        logger.info("Safety weights promoted; CLIP is resident on the device again.")
+        try:
+            self._clip_residency.stage()
+        except Exception as e:
+            if not is_resource_class_exception(e):
+                raise
+        else:
+            logger.info("Safety weights promoted; CLIP is resident on the device again.")
+            self.send_memory_report_message(include_vram=True)
+            return
+        self._clip_residency.resident = False
+        self._park_clip_in_host_ram()
+        logger.warning(
+            "Promoting the safety weights ran out of device memory. They stay demoted in host RAM and the "
+            "process stays up.",
+        )
+        self.release_allocator_cache()
+
+    @property
+    def _evaluation_device(self) -> str:
+        """The device the evaluation in hand computes on: the CPU during a rerun, else the safety device."""
+        return "cpu" if self._evaluating_on_cpu_now else self._safety_device
+
+    def _device_out_of_memory(self, error: Exception) -> _DeviceOutOfMemory | None:
+        """Return a description of ``error`` when it is a device out-of-memory a CPU rerun can answer.
+
+        None means the failure keeps its terminal meaning: it is not an out-of-memory, the process has no
+        device to fall back from, or it already is the CPU rerun.
+        """
+        if self._safety_device == "cpu" or self._clip_residency is None or self._evaluating_on_cpu_now:
+            return None
+        if not is_resource_class_exception(error):
+            return None
+        free_figure = _DEVICE_FREE_FIGURE_RE.search(str(error))
+        return _DeviceOutOfMemory(
+            stage=self._evaluation_stage,
+            free_figure=free_figure.group("free") if free_figure is not None else None,
+        )
+
+    @contextmanager
+    def _evaluating_on_cpu(self) -> Iterator[None]:
+        """Context manager that runs its body's evaluation on the CPU in a process initialised on CUDA.
+
+        On entry everything the process holds on the device is returned to it, so the card has the memory
+        back before the rerun starts, and each piece of device or precision state an evaluation reads is
+        pointed at the CPU:
+
+        - CLIP moves to host RAM in single precision. Its half-precision weights convert exactly, and
+          single precision is what a CPU process computes in (half-precision convolutions are not what
+          it runs).
+        - The interrogator's ``device`` routes the preprocessed image and the tokens.
+        - horde_safety's text caches swap to a CPU side, see ``_TextFeatureCacheSides``.
+        - DeepDanbooru and the aesthetic head, always single precision, run where they already rest.
+
+        On exit CLIP returns to its recorded per-tensor precision and stays in host RAM marked offloaded,
+        whatever the residency flag says, because the device was full a moment ago. The next evaluation's
+        staging puts it back, and a resident CLIP then stays on the device as before.
+        """
+        interrogator = self._interrogator
+        deep_danbooru = self._deep_danbooru_model
+        execution_device = interrogator.device  # type: ignore[attr-defined]
+        if self._text_feature_cache_sides is None:
+            self._text_feature_cache_sides = _TextFeatureCacheSides()
+        text_feature_cache_sides = self._text_feature_cache_sides
+
+        self._offload_transient_models()
+        self._park_clip_in_host_ram()
+        clip_dtypes = _tensor_dtypes(interrogator.clip_model)  # type: ignore[attr-defined]
+        interrogator.clip_model = interrogator.clip_model.float()  # type: ignore[attr-defined]
+        interrogator.clip_offloaded = False  # type: ignore[attr-defined]
+        interrogator.device = "cpu"  # type: ignore[attr-defined]
+        if isinstance(deep_danbooru, _OnDemandDeepDanbooruModel):
+            deep_danbooru.run_on("cpu")
+        text_feature_cache_sides.swap()
+        self._evaluating_on_cpu_now = True
+        gc.collect()
+        _clear_safety_accelerator_cache()
         self.send_memory_report_message(include_vram=True)
+        try:
+            yield
+        finally:
+            self._evaluating_on_cpu_now = False
+            text_feature_cache_sides.swap()
+            if isinstance(deep_danbooru, _OnDemandDeepDanbooruModel):
+                deep_danbooru.run_on(self._safety_device)
+            interrogator.device = execution_device  # type: ignore[attr-defined]
+            _restore_tensor_dtypes(interrogator.clip_model, clip_dtypes)  # type: ignore[attr-defined]
+            interrogator.clip_offloaded = True  # type: ignore[attr-defined]
 
     def _get_ranking_lists(self) -> dict[str, list[str]]:
         """Load the legacy interrogation ranking lists (vendored from clipfree) once."""
@@ -562,13 +780,13 @@ class HordeSafetyProcess(HordeProcess):
             try:
                 from horde_worker_regen.process_management.workers.aesthetic_predictor import load_aesthetic_scorer
 
-                self._aesthetic_scorer = load_aesthetic_scorer(device=self._safety_device)
+                self._aesthetic_scorer = load_aesthetic_scorer(device=self._evaluation_device)
             except Exception as e:
                 logger.warning(f"Aesthetic scoring unavailable (could not load predictor): {type(e).__name__} {e}")
                 self._aesthetic_unavailable = True
                 return None
         else:
-            self._aesthetic_scorer.to(self._safety_device)
+            self._aesthetic_scorer.to(self._evaluation_device)
 
         image_features = self._interrogator.image_to_features(image)  # type: ignore[attr-defined]
         return self._aesthetic_scorer.score(image_features)
@@ -714,6 +932,118 @@ class HordeSafetyProcess(HordeProcess):
         self.send_memory_report_message(include_vram=self._safety_device != "cpu")
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
+    def _stage_clip_for_evaluation(self) -> _DeviceOutOfMemory | None:
+        """Stage CLIP for an evaluation, returning the failure when the device has no room for it."""
+        self._evaluation_stage = SafetyEvaluationStage.CLIP_STAGING
+        try:
+            self._stage_clip()
+        except Exception as e:
+            device_failure = self._device_out_of_memory(e)
+            if device_failure is None:
+                raise
+            return device_failure
+        return None
+
+    def _evaluate_images(self, message: HordeSafetyControlMessage) -> list[HordeSafetyEvaluation]:
+        """Return one evaluation per image of the job, computed on whichever device the models are on."""
+        safety_evaluations: list[HordeSafetyEvaluation] = []
+
+        for image_bytes in message.images_bytes:
+            try:
+                image_as_pil = PIL.Image.open(BytesIO(image_bytes))
+            except Exception as e:
+                logger.error(f"Failed to open image: {type(e).__name__} {e}")
+                safety_evaluations.append(
+                    HordeSafetyEvaluation(
+                        is_nsfw=True,
+                        is_csam=True,
+                        replacement_image_bytes=None,
+                        failed=True,
+                    ),
+                )
+
+                continue
+
+            self._evaluation_stage = SafetyEvaluationStage.NSFW_CHECK
+            nsfw_result: NSFWResult | None = self._nsfw_checker.check_for_nsfw(
+                image=image_as_pil,
+                prompt=message.prompt,
+                model_info=(message.horde_model_info.model_dump() if message.horde_model_info is not None else None),
+            )
+
+            if nsfw_result is None:
+                raise RuntimeError("NSFW result is None")
+
+            replacement_image_bytes: bytes | None = None
+
+            if nsfw_result.is_csam:
+                replacement_image_bytes = self.censor_csam_image_bytes
+                logger.debug(f"CSAM detected in image {message.job_id}. Image is deleted.")
+            elif message.sfw_worker and nsfw_result.is_nsfw:
+                replacement_image_bytes = self.censor_sfw_worker_image_bytes
+                logger.info(f"SFW worker detected NSFW in image {message.job_id}.")
+            elif message.censor_nsfw and nsfw_result.is_nsfw:
+                replacement_image_bytes = self.censor_sfw_request_image_bytes
+                logger.info(f"Censor list detected NSFW in image {message.job_id}.")
+
+            # The aesthetic score rides on the same CLIP embedding the NSFW check just used, so it is
+            # cheap to attach here. It is scored on the original image (not any censored replacement)
+            # so the metadata describes what was actually generated.
+            self._evaluation_stage = SafetyEvaluationStage.AESTHETIC_SCORE
+            aesthetic_score = self._score_aesthetic(image_as_pil) if message.include_aesthetic_score else None
+
+            safety_evaluations.append(
+                HordeSafetyEvaluation(
+                    is_nsfw=nsfw_result.is_nsfw,
+                    is_csam=nsfw_result.is_csam,
+                    replacement_image_bytes=replacement_image_bytes,
+                    aesthetic_score=aesthetic_score,
+                ),
+            )
+
+        return safety_evaluations
+
+    def _evaluate_images_on_cpu(
+        self,
+        message: HordeSafetyControlMessage,
+        device_failure: _DeviceOutOfMemory,
+    ) -> list[HordeSafetyEvaluation]:
+        """Return the job's evaluations computed on the CPU after the device ran out of memory for them.
+
+        The whole job is rerun, so no verdict mixes devices. A failure here is not caught: the process
+        then ends, as any failed evaluation does.
+        """
+        rerun_start = time.time()
+        with self._evaluating_on_cpu():
+            safety_evaluations = self._evaluate_images(message)
+        free_figure = f"{device_failure.free_figure} free" if device_failure.free_figure else "free figure not stated"
+        logger.warning(
+            f"Safety job {message.job_id} ran out of device memory during {device_failure.stage} "
+            f"({free_figure}). The check was rerun on the CPU in {time.time() - rerun_start:.2f} seconds and "
+            "the process stays up.",
+        )
+        return safety_evaluations
+
+    def _evaluate_images_with_cpu_fallback(
+        self,
+        message: HordeSafetyControlMessage,
+        device_failure: _DeviceOutOfMemory | None,
+    ) -> list[HordeSafetyEvaluation]:
+        """Return the job's evaluations, rerunning them on the CPU when the device runs out of memory.
+
+        ``device_failure`` is a staging failure that already ruled the device out. The rerun starts after
+        the failed attempt's exception is released: the traceback keeps that attempt's device tensors
+        alive, and they must be collectable before the device memory is handed back.
+        """
+        if device_failure is None:
+            try:
+                return self._evaluate_images(message)
+            except Exception as e:
+                device_failure = self._device_out_of_memory(e)
+                if device_failure is None:
+                    raise
+        return self._evaluate_images_on_cpu(message, device_failure)
+
     @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
         if message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
@@ -792,13 +1122,11 @@ class HordeSafetyProcess(HordeProcess):
 
         self.send_memory_report_message(include_vram=False)
 
-        safety_evaluations: list[HordeSafetyEvaluation] = []
-
         # An off-GPU check costs seconds per image and the whole evaluation is one blocking call sequence,
         # during which the process loop publishes nothing. Without a beat the watchdog cannot tell a slow
         # check from a wedged one, so it reads a legitimately long CPU check as a hang.
         with self.periodic_heartbeat(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE):
-            self._stage_clip()
+            staging_failure = self._stage_clip_for_evaluation()
 
             time_start = time.time()
 
@@ -806,58 +1134,9 @@ class HordeSafetyProcess(HordeProcess):
                 f"Horde safety process received job {message.job_id}. Number of images: {len(message.images_bytes)}",
             )
 
-            for image_bytes in message.images_bytes:
-                try:
-                    image_as_pil = PIL.Image.open(BytesIO(image_bytes))
-                except Exception as e:
-                    logger.error(f"Failed to open image: {type(e).__name__} {e}")
-                    safety_evaluations.append(
-                        HordeSafetyEvaluation(
-                            is_nsfw=True,
-                            is_csam=True,
-                            replacement_image_bytes=None,
-                            failed=True,
-                        ),
-                    )
-
-                    continue
-
-                nsfw_result: NSFWResult | None = self._nsfw_checker.check_for_nsfw(
-                    image=image_as_pil,
-                    prompt=message.prompt,
-                    model_info=(
-                        message.horde_model_info.model_dump() if message.horde_model_info is not None else None
-                    ),
-                )
-
-                if nsfw_result is None:
-                    raise RuntimeError("NSFW result is None")
-
-                replacement_image_bytes: bytes | None = None
-
-                if nsfw_result.is_csam:
-                    replacement_image_bytes = self.censor_csam_image_bytes
-                    logger.debug(f"CSAM detected in image {message.job_id}. Image is deleted.")
-                elif message.sfw_worker and nsfw_result.is_nsfw:
-                    replacement_image_bytes = self.censor_sfw_worker_image_bytes
-                    logger.info(f"SFW worker detected NSFW in image {message.job_id}.")
-                elif message.censor_nsfw and nsfw_result.is_nsfw:
-                    replacement_image_bytes = self.censor_sfw_request_image_bytes
-                    logger.info(f"Censor list detected NSFW in image {message.job_id}.")
-
-                # The aesthetic score rides on the same CLIP embedding the NSFW check just used, so it is
-                # cheap to attach here. It is scored on the original image (not any censored replacement)
-                # so the metadata describes what was actually generated.
-                aesthetic_score = self._score_aesthetic(image_as_pil) if message.include_aesthetic_score else None
-
-                safety_evaluations.append(
-                    HordeSafetyEvaluation(
-                        is_nsfw=nsfw_result.is_nsfw,
-                        is_csam=nsfw_result.is_csam,
-                        replacement_image_bytes=replacement_image_bytes,
-                        aesthetic_score=aesthetic_score,
-                    ),
-                )
+            # A CPU rerun is timed with the device attempt it replaces, so the parent's backpressure and
+            # grace models read what the job really cost.
+            safety_evaluations = self._evaluate_images_with_cpu_fallback(message, staging_failure)
 
             # Measured inside the heartbeat window: leaving the context joins the reporter thread, and that
             # join must not land in the duration the parent's backpressure and grace models read.

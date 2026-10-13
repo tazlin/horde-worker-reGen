@@ -139,6 +139,17 @@ durable room.
 
 The later restore is the ordinary `Runtime safety placement: restoring the safety process to the GPU.` line.
 
+A check that finds the device full is rerun on the CPU by the same process, which writes one warning per
+fallback to its log (`bridge_0.log`). The stage is `CLIP staging`, `NSFW check` or `aesthetic score`, and the
+free figure is the one the allocator stated:
+
+```text
+Safety job 9c46c418-81a8-4727-b8c5-495da36f9efd ran out of device memory during NSFW check (0 bytes free). The
+check was rerun on the CPU in 5.73 seconds and the process stays up.
+```
+
+See [Resilience and recovery](../explanation/resilience_and_recovery.md#a-safety-check-that-runs-out-of-device-memory).
+
 A deferred inference start on such a card is retired instead, while another inference lane is serving, with
 a warning of this shape (a structural shortfall names the card's achievable room in place of the wait):
 

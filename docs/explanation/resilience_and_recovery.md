@@ -205,6 +205,41 @@ Reading these incidents, a child that died before it ever reported to the parent
 message loop; one that had reported got past that and died later. The futility
 disclosure names which it was.
 
+### A safety check that runs out of device memory
+
+An on-GPU safety process shares its card with samplers it does not schedule, so
+a check can find the device full. Rebuilding the process for that costs a cold
+start and leaves the job in flight waiting for the orphan watchdog to requeue
+it. `HordeSafetyProcess` handles it in place:
+
+- **The device is released first.** CLIP moves to host RAM, the conditional
+  companions (DeepDanbooru, the aesthetic head) go with it, the allocator cache
+  is returned and a memory report is sent, so the card has the memory back
+  before the rerun starts.
+- **The whole job is rerun on the CPU in the same process**, and its verdict is
+  the one a CPU safety process returns for the same images. CLIP is converted
+  from half to single precision for the rerun, which is exact, and DeepDanbooru
+  and the aesthetic head are single precision on either device. `horde_safety`
+  caches text embeddings by text alone, so the process keeps a separate CPU
+  side of those caches and swaps it in for the rerun.
+- **The process stays an on-GPU safety process.** The residency the parent last
+  set (resident or demoted) is unchanged. CLIP is left in host RAM in its
+  original precision because the card was full a moment ago, and the next
+  check's staging puts it back on the device.
+- **A promotion or demotion that runs out of device memory** leaves the weights
+  demoted, which needs no device memory at rest, and reports memory as a
+  demotion does.
+
+There is one fallback tier. Out-of-memory is recognised by
+`utils/oom_signature.py::is_resource_class_exception`. Any other failure, and
+any failure of the CPU rerun, ends the process as before, because its state is
+then unknown. Each fallback logs one warning (see
+[Logs](../reference/logs.md#runtime-safety-placement-diagnostics)). The fallback
+covers one check at a time. Runtime safety placement handles a card that keeps
+refusing the check, by demoting the weights or moving the process
+(see
+[Performance and backpressure](performance_and_backpressure.md#post-inference-safety-backpressure)).
+
 ### Coercing the adaptive solver instead of reaping it
 
 The watchdog below is a **backstop**, not the first response to a runaway
