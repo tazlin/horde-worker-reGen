@@ -5590,7 +5590,7 @@ class InferenceScheduler:
             safety_reclaim_allowed=(
                 self._residency_should_pause_safety(device_index) and self._job_tracker.safety_backlog_depth == 0
             ),
-            safety_weights_demotable=self._safety_weights_demotable(device_index),
+            safety_weights_demotable=self._safety_weights_reclaimable(device_index),
             safety_residency_fixed=self._safety_residency_fixed_on(device_index) and safety_contexts > 0,
             safety_footprint_mb=self._safety_footprint_mb() if safety_contexts > 0 else 0.0,
             lane_by_process_id=self._tenant_lane_by_process_id(device_index),
@@ -8349,6 +8349,21 @@ class InferenceScheduler:
             return False
         return self._process_map.num_safety_processes(device_index=device_index) > 0
 
+    def _safety_weights_reclaimable(self, device_index: int | None) -> bool:
+        """Whether a reclaim ladder may take safety's weights off the card for a request that does not fit.
+
+        Narrower than :meth:`_safety_weights_demotable`. The room a demotion returns is handed to the
+        request that asked for it, and the next evaluation needs it back to stage the weights, so a ladder
+        that demotes on every refusal trades the card away under safety with nothing holding the way back.
+        The ladders therefore take the weights only where the operator lets safety leave the card for a
+        residency (``whole_card_residency_safety_off_gpu``), the permission the process-level rung reads.
+        Sustained pressure still demotes them through the placement reconciler, which waits out a dwell
+        first and reads :meth:`_safety_weights_demotable` directly.
+        """
+        return bool(
+            self._runtime_config.bridge_data.whole_card_residency_safety_off_gpu,
+        ) and self._safety_weights_demotable(device_index)
+
     def demote_safety_weights(self, device_index: int | None) -> bool:
         """Ask the safety process to hold its weights in host RAM between evaluations (reclaim actuator).
 
@@ -8478,7 +8493,7 @@ class InferenceScheduler:
 
     def _reclaim_safety_weights_candidate(self, device_index: int | None) -> LaneReclaimCandidate | None:
         """Build the in-place safety weight demotion rung, promised at safety's measured reservation."""
-        if not self._safety_weights_demotable(device_index):
+        if not self._safety_weights_reclaimable(device_index):
             return None
         reserved_mb = self._process_map.reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
         promised_mb = (

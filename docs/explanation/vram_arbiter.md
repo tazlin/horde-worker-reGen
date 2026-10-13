@@ -901,8 +901,12 @@ The verified reclaim ladder uses the same operator permission as whole-card safe
 Under that permission the ladder carries two safety rungs. `DEMOTE_SAFETY_WEIGHTS` comes first: the safety
 child moves its CLIP weights to host RAM in place and stages them per evaluation, keeping its process and
 context, so it needs no cooldown and is verified on the fast budget. `SAFETY_OFF_GPU` (the rebuild) stays the
-last rung. The placement reconciler owns the promotion back, on the same admission and headroom-dwell
-evidence the process-level restore uses; a rebuilt safety process starts resident, which clears any demotion.
+last rung. Without that permission neither ladder offers the weight demotion
+(`InferenceScheduler._safety_weights_reclaimable`). The room it returns goes to the request that asked, and
+the next evaluation needs it back to stage the weights. Sustained pressure still demotes the weights through
+the placement reconciler, which waits out a dwell first and needs only `safety_on_gpu`. The reconciler owns
+the promotion back, on the first cycle the card is unpressured and the arbiter admits the safety load. A
+rebuilt safety process starts resident, which clears any demotion.
 
 **Placement is headroom-aware across cards, not a fixed device 0.** One identity
 ([`_choose_safety_gpu_card`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler])

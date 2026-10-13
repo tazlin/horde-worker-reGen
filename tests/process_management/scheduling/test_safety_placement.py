@@ -997,6 +997,39 @@ class TestWeightDemotionFirst:
         assert _sent_control_flags(send) == []
 
 
+class TestLaddersLeaveTheWeightsWithoutTheMovePermission:
+    """A reclaim ladder takes safety's weights only where the operator lets safety leave the card.
+
+    The room a demotion returns goes to the request that asked for it, and the next evaluation needs it back to
+    stage the weights. A ladder that demoted on every refusal handed that room to samplers with nothing holding
+    the way back, so the child ran out of device memory staging or evaluating. The reconciler's demotion after
+    a dwell of pressure is unaffected.
+    """
+
+    def test_no_ladder_rung_and_no_arbiter_offer_without_the_permission(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With the whole-card setting off the weights are demotable, and neither ladder is told so."""
+        harness = _placement_harness(monkeypatch)
+        _seat_safety_process(harness, whole_card_safety_off_gpu=False)
+        scheduler = harness.scheduler
+
+        assert scheduler._safety_weights_demotable(None) is True
+        assert scheduler._safety_weights_reclaimable(None) is False
+        assert scheduler._reclaim_safety_weights_candidate(None) is None
+
+    def test_the_ladders_are_offered_the_weights_with_the_permission(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With the whole-card setting on, the ladders may take the weights as the cheap rung."""
+        harness = _placement_harness(monkeypatch)
+        _seat_safety_process(harness, whole_card_safety_off_gpu=True)
+
+        assert harness.scheduler._safety_weights_reclaimable(None) is True
+
+
 class TestPostProcessingRestoreBound:
     """Post-processing defers a safety restore on depth and age, never absolutely.
 
