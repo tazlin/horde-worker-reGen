@@ -6593,8 +6593,12 @@ class InferenceScheduler:
 
         It also stops the clearance clock of every waiter on the card that waiting can now help, every tick,
         because a waiter behind another grant is not offered to :meth:`clearance_admit_process` at all.
+
+        Each waiter carries its job's priced non-weight term (:func:`pricing.sampling_reserve_mb`), which the
+        controller writes with the child's grants.
         """
         self._settle_staged_waiter_clocks(device_index)
+        snapshot: SchedulingSnapshot | None = None
         waiters: list[ClearanceWaiter] = []
         samplers: list[ActiveSampler] = []
         for process_info in self._process_map.values():
@@ -6612,11 +6616,19 @@ class InferenceScheduler:
                 # belongs to that job, and read as the new job sampling it would leave the new job ungranted.
                 # Earlier dispatch time sorts closer to the head; a process with no stamp yet sorts last.
                 dispatched_at = process_info.current_inference_started_at or float("inf")
+                snapshot = snapshot if snapshot is not None else self.snapshot()
+                baseline = self._model_metadata.get_baseline(referenced.model) if referenced.model else None
                 waiters.append(
                     ClearanceWaiter(
                         process_id=process_info.process_id,
                         priority=int(dispatched_at * 1000.0) if dispatched_at != float("inf") else 2**62,
                         job_id=str(referenced.id_) if referenced.id_ is not None else None,
+                        sampling_reserve_mb=pricing.sampling_reserve_mb(
+                            snapshot,
+                            referenced,
+                            str(baseline) if baseline is not None else None,
+                            device_index=device_index,
+                        ),
                     ),
                 )
             elif process_info.is_sampling_owned_job() and referenced.id_ is not None:

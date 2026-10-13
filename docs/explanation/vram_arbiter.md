@@ -1086,9 +1086,14 @@ seat = f x weights + max(activation, ComfyUI inference reserve)
   verdict at DEFER while reclaim remains. On a converged card the seat's outstanding part (net of what the job
   holds) is priced against the reading ahead of the measured attempt, so a qualifying job never spends or needs
   the one-shot. A seat that does not fit falls through to the ceiling attempt and the DENY unchanged.
-- **Grant and booking.** The grant is unchanged: it carries the measured device free the admission priced
-  against, and hordelib rebases ComfyUI's clamp on it, so the child loads every weight that fits after
-  ComfyUI's own holdback, at least the seat's share. The verdict carries `partial_seat`, and
+- **Grant and booking.** The grant carries the measured device free the admission priced against, and
+  hordelib rebases ComfyUI's clamp on it. It also carries the seat's non-weight term
+  (`pricing.sampling_reserve_mb`, the larger of the activation and ComfyUI's inference reserve), which
+  `ClearanceWaiter.sampling_reserve_mb` brings to every cleared job, seat or not. ComfyUI sizes a partial load
+  to leave only its own activation estimate, which for a large model can sit well below the priced activation.
+  hordelib raises that estimate to the granted term for the sampling model's load, both at the staged upload
+  and at `prepare_sampling`, so the child loads every weight that fits while leaving the room the seat priced.
+  The verdict carries `partial_seat`, and
   `ClearancePlan.booking_mb` books the dispatch reservation at the remaining charge capped at the measured
   available room, since the child grows only into what it was granted and a larger booking would stay
   outstanding through its whole sample.

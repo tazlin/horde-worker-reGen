@@ -3367,11 +3367,12 @@ class ProcessLifecycleManager:
         # clearance semaphore held-empty (its single permit acquired now, so the child blocks until the parent
         # clears it) and a done semaphore the child signals on release, wraps them in a picklable proxy shared
         # into the child by spawn inheritance, and registers it with the card's controller so the parent can
-        # grant and observe this child specifically. A shared float beside them carries the device free each
-        # grant was admitted against. Disabled: no proxy is created and the child gets None. Under two-phase
-        # clearance the child also gets a stage semaphore, held empty the same way, so its weight upload can be
-        # granted ahead of its sample window; without one the child's stage view is None and hordelib loads
-        # inside the sample permit as before.
+        # grant and observe this child specifically. Two shared floats beside them carry the device free each
+        # grant was admitted against and the activation reserve its window was priced with. When the lease is
+        # disabled no proxy is created and the child gets None. Under two-phase clearance the child also gets a
+        # stage semaphore, held empty the same way, with its own pair of figures, so its weight upload can be
+        # granted ahead of its sample window. Without one the child's stage view is None and hordelib loads
+        # inside the sample permit.
         gpu_sampling_lease: ClearanceLeaseProxy | None = None
         if self._gpu_sampling_lease_enabled:
             clearance_semaphore = BoundedSemaphore_MultiProcessing(1, ctx=self._ctx)
@@ -3379,16 +3380,20 @@ class ProcessLifecycleManager:
             done_semaphore = Semaphore(0, ctx=self._ctx)
             stage_semaphore = None
             staged_device_free = None
+            staged_sampling_reserve = None
             if self._gpu_sampling_lease_two_phase:
                 stage_semaphore = BoundedSemaphore_MultiProcessing(1, ctx=self._ctx)
                 stage_semaphore.acquire(block=False)
                 staged_device_free = self._ctx.Value("d", math.nan)
+                staged_sampling_reserve = self._ctx.Value("d", math.nan)
             gpu_sampling_lease = ClearanceLeaseProxy(
                 clearance=clearance_semaphore,
                 done=done_semaphore,
                 cleared_device_free=self._ctx.Value("d", math.nan),
                 stage=stage_semaphore,
                 staged_device_free=staged_device_free,
+                cleared_sampling_reserve=self._ctx.Value("d", math.nan),
+                staged_sampling_reserve=staged_sampling_reserve,
             )
             self._clearance_proxy_registrar(card.device_index, pid, gpu_sampling_lease)
 

@@ -1063,6 +1063,55 @@ async def test_a_paging_card_keeps_the_full_price() -> None:
     assert plan.verdict.partial_seat is False
 
 
+def _expected_sampling_reserve_mb(scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse) -> float:
+    """The seat's non-weight term, the larger of the job's activation and ComfyUI's inference reserve."""
+    from horde_worker_regen.process_management.resources.resource_budget import effective_inference_reserve_mb
+
+    activation_mb = pricing.partial_seat_activation_mb(scheduler.snapshot(), job, str(_KREA2_BASELINE))
+    assert activation_mb is not None
+    return max(activation_mb, effective_inference_reserve_mb(_SIXTEEN_GB_MB, 0.0))
+
+
+async def test_the_sampling_reserve_is_the_seats_non_weight_term() -> None:
+    """The figure a grant carries is the term the seat adds to its share of the weights, priced once."""
+    scheduler, job, waiter = await _krea2_staged_waiter()
+    snapshot = scheduler.snapshot()
+    baseline = str(_KREA2_BASELINE)
+    weights_mb = predict_job_weight_mb(job, baseline)
+    assert weights_mb is not None
+
+    reserve_mb = pricing.sampling_reserve_mb(snapshot, job, baseline, device_index=waiter.device_index)
+    seat_mb = pricing.partial_seat_mb(snapshot, job, baseline, device_index=waiter.device_index, weight_fraction=0.5)
+
+    assert reserve_mb == pytest.approx(_expected_sampling_reserve_mb(scheduler, job))
+    assert seat_mb == pytest.approx(0.5 * weights_mb + reserve_mb)
+
+
+async def test_a_job_without_a_seat_still_carries_its_sampling_reserve() -> None:
+    """A LoRA job has no partial-load seat, yet its window is priced with the same non-weight term."""
+    scheduler, job, waiter = await _krea2_staged_waiter(with_lora=True)
+    snapshot = scheduler.snapshot()
+    baseline = str(_KREA2_BASELINE)
+
+    assert (
+        pricing.partial_seat_mb(snapshot, job, baseline, device_index=waiter.device_index, weight_fraction=0.5) is None
+    )
+    assert pricing.sampling_reserve_mb(snapshot, job, baseline, device_index=waiter.device_index) == pytest.approx(
+        _expected_sampling_reserve_mb(scheduler, job),
+    )
+
+
+async def test_the_clearance_waiter_carries_its_jobs_sampling_reserve() -> None:
+    """The staged child's waiter row carries the reserve its grants will write."""
+    scheduler, job, waiter = await _krea2_staged_waiter()
+    waiter.record_inference_ownership(job, attempt_ordinal=1)
+
+    inputs = scheduler.build_clearance_inputs(device_index=waiter.device_index)
+
+    assert [row.process_id for row in inputs.staged_waiters] == [0]
+    assert inputs.staged_waiters[0].sampling_reserve_mb == pytest.approx(_expected_sampling_reserve_mb(scheduler, job))
+
+
 async def test_the_seat_weight_share_follows_the_waiter_clocks_upload_rate_and_step_time() -> None:
     """With an upload rate and a step time on the clock, the seat's weight share is derived from them."""
     scheduler, job, _waiter = await _krea2_staged_waiter()

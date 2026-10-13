@@ -526,6 +526,36 @@ def partial_seat_activation_mb(
     return store.estimate_mb(key, static_seed_mb=static_seed_mb)
 
 
+def _sampling_non_weight_mb(
+    snapshot: SchedulingSnapshot, activation_mb: float | None, *, device_index: int | None
+) -> float:
+    """Return the larger of the job's non-weight memory and ComfyUI's inference reserve (MB), or the reserve alone."""
+    comfy_reserve_mb = effective_inference_reserve_mb(snapshot.card(device_index).total_vram_mb, 0.0)
+    if activation_mb is None:
+        return comfy_reserve_mb
+    return max(activation_mb, comfy_reserve_mb)
+
+
+def sampling_reserve_mb(
+    snapshot: SchedulingSnapshot,
+    job: ImageGenerateJobPopResponse,
+    baseline: str | None,
+    *,
+    device_index: int | None,
+) -> float | None:
+    """Return the non-weight memory (MB) a job's sampling window is priced with, or None when there is none.
+
+    The term :func:`partial_seat_mb` adds to the weights it seats: the learned activation where the job's key
+    has one, raised to ComfyUI's inference reserve, and the reserve alone when the job's activation cannot be
+    predicted. A clearance grant carries it to the child, whose partial load would otherwise leave only
+    ComfyUI's activation estimate. None when the card's total is unknown and nothing is predicted.
+    """
+    non_weight_mb = _sampling_non_weight_mb(
+        snapshot, partial_seat_activation_mb(snapshot, job, baseline), device_index=device_index
+    )
+    return non_weight_mb if non_weight_mb > 0.0 else None
+
+
 def partial_seat_mb(
     snapshot: SchedulingSnapshot,
     job: ImageGenerateJobPopResponse,
@@ -554,8 +584,7 @@ def partial_seat_mb(
     activation_mb = partial_seat_activation_mb(snapshot, job, baseline)
     if weights_mb is None or activation_mb is None:
         return None
-    comfy_reserve_mb = effective_inference_reserve_mb(snapshot.card(device_index).total_vram_mb, 0.0)
-    return weight_fraction * weights_mb + max(activation_mb, comfy_reserve_mb)
+    return weight_fraction * weights_mb + _sampling_non_weight_mb(snapshot, activation_mb, device_index=device_index)
 
 
 # ---- the streaming forecast and the co-resident maximum

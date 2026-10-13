@@ -10,7 +10,10 @@ slot cap holds the next grant until a window retires).
 
 from __future__ import annotations
 
+import math
+import multiprocessing
 from collections.abc import Callable
+from multiprocessing.sharedctypes import Synchronized
 
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -699,3 +702,108 @@ class TestClearanceHoldGraceAccounting:
 
         widened = pm._process_lifecycle._effective_first_step_timeout(pm.bridge_data, proc, 90)
         assert widened == 90 + int(CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS)
+
+
+def _shared_figure() -> Synchronized[float]:
+    """A shared float as the spawn site creates beside a child's semaphores, unset."""
+    return multiprocessing.get_context("spawn").Value("d", math.nan)
+
+
+class TestGrantCarriesTheSamplingReserve:
+    """A grant carries the waiter's priced activation reserve to the child, which takes it once per grant.
+
+    hordelib raises ComfyUI's partial-load estimate to this figure, so a partial load leaves the room the parent
+    priced for the window instead of ComfyUI's smaller estimate.
+    """
+
+    _RESERVE_MB = 3117.0
+
+    def _proxy(self, *, two_phase: bool = False) -> ClearanceLeaseProxy:
+        return ClearanceLeaseProxy(
+            clearance=_FakeSemaphore(0, bound=1),
+            done=_FakeSemaphore(),
+            cleared_device_free=_shared_figure(),
+            cleared_sampling_reserve=_shared_figure(),
+            stage=_FakeSemaphore(0, bound=1) if two_phase else None,
+            staged_device_free=_shared_figure() if two_phase else None,
+            staged_sampling_reserve=_shared_figure() if two_phase else None,
+        )
+
+    def _waiter(self, sampling_reserve_mb: float | None) -> tuple[ClearanceWaiter, ...]:
+        return (ClearanceWaiter(process_id=2, priority=1, job_id="job-a", sampling_reserve_mb=sampling_reserve_mb),)
+
+    def test_the_reserve_is_granted_and_taken_once(self) -> None:
+        """The cleared child reads the waiter's reserve on its acquire and is served it once."""
+        controller = _controller()
+        proxy = self._proxy()
+        controller.register(2, proxy)
+        proxy.begin_job()
+
+        result = controller.step(_inputs(staged=self._waiter(self._RESERVE_MB)), admit_fn=lambda _pid: True)
+
+        assert result.cleared_process_ids == (2,)
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() == self._RESERVE_MB
+        assert proxy.take_cleared_sampling_reserve_mb() is None, "the figure is handed over once per grant"
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() is None, "a passed-through acquire carries no figure"
+
+    def test_a_grant_without_a_reserve_serves_none(self) -> None:
+        """A waiter whose job has no priced reserve is granted none, and the child reads None."""
+        controller = _controller()
+        proxy = self._proxy()
+        controller.register(2, proxy)
+        proxy.begin_job()
+
+        controller.step(_inputs(staged=self._waiter(None)), admit_fn=lambda _pid: True)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() is None
+
+    def test_a_proxy_without_the_reserve_figure_serves_none(self) -> None:
+        """A proxy built without the shared reserve accepts the grant and serves None."""
+        controller = _controller()
+        proxy = _proxy()
+        controller.register(2, proxy)
+        proxy.begin_job()
+
+        controller.step(_inputs(staged=self._waiter(self._RESERVE_MB)), admit_fn=lambda _pid: True)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() is None
+
+    def test_the_next_job_does_not_reuse_the_previous_reserve(self) -> None:
+        """A later job's grant priced without a reserve does not serve the earlier job's figure."""
+        controller = _controller()
+        proxy = self._proxy()
+        controller.register(2, proxy)
+        proxy.begin_job()
+        controller.step(_inputs(staged=self._waiter(self._RESERVE_MB)), admit_fn=lambda _pid: True)
+        assert proxy.acquire(True, 0.0) is True
+        proxy.release()
+        controller.step(_inputs(), admit_fn=lambda _pid: True)
+        assert controller.grant_state(2) is GrantState.IDLE
+
+        proxy.begin_job()
+        second = (ClearanceWaiter(process_id=2, priority=1, job_id="job-b"),)
+        controller.step(_inputs(staged=second), admit_fn=lambda _pid: True)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() is None
+
+    def test_the_stage_grant_carries_the_reserve_once(self) -> None:
+        """Under two-phase clearance the stage permit a clear grants carries the same reserve, taken once."""
+        controller = _controller()
+        proxy = self._proxy(two_phase=True)
+        controller.register(2, proxy)
+        proxy.begin_job()
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+
+        controller.step(_inputs(staged=self._waiter(self._RESERVE_MB)), admit_fn=lambda _pid: True)
+
+        assert stage_lease.acquire(True, 0.0) is True
+        assert stage_lease.take_cleared_sampling_reserve_mb() == self._RESERVE_MB
+        assert stage_lease.take_cleared_sampling_reserve_mb() is None
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() == self._RESERVE_MB
