@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from collections import deque
 from collections.abc import Callable
@@ -102,6 +103,7 @@ def _make_inference_scheduler(
     available_ram_mb: float | None = 65536.0,
     available_commit_mb: float | None = None,
     clock: Callable[[], float] | None = None,
+    platform: str = sys.platform,
 ) -> InferenceScheduler:
     """Build an InferenceScheduler with mostly-mocked dependencies.
 
@@ -154,6 +156,7 @@ def _make_inference_scheduler(
         on_pool_pressure_eviction=on_pool_pressure_eviction,
         card_runtimes=card_runtimes,
         clock=clock,
+        platform=platform,
     )
     # The worker injects its one reclaim ladder before scheduling starts, and the executor refuses to run
     # arbiter actuations without it.

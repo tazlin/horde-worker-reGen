@@ -886,6 +886,7 @@ class _DispatchWorld:
         child_free_view_lie_mb: float = 0.0,
         parent_device_reading: bool = True,
         child_report_platform: str | None = "linux",
+        pricing_platform: str = "win32",
         footprint_undershoot: float = 1.0,
         child_reports_card_sized_peaks: bool = False,
         phase_resident_components: bool = False,
@@ -1044,6 +1045,10 @@ class _DispatchWorld:
                 device reading. ``"linux"`` reports the whole device. ``"win32"`` reports a view that runs
                 ``child_free_view_lie_mb`` ahead of the card, and the reading is bounded by the committed
                 ledger. None gives the parent no reading at all.
+            pricing_platform: The ``sys.platform`` token the scheduler shapes its prices for: the admission
+                margin's fraction and ComfyUI's inference reserve both differ on Windows. Pinned to the WDDM
+                shape, which every golden and row is sized against, so they read the same on any host; a
+                replay of a session recorded elsewhere passes that host's token beside ``admission_noise_mb``.
             footprint_undershoot: Multiplier from what the scheduler's static fit predicts a job costs the card
                 to what it actually costs. Above one, admission passes on a figure the load then exceeds, which
                 is the regime where the parent's own defenses have already been satisfied and only the child's
@@ -1281,6 +1286,7 @@ class _DispatchWorld:
         self.child_free_view_lie_mb = child_free_view_lie_mb
         self.parent_device_reading = parent_device_reading
         self.child_report_platform = child_report_platform
+        self.pricing_platform = pricing_platform
         self.footprint_undershoot = footprint_undershoot
         self.true_footprint_mb = true_footprint_mb
         self.sample_seconds_by_job: Mapping[str, float] = dict(sample_seconds_by_job or {})
@@ -1741,6 +1747,7 @@ class _DispatchWorld:
             max_concurrent_inference_processes=max_threads,
             max_inference_processes=lane_count,
             lru=LRUCache(max(2, lane_count)),
+            platform=pricing_platform,
             reserve_ledger=self._reserve_ledger,
             decision_sink=self._record_decision,
             resource_state_sink=self._record_resource_state,

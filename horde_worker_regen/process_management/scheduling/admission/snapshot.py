@@ -13,6 +13,7 @@ into the card snapshot.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -395,6 +396,9 @@ class SchedulingSnapshot:
     """The models a rung-1 run holds, each mapped to the card it holds (None on a single-GPU host)."""
     pop_claim_model: str | None
     """The model the standing claim over the pop offer names, or None when the offer is unclaimed."""
+    platform: str
+    """The ``sys.platform`` token the prices are shaped for: the admission margin's fraction and ComfyUI's
+    reserve both differ on Windows, and every pricing frame reads the one token the scheduler was given."""
     post_processing_lane_card_index: int | None
     """The card the idle post-processing lane sits on, or None when no lane is free to take a chain.
 
@@ -558,6 +562,7 @@ def build_scheduling_snapshot(
     measured_free_mb: Callable[[int | None], float | None],
     reported_total_mb: Callable[[int | None], float | None],
     governor_state: Callable[[int | None], GovernorState],
+    platform: str = sys.platform,
     growth_held: Callable[[int | None], bool],
     arbiter_state: Callable[[int | None], DeviceVramState | None],
     foreign_floor_mb: Callable[[int | None], float | None],
@@ -747,6 +752,7 @@ def build_scheduling_snapshot(
         max_inference_processes=max_inference_processes,
         max_concurrent_inference_processes=max_concurrent_inference_processes,
         draining_process_ids=draining_process_ids,
+        platform=platform,
         shutting_down=shutting_down,
         recent_job_ttl=recent_job_ttl,
         committed_vram_reserve_mb=reserve_ledger.total_vram_mb(),

@@ -428,6 +428,9 @@ These fail as interactions, not as units, so component tests stay green through 
   iterations, so the tick closes with a clearance pass for the jobs its dispatch staged
   (`_clear_waiters_dispatched_this_tick`), as the next iteration would price them; without it every dispatched
   job waited a whole tick for its first clearance pass and the on-demand whole session read seven points low.
+  The world prices for the WDDM platform shape (`pricing_platform="win32"`: the admission margin's fraction and
+  ComfyUI's inference reserve both differ on Windows), so goldens and rows read the same on a Linux runner as
+  on the host they were sized on; a replay of a session recorded elsewhere passes that host's token.
   Under `learned_footprints` the world also hands the dispatcher a finished job's resident weight set
   (`_report_sampled_weight_set`), so the `SAMPLE_ACTIVATION` key is learned as production learns it. Under
   `performance_model` the world feeds

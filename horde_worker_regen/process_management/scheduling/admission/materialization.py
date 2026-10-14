@@ -154,7 +154,7 @@ def build_materialization_request(
         if forecast is None:
             forecast = pricing.forecast_streaming(snapshot, payload, baseline, device_index=device_index)
         structural_reserve_mb = (
-            effective_inference_reserve_mb(card.total_vram_mb, 0.0)
+            effective_inference_reserve_mb(card.total_vram_mb, 0.0, platform=snapshot.platform)
             if card.total_vram_mb is not None
             else forecast._effective_base_reserve  # noqa: SLF001 - the same budget owner sizes the teardown depth.
         )

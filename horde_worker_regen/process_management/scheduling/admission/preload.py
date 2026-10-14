@@ -1075,7 +1075,9 @@ def context_reduction_demand(
     if predictive.predicted_mb is not None:
         total_vram_mb = snapshot.card(device_index).total_vram_mb
         structural_reserve_mb = (
-            effective_inference_reserve_mb(total_vram_mb, 0.0) if total_vram_mb is not None else predictive.reserve_mb
+            effective_inference_reserve_mb(total_vram_mb, 0.0, platform=snapshot.platform)
+            if total_vram_mb is not None
+            else predictive.reserve_mb
         )
         max_resident = pricing.max_coresident_for_peak_mb(
             snapshot,

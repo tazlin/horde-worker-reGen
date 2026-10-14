@@ -483,6 +483,8 @@ def _sdxl_scheduler(job_tracker: JobTracker, processes: list[HordeProcessInfo]) 
         bridge_data=make_mock_bridge_data(enable_vram_budget=True, vram_reserve_mb=2048, ram_reserve_mb=4096),
         process_map=ProcessMap({p.process_id: p for p in processes}),
         model_metadata=make_test_model_metadata(reference),
+        # The rows' premises are sized against the WDDM admission margin, so they read the same on any host.
+        platform="win32",
     )
     # The seeded per-context figure stands in for a probe, which a sibling context needs before it can be priced.
     scheduler._overhead.set_marginal_overhead_mb(_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB)

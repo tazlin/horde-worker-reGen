@@ -341,7 +341,7 @@ class TestContextReductionSizingFloor:
         """With the card total known, the depth is sized against the ComfyUI floor, not the 4096 margin."""
         monkeypatch.setattr(
             "horde_worker_regen.process_management.scheduling.admission.preload.effective_inference_reserve_mb",
-            lambda total, floor: 1519.0,
+            lambda total, floor, **_: 1519.0,
         )
         scheduler, process_info = self._scheduler_for_verdict(report_total=True)
 

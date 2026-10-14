@@ -866,6 +866,7 @@ def effective_inference_reserve_mb(
     configured_floor_mb: float,
     *,
     reserve_vram_gb: float | None = None,
+    platform: str = sys.platform,
 ) -> float:
     """Return the free-VRAM headroom to preserve to avoid weight streaming.
 
@@ -873,13 +874,19 @@ def effective_inference_reserve_mb(
     via :func:`hordelib.vram_planning.compute_inference_reserve_mb` so the worker's forecast lines up with the
     backend's actual streaming threshold; the configured ``vram_reserve_mb`` is honored as an additional floor
     (a safety margin on top). Falls back to the configured floor when total VRAM is unknown (cold start).
+    ComfyUI keeps a larger reserve on Windows, so ``platform`` decides the mirror's shape; a caller pricing for a
+    host other than this one passes that host's ``sys.platform``.
     """
     if total_vram_mb is None or total_vram_mb <= 0:
         return configured_floor_mb
     try:
         from hordelib.vram_planning import compute_inference_reserve_mb
 
-        comfy_reserve = compute_inference_reserve_mb(int(total_vram_mb), reserve_vram_gb=reserve_vram_gb)
+        comfy_reserve = compute_inference_reserve_mb(
+            int(total_vram_mb),
+            is_windows=platform == "win32",
+            reserve_vram_gb=reserve_vram_gb,
+        )
     except Exception as e:
         logger.debug(f"Inference-reserve lookup failed for {total_vram_mb} MB: {type(e).__name__} {e}")
         return configured_floor_mb
@@ -896,6 +903,7 @@ def forecast_weight_streaming(
     num_inference_processes: int,
     configured_reserve_floor_mb: float,
     reserve_vram_gb: float | None = None,
+    platform: str = sys.platform,
     num_extra_resident_contexts: int = 0,
     safety_context_charge_mb: float = 0.0,
     learned_resident_footprint_mb: float | None = None,
@@ -1020,6 +1028,7 @@ def forecast_weight_streaming(
         total_vram_mb,
         0.0,
         reserve_vram_gb=reserve_vram_gb,
+        platform=platform,
     )
     configured_floor_mb = max(0.0, configured_reserve_floor_mb)
     # The reserve must cover the model's *sampling-phase activation working set*, not a flat constant.

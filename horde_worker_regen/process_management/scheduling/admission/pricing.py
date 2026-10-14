@@ -181,7 +181,11 @@ def whole_card_warranted(forecast: StreamForecast, *, marginal_overhead_mb: floa
 def admission_noise_mb(snapshot: SchedulingSnapshot, device_index: int | None, total_vram_mb: float | None) -> float:
     """The admission margin (MB) for a card: its operator override, else the platform default."""
     override = snapshot.config_for(device_index).vram_admission_noise_mb
-    return admission_margin_mb(total_vram_mb, override_mb=None if override is None else float(override))
+    return admission_margin_mb(
+        total_vram_mb,
+        override_mb=None if override is None else float(override),
+        platform=snapshot.platform,
+    )
 
 
 # ---- slots on a card
@@ -554,12 +558,14 @@ def _sampling_non_weight_mb(
     snapshot: SchedulingSnapshot, activation_mb: float | None, *, device_index: int | None
 ) -> float:
     """Return the larger of the job's non-weight memory and ComfyUI's inference reserve (MB), or the reserve alone."""
-    return _non_weight_on_card_mb(snapshot.card(device_index).total_vram_mb, activation_mb)
+    return _non_weight_on_card_mb(snapshot.card(device_index).total_vram_mb, activation_mb, platform=snapshot.platform)
 
 
-def _non_weight_on_card_mb(total_vram_mb: float | None, activation_mb: float | None) -> float:
+def _non_weight_on_card_mb(
+    total_vram_mb: float | None, activation_mb: float | None, *, platform: str = sys.platform
+) -> float:
     """Return :func:`_sampling_non_weight_mb` for a card of ``total_vram_mb``."""
-    comfy_reserve_mb = effective_inference_reserve_mb(total_vram_mb, 0.0)
+    comfy_reserve_mb = effective_inference_reserve_mb(total_vram_mb, 0.0, platform=platform)
     if activation_mb is None:
         return comfy_reserve_mb
     return max(activation_mb, comfy_reserve_mb)
@@ -622,6 +628,7 @@ def partial_seat_on_card_mb(
     wddm_paging_active: bool,
     model_tier: ModelSizeTier,
     weight_fraction: float,
+    platform: str = sys.platform,
 ) -> float | None:
     """Return :func:`partial_seat_mb` from explicit figures, for a caller that prices a seat outside a snapshot."""
     if wddm_paging_active:
@@ -636,7 +643,7 @@ def partial_seat_on_card_mb(
     activation_mb = _partial_seat_activation_from_store_mb(store, job, baseline)
     if weights_mb is None or activation_mb is None:
         return None
-    return weight_fraction * weights_mb + _non_weight_on_card_mb(total_vram_mb, activation_mb)
+    return weight_fraction * weights_mb + _non_weight_on_card_mb(total_vram_mb, activation_mb, platform=platform)
 
 
 # ---- the streaming forecast and the co-resident maximum
@@ -738,6 +745,7 @@ def forecast_streaming(
         per_process_overhead_mb=per_process_overhead_mb(snapshot, device_index),
         num_inference_processes=loaded_inference_count(snapshot, device_index),
         configured_reserve_floor_mb=floor_mb,
+        platform=snapshot.platform,
         num_extra_resident_contexts=num_post_process_contexts,
         safety_context_charge_mb=num_safety_contexts * snapshot.safety_footprint_mb,
         learned_resident_footprint_mb=learned_resident_footprint_mb(snapshot, job.model, baseline),

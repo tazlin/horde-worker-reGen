@@ -561,6 +561,7 @@ class InferenceScheduler:
         decision_sink: DecisionSink | None = None,
         resource_state_sink: ResourceStateSink | None = None,
         clock: Callable[[], float] | None = None,
+        platform: str = sys.platform,
     ) -> None:
         """Initialize the scheduler with references to the components it needs to manage.
 
@@ -619,8 +620,13 @@ class InferenceScheduler:
                 process's spawn time, IPC report ages, action-ledger entries) stay on the real clock, since
                 they are compared against stamps this scheduler does not write. ``None`` reads the real clock
                 through a fresh lookup on every call, so a test that patches ``time.time`` still governs it.
+            platform (str): The ``sys.platform`` token every price is shaped for. The admission margin's
+                fraction and ComfyUI's inference reserve both differ on Windows, so a replay or a row sized
+                against one platform's figures pins it here and reads the same on any host.
         """
         self._clock: Callable[[], float] = clock if clock is not None else lambda: time.time()
+        # The sys.platform token every price is shaped for; a replay pins it so goldens read alike on any host.
+        self._platform = platform
 
         # The ledgers read the clock through the scheduler rather than capturing the callable, so a clock
         # swapped after construction (the test harnesses do this) moves every ledger with it.
@@ -1566,6 +1572,7 @@ class InferenceScheduler:
             per_process_overhead_mb=self._per_process_overhead_mb(device_index),
             num_inference_processes=num_processes,
             configured_reserve_floor_mb=floor_mb,
+            platform=self._platform,
             num_extra_resident_contexts=num_post_process_contexts,
             safety_context_charge_mb=safety_context_charge_mb,
             learned_resident_footprint_mb=self._learned_resident_footprint_mb(job.model, baseline),
@@ -6214,6 +6221,7 @@ class InferenceScheduler:
             wddm_paging_active=self._retention.wddm_paging_active,
             model_tier=self._model_size_tier(model),
             weight_fraction=weight_fraction,
+            platform=self._platform,
         )
 
     def _managed_tenant_footprint_mb(self, device_index: int | None) -> float | None:
@@ -6302,6 +6310,7 @@ class InferenceScheduler:
                 device_index=device_index,
             ),
             governor_state=self.governor_state,
+            platform=self._platform,
             growth_held=self.is_vram_growth_held,
             arbiter_state=arbiter_state,
             foreign_floor_mb=self.current_foreign_floor_mb,
@@ -8908,7 +8917,11 @@ class InferenceScheduler:
     def _admission_margin_mb(self, device_index: int | None, total_vram_mb: float | None) -> float:
         """The admission margin (MB) for ``device_index``: the card's operator override, else the platform default."""
         override = self._card_bridge_data(device_index).vram_admission_noise_mb
-        return admission_margin_mb(total_vram_mb, override_mb=None if override is None else float(override))
+        return admission_margin_mb(
+            total_vram_mb,
+            override_mb=None if override is None else float(override),
+            platform=self._platform,
+        )
 
     def _probe_after_seconds(self, device_index: int | None) -> float:
         """How long the head must have starved before the measured-load probe may fire on ``device_index``."""
