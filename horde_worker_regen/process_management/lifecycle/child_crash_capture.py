@@ -129,7 +129,9 @@ def suppress_native_fault_dialog() -> None:
     try:
         import msvcrt
 
-        msvcrt.SetErrorMode(msvcrt.GetErrorMode() | msvcrt.SEM_FAILCRITICALERRORS | msvcrt.SEM_NOGPFAULTERRORBOX)
+        # The msvcrt stubs declare these names only for win32, so a non-Windows type check cannot see them.
+        flags = msvcrt.SEM_FAILCRITICALERRORS | msvcrt.SEM_NOGPFAULTERRORBOX  # pyrefly: ignore[missing-attribute]
+        msvcrt.SetErrorMode(msvcrt.GetErrorMode() | flags)  # pyrefly: ignore[missing-attribute]
     except Exception:  # noqa: BLE001 - crash capture must never block the worker from starting
         return
 
