@@ -264,6 +264,9 @@ DeviceMemoryReader = Callable[[int], DeviceMemoryReading | None]
 LaunchProcess = Callable[[TextBackendLaunchSpec], LaunchedProcess]
 """Starts the backend process described by a spec."""
 
+DescendantLister = Callable[[int], list[psutil.Process]]
+"""Lists a process's living descendants, recursively. Empty when the process cannot be inspected."""
+
 LaunchSpecFactory = Callable[[], TextBackendLaunchSpec]
 """Obtains the backend's executable and renders its command line.
 
@@ -302,6 +305,7 @@ class TextBackendSupervisor:
         backend_kind: TEXT_BACKENDS = TEXT_BACKENDS.koboldcpp,
         owned_registry: OwnedProcessRegistry | None = None,
         launch_process: LaunchProcess = default_launch_process,
+        list_descendants: DescendantLister | None = None,
         read_device_memory: DeviceMemoryReader | None = None,
         timings: TextBackendSupervisorTimings | None = None,
         first_launch_identifier: int = 0,
@@ -321,6 +325,9 @@ class TextBackendSupervisor:
                 one command line), so the kind is carried alongside it, for display only.
             owned_registry: Where launched PIDs are recorded for orphan reaping; None records nothing.
             launch_process: How a process is started; injected so tests never spawn anything.
+            list_descendants: How the launched process's descendants are found for recording and teardown.
+                None reads the real process table. A test with a fake handle injects its own, since the
+                teardown terminates every descendant of the handle's pid, whichever process holds it.
             read_device_memory: Card memory reader for the footprint delta. None disables it. The delta is
                 taken only from a device-wide reading, since no other reading includes the backend's process.
             timings: Waits and patience.
@@ -337,6 +344,7 @@ class TextBackendSupervisor:
         self._backend_kind = backend_kind
         self._owned_registry = owned_registry
         self._launch_process = launch_process
+        self._list_descendants = list_descendants or _living_descendants
         self._read_device_memory = read_device_memory
         self._timings = timings or TextBackendSupervisorTimings()
         self._next_launch_identifier = first_launch_identifier
@@ -772,7 +780,8 @@ class TextBackendSupervisor:
         """
         if self._process is None:
             return
-        resolved = _process_tree_pids(self._process.pid)
+        root_pid = self._process.pid
+        resolved = (root_pid, *(descendant.pid for descendant in self._list_descendants(root_pid)))
         newly_seen = tuple(pid for pid in resolved if pid not in self._tree_pids)
         self._tree_pids = tuple(pid for pid in self._tree_pids if pid in resolved) + newly_seen
         if self._owned_registry is None:
@@ -796,7 +805,7 @@ class TextBackendSupervisor:
         if process is None:
             self._forget_tree()
             return
-        descendants = _living_descendants(process.pid)
+        descendants = self._list_descendants(process.pid)
         for descendant in descendants:
             _terminate_quietly(descendant)
         _terminate_handle_quietly(process)
@@ -838,11 +847,6 @@ def _read_log_from(log_path: Path, offset_bytes: int) -> str:
     except OSError as error:
         logger.debug(f"Text backend log {log_path} could not be read: {error}")
         return ""
-
-
-def _process_tree_pids(root_pid: int) -> tuple[int, ...]:
-    """Return the root PID followed by its living descendants; just the root when it cannot be inspected."""
-    return (root_pid, *(descendant.pid for descendant in _living_descendants(root_pid)))
 
 
 def _living_descendants(root_pid: int) -> list[psutil.Process]:

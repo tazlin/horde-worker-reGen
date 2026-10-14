@@ -69,11 +69,28 @@ FAST = TextBackendSupervisorTimings(
 )
 
 
+def fake_pid(n: int) -> int:
+    """Return the ``n``th pid no process can hold on Linux, Windows or macOS.
+
+    The supervisor's teardown terminates every descendant of the handle's pid. A small fake pid can be a
+    real process, and pid 1 on Linux is init, whose descendants include the test runner itself. Linux pids
+    stay at or below 2**22, macOS pids below 100000, and Windows pids are multiples of 4.
+    """
+    return 2**22 + 4 * n + 1
+
+
+def no_descendants(root_pid: int) -> list[psutil.Process]:
+    """List no descendants, so a fake handle's teardown never reads or signals the real process table."""
+    return []
+
+
 class FakeLaunched:
     """A process handle whose exit is scripted by the test."""
 
     def __init__(self, pid: int) -> None:
-        """Create a running handle with the given pid."""
+        """Create a running handle with the given pid, which no real process may hold."""
+        if psutil.pid_exists(pid):
+            raise ValueError(f"fake pid {pid} belongs to a real process; use fake_pid()")
         self._pid = pid
         self._exit_code: int | None = None
         self.terminate_calls = 0
@@ -227,7 +244,7 @@ def test_port_is_free_reports_a_held_port() -> None:
 
 async def test_ready_after_polls_makes_the_backend_serving_and_measures_the_footprint(tmp_path: Path) -> None:
     """Readiness after several polls yields SERVING, a free-VRAM delta footprint, and a recorded PID."""
-    handle = FakeLaunched(pid=424242)
+    handle = FakeLaunched(pid=fake_pid(424242))
     launcher = Launcher([handle])
     backend = StubBackend(ready_results=[False, False, True])
     registry = OwnedProcessRegistry(tmp_path / "owned.json")
@@ -240,6 +257,7 @@ async def test_ready_after_polls_makes_the_backend_serving_and_measures_the_foot
         backend=backend,
         owned_registry=registry,
         launch_process=launcher,
+        list_descendants=no_descendants,
         read_device_memory=lambda device_index: next(readings),
         timings=FAST,
     )
@@ -249,9 +267,9 @@ async def test_ready_after_polls_makes_the_backend_serving_and_measures_the_foot
     assert backend.ready_calls == 3
     assert supervisor.launch_count == 1
     assert supervisor.footprint_mb == pytest.approx(2700.0)
-    assert supervisor.pids == (424242,)
+    assert supervisor.pids == (fake_pid(424242),)
     recorded = registry._load()
-    assert [record.os_pid for record in recorded] == [424242]
+    assert [record.os_pid for record in recorded] == [fake_pid(424242)]
     assert recorded[0].process_type == HordeProcessType.TEXT_BACKEND.name
 
     await supervisor.stop()
@@ -264,7 +282,7 @@ async def test_ready_after_polls_makes_the_backend_serving_and_measures_the_foot
 
 async def test_a_reading_that_is_not_device_wide_measures_no_footprint(tmp_path: Path) -> None:
     """The backend is another process, so a process-local free figure cannot show what its launch took."""
-    launcher = Launcher([FakeLaunched(pid=424243)])
+    launcher = Launcher([FakeLaunched(pid=fake_pid(424243))])
     backend = StubBackend(ready_results=[True])
     readings = iter(
         [
@@ -283,6 +301,7 @@ async def test_a_reading_that_is_not_device_wide_measures_no_footprint(tmp_path:
         backend=backend,
         owned_registry=OwnedProcessRegistry(tmp_path / "owned.json"),
         launch_process=launcher,
+        list_descendants=no_descendants,
         read_device_memory=lambda device_index: next(readings, None),
         timings=FAST,
     )
@@ -297,11 +316,12 @@ async def test_a_reading_that_is_not_device_wide_measures_no_footprint(tmp_path:
 
 async def test_footprint_is_unmeasured_without_a_reader(tmp_path: Path) -> None:
     """No free-VRAM reader means no footprint, not a zero."""
-    handle = FakeLaunched(pid=1)
+    handle = FakeLaunched(pid=fake_pid(1))
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=Launcher([handle]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -315,21 +335,22 @@ async def test_footprint_is_unmeasured_without_a_reader(tmp_path: Path) -> None:
 
 async def test_an_exit_before_ready_is_relaunched_after_backoff(tmp_path: Path) -> None:
     """A process that dies during start-up is relaunched and the second launch can serve."""
-    first = FakeLaunched(pid=11)
+    first = FakeLaunched(pid=fake_pid(11))
     first.exit(1)
-    second = FakeLaunched(pid=12)
+    second = FakeLaunched(pid=fake_pid(12))
     launcher = Launcher([first, second])
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=launcher,
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
 
     await wait_until(lambda: supervisor.is_serving)
     assert supervisor.launch_count == 2
-    assert supervisor.pids == (12,)
+    assert supervisor.pids == (fake_pid(12),)
 
     await supervisor.stop()
     await asyncio.wait_for(task, timeout=5.0)
@@ -341,12 +362,13 @@ async def test_the_launch_and_the_readiness_reach_the_event_ring(tmp_path: Path)
     Both carry the launch number, and the readiness carries how long the backend took, which is the only
     honest basis for telling a contributor how long the next start will take.
     """
-    handle = FakeLaunched(pid=31)
+    handle = FakeLaunched(pid=fake_pid(31))
     recorded: list[tuple[WorkerEventKind, dict[str, object]]] = []
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=Launcher([handle]),
+        list_descendants=no_descendants,
         timings=FAST,
         on_event=lambda kind, **fields: recorded.append((kind, fields)),
     )
@@ -372,14 +394,15 @@ async def test_the_launch_after_a_backoff_is_recorded_as_a_relaunch(tmp_path: Pa
     A back-off a stop interrupts never becomes a launch, and a reader of the feed wants the attempt; so the
     first launch is a launch and the one after a failure is a restart, with its launch number.
     """
-    first = FakeLaunched(pid=41)
+    first = FakeLaunched(pid=fake_pid(41))
     first.exit(1)
-    second = FakeLaunched(pid=42)
+    second = FakeLaunched(pid=fake_pid(42))
     recorded: list[tuple[WorkerEventKind, dict[str, object]]] = []
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=Launcher([first, second]),
+        list_descendants=no_descendants,
         timings=FAST,
         on_event=lambda kind, **fields: recorded.append((kind, fields)),
     )
@@ -399,14 +422,15 @@ async def test_the_launch_after_a_backoff_is_recorded_as_a_relaunch(tmp_path: Pa
 
 async def test_missing_the_ready_patience_stops_the_process_and_relaunches(tmp_path: Path) -> None:
     """A launch that never answers ready within the patience is terminated and tried again."""
-    first = FakeLaunched(pid=21)
-    second = FakeLaunched(pid=22)
+    first = FakeLaunched(pid=fake_pid(21))
+    second = FakeLaunched(pid=fake_pid(22))
     launcher = Launcher([first, second])
     never_ready = StubBackend(ready_results=[], default_ready=False)
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=never_ready,
         launch_process=launcher,
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -416,7 +440,7 @@ async def test_missing_the_ready_patience_stops_the_process_and_relaunches(tmp_p
     never_ready.default_ready = True
     await wait_until(lambda: supervisor.is_serving)
     assert supervisor.launch_count == 2
-    assert supervisor.pids == (22,)
+    assert supervisor.pids == (fake_pid(22),)
 
     await supervisor.stop()
     await asyncio.wait_for(task, timeout=5.0)
@@ -424,14 +448,15 @@ async def test_missing_the_ready_patience_stops_the_process_and_relaunches(tmp_p
 
 async def test_an_exit_while_serving_is_relaunched(tmp_path: Path) -> None:
     """A serving process that exits is relaunched and the registry follows the new PID."""
-    first = FakeLaunched(pid=31)
-    second = FakeLaunched(pid=32)
+    first = FakeLaunched(pid=fake_pid(31))
+    second = FakeLaunched(pid=fake_pid(32))
     registry = OwnedProcessRegistry(tmp_path / "owned.json")
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True, True]),
         owned_registry=registry,
         launch_process=Launcher([first, second]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -439,7 +464,7 @@ async def test_an_exit_while_serving_is_relaunched(tmp_path: Path) -> None:
     await wait_until(lambda: supervisor.is_serving)
     first.exit(3)
     await wait_until(lambda: supervisor.launch_count == 2 and supervisor.is_serving)
-    assert [record.os_pid for record in registry._load()] == [32]
+    assert [record.os_pid for record in registry._load()] == [fake_pid(32)]
 
     await supervisor.stop()
     await asyncio.wait_for(task, timeout=5.0)
@@ -447,8 +472,8 @@ async def test_an_exit_while_serving_is_relaunched(tmp_path: Path) -> None:
 
 async def test_a_requested_relaunch_stops_the_serving_tree_and_launches_again(tmp_path: Path) -> None:
     """A process that answers but will not generate is stopped on request and relaunched like one that exited."""
-    first = FakeLaunched(pid=33)
-    second = FakeLaunched(pid=34)
+    first = FakeLaunched(pid=fake_pid(33))
+    second = FakeLaunched(pid=fake_pid(34))
     registry = OwnedProcessRegistry(tmp_path / "owned.json")
     recorded: list[WorkerEventKind] = []
     supervisor = TextBackendSupervisor(
@@ -456,6 +481,7 @@ async def test_a_requested_relaunch_stops_the_serving_tree_and_launches_again(tm
         backend=StubBackend(ready_results=[True, True]),
         owned_registry=registry,
         launch_process=Launcher([first, second]),
+        list_descendants=no_descendants,
         timings=FAST,
         on_event=lambda kind, **_fields: recorded.append(kind),
     )
@@ -468,7 +494,7 @@ async def test_a_requested_relaunch_stops_the_serving_tree_and_launches_again(tm
 
     assert first.terminate_calls == 1
     assert second.terminate_calls == 0, "the request outlived the process it was made against"
-    assert [record.os_pid for record in registry._load()] == [34]
+    assert [record.os_pid for record in registry._load()] == [fake_pid(34)]
     assert WorkerEventKind.BACKEND_RELAUNCHED in recorded
 
     await supervisor.stop()
@@ -477,14 +503,15 @@ async def test_a_requested_relaunch_stops_the_serving_tree_and_launches_again(tm
 
 async def test_a_relaunch_is_refused_while_nothing_is_serving(tmp_path: Path) -> None:
     """A backend launching, backing off or stopped is already on its way to a launch of its own."""
-    exited = FakeLaunched(pid=35)
+    exited = FakeLaunched(pid=fake_pid(35))
     exited.exit(2)
     slow_backoff = FAST.model_copy(update={"relaunch_backoff": (30.0,)})
-    launcher = Launcher([exited, FakeLaunched(pid=36)])
+    launcher = Launcher([exited, FakeLaunched(pid=fake_pid(36))])
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=launcher,
+        list_descendants=no_descendants,
         timings=slow_backoff,
     )
 
@@ -504,7 +531,7 @@ async def test_a_relaunch_is_refused_while_nothing_is_serving(tmp_path: Path) ->
 
 async def test_a_held_port_defers_the_launch_without_starting_anything(tmp_path: Path) -> None:
     """A port another process holds defers the launch into backoff; no process is started."""
-    launcher = Launcher([FakeLaunched(pid=41)])
+    launcher = Launcher([FakeLaunched(pid=fake_pid(41))])
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
         holder.bind(("127.0.0.1", 0))
         held_port = int(holder.getsockname()[1])
@@ -512,6 +539,7 @@ async def test_a_held_port_defers_the_launch_without_starting_anything(tmp_path:
             launch_spec_factory=factory_for(spec_on(held_port, tmp_path)),
             backend=StubBackend(ready_results=[True]),
             launch_process=launcher,
+            list_descendants=no_descendants,
             timings=FAST,
         )
         task = asyncio.create_task(supervisor.run())
@@ -526,14 +554,15 @@ async def test_a_held_port_defers_the_launch_without_starting_anything(tmp_path:
 
 async def test_stop_during_backoff_ends_the_run_without_another_launch(tmp_path: Path) -> None:
     """Stopping while backing off leaves the run ended and the second handle unused."""
-    exited = FakeLaunched(pid=51)
+    exited = FakeLaunched(pid=fake_pid(51))
     exited.exit(2)
     slow_backoff = FAST.model_copy(update={"relaunch_backoff": (30.0,)})
-    launcher = Launcher([exited, FakeLaunched(pid=52)])
+    launcher = Launcher([exited, FakeLaunched(pid=fake_pid(52))])
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         launch_process=launcher,
+        list_descendants=no_descendants,
         timings=slow_backoff,
     )
     task = asyncio.create_task(supervisor.run())
@@ -603,7 +632,8 @@ async def test_the_stopped_row_names_the_backend_without_claiming_a_process(tmp_
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         backend_kind=TEXT_BACKENDS.koboldcpp,
-        launch_process=Launcher([FakeLaunched(pid=61)]),
+        launch_process=Launcher([FakeLaunched(pid=fake_pid(61))]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
 
@@ -631,7 +661,8 @@ async def test_the_row_reports_the_requests_the_flow_has_in_flight(tmp_path: Pat
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         backend_kind=TEXT_BACKENDS.koboldcpp,
-        launch_process=Launcher([FakeLaunched(pid=62)]),
+        launch_process=Launcher([FakeLaunched(pid=fake_pid(62))]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
 
@@ -652,7 +683,8 @@ async def test_a_row_with_nothing_in_flight_is_idle(tmp_path: Path) -> None:
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
         backend_kind=TEXT_BACKENDS.koboldcpp,
-        launch_process=Launcher([FakeLaunched(pid=63)]),
+        launch_process=Launcher([FakeLaunched(pid=fake_pid(63))]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
 
@@ -669,7 +701,7 @@ async def test_a_row_with_nothing_in_flight_is_idle(tmp_path: Path) -> None:
 
 async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_sizes(tmp_path: Path) -> None:
     """A serving backend's row states what it loaded, what it cost, and what its loader reported."""
-    handle = FakeLaunched(pid=71)
+    handle = FakeLaunched(pid=fake_pid(71))
     backend = StubBackend(
         ready_results=[True],
         description=TextBackendDescription(
@@ -687,6 +719,7 @@ async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_si
         backend=backend,
         backend_kind=TEXT_BACKENDS.koboldcpp,
         launch_process=LoggingLauncher([handle], [BACKEND_LOAD_LOG]),
+        list_descendants=no_descendants,
         read_device_memory=lambda device_index: next(readings),
         timings=FAST,
     )
@@ -697,7 +730,7 @@ async def test_the_ready_row_carries_the_description_footprint_pid_and_buffer_si
 
     assert row.display_state == "ready"
     assert row.is_alive is True
-    assert row.os_pid == 71
+    assert row.os_pid == fake_pid(71)
     assert row.device_index == 0
     assert row.loaded_horde_model_name == "koboldcpp/Llama-3.2-3B"
     detail = row.text_backend
@@ -739,7 +772,8 @@ async def _ready_lines_for(spec: TextBackendLaunchSpec, *, card_total_mb: float)
         supervisor = TextBackendSupervisor(
             launch_spec_factory=factory_for(spec),
             backend=StubBackend(ready_results=[True]),
-            launch_process=LoggingLauncher([FakeLaunched(pid=72)], [BACKEND_LOAD_LOG]),
+            launch_process=LoggingLauncher([FakeLaunched(pid=fake_pid(72))], [BACKEND_LOAD_LOG]),
+            list_descendants=no_descendants,
             read_device_memory=lambda device_index: next(readings),
             timings=FAST,
         )
@@ -798,7 +832,8 @@ async def test_the_launching_row_reports_launching_before_readiness(tmp_path: Pa
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=starting,
-        launch_process=LoggingLauncher([FakeLaunched(pid=81)], [BACKEND_LOAD_LOG]),
+        launch_process=LoggingLauncher([FakeLaunched(pid=fake_pid(81))], [BACKEND_LOAD_LOG]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -820,13 +855,14 @@ async def test_the_launching_row_reports_launching_before_readiness(tmp_path: Pa
 
 async def test_the_backing_off_row_counts_down_to_the_relaunch(tmp_path: Path) -> None:
     """A backend waiting to be relaunched says how long is left, and holds no detail from the dead launch."""
-    exited = FakeLaunched(pid=91)
+    exited = FakeLaunched(pid=fake_pid(91))
     exited.exit(1)
     slow_backoff = FAST.model_copy(update={"relaunch_backoff": (30.0,)})
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
-        launch_process=LoggingLauncher([exited, FakeLaunched(pid=92)], [BACKEND_LOAD_LOG, BACKEND_LOAD_LOG]),
+        launch_process=LoggingLauncher([exited, FakeLaunched(pid=fake_pid(92))], [BACKEND_LOAD_LOG, BACKEND_LOAD_LOG]),
+        list_descendants=no_descendants,
         timings=slow_backoff,
     )
     task = asyncio.create_task(supervisor.run())
@@ -854,14 +890,15 @@ async def test_the_backing_off_row_counts_down_to_the_relaunch(tmp_path: Path) -
 
 async def test_each_launch_describes_once_and_reads_only_its_own_output(tmp_path: Path) -> None:
     """A relaunch re-asks the backend and parses the second launch's lines, not the log's whole history."""
-    first = FakeLaunched(pid=101)
-    second = FakeLaunched(pid=102)
+    first = FakeLaunched(pid=fake_pid(101))
+    second = FakeLaunched(pid=fake_pid(102))
     relaunched_log = BACKEND_LOAD_LOG.replace("1918.35", "918.35").replace("476.00", "376.00")
     backend = StubBackend(ready_results=[True, True])
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=backend,
         launch_process=LoggingLauncher([first, second], [BACKEND_LOAD_LOG, relaunched_log]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -873,7 +910,7 @@ async def test_each_launch_describes_once_and_reads_only_its_own_output(tmp_path
     row = supervisor.to_process_snapshot()
 
     assert backend.describe_calls == 2
-    assert row.os_pid == 102
+    assert row.os_pid == fake_pid(102)
     detail = row.text_backend
     assert detail is not None
     assert detail.launch_count == 2
@@ -888,7 +925,8 @@ async def test_a_backend_that_will_not_describe_itself_still_serves(tmp_path: Pa
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True], describe_error=TextBackendUnavailable("no answer")),
-        launch_process=Launcher([FakeLaunched(pid=111)]),
+        launch_process=Launcher([FakeLaunched(pid=fake_pid(111))]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -911,7 +949,8 @@ async def test_a_backend_on_no_card_reports_no_device_index(tmp_path: Path) -> N
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path, device_index=None)),
         backend=StubBackend(ready_results=[True]),
-        launch_process=Launcher([FakeLaunched(pid=121)]),
+        launch_process=Launcher([FakeLaunched(pid=fake_pid(121))]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -989,7 +1028,8 @@ async def test_a_row_before_any_launch_has_no_launch_instant(tmp_path: Path) -> 
     supervisor = TextBackendSupervisor(
         launch_spec_factory=factory_for(spec_on(free_port(), tmp_path)),
         backend=StubBackend(ready_results=[True]),
-        launch_process=Launcher([FakeLaunched(pid=1)]),
+        launch_process=Launcher([FakeLaunched(pid=fake_pid(1))]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
 
@@ -1019,7 +1059,8 @@ async def test_the_row_reads_provisioning_while_the_program_is_being_obtained(tm
     supervisor = TextBackendSupervisor(
         launch_spec_factory=obtain_slowly,
         backend=StubBackend(ready_results=[True]),
-        launch_process=Launcher([FakeLaunched(pid=61)]),
+        launch_process=Launcher([FakeLaunched(pid=fake_pid(61))]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
     task = asyncio.create_task(supervisor.run())
@@ -1057,6 +1098,7 @@ async def test_a_program_that_cannot_be_obtained_is_reported_on_the_row_and_stop
         launch_spec_factory=cannot_obtain,
         backend=StubBackend(ready_results=[True]),
         launch_process=Launcher([]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
 
@@ -1081,6 +1123,7 @@ async def test_an_unrenderable_backend_is_reported_the_same_way(tmp_path: Path) 
         launch_spec_factory=cannot_render,
         backend=StubBackend(ready_results=[True]),
         launch_process=Launcher([]),
+        list_descendants=no_descendants,
         timings=FAST,
     )
 
