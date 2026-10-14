@@ -8,20 +8,40 @@ the session's duty shape, and a scheduling change is judged by how it moves the 
 the change's parent, never by a live figure.
 
 Values chosen without a live figure: the host's foreign RAM, the service-lane exit time, the safety placement
-readiness (the world's default of zero), and the jobs in flight at a window's start, which are not replayed.
+readiness (the world's default of zero), and the jobs in flight at a window's start, which are not replayed. The
+scheduler's performance model starts unseeded and learns sampling rates and dispatch-to-first-step overheads
+from the replay's jobs, where the live worker carried a model learned over earlier sessions.
 """
 
 from __future__ import annotations
 
 import math
 import statistics
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from horde_worker_regen.process_management.resources.admission_identity import admission_margin_mb
-from tests.process_management.liveness._dispatch_world import _CARD_24GB, _DispatchWorld, _ModelClass
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    _MEASURED_ESTIMATE_MARGIN,
+    FootprintKey,
+    FootprintStage,
+    ResolutionBucket,
+    job_class_key,
+    sampling_footprint_key,
+)
+from tests.process_management.conftest import make_job_pop_response
+from tests.process_management.liveness._dispatch_world import (
+    _CARD_24GB,
+    _FLUX,
+    _KREA2,
+    _SD15,
+    _DispatchWorld,
+    _ModelClass,
+    _support_component_mb,
+)
 from tests.process_management.liveness._host_ram import HostRamLedger
 from tests.process_management.liveness._session_replay import (
     SESSION_FOOTPRINTS_PATH,
@@ -31,6 +51,7 @@ from tests.process_management.liveness._session_replay import (
     calibrated_load_seconds_per_gb,
     chain_seconds,
     decode_seconds_by_job,
+    kudos_by_job,
     load_footprint_keys,
     load_footprint_store,
     load_session_jobs,
@@ -45,8 +66,11 @@ from tests.process_management.liveness._session_replay import (
 )
 from tests.process_management.liveness._world_assertions import (
     SAMPLING_CONCURRENCY_TOP,
+    ModelLoadTotals,
     concurrency_shares,
     handoff_gap_segments,
+    kudos_per_simulated_hour,
+    load_totals_by_model,
     pop_to_start_seconds,
     slot_duty_shares,
 )
@@ -81,6 +105,11 @@ _FOREIGN_VRAM_MB = 3300.0
 """Device memory on the session's card that no lane's report accounts for, held for the whole session."""
 _SERVICE_LANE_EXIT_SECONDS = 1.0
 """How long a paused service lane's process takes to exit. Chosen as one tick, with no measured figure recorded."""
+_LANE_START_SECONDS = 0.0
+"""How long a regrown inference lane takes to start. Zero, the world's default, since the session records no
+inference start against which a figure could be chosen."""
+_PHASE_RESIDENT_COMPONENTS = True
+"""The replay charges a monolithic job's text encoder and VAE as a lane tenant, so the truth hook leaves them out."""
 
 _SESSION_START_CLOCK_SECONDS = 13 * 3600 + 49 * 60 + 37.58
 """The session's start on the host's local clock (13:49:37.58), from which the fixture's offsets run."""
@@ -129,6 +158,20 @@ class _ReplayFigures:
     overcommit_ticks: int
     overcommit_max_mb: float
     driver: PopDriverRecord
+    kudos_per_hour: float
+    """The live kudos of the jobs the replay completed, per simulated hour."""
+    load_totals: list[ModelLoadTotals]
+    """Each model's device loads, the model with the most load seconds first."""
+
+    @property
+    def partial_loads(self) -> int:
+        """Return how many device loads left part of their weights in host RAM."""
+        return sum(totals.partial_loads for totals in self.load_totals)
+
+    @property
+    def complete_loads(self) -> int:
+        """Return how many device loads put all of their weights on the card."""
+        return sum(totals.loads - totals.partial_loads for totals in self.load_totals)
 
     def describe(self) -> str:
         """Return the figures as text a failing row prints, so a regression shows where the slot time went."""
@@ -143,12 +186,18 @@ class _ReplayFigures:
         pop_to_start = (
             "none" if self.pop_to_start_median_seconds is None else f"{self.pop_to_start_median_seconds:.1f} s"
         )
+        loads = ", ".join(
+            f"{totals.model} {totals.load_seconds:.0f} s over {totals.loads} ({totals.moved_mb:.0f} MB moved)"
+            for totals in self.load_totals
+        )
         return (
             f"sampling share {self.sampling_share:.1%}; lanes sampling {concurrency}; slot duty {holds}; "
             f"handoff gaps {gaps}; median pop to start {pop_to_start}; {self.completed_jobs} jobs completed; "
             f"{self.overcommit_ticks} over-committed ticks (at most {self.overcommit_max_mb:.0f} MB); "
             f"offered {self.driver.offered}, "
-            f"left {self.driver.remaining}, refused offers {self.driver.refused_offers}"
+            f"left {self.driver.remaining}, refused offers {self.driver.refused_offers}, "
+            f"taken out of order {self.driver.taken_out_of_order}; {self.kudos_per_hour:.0f} kudos per hour; "
+            f"loads {self.complete_loads} complete and {self.partial_loads} partial; ram_to_vram {loads}"
         )
 
 
@@ -178,6 +227,7 @@ def _replay_world(jobs: list[ReplayJob], *, scratch_directory: Path) -> tuple[_D
         tail_overlap=True,
         staged_lane_prefetch=True,
         idle_lane_warm=True,
+        performance_model=True,
         service_contexts=True,
         service_lane_exit_seconds=_SERVICE_LANE_EXIT_SECONDS,
         safety_off_gpu_allowed=True,
@@ -189,8 +239,10 @@ def _replay_world(jobs: list[ReplayJob], *, scratch_directory: Path) -> tuple[_D
         post_process_chain_measured_admission=True,
         learned_footprints=True,
         footprint_store=parent_store,
-        phase_resident_components=True,
+        phase_resident_components=_PHASE_RESIDENT_COMPONENTS,
         partial_loads=True,
+        text_encoder_released_before_wait=True,
+        lane_start_seconds=_LANE_START_SECONDS,
         lane_reports_carry_context=True,
         admission_noise_mb=_ADMISSION_NOISE_MB,
         host_ram=HostRamLedger(_HOST_RAM_MB, _FOREIGN_RAM_MB),
@@ -198,7 +250,7 @@ def _replay_world(jobs: list[ReplayJob], *, scratch_directory: Path) -> tuple[_D
         ram_pause_percent=_RAM_PAUSE_PERCENT,
         foreign_vram_mb_by_tick={1: _FOREIGN_VRAM_MB},
         extra_model_classes=tuple(classes),
-        true_footprint_mb=true_footprint(truth_store, classes),
+        true_footprint_mb=true_footprint(truth_store, classes, phase_resident_components=_PHASE_RESIDENT_COMPONENTS),
         sample_seconds_by_job=sample_seconds_by_job(jobs),
         decode_seconds_by_job=decode_seconds_by_job(jobs),
         load_seconds_per_gb=calibrated_load_seconds_per_gb(jobs, classes),
@@ -209,8 +261,8 @@ def _replay_world(jobs: list[ReplayJob], *, scratch_directory: Path) -> tuple[_D
     return world, classes
 
 
-def _figures(world: _DispatchWorld, driver: PopDriverRecord) -> _ReplayFigures:
-    """Read a finished replay's figures."""
+def _figures(world: _DispatchWorld, driver: PopDriverRecord, jobs: list[ReplayJob]) -> _ReplayFigures:
+    """Read a finished replay's figures, pricing completed jobs at the kudos ``jobs`` recorded for them live."""
     slot_duty = slot_duty_shares(world)
     waits = pop_to_start_seconds(world)
     return _ReplayFigures(
@@ -223,11 +275,19 @@ def _figures(world: _DispatchWorld, driver: PopDriverRecord) -> _ReplayFigures:
         overcommit_ticks=len({tick for tick, _card, _over_mb in world.card_overcommits}),
         overcommit_max_mb=max((over_mb for _tick, _card, over_mb in world.card_overcommits), default=0.0),
         driver=driver,
+        kudos_per_hour=kudos_per_simulated_hour(world, kudos_by_job(jobs)),
+        load_totals=load_totals_by_model(world),
     )
 
 
 async def _replay_w3_window(scratch_directory: Path) -> _ReplayFigures:
     """Replay 15:05 to 15:25 from the residents the lanes held at 15:05, and read the figures back."""
+    _world, figures = await _run_w3_window(scratch_directory)
+    return figures
+
+
+async def _run_w3_window(scratch_directory: Path) -> tuple[_DispatchWorld, _ReplayFigures]:
+    """Replay 15:05 to 15:25 from the residents the lanes held at 15:05, returning the finished world and figures."""
     window_end = _W3_START_OFFSET_SECONDS + _W3_SECONDS
     session_jobs = load_session_jobs(SESSION_JOBS_PATH)
     jobs = [
@@ -250,7 +310,7 @@ async def _replay_w3_window(scratch_directory: Path) -> _ReplayFigures:
         start_offset_seconds=_W3_START_OFFSET_SECONDS,
         seconds=_W3_SECONDS,
     )
-    return _figures(world, driver)
+    return world, _figures(world, driver, jobs)
 
 
 async def _replay_whole_session(scratch_directory: Path) -> _ReplayFigures:
@@ -265,7 +325,7 @@ async def _replay_whole_session(scratch_directory: Path) -> _ReplayFigures:
         start_offset_seconds=0.0,
         seconds=float(session_seconds),
     )
-    return _figures(world, driver)
+    return _figures(world, driver, jobs)
 
 
 def _assert_live_duty_shape(figures: _ReplayFigures, *, context: str) -> None:
@@ -310,3 +370,188 @@ async def test_replay_whole_session(tmp_path: Path) -> None:
     """
     figures = await _replay_whole_session(tmp_path)
     _assert_live_duty_shape(figures, context="whole session")
+
+
+_PEAK_PARTIAL_MODEL = _FLUX.name
+"""A replayed checkpoint whose whole-job peak was taken partially loaded, below its weights and support seed."""
+
+
+def test_the_truth_hook_leaves_the_encoder_and_vae_to_the_support_tenant(tmp_path: Path) -> None:
+    """With the components charged as a tenant, a job's transient leaves them out of its peak's share.
+
+    The sample key is the whole job's peak with the text encoder and VAE in it, and the world charges those
+    again as the lane's support tenant, so a transient read off the sample key less the weights charges them
+    twice. A peak below the weights and the seed was taken partially loaded, so its transient is the class's
+    measured activation instead. Every replayed job is checked against the branch its figures put it in.
+    """
+    jobs = load_session_jobs(SESSION_JOBS_PATH)
+    store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path)
+    classes = model_classes(jobs, store, load_footprint_keys(SESSION_FOOTPRINTS_PATH))
+    phased = true_footprint(store, classes, phase_resident_components=True)
+    whole = true_footprint(store, classes, phase_resident_components=False)
+
+    classes_by_name = {model_class.name: model_class for model_class in classes}
+    decomposed_models: set[str] = set()
+    partial_peak_models: set[str] = set()
+    for replay_job in jobs:
+        job = replay_job.pop_response
+        model_class = classes_by_name[replay_job.model]
+        weights_mb, transient_mb = phased(job)
+        _, peak_share_mb = whole(job)
+        support_mb = _support_component_mb(model_class)
+        assert weights_mb == model_class.weights_mb
+        if peak_share_mb > support_mb:
+            decomposed_models.add(replay_job.model)
+            assert transient_mb == pytest.approx(peak_share_mb - support_mb), (
+                f"{replay_job.model}: the transient is {transient_mb:.0f} MB, not its {peak_share_mb:.0f} MB peak "
+                f"share less the {support_mb:.0f} MB the support tenant already charges"
+            )
+            continue
+        partial_peak_models.add(replay_job.model)
+        activation_key = sampling_footprint_key(job, str(model_class.baseline), stage=FootprintStage.SAMPLE_ACTIVATION)
+        assert activation_key is not None
+        measured_activation_mb = store.measured_job_estimate_net_of_context_mb(
+            activation_key, job_class_key(activation_key, job)
+        )
+        expected_mb = 0.0 if measured_activation_mb is None else measured_activation_mb / _MEASURED_ESTIMATE_MARGIN
+        assert transient_mb == pytest.approx(expected_mb), (
+            f"{replay_job.model}: a peak below its weights and seed gave a {transient_mb:.0f} MB transient, not the "
+            f"{expected_mb:.0f} MB measured activation"
+        )
+    assert _PEAK_PARTIAL_MODEL in partial_peak_models, "the Flux peak decomposes, so the partial branch is untested"
+    assert decomposed_models, "no replayed class decomposes, so the double count branch is untested"
+
+
+_FLUX_SAMPLE_KEY = FootprintKey(
+    model_baseline=str(_FLUX.baseline),
+    resolution_bucket=ResolutionBucket.LE_1024,
+    platform=sys.platform,
+    stage=FootprintStage.SAMPLE,
+)
+"""The Flux sampling key most of the window's Flux jobs are learned under."""
+
+
+async def test_the_w3_window_leaves_the_learned_flux_sample_figure_where_it_began(tmp_path: Path) -> None:
+    """Over the window the parent's measured Flux sampling figure moves by less than the store's margin.
+
+    The live session ended with this key where the window begins, after thousands of observations, so a replay
+    that raises it is teaching the parent figures the live children never reported. Each of the world's reports
+    carries the job's sampling peak without the context share or the decode spike. Truth figures are read without
+    the store's margin, which the parent adds when it learns from them.
+    """
+    start_store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path / "start")
+    start_mb = start_store.measured_estimate_net_of_context_mb(_FLUX_SAMPLE_KEY)
+    assert start_mb is not None, "the fixture's Flux key is under-observed, so the row is moot"
+
+    world, figures = await _run_w3_window(tmp_path / "replay")
+
+    end_mb = world.footprint_store.measured_estimate_net_of_context_mb(_FLUX_SAMPLE_KEY)
+    assert end_mb is not None
+    tolerance_mb = start_mb * (_MEASURED_ESTIMATE_MARGIN - 1.0)
+    assert abs(end_mb - start_mb) <= tolerance_mb, (
+        f"the learned Flux le_1024 figure moved from {start_mb:.0f} MB to {end_mb:.0f} MB over the window, beyond "
+        f"the store's {tolerance_mb:.0f} MB margin. {figures.describe()}"
+    )
+
+
+def _stream_job(model: _ModelClass, *, offset_seconds: float) -> ReplayJob:
+    """Create a recorded job for ``model`` popped at ``offset_seconds``, with no measured figures."""
+    return ReplayJob(
+        offset_seconds=offset_seconds,
+        dispatch_offset_seconds=None,
+        finalized_offset_seconds=None,
+        live_job_id=f"recorded-{model.label}",
+        model=model.name,
+        baseline=str(model.baseline),
+        width=1024,
+        height=1024,
+        steps=20,
+        batch=1,
+        sampler="k_euler",
+        hires_fix=False,
+        lora_count=0,
+        textual_inversion_count=0,
+        post_processing=(),
+        sampling_seconds=None,
+        decode_seconds=None,
+        encode_seconds=None,
+        ram_to_vram_seconds=None,
+        chain_seconds=None,
+        safety_seconds=None,
+        kudos=None,
+        peak_device_used_mb=None,
+        peak_resident_weights_mb=None,
+        vram_used_high_water_mb=None,
+        faulted=False,
+        pop_response=make_job_pop_response(model.name, width=1024, height=1024, ddim_steps=20),
+    )
+
+
+def _throttled_world(*, switch_min_seconds: float) -> _DispatchWorld:
+    """Build a two-lane 24 GB world serving Flux and Krea2, both very large, under the popper's switch throttle."""
+    return _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=2,
+        whole_card_enabled=False,
+        extra_model_classes=(_KREA2,),
+        large_model_switch_min_seconds=switch_min_seconds,
+    )
+
+
+async def test_the_switch_throttle_narrows_the_world_offer_while_a_very_large_model_is_queued() -> None:
+    """A queued Flux job withholds Krea2 from the offer under the throttle, and the off default withholds nothing.
+
+    The world runs the popper's large-model governor ahead of the whole-card claim, so a replay with the
+    throttle or the re-entry cooldown configured is offered what the live popper would have asked for.
+    """
+    unthrottled = _throttled_world(switch_min_seconds=0.0)
+    assert await unthrottled.offer_job(make_job_pop_response(_FLUX.name, width=1024, height=1024))
+    assert _KREA2.name in unthrottled.advertised_models()
+    assert not unthrottled.large_model_withholds
+
+    world = _throttled_world(switch_min_seconds=600.0)
+    assert await world.offer_job(make_job_pop_response(_FLUX.name, width=1024, height=1024)), (
+        "an idle worker withholds nothing, so the first very-large job is taken"
+    )
+    advertised = world.advertised_models()
+    assert _FLUX.name in advertised
+    assert _SD15.name in advertised
+    assert _KREA2.name not in advertised
+    assert not await world.offer_job(make_job_pop_response(_KREA2.name, width=1024, height=1024))
+    assert {decision.reason for decision in world.large_model_withholds.values()} == {"switch throttle"}
+
+
+async def test_the_pop_driver_looks_past_a_refused_row_and_keeps_it_for_later() -> None:
+    """With a look-ahead, a row the offer refuses holds back none of the rows behind it.
+
+    The stream is Flux, Krea2 and SD 1.5, all due at once, under the switch throttle. Without the look-ahead the
+    refused Krea2 row stalls SD 1.5 behind it. With it, SD 1.5 is taken out of order and Krea2 stays in the stream.
+    """
+    stream = [
+        _stream_job(_FLUX, offset_seconds=0.0),
+        _stream_job(_KREA2, offset_seconds=0.0),
+        _stream_job(_SD15, offset_seconds=0.0),
+    ]
+
+    stalled = await pop_driver(
+        _throttled_world(switch_min_seconds=600.0),
+        stream,
+        queue_size=_POP_BUDGET,
+        start_offset_seconds=0.0,
+        seconds=1.0,
+    )
+    assert (stalled.offered, stalled.remaining, stalled.taken_out_of_order) == (1, 2, 0)
+
+    world = _throttled_world(switch_min_seconds=600.0)
+    looked_ahead = await pop_driver(
+        world,
+        stream,
+        queue_size=_POP_BUDGET,
+        start_offset_seconds=0.0,
+        seconds=1.0,
+        look_ahead_rows=2,
+    )
+    assert (looked_ahead.offered, looked_ahead.remaining, looked_ahead.taken_out_of_order) == (2, 1, 1)
+    assert sorted(world.popped_at) == sorted(str(job.pop_response.id_) for job in (stream[0], stream[2]))

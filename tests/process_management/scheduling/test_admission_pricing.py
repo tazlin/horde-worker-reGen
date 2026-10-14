@@ -257,6 +257,7 @@ class TestReclaimPredicates:
     """The reclaim and teardown predicates across the guard combinations."""
 
     async def _reclaim_worker(self):  # noqa: ANN202
+        """Slot 3 is the follower's ready seat ("queued"). The head ("other") has no lane holding its model."""
         unloading = _slot(2, model="queued")
         unloading.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM  # type: ignore[attr-defined]
         scheduler, _ = await _worker(
@@ -266,7 +267,7 @@ class TestReclaimPredicates:
                 2: unloading,
                 3: _slot(3, model="queued"),
             },
-            pending=["queued", "other"],
+            pending=["other", "queued"],
             in_progress=["busy"],
         )
         return scheduler.snapshot()
@@ -280,13 +281,19 @@ class TestReclaimPredicates:
             )
             for make_room in (None, "resident", "other")
         }
-        # The busy, unloading and affordable queued-lookahead slots are never candidates for a follower, so
-        # the target's own resident model is the only one an "other" load may displace.
+        # The busy, unloading and ready-seat slots are never candidates for a follower, so the target's own
+        # resident model is the only one an "other" load may displace.
         assert reclaimable == {None: False, "resident": False, "other": True}
 
     async def test_the_head_overrides_the_lookahead_guard(self) -> None:
-        """A queued model's idle copy is spared for a follower but reclaimable for the head."""
+        """A follower's ready seat is spared for a follower's reclaim but reclaimable for the head escalation.
+
+        `pricing.sweep_spares_idle_copy` keeps every pending job's ready seat for an ordinary sweep, and under the
+        escalation only the seat the head itself claims. The head here claims none, so the follower's seat yields
+        to the starved head, which has priority for the room.
+        """
         snapshot = await self._reclaim_worker()
+        assert 3 in pricing.ready_seat_process_ids(snapshot)
         assert pricing.has_reclaimable_idle_model(snapshot, 3, for_head_of_queue=False, device_index=None) is True
         assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is True
         assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=False, device_index=None) is False
@@ -354,13 +361,38 @@ class TestReclaimPredicates:
         assert pricing.has_reclaimable_idle_tenancy(snapshot, "head", 0, device_index=None) is True
         assert pricing.has_reclaimable_idle_tenancy(snapshot, "head", 2, device_index=None) is False
 
-    async def test_lookahead_affordability_matches(self) -> None:
-        """The static lookahead fit reads the same head and the same reserve."""
-        scheduler, _ = await _worker(slots={0: _slot(0, model="resident")}, pending=["head"])
-        snapshot = scheduler.snapshot()
-        assert pricing.coresident_lookahead_affordable(snapshot, "resident", device_index=None) is (
-            scheduler._coresident_lookahead_affordable("resident", device_index=None)  # type: ignore[attr-defined]
-        )
+    async def test_lookahead_affordability_matches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The static lookahead fit, and the predicate and the sweep agree on the copy it decides.
+
+        This row specifies the function. A lookahead copy fits while the card total less the reserve, the head's
+        sampling peak and the copy's footprint stays at or above zero. A queued copy with no ready seat (its job
+        held by a dispatch gate) is spared exactly while it fits, and `pricing.has_reclaimable_idle_model` offers it
+        exactly when `unload_models_from_vram` evicts it, because both ask `pricing.sweep_spares_idle_copy`.
+        """
+        footprint_mb = 6000.0
+        monkeypatch.setattr(pricing, "predict_job_footprint_mb", lambda job, baseline: footprint_mb)
+        for head_peak_mb in (2000.0, 9000.0):
+            monkeypatch.setattr(pricing, "predict_job_sampling_vram_mb", lambda job, baseline, peak=head_peak_mb: peak)
+            lookahead_holder = _slot(1, model="lookahead")
+            scheduler, jobs = await _worker(
+                slots={0: _slot(0, model=None), 1: lookahead_holder},
+                pending=["head", "lookahead"],
+            )
+            scheduler._dispatch_holds.note_pp_defer(str(jobs[1].id_), deferred=True)  # type: ignore[attr-defined]
+            snapshot = scheduler.snapshot()
+            total_mb = snapshot.card(None).total_vram_mb
+            assert total_mb is not None
+            fits = total_mb - snapshot.vram_reserve_mb - head_peak_mb - footprint_mb >= 0
+            assert fits is (head_peak_mb == 2000.0), "the two peaks straddle the card's room"
+            assert pricing.ready_seat_process_ids(snapshot) == frozenset()
+
+            assert pricing.coresident_lookahead_affordable(snapshot, "lookahead", device_index=None) is fits
+            assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=False, device_index=None) is (
+                not fits
+            )
+            assert scheduler.unload_models_from_vram(scheduler._process_map[0], under_pressure=True) is (not fits)
+            evicted = lookahead_holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM  # type: ignore[attr-defined]
+            assert evicted is (not fits)
 
 
 _FLUX = KNOWN_IMAGE_GENERATION_BASELINE.flux_1

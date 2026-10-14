@@ -1201,7 +1201,16 @@ class HordeInferenceProcess(HordeProcess):
             )
             if not self._first_step_report_sent:
                 self._first_step_report_sent = True
+                # The report runs on the sampler thread between the first and second steps. Its device reads
+                # do not synchronise the stream, but the private-RAM read walks the process's mappings, which
+                # on Linux grows with the checkpoints mapped into the process. The cost lands in the second
+                # step's rate sample, so it is timed here.
+                report_started_at = time.perf_counter()
                 self._send_inference_memory_report()
+                logger.debug(
+                    f"First-step memory report took {(time.perf_counter() - report_started_at) * 1000:.1f} ms "
+                    "on the sampler thread",
+                )
         else:
             self.send_heartbeat_message(
                 heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,

@@ -3,10 +3,11 @@
 Both reclaim mechanisms pick a victim from the live pool, and both sit on paths where a wrong pick
 manufactures the very stall they exist to relieve:
 
-- `InferenceScheduler.unload_models_from_vram` frees room for an incoming load. Its ``next_model``
-  guard is what keeps it from evicting the model the queue is about to dispatch, so the head's own
-  weights are never dropped out from under it by the reclaim running on its behalf. The head-of-queue
-  escalation deliberately overrides that guard, because by then the head has priority for the room.
+- `InferenceScheduler.unload_models_from_vram` frees room for an incoming load. Which idle copy it leaves in
+  place is decided by `pricing.sweep_spares_idle_copy`. A ready seat (an idle lane holding a model a pending
+  job can start on this cycle) is spared, because dispatch seats that job there later in the same cycle and
+  unloading it only buys a reload. The head-of-queue escalation keeps only the head's own seat and overrides
+  every other sparing, because by then the head has priority for the room.
 - `InferenceScheduler._replace_stale_ram_unload_process` cycles an idle slot whose allocator retained
   a freed model's pages, the only way to return that RAM to the OS. Its preconditions (idle,
   model-less, most recently told to unload from RAM, above the retention threshold) are each a guard
@@ -26,7 +27,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import MEMORY_REPORT_INTERVAL_SECONDS
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
-from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import FRESH_INFERENCE_CHILD_BASELINE_MB
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -44,10 +45,10 @@ _RETAINED_BYTES = 16 * 1024 * 1024 * 1024
 
 
 class TestVramUnloadNextModelGuard:
-    """The gentle VRAM reclaim spares the model the queue is about to need; the escalation may not."""
+    """The VRAM sweep spares a ready seat for the head, and the escalation overrides a follower's seat."""
 
-    def _scheduler_with_resident(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
-        """A requester slot plus a sibling holding the queue's next model resident."""
+    async def _scheduler_with_resident(self, queued_models: list[str]):  # noqa: ANN202
+        """Return a requester slot and a sibling holding the next model, over a real queue of ``queued_models``."""
         requester = make_mock_process_info(1, model_name=None)
         sibling = make_mock_process_info(2, model_name=_NEXT_MODEL)
         process_map = ProcessMap({1: requester, 2: sibling})
@@ -65,25 +66,31 @@ class TestVramUnloadNextModelGuard:
             max_concurrent=2,
             max_inference=2,
         )
-        monkeypatch.setattr(scheduler._job_tracker, "next_models", lambda n: [_NEXT_MODEL])
+        for model in queued_models:
+            await track_popped_job_async(scheduler._job_tracker, make_job_pop_response(model))
         return scheduler, requester, sibling
 
-    def test_gentle_reclaim_spares_the_next_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Without the head escalation, the resident copy of the next queued model is not evicted.
+    async def test_gentle_reclaim_spares_the_next_model(self) -> None:
+        """A lane holding the queue head's model is spared as the head's ready seat, by both sweeps.
 
-        Evicting it would trade one deferred load for two: the incoming model gains room by unloading
-        weights the very next dispatch must immediately reload.
+        Dispatch seats the head on that lane later in the same cycle with no load. Evicting the copy trades one
+        deferred load for two: the incoming model gains room by unloading weights the very next dispatch must
+        immediately reload. The head escalation keeps this seat too, since it is the head's own.
         """
-        scheduler, requester, sibling = self._scheduler_with_resident(monkeypatch)
+        scheduler, requester, sibling = await self._scheduler_with_resident([_NEXT_MODEL])
+        assert sibling.process_id in pricing.ready_seat_process_ids(scheduler.snapshot())
 
         freed = scheduler.unload_models_from_vram(requester, under_pressure=True)
+        freed_for_head = scheduler.unload_models_from_vram(requester, under_pressure=True, for_head_of_queue=True)
 
         assert freed is False
+        assert freed_for_head is False
         assert sibling.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
-    def test_head_escalation_may_evict_the_next_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """CONTROL: the head-of-queue escalation overrides the guard; the head has priority for room."""
-        scheduler, requester, sibling = self._scheduler_with_resident(monkeypatch)
+    async def test_head_escalation_may_evict_the_next_model(self) -> None:
+        """CONTROL: the head-of-queue escalation overrides a follower's ready seat, since the head has priority."""
+        scheduler, requester, sibling = await self._scheduler_with_resident([_OTHER_MODEL, _NEXT_MODEL])
+        assert sibling.process_id in pricing.ready_seat_process_ids(scheduler.snapshot())
 
         freed = scheduler.unload_models_from_vram(requester, under_pressure=True, for_head_of_queue=True)
 
@@ -92,7 +99,7 @@ class TestVramUnloadNextModelGuard:
 
 
 class TestVramUnloadSparesEveryLookaheadModel:
-    """Every model in the queue lookahead keeps its resident copy under gentle reclaim.
+    """Every queued model with a ready seat keeps its resident copy under gentle reclaim.
 
     The guard is set membership, not a single element: with several distinct models queued, sparing
     only one of them (as an order-dependent pick would) evicts weights another queued job must
@@ -101,7 +108,8 @@ class TestVramUnloadSparesEveryLookaheadModel:
 
     _UNQUEUED_MODEL = "AlbedoBase XL (SDXL)"
 
-    def _scheduler_with_three_residents(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
+    async def _scheduler_with_three_residents(self):  # noqa: ANN202
+        """Return lanes holding the head's model, a follower's model and an unqueued model, with both jobs queued."""
         requester = make_mock_process_info(1, model_name=None)
         head_holder = make_mock_process_info(2, model_name=_NEXT_MODEL)
         tail_holder = make_mock_process_info(3, model_name=_OTHER_MODEL)
@@ -115,13 +123,17 @@ class TestVramUnloadSparesEveryLookaheadModel:
             max_concurrent=2,
             max_inference=4,
         )
-        monkeypatch.setattr(scheduler._job_tracker, "next_models", lambda n: [_NEXT_MODEL, _OTHER_MODEL])
-        return scheduler, requester, head_holder, tail_holder, idle_holder
+        head_job = make_job_pop_response(_NEXT_MODEL)
+        tail_job = make_job_pop_response(_OTHER_MODEL)
+        await track_popped_job_async(scheduler._job_tracker, head_job)
+        await track_popped_job_async(scheduler._job_tracker, tail_job)
+        return scheduler, str(tail_job.id_), requester, head_holder, tail_holder, idle_holder
 
-    def test_lookahead_models_spared_unqueued_model_evicted(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Gentle reclaim leaves both queued models resident and takes the copy nothing queued wants."""
-        scheduler, requester, head_holder, tail_holder, idle_holder = self._scheduler_with_three_residents(
-            monkeypatch,
+    async def test_lookahead_models_spared_unqueued_model_evicted(self) -> None:
+        """Gentle reclaim leaves both queued models' ready seats resident and takes the copy nothing queued wants."""
+        scheduler, _, requester, head_holder, tail_holder, idle_holder = await self._scheduler_with_three_residents()
+        assert pricing.ready_seat_process_ids(scheduler.snapshot()) == frozenset(
+            {head_holder.process_id, tail_holder.process_id}
         )
 
         freed = scheduler.unload_models_from_vram(requester, under_pressure=True)
@@ -135,36 +147,42 @@ class TestVramUnloadSparesEveryLookaheadModel:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """On a card that cannot hold a queued resident alongside the head's sampling peak, evict it.
+        """On a card that cannot hold a queued copy beside the head's sampling, only a seatless copy is evicted.
 
-        Sparing the copy would force driver demand-paging during the head's sampling (silent on WDDM,
-        which keeps reporting free VRAM while saturated), costing far more than the one reload the
-        protection saves. The affordability judgment is static: reported total minus reserve minus the
-        head job's sampling peak minus the resident's weight footprint.
+        A lookahead copy with no ready seat (its job held by a dispatch gate) is spared only while it fits beside
+        the head's sampling peak. Sparing it on a card that cannot hold both forces driver demand-paging during
+        the head's sampling (silent on WDDM, which keeps reporting free VRAM while saturated), costing far more
+        than the one reload the protection saves. The affordability judgment is static: reported total minus
+        reserve minus the head job's sampling peak minus the resident's weight footprint.
+
+        The head's own ready seat is spared whatever that judgment says. Its copy is the weights the head samples
+        with once dispatch seats it there, so it is no co-resident beside the head's peak, and unloading it only
+        buys the head a reload.
         """
-        scheduler, requester, head_holder, tail_holder, idle_holder = self._scheduler_with_three_residents(
-            monkeypatch,
-        )
+        (
+            scheduler,
+            tail_job_id,
+            requester,
+            head_holder,
+            tail_holder,
+            idle_holder,
+        ) = await self._scheduler_with_three_residents()
         # A 16 GB card: peak 8258 + footprint 6600 + reserve leaves no room for co-residency.
         for process_info in (requester, head_holder, tail_holder, idle_holder):
             process_info.total_vram_mb = 16376
-        await track_popped_job_async(scheduler._job_tracker, make_job_pop_response(_NEXT_MODEL))
-        monkeypatch.setattr(
-            inference_scheduler_module,
-            "predict_job_sampling_vram_mb",
-            lambda job, baseline: 8258.0,
-        )
-        monkeypatch.setattr(
-            inference_scheduler_module,
-            "predict_job_footprint_mb",
-            lambda job, baseline: 6600.0,
-        )
+        monkeypatch.setattr(pricing, "predict_job_sampling_vram_mb", lambda job, baseline: 8258.0)
+        monkeypatch.setattr(pricing, "predict_job_footprint_mb", lambda job, baseline: 6600.0)
+        scheduler._dispatch_holds.note_pp_defer(tail_job_id, deferred=True)
+        snapshot = scheduler.snapshot()
+        assert pricing.ready_seat_process_ids(snapshot) == frozenset({head_holder.process_id})
+        assert pricing.coresident_lookahead_affordable(snapshot, _OTHER_MODEL, device_index=None) is False
 
         freed = scheduler.unload_models_from_vram(requester, under_pressure=True)
 
         assert freed is True
-        assert head_holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        assert head_holder.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
         assert tail_holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        assert idle_holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
 
 class TestStaleRamUnloadRecycleScope:

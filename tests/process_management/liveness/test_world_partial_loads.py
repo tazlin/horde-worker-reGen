@@ -2,7 +2,9 @@
 
 Each row runs one closed-loop lane on a 24 GB card and states its jobs' true footprints, so the child's shortfall
 arithmetic, and not the parent's forecast, decides what reaches the card. The rows read the world's own records:
-each job's window, the lane's host-RAM remainder between jobs, and the support components the lane holds.
+each job's window, the lane's host-RAM remainder between jobs, and the support components the lane holds. Further
+rows cover what funds an activation and a decode spike, the encoder released before the clearance wait, and the
+activation reserve a grant carries into the load.
 """
 
 from __future__ import annotations
@@ -203,12 +205,13 @@ async def test_a_decode_unloads_the_lanes_own_weights_and_the_next_job_returns_t
 
 
 async def test_a_skip_listed_model_loads_partially_beside_its_resident_encoder() -> None:
-    """Flux, cleared at a price above what its child believes is free, offloads the rest and keeps its encoder."""
+    """Flux, cleared at a price above what its child believes is free, offloads the rest and keeps its encoder.
+
+    The load keeps clear the larger of the child's margin and the activation reserve its grant carried.
+    """
     support_mb = _support_component_mb(_FLUX)
     weights_mb = 19_000.0
     believed_free_mb = _LANE_ROOM_MB - support_mb
-    offload_mb = weights_mb + _CHILD_FREE_MARGIN_MB - believed_free_mb
-    assert offload_mb > 0.0, "the stated weights fit beside the encoder, so the row would show no partial load"
     world = _one_lane_world(
         true_footprint_mb=_stated(weights_mb, 500.0),
         phase_resident_components=True,
@@ -217,13 +220,17 @@ async def test_a_skip_listed_model_loads_partially_beside_its_resident_encoder()
 
     (served,) = await _serve_streak(world, [_job(_FLUX)])
 
+    margin_mb = served.window.load_margin_mb
+    assert margin_mb is not None and margin_mb >= _CHILD_FREE_MARGIN_MB
+    offload_mb = weights_mb + margin_mb - believed_free_mb
+    assert offload_mb > 0.0, "the stated weights fit beside the encoder, so the row would show no partial load"
     assert world.clearance_grants, "the job was never cleared, so the row says nothing about a clear"
     assert served.window.load_believed_free_mb == pytest.approx(believed_free_mb)
     assert served.window.load_offloaded_mb == pytest.approx(offload_mb), (
         f"the child left {served.window.load_offloaded_mb} MB in host RAM, not the {offload_mb} MB its believed "
         "free less the margin could not take"
     )
-    assert served.window.load_moved_mb == pytest.approx(believed_free_mb - _CHILD_FREE_MARGIN_MB)
+    assert served.window.load_moved_mb == pytest.approx(believed_free_mb - margin_mb)
     assert served.support_while_sampling_mb == pytest.approx(support_mb), (
         f"the lane held {served.support_while_sampling_mb} MB of support components while Flux sampled, not its "
         f"whole {support_mb} MB encoder and VAE"
@@ -384,3 +391,156 @@ async def test_a_stage_beside_retained_weights_unloads_them_and_the_next_load_re
         "the lane held in host RAM after the stage"
     )
     assert not world.card_overcommits, f"the card was over-committed: {world.card_overcommits[:3]}"
+
+
+_ACTIVATION_SPARE_MB = 200.0
+"""Free VRAM beyond the child's margin that the weight load leaves, so the activation finds a shortfall."""
+
+
+async def test_an_activation_is_funded_from_the_support_components_before_the_weights() -> None:
+    """An activation the believed free does not cover releases the encoder and VAE before any diffusion weights.
+
+    ComfyUI's sampling load frees the process's other models before it partially unloads the diffusion model it
+    samples with, so the activation's shortfall comes out of the support tenant while the tenant can cover it.
+    """
+    support_mb = _support_component_mb(_SDXL)
+    transient_mb = 1000.0
+    weights_mb = _LANE_ROOM_MB - support_mb - _CHILD_FREE_MARGIN_MB - _ACTIVATION_SPARE_MB
+    activation_shortfall_mb = transient_mb - _ACTIVATION_SPARE_MB
+    assert 0.0 < activation_shortfall_mb < support_mb
+    world = _one_lane_world(true_footprint_mb=_stated(weights_mb, transient_mb), phase_resident_components=True)
+
+    (served,) = await _serve_streak(world, [_job(_SDXL)])
+
+    assert served.window.load_offloaded_mb == 0.0, "the weight load was already short of room"
+    assert served.support_while_sampling_mb == pytest.approx(support_mb - activation_shortfall_mb), (
+        f"the lane held {served.support_while_sampling_mb} MB of support components while sampling, not the "
+        f"{support_mb - activation_shortfall_mb} MB left after funding a {activation_shortfall_mb} MB shortfall"
+    )
+    assert not any("own weights to fund" in line for line in world.child_shortfall_frees), (
+        f"the activation returned diffusion weights while the support tenant could fund it: "
+        f"{world.child_shortfall_frees}"
+    )
+    assert served.window.activation_support_released_mb == pytest.approx(activation_shortfall_mb)
+
+
+async def test_an_encoder_released_before_the_wait_leaves_no_support_tenant() -> None:
+    """With the release modelled, a staged lane waits holding no encoder, and its commit charges no tenant.
+
+    hordelib's sampling lease hook returns the text encoder to its CPU origins after the encode and before the
+    first acquire, so neither the encode's allocation nor a support tenant is on the card while the job waits
+    or samples.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=2,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        true_footprint_mb=_stated(6000.0, 1000.0),
+        phase_resident_components=True,
+        clearance_lease=True,
+        partial_loads=True,
+        text_encoder_released_before_wait=True,
+    )
+
+    (served,) = await _serve_streak(world, [_job(_SDXL)])
+
+    assert world.clearance_grants, "the job was never cleared, so the row says nothing about a clear"
+    assert served.window.support_released_before_wait_mb == pytest.approx(staging_charge_mb(str(_SDXL.baseline)))
+    assert served.support_while_sampling_mb == 0.0, (
+        f"the lane held {served.support_while_sampling_mb} MB of support components while sampling, after its "
+        "encoder left the card before the wait"
+    )
+    assert not world._encode_staging_mb, f"a staged lane still holds an encode: {world._encode_staging_mb}"
+
+
+def test_the_encoder_release_needs_the_lease_and_the_support_tenant() -> None:
+    """The release runs in the sampling lease hook and frees the support tenant, so a world without them refuses it."""
+    with pytest.raises(ValueError, match="encoder release"):
+        _DispatchWorld(
+            card=_CARD_24GB,
+            lane_count=1,
+            max_threads=1,
+            queue_depth=2,
+            closed_loop=True,
+            partial_loads=True,
+            phase_resident_components=True,
+            text_encoder_released_before_wait=True,
+        )
+
+
+async def test_a_partial_load_leaves_the_grants_activation_reserve() -> None:
+    """A skip-listed load cleared under the lease leaves the reserve its grant carried in place of the child's margin.
+
+    The grant carries the activation reserve the parent priced the window with, and hordelib raises ComfyUI's
+    partial sizing to it, so the load leaves that room for the activation in place of the child's smaller estimate.
+    """
+    weights_mb = 25_000.0
+    world = _one_lane_world(true_footprint_mb=_stated(weights_mb, 500.0), clearance_lease=True)
+    job = _job(_FLUX)
+    job_id = str(job.id_)
+    await world.pop(job)
+    granted_reserve_mb: float | None = None
+    for _ in range(_MAX_TICKS):
+        await world.step()
+        granted_reserve_mb = world._granted_sampling_reserve_mb.get(job_id, granted_reserve_mb)
+        if world.completed_jobs == 1:
+            break
+
+    window = world.job_windows[job_id]
+    assert world.clearance_grants, "the job was never cleared, so the row says nothing about a grant"
+    assert granted_reserve_mb is not None, "the grant carried no activation reserve"
+    assert granted_reserve_mb > _CHILD_FREE_MARGIN_MB, (
+        f"the grant's {granted_reserve_mb:.0f} MB reserve is within the child's margin, so the row proves nothing"
+    )
+    assert window.load_margin_mb == pytest.approx(granted_reserve_mb)
+    assert window.load_believed_free_mb is not None
+    assert window.load_moved_mb == pytest.approx(window.load_believed_free_mb - granted_reserve_mb), (
+        f"the load moved {window.load_moved_mb:.0f} MB into {window.load_believed_free_mb:.0f} MB believed free, "
+        f"not leaving the granted {granted_reserve_mb:.0f} MB reserve"
+    )
+
+
+_DECODE_FOREIGN_TICK = 3
+"""The tick a foreign tenant takes the card, after the job's load committed and before its decode."""
+_DECODE_STATED_WEIGHTS_MB = 2000.0
+"""Weights small enough that the decode spike's shortfall outlasts them."""
+
+
+async def test_a_decode_with_too_few_weights_left_takes_the_support_components() -> None:
+    """A decode spike the lane's own weights cannot fund releases its encoder instead of over-committing the card.
+
+    A foreign tenant arrives while the job samples and leaves the lane exactly its margin free. The decode then
+    unloads all of the lane's weights and funds the rest from the support tenant, as ComfyUI's free-memory pass
+    unloads a resident text encoder to fit the VAE's working set.
+    """
+    probe = _job(_FLUX)
+    decode_spike_mb = predict_job_decode_spike_mb(probe, str(_FLUX.baseline))
+    assert decode_spike_mb is not None
+    support_mb = _support_component_mb(_FLUX)
+    support_needed_mb = decode_spike_mb - _DECODE_STATED_WEIGHTS_MB
+    assert 0.0 < support_needed_mb < support_mb
+    foreign_mb = _LANE_ROOM_MB - support_mb - _DECODE_STATED_WEIGHTS_MB - _CHILD_FREE_MARGIN_MB
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=1,
+        max_threads=1,
+        queue_depth=2,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        true_footprint_mb=_stated(_DECODE_STATED_WEIGHTS_MB, 0.0),
+        phase_resident_components=True,
+        partial_loads=True,
+        foreign_vram_mb_by_tick={_DECODE_FOREIGN_TICK: foreign_mb},
+    )
+
+    (served,) = await _serve_streak(world, [probe])
+
+    assert served.window.sample_until is not None
+    assert served.window.sample_until > _DECODE_FOREIGN_TICK * _TICK_SECONDS, "the decode began before the tenant"
+    assert served.window.load_offloaded_mb == 0.0, "the load was already short of room"
+    assert served.window.decode_unloaded_mb == pytest.approx(_DECODE_STATED_WEIGHTS_MB)
+    assert not world.card_overcommits, f"the card was over-committed: {world.card_overcommits[:3]}"
+    assert served.window.decode_support_released_mb == pytest.approx(support_needed_mb)

@@ -20,6 +20,7 @@ means the same thing in both places.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -90,6 +91,55 @@ def jobs_per_simulated_hour(world: _DispatchWorld) -> float:
     """Return the completed-job rate the run achieved, in jobs per simulated hour."""
     elapsed = max(1e-9, world.now - world.started_at)
     return world.completed_jobs * 3600.0 / elapsed
+
+
+def kudos_per_simulated_hour(world: _DispatchWorld, kudos_by_job: Mapping[str, float]) -> float:
+    """Return the kudos the run's completed jobs earned per simulated hour.
+
+    The world prices nothing, so a row states each job's kudos (a replay passes the live figure) and the rate is
+    their sum over completed jobs. A completed job with no figure adds nothing.
+    """
+    elapsed = max(1e-9, world.now - world.started_at)
+    earned = sum(kudos_by_job.get(job_id, 0.0) for job_id in world.completed_job_ids)
+    return earned * 3600.0 / elapsed
+
+
+@dataclass(frozen=True)
+class ModelLoadTotals:
+    """Represents one model's device loads over a run, read off its job windows."""
+
+    model: str
+    loads: int
+    """Jobs that paid a load, either a fresh load of their weights or a return of weights left in host RAM."""
+    load_seconds: float
+    """The seconds those loads took, the world's counterpart of the live ``ram_to_vram`` phase."""
+    moved_mb: float
+    """The weights the loads put on the card under ``partial_loads``, and zero without it."""
+    partial_loads: int
+    """Loads whose child left part of the weights in host RAM (``load_offloaded_mb`` above zero)."""
+
+
+def load_totals_by_model(world: _DispatchWorld) -> list[ModelLoadTotals]:
+    """Return each model's device loads over the run, the model with the most load seconds first.
+
+    A window counts as a load when it paid a fresh load or returned offloaded weights, as
+    :meth:`_DispatchWorld._report_device_load` reports one, and as a partial load when its child offloaded.
+    """
+    loads: dict[str, list[_JobWindow]] = {}
+    for window in world.job_windows.values():
+        if window.loaded_now or window.load_returned_mb > 0.0:
+            loads.setdefault(window.model, []).append(window)
+    totals = [
+        ModelLoadTotals(
+            model=model,
+            loads=len(windows),
+            load_seconds=sum(window.load_seconds for window in windows),
+            moved_mb=sum(window.load_moved_mb for window in windows),
+            partial_loads=sum(1 for window in windows if window.load_offloaded_mb > 0.0),
+        )
+        for model, windows in loads.items()
+    ]
+    return sorted(totals, key=lambda total: -total.load_seconds)
 
 
 PREPARING_LANE_STATES = frozenset(

@@ -2,7 +2,8 @@
 
 Each knob is off by default, so every other row runs on the classes, predictors and rates the world carries. A
 row here sets one knob on a one-lane card and reads back from the world's own records that the card was charged,
-or the job was timed, as the knob stated.
+or the job was timed, as the knob stated. The lane start latency is read on a two-lane pool, since it applies to a
+lane the pool regrows.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
@@ -214,3 +216,50 @@ async def test_a_seeded_store_is_the_parents_prior_and_keeps_learning() -> None:
 
     assert store.observation_count(seed_key) == 1, "the seeded observation did not survive the run"
     assert len(store) > 1, "the children's reports never reached the seeded store"
+
+
+def _lane_state(world: _DispatchWorld, lane_id: int) -> HordeProcessState:
+    """Return the state the world's process map holds for ``lane_id``."""
+    return world._process_map[lane_id].last_process_state
+
+
+@pytest.mark.parametrize("lane_start_seconds", [0.0, 3.0], ids=["instant", "three_seconds"])
+async def test_a_regrown_lane_charges_its_context_once_started(lane_start_seconds: float) -> None:
+    """A regrown lane is starting, with no context on the card, until its start latency has passed.
+
+    A live process passes ``PROCESS_STARTING`` before its CUDA context exists, so the card carries the lane only
+    once the start completes. Zero, the default, adds the lane waiting for jobs with its context charged at once.
+    """
+    world = _DispatchWorld(
+        card=_CARD_24GB,
+        lane_count=2,
+        max_threads=1,
+        queue_depth=2,
+        closed_loop=True,
+        tick_seconds=_TICK_SECONDS,
+        lane_start_seconds=lane_start_seconds,
+    )
+    two_lane_committed_mb = world.card_committed_mb(_CARD_INDEX)
+    assert world.scale_inference_processes(1) == 1
+    one_lane_committed_mb = world.card_committed_mb(_CARD_INDEX)
+    assert one_lane_committed_mb < two_lane_committed_mb
+    kept = set(world.inference_lane_ids())
+    assert world.scale_inference_processes(2) == 2
+    (regrown,) = set(world.inference_lane_ids()) - kept
+
+    if lane_start_seconds == 0.0:
+        assert _lane_state(world, regrown) == HordeProcessState.WAITING_FOR_JOB
+        assert world.card_committed_mb(_CARD_INDEX) == pytest.approx(two_lane_committed_mb)
+        return
+    assert _lane_state(world, regrown) == HordeProcessState.PROCESS_STARTING
+    assert world.card_committed_mb(_CARD_INDEX) == pytest.approx(one_lane_committed_mb), (
+        "a lane still starting was charged its context"
+    )
+    started_at = world.now + lane_start_seconds
+    while world.now < started_at - _TICK_SECONDS / 2:
+        await world.step()
+        if world.now < started_at - _TICK_SECONDS / 2:
+            assert _lane_state(world, regrown) == HordeProcessState.PROCESS_STARTING
+            assert world.card_committed_mb(_CARD_INDEX) == pytest.approx(one_lane_committed_mb)
+    assert _lane_state(world, regrown) == HordeProcessState.WAITING_FOR_JOB, f"{world.state_dump()}"
+    assert world.card_committed_mb(_CARD_INDEX) == pytest.approx(two_lane_committed_mb)
