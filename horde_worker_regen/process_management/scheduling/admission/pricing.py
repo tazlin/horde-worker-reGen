@@ -511,8 +511,14 @@ def partial_seat_activation_mb(
 ) -> float | None:
     """Return the non-weight memory (MB) a whole job needs, or None when its weights or peak cannot be predicted.
 
-    The static seed is the sampler-only peak less the weights, raised by the learned activation watermark for
-    the job's key. The learned figure carries the VAE and the encoded conditioning the seed leaves out.
+    The figure is the measured activation of the job's class, else of its pooled band, once that window holds
+    enough jobs (:meth:`LearnedFootprintStore.measured_job_estimate_net_of_context_mb`). Until then it is the
+    static seed, the sampler-only peak less the weights. The measured figure carries the VAE and the encoded
+    conditioning the seed leaves out, and it may fall below the seed.
+
+    The key's raise-only watermark is never read here. A grant carries this figure as room the child's load must
+    leave free, so one reading that also held streamed weights or another model's cache would hold that room
+    free on every later grant and force partial loads.
     """
     weights_mb = predict_job_weight_mb(job, baseline)
     sampler_only_mb = predict_job_sampler_only_vram_mb(job, baseline)
@@ -523,7 +529,8 @@ def partial_seat_activation_mb(
     key = sampling_footprint_key(job, baseline, stage=FootprintStage.SAMPLE_ACTIVATION)
     if store is None or key is None:
         return static_seed_mb
-    return store.estimate_mb(key, static_seed_mb=static_seed_mb)
+    measured_mb = store.measured_job_estimate_net_of_context_mb(key, job_class_key(key, job))
+    return static_seed_mb if measured_mb is None else measured_mb
 
 
 def _sampling_non_weight_mb(
@@ -545,10 +552,11 @@ def sampling_reserve_mb(
 ) -> float | None:
     """Return the non-weight memory (MB) a job's sampling window is priced with, or None when there is none.
 
-    The term :func:`partial_seat_mb` adds to the weights it seats: the learned activation where the job's key
-    has one, raised to ComfyUI's inference reserve, and the reserve alone when the job's activation cannot be
-    predicted. A clearance grant carries it to the child, whose partial load would otherwise leave only
-    ComfyUI's activation estimate. None when the card's total is unknown and nothing is predicted.
+    The term :func:`partial_seat_mb` adds to the weights it seats is the job's activation
+    (:func:`partial_seat_activation_mb`) raised to ComfyUI's inference reserve, or the reserve alone when the
+    job's activation cannot be predicted. A clearance grant carries it to the child, whose partial load would
+    otherwise leave only ComfyUI's activation estimate. None when the card's total is unknown and nothing is
+    predicted.
     """
     non_weight_mb = _sampling_non_weight_mb(
         snapshot, partial_seat_activation_mb(snapshot, job, baseline), device_index=device_index

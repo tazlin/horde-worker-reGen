@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.config.worker_state import WorkerStat
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.message_dispatcher import (
     _RESIDENT_OBSERVATION_SETTLE_SECONDS,
+    _WHOLE_WEIGHTS_TOLERANCE_FRACTION,
     MessageDispatcher,
 )
 from horde_worker_regen.process_management.ipc.messages import (
@@ -41,6 +42,8 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     platform_context_constant_mb,
+    predict_job_sampler_only_vram_mb,
+    predict_job_weight_mb,
     predict_model_weight_mb,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
@@ -690,11 +693,7 @@ def _activation_key() -> FootprintKey:
 
 
 async def test_a_jobs_activation_is_its_sampling_peak_less_its_resident_weights() -> None:
-    """The job's sampling peak less the weights its footprint reports lands under the activation key.
-
-    A partially loaded checkpoint's peak carries only the weights that fit, so the peak less those weights is
-    the non-weight memory the job needed, whatever share of the file was on the card.
-    """
+    """A job that sampled with its weights whole records its sampling peak less those weights as its activation."""
     process_info = make_mock_process_info(1, model_name=_MODEL)
     job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
     process_info.record_inference_ownership(job, attempt_ordinal=1)
@@ -713,6 +712,81 @@ async def test_a_jobs_activation_is_its_sampling_peak_less_its_resident_weights(
     observation = store.get_observation(_activation_key())
     assert observation is not None
     assert observation.watermark_mb == pytest.approx(4500.0)
+
+
+async def _commit_one_job(*, peak_mb: int, peak_resident_weights_mb: float) -> LearnedFootprintStore:
+    """Run one 1024-pixel job to its commit with the given sampling peak and measured resident weights."""
+    process_info = make_mock_process_info(1, model_name=_MODEL)
+    job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+    process_info.record_inference_ownership(job, attempt_ordinal=1)
+    job_tracker = JobTracker()
+    await mark_job_in_progress_async(job_tracker, job)
+    store = LearnedFootprintStore()
+    dispatcher = _dispatcher_with_store(
+        process_map=ProcessMap({1: process_info}), job_tracker=job_tracker, store=store
+    )
+    dispatcher._handle_memory_report(_memory_message(1, peak_mb=peak_mb))
+    dispatcher._observe_job_footprint(
+        _job_metrics_message(str(job.id_), peak_resident_weights_mb=peak_resident_weights_mb)
+    )
+    assert job.id_ is not None
+    dispatcher._commit_job_sampling_peak(job.id_)
+    return store
+
+
+def _job_weight_and_sampler_only_seed_mb() -> tuple[float, float]:
+    """The predicted core weights and static sampler-only seed of the 1024-pixel ``_MODEL`` job."""
+    job = make_job_pop_response(model=_MODEL, width=1024, height=1024)
+    weights_mb = predict_job_weight_mb(job, str(_BASELINE))
+    sampler_only_mb = predict_job_sampler_only_vram_mb(job, str(_BASELINE))
+    assert weights_mb is not None and sampler_only_mb is not None
+    return weights_mb, sampler_only_mb
+
+
+async def test_a_partially_loaded_job_records_no_activation() -> None:
+    """A job holding a share of its weights teaches its sampling key and nothing about its activation.
+
+    Its peak less the small resident share would also count the weights it streamed and whatever else the
+    process held, and the grant's reserve is priced from the activation window.
+    """
+    weights_mb, _sampler_only_mb = _job_weight_and_sampler_only_seed_mb()
+    store = await _commit_one_job(peak_mb=11000, peak_resident_weights_mb=weights_mb * 0.4)
+
+    assert store.get_observation(_activation_key()) is None
+    assert store.get_observation(_activation_key().for_job_class(batch=1, hires_fix=False)) is None
+    assert len(store) == 2
+
+
+@pytest.mark.parametrize(
+    ("resident_share", "records_activation"),
+    [
+        pytest.param(1.0 - _WHOLE_WEIGHTS_TOLERANCE_FRACTION, True, id="at-the-whole-floor"),
+        pytest.param(1.0 - 2 * _WHOLE_WEIGHTS_TOLERANCE_FRACTION, False, id="below-the-whole-floor"),
+    ],
+)
+async def test_whole_residency_is_judged_against_the_predicted_weights(
+    resident_share: float, records_activation: bool
+) -> None:
+    """Resident weights within the tolerance of the prediction count as whole; further below, as partial."""
+    weights_mb, _sampler_only_mb = _job_weight_and_sampler_only_seed_mb()
+    store = await _commit_one_job(peak_mb=8000, peak_resident_weights_mb=weights_mb * resident_share)
+
+    assert (store.get_observation(_activation_key()) is not None) is records_activation
+
+
+async def test_an_activation_above_the_jobs_sampler_only_seed_is_dropped() -> None:
+    """The non-weight part of a job cannot exceed the whole job's seed, so a reading above it is not learned.
+
+    The sampling key still learns the peak, which its ceiling admits.
+    """
+    weights_mb, sampler_only_mb = _job_weight_and_sampler_only_seed_mb()
+    store = await _commit_one_job(
+        peak_mb=int(weights_mb + sampler_only_mb + 100.0), peak_resident_weights_mb=weights_mb
+    )
+
+    assert store.get_observation(_activation_key()) is None
+    assert store.get_observation(_activation_key().for_job_class(batch=1, hires_fix=False)) is None
+    assert store.get_observation(_activation_key().model_copy(update={"stage": FootprintStage.SAMPLE})) is not None
 
 
 async def test_a_job_without_a_measured_footprint_records_no_activation() -> None:

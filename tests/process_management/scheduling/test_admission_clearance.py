@@ -29,6 +29,13 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     ActuatorCommandKind,
 )
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    FootprintKey,
+    FootprintStage,
+    LearnedFootprintStore,
+    job_class_key,
+    sampling_footprint_key,
+)
 from horde_worker_regen.process_management.scheduling.admission import clearance as clearance_module
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.admission.clearance import (
@@ -1110,6 +1117,81 @@ async def test_the_clearance_waiter_carries_its_jobs_sampling_reserve() -> None:
 
     assert [row.process_id for row in inputs.staged_waiters] == [0]
     assert inputs.staged_waiters[0].sampling_reserve_mb == pytest.approx(_expected_sampling_reserve_mb(scheduler, job))
+
+
+_CARD_SIZED_ACTIVATION_MB = 16000.0
+"""An activation reading that once raised the key's watermark to nearly the whole card."""
+
+
+def _seed_activation_window(
+    scheduler: InferenceScheduler, job: ImageGenerateJobPopResponse, readings_mb: list[float]
+) -> tuple[LearnedFootprintStore, FootprintKey, FootprintKey]:
+    """Give the scheduler a store whose activation keys for ``job`` have seen ``readings_mb``, oldest first."""
+    store = LearnedFootprintStore()
+    key = sampling_footprint_key(job, str(_KREA2_BASELINE), stage=FootprintStage.SAMPLE_ACTIVATION)
+    assert key is not None
+    class_key = job_class_key(key, job)
+    for reading_mb in readings_mb:
+        store.observe_job_peak(key, class_key, reading_mb)
+    scheduler.set_footprint_store(store)
+    return store, key, class_key
+
+
+async def test_the_activation_prices_from_the_measured_window_not_the_watermark() -> None:
+    """A card-sized reading keeps the watermark at 16 GB, yet the window of 1 to 3 GB jobs sets the reserve.
+
+    The grant carries the reserve as room the child's load leaves free, so pricing it at the watermark would
+    force every later load of the key to be partial.
+    """
+    scheduler, job, waiter = await _krea2_staged_waiter()
+    window_mb = [1000.0 + 100.0 * index for index in range(20)]
+    store, key, class_key = _seed_activation_window(scheduler, job, [_CARD_SIZED_ACTIVATION_MB, *window_mb])
+    snapshot = scheduler.snapshot()
+    baseline = str(_KREA2_BASELINE)
+    observation = store.get_observation(class_key)
+    assert observation is not None and observation.watermark_mb == _CARD_SIZED_ACTIVATION_MB
+    measured_mb = store.measured_job_estimate_net_of_context_mb(key, class_key)
+    assert measured_mb is not None
+
+    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, baseline)
+    reserve_mb = pricing.sampling_reserve_mb(snapshot, job, baseline, device_index=waiter.device_index)
+
+    assert measured_mb < observation.watermark_mb / 2
+    assert activation_mb == pytest.approx(measured_mb)
+    assert reserve_mb == pytest.approx(measured_mb)
+
+
+async def test_an_under_observed_activation_prices_at_the_static_seed() -> None:
+    """Too few jobs for a measured figure leave the seed in force, however high the watermark already reads."""
+    from horde_worker_regen.process_management.resources.resource_budget import predict_job_sampler_only_vram_mb
+
+    scheduler, job, _waiter = await _krea2_staged_waiter()
+    _seed_activation_window(scheduler, job, [_CARD_SIZED_ACTIVATION_MB, 2000.0, 2500.0])
+    baseline = str(_KREA2_BASELINE)
+    weights_mb = predict_job_weight_mb(job, baseline)
+    sampler_only_mb = predict_job_sampler_only_vram_mb(job, baseline)
+    assert weights_mb is not None and sampler_only_mb is not None
+
+    activation_mb = pricing.partial_seat_activation_mb(scheduler.snapshot(), job, baseline)
+
+    assert activation_mb == pytest.approx(max(0.0, sampler_only_mb - weights_mb))
+
+
+async def test_a_measured_activation_below_comfys_inference_reserve_is_raised_to_it() -> None:
+    """ComfyUI keeps its inference reserve free whatever the job measured, so the reserve stays the floor."""
+    from horde_worker_regen.process_management.resources.resource_budget import effective_inference_reserve_mb
+
+    scheduler, job, waiter = await _krea2_staged_waiter()
+    _seed_activation_window(scheduler, job, [200.0] * 10)
+    snapshot = scheduler.snapshot()
+    baseline = str(_KREA2_BASELINE)
+    comfy_reserve_mb = effective_inference_reserve_mb(_SIXTEEN_GB_MB, 0.0)
+    activation_mb = pricing.partial_seat_activation_mb(snapshot, job, baseline)
+    assert activation_mb is not None and activation_mb < comfy_reserve_mb
+
+    reserve_mb = pricing.sampling_reserve_mb(snapshot, job, baseline, device_index=waiter.device_index)
+
+    assert reserve_mb == pytest.approx(comfy_reserve_mb)
 
 
 async def test_the_seat_weight_share_follows_the_waiter_clocks_upload_rate_and_step_time() -> None:

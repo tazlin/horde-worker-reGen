@@ -275,9 +275,12 @@ class FootprintStage(enum.StrEnum):
     """A monolithic job's sampling peak less the weights it held on the card at its peak: the non-weight memory
     a whole job needs (activations, conditioning, the VAE once loaded beside the model, allocator cache).
 
-    Kept apart from :attr:`SAMPLE` because a partially loaded checkpoint's peak carries only the share of the
-    weights that fit, and a :attr:`SAMPLE` reading cannot be split into weights and the rest after the fact.
-    Prices the non-weight term of a partial-load seat."""
+    Kept apart from :attr:`SAMPLE` because a :attr:`SAMPLE` reading cannot be split into weights and the rest
+    after the fact. Fed only by a job that sampled with its checkpoint on the card whole, since a partially loaded
+    job's peak less its small resident share also counts the weights it streamed and whatever else the process
+    held. Prices the non-weight term of a partial-load seat and the reserve a clearance grant carries, from the
+    measured window only (:meth:`LearnedFootprintStore.measured_job_estimate_net_of_context_mb`). The watermark
+    is kept for display and prices nothing."""
     DECODE = "decode"
     """The VAE-decode stage."""
     SAFETY_CHECK = "safety_check"

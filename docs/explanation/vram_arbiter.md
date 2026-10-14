@@ -211,10 +211,15 @@ The arbiter keeps four concerns deliberately separate:
 
     The two sources meet in one more key. When a monolithic job's footprint arrives, the dispatcher keeps its
     `peak_resident_weights_mb` beside the job's running sampling peak, and the commit on the job's result also
-    records the peak less those weights under `SAMPLE_ACTIVATION`. A partially loaded checkpoint's peak
-    carries only the share of the weights that fit, so this difference is the one figure that separates the
-    job's non-weight memory (activations, conditioning, the VAE once loaded beside the model, allocator cache)
-    from however much of the file was on the card. It prices the partial-load seat below.
+    records the peak less those weights, the job's non-weight memory (activations, conditioning, the VAE once
+    loaded beside the model, allocator cache), under `SAMPLE_ACTIVATION`. Only a job that sampled with its
+    checkpoint on the card whole feeds it, judged by a resident peak at or above the job's predicted core
+    weights less 5% (`_JobSamplingPeak.sampled_with_weights_whole`). A partially loaded job's peak less its
+    small resident share also counts the weights it streamed and whatever else the process held, so it teaches
+    no activation. `sum_component_weights_mb` cannot make the judgment, since it sums each loaded component at
+    its full size whether or not all of it was resident. An activation above the job's static sampler-only seed
+    is dropped, since the non-weight part of a job cannot exceed the whole job's seed. The key prices the
+    partial-load seat and the grant's reserve below.
     A backend that reports no footprint (an older one, or a dry run) leaves the memory-report path as the
     only source for every key. The store persists to `.horde_worker_regen/vram_footprints.json` (schema-versioned,
     atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration.
@@ -1081,9 +1086,15 @@ seat = f x weights + max(activation, ComfyUI inference reserve)
   temporaries have crashed children natively in this regime), on a card the driver is not paging. Only
   clearance sets the seat, since only its grant carries the free figure the child's partial load is sized
   against. Dispatch and preload pricing are unchanged.
-- **Activation.** The static sampler-only peak less the weights, raised by the `SAMPLE_ACTIVATION`
-  watermark. ComfyUI's inference reserve (`effective_inference_reserve_mb`) is the free memory ComfyUI keeps
-  for those same activations, so the seat takes the larger of the two and adds no separate VAE term.
+- **Activation.** The measured activation of jobs that sampled whole, from the job class's `SAMPLE_ACTIVATION`
+  window, else the pooled band's, at the window's second-highest job times the measured margin once it holds
+  five jobs (`measured_job_estimate_net_of_context_mb`). Under-observed, it is the static sampler-only peak
+  less the weights. The raise-only watermark never prices it. The grant carries this term as room the child's
+  load leaves free, so a watermark raised once by a card-sized reading would hold that room on every later
+  grant and force partial loads. ComfyUI's inference reserve
+  (`effective_inference_reserve_mb`) is the free memory ComfyUI keeps for those same activations, so the seat
+  takes the larger of the two and adds no separate VAE term. The watermark stays in the store and in the duty
+  report's footprint listing for display.
 - **Weight share.** `pricing.partial_seat_weight_fraction` sizes `f` so the bus moves the offloaded share
   within one step: `f = 1 - seconds_per_step x upload_mb_per_second / weights`, clamped to
   `[PARTIAL_SEAT_MIN_WEIGHT_FRACTION, PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION]` (0.25 to 0.5). The step time is

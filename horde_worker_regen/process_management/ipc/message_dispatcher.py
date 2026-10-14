@@ -65,6 +65,8 @@ from horde_worker_regen.process_management.resources.device_memory_source import
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     platform_context_constant_mb,
+    predict_job_sampler_only_vram_mb,
+    predict_job_weight_mb,
     predict_model_weight_mb,
 )
 from horde_worker_regen.process_management.resources.vram_footprints import (
@@ -148,6 +150,13 @@ The resident footprint is the weights alone: a slot that is priming, sampling, o
 transient activation on top of them, which belongs to the sampling stages and would permanently over-price
 the resident watermark if folded into it."""
 
+_WHOLE_WEIGHTS_TOLERANCE_FRACTION = 0.05
+"""How far below the job's predicted core weights its measured resident peak may read and still count as whole.
+
+The prediction is a per-baseline seed with per-model overrides, and a checkpoint's measured resident weights sit
+within a few percent of it on either side. A partial load leaves a share of the weights off the card that is
+far larger than that."""
+
 
 @dataclass
 class _JobSamplingPeak:
@@ -161,8 +170,25 @@ class _JobSamplingPeak:
     """The highest plausible reading seen for the job so far (MB)."""
     plausible_max_mb: float | None
     """The bound the highest reading was checked against, passed on to the store at commit."""
+    predicted_weights_mb: float | None
+    """The job's predicted core diffusion weights (MB), against which its measured resident peak is judged whole."""
+    activation_ceiling_mb: float | None
+    """The job's static sampler-only seed (MB), the most its non-weight memory can plausibly be."""
     peak_resident_weights_mb: float | None = None
     """The weights the job held on the card at its peak, from its measured footprint, once its metrics arrive."""
+
+    def sampled_with_weights_whole(self) -> bool:
+        """Whether the job's measured resident weights show its checkpoint was on the card whole while it sampled.
+
+        The footprint's ``peak_resident_weights_mb`` is the largest on-device weight set at one instant, so a
+        partial load reads the share that fit and a whole load reads at least the core weights. Its
+        ``sum_component_weights_mb`` is not used, since it sums every loaded component at its full size whether or not
+        all of it was resident, so it reads the same for a partial load as for a whole one.
+        """
+        if self.peak_resident_weights_mb is None or self.predicted_weights_mb is None:
+            return False
+        whole_floor_mb = self.predicted_weights_mb * (1.0 - _WHOLE_WEIGHTS_TOLERANCE_FRACTION)
+        return self.peak_resident_weights_mb >= whole_floor_mb
 
 
 @dataclass
@@ -1299,6 +1325,8 @@ class MessageDispatcher:
                 class_key=job_class_key(key, job),
                 peak_mb=float(peak_mb),
                 plausible_max_mb=plausible_max_mb,
+                predicted_weights_mb=predict_job_weight_mb(job, str(baseline)),
+                activation_ceiling_mb=predict_job_sampler_only_vram_mb(job, str(baseline)),
             )
         elif peak_mb > running.peak_mb:
             running.peak_mb = float(peak_mb)
@@ -1307,8 +1335,12 @@ class MessageDispatcher:
     def _commit_job_sampling_peak(self, job_id: GenerationID) -> None:
         """Commit ``job_id``'s highest sampling reading to the store as one observation, if it has one.
 
-        A job whose measured footprint arrived also commits its peak less the weights it held under the activation
-        key, since only the two figures together separate a partial load's weights from the rest.
+        A job whose measured footprint shows its checkpoint was on the card whole
+        (:meth:`_JobSamplingPeak.sampled_with_weights_whole`) also commits its peak less the weights it held under
+        the activation key. A partially loaded job commits no activation. Its peak can carry streamed weights and
+        whatever else the process held, which read as activation once only the small resident share is taken off.
+        The activation is bounded by the job's static sampler-only seed, since the non-weight part of a job cannot
+        exceed the whole job's seed.
         """
         running = self._job_sampling_peaks.pop(job_id, None)
         if running is None or self._footprint_store is None:
@@ -1319,14 +1351,14 @@ class MessageDispatcher:
             running.peak_mb,
             plausible_max_mb=running.plausible_max_mb,
         )
-        if running.peak_resident_weights_mb is None:
+        if running.peak_resident_weights_mb is None or not running.sampled_with_weights_whole():
             return
         activation = {"stage": FootprintStage.SAMPLE_ACTIVATION}
         self._footprint_store.observe_job_peak(
             running.key.model_copy(update=activation),
             running.class_key.model_copy(update=activation),
             running.peak_mb - running.peak_resident_weights_mb,
-            plausible_max_mb=running.plausible_max_mb,
+            plausible_max_mb=running.activation_ceiling_mb,
         )
 
     def _commit_ended_job_sampling_peaks(self) -> None:
