@@ -68,6 +68,17 @@ line is registered, update the pattern, the sample, and any detector in the same
 | Text backend wedged | `text_backend_wedged` | `horde-log diagnose --last`, then the backend counters in the hold line | `text_backend.log` |
 | Inference slot retired, safety moved to the CPU | `inference_slot_retired`, `safety_start_escalated_to_cpu` | `horde-log timeline --last` for the `INFERENCE_START_RETIRED`, `INFERENCE_SLOT_RESTORED` and `SAFETY_START_ESCALATED_TO_CPU` ledger events | `action_ledger.jsonl` |
 | Benchmark beside a worker | findings tagged as the benchmark run | `horde-log diagnose --last-benchmark`, stopped with `.abort_benchmark` | `bridge_harness.log` |
+| GPU duty below target | the duty report | `horde-log duty --stats <bundle>/stats --logs <bundle>/logs` | `stats/*.jsonl`, `bridge.log` |
+
+**Reading duty.** The duty report's "GPU time lost" labels are an order of precedence over what was outstanding
+(a pending submit outranks a pending safety check, which outranks every lane state), not costs; the costs are the
+per-job phase medians and the `job_completed` rows' `phase_metrics` (sampling seconds and per-step rates, encode,
+decode, `ram_to_vram`, the post-processing chain, safety, and the job's measured device peaks). The
+`clearance_hold` slot bucket carries the cleared child's load as well as the arbiter's hold. The stats rows are
+`{"event": "stats_sample", "sample": {...}}` plus `decision`, `resource_state`, `job_completed` and one
+`session_start`; their epochs are UTC while the logs are the host's zone. A recorded session's `job_completed`
+rows are also the source of a replay fixture for the dispatch-world simulator (`tests/process_management/liveness/replay/`),
+built with `horde-log replay-fixture <bundle> --session N <out_dir>` (see `docs/reference/cli.md`).
 
 ## The map (most important files & classes)
 
@@ -113,6 +124,56 @@ launches the headless worker as a child. Other console scripts: `download_models
 owned_pids.json, action_ledger.jsonl, perf_model.json, vram_footprints.json), alongside `bridgeData.yaml`, `logs/`, and
 `benchmark_results/`.
 
+### Scheduling and admission, by mechanism
+
+Start from the mechanism, not the file. Each line names the owner of one question; read outward from it.
+
+- **What an empty sampling slot was waiting on:** `InferenceScheduler.record_slot_duty` and `slot_duty.py`.
+  The `clearance_hold` bucket is keyed on the lane state and a cleared child stays `INFERENCE_PRIMED` until its
+  first step, so the bucket carries the child's weight upload and prompt encode as well as the arbiter's hold.
+  Split it with the `Clearance held` and `cleared process` lines: dispatch to clearance is the gate, clearance to
+  first step is the child.
+- **Whether a staged child may load and sample:** `scheduling/clearance_lease.py` (`ClearanceController.step`,
+  `decide_clearances`, `_clear`, `_clear_stage`; the child's `ClearanceLeaseProxy` serves the grant's device-free
+  and activation-reserve figures once each) and the scheduler's `clearance_admit_process` and
+  `clearance_stage_admit_process`. The arbiter's verdict is `resources/vram_arbiter.py` (`evaluate`,
+  `_partial_seat_admission`, `_probe_due`, `_card_converged_empty`); the identity it tests is
+  `resources/admission_identity.py` (`candidate <= device free - outstanding - margin`). A waiter's starvation
+  clock runs through an applied reclaim rung and restarts only when measured free rises by the progress epsilon
+  since the send.
+- **What a job costs the card:** `scheduling/admission/pricing.py` (`partial_seat_mb`, `sampling_reserve_mb`,
+  `has_reclaimable_idle_model`, `sweep_spares_idle_copy`, the ready seats), `resources/vram_footprints.py`
+  (`LearnedFootprintStore`, stages `SAMPLE`, `SAMPLE_ACTIVATION`, `RESIDENT`, keyed by platform) and
+  `resources/resource_budget.py` (`StreamForecast`, the static seeds, the booking decay). A dispatch booking is
+  set at clearance against the lane's report and decays only by growth past the lowest report since, so a job
+  past its first step can still carry gigabytes of booking.
+- **Whether the card has room nobody holds:** `resources/foreign_vram_floor.py` (a 120 s trailing minimum of
+  `total - free - worker footprint`, clamped at 0 and withheld until the window fills) and the scheduler's
+  `_sustained_foreign_floor_mb` and `current_foreign_floor_mb`; the worker footprint is
+  `process_map.committed_vram_mb` (context constant plus reservation per committed process). A reading at or
+  below zero comes from the worker's own stale or over-charged footprint, never from the card.
+- **Whether a lane keeps its weights between jobs:** the scheduler's `_should_keep_model_resident`
+  (governor gate, repeat evidence, static fit through `_retention_fit`) and `ledgers/retention.py`
+  (`RetentionFit`, `slot_has_repeat_evidence`); the child honours the verdict as `defer_vram_unload`.
+- **Whether a model takes the whole card:** `scheduling/governance/whole_card.py` (`WholeCardResidencyMachine`,
+  `WholeCardResidencyLedger`, `teardown_complete`, the pop claim and `WholeCardPopClaimRelease`), the scheduler's
+  `_whole_card_*` methods, `wants_whole_card` in `pricing.py`, and the settings `whole_card_exclusive_residency`,
+  `whole_card_residency_safety_off_gpu`, `whole_card_residency_max_hold_seconds`,
+  `large_model_reentry_cooldown_seconds`. The verdict is being redefined as a ladder of dominance (a model no
+  other offered model can sample beside gets the policy levers; a model that cannot co-reside with a context gets
+  the teardown); see the duty programme's plan under `docs/plans/`.
+- **Which lane a preload or a sweep may touch:** `scheduling/admission/preload.py` (`lanes_committed_elsewhere`,
+  the three target selectors) and `pricing.sweep_spares_idle_copy`: a lane loading one model is no target for
+  another, a lane that owns a dispatched job is busy whatever it last reported, and the queue head's ready seat is
+  spared by the clearance and pressure sweeps. The commitment is bound to the model map's `LOADING` entry
+  (`models/horde_model_map.py`, `PRELOAD_FIRST_REPORT_GRACE_SECONDS`), not to the control flag.
+- **What the child does between its clearance and its first step:** hordelib `execution/sampling_lease.py`
+  (the `CFGGuider.sample` hook: encoder release, stage upload, the sample permit) and
+  `execution/comfy_patches.py` (`_load_models_gpu_hijack`, the class-list skip, the overflow check charging the
+  held reserve, the free-view clamp); the worker's `workers/inference_process.py` handles one control message at
+  a time, so a preload or unload queued ahead of `START_INFERENCE` delays the job. The force-load skip list is
+  `worker_entry_points.FORCE_LOAD_SKIP_BASELINES`.
+
 ## Code quality
 
 Follow the **[Haidra Python style guide](docs/haidra-assets/docs/meta/python.md)** (canonical). In
@@ -140,6 +201,13 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
 
 - `tests/process_management/` is grouped by subsystem and builds a testable manager via
   `make_testable_process_manager()`; `tests/e2e/` exercises the dry-run/fake flow (marked `e2e`).
+- **How to test is written down in `TESTING.md`**, for human contributors: install per compute backend,
+  the bands and markers, what CI covers, non-NVIDIA and CPU-only checks, the bootstrap, real hardware,
+  text generation, the dashboard, the live maintenance-mode run, and reading a run. Read it
+  before running anything beyond a targeted file. It names only committed tooling; scripts under
+  `docs/plans/` never belong in it. When a band, a marker, a harness mode or a live-run step changes,
+  update `TESTING.md` in the same change. The rules below (tee, rerun, wait) are agent discipline and
+  stay here.
 - **Marker contract:** the `slow`, `gpu`, and `chaos_sweep` bands run only when the `-m` expression
   names them (`-m "not slow"` and `-m slow` both behave as written). The chaos sweep's full-worker
   half is also `slow`: `-m "chaos_sweep and slow"`. `CONTRIBUTING.md` carries the gate commands and
@@ -246,6 +314,38 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
 - **Faulting a doomed job back to the horde sends the same burn to the next worker.** Before
   automating what follows a failure (retries, quarantines, breakers), ask whether the failure has to
   happen at all.
+- **A card can carry a tenant nobody lists.** A graphics or driver tenancy can hold gigabytes that NVML's
+  compute-process list does not show; the worker learns it only through the foreign floor. The floor is learned
+  from positive readings only (a reading at or below zero is an over-charged worker footprint, never evidence of
+  zero foreign), and where the driver reports per-process usage the worker's own share is measured from its
+  pids rather than estimated from the ledger. Price against the floor; never assume the card offers its total.
+- **The encoder's device residency is decided at its own job's diffusion load.** ComfyUI's `free_memory` pass
+  partially unloads the job's text encoder to fit the diffusion weights (a copy back and pin per module), unless
+  hordelib has released it whole through its CPU origins first; a waiter's encoder also fills the room a stage grant
+  needs. The job-end component rule decides the RAM cache, not the device.
+- **A partial-load seat assumes the child leaves the priced activation room.** The grant carries that room as a
+  figure hordelib bounds ComfyUI's partial sizing with; without it ComfyUI leaves only its own estimate and a
+  whole-card model faults in the sampler with the weights fully loaded. The room is the measured activation of
+  jobs that sampled with their weights whole, never the raise-only watermark: a partial load's peak less its
+  resident share reads streamed weights as activation, and a watermark priced from it forces every later load
+  deeper into partial mode.
+- **`PRELOADED_MODEL` is busy to every reader but a residency's teardown.** A preload predicts a dispatch, so the
+  state is busy for dispatch, lease and reclaim; a held whole-card residency withholds that dispatch, so its shrink
+  and its safety move treat a lane that holds only a preload as stoppable (`holds_only_a_preload`). Left busy, the
+  residency can never reach its target and the card idles with both jobs pending.
+- **A lane's last control flag is the last command sent.** The VRAM sweep skips a lane whose flag already reads
+  an unload, and a service lane never sends the `LOADED_IN_VRAM` report that retires it, so a dispatch to a
+  service lane records its own command (`START_POST_PROCESS`) or the lane is unloaded once per launch and keeps
+  every module it loads afterwards.
+- **The overlap headway is read over sampling jobs.** Under the clearance lease a dispatched job without a grant
+  is not a running sampler; held as one, it parks every later job behind a job that may be waiting for the room
+  those jobs' lanes hold.
+- **The dispatch world's five fidelity traps.** A served class outside its catalogue is charged nothing unless
+  it resolves through the row's own set; the lanes report no context unless `lane_reports_carry_context` is on,
+  so the scheduler's foreign reading runs above the scripted tenancy; the admission margin is the WDDM buffer
+  unless `admission_noise_mb` states the session's; regrown lanes, absent post-processing lanes and RAM-held idle
+  lanes each had a path that wedged or crashed the row before they were modelled; and a replay that reads far from
+  live is a simulator finding before it is a scheduling one.
 
 ## Changing scheduling, memory, or recovery behaviour
 
@@ -305,6 +405,41 @@ These fail as interactions, not as units, so component tests stay green through 
   `foreign_mb_by_tick`), and a monolithic load carries its text encoder and VAE.
   `phase_resident_components=True` charges a sampling job its sampler-only footprint and a decode tail its
   weights plus the decode spike, as ComfyUI loads components separately; the encode phase is not modelled.
+  `partial_loads=True` models hordelib's and ComfyUI's partial loads: a lane's offloaded remainder survives the
+  job and the next same-model load pays to return it at the load rate, the decode spike unloads the lane's own
+  weights first, and a model on the worker's force-load skip list (`worker_entry_points.FORCE_LOAD_SKIP_BASELINES`)
+  loads only into believed free and keeps its support components resident as a lane tenant; each window records
+  `load_moved_mb`, `load_returned_mb` and `decode_unloaded_mb`. `lane_reports_carry_context=True` has every
+  process report its share of the card's context charge, so the scheduler's instantaneous foreign reading equals
+  the tenancy a row scripts with `foreign_vram_mb_by_tick`; off, the reading exceeds it by the world's context
+  charge less the scheduler's resolved constant. Rows that state a true workload can also pass
+  `extra_model_classes` (served classes resolve and are charged whatever the module lists), a `true_footprint_mb`
+  hook (resident and transient per job), `sample_seconds_by_job` and `decode_seconds_by_job`, and a seeded
+  `footprint_store`; `tests/process_management/liveness/replay/` holds a live session's job stream and learned
+  store for that purpose, built with `horde-log replay-fixture`. A replay measures a run with the pop driver's
+  bounded look-ahead (`pop_driver(look_ahead_rows=N)`; a refused row keeps its order), the large-model pop
+  governor under `large_model_switch_min_seconds` and `large_model_reentry_cooldown_seconds` (0 and 0 skip it;
+  a faithful replay of the recorded host passes 45 for re-entry), and the figures `kudos_per_hour`,
+  `load_totals` per model, `partial_loads` and `complete_loads`. The driver has two supply models. At the
+  recorded offsets it offers each row when the live worker popped it, which calibrates the world against the
+  session but starves a world that outruns the live one on the fixture rather than on the card.
+  `pop_driver(on_demand=True)` offers the next row whenever the world asks, keeping the queue budget and the
+  look-ahead, and is the model a duty claim is proven on. A tick spans several of the manager's 0.1 s loop
+  iterations, so the tick closes with a clearance pass for the jobs its dispatch staged
+  (`_clear_waiters_dispatched_this_tick`), as the next iteration would price them; without it every dispatched
+  job waited a whole tick for its first clearance pass and the on-demand whole session read seven points low.
+  Under `learned_footprints` the world also hands the dispatcher a finished job's resident weight set
+  (`_report_sampled_weight_set`), so the `SAMPLE_ACTIVATION` key is learned as production learns it. Under
+  `performance_model` the world feeds
+  `note_first_step` at each job's first step, so a rule that reads learned dispatch overheads can fire in a
+  replay, and a service lane keeps its served unload flag as production does, so a card reads converged-empty
+  once nothing is left to reclaim. `text_encoder_released_before_wait` defaults to on wherever the lease,
+  `partial_loads` and `phase_resident_components` are all on, and drops the staged encode and the support
+  tenant before the clearance wait, as hordelib releases the encoder whole; `lane_start_seconds` holds a
+  regrown lane in `PROCESS_STARTING` with no context for that long (default 0). A lane's reported high-water
+  carries no context share and no decode spike, since a child's allocator never holds either, so the store the
+  replay learns from does not climb; the fixture's truth hook charges the store's figures without their margin,
+  which the parent adds once.
   `seed_ram_held_checkpoint` makes a lane report its seated checkpoint as a held component sized by its RAM
   pages with nothing of it on the device, the report of a pooled monolithic lane. `post_process_chain_peak_mb`
   gives the post-processing lane modelled chains that go through production's sampling co-residency check

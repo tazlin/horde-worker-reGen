@@ -1686,7 +1686,8 @@ exactly the set that would claim the card.
 - **The re-entry cooldown** (`large_model_reentry_cooldown_seconds`): once the whole-card residency lease is
   up *and* no very-large model remains loaded or queued, *any* very-large model is withheld for the
   cooldown, so the worker does ordinary work for a beat instead of immediately re-thrashing. `-1` inherits
-  `whole_card_residency_cooldown_seconds` (the lease it complements); `0` disables it.
+  `whole_card_residency_cooldown_seconds` (the lease it complements); `0` disables it. A rung-1 run counts as
+  a held lease, so the cooldown opens between runs as it does between teardowns.
 
 Both yield to an idle escape: when the worker holds no local work at all (an empty queue, nothing in
 flight), nothing is withheld, so a limiter never leaves the worker idle when the only work it could take is
@@ -1710,9 +1711,19 @@ resident model (a quarantine, a serviceability exclusion), there is nothing this
 this cycle, so the pop is withheld and the `whole_card_pop_claim` gate is named. Advertising the rest of the
 pool instead would hand the card exactly the work the claim exists to keep off it.
 
+A rung-1 run claims the offer the same way. A model no other offered model can sample beside gains nothing
+from a teardown, but each foreign job accepted beside it still costs its weights, so the run's grant
+(see [The VRAM arbiter](vram_arbiter.md#the-four-layers)) narrows the offer to the model once its first job
+reaches its first step, and the worker keeps earning on the loaded weights instead of swapping to another large
+model and back. The claim does not engage at the dispatch commit, since it would then narrow intake for the
+whole load and for a load that never lands. The run's length is set by demand alone: it lasts while its jobs
+keep arriving.
+
 The claim is bounded by `whole_card_residency_max_hold_seconds` and released early when a run of pops comes
-back with no work for the resident model, and it is skipped entirely on a host driving more than one card.
-Those ends, and why each is shaped the way it is, are in
+back with no work for the resident model, or when a job for the claimed model faults terminally (the
+process manager's terminal-fault observer calls `InferenceScheduler.note_terminal_job_fault`), since a
+narrowed offer would feed the card more of the failing work. It is skipped entirely on a host driving more
+than one card. Those ends, and why each is shaped the way it is, are in
 [Resource governance](resource_governance.md).
 
 A claim changes what the worker *asks* for rather than what it does with what arrives, so it leaves no trace

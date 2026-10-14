@@ -26,18 +26,10 @@
 
 ## Testing
 
-* Run the suite with `uv run pytest`. The default sweep is fast because three bands are **opt-in** and skipped unless you ask for them:
-    * `-m slow` runs the tests that spawn real OS subprocesses (the end-to-end worker-lifecycle family) or take multiple seconds. Run this before pushing a change that touches the worker lifecycle.
-    * `-m gpu` runs the tests that need a real accelerator; they auto-skip when no CUDA device is present.
-    * `-m chaos_sweep` runs the generated wedge-liveness chaos sweep. See below; the default sweep runs its representative core slice instead.
-* `-m "slow or gpu"` runs both opt-in bands at once. CI runs the fast sweep and the `slow` band as separate steps, so the full-lifecycle coverage is exercised on every push.
-* `closed_loop` marks the simulator rows under `tests/process_management/liveness/` (incident scenarios, golden traces, the bounded dispatch matrix, the chaos core slice). They stay in the default sweep and run after the rest of `process_management`, but each costs seconds, so while iterating on a scheduling change run `-m "not closed_loop"` plus the rows the change names, and run the whole band once before committing.
-    * That pre-commit run of the whole band parallelises. The rows are pure in-process simulation on a virtual clock, with no fixture outliving a test and no state shared through the filesystem, so they are independent: `uv run pytest tests/process_management/liveness -m closed_loop -n auto` puts the band on one worker per core and cuts its wall clock to roughly a third. `pytest-xdist` is a dev dependency but is never enabled by default; `-n` is opt-in per invocation, because most of the suite is fast enough that the per-worker collection cost dominates.
-    * Two caveats. The fastest-first run order in `tests/conftest.py` is a serial property: `-n` hands rows to workers as they come free, so parallelise the band on its own rather than a mixed selection that relies on the ordering to surface a cheap break first. Concurrent invocations in one checkout are safe, since every test runs under its own `HORDE_WORKER_RUN_ROOT` (an autouse fixture points it at the test's temp directory), so no two tests share a `.abort` sentinel, a `logs/` directory or a state directory; what they do share is the CPU, which matters for timing-sensitive rows.
-    * The generated chaos sweep is the same closed-loop kind and takes the same treatment: `uv run pytest tests/process_management/liveness/test_chaos_generated.py -m chaos_sweep -n auto`.
-    * The slow band parallelises too, now that every test has its own run root: `uv run pytest -m "slow or chaos_sweep" -n auto --dist loadgroup` ran in about 21 minutes against 89 serially. `--dist loadgroup` keeps the rows marked `xdist_group("serial_timing")` (the clearance lease streaks and the multi-card pop feed, whose assertions are wall-clock measurements) on one worker in sequence instead of beside each other; everything else spreads freely.
-    * Order dependencies are found on purpose rather than by accident: `uv run pytest --shuffle-seed 1` keeps the fastest-first phases but runs the rows inside each phase in a seeded random order, and the header prints the seed so a red run replays the same way. Run it once before relying on a parallel band, since xdist hands each worker its own order.
-* Every run prints its thirty slowest tests (`--durations=30` is in `addopts`), so the tee of any run answers "what was slow" without a second run.
+* [TESTING.md](TESTING.md) covers the test bands, the opt-in markers, parallel runs, and the per-scenario
+  how-tos (text generation, a live run in maintenance mode, reading a run). Run the default sweep on every
+  change and the `slow` band before pushing anything that touches the worker lifecycle. CI runs both as
+  separate steps on every push.
 
 ### The generated chaos sweep (pre-release gate)
 
