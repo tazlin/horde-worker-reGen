@@ -38,6 +38,21 @@ highest-volume emissions in the log while carrying no per-report forensic value:
 are always available from the process map and the full series remains in the TRACE log.
 """
 
+_CONTEXT_ONLY_WITH_DEVICE_MEMORY_TYPES = frozenset({HordeProcessType.SAFETY, HordeProcessType.UTILITIES})
+"""Process types whose CUDA context exists only while they hold device memory of their own.
+
+Safety can be placed on the CPU, and the utilities service initialises CUDA without creating a context until an
+operation runs on the card. Both report a zero allocator reservation in that state."""
+
+
+def _holds_device_context(process_info: HordeProcessInfo) -> bool:
+    """Return whether a reporting process holds a CUDA context on its card."""
+    if process_info.process_type not in _CONTEXT_ONLY_WITH_DEVICE_MEMORY_TYPES:
+        return True
+    device_memory_mb = (process_info.process_reserved_mb or 0) + (process_info.process_aimdo_mb or 0)
+    return device_memory_mb > 0
+
+
 _EXPECTED_PROCESS_STATE_SOURCES: dict[HordeProcessState, frozenset[HordeProcessState]] = {
     HordeProcessState.DOWNLOAD_COMPLETE: frozenset({HordeProcessState.DOWNLOADING_MODEL}),
     HordeProcessState.PRELOADED_MODEL: frozenset({HordeProcessState.PRELOADING_MODEL}),
@@ -964,10 +979,15 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """Return the GPU processes whose footprint the committed-VRAM ledger charges (a shared predicate).
 
         A process is counted when it has reported a ``process_reserved_mb`` (a GPU-bearing process that has
-        sent at least one VRAM-inclusive memory report) and has not entered its terminal shutdown states.
-        :meth:`committed_vram_mb`, :meth:`oldest_committed_report_age_seconds`, and the scheduler's
-        idle-context residency capture all key on this exact set so the ledger sum, its staleness assessment,
-        and the per-context marginal derivation can never disagree about which tenants make it up.
+        sent at least one VRAM-inclusive memory report), holds a CUDA context, and has not entered its terminal
+        shutdown states. :meth:`committed_vram_mb`, :meth:`oldest_committed_report_age_seconds`, and the
+        scheduler's idle-context residency capture all key on this exact set so the ledger sum, its staleness
+        assessment, and the per-context marginal derivation can never disagree about which tenants make it up.
+
+        A safety process moved to the CPU, and the utilities service before it runs an operation on the card,
+        report a zero reservation without holding a context. Such a process is no tenant until it reports
+        device memory of its own. An inference, post-processing, VAE or component lane creates its context when
+        it reads the device, so its zero reservation (a fresh or fully emptied allocator) still marks a tenant.
         """
         processes: list[HordeProcessInfo] = []
         for process_info in self.values():
@@ -980,11 +1000,17 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 HordeProcessState.PROCESS_ENDED,
             ):
                 continue
+            if not _holds_device_context(process_info):
+                continue
             processes.append(process_info)
         return processes
 
     def committed_vram_mb(self, *, context_constant_mb: float, device_index: int | None = None) -> float:
         """Return the device VRAM (MB) attributable to this worker: the sum of every live GPU process's footprint.
+
+        A process that reports no device memory and holds no context is not summed (see
+        :meth:`committed_ledger_processes`), since the context charge is for a CUDA context the process holds
+        and a CPU-placed safety process or an idle utilities service holds none.
 
         Each live GPU process's device footprint is ``context_constant_mb + process_reserved_mb +
         process_aimdo_mb`` (the fixed CUDA-context overhead, plus the process's own byte-exact allocator

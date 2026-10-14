@@ -144,6 +144,36 @@ class TestCommittedVramLedger:
         )
         assert process_map.committed_vram_mb(context_constant_mb=200.0) == 6200.0
 
+    def test_a_service_process_reporting_no_device_memory_is_charged_nothing(self) -> None:
+        """A CPU-placed safety process and an idle utilities service hold no context, so no context is charged."""
+        process_map = ProcessMap(
+            {
+                0: self._reporting_process(0, 6000),
+                1: self._reporting_process(1, 0, process_type=HordeProcessType.SAFETY),
+                2: self._reporting_process(2, 0, aimdo_mb=0, process_type=HordeProcessType.UTILITIES),
+            },
+        )
+        assert process_map.committed_vram_mb(context_constant_mb=200.0) == 6200.0
+        assert [process.process_id for process in process_map.committed_ledger_processes()] == [0]
+
+    def test_a_service_process_holding_device_memory_is_charged_its_context(self) -> None:
+        """A utilities service running on the card reports its reservation and holds a context with it."""
+        process_map = ProcessMap(
+            {
+                0: self._reporting_process(0, 900, process_type=HordeProcessType.UTILITIES),
+            },
+        )
+        assert process_map.committed_vram_mb(context_constant_mb=200.0) == 1100.0
+
+    def test_an_inference_lane_with_an_empty_allocator_is_still_charged_its_context(self) -> None:
+        """An inference lane creates its context when it reads the device, before its allocator holds anything."""
+        process_map = ProcessMap(
+            {
+                0: self._reporting_process(0, 0),
+            },
+        )
+        assert process_map.committed_vram_mb(context_constant_mb=200.0) == 200.0
+
     def test_excludes_terminal_processes(self) -> None:
         """A process in a terminal shutdown state no longer commits VRAM and is excluded."""
         process_map = ProcessMap(

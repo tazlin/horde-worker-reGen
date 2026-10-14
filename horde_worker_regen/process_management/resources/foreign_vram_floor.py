@@ -13,6 +13,13 @@ which can only raise the ceiling: the worst it does is defer-and-reclaim a load 
 false terminal denial. The floor is withheld (None) until a full window of observation has elapsed, so a
 cold-start transient cannot set it prematurely; None preserves the arbiter's pre-foreign behaviour exactly.
 
+The floor is evidence about other tenants, so only a positive reading is a sample. A reading at or below zero
+comes from the worker's footprint figure meeting or exceeding the card's use (a reservation report lagging a
+release, a context charged to a process that holds none) and carries no evidence about other tenants.
+Recording it would pin the window minimum at zero for a whole window after every such tick, so it neither
+enters the window nor restarts it. A card no other program uses then never learns a floor and keeps the
+pre-foreign behaviour.
+
 A tenant the worker launched and measured itself (the managed text backend) needs no window: its footprint is
 known from the moment it is measured. :class:`ManagedVramTenant` carries it and
 :func:`floor_with_known_tenant_mb` folds it in as a standing floor on its card, the larger of the two figures
@@ -72,19 +79,19 @@ class ForeignVramFloorTracker:
 
         Args:
             device_key: The card index (0 for the single-GPU/worker-wide key).
-            foreign_now_mb: This tick's ``total - device_free - worker_footprint`` (MB), clamped to >= 0 on
-                entry, or None when it cannot be measured (children not yet reporting VRAM). None contributes
-                no sample; the existing window still ages so a card whose reports stop eventually forgets its
+            foreign_now_mb: This tick's ``total - device_free - worker_footprint`` (MB), or None when it cannot
+                be measured (children not yet reporting VRAM). None and a reading at or below zero contribute
+                no sample. The existing window still ages, so a card whose readings stop eventually forgets its
                 floor.
             now: The monotonic-clock timestamp of this tick.
 
         Returns:
-            The minimum foreign reading over the trailing window once observation has covered a full window,
-            else None (cold start / warm-up).
+            The minimum positive foreign reading over the trailing window once observation has covered a full
+            window, else None (cold start, warm-up, or no positive reading).
         """
         samples = self._samples.setdefault(device_key, deque())
-        if foreign_now_mb is not None:
-            samples.append((now, max(0.0, foreign_now_mb)))
+        if foreign_now_mb is not None and foreign_now_mb > 0:
+            samples.append((now, foreign_now_mb))
             self._first_sample_at.setdefault(device_key, now)
         cutoff = now - self._window_seconds
         while samples and samples[0][0] < cutoff:

@@ -616,14 +616,26 @@ wedged jobs non-retryably so the horde can reissue them elsewhere.
 
 `DENY` is reserved for a candidate that could not fit even an emptied card: one whose demand exceeds the
 card's **achievable ceiling**, the card total minus the noise buffer minus the sustained foreign floor (the
-VRAM the OS/desktop/other processes hold, measured outside the arbiter as the trailing-window minimum of
-`total - device-free - worker-committed` and carried on the device state; an unknown floor collapses the
+VRAM the OS/desktop/other processes hold, measured outside the arbiter as the trailing-window minimum of the
+positive readings of `total - device-free - worker footprint` and carried on the device state; an unknown floor collapses the
 ceiling to `total - noise`, preserving the pre-foreign boundary). Model-level prevention keeps most such jobs
 out earlier, and when a runtime `DENY` does fire for the true head with no other card that could seat it, the
 scheduler faults the head for reissue and places the model on a conditional, self-lifting ceiling hold
 (re-checked against the current ceiling, lifted once the foreign floor recedes) rather than deferring into a
 permanent wedge (see [the achievable ceiling in Performance and Backpressure](performance_and_backpressure.md#the-achievable-ceiling-a-model-that-can-never-fit-this-card)).
 The first concurrent sampling of its kind admits on an empty ledger.
+
+The foreign floor is evidence about the card's other tenants, including those NVML's compute-process list does
+not show, such as a display server. Each reading subtracts the worker's own use from the card's. Where the driver
+reports device memory per process (NVML on Linux), the worker's use is the sum of those figures over its
+processes' pids, taken with the free figure. Under WDDM the driver gives no per-process figure, and the reading
+falls back to the committed ledger (a context charge plus the reported reservation per process). That estimate
+lags a release and misses a load in flight, so it can meet or exceed the card's use. A reading at or below zero
+comes from a stale or over-charged worker figure and carries no evidence about other tenants, so it is not a
+sample. It neither enters the window nor restarts it, so a card no other program uses learns no floor. The
+ledger charges no context to a process that holds none. A safety process placed on the CPU, or the utilities
+service before it runs on the card, reports a zero reservation and is no ledger tenant until it reports device
+memory.
 
 The worker's managed text backend is a known tenant of its card, so the ceiling does not wait for the learned
 window to find it. Once the backend is serving with a measured footprint (the card's free-VRAM drop between its

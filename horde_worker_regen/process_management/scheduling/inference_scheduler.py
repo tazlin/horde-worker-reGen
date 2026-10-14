@@ -5715,7 +5715,11 @@ class InferenceScheduler:
                 device_index,
                 total_vram_mb=raw_total_mb,
                 device_free_mb=device_wide_free_mb,
-                worker_footprint_mb=committed_mb,
+                worker_footprint_mb=self._foreign_reading_worker_footprint_mb(
+                    device_index,
+                    device_reading=device_reading,
+                    ledger_footprint_mb=committed_mb,
+                ),
             ),
             self._managed_tenant_footprint_mb(device_index),
         )
@@ -5834,12 +5838,13 @@ class InferenceScheduler:
         """Return this card's sustained foreign-VRAM floor (MB), advancing the trailing-window tracker.
 
         The instantaneous foreign reading is ``total - device_free - worker_footprint``: the device VRAM the
-        NVML reading shows used, less the worker's own committed footprint (the ledger already excludes the
-        shared baseline), so what remains is the VRAM the OS/desktop/other processes hold. It is contributed
-        as a sample only when the card is fully measured and at least one worker process has reported its VRAM
-        footprint; otherwise (cold start, children not yet reporting) no sample is added and the floor stays
-        None, preserving the arbiter's pre-foreign behaviour. The tracker returns the sustained minimum over
-        its trailing window, or None until a full window has been observed.
+        NVML reading shows used, less the worker's own footprint (see
+        :meth:`_foreign_reading_worker_footprint_mb`), so what remains is the VRAM the OS/desktop/other
+        processes hold. It is handed to the tracker only when the card is fully measured and at least one
+        worker process has reported its VRAM footprint. Otherwise (cold start, children not yet reporting) no
+        reading is offered and the floor stays None, preserving the arbiter's pre-foreign behaviour. The
+        tracker keeps only positive readings and returns their minimum over its trailing window, or None until
+        a full window has been observed.
         """
         device_key = device_index if device_index is not None else 0
         if (
@@ -5851,6 +5856,35 @@ class InferenceScheduler:
         else:
             foreign_now_mb = None
         return self._foreign_vram_floor.update(device_key, foreign_now_mb, now=self._foreign_floor_clock())
+
+    def _foreign_reading_worker_footprint_mb(
+        self,
+        device_index: int | None,
+        *,
+        device_reading: DeviceMemoryReading | None,
+        ledger_footprint_mb: float,
+    ) -> float:
+        """Return the worker's own device memory (MB) the foreign reading subtracts from the card's use.
+
+        Where the reading carries the driver's per-process usage and lists at least one of the worker's
+        processes, the footprint is the sum of that usage over the worker's pids on the card. That figure is a
+        measurement taken with the free figure, so it neither lags a release nor misses a load in flight, as the
+        ledger built from the children's reports can. A worker process the driver does not list holds no
+        context on the card and counts nothing. Otherwise (WDDM gives no per-process figure, or no worker pid is
+        listed, as in a separate pid namespace) the ledger estimate stands. Admission prices the ledger either way.
+        """
+        process_used_mb = None if device_reading is None else device_reading.process_used_mb
+        if process_used_mb is None:
+            return ledger_footprint_mb
+        worker_pids = {
+            process_info.os_pid
+            for process_info in self._process_map.values()
+            if process_info.os_pid is not None and (device_index is None or process_info.device_index == device_index)
+        }
+        listed_worker_pids = worker_pids.intersection(process_used_mb)
+        if not listed_worker_pids:
+            return ledger_footprint_mb
+        return sum(process_used_mb[pid] for pid in listed_worker_pids)
 
     def achievable_ceiling_mb(self, device_index: int | None) -> float | None:
         """Return a card's current achievable VRAM ceiling (MB): total net of noise and the standing foreign floor.

@@ -13,7 +13,8 @@ process holds as free. A host-memory figure is system RAM a unified-memory card 
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from strenum import StrEnum
 
@@ -52,6 +53,9 @@ class DeviceMemoryReading:
     """Memory in use on the device across every process, where the source measures it. It is stated apart
     from ``total_mb - free_mb`` because a driver holds some memory back that is neither. None from process
     reports, which do not measure it."""
+    process_used_mb: Mapping[int, float] | None = field(default=None, hash=False)
+    """Device memory (MB) each compute process on the card uses, keyed by OS pid, taken with the free figure.
+    None where the driver does not report usage per process (WDDM) or the source cannot list processes."""
 
     @property
     def is_device_wide(self) -> bool:
@@ -102,7 +106,13 @@ def shadow_free_figures(
     )
 
 
-def nvml_reading(*, free_mb: float, total_mb: float, used_mb: float | None = None) -> DeviceMemoryReading:
+def nvml_reading(
+    *,
+    free_mb: float,
+    total_mb: float,
+    used_mb: float | None = None,
+    process_used_mb: Mapping[int, float] | None = None,
+) -> DeviceMemoryReading:
     """Return the reading for a card NVML answered for, which is device-wide by construction."""
     return DeviceMemoryReading(
         free_mb=free_mb,
@@ -110,6 +120,7 @@ def nvml_reading(*, free_mb: float, total_mb: float, used_mb: float | None = Non
         source=DeviceMemorySourceKind.NVML,
         provenance=ReadingProvenance.DEVICE_WIDE,
         used_mb=used_mb,
+        process_used_mb=process_used_mb,
     )
 
 

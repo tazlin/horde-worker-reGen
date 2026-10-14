@@ -222,6 +222,7 @@ from horde_worker_regen.process_management.resources.model_serviceability import
     max_power_to_pixels,
     model_serviceability_verdicts,
 )
+from horde_worker_regen.process_management.resources.nvml_process_memory import read_process_device_memory_mb
 from horde_worker_regen.process_management.resources.reclaim_ladder import (
     ReclaimRungKind,
     VerifiedReclaimLadder,
@@ -3787,7 +3788,11 @@ class HordeWorkerProcessManager:
         return device_info.kind in (AcceleratorKind.mps.value, AcceleratorKind.cpu.value)
 
     def _read_nvml_memory(self, device_index: int) -> DeviceMemoryReading | None:
-        """Return device ``index``'s reading via NVML, or None when NVML does not answer."""
+        """Return device ``index``'s reading via NVML, or None when NVML does not answer.
+
+        The per-process usage is read beside the free figure so the foreign reading can subtract what the
+        worker's processes measurably hold. It is None where the driver does not report it (WDDM).
+        """
         try:
             from hordelib.utils.nvml import get_device_memory_mb
         except Exception as e:  # noqa: BLE001 - "no NVML" is an expected environment, not a crash
@@ -3800,6 +3805,7 @@ class HordeWorkerProcessManager:
             free_mb=float(memory.free_mb),
             total_mb=float(memory.total_mb),
             used_mb=float(memory.used_mb),
+            process_used_mb=read_process_device_memory_mb(device_index),
         )
 
     def _evaluate_device_free_governor(self) -> None:

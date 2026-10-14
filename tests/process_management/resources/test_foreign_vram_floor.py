@@ -18,6 +18,7 @@ from horde_worker_regen.process_management.resources.device_memory_source import
     DeviceMemoryReading,
     DeviceMemorySourceKind,
     ReadingProvenance,
+    nvml_reading,
 )
 from horde_worker_regen.process_management.resources.foreign_vram_floor import (
     FOREIGN_FLOOR_WINDOW_SECONDS,
@@ -98,6 +99,45 @@ def test_stale_samples_age_out_and_the_floor_is_forgotten() -> None:
     assert tracker.update(0, 1900.0, now=now) == 1900.0
     # A long gap with no reports: every sample falls outside the trailing window and is pruned.
     assert tracker.update(0, None, now=now + 2 * FOREIGN_FLOOR_WINDOW_SECONDS) is None
+
+
+def test_non_positive_readings_are_not_samples() -> None:
+    """Zeros and negatives interleaved with positive readings leave the floor at the positive minimum.
+
+    A reading at or below zero is the worker's own footprint figure meeting the card's use, never evidence that
+    nothing foreign is on the card.
+    """
+    tracker = ForeignVramFloorTracker()
+    readings = [3300.0, 0.0, 3250.0, -4345.0, 3400.0, 0.0]
+    now = 0.0
+    while now <= FOREIGN_FLOOR_WINDOW_SECONDS:
+        tracker.update(0, readings[int(now / 10.0) % len(readings)], now=now)
+        now += 10.0
+    assert tracker.update(0, 0.0, now=now) == 3250.0
+
+
+def test_only_non_positive_readings_learn_no_floor() -> None:
+    """A card whose readings never rise above zero keeps the floor unknown, the pre-foreign behaviour."""
+    tracker = ForeignVramFloorTracker()
+    now = 0.0
+    while now <= 3 * FOREIGN_FLOOR_WINDOW_SECONDS:
+        assert tracker.update(0, 0.0 if int(now) % 20 else -500.0, now=now) is None
+        now += 10.0
+
+
+def test_non_positive_readings_do_not_hold_a_floor_past_its_window() -> None:
+    """Positive samples still age out while only non-positive readings arrive, so the floor is forgotten."""
+    tracker = ForeignVramFloorTracker()
+    now = 0.0
+    while now <= FOREIGN_FLOOR_WINDOW_SECONDS:
+        tracker.update(0, 1900.0, now=now)
+        now += 10.0
+    assert tracker.update(0, 0.0, now=now) == 1900.0
+    last_positive_at = now - 10.0
+    while now <= last_positive_at + FOREIGN_FLOOR_WINDOW_SECONDS:
+        tracker.update(0, 0.0, now=now)
+        now += 10.0
+    assert tracker.update(0, 0.0, now=now) is None
 
 
 def test_per_card_isolation() -> None:
@@ -213,6 +253,84 @@ class TestFloorSamplesOnlyADeviceWideReading:
     def test_a_host_memory_reading_contributes_none(self) -> None:
         """System RAM in use is no measure of what another program holds on the card."""
         assert self._sampled_foreign_mb(ReadingProvenance.HOST_MEMORY) is None
+
+
+class TestFloorMeasuresTheWorkerWhereTheDriverReportsPerProcess:
+    """Per-process device usage replaces the ledger estimate in the foreign reading wherever the driver gives it."""
+
+    _WORKER_PID = 4242
+    _WORKER_USES_MB = 2500.0
+    """What the driver lists the worker's process as using on card 0."""
+    _EXTERNAL_TENANT_MB = 2000.0
+    """Device memory another program holds on card 0, which the driver's compute-process list does not show."""
+
+    def _scheduler_over_card_zero(self, *, ledger_reserved_mb: int) -> tuple[InferenceScheduler, list[float]]:
+        """Return a two-card scheduler whose card 0 process reports ``ledger_reserved_mb``, and its clock."""
+        scheduler, _tenant_box = _two_card_scheduler()
+        worker = scheduler._process_map[1]  # type: ignore[index]
+        worker.os_pid = self._WORKER_PID
+        worker.process_reserved_mb = ledger_reserved_mb
+        scheduler._process_map[2].os_pid = self._WORKER_PID + 1  # type: ignore[index]
+        now = [0.0]
+        scheduler._foreign_floor_clock = lambda: now[0]
+        return scheduler, now
+
+    def _card_zero_reading(self, *, per_process: bool) -> DeviceMemoryReading:
+        """Return card 0's NVML reading with the worker and the external tenant on it."""
+        free_mb = _SMALL_CARD_MB - self._WORKER_USES_MB - self._EXTERNAL_TENANT_MB
+        return nvml_reading(
+            free_mb=free_mb,
+            total_mb=_SMALL_CARD_MB,
+            process_used_mb={self._WORKER_PID: self._WORKER_USES_MB} if per_process else None,
+        )
+
+    def _floor_after_one_window(
+        self, scheduler: InferenceScheduler, now: list[float], reading: DeviceMemoryReading
+    ) -> float | None:
+        """Build card 0's arbiter state every 10 s over one full window and return the floor it carries."""
+        floor_mb: float | None = None
+        while now[0] <= FOREIGN_FLOOR_WINDOW_SECONDS:
+            floor_mb = scheduler.build_vram_arbiter_device_state(0, device_reading=reading).foreign_floor_mb
+            now[0] += 10.0
+        return floor_mb
+
+    def test_the_floor_learns_the_tenant_when_the_ledger_overcharges(self) -> None:
+        """A ledger reservation above what the driver lists would read at or below zero; the measurement does not."""
+        scheduler, now = self._scheduler_over_card_zero(ledger_reserved_mb=6000)
+        reading = self._card_zero_reading(per_process=True)
+        ledger_mb = scheduler._process_map.committed_vram_mb(
+            context_constant_mb=scheduler.resolved_context_constant_mb(),
+            device_index=0,
+        )
+        assert _SMALL_CARD_MB - reading.free_mb - ledger_mb <= 0
+
+        assert self._floor_after_one_window(scheduler, now, reading) == self._EXTERNAL_TENANT_MB
+
+    def test_without_per_process_figures_the_ledger_estimate_is_used(self) -> None:
+        """Under WDDM the driver gives no per-process figure, so the reading subtracts the ledger estimate."""
+        scheduler, now = self._scheduler_over_card_zero(ledger_reserved_mb=1000)
+        reading = self._card_zero_reading(per_process=False)
+        ledger_mb = scheduler._process_map.committed_vram_mb(
+            context_constant_mb=scheduler.resolved_context_constant_mb(),
+            device_index=0,
+        )
+
+        assert self._floor_after_one_window(scheduler, now, reading) == _SMALL_CARD_MB - reading.free_mb - ledger_mb
+
+    def test_a_list_without_any_worker_pid_keeps_the_ledger_estimate(self) -> None:
+        """A process list that names none of the worker's pids (another pid namespace) says nothing about it."""
+        scheduler, now = self._scheduler_over_card_zero(ledger_reserved_mb=1000)
+        reading = nvml_reading(
+            free_mb=_SMALL_CARD_MB - self._WORKER_USES_MB - self._EXTERNAL_TENANT_MB,
+            total_mb=_SMALL_CARD_MB,
+            process_used_mb={1: self._WORKER_USES_MB},
+        )
+        ledger_mb = scheduler._process_map.committed_vram_mb(
+            context_constant_mb=scheduler.resolved_context_constant_mb(),
+            device_index=0,
+        )
+
+        assert self._floor_after_one_window(scheduler, now, reading) == _SMALL_CARD_MB - reading.free_mb - ledger_mb
 
 
 class TestManagedTenantIsChargedOnItsCard:
