@@ -58,6 +58,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     _GOVERNOR_DEFER_DWELL_SECONDS,
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
+    DominanceRung,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _RESIDENCY_GRACE_SECONDS,
@@ -2156,6 +2157,122 @@ class TestFailedPreloadSend:
         assert scheduler._reserve_ledger.total_vram_mb() == 0.0
 
 
+class TestCrossModelPreloadOntoARetainingLane:
+    """A preload of another model is the lane's model change, so its retained weights go back ahead of it."""
+
+    async def test_the_retained_weights_are_unloaded_ahead_of_the_preload(self) -> None:
+        """The unload precedes the preload on the pipe and the retained record is cleared.
+
+        Left booked, the record sits under a lane that reads busy once preloaded, which every eviction actuator
+        refuses, so a dispatch held for those weights never gets them back and the queue stops.
+        """
+        lane = make_mock_process_info(0, model_name="retained-model")
+        lane.note_retention_grant("retained-model")
+        lane.settle_retention_after_job()
+        assert lane.retained_resident_model == "retained-model"
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
+        job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        assert scheduler._send_preload(job, lane, planned_charge_mb=None) is True
+
+        flags = [call.args[0].control_flag for call in lane.pipe_connection.send.call_args_list]
+        assert flags == [HordeControlFlag.UNLOAD_MODELS_FROM_VRAM, HordeControlFlag.PRELOAD_MODEL]
+        assert lane.retained_resident_model is None
+
+    async def test_a_same_model_preload_keeps_the_retained_weights(self) -> None:
+        """Re-preloading the model the lane retains is the retention case proper and sends no unload."""
+        lane = make_mock_process_info(0, model_name="stable_diffusion")
+        lane.note_retention_grant("stable_diffusion")
+        lane.settle_retention_after_job()
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
+        job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        assert scheduler._send_preload(job, lane, planned_charge_mb=None) is True
+
+        flags = [call.args[0].control_flag for call in lane.pipe_connection.send.call_args_list]
+        assert flags == [HordeControlFlag.PRELOAD_MODEL]
+        assert lane.retained_resident_model == "stable_diffusion"
+
+
+class TestDominantRunGrantAtFirstStep:
+    """A rung-1 run, and so its claim over the offer, is granted once the job samples, never at the dispatch commit."""
+
+    async def _sampling_lane(self, monkeypatch: pytest.MonkeyPatch) -> tuple[InferenceScheduler, HordeProcessInfo]:
+        """A lane owning a dispatched job for a model whose card verdict is rung 1, still loading."""
+        lane = make_mock_process_info(0, model_name="run-model", state=HordeProcessState.INFERENCE_PRIMED)
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: lane}))
+        monkeypatch.setattr(scheduler, "_dominant_run_grantable", lambda model, device_index: model == "run-model")
+        job = make_job_pop_response("run-model")
+        await track_popped_job_async(scheduler._job_tracker, job)
+        lane.record_inference_ownership(job, attempt_ordinal=1)
+        return scheduler, lane
+
+    async def test_the_run_is_granted_at_the_first_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The card holds no run while the lane loads, and the first step grants it."""
+        scheduler, lane = await self._sampling_lane(monkeypatch)
+
+        scheduler._grant_dominant_runs_at_first_step()
+        assert scheduler._whole_card_ledger.holder_for_model("run-model") == (False, None)
+
+        lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+        scheduler._grant_dominant_runs_at_first_step()
+        found, device_index = scheduler._whole_card_ledger.holder_for_model("run-model")
+        assert found
+        assert scheduler._whole_card_ledger.state_for(device_index).rung is DominanceRung.CANNOT_CO_SAMPLE
+
+    async def test_a_job_that_keeps_sampling_is_counted_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A job that keeps sampling does not re-ask, since a re-ask is new demand and restarts the empty-pop run.
+
+        Re-asked on every cycle, the claim could never reach its no-further-work end.
+        """
+        scheduler, lane = await self._sampling_lane(monkeypatch)
+        lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+        scheduler._grant_dominant_runs_at_first_step()
+        ledger = scheduler._whole_card_ledger
+        ledger.note_pop_outcome(None, served=False, now=scheduler._clock())
+        assert ledger.state_for(None).pop_claim_empty_pops == 1
+
+        scheduler._grant_dominant_runs_at_first_step()
+        assert ledger.state_for(None).pop_claim_empty_pops == 1
+
+
+class TestDominantRunJobPassesAHeldHead:
+    """A run's job is seated on its lane when a head for another model is held for the run's weights."""
+
+    async def test_the_run_job_behind_a_held_head_is_selected(self) -> None:
+        """The run's weights stay while its job waits, and the run ends only once that job is served.
+
+        Left behind the held head, the run job would keep the run, and so the head, waiting on itself.
+        """
+        head_lane = make_mock_process_info(0, model_name="head-model")
+        run_lane = make_mock_process_info(1, model_name="run-model")
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: head_lane, 1: run_lane}))
+        head = make_job_pop_response("head-model")
+        run_job = make_job_pop_response("run-model")
+        await track_popped_job_async(scheduler._job_tracker, head)
+        await track_popped_job_async(scheduler._job_tracker, run_job)
+
+        assert scheduler._select_dominant_run_job(head, [head, run_job], head_device_index=None) is None, (
+            "without a run, a job behind the head is not pulled forward"
+        )
+
+        scheduler._whole_card_ledger.record_grant(
+            None, model="run-model", forecast=None, cooldown_until=0.0, now=0.0, rung=DominanceRung.CANNOT_CO_SAMPLE
+        )
+        assert scheduler._select_dominant_run_job(head, [head, run_job], head_device_index=None) == (
+            run_job,
+            run_lane,
+        )
+
+        scheduler._whole_card_ledger.record_run_end(None)
+        scheduler._whole_card_ledger.record_grant(None, model="run-model", forecast=None, cooldown_until=0.0, now=0.0)
+        assert scheduler._select_dominant_run_job(head, [head, run_job], head_device_index=None) is None, (
+            "a rung-2 residency's jobs pass a cold head through the residency bypass, never this route"
+        )
+
+
 class TestPrivateArbiterCycleFreshness:
     """A scheduler with no manager driving it must still price against the card as it currently is.
 
@@ -3482,7 +3599,16 @@ class TestACycleBothPreloadsAndDispatches:
 
 
 class TestLadderLaneRestoreUnderWholeCard:
-    """A ladder-paused service lane is not restored under a held whole-card residency unless post-processing waits."""
+    """A ladder-paused service lane is not restored under a held rung-2 residency unless post-processing waits.
+
+    A rung-1 run tears nothing down and its model samples beside a context, so it does not stand the restore down.
+    """
+
+    @staticmethod
+    def _grant(sched: InferenceScheduler, rung: DominanceRung) -> None:
+        sched._whole_card_ledger.record_grant(
+            None, model="whole-card-model", forecast=None, cooldown_until=0.0, now=0.0, rung=rung
+        )
 
     @pytest.mark.parametrize("restore", ["restore_utilities_lane", "restore_post_process_lane"])
     async def test_lane_restore_proceeds_under_a_residency_while_post_processing_waits(self, restore: str) -> None:
@@ -3496,7 +3622,7 @@ class TestLadderLaneRestoreUnderWholeCard:
             "restore_post_process_lane": "restore_post_process_off_gpu",
         }[restore]
         setattr(sched._process_lifecycle, lifecycle_name, lifecycle_restore)
-        sched._whole_card_ledger.any_held = Mock(return_value=True)  # type: ignore[method-assign]
+        self._grant(sched, DominanceRung.CANNOT_CO_RESIDE)
         assert job_tracker.post_processing_backlog_depth == 1
 
         assert getattr(sched, restore)(0) is True
@@ -3512,11 +3638,26 @@ class TestLadderLaneRestoreUnderWholeCard:
             "restore_post_process_lane": "restore_post_process_off_gpu",
         }[restore]
         setattr(sched._process_lifecycle, lifecycle_name, lifecycle_restore)
-        sched._whole_card_ledger.any_held = Mock(return_value=True)  # type: ignore[method-assign]
+        self._grant(sched, DominanceRung.CANNOT_CO_RESIDE)
 
         assert getattr(sched, restore)(0) is False
         lifecycle_restore.assert_not_called()
 
-        sched._whole_card_ledger.any_held = Mock(return_value=False)  # type: ignore[method-assign]
+        sched._whole_card_ledger.record_restore(None, now=1.0)
+        assert getattr(sched, restore)(0) is True
+        lifecycle_restore.assert_called_once()
+
+    @pytest.mark.parametrize("restore", ["restore_utilities_lane", "restore_post_process_lane"])
+    def test_lane_restore_proceeds_under_a_run(self, restore: str) -> None:
+        """A rung-1 run cleared no context, so the ladder's restore of the lane is not stood down."""
+        sched = _make_inference_scheduler()
+        lifecycle_restore = Mock(return_value=True)
+        lifecycle_name = {
+            "restore_utilities_lane": "restore_utilities_off_gpu",
+            "restore_post_process_lane": "restore_post_process_off_gpu",
+        }[restore]
+        setattr(sched._process_lifecycle, lifecycle_name, lifecycle_restore)
+        self._grant(sched, DominanceRung.CANNOT_CO_SAMPLE)
+
         assert getattr(sched, restore)(0) is True
         lifecycle_restore.assert_called_once()

@@ -33,7 +33,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     ResolutionBucket,
     sampling_footprint_key,
 )
-from horde_worker_regen.process_management.scheduling.admission import pricing
+from horde_worker_regen.process_management.scheduling.admission import preload, pricing
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.governance.whole_card import DominanceRung
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -397,6 +397,92 @@ class TestReclaimPredicates:
             assert scheduler.unload_models_from_vram(scheduler._process_map[0], under_pressure=True) is (not fits)
             evicted = lookahead_holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM  # type: ignore[attr-defined]
             assert evicted is (not fits)
+
+
+class TestDominantRunCopy:
+    """A rung-1 run's copy with a next job is spared by the sweep and by preload targeting, whoever needs the room."""
+
+    async def _run_worker(self, *, pending: list[str]):  # noqa: ANN202
+        """Slot 1 holds the run's model idle; slot 0 is the lane a head for another model would be seated on."""
+        run_lane = _slot(1, model="run")
+        scheduler, jobs = await _worker(slots={0: _slot(0, model=None), 1: run_lane}, pending=pending)
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model="run",
+            forecast=None,
+            cooldown_until=0.0,
+            now=scheduler._clock(),
+            rung=DominanceRung.CANNOT_CO_SAMPLE,
+        )
+        return scheduler, jobs, run_lane
+
+    async def test_a_pending_job_or_the_claim_gives_the_run_a_next_job(self) -> None:
+        """The copy belongs to the run while a job for its model waits or its claim stands, and not otherwise."""
+        scheduler, jobs, _run_lane = await self._run_worker(pending=["other", "run"])
+        snapshot = scheduler.snapshot()
+        assert snapshot.dominant_runs == {"run": None}
+        assert pricing.copy_belongs_to_dominant_run(snapshot, "run", None) is True
+        assert pricing.copy_belongs_to_dominant_run(snapshot, "other", None) is False
+        assert pricing.copy_belongs_to_dominant_run(snapshot, "run", None, besides_job_id=str(jobs[1].id_)) is (
+            snapshot.pop_claim_model == "run"
+        ), "the job dispatching now is not its own successor; only the claim is left"
+
+        scheduler._whole_card_ledger.note_terminal_fault("run", now=scheduler._clock())
+        released = scheduler.snapshot()
+        assert released.pop_claim_model is None
+        assert pricing.copy_belongs_to_dominant_run(released, "run", None, besides_job_id=str(jobs[1].id_)) is False
+
+    async def test_a_teardown_residency_is_not_a_run(self) -> None:
+        """A rung-2 residency is not a run, and its model is left to the readers that own the teardown."""
+        scheduler, _jobs = await _worker(slots={1: _slot(1, model="heavy")}, pending=["heavy"])
+        scheduler._whole_card_ledger.record_grant(None, model="heavy", forecast=None, cooldown_until=0.0, now=0.0)
+        snapshot = scheduler.snapshot()
+        assert snapshot.dominant_runs == {}
+        assert pricing.copy_belongs_to_dominant_run(snapshot, "heavy", None) is False
+
+    async def test_the_sweep_spares_the_run_copy_for_the_head_and_takes_it_once_the_run_has_no_next_job(
+        self,
+    ) -> None:
+        """The head escalation does not take a run's copy, which is an idle resident once no job or claim is left.
+
+        The predicate and the actuator agree, since both ask `pricing.sweep_spares_idle_copy`.
+        """
+        scheduler, _jobs, run_lane = await self._run_worker(pending=["other", "run"])
+        snapshot = scheduler.snapshot()
+        assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is False
+        assert (
+            scheduler.unload_models_from_vram(scheduler._process_map[0], under_pressure=True, for_head_of_queue=True)
+            is False
+        )
+        assert run_lane.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM  # type: ignore[attr-defined]
+
+        scheduler, _jobs, run_lane = await self._run_worker(pending=["other"])
+        scheduler._whole_card_ledger.note_terminal_fault("run", now=scheduler._clock())
+        snapshot = scheduler.snapshot()
+        assert pricing.copy_belongs_to_dominant_run(snapshot, "run", None) is False
+        assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is True
+        assert (
+            scheduler.unload_models_from_vram(scheduler._process_map[0], under_pressure=True, for_head_of_queue=True)
+            is True
+        )
+        assert run_lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM  # type: ignore[attr-defined]
+
+    async def test_a_run_lane_is_no_preload_target_for_another_model(self) -> None:
+        """The lane holding a run's copy is committed to the run's next job, so another model's preload has no target.
+
+        Once the run has no next job the lane is an ordinary target again.
+        """
+        scheduler, jobs = await _worker(slots={1: _slot(1, model="run")}, pending=["other", "run"])
+        scheduler._whole_card_ledger.record_grant(
+            None, model="run", forecast=None, cooldown_until=0.0, now=0.0, rung=DominanceRung.CANNOT_CO_SAMPLE
+        )
+        snapshot = scheduler.snapshot()
+        assert 1 in preload.lanes_committed_elsewhere(snapshot, "other")
+        assert 1 not in preload.lanes_committed_elsewhere(snapshot, "run")
+        assert preload.select_preload_target(snapshot, str(jobs[0].id_)) is None
+
+        scheduler._whole_card_ledger.record_run_end(None)
+        assert preload.select_preload_target(scheduler.snapshot(), str(jobs[0].id_)) == 1
 
 
 _FLUX = KNOWN_IMAGE_GENERATION_BASELINE.flux_1

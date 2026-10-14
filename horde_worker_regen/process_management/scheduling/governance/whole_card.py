@@ -13,12 +13,16 @@ stored and answered here, and actuated at the scheduler's call sites.
 
 A held residency also claims the worker's intake: while the claim stands the offer is exactly the resident
 model, so the horde stops sending work that would force the resident weights back out of the card. The claim
-is a residency fact, so its state and its two end conditions (the operator-configured maximum hold, and the
-run of empty pops that says the resident model's demand has dried up) are answered here too.
+is a residency fact, so its state and its early ends (the operator-configured maximum hold, the run of empty
+pops that says the resident model's demand has dried up, and a terminal fault of the claimed model) are
+answered here too.
 
 Each grant carries the dominance rung it was made on (:class:`DominanceRung`). Rung 2 carries the teardown. The
 readers that stop siblings, move safety or pause lanes read :meth:`WholeCardResidencyLedger.teardown_held`, so a rung-1
-grant shares the claim, the holds and the cooldown without tearing anything down.
+grant shares the claim and the cooldown without tearing anything down. A rung-1 grant is a run: the worker keeps
+earning on the dominant model's loaded weights instead of swapping to another large model and back. Since it tears
+nothing down, it opens no grace window, counts toward neither churn governor and has no minimum hold, and its end
+regrows nothing (:meth:`WholeCardResidencyLedger.record_run_end`).
 
 The scheduler keeps the transitions that touch live processes (establish, converge,
 restore); it reads and writes residency state exclusively through
@@ -239,10 +243,11 @@ class WholeCardPopClaim:
 class WholeCardPopClaimRelease(StrEnum):
     """Why a standing claim over the pop offer stopped narrowing what the worker advertises.
 
-    The three ends call for different responses, so they are distinguished rather than reported as one
-    "claim over" event: a cap expiry says the burst outlasted the window the operator set, the empty-pop
-    finding says the demand went away, and a residency release says the card simply stopped holding the
-    model. Enumerated so the status surfaces and the disclosure line name the same set.
+    The ends call for different responses, so they are distinguished rather than reported as one "claim over"
+    event: a cap expiry says the burst outlasted the window the operator set, the empty-pop finding says the
+    demand went away, a terminal fault says the claimed model's work is failing on the card, and a residency
+    release says the card simply stopped holding the model. Enumerated so the status surfaces and the
+    disclosure line name the same set.
     """
 
     MAXIMUM_HOLD = "maximum_hold"
@@ -251,6 +256,9 @@ class WholeCardPopClaimRelease(StrEnum):
     """The run of empty pops established that the resident model's demand had dried up."""
     RESIDENCY_RELEASED = "residency_released"
     """The residency behind the claim let go, and the claim went with it."""
+    TERMINAL_FAULT = "terminal_fault"
+    """A job for the claimed model faulted terminally. Narrowing the offer to a model whose jobs fault feeds the
+    card more of the same failure, so the claim lets go at the first one."""
 
 
 class DominanceRung(StrEnum):
@@ -281,7 +289,7 @@ class WholeCardResidency:
     """The model holding (or being given) sole residency on this card; None when no residency is held."""
     rung: DominanceRung = DominanceRung.CANNOT_CO_RESIDE
     """The dominance rung the grant was made on. Rung 2 carries the teardown (stopped siblings, safety off the
-    card, paused lanes). Rung 1 shares the claim, the holds and the cooldown and tears nothing down."""
+    card, paused lanes). Rung 1 is a run: it shares the claim and the cooldown and tears nothing down."""
     forecast: StreamForecast | None = None
     """The immutable forecast that granted this residency, cached for diagnostics and its fit guarantee."""
     repriced_target: int | None = None
@@ -348,10 +356,12 @@ class WholeCardResidency:
     pop_claim_empty_pop_since: float = 0.0
     """When the current run of empty pops began, so the run is judged over a span as well as a count."""
     pop_claim_released_at: float = 0.0
-    """When the empty-pop evidence ended this residency's claim over the offer; 0.0 while it still stands.
+    """When the empty-pop evidence or a terminal fault ended this residency's claim over the offer; 0.0 while it
+    still stands.
 
     Distinct from the maximum hold, which is a clock on the grant: this is a finding that the resident model
-    has no demand left, so continuing to hold the pool to it would starve the worker on its own claim."""
+    has no demand left, or that its jobs fail on the card, so continuing to hold the pool to it would starve the
+    worker on its own claim."""
 
 
 class WholeCardGrantKind(StrEnum):
@@ -463,13 +473,20 @@ class WholeCardResidencyLedger:
         run alone; resetting the run on every re-ask would keep the claim from ever releasing while the head
         is parked.
 
-        ``rung`` is the dominance rung the grant is made on. A further ask on a higher rung promotes the held
-        grant in place. A lower one never demotes it while it is held.
+        ``rung`` is the dominance rung the grant is made on. A rung-1 grant is a run and costs no teardown, so
+        its establishment opens no minimum hold and is not counted by the rate limiter. A rung-2 ask for the
+        model a run holds is the teardown starting, so it is an establishment and restarts every clock. A rung-1
+        ask never demotes a held rung-2 grant.
         """
         state = self.state_for(device_index)
+        promoting_run = (
+            state.model == model
+            and state.rung is not DominanceRung.CANNOT_CO_RESIDE
+            and rung is DominanceRung.CANNOT_CO_RESIDE
+        )
         kind = (
             WholeCardGrantKind.REUSE
-            if state.model is not None and state.model == model and state.established_at != 0.0
+            if state.model is not None and state.model == model and state.established_at != 0.0 and not promoting_run
             else WholeCardGrantKind.ESTABLISH
         )
         # A job asking for this model is the direct contradiction of the empty-pop evidence, so the run restarts
@@ -479,13 +496,15 @@ class WholeCardResidencyLedger:
             state.pop_claim_empty_pops = 0
             state.pop_claim_empty_pop_since = 0.0
         if kind is WholeCardGrantKind.ESTABLISH:
+            tears_down = rung is DominanceRung.CANNOT_CO_RESIDE
             state.established_at = now
-            state.min_hold_until = now + _MIN_HOLD_SECONDS
+            state.min_hold_until = now + _MIN_HOLD_SECONDS if tears_down else now
             state.structural_complete_at = 0.0
             state.drain_reference_at = 0.0
             state.drain_reference_mb = 0.0
             state.pop_claim_released_at = 0.0
-            state.establishments.append(now)
+            if tears_down:
+                state.establishments.append(now)
             if establish_grace_seconds > 0.0:
                 state.grace_charges.append((now, establish_grace_seconds))
             state.forecast = forecast
@@ -512,22 +531,21 @@ class WholeCardResidencyLedger:
         genuinely inside still runs its full duration and nothing cuts it short.
         """
         state = self.state_for(device_index)
-        state.model = None
-        state.rung = DominanceRung.CANNOT_CO_RESIDE
-        state.forecast = None
-        state.repriced_target = None
-        state.established_at = 0.0
-        state.min_hold_until = 0.0
-        state.structural_complete_at = 0.0
-        state.drain_reference_at = 0.0
-        state.drain_reference_mb = 0.0
-        state.prestage_process_id = None
-        state.pop_claim_empty_pops = 0
-        state.pop_claim_empty_pop_since = 0.0
-        state.pop_claim_released_at = 0.0
+        _clear_grant(state)
         state.restore_at = now
         if restore_grace_seconds > 0.0:
             state.grace_charges.append((now, restore_grace_seconds))
+
+    def record_run_end(self, device_index: int | None) -> None:
+        """Clear a rung-1 run on ``device_index`` once its own work has drained.
+
+        A run stopped no sibling and paused no lane, so its end has no churn to cover: unlike
+        :meth:`record_restore` it opens no restore window and charges nothing to the grace budget.
+        """
+        state = self._residencies.get(device_index)
+        if state is None:
+            return
+        _clear_grant(state)
 
     def close_restore_window(self, device_index: int | None, *, granted_at: float) -> None:
         """Withdraw a restore window granted at ``granted_at`` whose restore had no churn to cover.
@@ -634,6 +652,24 @@ class WholeCardResidencyLedger:
         state.pop_claim_released_at = now
         return True
 
+    def note_terminal_fault(self, model: str | None, *, now: float) -> bool:
+        """Release the claim a residency holds for ``model`` because one of its jobs faulted terminally.
+
+        A fault of a model the card does not claim leaves every claim standing. The release ends the claim's
+        retention as the empty-pop release does, so the residency lets go once its accepted work has drained.
+
+        Returns:
+            True when this fault released a standing claim, so the caller can name the end once.
+        """
+        found, device_index = self.holder_for_model(model)
+        if not found:
+            return False
+        state = self._residencies[device_index]
+        if state.pop_claim_released_at != 0.0 or state.established_at == 0.0:
+            return False
+        state.pop_claim_released_at = now
+        return True
+
     def pop_claim_retention_ended(
         self,
         device_index: int | None,
@@ -715,8 +751,11 @@ class WholeCardResidencyLedger:
         state = self._residencies.get(device_index)
         if state is None or state.model is None:
             return None, WholeCardPhase.NONE
-        establishing = state.established_at != 0.0 and (now - state.established_at) < establish_grace_seconds
-        return state.model, (WholeCardPhase.ESTABLISHING if establishing else WholeCardPhase.HOLDING)
+        return state.model, (
+            WholeCardPhase.ESTABLISHING
+            if _establishing(state, now=now, establish_grace_seconds=establish_grace_seconds)
+            else WholeCardPhase.HOLDING
+        )
 
     def grace_active(
         self,
@@ -857,13 +896,8 @@ class WholeCardResidencyLedger:
         restore_grace_seconds: float,
     ) -> bool:
         """Return whether one card's residency sits inside a nominal establish or restore window."""
-        establishing = (
-            state.model is not None
-            and state.established_at != 0.0
-            and (now - state.established_at) < establish_grace_seconds
-        )
         restoring = state.restore_at != 0.0 and (now - state.restore_at) < restore_grace_seconds
-        return establishing or restoring
+        return _establishing(state, now=now, establish_grace_seconds=establish_grace_seconds) or restoring
 
     def drain_backstop_elapsed(self, device_index: int | None, *, now: float, settle_seconds: float) -> bool:
         """Return whether the bounded drain-settle window has elapsed since the teardown became structural.
@@ -1117,6 +1151,36 @@ def offer_under_pop_claim(models: frozenset[str], *, claim: WholeCardPopClaim | 
     return models & {claim.model}
 
 
+def _establishing(state: WholeCardResidency, *, now: float, establish_grace_seconds: float) -> bool:
+    """Return whether a held rung-2 residency is still inside its establish grace.
+
+    A run tears nothing down, so it never holds the queue for a teardown and is never establishing.
+    """
+    return (
+        state.model is not None
+        and state.rung is DominanceRung.CANNOT_CO_RESIDE
+        and state.established_at != 0.0
+        and (now - state.established_at) < establish_grace_seconds
+    )
+
+
+def _clear_grant(state: WholeCardResidency) -> None:
+    """Reset every field a grant sets, leaving the card's churn history (restore stamp, charges, establishments)."""
+    state.model = None
+    state.rung = DominanceRung.CANNOT_CO_RESIDE
+    state.forecast = None
+    state.repriced_target = None
+    state.established_at = 0.0
+    state.min_hold_until = 0.0
+    state.structural_complete_at = 0.0
+    state.drain_reference_at = 0.0
+    state.drain_reference_mb = 0.0
+    state.prestage_process_id = None
+    state.pop_claim_empty_pops = 0
+    state.pop_claim_empty_pop_since = 0.0
+    state.pop_claim_released_at = 0.0
+
+
 def _prune_before(stamps: deque[float], *, cutoff: float) -> None:
     """Drop timestamps at or before ``cutoff`` from the front of an oldest-first deque.
 
@@ -1172,13 +1236,17 @@ class WholeCardPopClaimTracker:
     def __init__(self) -> None:
         """Start with no claim disclosed and no release remembered."""
         self._disclosed: WholeCardPopClaim | None = None
-        self._empty_release_pending = False
+        self._early_release_pending: WholeCardPopClaimRelease | None = None
         self._release: tuple[WholeCardPopClaimRelease, float] | None = None
         self._multi_gpu_disclosed = False
 
     def note_empty_pop_release(self) -> None:
         """Remember that the empty-pop evidence ended the claim, so the next edge names that end."""
-        self._empty_release_pending = True
+        self._early_release_pending = WholeCardPopClaimRelease.NO_FURTHER_WORK
+
+    def note_terminal_fault_release(self) -> None:
+        """Remember that a terminal fault of the claimed model ended the claim, so the next edge names that end."""
+        self._early_release_pending = WholeCardPopClaimRelease.TERMINAL_FAULT
 
     def disclose_skipped_on_multi_gpu(self, *, any_held: bool) -> None:
         """State once that a residency on a multi-card host does not claim the worker-wide offer.
@@ -1201,7 +1269,7 @@ class WholeCardPopClaimTracker:
             if previous is not None and previous.model == claim.model:
                 return
             self._disclosed = claim
-            self._empty_release_pending = False
+            self._early_release_pending = None
             self._release = None
             logger.info(
                 f"Whole-card pop claim engaged for {claim.model}: advertising that model alone while it holds "
@@ -1211,16 +1279,19 @@ class WholeCardPopClaimTracker:
         if previous is None:
             return
         self._disclosed = None
-        if self._empty_release_pending:
+        if self._early_release_pending is WholeCardPopClaimRelease.NO_FURTHER_WORK:
             release = WholeCardPopClaimRelease.NO_FURTHER_WORK
             reason = "the horde had no further work for it"
+        elif self._early_release_pending is WholeCardPopClaimRelease.TERMINAL_FAULT:
+            release = WholeCardPopClaimRelease.TERMINAL_FAULT
+            reason = "a job for it faulted terminally"
         elif now >= previous.expires_at:
             release = WholeCardPopClaimRelease.MAXIMUM_HOLD
             reason = "the maximum hold elapsed"
         else:
             release = WholeCardPopClaimRelease.RESIDENCY_RELEASED
             reason = "the residency released"
-        self._empty_release_pending = False
+        self._early_release_pending = None
         self._release = (release, now)
         logger.info(f"Whole-card pop claim released for {previous.model}: {reason}; advertising the full pool again.")
 

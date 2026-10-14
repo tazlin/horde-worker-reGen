@@ -1310,6 +1310,8 @@ class _DispatchWorld:
         self._large_model_pop_governor = LargeModelPopGovernor()
         self.large_model_withholds: dict[int, LargeModelPopDecision] = {}
         """Per tick, the last offer the large-model governor narrowed, with the models it withheld and why."""
+        self._empty_pop_reported_tick: int | None = None
+        """The tick whose refused offer last reported an empty pop under the claim, so a tick reports one."""
         self._first_step_noted: set[str] = set()
         """Jobs whose first step the performance model has been handed."""
         self.completed_job_ids: list[str] = []
@@ -2845,13 +2847,22 @@ class _DispatchWorld:
         """Take a job only when its model is one the worker is currently asking for.
 
         Stands in for the horde answering a pop with a job: work the worker did not advertise never arrives,
-        so a job for an unadvertised model is refused and the queue never sees it.
+        so a job for an unadvertised model is refused and the queue never sees it. Under a standing pop claim the
+        outcome is reported as the popper reports it: a refusal is the horde answering the narrowed pop with
+        nothing, counted once per tick since the tick is the world's pop cadence, and a taken job is the claimed
+        model's demand.
         """
         if self.pops_held_for_host_ram():
             return False
+        claim = self._scheduler.whole_card_pop_claim()
         if job.model not in self.advertised_models():
+            if claim is not None and self._empty_pop_reported_tick != self.tick:
+                self._empty_pop_reported_tick = self.tick
+                self.report_empty_pop()
             return False
         await self.pop(job)
+        if claim is not None:
+            self._scheduler.note_whole_card_pop_outcome(served=True)
         return True
 
     def report_empty_pop(self) -> None:

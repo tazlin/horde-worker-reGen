@@ -2460,13 +2460,15 @@ class HordeWorkerProcessManager:
         return True
 
     def _on_terminal_job_fault(self, model: str | None) -> None:
-        """Record one terminally faulted generation against the fault-rate breaker's window.
+        """Record one terminally faulted generation against the fault-rate breaker's window and the pop claim.
 
         Shutdown is excluded: the drain deliberately faults the remaining backlog so the horde reissues it
-        promptly, and pausing intake on a worker that is already leaving accepts nothing either way.
+        promptly, and pausing intake on a worker that is already leaving accepts nothing either way. A claim
+        held for the faulted model releases, so the offer stops narrowing to work that fails on the card.
         """
         if self._state.shutting_down:
             return
+        self._inference_scheduler.note_terminal_job_fault(model)
         now = time.time()
         self._terminal_fault_history.append((now, model))
         cutoff = now - TERMINAL_FAULT_BREAKER_WINDOW_SECONDS

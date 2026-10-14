@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from unittest.mock import Mock
 
 import pytest
 from loguru import logger
@@ -374,9 +373,10 @@ async def test_stranded_reduction_backstop_holds_while_the_head_is_parked(monkey
 async def test_stranded_context_reduction_stands_down_under_a_whole_card_residency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """While a whole-card residency owns the pool the backstop defers to it and keeps the obligation booked."""
+    """While a rung-2 whole-card residency owns the pool the backstop defers to it and keeps the obligation booked."""
     manager, requested_targets = _manager_with_a_stranded_context_reduction(monkeypatch)
-    manager._inference_scheduler._whole_card_ledger.any_held = Mock(return_value=True)  # type: ignore[method-assign]
+    ledger = manager._inference_scheduler._whole_card_ledger
+    ledger.record_grant(None, model="whole-card-model", forecast=None, cooldown_until=0.0, now=0.0)
 
     manager._restore_stranded_context_reductions(0, saturated=False)
     manager._context_reduction_stranded_since_by_device[0] -= manager._STRANDED_LANE_RESTORE_DEBOUNCE_SECONDS + 5.0
@@ -389,7 +389,7 @@ async def test_stranded_context_reduction_stands_down_under_a_whole_card_residen
     )
 
     # Residency released: the retained obligation is what lets the retry succeed.
-    manager._inference_scheduler._whole_card_ledger.any_held = Mock(return_value=False)  # type: ignore[method-assign]
+    ledger.record_restore(None, now=1.0)
     manager._restore_stranded_context_reductions(0, saturated=False)
     assert manager._process_map.num_loaded_inference_processes(device_index=0) == 2
 

@@ -919,6 +919,9 @@ class InferenceScheduler:
         # floor was last reported as holding a ready different-model head off that card. Cleared when the
         # residency restores, so each episode's floor is stated once.
         self._min_hold_disclosed: dict[int | None, str | None] = {}
+        # The job each inference lane last reported sampling for, so a rung-1 run is granted once per job at its
+        # first step and a lane that keeps sampling the same job does not re-ask.
+        self._dominant_run_sampled_job: dict[int, str] = {}
         # Clocks, latches and records about the head of the queue: its idle-device starvation, the RAM-defer
         # barrier, the safety-recovery admission hold, the last admission decision, staging deferrals, the
         # missing-model latch, the dispatch-stall diagnostic and the heavy-head load grace.
@@ -2568,7 +2571,7 @@ class InferenceScheduler:
         preload predicts a dispatch the held residency withholds, so no safety check of its can come before the
         residency ends, and waiting on it would keep safety on the card for nothing.
         """
-        for device_index, state in self._whole_card_ledger.held():
+        for device_index, state in self._whole_card_ledger.teardown_held():
             if state.model is None or not self._residency_should_pause_safety(device_index):
                 continue
             for process in self._process_map.values():
@@ -2988,6 +2991,110 @@ class InferenceScheduler:
                 self._process_map.residency_snapshot(),
             )
 
+    def _grant_dominant_runs_at_first_step(self) -> None:
+        """Grant or extend a rung-1 run (:meth:`_note_dominant_run`) for each job that has reached its first step.
+
+        The run's claim narrows the offer, so it engages once the model is loaded and sampling. Engaged at the
+        dispatch commit, it narrows intake for the whole load, and a load that never lands leaves the worker asking
+        for a model it is not serving. A lane reports ``INFERENCE_STARTING`` at its first step whether or not the
+        sampling lease cleared it, so this one reading covers both paths. Each job is counted once.
+        """
+        sampling: dict[int, str] = {}
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.last_process_state is not HordeProcessState.INFERENCE_STARTING:
+                continue
+            job = process_info.current_inference_job()
+            if job is None or job.model is None:
+                continue
+            job_id = str(job.id_)
+            sampling[process_info.process_id] = job_id
+            if self._dominant_run_sampled_job.get(process_info.process_id) != job_id:
+                self._note_dominant_run(job.model, process_info)
+        self._dominant_run_sampled_job = sampling
+
+    def _dominant_run_grantable(self, model: str, device_index: int | None) -> bool:
+        """Whether ``model`` may hold a rung-1 run on the card, which needs a rung-1 verdict and no other grant.
+
+        A card holding a grant for another model is left to that grant, and rung 2 is granted by the demand path
+        alone.
+        """
+        if not self._budget_active() or not self._whole_card_residency_enabled():
+            return False
+        held = self._whole_card_ledger.get(device_index)
+        if (
+            held is not None
+            and held.model is not None
+            and (held.model != model or held.rung is DominanceRung.CANNOT_CO_RESIDE)
+        ):
+            return False
+        verdict = pricing.model_dominance(
+            self.card_dominance(device_index),
+            self._footprint_store,
+            model,
+            self._model_metadata.get_baseline(model),
+        )
+        return verdict is not None and verdict.rung is DominanceRung.CANNOT_CO_SAMPLE
+
+    def _note_dominant_run(self, model: str, process_with_model: HordeProcessInfo) -> None:
+        """Grant a rung-1 model a run on its card, or extend the run it already holds.
+
+        A run is the residency grant on rung 1: it claims the offer for the model and keeps its weights between
+        consecutive jobs, so the worker keeps earning on the loaded weights instead of swapping to another large
+        model and back. It tears nothing down.
+        """
+        device_index = self._routing_device_index(process_with_model)
+        if not self._dominant_run_grantable(model, device_index):
+            return
+        now = self._clock()
+        grant_kind = self._whole_card_ledger.record_grant(
+            device_index,
+            model=model,
+            forecast=None,
+            cooldown_until=now + self._whole_card_cooldown_seconds(),
+            now=now,
+            rung=DominanceRung.CANNOT_CO_SAMPLE,
+        )
+        if grant_kind is WholeCardGrantKind.ESTABLISH:
+            logger.info(
+                f"Dominant-model run for {model} on device {device_index if device_index is not None else 0}: no "
+                "offered model can sample beside it, so the offer narrows to it and its weights stay on the card "
+                "between its jobs; nothing is torn down.",
+            )
+
+    def _weights_belong_to_dominant_run(
+        self,
+        model: str,
+        *,
+        device_index: int | None,
+        dispatched_job: ImageGenerateJobPopResponse,
+    ) -> bool:
+        """Whether ``dispatched_job``'s weights belong to a rung-1 run that has a next job.
+
+        Read through :func:`pricing.copy_belongs_to_dominant_run`, with the dispatch committing now left out of the
+        pending jobs. The first job of a run counts as well when another job for its model is pending. Its run is
+        granted at its first step, after this verdict, and the weights it keeps belong to the run from then on.
+        """
+        snapshot = self.snapshot()
+        besides_job_id = str(dispatched_job.id_)
+        if pricing.copy_belongs_to_dominant_run(snapshot, model, device_index, besides_job_id=besides_job_id):
+            return True
+        if model in snapshot.dominant_runs or not self._dominant_run_grantable(model, device_index):
+            return False
+        return model in self._pending_models_besides(dispatched_job)
+
+    def note_terminal_job_fault(self, model: str | None) -> None:
+        """Release the pop claim held for ``model`` because one of its jobs faulted terminally.
+
+        Fed by the job tracker's terminal-fault observer, which reports generation faults only. A claimed model
+        whose jobs fault would otherwise keep the offer narrowed to more of the same failure.
+        """
+        if not self._whole_card_ledger.note_terminal_fault(model, now=self._clock()):
+            return
+        self._pop_claim_tracker.note_terminal_fault_release()
+        self._pop_claim_tracker.disclose_edge(self.whole_card_pop_claim(), now=self._clock())
+
     def _converge_whole_card_residency(self) -> None:
         """Collapse each held residency to sole VRAM residency once its model has a holder.
 
@@ -3095,7 +3202,7 @@ class InferenceScheduler:
         since it carries the target and fits-alone guarantee captured at establishment.
         """
         found, device_index = self._whole_card_ledger.holder_for_model(job.model)
-        if not found:
+        if not found or self._whole_card_ledger.state_for(device_index).rung is not DominanceRung.CANNOT_CO_RESIDE:
             return False
         # Re-use the residency's stored forecast for the readiness check rather than re-deriving from the
         # current (possibly degraded) state: it carries the stable weight footprint, the budget-relative target,
@@ -3362,6 +3469,16 @@ class InferenceScheduler:
                 # back-to-back heavy jobs).
                 if not retention_ended:
                     state.cooldown_until = now + self._whole_card_cooldown_seconds()
+                continue
+            if state.rung is not DominanceRung.CANNOT_CO_RESIDE:
+                # A run tore nothing down, so no minimum hold amortises it: any head for a different model ends it
+                # once its own work has drained, and its end regrows nothing.
+                head = self._job_tracker.undispatched_head()
+                different_model_head = head is not None and head.model is not None and head.model != model
+                if now < state.cooldown_until and not different_model_head and not retention_ended:
+                    continue
+                self._whole_card_ledger.record_run_end(device_index)
+                logger.debug(f"Dominant-model run for {model} ended: its jobs drained.")
                 continue
             # A ready head for a different model may cut the cooldown short, but not before the residency has
             # held long enough to amortize the teardown and the regrowth the release itself will pay for;
@@ -3672,9 +3789,9 @@ class InferenceScheduler:
     def is_whole_card_residency_active(self) -> bool:
         """Whether any card currently holds a whole-card residency lease (its cooldown still running).
 
-        Mirrors the ``active`` field of :meth:`whole_card_residency_state` but without building the full
-        snapshot, so the job popper's large-model re-entry cooldown can cheaply ask "is the lease up?" every
-        pop cycle: the lease is up exactly when this returns False (no card holds a residency model).
+        Counts a rung-1 run as well as a rung-2 residency, so the job popper's large-model re-entry cooldown
+        opens between runs as it does between teardowns. It asks this every pop cycle: the lease is up exactly
+        when this returns False (no card holds a grant).
         """
         return self._whole_card_ledger.any_held()
 
@@ -3694,6 +3811,12 @@ class InferenceScheduler:
         """
         if self._multi_gpu_routing_active:
             self._pop_claim_tracker.disclose_skipped_on_multi_gpu(any_held=self._whole_card_ledger.any_held())
+            return None
+        return self._standing_pop_claim()
+
+    def _standing_pop_claim(self) -> WholeCardPopClaim | None:
+        """The claim :meth:`whole_card_pop_claim` reports, read without its multi-GPU disclosure."""
+        if self._multi_gpu_routing_active:
             return None
         max_hold_seconds = self._whole_card_max_hold_seconds()
         if max_hold_seconds <= 0.0:
@@ -3792,9 +3915,10 @@ class InferenceScheduler:
         multi_process = self._max_inference_processes > 1
         possible = enabled and budget_on and (multi_process or safety_off_enabled)
 
-        # Represent the posture with the first held residency (single-GPU has at most one).
-        # ``active`` is true while any card holds a residency.
-        held = self._whole_card_ledger.held()
+        # Represent the posture with the first held rung-2 residency (single-GPU has at most one). A rung-1 run
+        # tears nothing down, so it has no phase, target or safety move to show; its claim over the offer is
+        # reported below like any other.
+        held = self._whole_card_ledger.teardown_held()
         representative_index, representative = held[0] if held else (None, None)
         model = representative.model if representative is not None else None
         active = model is not None
@@ -4332,7 +4456,7 @@ class InferenceScheduler:
             nonhead_residency_model = next(
                 (
                     state.model
-                    for _, state in self._whole_card_ledger.held()
+                    for _, state in self._whole_card_ledger.teardown_held()
                     if state.model is not None and state.model != head.model
                 ),
                 None,
@@ -6182,6 +6306,7 @@ class InferenceScheduler:
             arbiter_state=arbiter_state,
             foreign_floor_mb=self.current_foreign_floor_mb,
             dominance=self.card_dominance,
+            pop_claim_model=claim.model if (claim := self._standing_pop_claim()) is not None else None,
             eligible_cards=self._eligible_card_indices,
             disaggregation_class_eligible=self._is_disaggregation_class_eligible,
             unserviceable_reason=self._unserviceable_job_reason,
@@ -7671,6 +7796,12 @@ class InferenceScheduler:
         prior_model = available_process.loaded_horde_model_name
         is_model_swap = prior_model is not None and prior_model != job.model
 
+        # A preload of another model is the slot's model change, so weights it retains for an earlier model go back
+        # ahead of it on the same pipe, as they do ahead of a cross-model dispatch. Left booked, they sit under a
+        # slot that reads busy once preloaded, which every eviction actuator refuses, and a dispatch held for them
+        # never gets them back.
+        self.evict_retained_resident_for_model_change(available_process, job.model)
+
         with span_preload_model(model_name=job.model, process_id=available_process.process_id):
             preload_sent = available_process.safe_send_message(
                 HordePreloadInferenceModelMessage(
@@ -8897,12 +9028,12 @@ class InferenceScheduler:
         """Regrow a card's inference pool after a reclaim reduction (reclaim-ladder actuator).
 
         The unwind of :meth:`reduce_live_contexts`, driven by the reclaim ladder once the governor calls the
-        card HEALTHY. Stands down while that card holds a whole-card residency: the residency's own restore
+        card HEALTHY. Stands down while a rung-2 whole-card residency is held: the residency's own restore
         (:meth:`_restore_siblings_after_whole_card`) owns the regrowth then, and growing the pool underneath a
-        held residency would re-add the very contexts it cleared. Reports no-op when the pool is already at
-        its configured size.
+        held residency would re-add the very contexts it cleared. A rung-1 run cleared none, so it does not
+        stand the restore down. Reports no-op when the pool is already at its configured size.
         """
-        if self._whole_card_ledger.any_held():
+        if self._whole_card_ledger.teardown_held():
             return False
         ceiling = self._residency_restore_ceiling(device_index)
         current = self._process_map.num_loaded_inference_processes(device_index=device_index)
@@ -9504,16 +9635,17 @@ class InferenceScheduler:
     def restore_post_process_lane(self, device_index: int | None) -> bool:
         """Restart a ladder-paused post-processing lane once the card has recovered (reclaim-ladder actuator).
 
-        Stands down while a whole-card residency holds the card, as :meth:`restore_live_contexts` does: the
-        residency advertises its model alone, so the next job is another whole-card job on the same lane, and a
-        lane context restored between two of them is reclaimed again before the next can clear. The ladder keeps
-        the obligation and restores the lane once the residency has drained.
+        Stands down while a rung-2 whole-card residency holds the card, as :meth:`restore_live_contexts` does:
+        the residency advertises its model alone, so the next job is another whole-card job on the same lane, and
+        a lane context restored between two of them is reclaimed again before the next can clear. The ladder
+        keeps the obligation and restores the lane once the residency has drained. A rung-1 model samples beside
+        a context, so a run does not stand the restore down.
 
         The stand-down holds only while nothing is waiting for or on the post-processing lane. Jobs in that backlog
         are the residency's own and cannot drain without the lane, so refusing the restore would keep the residency
         from ever draining.
         """
-        if self._whole_card_ledger.any_held() and self._job_tracker.post_processing_backlog_depth == 0:
+        if self._whole_card_ledger.teardown_held() and self._job_tracker.post_processing_backlog_depth == 0:
             return False
         return self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 
@@ -9532,10 +9664,10 @@ class InferenceScheduler:
     def restore_utilities_lane(self, device_index: int | None) -> bool:
         """Restart a ladder-paused image-utilities lane once the card has recovered (reclaim-ladder actuator).
 
-        Stands down under a held whole-card residency, and restores under one while post-processing waits, for
-        the reasons :meth:`restore_post_process_lane` gives.
+        Stands down under a held rung-2 whole-card residency, and restores under one while post-processing
+        waits, for the reasons :meth:`restore_post_process_lane` gives.
         """
-        if self._whole_card_ledger.any_held() and self._job_tracker.post_processing_backlog_depth == 0:
+        if self._whole_card_ledger.teardown_held() and self._job_tracker.post_processing_backlog_depth == 0:
             return False
         return self._process_lifecycle.restore_utilities_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
 
@@ -9551,8 +9683,9 @@ class InferenceScheduler:
     def preload_models(self) -> bool:
         """Preload models that are likely to be used soon.
 
-        Housekeeping first (whole-card residency restore and convergence, safety placement, stale model-map
-        expiry, clearing preloads the queue no longer needs), then one pass over the pending queue in placement
+        Housekeeping first (rung-1 run grants at a first step, whole-card residency restore and convergence,
+        safety placement, stale model-map expiry, clearing preloads the queue no longer needs), then one pass over
+        the pending queue in placement
         order: each job's gate plan is decided over the cycle's snapshot and executed until one preloads or a
         gate stops the pass. A plan that faulted a job changes the queue the remaining decisions read, so the
         snapshot is re-taken behind it.
@@ -9566,6 +9699,7 @@ class InferenceScheduler:
         Returns:
             True if a model was preloaded, False otherwise.
         """
+        self._grant_dominant_runs_at_first_step()
         self._restore_siblings_after_whole_card()
         self._converge_whole_card_residency()
         self._reconcile_runtime_safety_placement()
@@ -10222,6 +10356,45 @@ class InferenceScheduler:
                 overlap,
                 device_index=candidate_process.device_index,
             ):
+                continue
+            return candidate_job, candidate_process
+        return None
+
+    def _select_dominant_run_job(
+        self,
+        head_job: ImageGenerateJobPopResponse,
+        candidates: list[ImageGenerateJobPopResponse],
+        *,
+        head_device_index: int | None,
+    ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
+        """A pending job of a rung-1 run on the head's card, seatable now on the lane holding the run's weights.
+
+        Offered when a residency gate withheld a head for another model. The run's weights stay on the card while
+        the run has a next job (:func:`pricing.copy_belongs_to_dominant_run`), and the run ends only once its own
+        work drains (:meth:`_restore_siblings_after_whole_card`), so a run job left behind the head would keep the
+        head waiting on itself. The run's job loads nothing and takes no room the head waits for. The cold-head
+        residency bypass in :meth:`get_next_job_and_process` passes a held residency's jobs on the same ground. A
+        degraded retry must run isolated and is never seated this way.
+        """
+        for candidate_job in candidates:
+            if candidate_job is head_job or candidate_job.model is None or candidate_job.model == head_job.model:
+                continue
+            found, holder_device = self._whole_card_ledger.holder_for_model(candidate_job.model)
+            if (
+                not found
+                or self._whole_card_ledger.state_for(holder_device).rung is not DominanceRung.CANNOT_CO_SAMPLE
+            ):
+                continue
+            if holder_device is not None and head_device_index is not None and holder_device != head_device_index:
+                continue
+            if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
+                continue
+            candidate_process = self._seatable_resident_process(candidate_job)
+            if candidate_process is None:
+                continue
+            if not self._multi_gpu_routing_active and len(
+                self._job_tracker.jobs_in_progress,
+            ) >= self._max_jobs_in_progress_allowed(card=None, job=candidate_job):
                 continue
             return candidate_job, candidate_process
         return None
@@ -10951,6 +11124,20 @@ class InferenceScheduler:
                     )
                     self._pending_line_skip = selection
                     return selection
+            if declined_head.bucket is SlotDutyBucket.RESIDENCY_RECONCILIATION:
+                run_job = self._select_dominant_run_job(
+                    next_job,
+                    next_n_jobs,
+                    head_device_index=declined_head.device_index,
+                )
+                if run_job is not None:
+                    selection = NextJobAndProcess(
+                        next_job=run_job[0],
+                        process_with_model=run_job[1],
+                        line_skip=LineSkip(displaced_job=next_job, reason="dominant_run"),
+                    )
+                    self._pending_line_skip = selection
+                    return selection
             return self._cross_card_selection(
                 next_job,
                 next_n_jobs,
@@ -11262,6 +11449,12 @@ class InferenceScheduler:
         job's peak beside what the card already carries. The measured admission floor is deliberately not
         re-checked: retaining materialized weights adds no bytes, and a measured veto here only reintroduces
         committed-figure noise. Even when granted, hordelib's overflow guard remains the backstop.
+
+        Where the weights belong to a rung-1 run that has a next job (:meth:`_weights_belong_to_dominant_run`), the
+        governor gate does not apply. The pressure the
+        governor reads is often the run's own retained copy beside a sibling's job, and the reclaim ladder
+        answers pressure by evicting idle residents elsewhere, so dropping the run's weights would only make the
+        next job reload them.
         """
         model = dispatched_job.model
         if model is None:
@@ -11280,7 +11473,11 @@ class InferenceScheduler:
             self._retention.note_denial(RetentionDenialReason.WDDM_PAGING)
             return False
         governor_state = self.governor_state(device_index)
-        if governor_state is not GovernorState.HEALTHY:
+        if governor_state is not GovernorState.HEALTHY and not self._weights_belong_to_dominant_run(
+            model,
+            device_index=device_index,
+            dispatched_job=dispatched_job,
+        ):
             return self._deny_retention(
                 model,
                 process_with_model,
@@ -11766,9 +11963,15 @@ class InferenceScheduler:
 
         Every owner of a retention eviction goes through here, so the actuation and its in-flight record cannot
         come apart. The record holds a dispatch on this card until the child's own reports evidence the free.
+        Weights that belong to a rung-1 run with a next job (:func:`pricing.copy_belongs_to_dominant_run`) stay,
+        as they do in the sweep, and the run's end returns them.
         """
         retained_model = process_info.retained_resident_model
         if retained_model is None or not process_info.can_accept_job():
+            return False
+        if pricing.copy_belongs_to_dominant_run(
+            self.snapshot(), retained_model, self._routing_device_index(process_info)
+        ):
             return False
         reserved_baseline_mb = (
             float(process_info.process_reserved_mb) if process_info.process_reserved_mb is not None else None
@@ -13257,7 +13460,9 @@ class InferenceScheduler:
 
         The head's own target slot is spared, and the ladder books each lane pause the starved-head rungs
         actuate as a restore obligation held for this job. The caller holds (dispatch or clearance) and re-asks
-        next pass, releasing once the arbiter verdicts FITS on the reclaimed room.
+        next pass, releasing once the arbiter verdicts FITS on the reclaimed room. The verdict's measured deficit
+        travels as the head's shortfall, so the idle-model eviction keeps a copy a popped job names while unnamed
+        copies cover it.
         """
         return self._executor.execute_actuations(
             verdict.required_actuations,
@@ -13408,8 +13613,9 @@ class InferenceScheduler:
         withheld selection is recorded and the walk resumes for work another card can take, rather than
         reading as "nothing more can start" and idling the fleet behind one held head. On a single-GPU host
         the resumed walk has nowhere else to look and returns nothing, which is the original behaviour: a
-        held head ends the loop. The one exception there is a job withheld for the post-processing lane, since
-        work that fits beside the lane's chain can still run on the same card.
+        held head ends the loop. Two exceptions apply there. Work that fits beside the post-processing lane's
+        chain can still run on the same card when a job is withheld for the lane, and a rung-1 run's job can run
+        on the lane holding its weights when a head is withheld for residency (:meth:`_select_dominant_run_job`).
         """
         next_job_and_process = await self.get_next_job_and_process()
 
@@ -13620,6 +13826,11 @@ class InferenceScheduler:
             elif line_skip.reason == "post_processing_hold":
                 skip_detail = (
                     "the displaced job cannot share the card with the post-processing lane's work, and this job can"
+                )
+            elif line_skip.reason == "dominant_run":
+                skip_detail = (
+                    "the displaced job waits for a dominant-model run's weights to leave the card, and this job is "
+                    "that run's, on the lane already holding them"
                 )
             else:
                 skip_detail = "the displaced job's process is busy sampling its own model"

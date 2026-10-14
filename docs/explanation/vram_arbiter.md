@@ -317,8 +317,28 @@ The arbiter keeps four concerns deliberately separate:
       side on rung 1 or above sample together only where the same sum shows at least the hysteresis band of
       room (`pricing.pair_co_samples`), so nothing samples beside a rung-1 model. A pairing of two models that
       each have a partner is left to the arbiter's memory verdict. The size tier alone keeps no two models
-      apart. Other rung-1 levers (a narrowed offer, retention for the run, no large preload beside it) are not
-      implemented.
+      apart. A rung-1 model's job that reaches its first step grants it a *run*
+      (`InferenceScheduler._grant_dominant_runs_at_first_step`, through `_note_dominant_run`): a residency grant
+      on rung 1 that claims the pop offer for the model, keeps its weights between its jobs (see
+      [Cross-job retention](#cross-job-retention)) and tears nothing down. The grant waits for the first step
+      because the claim narrows intake, and a claim taken at the dispatch commit narrows it for the whole load. A
+      run opens no establish or restore window, counts toward neither churn governor, has no minimum hold, and
+      ends without regrowing anything (`WholeCardResidencyLedger.record_run_end`) once its own work has drained
+      and the claim has ended or a head for another model waits. A card already holding a grant for another
+      model keeps it, and a rung-2 ask for the run's model promotes the grant to a teardown with every clock
+      restarted. The reclaim ladder's context and lane restores stand down for rung-2 grants only, since a run
+      cleared nothing.
+
+      While the run has a next job (a pending job for its model, or its standing claim), its copy belongs to the
+      run (`pricing.copy_belongs_to_dominant_run`, the one owner every reader below asks). The VRAM sweep
+      (`pricing.sweep_spares_idle_copy`, and so the materialisation verdict's eviction and its
+      `has_reclaimable_idle_model` mirror) spares it, the head escalation included. A retention eviction for
+      another dispatch (`_issue_retention_eviction`) leaves it. Preload does not target its lane for another
+      model (`preload.lanes_committed_elsewhere`). A head for another model that needs the room waits for the
+      run to end. On one card a held head ends the dispatch pass, so a run job queued behind it would keep the
+      run, and the head, waiting on itself. The run's job is therefore seated past the held head on the lane
+      holding its weights (`_select_dominant_run_job`, line-skip reason `dominant_run`) until the run's work
+      drains.
 
     A held rung changes only when its test's slack crosses zero by more than `DOMINANCE_HYSTERESIS_MB`, the
     same 256 MB bucket the recompute key bands the floor with, so a measured peak drifting about a threshold
@@ -1290,6 +1310,12 @@ to the card. It is instead a governed live gate that grants only when:
   `PRESSURE` or `SATURATED` card is one the verified reclaim ladder is or may soon be reclaiming from, so it
   is handed no new resident to evict. This reads the one figure a WDDM driver cannot misreport under
   demand-paging (NVML device-free), so it holds precisely in the regime where measured free VRAM lies.
+  Weights that belong to a rung-1 run with a next job (a pending job for the model, or the run's standing pop
+  claim) are the exception (`InferenceScheduler._weights_belong_to_dominant_run`). The pressure the governor
+  reads is often that run's own retained copy beside a sibling's job, the reclaim ladder answers pressure by
+  evicting idle residents elsewhere, and dropping the run's weights would only make its next job reload them.
+  The first job of a run counts too when another job for its model is queued, since its run is granted at its
+  first step, after this verdict. Outside a run the gate applies as written.
 - **The slot's own recent traffic repeats this model.** The dispatched model must appear among the slot's
   previous `RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3, in `scheduling/ledgers/retention.py`) dispatches. See
   [Retention is granted on repeat evidence](#retention-is-granted-on-repeat-evidence).
@@ -1321,6 +1347,13 @@ evidence about the job and none at all about the device: a job that failed part-
 its weights standing, freed them, or never loaded them, and the parent cannot tell which. Recording
 residency on that guess is what makes the static fit above charge weights that are not there and same-model
 routing seat a successor on an empty slot, so a faulted result drops the grant and the record together.
+
+A preload of a different model onto a slot that retains weights is that slot's model change, so the retained
+weights are unloaded ahead of the preload on the same pipe and the record is cleared
+(`evict_retained_resident_for_model_change`, the owner a cross-model dispatch uses). Left booked, the record
+outlives the slot's move: the slot reads busy once its preload lands, every eviction actuator refuses a busy
+slot, and a dispatch held for those weights (`_retained_resident_dispatch_holds`) waits for a return that never
+comes while the preloaded job queues behind it.
 
 ### Retention is granted on repeat evidence
 

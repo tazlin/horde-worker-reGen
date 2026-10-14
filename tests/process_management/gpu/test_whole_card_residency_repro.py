@@ -17,12 +17,14 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.resources.resource_budget import (
@@ -31,6 +33,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     forecast_weight_streaming,
     predict_job_weight_mb,
 )
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _POP_CLAIM_EMPTY_POP_RUN,
     _POP_CLAIM_EMPTY_POP_WINDOW_SECONDS,
@@ -38,6 +41,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     POP_CLAIM_RELEASE_VISIBLE_SECONDS,
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
+    DominanceRung,
     WholeCardPopClaimRelease,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -45,7 +49,9 @@ from horde_worker_regen.process_management.scheduling.ledgers.safety_placement i
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_model_metadata,
     make_testable_process_manager,
     track_popped_job_async,
 )
@@ -63,6 +69,40 @@ _RAM_RESERVE_MB = 4096
 _FLUX_MODEL = "Flux.1-Schnell fp8 (Compact)"
 _RESIDENT_SD15 = "Deliberate"
 _RESIDENT_SDXL = "CyberRealistic Pony"
+_FLUX_REFERENCE_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
+
+
+def _flux_model_metadata() -> ModelMetadata:
+    """Return model metadata that gives Flux its reference baseline, so the dominance verdict prices its seed."""
+    return make_test_model_metadata(
+        {_FLUX_MODEL: make_mock_model_reference_record(_FLUX_MODEL, baseline=_FLUX_REFERENCE_BASELINE)},
+    )
+
+
+def _card16_flux_dominance() -> pricing.ModelDominance:
+    """Return Flux's dominance verdict on the 16 GB card with two process contexts, priced at its static seed."""
+    inputs = pricing.DominanceInputs(
+        offered_models=frozenset({_FLUX_MODEL}),
+        whole_card_pins=frozenset(),
+        total_vram_mb=float(_DEVICE_TOTAL_VRAM_MB),
+        first_context_mb=float(_PER_PROCESS_OVERHEAD_MB),
+        marginal_context_mb=float(_PER_PROCESS_OVERHEAD_MB),
+        admission_noise_mb=0.0,
+        foreign_floor_bucket=None,
+        sample_observation_counts=(),
+    )
+    peaks = [pricing.model_sampling_peak(None, _FLUX_MODEL, _FLUX_REFERENCE_BASELINE)]
+    return pricing.decide_card_dominance(inputs, foreign_floor_mb=0.0, peaks=peaks).verdicts[_FLUX_MODEL]
+
+
+def _assert_flux_on_rung_two(scheduler: InferenceScheduler) -> None:
+    """Assert the scheduler's dominance verdict holds Flux on rung 2, the rung a whole-card residency serves.
+
+    Where Flux is outside the offered set it is judged against the offer at its static seed.
+    """
+    verdict = pricing.model_dominance(scheduler.card_dominance(None), None, _FLUX_MODEL, _FLUX_REFERENCE_BASELINE)
+    assert verdict is not None
+    assert verdict.rung is DominanceRung.CANNOT_CO_RESIDE
 
 
 class TestStreamForecastClassification:
@@ -85,13 +125,19 @@ class TestStreamForecastClassification:
         assert effective_inference_reserve_mb(None, 2048.0) == 2048.0
 
     def test_flux_fp8_streams_coresident_evicting_models_suffices(self) -> None:
-        """Flux fp8 at ~57MB free streams co-resident; evicting the two sibling *models* leaves room."""
+        """Flux fp8 at ~57MB free streams co-resident; evicting the two sibling *models* leaves room.
+
+        The sole residency comes from the dominance verdict: Flux's seed beside two contexts overflows the card.
+        """
+        verdict = _card16_flux_dominance()
+        assert verdict.rung is DominanceRung.CANNOT_CO_RESIDE
         forecast = StreamForecast(
             weights_mb=_FLUX_WEIGHTS_MB,
             reserve_mb=_VRAM_RESERVE_MB,
             free_now_mb=_FREE_WITH_SIBLINGS_MB,
             free_if_alone_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,  # 15087
             free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB - 2 * _PER_PROCESS_OVERHEAD_MB,  # 13799: 2 contexts fit
+            wants_whole_card=verdict.cannot_co_reside,
         )
         assert forecast.fits_coresident is False
         assert forecast.fits_after_model_evict is True
@@ -105,8 +151,11 @@ class TestStreamForecastClassification:
 
         At admit the idle siblings' contexts have not allocated, so ``free_now`` reads ~15GB, but four
         process contexts mean the model needs sibling *processes* stopped, not just their models evicted.
-        The structural floor must catch this even though ``free_now`` looks ample.
+        The structural floor must catch this even though ``free_now`` looks ample. The sole residency itself
+        comes from the dominance verdict.
         """
+        verdict = _card16_flux_dominance()
+        assert verdict.rung is DominanceRung.CANNOT_CO_RESIDE
         forecast = StreamForecast(
             weights_mb=_FLUX_WEIGHTS_MB,
             reserve_mb=_VRAM_RESERVE_MB,
@@ -114,6 +163,7 @@ class TestStreamForecastClassification:
             free_if_alone_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,  # 15087
             free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB
             - 4 * _PER_PROCESS_OVERHEAD_MB,  # 11223: contexts over-commit
+            wants_whole_card=verdict.cannot_co_reside,
         )
         assert forecast.fits_coresident is False  # structural floor overrides the high instantaneous reading
         assert forecast.fits_after_model_evict is False  # evicting models does not free the contexts
@@ -290,7 +340,11 @@ def _storm_bridge_data() -> Mock:
 
 
 def _build_storm_scheduler() -> tuple[InferenceScheduler, ProcessMap, JobTracker, object, object]:
-    """Two idle sibling processes resident with SD/SDXL, device-free at the ~57MB a Flux load leaves."""
+    """Two idle sibling processes resident with SD/SDXL, device-free at the ~57MB a Flux load leaves.
+
+    Each process context is charged the overhead measured on the live box. The dominance verdict prices Flux's
+    seed beside that context, which leaves no room on the card, so Flux is on rung 2.
+    """
     proc_sd15 = make_mock_process_info(1, model_name=_RESIDENT_SD15, state=HordeProcessState.WAITING_FOR_JOB)
     proc_sdxl = make_mock_process_info(2, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
     for proc in (proc_sd15, proc_sdxl):
@@ -298,13 +352,16 @@ def _build_storm_scheduler() -> tuple[InferenceScheduler, ProcessMap, JobTracker
         proc.vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - _FREE_WITH_SIBLINGS_MB
     process_map = ProcessMap({1: proc_sd15, 2: proc_sdxl})
 
+    bridge_data = _storm_bridge_data()
+    bridge_data.vram_per_process_overhead_mb = _PER_PROCESS_OVERHEAD_MB
     job_tracker = JobTracker()
     scheduler = _make_inference_scheduler(
         process_map=process_map,
         job_tracker=job_tracker,
-        bridge_data=_storm_bridge_data(),
+        bridge_data=bridge_data,
         max_concurrent=1,
         max_inference=2,
+        model_metadata=_flux_model_metadata(),
     )
     return scheduler, process_map, job_tracker, proc_sd15, proc_sdxl
 
@@ -326,6 +383,7 @@ class TestWholeCardExclusiveResidency:
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
 
         scheduler, _process_map, job_tracker, proc_sd15, proc_sdxl = _build_storm_scheduler()
+        _assert_flux_on_rung_two(scheduler)
         head_job = make_job_pop_response(_FLUX_MODEL)
         await track_popped_job_async(job_tracker, head_job)
 
@@ -954,6 +1012,7 @@ def _build_overhead_storm_scheduler(
         bridge_data=bridge_data,
         max_concurrent=1,
         max_inference=max_inference,
+        model_metadata=_flux_model_metadata(),
     )
     return scheduler, process_map, job_tracker
 
@@ -993,6 +1052,7 @@ class TestSchedulerResidencyRouting:
             free_mb=2000.0,
             resident_models=[_RESIDENT_SD15, _RESIDENT_SDXL],
         )
+        _assert_flux_on_rung_two(scheduler)
         head_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
         await track_popped_job_async(job_tracker, head_job)
 
@@ -1069,6 +1129,7 @@ def _sole_residency_scheduler(
         bridge_data=bridge_data,
         max_concurrent=1,
         max_inference=max_inference,
+        model_metadata=_flux_model_metadata(),
     )
     # The residency has already cycled safety off-GPU, so its context is not on the card.
     scheduler._process_lifecycle.is_safety_gpu_paused = safety_paused
@@ -1107,6 +1168,7 @@ class TestWholeCardTerminalAdmit:
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 15218.0)
 
         scheduler, job_tracker, proc = _sole_residency_scheduler(free_mb=15007.0)
+        _assert_flux_on_rung_two(scheduler)
         head_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
         await track_popped_job_async(job_tracker, head_job)
 
@@ -1139,6 +1201,7 @@ class TestWholeCardTerminalAdmit:
 
         # free_now is still low: the stopped siblings' VRAM has not been returned to the driver yet.
         scheduler, job_tracker, proc = _sole_residency_scheduler(free_mb=2000.0)
+        _assert_flux_on_rung_two(scheduler)
         head_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
         await track_popped_job_async(job_tracker, head_job)
 

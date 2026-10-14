@@ -41,6 +41,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import DeviceV
 from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    DominanceRung,
     WholeCardPhase,
     WholeCardResidencyLedger,
 )
@@ -390,6 +391,10 @@ class SchedulingSnapshot:
     """Models that have completed at least one job on this worker, the trust gate for measured footprints."""
     whole_card_held_models: frozenset[str]
     """Models holding a whole-card residency somewhere, which pressure eviction never takes."""
+    dominant_runs: Mapping[str, int | None]
+    """The models a rung-1 run holds, each mapped to the card it holds (None on a single-GPU host)."""
+    pop_claim_model: str | None
+    """The model the standing claim over the pop offer names, or None when the offer is unclaimed."""
     post_processing_lane_card_index: int | None
     """The card the idle post-processing lane sits on, or None when no lane is free to take a chain.
 
@@ -582,6 +587,7 @@ def build_scheduling_snapshot(
     remaining_sampling_seconds: Callable[[HordeProcessInfo], float | None] | None = None,
     dispatch_overhead_seconds: Callable[[ImageGenerateJobPopResponse, bool], float | None] | None = None,
     dominance: Callable[[int | None], CardDominance | None] | None = None,
+    pop_claim_model: str | None = None,
 ) -> SchedulingSnapshot:
     """Freeze the worker for one cycle.
 
@@ -589,7 +595,8 @@ def build_scheduling_snapshot(
     ``snapshot`` method is the one production caller and supplies its own accessors for the per-card
     measurements. ``remaining_sampling_seconds``, ``dispatch_overhead_seconds`` (job, resident at dispatch) and
     ``dominance`` are optional. Without them every slot and job carries None for those figures and every card
-    carries no dominance verdict.
+    carries no dominance verdict. ``pop_claim_model`` is the model the standing claim over the pop offer names,
+    and without it the snapshot reads the offer as unclaimed.
     """
     multi_gpu = len(card_runtimes) > 1
     card_keys: list[int | None] = [None]
@@ -747,6 +754,12 @@ def build_scheduling_snapshot(
         whole_card_held_models=frozenset(
             state.model for _, state in whole_card_ledger.held() if state.model is not None
         ),
+        dominant_runs={
+            state.model: device_index
+            for device_index, state in whole_card_ledger.held()
+            if state.model is not None and state.rung is DominanceRung.CANNOT_CO_SAMPLE
+        },
+        pop_claim_model=pop_claim_model,
         post_processing_lane_card_index=post_processing_lane_card_index,
         pending_post_processing_reserve_mb=pending_post_processing_reserve_mb,
         ledgers=ledgers,

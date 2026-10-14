@@ -40,6 +40,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
+from horde_worker_regen.process_management.scheduling.governance.whole_card import DominanceRung
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -161,6 +162,80 @@ async def test_no_retain_when_governor_reports_pressure() -> None:
     scheduler = _budget_on_scheduler(job_tracker)
     scheduler.set_governor_state(0, GovernorState.PRESSURE)
     process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+
+
+async def test_a_run_keeps_its_weights_under_pressure_when_its_next_job_is_queued() -> None:
+    """A rung-1 run whose next job is queued keeps its weights though the governor reads pressure.
+
+    The pressure is often the run's own retained copy beside a sibling's job, and the reclaim ladder answers it by
+    evicting idle residents elsewhere; dropping the run's weights only makes its next job reload them.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    successor = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+    await track_popped_job_async(job_tracker, successor)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    scheduler.set_governor_state(0, GovernorState.PRESSURE)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    scheduler._whole_card_ledger.record_grant(
+        None,
+        model=_MODEL,
+        forecast=None,
+        cooldown_until=0.0,
+        now=0.0,
+        rung=DominanceRung.CANNOT_CO_SAMPLE,
+    )
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+async def test_the_first_job_of_a_run_keeps_its_weights_under_pressure_when_another_is_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run is granted at the first step, after this verdict, so the job that starts it counts as the run's.
+
+    Denied here, the weights the run is about to hold would leave at the end of its first job and the second job
+    would reload them. With no other job for the model queued, the gate stands.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    scheduler.set_governor_state(0, GovernorState.PRESSURE)
+    monkeypatch.setattr(scheduler, "_dominant_run_grantable", lambda model, device_index: model == _MODEL)
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+
+    await track_popped_job_async(job_tracker, make_job_pop_response(model=_MODEL))
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+async def test_a_teardown_residency_under_pressure_still_denies() -> None:
+    """Outside a run the governor gate stands, a rung-2 residency included."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    successor = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+    await track_popped_job_async(job_tracker, successor)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    scheduler.set_governor_state(0, GovernorState.PRESSURE)
+    process_info = scheduler._process_map[_PROCESS_ID]
+    scheduler._whole_card_ledger.record_grant(None, model=_MODEL, forecast=None, cooldown_until=0.0, now=0.0)
 
     assert (
         scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False

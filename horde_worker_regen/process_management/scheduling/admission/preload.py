@@ -539,8 +539,10 @@ def lanes_committed_elsewhere(snapshot: SchedulingSnapshot, model: str | None) -
     another model is committed to that load until the child reports it or the map expires the entry. A child reads
     its control messages one at a time, and the parent books a preload at the send, so a lane still reads idle
     while its load waits in the pipe. A second preload sent then runs ahead of the job the first one is for. A
-    preload of the model the lane is already loading is the same load. Unlike the displacement guards
-    (:func:`preload_disallowed_processes`), no fallback overrides this.
+    preload of the model the lane is already loading is the same load. A lane holding a rung-1 run's copy
+    (:func:`~pricing.copy_belongs_to_dominant_run`) is committed to the run's next job, so a preload of another model
+    does not take it while the run stands. Unlike the displacement guards (:func:`preload_disallowed_processes`),
+    no fallback overrides this.
     """
     loading_by_process = {
         entry.process_id: name
@@ -551,7 +553,14 @@ def lanes_committed_elsewhere(snapshot: SchedulingSnapshot, model: str | None) -
         slot.process_id
         for slot in snapshot.slots.values()
         if slot.process_type is HordeProcessType.INFERENCE
-        and (slot.current_job_id is not None or loading_by_process.get(slot.process_id, model) != model)
+        and (
+            slot.current_job_id is not None
+            or loading_by_process.get(slot.process_id, model) != model
+            or (
+                slot.model != model
+                and pricing.copy_belongs_to_dominant_run(snapshot, slot.model, snapshot.routing_device_index(slot))
+            )
+        )
     )
 
 

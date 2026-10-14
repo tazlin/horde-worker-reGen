@@ -1208,6 +1208,59 @@ def ready_seat_process_ids(snapshot: SchedulingSnapshot, claimants: Iterable[str
     )
 
 
+def copy_belongs_to_dominant_run(
+    snapshot: SchedulingSnapshot,
+    model: str | None,
+    device_index: int | None,
+    *,
+    besides_job_id: str | None = None,
+) -> bool:
+    """Whether a copy of ``model`` on the card belongs to a rung-1 run that has a next job.
+
+    The run holds the model on that card, and its next job is either a pending job for the model or the next pop
+    under the run's standing claim over the offer. The sweep spares such a copy, preload does not target its lane
+    for another model, and retention keeps it under governor pressure. The run's own end
+    (``_restore_siblings_after_whole_card``) frees it once the run's work drains and a head for another model
+    waits. ``besides_job_id`` leaves out a job being dispatched now, which would otherwise count as its own
+    successor.
+    """
+    if model is None or model not in snapshot.dominant_runs:
+        return False
+    holder = snapshot.dominant_runs[model]
+    if holder is not None and device_index is not None and holder != device_index:
+        return False
+    if snapshot.pop_claim_model == model:
+        return True
+    return queued_job_naming(snapshot, model, besides_job_id=besides_job_id) is not None
+
+
+def queued_job_naming(
+    snapshot: SchedulingSnapshot,
+    model: str | None,
+    *,
+    besides_job_id: str | None = None,
+) -> str | None:
+    """The first popped job not yet dispatched that names ``model``, in pop order, or None.
+
+    A rung-1 run reads it as the run's next job (:func:`copy_belongs_to_dominant_run`). It is not a retention or
+    eviction rule on its own: keeping a copy for a named successor was measured as a loss on a two-lane card, where
+    the kept weights hold room the other lane's different-model job needs (see the retention section of
+    ``docs/explanation/vram_arbiter.md``). ``besides_job_id`` leaves out a job being dispatched now, which would
+    otherwise count as its own successor.
+    """
+    if model is None:
+        return None
+    in_progress = frozenset(snapshot.queue.in_progress)
+    return next(
+        (
+            job_id
+            for job_id in snapshot.queue.pending_in_pop_order
+            if job_id not in in_progress and job_id != besides_job_id and snapshot.queue.jobs[job_id].model == model
+        ),
+        None,
+    )
+
+
 def sweep_spares_idle_copy(
     snapshot: SchedulingSnapshot,
     slot: SlotSnapshot,
@@ -1220,6 +1273,10 @@ def sweep_spares_idle_copy(
 
     The eviction (`unload_models_from_vram`) and its read-only mirror (:func:`has_reclaimable_idle_model`) both
     ask it, so the sweep's protection of queued models has one owner.
+
+    A copy that belongs to a rung-1 run (:func:`copy_belongs_to_dominant_run`) is spared outright, the head escalation
+    included. Another head that needs its room waits for the run to end, since the run's next job would
+    otherwise reload the weights the sweep took.
 
     A ready seat (:func:`ready_seat_process_ids`) is spared first. Dispatch runs later in the same cycle and
     starts its job there with no load. Unloading the copy frees room the reload takes back a tick later, and
@@ -1238,6 +1295,8 @@ def sweep_spares_idle_copy(
     """
     if slot.model is None:
         return False
+    if copy_belongs_to_dominant_run(snapshot, slot.model, snapshot.routing_device_index(slot)):
+        return True
     in_progress = frozenset(snapshot.queue.in_progress)
     head_id = next((job_id for job_id in snapshot.queue.pending_in_pop_order if job_id not in in_progress), None)
     claimants = None if not for_head_of_queue else (head_id,) if head_id is not None else ()

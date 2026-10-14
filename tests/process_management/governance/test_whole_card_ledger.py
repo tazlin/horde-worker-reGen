@@ -16,7 +16,10 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     _GRACE_BUDGET_SECONDS,
     _GRACE_BUDGET_WINDOW_SECONDS,
     _MIN_HOLD_SECONDS,
+    DominanceRung,
     WholeCardGrantKind,
+    WholeCardPopClaimRelease,
+    WholeCardPopClaimTracker,
 )
 
 _NOW = 1_000_000.0
@@ -1004,3 +1007,120 @@ class TestStructuralCompletionLatch:
             device_index=0,
         )
         assert machine.state_for(0).structural_complete_at == 0.0
+
+
+class TestDominantModelRun:
+    """A rung-1 grant is a run: it claims the offer and tears nothing down, so it charges no churn."""
+
+    _MAX_HOLD = 180.0
+
+    @staticmethod
+    def _run_ledger(model: str = "flux") -> WholeCardResidencyMachine:
+        ledger = WholeCardResidencyMachine()
+        ledger.record_grant(
+            None,
+            model=model,
+            forecast=None,
+            cooldown_until=_NOW + 45.0,
+            now=_NOW,
+            rung=DominanceRung.CANNOT_CO_SAMPLE,
+        )
+        return ledger
+
+    def test_a_run_claims_the_offer_without_a_grace_window_or_a_governor_charge(self) -> None:
+        """The run claims the offer, yet the supervisor excuses no held queue and no churn governor counts it."""
+        ledger = self._run_ledger()
+        state = ledger.state_for(None)
+        assert state.rung is DominanceRung.CANNOT_CO_SAMPLE
+        assert ledger.teardown_held() == []
+        claim = ledger.pop_claim(None, now=_NOW + 1.0, max_hold_seconds=self._MAX_HOLD)
+        assert claim is not None and claim.model == "flux"
+        assert not ledger.grace_active(
+            now=_NOW + 1.0,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+            restore_grace_seconds=_RESTORE_GRACE,
+        )
+        assert (
+            ledger.phase(None, now=_NOW + 1.0, establish_grace_seconds=_ESTABLISH_GRACE)[1] is WholeCardPhase.HOLDING
+        )
+        assert not ledger.min_hold_active(None, now=_NOW + 1.0)
+        assert len(state.establishments) == 0
+        assert ledger.grace_budget_status(None, now=_NOW + 1.0).spent_seconds == 0.0
+
+    def test_a_rung_two_ask_for_the_run_model_is_an_establishment(self) -> None:
+        """The teardown starting over a run restarts every clock and counts toward the rate limiter."""
+        ledger = self._run_ledger()
+        kind = ledger.record_grant(
+            None,
+            model="flux",
+            forecast=None,
+            cooldown_until=_NOW + 100.0,
+            now=_NOW + 10.0,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+            rung=DominanceRung.CANNOT_CO_RESIDE,
+        )
+        state = ledger.state_for(None)
+        assert kind is WholeCardGrantKind.ESTABLISH
+        assert state.rung is DominanceRung.CANNOT_CO_RESIDE
+        assert state.established_at == _NOW + 10.0
+        assert ledger.min_hold_active(None, now=_NOW + 11.0)
+        assert len(state.establishments) == 1
+
+    def test_a_rung_one_ask_never_demotes_a_teardown(self) -> None:
+        """A run ask for a model a rung-2 residency holds is a reuse that leaves the teardown standing."""
+        ledger = _granted_ledger(model="flux")
+        kind = ledger.record_grant(
+            None,
+            model="flux",
+            forecast=None,
+            cooldown_until=_NOW + 100.0,
+            now=_NOW + 10.0,
+            rung=DominanceRung.CANNOT_CO_SAMPLE,
+        )
+        assert kind is WholeCardGrantKind.REUSE
+        assert ledger.state_for(None).rung is DominanceRung.CANNOT_CO_RESIDE
+
+    def test_a_run_end_opens_no_restore_window(self) -> None:
+        """A run stopped nothing, so its end leaves the supervisor and the grace budget untouched."""
+        ledger = self._run_ledger()
+        ledger.record_run_end(None)
+        state = ledger.state_for(None)
+        assert state.model is None
+        assert state.restore_at == 0.0
+        assert not ledger.grace_active(
+            now=_NOW + 1.0,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+            restore_grace_seconds=_RESTORE_GRACE,
+        )
+        assert ledger.grace_budget_status(None, now=_NOW + 1.0).spent_seconds == 0.0
+
+
+class TestTerminalFaultClaimEnd:
+    """A terminal fault of the claimed model ends the claim; a fault of another model does not."""
+
+    _MAX_HOLD = 180.0
+
+    def test_a_fault_of_the_claimed_model_releases_the_claim_and_its_retention(self) -> None:
+        """The claim stops narrowing the offer and the residency stops being retained past its own work."""
+        ledger = _granted_ledger(model="qwen")
+        assert ledger.note_terminal_fault("qwen", now=_NOW + 5.0) is True
+        assert ledger.pop_claim(None, now=_NOW + 6.0, max_hold_seconds=self._MAX_HOLD) is None
+        assert ledger.pop_claim_retention_ended(None, now=_NOW + 6.0, max_hold_seconds=self._MAX_HOLD)
+        assert ledger.note_terminal_fault("qwen", now=_NOW + 7.0) is False
+
+    def test_a_fault_of_another_model_leaves_the_claim_standing(self) -> None:
+        """Only the claimed model's own failure says the narrowed offer feeds the card failing work."""
+        ledger = _granted_ledger(model="qwen")
+        assert ledger.note_terminal_fault("sdxl", now=_NOW + 5.0) is False
+        assert ledger.note_terminal_fault(None, now=_NOW + 5.0) is False
+        assert ledger.pop_claim(None, now=_NOW + 6.0, max_hold_seconds=self._MAX_HOLD) is not None
+
+    def test_the_tracker_names_the_terminal_fault_end(self) -> None:
+        """The release edge and the status surface name the fault, never the residency or the hold."""
+        ledger = _granted_ledger(model="qwen")
+        tracker = WholeCardPopClaimTracker()
+        tracker.disclose_edge(ledger.pop_claim(None, now=_NOW + 1.0, max_hold_seconds=self._MAX_HOLD), now=_NOW + 1.0)
+        ledger.note_terminal_fault("qwen", now=_NOW + 5.0)
+        tracker.note_terminal_fault_release()
+        tracker.disclose_edge(ledger.pop_claim(None, now=_NOW + 5.0, max_hold_seconds=self._MAX_HOLD), now=_NOW + 5.0)
+        assert tracker.recent_release(_NOW + 6.0) is WholeCardPopClaimRelease.TERMINAL_FAULT
