@@ -820,6 +820,15 @@ class HordeProcessInfo:
             or self.last_process_state == HordeProcessState.PROCESS_STARTING
         )
 
+    def holds_only_a_preload(self) -> bool:
+        """Return whether this slot sits on a completed preload and owns no dispatched job.
+
+        ``PRELOADED_MODEL`` counts as busy because a preload predicts a dispatch, and nothing may race that
+        dispatch onto the slot. The slot itself holds no work until the dispatch comes, so a reader that knows the
+        dispatch is withheld (a held whole-card residency) or overdue (a parked preload) can treat it as idle.
+        """
+        return self.last_process_state == HordeProcessState.PRELOADED_MODEL and self.current_inference_job() is None
+
     def is_parked_preload(self, *, now: float, dwell_seconds: float) -> bool:
         """Whether this slot has sat on a completed preload past ``dwell_seconds`` with no job to run.
 
@@ -830,9 +839,7 @@ class HordeProcessInfo:
         may take the slot's residency back; the slot stays busy for dispatch and lease purposes either way,
         so this never opens a window for a job to land on a slot that is already committed.
         """
-        if self.last_process_state != HordeProcessState.PRELOADED_MODEL:
-            return False
-        if self.current_inference_job() is not None:
+        if not self.holds_only_a_preload():
             return False
         return (now - self.last_process_state_started_at) >= dwell_seconds
 

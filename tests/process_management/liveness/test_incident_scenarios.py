@@ -2252,18 +2252,22 @@ async def test_m_a_whole_card_teardown_spares_the_lane_a_pinned_sampler_owns() -
 def _kill_selection_blind_to_ownership(
     self: ProcessMap,
     disallowed_processes: list[int] | None = None,
+    *,
+    preloaded_siblings_stoppable: bool = False,
 ) -> HordeProcessInfo | None:
     """Victim selection that reads idleness from the child's reported state alone.
 
-    The pre-fix selector: every skip it applies is a statement about what the child last said, so a slot the
-    parent has dispatched a job onto and is waiting on another lane for reads exactly like a spare.
+    Every skip it applies is a statement about what the child last said, so a slot the
+    parent has dispatched a job onto and is waiting on another lane for reads exactly like a spare. Where the
+    shrink lets a preloaded lane go, it reads that from the reported state too.
     """
     for process_info in self.values():
         if process_info.process_type != HordeProcessType.INFERENCE:
             continue
         if process_info.process_id in (disallowed_processes or []):
             continue
-        if process_info.is_process_busy():
+        reported_preloaded = process_info.last_process_state == HordeProcessState.PRELOADED_MODEL
+        if process_info.is_process_busy() and not (preloaded_siblings_stoppable and reported_preloaded):
             continue
         if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
             continue

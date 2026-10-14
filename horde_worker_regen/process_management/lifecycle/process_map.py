@@ -1213,10 +1213,19 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     def _get_first_inference_process_to_kill(
         self,
         disallowed_processes: list[int] | None = None,
+        *,
+        preloaded_siblings_stoppable: bool = False,
     ) -> HordeProcessInfo | None:
         """Return the first inference process eligible to be killed, or None if there are none.
 
-        Used during shutdown.
+        Used during shutdown and by the scale-down victim selection.
+
+        Args:
+            disallowed_processes: Process ids to skip.
+            preloaded_siblings_stoppable: Treat a process that holds only a completed preload (no dispatched job)
+                as idle. A whole-card residency's shrink sets it, since the preload predicts a dispatch the held
+                residency withholds and the process holds a context on the card for nothing the residency can
+                use. Every other caller leaves it False, so a preload's dispatch is never raced.
         """
         if disallowed_processes is None:
             disallowed_processes = []
@@ -1228,7 +1237,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             if p.process_id in disallowed_processes:
                 continue
 
-            if p.is_process_busy():
+            if p.is_process_busy() and not (preloaded_siblings_stoppable and p.holds_only_a_preload()):
                 continue
 
             # A slot that owns a dispatched job is serving it even while its child still reports idle:

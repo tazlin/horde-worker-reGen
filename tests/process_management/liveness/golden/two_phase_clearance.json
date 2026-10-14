@@ -383,21 +383,9 @@
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": true,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -418,8 +406,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 0,
-            "reclaim_applied_kinds": "evict_idle_model",
-            "reclaimable_idle_model": true,
+            "reclaimable_idle_model": false,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 1402.2,
             "room_candidate_mb": 2883.0,
@@ -437,7 +424,7 @@
             "tenancy_inference_target_mb": 7332.0,
             "tenancy_post_process_mb": 384.0,
             "tenancy_safety_mb": 384.0,
-            "waiting_can_help": false
+            "waiting_can_help": true
           },
           "kind": "clearance",
           "reason": "the candidate does not fit the measured available room",
@@ -478,36 +465,15 @@
           "verdict": "no_op"
         }
       ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
-        }
-      ],
       "tick": 19
     },
     {
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": true,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -528,8 +494,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 0,
-            "reclaim_applied_kinds": "evict_idle_model",
-            "reclaimable_idle_model": true,
+            "reclaimable_idle_model": false,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 1402.2,
             "room_candidate_mb": 2883.0,
@@ -547,7 +512,7 @@
             "tenancy_inference_target_mb": 7332.0,
             "tenancy_post_process_mb": 384.0,
             "tenancy_safety_mb": 384.0,
-            "waiting_can_help": false
+            "waiting_can_help": true
           },
           "kind": "clearance",
           "reason": "the candidate does not fit the measured available room",
@@ -588,36 +553,15 @@
           "verdict": "no_op"
         }
       ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
-        }
-      ],
       "tick": 20
     },
     {
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": true,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -638,8 +582,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 0,
-            "reclaim_applied_kinds": "evict_idle_model",
-            "reclaimable_idle_model": true,
+            "reclaimable_idle_model": false,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 1402.2,
             "room_candidate_mb": 2883.0,
@@ -657,7 +600,7 @@
             "tenancy_inference_target_mb": 7332.0,
             "tenancy_post_process_mb": 384.0,
             "tenancy_safety_mb": 384.0,
-            "waiting_can_help": false
+            "waiting_can_help": true
           },
           "kind": "clearance",
           "reason": "the candidate does not fit the measured available room",
@@ -696,15 +639,6 @@
           "reason": "model already resident or loading",
           "subject": "job-4",
           "verdict": "no_op"
-        }
-      ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
         }
       ],
       "tick": 21
@@ -728,7 +662,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 0,
-            "reclaimable_idle_model": true,
+            "reclaimable_idle_model": false,
             "reclaimable_idle_tenancy": false,
             "starved_seconds": 0.0
           },
@@ -836,21 +770,9 @@
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": true,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -871,8 +793,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 1,
-            "reclaim_applied_kinds": "evict_idle_model",
-            "reclaimable_idle_model": true,
+            "reclaimable_idle_model": false,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 6302.2,
             "room_candidate_mb": 7783.0,
@@ -890,7 +811,7 @@
             "tenancy_inference_target_mb": 2432.0,
             "tenancy_post_process_mb": 384.0,
             "tenancy_safety_mb": 384.0,
-            "waiting_can_help": false
+            "waiting_can_help": true
           },
           "kind": "clearance",
           "reason": "the candidate does not fit the measured available room",
@@ -946,36 +867,15 @@
           "verdict": "no_op"
         }
       ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
-        }
-      ],
       "tick": 25
     },
     {
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": true,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -996,8 +896,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 1,
-            "reclaim_applied_kinds": "evict_idle_model",
-            "reclaimable_idle_model": true,
+            "reclaimable_idle_model": false,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 1402.2,
             "room_candidate_mb": 2883.0,
@@ -1015,7 +914,7 @@
             "tenancy_inference_target_mb": 7332.0,
             "tenancy_post_process_mb": 384.0,
             "tenancy_safety_mb": 384.0,
-            "waiting_can_help": false
+            "waiting_can_help": true
           },
           "kind": "clearance",
           "reason": "the candidate does not fit the measured available room",
@@ -1045,36 +944,15 @@
           "verdict": "no_op"
         }
       ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
-        }
-      ],
       "tick": 26
     },
     {
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": true,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -1095,8 +973,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 1,
-            "reclaim_applied_kinds": "evict_idle_model",
-            "reclaimable_idle_model": true,
+            "reclaimable_idle_model": false,
             "reclaimable_idle_tenancy": false,
             "room_available_mb": 1402.2,
             "room_candidate_mb": 2883.0,
@@ -1114,7 +991,7 @@
             "tenancy_inference_target_mb": 7332.0,
             "tenancy_post_process_mb": 384.0,
             "tenancy_safety_mb": 384.0,
-            "waiting_can_help": false
+            "waiting_can_help": true
           },
           "kind": "clearance",
           "reason": "the candidate does not fit the measured available room",
@@ -1142,15 +1019,6 @@
           "reason": "model already resident or loading",
           "subject": "job-4",
           "verdict": "no_op"
-        }
-      ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
         }
       ],
       "tick": 27
@@ -1174,7 +1042,7 @@
             "partial_seat_mb": null,
             "probe_after_seconds": 10.0,
             "process_id": 1,
-            "reclaimable_idle_model": true,
+            "reclaimable_idle_model": false,
             "reclaimable_idle_tenancy": false,
             "starved_seconds": 0.0
           },

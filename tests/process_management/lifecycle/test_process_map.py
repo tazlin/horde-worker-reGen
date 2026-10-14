@@ -610,3 +610,30 @@ class TestCardQueries:
         process_map = ProcessMap({0: make_mock_process_info(0, device_index=0)})
 
         assert process_map.bare_context_total_mb(device_used_mb=6000.0, baseline_mb=500.0, device_index=0) is None
+
+
+class TestPreloadedSiblingVictims:
+    """A whole-card shrink may stop a lane that holds only a completed preload. No other shrink may."""
+
+    def test_a_lane_holding_only_a_preload_is_a_victim_only_when_the_shrink_allows_it(self) -> None:
+        """The default selection skips a preloaded lane as busy, and the residency's selection takes it."""
+        preloaded = make_mock_process_info(0, state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({0: preloaded})
+
+        assert process_map._get_first_inference_process_to_kill() is None
+        assert process_map._get_first_inference_process_to_kill(preloaded_siblings_stoppable=True) is preloaded
+
+    def test_a_preloaded_lane_that_owns_a_job_is_never_a_victim(self) -> None:
+        """A preloaded lane whose job has been dispatched to it is serving that job, whatever the shrink."""
+        owning = make_mock_process_info(0, state=HordeProcessState.PRELOADED_MODEL)
+        owning.record_inference_ownership(make_job_pop_response(), attempt_ordinal=1)
+        process_map = ProcessMap({0: owning})
+
+        assert process_map._get_first_inference_process_to_kill(preloaded_siblings_stoppable=True) is None
+
+    def test_a_lane_mid_job_is_never_a_victim(self) -> None:
+        """The keyword relaxes only the preload, so a lane starting inference stays busy."""
+        starting = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: starting})
+
+        assert process_map._get_first_inference_process_to_kill(preloaded_siblings_stoppable=True) is None

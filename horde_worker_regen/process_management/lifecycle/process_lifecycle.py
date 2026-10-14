@@ -3529,7 +3529,10 @@ class ProcessLifecycleManager:
                 process the head is staged/resident on) is spared; otherwise a sibling holding a model queued
                 *behind* the head pins the count above the target and the residency can never converge, wedging
                 the queue. Busy processes are still never killed (the victim selection skips them), so live work
-                is unaffected. Leave None for the ordinary benchmark / pressure shrink.
+                is unaffected. The one exception is a sibling that holds only a completed preload, which is
+                stoppable. The preload predicts a dispatch, and the held residency withholds that dispatch, so the
+                sibling holds a context on the card for nothing the residency can use. Leave None for the ordinary
+                benchmark / pressure shrink.
             pressure_shortfall_mb: When set, choose the smallest idle victim that can plausibly clear this
                 RAM shortfall before falling back to the usual first eligible victim. This keeps a small RAM
                 dip from tearing down a much larger model-holding process when a smaller idle context suffices.
@@ -3585,6 +3588,7 @@ class ProcessLifecycleManager:
                 victim = self._select_inference_process_to_scale_down(
                     disallowed_processes=disallowed,
                     pressure_shortfall_mb=pressure_shortfall_mb,
+                    preloaded_siblings_stoppable=protected_model is not None,
                 )
                 if victim is None:
                     logger.debug("Scale down: no idle inference process available to stop right now")
@@ -3600,15 +3604,27 @@ class ProcessLifecycleManager:
         *,
         disallowed_processes: list[int],
         pressure_shortfall_mb: float | None,
+        preloaded_siblings_stoppable: bool = False,
     ) -> HordeProcessInfo | None:
         """Choose an idle inference process to stop for scale-down.
 
         Under RAM pressure, prefer the smallest eligible resident context whose reported RSS can clear the
         shortfall. If no eligible process has a sufficient report, fall back to the existing first-eligible
         behavior so ordinary scale-down semantics stay unchanged.
+
+        Args:
+            disallowed_processes: Process ids no victim may be taken from.
+            pressure_shortfall_mb: The RAM shortfall to clear, or None for an ordinary shrink.
+            preloaded_siblings_stoppable: Treat a process that holds only a completed preload as idle. A
+                whole-card residency's shrink sets it, since the preload predicts a dispatch the held residency
+                withholds and the process holds a context on the card for nothing the residency can use. The
+                generic and RAM-pressure shrinks leave it False, so a preload's dispatch is never raced.
         """
         if pressure_shortfall_mb is None or pressure_shortfall_mb <= 0:
-            return self._process_map._get_first_inference_process_to_kill(disallowed_processes=disallowed_processes)
+            return self._process_map._get_first_inference_process_to_kill(
+                disallowed_processes=disallowed_processes,
+                preloaded_siblings_stoppable=preloaded_siblings_stoppable,
+            )
 
         shortfall_bytes = pressure_shortfall_mb * 1024 * 1024
         candidates: list[HordeProcessInfo] = []
@@ -3617,7 +3633,9 @@ class ProcessLifecycleManager:
                 continue
             if process_info.process_id in disallowed_processes:
                 continue
-            if process_info.is_process_busy():
+            if process_info.is_process_busy() and not (
+                preloaded_siblings_stoppable and process_info.holds_only_a_preload()
+            ):
                 continue
             # Execution ownership outlives the child's idle report on the disaggregated path: the sampler
             # is pinned and owns the job while it waits for the encode lane, so an owned slot is serving.
@@ -3630,7 +3648,10 @@ class ProcessLifecycleManager:
 
         if candidates:
             return min(candidates, key=lambda process_info: process_info.ram_usage_bytes)
-        return self._process_map._get_first_inference_process_to_kill(disallowed_processes=disallowed_processes)
+        return self._process_map._get_first_inference_process_to_kill(
+            disallowed_processes=disallowed_processes,
+            preloaded_siblings_stoppable=preloaded_siblings_stoppable,
+        )
 
     def _other_card_inference_processes(self, device_index: int) -> list[int]:
         """Return inference processes pinned to a card other than ``device_index`` (off-limits for a scoped shrink)."""

@@ -104,15 +104,6 @@
           "verdict": "defer"
         }
       ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
-        }
-      ],
       "tick": 4
     },
     {
@@ -178,13 +169,6 @@
           "keep_model_resident_after": false,
           "model": "Flux.1-Schnell fp8 (Compact)",
           "process_id": 0
-        },
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
         }
       ],
       "sampling_started": [
@@ -545,15 +529,6 @@
           "verdict": "defer"
         }
       ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
-        }
-      ],
       "resource_states": [
         {
           "device_index": null,
@@ -735,15 +710,6 @@
           "reason": "the candidate does not fit the measured available room",
           "subject": "job-2",
           "verdict": "defer"
-        }
-      ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
         }
       ],
       "tick": 19

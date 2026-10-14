@@ -2537,7 +2537,9 @@ class InferenceScheduler:
         check. Moving safety to the CPU before they drain makes each of those checks take tens of seconds
         in place of a fraction of one, which lengthens the very drain the residency is waiting on. The
         residency's own holder and its pre-stage target are not siblings: they are busy loading the model
-        the residency is for.
+        the residency is for. A sibling that holds only a completed preload has no work in hand either. The
+        preload predicts a dispatch the held residency withholds, so no safety check of its can come before the
+        residency ends, and waiting on it would keep safety on the card for nothing.
         """
         for device_index, state in self._whole_card_ledger.held():
             if state.model is None or not self._residency_should_pause_safety(device_index):
@@ -2549,7 +2551,7 @@ class InferenceScheduler:
                     continue
                 if process.loaded_horde_model_name == state.model or process.process_id == state.prestage_process_id:
                     continue
-                if process.is_process_busy():
+                if process.is_process_busy() and not process.holds_only_a_preload():
                     return True
         return False
 

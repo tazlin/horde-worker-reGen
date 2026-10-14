@@ -613,6 +613,31 @@ Before that the sibling shrink and the lane pauses are retried, each a no-op onc
 device" line is written on an establishment, or when a retry actually stopped a sibling or a lane; that the
 residency moves safety off the card holds on every cycle and only adds a note to the line.
 
+**Which siblings the teardown stops.** The residency's shrink (`scale_inference_processes` with a
+`protected_model`) spares only the lane holding the residency's model and the slot its caller committed to. A
+sibling holding some other queued model is stoppable, and its job reloads after the residency drains. A sibling
+with a job in hand is never stopped, and the shrink retries each cycle until it drains. A sibling that holds only a
+completed preload (`HordeProcessInfo.holds_only_a_preload`: `PRELOADED_MODEL` and no dispatched job) is stopped
+like an idle one. Every other reader counts such a lane as busy so nothing races the dispatch the preload
+predicts, but a held residency withholds that dispatch, so the lane would hold a context on the card for a job
+that cannot run until the residency ends, and the residency could never reach its target. The same reading keeps
+the safety move from waiting on it. `_held_residency_siblings_busy` holds safety on the card only for siblings
+whose jobs will end in a safety check, and a parked preload has none to come.
+
+**After the teardown, a head that does not fit alone.** The residency's frame (`fits_alone`, the card total less
+one context) charges no foreign tenant, so on a card that carries one a head can need more than the finished
+teardown leaves. A Qwen-class head is priced about 22 GB, and a 24 GB card with a 3.3 GB tenant offers about
+18 GB once its siblings are stopped and safety has moved off. Under the clearance lease the head is staged, and
+clearance prices it with its partial-load seat (see [The partial-load seat](#the-partial-load-seat)). The seat
+is taken only on a converged-empty card. Once the teardown is structurally complete, the card reads so as soon as
+nothing reclaimable is left. The post-processing lane counts as reclaimable until its VRAM unload has been sent,
+and the parent sends that unload once, because the flag stands until the lane materialises VRAM again and a lane
+holding no model never does. The head is then granted at its seat on the next clearance pass rather than
+sampling unpriced at its lease-acquire timeout. A seat that does not fit falls through to the ceiling attempt and
+the `DENY` below. Without the lease the dispatch is the VRAM moment and no seat is priced, because only a
+clearance grant carries the free figure and activation room the child bounds a partial load by. The head is then
+held on its full charge until the measured-load probe, which runs only for the starved head of queue.
+
 A head deferred past the 60s diagnostic threshold with reclaim genuinely exhausted and no such teardown target
 (no first-party context reclaim remains) emits a warning with the full arithmetic and increments
 `starvation_diagnostics`; it still does not admit. The job stays queued for the structural queue wedge recovery

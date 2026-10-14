@@ -752,6 +752,35 @@ class TestRestoreForecastDwell:
         harness.reconcile()
         harness.lifecycle.pause_safety_on_gpu.assert_called_once_with(owner=PauseOwner.WHOLE_CARD)
 
+    def test_a_sibling_holding_only_a_preload_does_not_hold_the_move(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sibling parked on a preload has no job in hand, so the residency's safety move does not wait on it.
+
+        The preload predicts a dispatch the held residency withholds, so no safety check of the sibling's can
+        come before the residency ends. A sibling starting inference does hold the move.
+        """
+        harness = _placement_harness(monkeypatch)
+        harness.scheduler._runtime_config.bridge_data.whole_card_residency_safety_off_gpu = True
+        harness.scheduler._whole_card_ledger.record_grant(
+            None,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=harness.clock() + 10_000.0,
+            now=harness.clock(),
+        )
+        holder = make_mock_process_info(1, model_name="heavy-model")
+        holder.last_process_state = HordeProcessState.PRELOADING_MODEL
+        sibling = make_mock_process_info(2, model_name="light-model")
+        sibling.last_process_state = HordeProcessState.PRELOADED_MODEL
+        harness.scheduler._process_map = ProcessMap({1: holder, 2: sibling})
+
+        assert harness.scheduler._held_residency_siblings_busy() is False
+
+        sibling.last_process_state = HordeProcessState.INFERENCE_STARTING
+        assert harness.scheduler._held_residency_siblings_busy() is True
+
 
 class TestTransitionFreeze:
     """Evidence does not accrue across an intentional rebuild, and restarts from scratch after it.

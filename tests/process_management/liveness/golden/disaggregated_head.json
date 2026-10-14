@@ -120,21 +120,9 @@
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": false,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -170,15 +158,6 @@
           "reason": "the candidate does not fit the measured available room",
           "subject": "job-3",
           "verdict": "defer"
-        }
-      ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
         }
       ],
       "tick": 4
@@ -187,21 +166,9 @@
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": false,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -237,15 +204,6 @@
           "reason": "the candidate does not fit the measured available room",
           "subject": "job-3",
           "verdict": "defer"
-        }
-      ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
         }
       ],
       "tick": 5
@@ -254,21 +212,9 @@
       "arbiter": [
         {
           "device_index": null,
-          "executed": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ],
+          "executed": [],
           "for_head_of_queue": false,
-          "requested": [
-            {
-              "device_index": null,
-              "kind": "evict_idle_model",
-              "target_process_id": null
-            }
-          ]
+          "requested": []
         }
       ],
       "decisions": [
@@ -304,15 +250,6 @@
           "reason": "the candidate does not fit the measured available room",
           "subject": "job-3",
           "verdict": "defer"
-        }
-      ],
-      "messages": [
-        {
-          "control_flag": "UNLOAD_MODELS_FROM_VRAM",
-          "job": null,
-          "keep_model_resident_after": null,
-          "model": null,
-          "process_id": 200
         }
       ],
       "tick": 6

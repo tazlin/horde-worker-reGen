@@ -2827,12 +2827,16 @@ class _DispatchWorld:
         lane.held_components = None
         self._granted_resident_evicted.discard(lane.process_id)
         lane.loaded_horde_model_name = None
-        if self.service_lane_exit_seconds is None or lane.process_type == HordeProcessType.INFERENCE:
+        if lane.process_type == HordeProcessType.INFERENCE:
             lane.last_control_flag = None
         else:
             # The parent retires an outstanding unload only when the slot materialises VRAM again, and a service
-            # lane holding no model never does, so its flag keeps it out of the eviction mirror.
+            # lane holding no model never does, so its flag keeps it out of the eviction mirror and the parent
+            # sends the unload once. Clearing it here would have the lane read reclaimable again on the next pass,
+            # so the card would never read converged-empty to a head waiting on it. The lane has served the
+            # unload, so the standing flag is not a fresh command to act on.
             lane.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+            self._unload_served.add(lane.process_id)
         lane.last_process_state = HordeProcessState.WAITING_FOR_JOB
         # A model gone from the device can no longer be a retained resident, exactly as the process
         # map's own eviction bookkeeping records it.
@@ -4542,6 +4546,7 @@ class _DispatchWorld:
             victim = selector._select_inference_process_to_scale_down(
                 disallowed_processes=disallowed,
                 pressure_shortfall_mb=pressure_shortfall_mb,
+                preloaded_siblings_stoppable=protected_model is not None,
             )
             if victim is None:
                 break
