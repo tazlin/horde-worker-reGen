@@ -134,6 +134,7 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
     ClearanceController,
     ClearanceLeaseProxy,
     ClearanceStageLease,
+    GrantState,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import offer_under_pop_claim
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -437,6 +438,8 @@ class _SlotOccupancy:
     total_steps: int = 0
     copy_mb: float = 0.0
     """The job's whole weight copy (MB), its device and host-RAM parts together. Set only under ``partial_loads``."""
+    sampled_weight_set_mb: float | None = None
+    """The weights the lane held on the card while the job sampled (MB), read once its sampling ends; None before."""
 
 
 @dataclass
@@ -1821,6 +1824,8 @@ class _DispatchWorld:
         waiter for room the card already had imposes on every job."""
         self.clearance_grants: list[tuple[int, int, str]] = []
         """Every lane the controller cleared into its load-and-sample window, as (tick, lane, job)."""
+        self._clearance_waiters_seen: set[str] = set()
+        """The jobs the tick's clearance pass found staged, so the pass after dispatch prices only those it seated."""
         self._clearance_stage_semaphores: dict[int, synchronize.Semaphore] = {}
         """Per lane under two-phase clearance, the stage permit the parent grants, held empty as the clearance is."""
         self.stage_grants: list[tuple[int, int, str]] = []
@@ -2279,6 +2284,20 @@ class _DispatchWorld:
             + self._unretained_component_mb.get(lane_id, 0.0)
             + self._encode_staging_mb.get(lane_id, 0.0)
             + self._post_process_chain_mb.get(lane_id, 0.0)
+            + self._support_resident_mb.get(lane_id, 0.0)
+        )
+
+    def _lane_weight_set_mb(self, lane_id: int) -> float:
+        """Return the model weights one lane holds on the card, without its activation, decode spike or chain.
+
+        The figure hordelib's job profiler reads as the resident weights: every model ComfyUI holds loaded, which
+        includes the support components, a held component and an encoder still staged beside the checkpoint.
+        """
+        return (
+            self._resident_mb.get(lane_id, 0.0)
+            + self._held_component_mb.get(lane_id, 0.0)
+            + self._unretained_component_mb.get(lane_id, 0.0)
+            + self._encode_staging_mb.get(lane_id, 0.0)
             + self._support_resident_mb.get(lane_id, 0.0)
         )
 
@@ -4105,13 +4124,66 @@ class _DispatchWorld:
         stage admission is passed as the step's ``stage_admit_fn``, as the manager passes it.
         """
         stage_admit_fn = self._scheduler.clearance_stage_admit_process if self.two_phase else None
+        self._clearance_waiters_seen.clear()
         for device_index, controller in self._clearance_controllers.items():
+            inputs = self._scheduler.build_clearance_inputs(device_index=device_index)
+            self._clearance_waiters_seen.update(
+                waiter.job_id for waiter in inputs.staged_waiters if waiter.job_id is not None
+            )
             controller.step(
-                self._scheduler.build_clearance_inputs(device_index=device_index),
+                inputs,
                 admit_fn=self._scheduler.clearance_admit_process,
                 stage_admit_fn=stage_admit_fn,
             )
         self._open_cleared_windows()
+
+    def _clear_waiters_dispatched_this_tick(self) -> None:
+        """Give each job the tick's dispatch pass staged its first clearance pass, in the tick that staged it.
+
+        The manager's loop clears before it dispatches, as :meth:`step` does, but it loops every
+        ``_loop_interval`` (0.1 s), so a job dispatched in one iteration is priced by the next one's clearance a
+        fraction of a second later. A world tick spans several of those iterations, so pricing the job only at the
+        next tick's pass would hold every dispatched job a whole tick before its first clearance pass. This pass
+        stands for the next iteration's.
+
+        It does only what the next iteration would do that the tick's first pass has not. A card with no newly
+        staged job is not stepped. A waiter the first pass already saw is refused without being priced again, so
+        it keeps its place in the slot order and its clocks and records are left as the first pass set them.
+        Under two-phase clearance a card whose stage head the first pass already asked is not stepped either,
+        because the stage pass would ask that head again, and the head always precedes a job dispatched after it.
+        The step's grant retirement finds nothing new, since a dispatch seats a job only on a lane holding no
+        grant. Its tail-overlap clause is evaluated again, now with the new waiter staged, so a denial in that
+        clause is tallied once more for the tick.
+        """
+        stage_admit_fn = self._scheduler.clearance_stage_admit_process if self.two_phase else None
+        stepped = False
+        for device_index, controller in self._clearance_controllers.items():
+            newly_staged = {
+                lane.process_id
+                for lane in self._process_map.values()
+                if lane.device_index == device_index
+                and lane.is_staged_short_of_sampling()
+                and (job := lane.current_inference_job()) is not None
+                and job.id_ is not None
+                and str(job.id_) not in self._clearance_waiters_seen
+            }
+            if not newly_staged:
+                continue
+            inputs = self._scheduler.build_clearance_inputs(device_index=device_index)
+            stage_head_already_asked = stage_admit_fn is not None and any(
+                waiter.process_id not in newly_staged and controller.grant_state(waiter.process_id) is GrantState.IDLE
+                for waiter in inputs.staged_waiters
+            )
+            if stage_head_already_asked:
+                continue
+
+            def admit_newly_staged(process_id: int, newly_staged: set[int] = newly_staged) -> bool:
+                return process_id in newly_staged and self._scheduler.clearance_admit_process(process_id)
+
+            controller.step(inputs, admit_fn=admit_newly_staged, stage_admit_fn=stage_admit_fn)
+            stepped = True
+        if stepped:
+            self._open_cleared_windows()
 
     def _open_cleared_windows(self) -> None:
         """Start the load-and-sample window of every staged lane whose permit arrived, or whose wait ran out.
@@ -4411,6 +4483,9 @@ class _DispatchWorld:
             if self.host_ram is not None and sampled_seconds > 0.0:
                 # A sampling job reads its mapped weights, so its pages are the last a pressure eviction takes.
                 self.host_ram.touch(occupancy.model)
+            if occupancy.sampled_weight_set_mb is None and self.now >= occupancy.sample_until:
+                # Read before the decode tail can unload any of them, so it is the set the job sampled beside.
+                occupancy.sampled_weight_set_mb = self._lane_weight_set_mb(occupancy.lane_id)
             if occupancy.transient_charged and self.now >= occupancy.sample_until:
                 self._release_transient(occupancy)
                 if self.now < occupancy.decode_until:
@@ -4526,6 +4601,20 @@ class _DispatchWorld:
                 ),
             ),
         )
+
+    def _report_sampled_weight_set(self, job: ImageGenerateJobPopResponse, occupancy: _SlotOccupancy) -> None:
+        """Give the dispatcher a finished job's resident weights, as the measured footprint in its job metrics does.
+
+        The metrics reach the parent ahead of the job's result, and the job's sampling peak commits on the next
+        memory report. The dispatcher's own commit then decides whether the job sampled with its weights whole and,
+        if it did, learns its peak less those weights under the ``SAMPLE_ACTIVATION`` key, bounded by the job's
+        sampler-only seed. That key is what clearance prices a grant's activation reserve from, per job class.
+        """
+        if occupancy.sampled_weight_set_mb is None:
+            return
+        running = self._dispatcher._job_sampling_peaks.get(job.id_)
+        if running is not None:
+            running.peak_resident_weights_mb = occupancy.sampled_weight_set_mb
 
     def _release_transient(self, occupancy: _SlotOccupancy) -> None:
         """Give the card back the activation a finished sampling window was holding."""
@@ -4649,6 +4738,8 @@ class _DispatchWorld:
         job = next((tracked for tracked in self._job_tracker.jobs_in_progress if str(tracked.id_) == job_id), None)
         if job is None:
             return
+        if self.learned_footprints:
+            self._report_sampled_weight_set(job, occupancy)
         job_info = HordeJobInfo(
             sdk_api_job_info=job,
             job_image_results=[HordeImageResult(image_bytes=b"raw")],
@@ -5086,7 +5177,15 @@ class _DispatchWorld:
         return not self._scheduler.head_of_queue_is_parked()
 
     async def step(self) -> None:
-        """Advance one scheduling tick, in the control loop's order."""
+        """Advance one scheduling tick, in the control loop's order.
+
+        The manager's iteration (``HordeWorkerProcessManager._control_loop_tick``) steps the clearance
+        controllers, then runs the scheduling cycle that preloads and dispatches, then records slot duty, and the
+        next iteration's clearance pass follows ``_loop_interval`` later. The tick keeps that order and closes
+        with the next iteration's pass for the jobs its dispatch staged (:meth:`_clear_waiters_dispatched_this_tick`),
+        since a tick spans several of the manager's iterations and a job dispatched in one is priced within the
+        next.
+        """
         self.tick += 1
         self.now += self.tick_seconds
         self._foreign_vram_mb = self._foreign_vram_mb_by_tick.get(self.tick, self._foreign_vram_mb)
@@ -5170,6 +5269,7 @@ class _DispatchWorld:
                 job_id: f"{decline.bucket.value} on card {decline.device_index}: {decline.detail}"
                 for job_id, decline in declines.items()
             }
+        self._clear_waiters_dispatched_this_tick()
         for device_index in self._card_totals:
             self.min_card_free_mb[device_index] = min(
                 self.min_card_free_mb[device_index],

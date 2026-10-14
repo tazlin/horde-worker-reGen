@@ -29,24 +29,12 @@
       "tick": 1
     },
     {
-      "messages": [
-        {
-          "control_flag": "START_INFERENCE",
-          "job": "job-1",
-          "keep_model_resident_after": true,
-          "model": "sdxl-checkpoint",
-          "process_id": 0
-        }
-      ],
-      "tick": 2
-    },
-    {
       "decisions": [
         {
           "inputs": {
             "attempt_deadline_seconds": 50.0,
             "available_mb": 11778.8,
-            "candidate_delta_mb": 6210.0,
+            "candidate_delta_mb": 4371.0,
             "candidate_held_mb": 2048.0,
             "device_free_mb": 12598.0,
             "device_index": null,
@@ -67,7 +55,30 @@
           "reason": "granted by price",
           "subject": "job-1",
           "verdict": "admit"
-        },
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 0,
+          "model": "sdxl-checkpoint"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-1",
+          "keep_model_resident_after": true,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
+      "sampling_started": [
+        "job-1"
+      ],
+      "tick": 2
+    },
+    {
+      "decisions": [
         {
           "inputs": {
             "decision": "already_loaded",
@@ -102,12 +113,6 @@
           "verdict": "admit"
         }
       ],
-      "dispatches": [
-        {
-          "lane": 0,
-          "model": "sdxl-checkpoint"
-        }
-      ],
       "messages": [
         {
           "control_flag": "PRELOAD_MODEL",
@@ -116,9 +121,6 @@
           "model": "sdxl-checkpoint-b",
           "process_id": 1
         }
-      ],
-      "sampling_started": [
-        "job-1"
       ],
       "tick": 3
     },
@@ -135,25 +137,13 @@
       "tick": 4
     },
     {
-      "messages": [
-        {
-          "control_flag": "START_INFERENCE",
-          "job": "job-2",
-          "keep_model_resident_after": true,
-          "model": "sdxl-checkpoint",
-          "process_id": 0
-        }
-      ],
-      "tick": 9
-    },
-    {
       "decisions": [
         {
           "inputs": {
             "attempt_deadline_seconds": 50.0,
             "available_mb": 6878.8,
-            "candidate_delta_mb": 1310.0,
-            "candidate_held_mb": 6948.0,
+            "candidate_delta_mb": 0.0,
+            "candidate_held_mb": 6419.0,
             "device_free_mb": 7698.0,
             "device_index": null,
             "idle_contexts_teardownable": false,
@@ -181,10 +171,19 @@
           "model": "sdxl-checkpoint"
         }
       ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-2",
+          "keep_model_resident_after": true,
+          "model": "sdxl-checkpoint",
+          "process_id": 0
+        }
+      ],
       "sampling_started": [
         "job-2"
       ],
-      "tick": 10
+      "tick": 8
     },
     {
       "messages": [
@@ -196,19 +195,7 @@
           "process_id": 0
         }
       ],
-      "tick": 14
-    },
-    {
-      "messages": [
-        {
-          "control_flag": "START_INFERENCE",
-          "job": "job-3",
-          "keep_model_resident_after": false,
-          "model": "sdxl-checkpoint-b",
-          "process_id": 1
-        }
-      ],
-      "tick": 15
+      "tick": 12
     },
     {
       "decisions": [
@@ -216,7 +203,7 @@
           "inputs": {
             "attempt_deadline_seconds": 50.0,
             "available_mb": 11778.8,
-            "candidate_delta_mb": 6210.0,
+            "candidate_delta_mb": 4371.0,
             "candidate_held_mb": 2048.0,
             "device_free_mb": 12598.0,
             "device_index": null,
@@ -237,7 +224,30 @@
           "reason": "granted by price",
           "subject": "job-3",
           "verdict": "admit"
-        },
+        }
+      ],
+      "dispatches": [
+        {
+          "lane": 1,
+          "model": "sdxl-checkpoint-b"
+        }
+      ],
+      "messages": [
+        {
+          "control_flag": "START_INFERENCE",
+          "job": "job-3",
+          "keep_model_resident_after": false,
+          "model": "sdxl-checkpoint-b",
+          "process_id": 1
+        }
+      ],
+      "sampling_started": [
+        "job-3"
+      ],
+      "tick": 13
+    },
+    {
+      "decisions": [
         {
           "inputs": {
             "decision": "already_loaded",
@@ -250,14 +260,37 @@
           "verdict": "no_op"
         }
       ],
-      "dispatches": [
+      "tick": 14
+    },
+    {
+      "decisions": [
         {
-          "lane": 1,
-          "model": "sdxl-checkpoint-b"
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
         }
       ],
-      "sampling_started": [
-        "job-3"
+      "tick": 15
+    },
+    {
+      "decisions": [
+        {
+          "inputs": {
+            "decision": "already_loaded",
+            "model": "sdxl-checkpoint-b",
+            "process_id": null
+          },
+          "kind": "vram_admission",
+          "reason": "model already resident or loading",
+          "subject": "job-3",
+          "verdict": "no_op"
+        }
       ],
       "tick": 16
     },
@@ -292,54 +325,6 @@
         }
       ],
       "tick": 18
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sdxl-checkpoint-b",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-3",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 19
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sdxl-checkpoint-b",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-3",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 20
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sdxl-checkpoint-b",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-3",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 21
     }
   ],
   "ticks_driven": 40

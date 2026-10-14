@@ -3525,9 +3525,17 @@ def _unseen_tenant_world(arrival_tick: int) -> _DispatchWorld:
 
 
 async def _drive_unseen_tenant_waiter(world: _DispatchWorld) -> tuple[ImageGenerateJobPopResponse, float]:
-    """Queue one SDXL job and run the row past the lease-acquire timeout. Returns the job and its start instant."""
+    """Queue one Flux LoRA job and run the row past the lease-acquire timeout. Returns the job and its start."""
+    from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
+
     width, height = _CLEARANCE_JOB_SHAPE
-    job = make_job_pop_response(_SDXL.name, width=width, height=height, ddim_steps=20)
+    job = make_job_pop_response(
+        _UNSEEN_TENANT_MODEL.name,
+        width=width,
+        height=height,
+        ddim_steps=20,
+        loras=[LorasPayloadEntry(name="some_lora", model=1.0, clip=1.0)],
+    )
     started_at = world.now
     await world.pop(job)
     for _ in range(int(CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS / _LANE_RUNG_TICK_SECONDS) + 20):
@@ -3560,6 +3568,11 @@ async def test_r_a_waiter_nothing_can_help_is_probed_one_delay_after_its_last_ru
     lane_rungs = [now for _tick, now, _process_id, _owner in world.service_lane_pauses]
     if arrival == "after_the_first_lane_rung":
         assert lane_rungs, f"precondition: no lane rung was taken before the tenant arrived. {world.state_dump()}"
+    else:
+        assert not lane_rungs, (
+            f"precondition: with the tenant on from the start no lane rung can close the shortfall, yet lane rungs "
+            f"were taken at {lane_rungs}. {world.state_dump()}"
+        )
     assert not world.clearance_timeouts, (
         f"{context}: lane(s) {world.clearance_timeouts} sampled through the lease-acquire timeout. "
         f"{world.state_dump()}"
@@ -3605,6 +3618,23 @@ async def test_r_defect_reinjection_the_horizon_and_the_starved_deadline_time_ou
 
     job, _started_at = await _drive_unseen_tenant_waiter(world)
 
+    last_hold = next(
+        (
+            record
+            for record in reversed(world.decision_records)
+            if record.decision_kind is DecisionKind.CLEARANCE
+            and record.subject == str(job.id_)
+            and record.verdict is DecisionVerdict.DEFER
+        ),
+        None,
+    )
+    assert last_hold is not None, f"precondition: the waiter was never held at clearance. {world.state_dump()}"
+    last_deficit_mb = last_hold.inputs.get("room_deficit_mb")
+    assert isinstance(last_deficit_mb, float) and last_deficit_mb > arbiter_mod._MEASURED_ATTEMPT_BAND_MB, (
+        f"precondition: the shortfall the waiter is left with ({last_deficit_mb}MB) must sit past the "
+        f"{arbiter_mod._MEASURED_ATTEMPT_BAND_MB:.0f}MB measured attempt band, the shortfall the horizon applies to. "
+        f"{world.state_dump()}"
+    )
     assert [job_id for _tick, _lane, job_id in world.clearance_timeouts] == [str(job.id_)], (
         "with the horizon and the starved-clock deadline the waiter must reach its lease-acquire timeout; the run "
         f"recorded {world.clearance_timeouts}. {world.state_dump()}"
@@ -6074,13 +6104,21 @@ _COLD_READ_UNDER_PRESSURE_XFAIL = pytest.mark.xfail(
     ),
 )
 
+_COLD_READ_AFTER_PROMPT_GRANT_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the parent grants a staged job about 0.1 s after dispatch, and nothing holds the grant for an unfinished "
+        "idle-lane warm or staged prefetch, so a booked-holding lane whose checkpoint pages were reclaimed pays the "
+        "rest of the read after clearance even with ample host RAM"
+    ),
+)
+_COLD_READ_XFAILS = {"ample": _COLD_READ_AFTER_PROMPT_GRANT_XFAIL, "tight": _COLD_READ_UNDER_PRESSURE_XFAIL}
+"""The headroom levels at which a booked-holding load still reads reclaimed pages after clearance, by label."""
+
 
 @pytest.mark.parametrize(
     "headroom",
-    [
-        pytest.param(level, id=level.label, marks=() if level.label == "ample" else _COLD_READ_UNDER_PRESSURE_XFAIL)
-        for level in _HEADROOM_LEVELS
-    ],
+    [pytest.param(level, id=level.label, marks=_COLD_READ_XFAILS.get(level.label, ())) for level in _HEADROOM_LEVELS],
 )
 async def test_y_a_lane_booked_as_holding_its_model_never_waits_on_the_disk(headroom: _HostHeadroom) -> None:
     """No device load reads reclaimed checkpoint pages on a lane the parent booked as holding the model.
@@ -8133,12 +8171,16 @@ async def test_z_defect_reinjection_nothing_is_offered_behind_a_held_head(
 
 # A safety check sent in the same pass as a sampler's clearance
 
-_SAFETY_WINDOW_GROWTH_MB = 5000.0
+_SAFETY_WINDOW_GROWTH_MB = 10500.0
 """How much more than it holds at rest the modelled safety process needs on the card while a check runs.
 
-Sized against this row's card and jobs: more than the card has free once the large job's successor is cleared,
-and less than it has free before that clearance. So a check sent in the same pass as the clearance fits when it
-is sent and no longer fits when its allocations land."""
+Sized against this row's card and jobs: more than the card has free once an SDXL job's successor is cleared
+(9579 MB), and less than the measured free less the noise buffer when the check is sent (11233 MB). So a check
+sent in the same pass as the clearance fits when it is sent and no longer fits when its allocations land."""
+
+_SAFETY_WINDOW_SDXL_SIDE = 1536
+"""The SDXL jobs' side, large enough that the activation a cleared successor takes exceeds the noise buffer by
+more than the gap between the two frees above, which leaves the growth a band to sit in."""
 
 _SAFETY_WINDOW_JOBS = 8
 _SAFETY_WINDOW_MAX_TICKS = 700
@@ -8155,7 +8197,7 @@ class _SafetyWindowRun:
 async def _run_safety_checks_beside_a_cleared_sampler() -> _SafetyWindowRun:
     """Finish jobs on a 24 GB card where each result's safety check is sent as the next sampler is cleared.
 
-    A large-batch Krea2 job and three small SDXL jobs repeat on two lanes. When a job finishes, its check is
+    A large-batch Krea2 job and three SDXL jobs repeat on two lanes. When an SDXL job finishes, its check is
     sent and the lane's next job is cleared in the same control-loop pass. The check's allocations reach the
     card a tick later, after the cleared sampler's.
     """
@@ -8181,7 +8223,12 @@ async def _run_safety_checks_beside_a_cleared_sampler() -> _SafetyWindowRun:
                 n_iter=_CHAIN_COPY_HEAD_BATCH,
             )
         else:
-            job = make_job_pop_response(_SDXL.name, width=1024, height=1024, ddim_steps=8)
+            job = make_job_pop_response(
+                _SDXL.name,
+                width=_SAFETY_WINDOW_SDXL_SIDE,
+                height=_SAFETY_WINDOW_SDXL_SIDE,
+                ddim_steps=8,
+            )
         await world.pop(job)
     for _ in range(_SAFETY_WINDOW_MAX_TICKS):
         await world.step()
@@ -8249,7 +8296,13 @@ async def test_z_defect_reinjection_an_unbooked_safety_check_finds_the_card_full
     run = await _run_safety_checks_beside_a_cleared_sampler()
     world = run.world
 
-    starved = [check for check in world.safety_checks if check.starved]
+    grant_ticks = {tick for tick, _lane, _job_id in world.clearance_grants}
+    collisions = [check for check in world.safety_checks if check.started_tick in grant_ticks]
+    assert collisions, (
+        "precondition: a check must be sent in the pass that clears a sampler; "
+        f"checks={_describe_safety_checks(world)} grants={world.clearance_grants} {world.state_dump()}"
+    )
+    starved = [check for check in collisions if check.starved]
     assert starved and world.card_overcommits, (
         "without the window a check must land without room and over-commit the card; "
         f"overcommits={world.card_overcommits} checks={_describe_safety_checks(world)} {world.state_dump()}"

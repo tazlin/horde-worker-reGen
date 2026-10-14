@@ -32,6 +32,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     job_class_key,
     sampling_footprint_key,
 )
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from tests.process_management.conftest import make_job_pop_response
 from tests.process_management.liveness._dispatch_world import (
     _CARD_24GB,
@@ -133,8 +134,13 @@ _W3_RESIDENTS: tuple[tuple[str, bool] | None, ...] = (
 Process 3 and 5 were sampling CyberRealistic Pony and Anima, process 4 had just moved Flux to RAM and process 6
 had just dropped its model to disk."""
 
-_LIVE_SLOT_DUTY_SAMPLING_SHARE = 0.39
-"""The session's slot-duty sampling share over its whole length."""
+_LIVE_SLOT_DUTY_SAMPLING_SHARE = 0.40
+"""The session's slot-duty sampling share over the slot time that had local work.
+
+The live report reads sampling 39% and `no_local_work` 3% over the whole session, so the share over the slot time
+with work is 39 / 97, the same normalisation :attr:`_ReplayFigures.sampling_share_with_local_work` applies to the
+replay (a recorded-offset row starves on the fixture, and starvation is the supply model's property).
+"""
 _SAMPLING_SHARE_BAND = 0.15
 """How far the replay's sampling share may sit from the live share and still count as the same duty shape.
 
@@ -168,6 +174,27 @@ class _ReplayFigures:
     """Each model's device loads, the model with the most load seconds first."""
 
     @property
+    def card_busy_share(self) -> float:
+        """Return the share of ticks with at least one lane sampling, the card-level duty the target is set on.
+
+        Slot duty divides each slot's seconds among its buckets, so two half-busy slots read as half duty while
+        the card samples throughout. The card's own figure is the complement of the share with no lane sampling.
+        """
+        return 1.0 - self.concurrency.get(0, 0.0)
+
+    @property
+    def sampling_share_with_local_work(self) -> float:
+        """Return the sampling share of the slot time that had local work, the share a recorded-offset row calibrates.
+
+        At the recorded offsets a world that outruns the live worker idles for want of a row, which slot duty
+        buckets ``no_local_work``. That idle time is the supply model's, so the share leaves it out.
+        """
+        local_work_share = 1.0 - self.slot_duty.get(SlotDutyBucket.NO_LOCAL_WORK, 0.0)
+        if local_work_share <= 0.0:
+            return 0.0
+        return self.sampling_share / local_work_share
+
+    @property
     def partial_loads(self) -> int:
         """Return how many device loads left part of their weights in host RAM."""
         return sum(totals.partial_loads for totals in self.load_totals)
@@ -195,7 +222,9 @@ class _ReplayFigures:
             for totals in self.load_totals
         )
         return (
-            f"sampling share {self.sampling_share:.1%}; lanes sampling {concurrency}; slot duty {holds}; "
+            f"card busy {self.card_busy_share:.1%}; sampling share {self.sampling_share:.1%} "
+            f"({self.sampling_share_with_local_work:.1%} of the slot time with local work); "
+            f"lanes sampling {concurrency}; slot duty {holds}; "
             f"handoff gaps {gaps}; median pop to start {pop_to_start}; {self.completed_jobs} jobs completed; "
             f"{self.overcommit_ticks} over-committed ticks (at most {self.overcommit_max_mb:.0f} MB); "
             f"offered {self.driver.offered}, "
@@ -339,7 +368,12 @@ async def _replay_whole_session(scratch_directory: Path) -> _ReplayFigures:
 
 
 def _assert_live_duty_shape(figures: _ReplayFigures, *, context: str) -> None:
-    """Assert the replay's duty shape sits inside the calibration band around the live session's."""
+    """Assert the replay's duty shape sits inside the calibration band around the live session's.
+
+    The sampling share is read over the slot time that had local work. The rows offer jobs at the recorded pop
+    offsets, so a scheduler faster than the live one starves on the fixture, and a share over all slot time would
+    fall as the scheduler gets faster. That starvation belongs to the supply model and says nothing about the card.
+    """
     description = figures.describe()
     # An over-commit inside the admission margin is what the margin exists to absorb, and the live session's
     # decode tails ran there too. One beyond it is a pricing decision that admitted room the card did not have.
@@ -347,9 +381,10 @@ def _assert_live_duty_shape(figures: _ReplayFigures, *, context: str) -> None:
         f"{context}: the card was over-committed beyond the admission margin ({_ADMISSION_NOISE_MB:.0f} MB). "
         f"{description}"
     )
-    assert abs(figures.sampling_share - _LIVE_SLOT_DUTY_SAMPLING_SHARE) <= _SAMPLING_SHARE_BAND, (
-        f"{context}: sampling share {figures.sampling_share:.1%} is more than {_SAMPLING_SHARE_BAND:.0%} from the "
-        f"live {_LIVE_SLOT_DUTY_SAMPLING_SHARE:.0%}. {description}"
+    sampling_share = figures.sampling_share_with_local_work
+    assert abs(sampling_share - _LIVE_SLOT_DUTY_SAMPLING_SHARE) <= _SAMPLING_SHARE_BAND, (
+        f"{context}: sampling share {sampling_share:.1%} of the slot time with local work is more than "
+        f"{_SAMPLING_SHARE_BAND:.0%} from the live {_LIVE_SLOT_DUTY_SAMPLING_SHARE:.0%}. {description}"
     )
     two_sampler_share = figures.concurrency[SAMPLING_CONCURRENCY_TOP]
     assert two_sampler_share < _TWO_SAMPLER_SHARE_CEILING, (
@@ -366,7 +401,9 @@ async def test_replay_w3_window_reproduces_the_live_duty_shape(tmp_path: Path) -
     share within 15 points of the session's 39%, fewer than 30% of ticks with two lanes sampling against the
     session's 13.7%, and no tick over the card by more than the admission margin. The share is the session's
     because the stretch alone has too few jobs to fix a figure. The band is wide for the same reason and for the
-    mismatches the fixture module lists.
+    mismatches the fixture module lists. The replay's share is read over the slot time with local work, since
+    the row offers jobs at the recorded pop offsets and a scheduler that outruns the live one idles on the
+    fixture's supply as ``no_local_work``.
     """
     figures = await _replay_w3_window(tmp_path)
     _assert_live_duty_shape(figures, context="15:05 to 15:25 window")

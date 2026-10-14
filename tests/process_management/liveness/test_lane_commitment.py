@@ -341,7 +341,8 @@ async def test_a_clearance_sweep_spares_the_queue_heads_ready_seat() -> None:
     A staged Flux job on lane 0 does not fit, and its hold runs the eviction sweep while lane 1 holds the queue
     head's SD15 on the card and lane 2 an SDXL model nothing queued wants. The card has a free sampling slot, so
     lane 1 is the head's ready seat. The sweep unloads only lane 2. The head starts on lane 1 with no load, and
-    the hold is still admitted.
+    the hold is still admitted. Both jobs are queued before the first tick, since the Flux job's first clearance
+    pass runs in the tick that stages it, and a sweep run before the head arrives has no ready seat to spare.
     """
     world = _DispatchWorld(
         card=_CARD_24GB,
@@ -362,15 +363,11 @@ async def test_a_clearance_sweep_spares_the_queue_heads_ready_seat() -> None:
     head = make_job_pop_response(_SD15.name)
     staged_id, head_id = str(staged.id_), str(head.id_)
     await world.pop(staged)
+    await world.pop(head)
     log = _CommandLog()
-    head_popped = False
     for _ in range(_MAX_TICKS):
         await world.step()
         log.record(world)
-        if not head_popped and staged_id in world.job_windows:
-            # Popped once the Flux job is staged, so the next tick's clearance hold sweeps with the head pending.
-            await world.pop(head)
-            head_popped = True
         if world.completed_jobs >= 2:
             break
 
@@ -392,6 +389,10 @@ async def test_a_clearance_sweep_spares_the_queue_heads_ready_seat() -> None:
         index
         for index, command in enumerate(head_commands)
         if command.flag is HordeControlFlag.START_INFERENCE and command.job_id == head_id
+    )
+    assert head_commands[head_start].tick > sweeps[0], (
+        f"precondition: the head must still be queued when the hold sweeps at tick {sweeps[0]}, yet it started at "
+        f"tick {head_commands[head_start].tick}. {world.state_dump()}"
     )
     unloads_ahead = [
         (command.tick, command.model)

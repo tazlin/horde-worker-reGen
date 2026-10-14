@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
+from typing import override
 
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -341,14 +343,46 @@ _Z_IMAGE = _ModelClass(
 )
 
 
+@dataclass(frozen=True)
+class _StageReading:
+    """Represents one staged lane as its encode settled, before the tick's clearance pass could grant it."""
+
+    resident_mb: float
+    offloaded_mb: float
+    card_free_mb: float
+
+
+class _StageReadingWorld(_DispatchWorld):
+    """A world that reads the staged lane once each dispatch's encode has settled.
+
+    The clearance pass that closes a dispatch tick grants the staged job and its load returns what the stage
+    unloaded, so a reading taken when the tick ends no longer shows the stage.
+    """
+
+    @cached_property
+    def stage_readings(self) -> dict[str, _StageReading]:
+        """Return each staged job's reading, by job id."""
+        return {}
+
+    @override
+    def _begin_staged_prefetch(self, admitted: ImageGenerateJobPopResponse, *, lane_id: int) -> None:
+        self.stage_readings[str(admitted.id_)] = _StageReading(
+            resident_mb=self._resident_mb.get(lane_id, 0.0),
+            offloaded_mb=self._offloaded_mb.get(lane_id, 0.0),
+            card_free_mb=self.card_free_mb(self._card_of(lane_id)),
+        )
+        super()._begin_staged_prefetch(admitted, lane_id=lane_id)
+
+
 async def test_a_stage_beside_retained_weights_unloads_them_and_the_next_load_returns_them() -> None:
     """A retained lane staged for its next job funds the encoder from its own weights, then gets them back.
 
     ComfyUI's free-memory pass makes room for the text encoder by unloading the process's own diffusion weights,
     so the stage commits no more than the child believes is free less its margin. The next load of the same model
-    returns everything the lane left in host RAM, the stage's unload included.
+    returns everything the lane left in host RAM, the stage's unload included. The stage is read as its encode
+    settles, since the same tick's clearance pass grants the job and its load returns the weights.
     """
-    world = _DispatchWorld(
+    world = _StageReadingWorld(
         card=_CARD_24GB,
         lane_count=1,
         max_threads=1,
@@ -365,21 +399,21 @@ async def test_a_stage_beside_retained_weights_unloads_them_and_the_next_load_re
     for job in (first_job, second_job):
         await world.pop(job)
     second_id = str(second_job.id_)
-    stage_unloaded_mb: float | None = None
-    offloaded_after_stage_mb = 0.0
-    free_after_stage_mb = 0.0
+    resident_before_stage_mb: float | None = None
     for _ in range(_MAX_TICKS):
         resident_before_mb = world._resident_mb.get(0, 0.0)
         await world.step()
-        if stage_unloaded_mb is None and second_id in world.job_windows:
-            stage_unloaded_mb = resident_before_mb - world._resident_mb.get(0, 0.0)
-            offloaded_after_stage_mb = world._offloaded_mb.get(0, 0.0)
-            free_after_stage_mb = world.card_free_mb(0)
+        if resident_before_stage_mb is None and second_id in world.job_windows:
+            resident_before_stage_mb = resident_before_mb
         if world.completed_jobs == 2:
             break
 
-    assert stage_unloaded_mb is not None, f"the second job was never staged. {world.state_dump()}"
+    assert resident_before_stage_mb is not None, f"the second job was never staged. {world.state_dump()}"
     assert world.job_windows[str(first_job.id_)].retention_granted, "the first job was not retained"
+    stage = world.stage_readings[second_id]
+    stage_unloaded_mb = resident_before_stage_mb - stage.resident_mb
+    offloaded_after_stage_mb = stage.offloaded_mb
+    free_after_stage_mb = stage.card_free_mb
     assert stage_unloaded_mb > 0.0, "the stage found room beside the retained weights, so the row proves nothing"
     assert free_after_stage_mb >= _CHILD_FREE_MARGIN_MB - 1e-6, (
         f"the stage left {free_after_stage_mb:.0f} MB free, under the child's {_CHILD_FREE_MARGIN_MB:.0f} MB margin"
