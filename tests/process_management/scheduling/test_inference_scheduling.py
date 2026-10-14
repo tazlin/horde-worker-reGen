@@ -2100,8 +2100,9 @@ class TestPreloadTargetRetiredDuringAdmission:
             *,
             is_head_blocker: bool,
             snapshot: object = None,
+            fit_only: bool = False,
         ) -> bool:
-            del job, is_head_blocker, snapshot
+            del job, is_head_blocker, snapshot, fit_only
             assert process_info.process_id == 0, "precondition: the pass aims at the first idle lane"
             process_map.retire_process(process_map[0], "inference scale-down")
             return True
@@ -2123,8 +2124,9 @@ class TestPreloadTargetRetiredDuringAdmission:
             *,
             is_head_blocker: bool,
             snapshot: object = None,
+            fit_only: bool = False,
         ) -> bool:
-            del job, process_info, is_head_blocker, snapshot
+            del job, process_info, is_head_blocker, snapshot, fit_only
             for process_id in (0, 1):
                 process_map.retire_process(process_map[process_id], "inference scale-down")
             return True

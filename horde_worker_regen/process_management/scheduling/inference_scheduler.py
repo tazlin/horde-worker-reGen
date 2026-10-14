@@ -1099,6 +1099,21 @@ class InferenceScheduler:
             return None
         return self._performance_model.expected_sampling_seconds(signature)
 
+    def _expected_dispatch_overhead_seconds(self, job: ImageGenerateJobPopResponse, resident: bool) -> float | None:
+        """Return the performance model's learned dispatch-to-first-step seconds for a job, or ``None`` when unknown.
+
+        Args:
+            job: The job whose signature is looked up.
+            resident: Whether the lane it would run on holds its model in VRAM at dispatch.
+        """
+        if self._performance_model is None or job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        signature = signature_from_job(job, str(baseline) if baseline is not None else None)
+        if signature is None:
+            return None
+        return self._performance_model.expected_overhead_seconds(signature, resident=resident)
+
     def _log_stream_forecast(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast) -> None:
         """Log the stream forecast when its decision or materially-relevant measurements change."""
         if not forecast.known:
@@ -6048,7 +6063,18 @@ class InferenceScheduler:
                 safety_placement=self._safety_placement,
                 ram_reclaim=self._ram_reclaim,
             ),
+            remaining_sampling_seconds=self._sampling_slot_remaining_seconds,
+            dispatch_overhead_seconds=self._expected_dispatch_overhead_seconds,
         )
+
+    def _sampling_slot_remaining_seconds(self, process_info: HordeProcessInfo) -> float | None:
+        """Return the seconds left in a sampling slot's denoise loop, or None for a slot that is not inside one.
+
+        The step fields outlive the job that wrote them, so a slot's figure is read only while it samples.
+        """
+        if process_info.last_process_state is not HordeProcessState.INFERENCE_STARTING:
+            return None
+        return self._remaining_sampling_seconds(process_info)
 
     def build_vram_arbiter_snapshot(
         self,
@@ -7876,8 +7902,11 @@ class InferenceScheduler:
         is_head_blocker: bool,
         no_live_resource_consumer: bool,
         snapshot: SchedulingSnapshot | None = None,
+        fit_only: bool = False,
     ) -> bool:
         """Apply the system-RAM budget verdict for a preload: admit, reclaim idle RAM, or best-effort admit.
+
+        With ``fit_only`` a miss records its reason and returns False before any reclaim runs.
 
         The verdict is :func:`decide_ram_admission` over the phase snapshot (the component charge or the
         page-reuse credit, both marginal accountings of the same load). A fit records the accounting it was
@@ -7911,6 +7940,10 @@ class InferenceScheduler:
                 self._record_load_for_learning(job, available_process, ram_verdict, ReuseCreditKind.WHOLE)
             self._resolve_head_ram_defer(job, reason="admitted")
             return True
+
+        if fit_only:
+            self._last_budget_defer_reason = admission.reason()
+            return False
 
         suppressed = self._diagnostics.suppressed_count(
             "ram_budget_defer",
@@ -7963,8 +7996,13 @@ class InferenceScheduler:
         *,
         is_head_blocker: bool,
         snapshot: SchedulingSnapshot | None = None,
+        fit_only: bool = False,
     ) -> bool:
         """Return whether ``job`` may be admitted for preload, with the VRAM arbiter as the deciding authority.
+
+        With ``fit_only`` (a single-card cold copy, which the head does not need to run) the preload is admitted
+        only on a plain fit of both VRAM and RAM as the card stands. Neither the whole-card demand nor a measured
+        attempt is consulted, and a refusal runs no reclaim, rung or eviction.
 
         True means proceed to send the preload; False means defer this cycle. The whole-card residency state
         machine is consulted first (pre-stage, defer, or fall through once its teardown has cleared the card to
@@ -8013,6 +8051,15 @@ class InferenceScheduler:
         # Trace the forecast for every budget-gated load so the logs show the residency dynamics, not just the
         # action taken. Unchanged observations are coalesced by _log_stream_forecast.
         self._log_stream_forecast(job, forecast)
+
+        if fit_only:
+            return self._admit_preload_if_it_fits(
+                job,
+                available_process,
+                arbiter=arbiter,
+                forecast=forecast,
+                no_live_resource_consumer=no_live_resource_consumer,
+            )
 
         whole_card = self._decide_whole_card_demand(
             job,
@@ -8126,6 +8173,45 @@ class InferenceScheduler:
             ),
         )
         return False
+
+    def _admit_preload_if_it_fits(
+        self,
+        job: ImageGenerateJobPopResponse,
+        available_process: HordeProcessInfo,
+        *,
+        arbiter: VramArbiter,
+        forecast: StreamForecast,
+        no_live_resource_consumer: bool,
+    ) -> bool:
+        """Return whether a preload fits the card's VRAM and the host's RAM as they stand, acting on nothing.
+
+        The pricing is the ordinary preload's, so the copy's fit is judged exactly as any load's is. Only a plain
+        FITS counts, since a measured attempt is the starved head's escape hatch and never applies to a load the
+        head does not need. A refusal records its reason and returns, leaving every resident where it is.
+        """
+        if job.id_ is None:
+            raise ValueError(f"job.id_ is None ({job})")
+        snapshot = self.snapshot()
+        priced = price_preload(
+            snapshot,
+            str(job.id_),
+            available_process.process_id,
+            arbiter=arbiter,
+            is_head_blocker=False,
+            forecast=forecast,
+        )
+        verdict = arbiter.evaluate(priced.priced.request)
+        if verdict.disposition is not VramDisposition.FITS or verdict.measured_attempt:
+            self._last_budget_defer_reason = verdict.reason
+            return False
+        return self._apply_ram_verdict(
+            job,
+            available_process,
+            is_head_blocker=False,
+            no_live_resource_consumer=no_live_resource_consumer,
+            snapshot=snapshot,
+            fit_only=True,
+        )
 
     def _mark_measured_attempt(
         self,
@@ -9417,8 +9503,24 @@ class InferenceScheduler:
             process,
             is_head_blocker=plan.is_head_blocker,
             snapshot=snapshot,
+            fit_only=plan.cold_copy,
         ):
-            return AdmissionDecision.DEFER_BUDGET, process, self._last_budget_defer_reason or "VRAM/RAM budget gate"
+            defer_reason = self._last_budget_defer_reason or "VRAM/RAM budget gate"
+            if plan.cold_copy:
+                # The head keeps its resident lane, so a copy that does not fit the card as it stands is not
+                # loaded, and the pass reads the head as already resident, as it would without the copy.
+                return (
+                    AdmissionDecision.ALREADY_LOADED,
+                    None,
+                    f"model already resident and a cold copy does not fit the card as it stands ({defer_reason})",
+                )
+            return AdmissionDecision.DEFER_BUDGET, process, defer_reason
+        if plan.cold_copy and self._process_map.get(process.process_id) is not process:
+            return (
+                AdmissionDecision.ALREADY_LOADED,
+                None,
+                "model already resident and the cold copy's lane left the pool",
+            )
         if self._process_map.get(process.process_id) is not process:
             reselected = self._select_preload_process(job, sorted(plan.disallowed_process_ids))
             if reselected is None:
@@ -10188,12 +10290,32 @@ class InferenceScheduler:
         A free slot that holds the model's *retained* weights wins over any other resident candidate. Both
         record the model as loaded, but only the retainer still has it on the device, so seating the job
         anywhere else pays a full RAM->VRAM re-upload for weights the card already carries.
+
+        On one card a model has a second copy only when the preload gate loaded one because it starts the head
+        sooner than waiting for the busy lane
+        (:func:`~horde_worker_regen.process_management.scheduling.admission.preload.single_card_cold_copy_may_serve`).
+        Of two copies, one that can accept the job wins over a busy one, so the head lands on whichever lane frees
+        first.
         """
         if job.model is None:
             return None
         if not self._multi_gpu_routing_active:
             resident = self._process_map.get_process_by_horde_model_name(job.model, include_reserved=include_reserved)
-            return self._prefer_free_retainer(job.model, resident, include_reserved=include_reserved)
+            resident = self._prefer_free_retainer(job.model, resident, include_reserved=include_reserved)
+            if resident is None or resident.can_accept_job():
+                return resident
+            free_copy = next(
+                (
+                    candidate
+                    for candidate in self._process_map.get_processes_by_horde_model_name(
+                        job.model,
+                        include_reserved=include_reserved,
+                    )
+                    if candidate.can_accept_job()
+                ),
+                None,
+            )
+            return free_copy if free_copy is not None else resident
         allowed = self._eligible_card_indices(job)
         candidates = self._process_map.get_processes_by_horde_model_name(
             job.model,

@@ -118,7 +118,7 @@ the seat is not the head's own
 | Preload target choice (sticky unless that card is at its sampling cap, then least loaded, sparing the head's own copy) | [`select_preload_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_preload_target], [`select_head_room_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_head_room_target] | snapshot | a process id or None | the gate ladder |
 | Room for a follower a protected pool leaves no target for: displace one idle lane whose resident model has strictly less outstanding demand (multi-GPU, never live work, a capped card or a head's copy) | [`select_follower_room_target`][horde_worker_regen.process_management.scheduling.admission.preload.select_follower_room_target] over [`select_follower_room_process_id`][horde_worker_regen.process_management.scheduling.governance.preload_admission.select_follower_room_process_id] | snapshot | a process id or None | the gate ladder, after the head-room fallback |
 | Which slots a preload may not displace (queued-model guard, affinity protection, RAM draining; on a multi-GPU host also every ready seat, an idle lane a pending job can start on this cycle because its card runs fewer jobs than its cap) | [`compute_preload_disallowed_processes`][horde_worker_regen.process_management.scheduling.governance.preload_admission.compute_preload_disallowed_processes] over [`wanted_models`][horde_worker_regen.process_management.scheduling.admission.pricing.wanted_models], plus [`ready_seat_process_ids`][horde_worker_regen.process_management.scheduling.admission.pricing.ready_seat_process_ids] | snapshot | a set of process ids | `select_preload_target` |
-| Whether a model may hold a second copy, and how many (no eligible copy can start the job now, none loading, inside the demand-and-card-count ceiling; a free copy beside a sibling running a job on a card capped at one cannot start it) | [`duplicate_copy_may_serve`][horde_worker_regen.process_management.scheduling.admission.preload.duplicate_copy_may_serve], [`duplicate_copies_permitted`][horde_worker_regen.process_management.scheduling.admission.preload.duplicate_copies_permitted] | snapshot | a predicate and a count | the gate ladder's already-resident exit |
+| Whether a model may hold a second copy, and how many (no eligible copy can start the job now, none loading, inside the demand-and-card-count ceiling; a free copy beside a sibling running a job on a card capped at one cannot start it; on one card, only for the head when a cold copy starts sooner than its busy resident lane, see Dispatch selection) | [`duplicate_copy_may_serve`][horde_worker_regen.process_management.scheduling.admission.preload.duplicate_copy_may_serve], [`duplicate_copies_permitted`][horde_worker_regen.process_management.scheduling.admission.preload.duplicate_copies_permitted] | snapshot | a predicate and a count | the gate ladder's already-resident exit |
 | Preload budget pricing (predictive verdict, context-reduction depth, arbiter request) | [`price_preload`][horde_worker_regen.process_management.scheduling.admission.preload.price_preload] | snapshot, the frozen arbiter, the streaming forecast | `PricedPreload` | `_admit_preload_under_budget`, which evaluates through the arbiter and runs the RAM verdict or the actuations |
 | RAM staging verdict (whole checkpoint, page-reuse credit, or the UNet-only component charge), with the checkpoint mapping judged against available commit | [`decide_ram_admission`][horde_worker_regen.process_management.scheduling.admission.preload.decide_ram_admission] over [`decide_commit_admission`][horde_worker_regen.process_management.scheduling.admission.preload.decide_commit_admission] | snapshot | `RamAdmission` | `_apply_ram_verdict`, which records the accounting on a fit and runs the reclaim sequence on a miss |
 | Materialisation request (dispatch, clearance and preload share it) | [`build_materialization_request`][horde_worker_regen.process_management.scheduling.admission.materialization.build_materialization_request] | snapshot, the frozen arbiter | `MaterializationRequest` (the `VramRequest`, the context-reduction depth, the candidate delta) | `VramArbiter.evaluate` |
@@ -158,6 +158,27 @@ Where a job's model is resident on more than one card, the copy it is routed to 
 running fewer jobs than its cap, then the card with the fewest busy lanes (`_pick_best_resident_process`). A
 lane loading or holding a freshly loaded model is busy without running a job, so busy lanes alone tie a card
 that is loading with one that is sampling, and the copy beside the sampler cannot start until its job ends.
+
+On one card a head whose model is resident on a lane that is still sampling normally waits for that lane. The
+preload gate loads a second copy onto an idle lane instead when the copy reaches its first step sooner
+([`single_card_cold_copy_may_serve`][horde_worker_regen.process_management.scheduling.admission.preload.single_card_cold_copy_may_serve]):
+the busy lane's remaining sampling seconds (its step heartbeat, `SlotSnapshot.remaining_sampling_seconds`) plus
+the learned resident dispatch-to-first-step seconds must exceed the learned cold dispatch-to-first-step seconds
+(`JobSnapshot.resident_overhead_seconds` and `cold_overhead_seconds`, from the performance model by the job's
+signature). All three figures must be known; the copy must be the only one, not loading, and unable to take the
+job; the card's sampling cap must leave room for a second job; and the model must hold no whole-card residency,
+need no exclusive residency and sit below the extra-large tier, since the overlap gate never seats an
+extra-large job beside another. The copy is an optimisation of a head that already has a lane to run on, so it
+loads only where the card has room for it as it stands. It targets an empty idle lane and never displaces
+another lane's model (`cold_copy_target`). It is not the head for pricing and takes no head-room fallback, and
+the budget step admits it only on a plain fit of VRAM and RAM, with no whole-card demand, measured attempt,
+reclaim rung or eviction behind a refusal. A copy that does not fit reads as the already-resident exit, and the
+head waits on its resident lane as it would without the rule. Reclaiming for it would spend other lanes' work
+to shave seconds off a job that is going to run anyway. Dispatch (`resident_process_for_job`) seats the head on
+whichever copy can take it first. Three figures are left out of the comparison. The busy lane's decode tail and
+result report are not in the wait, which favours waiting. The copy's disk-to-RAM read is not in the cold
+figure, which favours the copy. The retention fit (`_retention_affinity_retainer`) re-prices room at dispatch,
+so where it disagrees with the preload budget the head goes back to the busy retainer and the copy is wasted.
 
 A head that cannot be seated therefore blocks only its own card. Where the worker drives more than one, the
 walk resumes and the first job another card can serve immediately is dispatched instead

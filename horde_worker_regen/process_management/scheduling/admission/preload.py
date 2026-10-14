@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType, WorkerCapability
+from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier
 from horde_worker_regen.process_management.resources.resource_budget import (
     BudgetVerdict,
     StreamForecast,
@@ -153,6 +154,10 @@ class PreloadGatePlan:
     """The slots the preload may not displace, for the re-selection an admission that retires the target needs."""
     notice: str | None = None
     records_admission: bool = True
+    cold_copy: bool = False
+    """Whether the plan loads a single-card cold copy of a model already resident on a busy lane
+    (:func:`single_card_cold_copy_may_serve`). Such a load is admitted only where it fits the card as it stands.
+    The budget step runs no reclaim for it, and a refusal leaves the head waiting on its resident lane."""
 
     @property
     def admits(self) -> bool:
@@ -283,22 +288,134 @@ def duplicate_copies_permitted(snapshot: SchedulingSnapshot, model: str) -> int:
     return min(model_demand_count(snapshot, model), snapshot.card_count)
 
 
-def duplicate_copy_may_serve(snapshot: SchedulingSnapshot, job_id: str) -> bool:
-    """Whether a second copy of the job's already-resident model may be preloaded onto another card.
+@dataclass(frozen=True)
+class ResidentWaitComparison:
+    """Represents the two start-to-first-step estimates for a head whose model is resident on a busy lane.
 
-    On one card a duplicate is pure waste. Across cards the single-copy rule inverts when no eligible copy can
+    ``wait_seconds`` is the busy lane's remaining sampling plus the resident dispatch overhead. ``cold_seconds``
+    is the cold dispatch overhead on another lane. Neither counts the busy lane's decode tail and result report
+    (the wait is understated) nor the second copy's disk-to-RAM read (the cold start is understated).
+    """
+
+    wait_seconds: float
+    cold_seconds: float
+
+    @property
+    def cold_starts_sooner(self) -> bool:
+        """Whether the cold copy reaches its first step before the resident lane would."""
+        return self.cold_seconds < self.wait_seconds
+
+
+def resident_wait_or_cold(snapshot: SchedulingSnapshot, job_id: str) -> ResidentWaitComparison | None:
+    """Compare waiting for the job's busy resident lane with a cold start elsewhere, or None when not comparable.
+
+    Defined only when exactly one inference slot holds the job's model and that slot is sampling with a trusted
+    remaining figure, and the performance model knows both the resident and the cold dispatch overhead for the
+    job's signature. Any unknown figure leaves the question unanswered, which keeps the single-copy rule.
+    """
+    job = snapshot.queue.jobs[job_id]
+    if job.model is None or job.resident_overhead_seconds is None or job.cold_overhead_seconds is None:
+        return None
+    copies = [
+        slot
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE and slot.model == job.model
+    ]
+    if len(copies) != 1:
+        return None
+    remaining_seconds = copies[0].remaining_sampling_seconds
+    if remaining_seconds is None:
+        return None
+    return ResidentWaitComparison(
+        wait_seconds=remaining_seconds + job.resident_overhead_seconds,
+        cold_seconds=job.cold_overhead_seconds,
+    )
+
+
+def cold_copy_target(snapshot: SchedulingSnapshot, job_id: str) -> int | None:
+    """Return the empty idle inference lane a single-card cold copy may load onto, or None.
+
+    Only a lane holding no model qualifies. The copy is an optimisation of a head that already has a resident
+    lane, so it never displaces another lane's model to find room. It also never takes a lane the preload guards
+    or another commitment holds (:func:`preload_disallowed_processes`, :func:`lanes_committed_elsewhere`).
+    """
+    job = snapshot.queue.jobs[job_id]
+    excluded = preload_disallowed_processes(snapshot, job) | lanes_committed_elsewhere(snapshot, job.model)
+    return next(
+        (
+            slot.process_id
+            for slot in snapshot.slots.values()
+            if slot.process_type is HordeProcessType.INFERENCE
+            and WorkerCapability.IMAGE_GEN in slot.capabilities
+            and slot.is_unoccupied
+            and slot.can_accept_job
+            and not slot.reserved_for_disaggregation
+            and slot.process_id not in excluded
+            and slot.process_id not in snapshot.draining_process_ids
+        ),
+        None,
+    )
+
+
+def single_card_cold_copy_may_serve(snapshot: SchedulingSnapshot, job_id: str) -> bool:
+    """Whether the queue head may have a second copy of its model loaded on one card, to start sooner than waiting.
+
+    The head's model sits on a lane that is still sampling. A copy on an idle lane is worth loading only when it
+    reaches its first step before the busy lane would (:func:`resident_wait_or_cold`), and only where it can
+    sample beside that lane at all. A model holding or needing the whole card rules it out, as does an extra-large
+    model (the overlap gate never seats an extra-large job beside another) or a card whose sampling cap leaves no
+    room for a second job. It also needs an empty idle lane (:func:`cold_copy_target`).
+    Whether the copy fits the card as it stands is the budget step's question, asked with no reclaim behind it.
+    """
+    job = snapshot.queue.jobs[job_id]
+    model = job.model
+    if model is None or preload_head(snapshot) != job_id:
+        return False
+    entry = snapshot.model_map.get(model)
+    if entry is not None and entry.load_state is ModelLoadState.LOADING:
+        return False
+    copies = [
+        slot
+        for slot in snapshot.slots.values()
+        if slot.process_type is HordeProcessType.INFERENCE and slot.model == model
+    ]
+    if len(copies) != 1 or any(copy.can_accept_job for copy in copies):
+        return False
+    if None not in pricing.cards_able_to_start_job(snapshot):
+        return False
+    if model in snapshot.whole_card_held_models or snapshot.card(None).whole_card_model is not None:
+        return False
+    if pricing.size_tier(snapshot, model) >= ModelSizeTier.EXTRA_LARGE:
+        return False
+    if cold_copy_target(snapshot, job_id) is None:
+        return False
+    comparison = resident_wait_or_cold(snapshot, job_id)
+    if comparison is None or not comparison.cold_starts_sooner:
+        return False
+    payload = snapshot.queue.payloads[job_id]
+    forecast = pricing.forecast_streaming(snapshot, payload, snapshot.services.model_metadata.get_baseline(model))
+    return not forecast.needs_exclusive_residency
+
+
+def duplicate_copy_may_serve(snapshot: SchedulingSnapshot, job_id: str) -> bool:
+    """Whether a second copy of the job's already-resident model may be preloaded.
+
+    On one card a duplicate is waste unless it starts the queue head sooner than its busy resident lane would
+    (:func:`single_card_cold_copy_may_serve`). Across cards the single-copy rule inverts when no eligible copy can
     start the job now: the queued job would otherwise wait a whole sampling window for weights an idle card
     could be given. A copy can start the job only when its lane accepts work and its card can start a job
     (:func:`~pricing.cards_able_to_start_job`): an idle lane beside a sibling sampling on a card capped at one runs
-    nothing until that sibling ends. A duplicate is considered only when the worker routes across cards, at
-    least one eligible copy exists, none of them can start the job, no copy is still loading (a load in flight
-    is about to provide a serving copy), and the copies already held are inside the bound
-    (:func:`duplicate_copies_permitted`) that keeps a burst of one model from taking the whole pool. Whether it
-    lands stays the rest of the ladder's decision.
+    nothing until that sibling ends. A duplicate across cards is considered only when at least one eligible copy
+    exists, none of them can start the job, no copy is still loading (a load in flight is about to provide a
+    serving copy), and the copies already held are inside the bound (:func:`duplicate_copies_permitted`) that
+    keeps a burst of one model from taking the whole pool. Whether it lands stays the rest of the ladder's
+    decision.
     """
     job = snapshot.queue.jobs[job_id]
-    if not snapshot.multi_gpu_routing_active or job.model is None:
+    if job.model is None:
         return False
+    if not snapshot.multi_gpu_routing_active:
+        return single_card_cold_copy_may_serve(snapshot, job_id)
     entry = snapshot.model_map.get(job.model)
     if entry is not None and entry.load_state is ModelLoadState.LOADING:
         return False
@@ -653,10 +770,35 @@ def decide_preload_gates(
         head_job_id: The queue head (see :func:`preload_head`), which alone may escalate to displacing another
             queued model.
         loaded_models: The models already resident or loading (see :func:`loaded_or_loading_models`).
+
+    A single-card cold copy (:func:`single_card_cold_copy_may_serve`) is held to its empty target with no
+    fallback, and any gate that would stop it reads instead as the already-resident exit with no commands. The
+    head keeps its resident lane, and the pass goes on as it would without the copy.
     """
+    gate_plan = _decide_preload_gate_ladder(snapshot, job_id, head_job_id=head_job_id, loaded_models=loaded_models)
+    if not gate_plan.cold_copy or gate_plan.admits:
+        return gate_plan
+    return PreloadGatePlan(
+        decision=AdmissionDecision.ALREADY_LOADED,
+        job_id=job_id,
+        reason=f"model already resident and a cold copy was not loaded ({gate_plan.reason})",
+        target_process_id=None,
+    )
+
+
+def _decide_preload_gate_ladder(
+    snapshot: SchedulingSnapshot,
+    job_id: str,
+    *,
+    head_job_id: str | None,
+    loaded_models: frozenset[str | None],
+) -> PreloadGatePlan:
+    """Run the gate ladder :func:`decide_preload_gates` describes, marking a single-card cold copy's plans."""
     job = snapshot.queue.jobs[job_id]
     if job.model is None:
         raise ValueError(f"job.model is None ({snapshot.queue.payloads[job_id]})")
+    # Set once the already-resident gate has let a single-card copy through. Every plan after it carries the mark.
+    cold_copy = False
 
     def plan(
         decision: AdmissionDecision,
@@ -679,6 +821,7 @@ def decide_preload_gates(
             disallowed_process_ids=disallowed,
             notice=notice,
             records_admission=records_admission,
+            cold_copy=cold_copy,
         )
 
     # An aux-unprepared job must not compete for capacity: staging its model reserves a lane and prices VRAM
@@ -701,8 +844,10 @@ def decide_preload_gates(
         commands = () if job.in_progress else (FaultJob(payload, FaultCause.QUARANTINED, reason),)
         return plan(AdmissionDecision.QUARANTINED, reason, commands=commands)
 
-    if model_loaded_for_job(snapshot, job_id, loaded_models) and not duplicate_copy_may_serve(snapshot, job_id):
+    already_loaded = model_loaded_for_job(snapshot, job_id, loaded_models)
+    if already_loaded and not duplicate_copy_may_serve(snapshot, job_id):
         return plan(AdmissionDecision.ALREADY_LOADED, "model already resident or loading")
+    cold_copy = already_loaded and not snapshot.multi_gpu_routing_active
 
     # Loading a new model routes its weights through system RAM first, so admitting one while the host is
     # already below its danger floor is the OS OOM kill, not progress. The governor's tick has already
@@ -717,14 +862,25 @@ def decide_preload_gates(
             ),
         )
 
-    is_head_blocker = head_job_id is not None and job_id == head_job_id
+    # A cold copy is an optimisation for a head that already has a resident lane, so it never escalates as the
+    # head and takes neither the displacement fallback nor head-priority pricing and reclaim.
+    is_head_blocker = head_job_id is not None and job_id == head_job_id and not cold_copy
     # The commitment joins the plan's disallowed set as well as every selector below, so a target re-selected
     # after admission retired the chosen one is held to it too.
     disallowed = frozenset(preload_disallowed_processes(snapshot, job)) | lanes_committed_elsewhere(
         snapshot, job.model
     )
     admit_reason = "gates passed"
-    target = select_preload_target(snapshot, job_id, disallowed)
+    if cold_copy:
+        comparison = resident_wait_or_cold(snapshot, job_id)
+        if comparison is not None:
+            admit_reason = (
+                f"gates passed (a cold copy starts in {comparison.cold_seconds:.1f}s against "
+                f"{comparison.wait_seconds:.1f}s waiting for the busy resident lane)"
+            )
+        target = cold_copy_target(snapshot, job_id)
+    else:
+        target = select_preload_target(snapshot, job_id, disallowed)
     if target is None and is_head_blocker:
         # Affinity is provisioned against the inference-process ceiling, so with more resident models than
         # running processes it can pin every slot and starve a genuinely queued head. The head must make

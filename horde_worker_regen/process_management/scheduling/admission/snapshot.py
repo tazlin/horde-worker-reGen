@@ -111,6 +111,9 @@ class SlotSnapshot:
     clearance_wait_entered: bool = False
     """Whether the slot is staged and its child has entered its clearance wait for the job it owns, so its
     encode is done and the device-free reading already holds everything it will hold until cleared."""
+    remaining_sampling_seconds: float | None = None
+    """Seconds left in the slot's denoise loop, extrapolated from its step heartbeat, or None while the slot
+    is not sampling or its rate cannot yet be trusted (before its second step and a minimum share of its steps)."""
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,12 @@ class JobSnapshot:
     swap_charge_mb: float | None = None
     """The trusted learned RAM growth (MB) of swapping this checkpoint onto a slot that kept its pages, else
     None. Excludes feature RAM."""
+    resident_overhead_seconds: float | None = None
+    """The learned dispatch-to-first-step seconds for the job's signature on a lane already holding its model in
+    VRAM, or None until the performance model has enough observations (or none is wired)."""
+    cold_overhead_seconds: float | None = None
+    """The learned dispatch-to-first-step seconds for the job's signature on a lane not holding its model in VRAM,
+    or None until the performance model has enough observations (or none is wired)."""
 
 
 @dataclass(frozen=True)
@@ -423,6 +432,7 @@ def snapshot_slot(
     now: float,
     reserved_for_disaggregation: bool = False,
     checkpoint_models_held: frozenset[str] = frozenset(),
+    remaining_sampling_seconds: float | None = None,
 ) -> SlotSnapshot:
     """Freeze one process record, answering weight residency through the model map for the models it names."""
     job = process_info.current_inference_job()
@@ -462,6 +472,7 @@ def snapshot_slot(
         checkpoint_models_held=checkpoint_models_held,
         staged_short_of_sampling=process_info.is_staged_short_of_sampling(),
         clearance_wait_entered=process_info.is_waiting_on_clearance(),
+        remaining_sampling_seconds=remaining_sampling_seconds,
     )
 
 
@@ -560,12 +571,15 @@ def build_scheduling_snapshot(
     post_processing_lane_card_index: int | None,
     pending_post_processing_reserve_mb: float,
     ledgers: LedgerViews,
+    remaining_sampling_seconds: Callable[[HordeProcessInfo], float | None] | None = None,
+    dispatch_overhead_seconds: Callable[[ImageGenerateJobPopResponse, bool], float | None] | None = None,
 ) -> SchedulingSnapshot:
     """Freeze the worker for one cycle.
 
     Takes the collaborators explicitly so the builder is testable without a scheduler; the scheduler's
     ``snapshot`` method is the one production caller and supplies its own accessors for the per-card
-    measurements.
+    measurements. ``remaining_sampling_seconds`` and ``dispatch_overhead_seconds`` (job, resident at dispatch) are
+    optional. Without them every slot and job carries None for those figures.
     """
     multi_gpu = len(card_runtimes) > 1
     card_keys: list[int | None] = [None]
@@ -645,6 +659,12 @@ def build_scheduling_snapshot(
             staging_charge_mb=staging_charge_mb(job),
             feature_ram_mb=feature_ram_mb(job),
             swap_charge_mb=swap_charge_mb(job),
+            resident_overhead_seconds=(
+                dispatch_overhead_seconds(job, True) if dispatch_overhead_seconds is not None else None
+            ),
+            cold_overhead_seconds=dispatch_overhead_seconds(job, False)
+            if dispatch_overhead_seconds is not None
+            else None,
         )
         (in_progress_ids if is_in_progress else pending_ids).append(key)
 
@@ -681,6 +701,9 @@ def build_scheduling_snapshot(
                 now=now,
                 reserved_for_disaggregation=process_map.is_reserved_for_disaggregation(process_id),
                 checkpoint_models_held=checkpoint_models_held(process_id),
+                remaining_sampling_seconds=(
+                    remaining_sampling_seconds(info) if remaining_sampling_seconds is not None else None
+                ),
             )
             for process_id, info in sorted(process_map.items())
         },

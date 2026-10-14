@@ -22,6 +22,7 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot, snapshot_slot
+from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel, signature_from_job
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
@@ -93,6 +94,14 @@ class TestSlotSnapshot:
 
         process_info.note_clearance_wait_entered(ownership.recorded_at + 1.0)
         assert snapshot_slot(process_info, model_map, now=1_000.0).clearance_wait_entered is True
+
+    def test_remaining_sampling_seconds_is_carried_as_given(self) -> None:
+        """The builder supplies the figure, and a slot built without one carries None."""
+        process_info = make_mock_process_info(3, model_name="sd", state=HordeProcessState.INFERENCE_STARTING)
+        model_map = HordeModelMap(root={})
+        assert snapshot_slot(process_info, model_map, now=1_000.0).remaining_sampling_seconds is None
+        slot = snapshot_slot(process_info, model_map, now=1_000.0, remaining_sampling_seconds=12.5)
+        assert slot.remaining_sampling_seconds == 12.5
 
     def test_a_pinned_sampler_is_marked_reserved(self) -> None:
         """The disaggregation pin is read from the process map, not the record."""
@@ -245,6 +254,55 @@ class TestSchedulingSnapshot:
 
         assert set(snapshot.cards) == {None, 0, 1}
         assert snapshot.card_count == 2
+
+    async def test_a_sampling_slot_carries_its_remaining_seconds_and_an_idle_one_none(self) -> None:
+        """The sampling slot's figure is its step rate over the steps it has left. The idle slot has none."""
+        _initial, scheduler = await self._scheduler()
+        busy = scheduler._process_map[1]  # type: ignore[attr-defined]
+        busy.last_total_steps = 30
+        busy.last_current_step = 10
+        busy.current_first_step_at = 1_000.0 - 20.0
+        idle = scheduler._process_map[0]  # type: ignore[attr-defined]
+        idle.last_total_steps = 30
+        idle.last_current_step = 10
+        idle.current_first_step_at = 1_000.0 - 20.0
+
+        snapshot = scheduler.snapshot()  # type: ignore[attr-defined]
+
+        assert snapshot.slots[1].remaining_sampling_seconds == pytest.approx(40.0)
+        assert snapshot.slots[0].remaining_sampling_seconds is None, "step fields outlive their job"
+
+    async def test_dispatch_overheads_come_from_the_performance_model_by_signature(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Each queued job carries the learned resident and cold overheads, and None without a model or samples."""
+        snapshot, scheduler = await self._scheduler()
+        monkeypatch.setattr(
+            scheduler._model_metadata,  # type: ignore[attr-defined]
+            "get_baseline",
+            lambda _model: "stable_diffusion_xl",
+        )
+        head_id = snapshot.queue.head()
+        assert head_id is not None
+        assert snapshot.queue.jobs[head_id].resident_overhead_seconds is None
+        assert snapshot.queue.jobs[head_id].cold_overhead_seconds is None
+
+        performance_model = PerformanceModel()
+        scheduler._performance_model = performance_model  # type: ignore[attr-defined]
+        head = snapshot.queue.payloads[head_id]
+        baseline = scheduler._model_metadata.get_baseline(head.model)  # type: ignore[attr-defined]
+        signature = signature_from_job(head, str(baseline) if baseline is not None else None)
+        assert signature is not None
+        assert scheduler.snapshot().queue.jobs[head_id].cold_overhead_seconds is None, "no samples yet"  # type: ignore[attr-defined]
+        for _ in range(5):
+            performance_model.observe_overhead(signature, 2.0, resident=True)
+            performance_model.observe_overhead(signature, 6.0, resident=False)
+
+        learned = scheduler.snapshot().queue.jobs[head_id]  # type: ignore[attr-defined]
+
+        assert learned.resident_overhead_seconds == 2.0
+        assert learned.cold_overhead_seconds == 6.0
 
     async def test_one_card_counts_as_one_card(self) -> None:
         """Card-agnostic routing still reports a card, so a per-card bound stays a number rather than zero."""
