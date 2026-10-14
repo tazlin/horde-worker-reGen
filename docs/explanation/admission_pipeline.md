@@ -222,7 +222,11 @@ and the placement-order walk resumes through the same cross-card path, seating w
 now. The withheld job keeps its queue position and its gate keeps its clocks; it is simply not offered again
 until the next cycle re-asks its gate, and the card it was aimed at is excluded for the rest of the cycle on
 the same ground as the head's own. The exclusion is discarded in `begin_scheduling_cycle` and never persists.
-On one card the resumed walk has no other card to offer, so a withheld head ends the loop exactly as before.
+On one card the resumed walk has no other card to offer, so a withheld head ends the loop exactly as before,
+with two exceptions: work that fits beside the post-processing lane's chain, and a rung-1 run's job on the lane
+holding its weights when the head is withheld for residency. The walk's bound is the decline record itself: a
+selection that offers a job the cycle has already declined ends the loop, so a cached pair that outlives its
+decline costs a stalled tick the starvation backstops break, never a loop with no exit inside one tick.
 
 The decline record is what the dispatch-stall explainer reads before reporting an unexplained stall, so a
 parked head names the gate that withheld it. Each gate takes a `SlotDutyBucket` member, which is the same

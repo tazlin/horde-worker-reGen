@@ -13624,8 +13624,16 @@ class InferenceScheduler:
             if withheld is None:
                 await self._commit_dispatch(next_job_and_process)
                 return True
+            if withheld.job_id in self._dispatch_holds.cycle_declines:
+                # The gate has already answered for this job this cycle, so the selection that offered it again
+                # has nothing new to find. Ending the walk here keeps a selection that outlives its decline a
+                # stalled tick that the starvation backstops break, never a loop with no exit.
+                return False
             self._dispatch_holds.note_decline(withheld)
-            if not self._multi_gpu_routing_active and withheld.bucket is not SlotDutyBucket.POST_PROCESSING_DEFER:
+            if not self._multi_gpu_routing_active and withheld.bucket not in (
+                SlotDutyBucket.POST_PROCESSING_DEFER,
+                SlotDutyBucket.RESIDENCY_RECONCILIATION,
+            ):
                 return False
             next_job_and_process = await self.get_next_job_and_process()
 
