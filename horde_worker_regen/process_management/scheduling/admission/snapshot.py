@@ -281,6 +281,9 @@ class DispatchHoldView:
     clearance_hold_ids: frozenset[str]
     clearance_granted_ids: frozenset[str] = frozenset()
     """In-progress jobs the clearance gate has granted their load-and-sample window."""
+    closable_holds: frozenset[str] = frozenset()
+    """Held jobs whose latest room breakdown the permitted reclaim rungs cover (``room_closable``), so the hold
+    releases once that reclaim lands rather than waiting on the probe or on foreign VRAM."""
 
 
 @dataclass(frozen=True)
@@ -488,6 +491,11 @@ def snapshot_ledgers(
             pp_defer_holds=frozenset(dispatch_holds.pp_defer_holds),
             clearance_hold_ids=frozenset(dispatch_holds.clearance_hold_ids),
             clearance_granted_ids=frozenset(dispatch_holds.clearance_granted_ids),
+            closable_holds=frozenset(
+                job_id
+                for job_id in dispatch_holds.hold_since
+                if dispatch_holds.room_inputs.get(job_id, {}).get("room_closable") is True
+            ),
         ),
         retention=RetentionView(
             wddm_paging_active=retention.wddm_paging_active,

@@ -655,6 +655,13 @@ lane at full progress has released its slot and is decoding. The clearance and t
 holds an extra-large head under the pairing rule or keeps the full price on the memory verdict. The scheduler
 logs once per session on a card that the headway is not applied, so a reader of the `overlap_headway` slot-duty bucket can tell that its zero
 share means the gate stood aside. With the lease off or two-phase off, the headway applies as described above.
+Under the lease with two-phase off, the headway and the staging charge leave out a dispatched job that is still
+waiting for its clearance grant: its lane holds no sampling slot, the clearance admission has held the job for
+less than the lease-acquire timeout, and it reports no progress. Such a job has not started loading or sampling,
+and it may be waiting for room an idle lane holds for the next job. A headway read at its zero progress would hold
+that next job behind it until the lease-acquire timeout. A lane held past that timeout has sampled through it
+unpriced, and a lane reporting progress is in its denoise loop, so both are read as running samplers whatever the
+grant record says. Without the lease every in-flight job is read.
 
 The required headway is finally scaled by the worker's performance mode
 (`performance_mode_headway_scale`): high-performance mode multiplies it by `0.5` and moderate-performance
@@ -862,8 +869,10 @@ can statically afford that copy alongside the head-of-queue job's sampling peak;
 coexist, keeping the copy warm would force silent driver demand-paging during sampling, which costs far more
 than the one reload the protection saves. A ready seat outranks both: an idle lane holding the model a pending
 job will start on this cycle keeps its copy, since unloading it only for the job to reload it a tick later is the
-worst exchange the sweep can make. The head escalation keeps only the head's own seat, and a job a dispatch gate
-is holding claims none. One rule owns all of this
+worst exchange the sweep can make. The head escalation keeps only the head's own seat. A job the post-processing
+gate is holding claims none, and neither does a job held on room the permitted reclaim rungs cannot close, since
+neither will start whatever its lane holds. A job held on room the rungs can close keeps its seat, because the
+sweep that frees that room is what would otherwise take its copy. One rule owns all of this
 ([`sweep_spares_idle_copy`][horde_worker_regen.process_management.scheduling.admission.pricing.sweep_spares_idle_copy]).
 
 Underneath the scheduler's retention lever sits ComfyUI's own model management. ComfyUI's *smart memory*

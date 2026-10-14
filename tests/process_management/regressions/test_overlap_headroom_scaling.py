@@ -18,6 +18,7 @@ relaxes to admit and only the temporal guard applies.
 from __future__ import annotations
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -120,6 +121,16 @@ async def _running(job_tracker: JobTracker, model: str, *, n_iter: int = 1):  # 
 def _pin_progress(monkeypatch: pytest.MonkeyPatch, scheduler, fraction: float) -> None:  # noqa: ANN001
     """Pin the in-flight job's sampling progress fraction."""
     monkeypatch.setattr(scheduler, "_in_flight_progress_fraction", lambda job: fraction)
+
+
+def _hold_for_clearance(
+    scheduler: InferenceScheduler,
+    job: ImageGenerateJobPopResponse,
+    *,
+    held_for_seconds: float,
+) -> None:
+    """Record that the clearance admission has held ``job`` for ``held_for_seconds`` on the scheduler's clock."""
+    scheduler._clearance_held_since[str(job.id_)] = scheduler._clock() - held_for_seconds
 
 
 _BOTH_HEAVY = {_HEAVY_A: ModelSizeTier.HEAVY, _HEAVY_B: ModelSizeTier.HEAVY}
@@ -522,13 +533,17 @@ class TestOverlapPricesWhatALeasedDispatchPutsOnTheCard:
         two_phase: bool,
         sibling_holds_slot: bool,
     ) -> InferenceScheduler:
-        """The leased scheduler beside a second dispatched job on lane 2 that has not entered its denoise loop."""
+        """The leased scheduler beside a second dispatched job on lane 2 that has not entered its denoise loop.
+
+        The clearance admission is holding the sibling's job inside the lease-acquire timeout.
+        """
         scheduler = await self._leased_scheduler(job_tracker, monkeypatch, lease=True, remaining_seconds=5.0)
         scheduler._runtime_config.bridge_data.gpu_sampling_lease_two_phase = two_phase
         sibling_job = await _running(job_tracker, _HEAVY_A)
         sibling_lane = scheduler._process_map[2]
         sibling_lane.record_inference_ownership(sibling_job, attempt_ordinal=1)
         sibling_lane.last_process_state = HordeProcessState.INFERENCE_PRIMED
+        _hold_for_clearance(scheduler, sibling_job, held_for_seconds=0.0)
         scheduler.set_sampling_slot_provider(
             lambda process_info: sibling_holds_slot or process_info.process_id != sibling_lane.process_id
         )
@@ -537,7 +552,7 @@ class TestOverlapPricesWhatALeasedDispatchPutsOnTheCard:
     async def test_under_two_phase_a_staged_sibling_leaves_the_staging_charge(
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A staged lane holds no sampling slot, so it is not a running sampler whose hand-over time is unknown."""
+        """A staged lane the admission holds has no slot, so it is not a sampler with an unknown hand-over time."""
         scheduler = await self._with_sibling_on_lane_two(
             job_tracker, monkeypatch, two_phase=True, sibling_holds_slot=False
         )
@@ -554,15 +569,19 @@ class TestOverlapPricesWhatALeasedDispatchPutsOnTheCard:
 
         assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
 
-    async def test_without_two_phase_a_staged_sibling_keeps_the_full_price(
+    async def test_under_the_single_phase_lease_a_sibling_the_admission_holds_leaves_the_staging_charge(
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """CONTROL: single-phase dispatch is the load-and-sample window, so every in-flight job is in the set."""
+        """A lane the clearance admission is holding for its grant is not a sampler with an unknown hand-over time.
+
+        Its load-and-sample window has not opened, so its booking at clearance prices it instead of the running
+        set.
+        """
         scheduler = await self._with_sibling_on_lane_two(
             job_tracker, monkeypatch, two_phase=False, sibling_holds_slot=False
         )
 
-        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0) is False
+        assert scheduler._overlap_memory_verdict(make_job_pop_response(model=_HEAVY_B), target_device_index=0)
 
 
 class TestTwoPhaseRunningSetIsTheSamplingLanes:
@@ -616,3 +635,130 @@ class TestTwoPhaseRunningSetIsTheSamplingLanes:
         scheduler = await self._extra_large_on_lane_one(job_tracker, monkeypatch, two_phase=False, steps_done=20)
 
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE_OTHER)) is False
+
+
+class TestSinglePhaseRunningSetIsTheGrantedLanes:
+    """Under the single-phase lease a lane the clearance admission is holding for its grant is not a running sampler.
+
+    Such a job has not opened its load-and-sample window. It may be waiting for room an idle lane holds for the
+    next job, so counting it as a sampler at zero progress would hold that next job behind it until the
+    lease-acquire timeout. The exclusion lasts only while the admission's hold is inside that timeout and the job
+    reports no progress: past the timeout the child samples unpriced, a job reporting progress is in its denoise
+    loop, and a lane the admission has not held has had nothing withhold its grant, so each is a running sampler.
+    """
+
+    async def _two_dispatched_lanes(
+        self,
+        job_tracker: JobTracker,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        lease: bool,
+        waiting_lane_granted: bool,
+        held_for_seconds: float | None = 0.0,
+    ) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse]:
+        """Return a single-phase scheduler with a granted job on lane 1 and a second dispatched job on lane 2.
+
+        The clearance admission has held lane 2's job for ``held_for_seconds``, or has not held it when None.
+        """
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
+        scheduler._runtime_config.bridge_data.gpu_sampling_lease_enabled = lease
+        scheduler._runtime_config.bridge_data.gpu_sampling_lease_two_phase = False
+        granted_job = await _running(job_tracker, _HEAVY_A)
+        granted_lane = scheduler._process_map[1]
+        granted_lane.record_inference_ownership(granted_job, attempt_ordinal=1)
+        granted_lane.last_process_state = HordeProcessState.INFERENCE_STARTING
+        waiting_job = await _running(job_tracker, _HEAVY_B)
+        waiting_lane = scheduler._process_map[2]
+        waiting_lane.record_inference_ownership(waiting_job, attempt_ordinal=1)
+        waiting_lane.last_process_state = HordeProcessState.INFERENCE_PRIMED
+        if held_for_seconds is not None:
+            _hold_for_clearance(scheduler, waiting_job, held_for_seconds=held_for_seconds)
+        scheduler.set_sampling_slot_provider(
+            lambda process_info: waiting_lane_granted or process_info.process_id != waiting_lane.process_id
+        )
+        return scheduler, granted_job, waiting_job
+
+    async def test_a_job_the_admission_holds_is_not_a_running_sampler(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lane the admission holds for its grant is left out, and the granted lane is kept."""
+        scheduler, granted_job, _waiting_job = await self._two_dispatched_lanes(
+            job_tracker, monkeypatch, lease=True, waiting_lane_granted=False
+        )
+
+        assert scheduler._running_sampler_jobs(None) == (granted_job,)
+
+    async def test_a_held_job_past_the_acquire_timeout_is_a_running_sampler(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A job held as long as the lease-acquire timeout samples unpriced, so its lane is in the running set."""
+        scheduler, granted_job, waiting_job = await self._two_dispatched_lanes(
+            job_tracker,
+            monkeypatch,
+            lease=True,
+            waiting_lane_granted=False,
+            held_for_seconds=CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
+        )
+
+        assert scheduler._running_sampler_jobs(None) == (granted_job, waiting_job)
+
+    async def test_a_held_job_reporting_progress_is_a_running_sampler(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A held job whose lane reports a denoise step is inside its loop, so it is in the running set."""
+        scheduler, granted_job, waiting_job = await self._two_dispatched_lanes(
+            job_tracker, monkeypatch, lease=True, waiting_lane_granted=False
+        )
+        waiting_lane = scheduler._process_map[2]
+        waiting_lane.last_total_steps = 20
+        waiting_lane.last_current_step = 1
+        assert scheduler._in_flight_progress_fraction(waiting_job) > 0.0, "precondition: the held job reports progress"
+
+        assert scheduler._running_sampler_jobs(None) == (granted_job, waiting_job)
+
+    async def test_a_job_the_admission_has_not_held_is_a_running_sampler(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lane with no grant on record that nothing has withheld a grant from is in the running set."""
+        scheduler, granted_job, waiting_job = await self._two_dispatched_lanes(
+            job_tracker, monkeypatch, lease=True, waiting_lane_granted=False, held_for_seconds=None
+        )
+
+        assert scheduler._running_sampler_jobs(None) == (granted_job, waiting_job)
+
+    async def test_a_dispatched_job_with_a_grant_is_a_running_sampler(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once its grant is on record the lane's job is in the running set."""
+        scheduler, granted_job, waiting_job = await self._two_dispatched_lanes(
+            job_tracker, monkeypatch, lease=True, waiting_lane_granted=True
+        )
+
+        assert scheduler._running_sampler_jobs(None) == (granted_job, waiting_job)
+
+    async def test_without_the_lease_every_in_flight_job_is_a_running_sampler(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: without the lease the dispatch opens the window, so no grant is asked."""
+        scheduler, granted_job, waiting_job = await self._two_dispatched_lanes(
+            job_tracker, monkeypatch, lease=False, waiting_lane_granted=False
+        )
+
+        assert scheduler._running_sampler_jobs(None) == (granted_job, waiting_job)
+
+    async def test_a_job_waiting_for_its_grant_does_not_hold_a_later_job_on_headway(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With only a job the admission holds in flight, a later heavy job is not held behind its zero progress."""
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
+        scheduler._runtime_config.bridge_data.gpu_sampling_lease_enabled = True
+        scheduler._runtime_config.bridge_data.gpu_sampling_lease_two_phase = False
+        waiting_job = await _running(job_tracker, _HEAVY_A)
+        waiting_lane = scheduler._process_map[1]
+        waiting_lane.record_inference_ownership(waiting_job, attempt_ordinal=1)
+        waiting_lane.last_process_state = HordeProcessState.INFERENCE_PRIMED
+        _hold_for_clearance(scheduler, waiting_job, held_for_seconds=0.0)
+        scheduler.set_sampling_slot_provider(lambda process_info: process_info.process_id != waiting_lane.process_id)
+        _pin_progress(monkeypatch, scheduler, 0.0)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is True

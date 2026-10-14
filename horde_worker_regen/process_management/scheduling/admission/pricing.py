@@ -788,9 +788,11 @@ def ready_seat_process_ids(snapshot: SchedulingSnapshot, claimants: Iterable[str
     and sits where that job may run and a job can start now (:func:`cards_able_to_start_job`), which on a
     multi-GPU host is a card eligible for the job and otherwise the worker. Dispatch runs after the preload pass
     in the same cycle and seats that job at once. Jobs awaiting auxiliary preparation are invisible to dispatch and
-    claim no seat, and so are jobs a dispatch gate is holding (a residency hold or the post-processing hold), which
-    will not start this cycle whatever their lane holds. ``claimants`` restricts the jobs that may claim a seat, and
-    None lets every pending job claim one.
+    claim no seat, and so are jobs a dispatch gate is holding with no reclaim able to release them (a room hold
+    the permitted rungs cannot close, or the post-processing hold), which will not start this cycle whatever their
+    lane holds. A job held on room the rungs can close keeps its seat, since the sweep that frees that room would
+    otherwise take the copy the job is about to sample on and the job pays a reload. ``claimants`` restricts the
+    jobs that may claim a seat, and None lets every pending job claim one.
     """
     startable_cards = cards_able_to_start_job(snapshot)
     in_progress = frozenset(snapshot.queue.in_progress)
@@ -801,7 +803,8 @@ def ready_seat_process_ids(snapshot: SchedulingSnapshot, claimants: Iterable[str
         job = snapshot.queue.jobs[job_id]
         if job_id in in_progress or job.model is None or job.requires_aux_preparation:
             continue
-        if job_id in holds.hold_since or job_id in holds.pp_defer_holds:
+        held_without_reclaim = job_id in holds.hold_since and job_id not in holds.closable_holds
+        if held_without_reclaim or job_id in holds.pp_defer_holds:
             continue
         allowed: frozenset[int | None] = (
             frozenset(job.eligible_cards) if snapshot.multi_gpu_routing_active else frozenset({None})

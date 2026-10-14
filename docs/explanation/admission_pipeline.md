@@ -104,7 +104,7 @@ and unlike the displacement guards no fallback overrides it. A preload of the mo
 is that same load. Reclaim declines a lane that owns a dispatched job whatever state it last reported. No eviction,
 cache release or context teardown targets it, and the admission room lists its tenancy as a rung that is not
 permitted, so the ladder moves to the next tenant. A ready seat, an idle lane holding the model of a pending job
-that can start on it this cycle and is not held by a dispatch gate
+that can start on it this cycle and is not held by a dispatch gate that reclaim cannot release
 ([`ready_seat_process_ids`][horde_worker_regen.process_management.scheduling.admission.pricing.ready_seat_process_ids]),
 is committed to that job in the same way. The VRAM sweeps spare it unless the head escalation is clearing room and
 the seat is not the head's own

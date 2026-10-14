@@ -183,6 +183,7 @@ from horde_worker_regen.process_management.scheduling.admission.snapshot import 
     snapshot_ledgers,
 )
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
+    CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS,
     TAIL_OVERLAP_MIN_PROGRESS_FOR_ESTIMATE,
     ActiveSampler,
     ClearanceInputs,
@@ -955,8 +956,8 @@ class InferenceScheduler:
     def set_sampling_slot_provider(self, lane_holds_sampling_slot: Callable[[HordeProcessInfo], bool]) -> None:
         """Register the source of whether an inference lane holds a sampling slot on its card's clearance controller.
 
-        Read by the overlap rule under two-phase clearance to tell a sampling lane from a staged one
-        (:meth:`_running_sampler_jobs`).
+        Read by the overlap rule under the clearance lease to tell a lane in its load-and-sample window from one
+        still waiting for its grant (:meth:`_running_sampler_jobs`).
         """
         self._lane_holds_sampling_slot = lane_holds_sampling_slot
 
@@ -6250,24 +6251,46 @@ class InferenceScheduler:
     def _running_sampler_jobs(self, target_device_index: int | None) -> tuple[ImageGenerateJobPopResponse, ...]:
         """Return the running samplers an overlap onto ``target_device_index`` shares the card with.
 
-        Under two-phase clearance a job is a running sampler while its lane holds a sampling slot and its progress
-        is below 1.0. A staged lane holds no slot until its sample grant, and a lane at full progress has released
-        its slot and is decoding; the clearance and the lease price both. A job no lane owns is kept, since its
-        slot cannot be asked. Without two-phase clearance every in-flight job is one: the dispatch opens the
-        load-and-sample window, and the overlap headway reads each in-flight job's progress.
+        Under the clearance lease a dispatched job still waiting for its grant is not a running sampler
+        (:meth:`_lane_waits_for_its_grant`). It has not opened its load-and-sample window, so it has no progress to
+        read and may be waiting for room a later job's lane holds. Holding that later job behind it would leave
+        both waiting until the lease-acquire timeout. Under two-phase clearance a job at full progress is also
+        excluded, since it has released its slot and is decoding, and the clearance and the lease price both. A job
+        no lane owns is kept, since its slot cannot be asked. Without the lease every in-flight job is one, because
+        the dispatch opens the load-and-sample window and the overlap headway reads each in-flight job's progress.
         """
         in_progress_jobs = tuple(self._overlap_scope_jobs(target_device_index))
-        if not self._two_phase_clearance_active():
+        if not self._clearance_lease_active():
             return in_progress_jobs
+        decoding_lanes_released = self._two_phase_clearance_active()
         running_samplers: list[ImageGenerateJobPopResponse] = []
         for job in in_progress_jobs:
             process_info = self._process_map.process_running_job(job)
-            if process_info is not None and not self._lane_holds_sampling_slot(process_info):
+            if process_info is not None and self._lane_waits_for_its_grant(process_info, job):
                 continue
-            if self._in_flight_progress_fraction(job) >= 1.0:
+            if decoding_lanes_released and self._in_flight_progress_fraction(job) >= 1.0:
                 continue
             running_samplers.append(job)
         return tuple(running_samplers)
+
+    def _lane_waits_for_its_grant(self, process_info: HordeProcessInfo, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``process_info`` is blocked in its clearance acquire for ``job``, with nothing on the card yet.
+
+        A lane holding a sampling slot has its grant. Without one, the lane is waiting only while the clearance
+        admission has held the job (:attr:`_clearance_held_since`) for less than the child's lease-acquire
+        timeout and the job reports no progress. A lane held past that timeout has sampled through it and is
+        loading or sampling unpriced, and one reporting progress is inside its denoise loop, so both are running
+        samplers whatever the grant record says. A dispatched lane the admission has not yet been asked about is
+        not waiting either, since nothing has withheld its grant.
+        """
+        if self._lane_holds_sampling_slot(process_info):
+            return False
+        held_since = self._clearance_held_since.get(str(job.id_)) if job.id_ is not None else None
+        if held_since is None:
+            return False
+        if self._clock() - held_since >= CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS:
+            return False
+        return self._in_flight_progress_fraction(job) <= 0.0
 
     def _running_remaining_sampling_seconds(self, target_device_index: int | None) -> tuple[float | None, ...]:
         """Each running sampler's remaining sampling seconds, None for one that is not inside its denoise loop.
@@ -6294,7 +6317,8 @@ class InferenceScheduler:
         """Whether ``candidate_job`` may start while other jobs are already sampling.
 
         Gathers the running samplers (those on ``target_device_index`` when multi-GPU routing is active, else
-        worker-wide; under two-phase clearance only the lanes that are sampling, see :meth:`_running_sampler_jobs`)
+        worker-wide; under the clearance lease not the lanes still waiting for their grant, see
+        :meth:`_running_sampler_jobs`)
         and defers to :func:`concurrent_overlap_permitted`, with the VRAM arbiter's dispatch verdict as the memory
         answer. No actuations run on a DEFER; reclaim is driven only by the preload path. A blocked job keeps its
         queue position and is re-asked on the next scheduling pass.
