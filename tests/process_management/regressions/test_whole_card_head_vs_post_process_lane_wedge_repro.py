@@ -74,7 +74,7 @@ _NUM_INFERENCE_PROCESSES = 4
 
 
 def _install_flux_forecast_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the head model's weight/footprint/peak so it wants the whole card and does not co-reside."""
+    """Pin the head model's weight/footprint/peak so its forecast fits the card alone and does not co-reside."""
     monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
     monkeypatch.setattr(resource_budget, "predict_job_footprint_mb", lambda job, baseline: _FLUX_FOOTPRINT_MB)
     monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: _FLUX_SAMPLING_PEAK_MB)
@@ -127,6 +127,9 @@ def _build_pp_contended_scheduler(
         safety_on_gpu=True,
         post_process_job_overlap=True,
         image_models_to_load=[_FLUX_MODEL],
+        # The head wants sole residency through the operator's pin. Flux's static seed leaves room beside one
+        # context on a 24 GB card, so the dominance verdict alone holds it below rung 2.
+        whole_card_models=[_FLUX_MODEL],
         max_threads=1,
     )
     scheduler = _make_inference_scheduler(
@@ -514,14 +517,38 @@ class TestReclaimBoundaries:
         scheduler._process_lifecycle.pause_post_process_off_gpu.assert_not_called()
 
     async def test_head_admits_once_lane_vram_has_freed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """After the lane's modules unload and device-free reflects the freed room, the head admits.
+        """After the lane's modules unload and the residency's teardown completes, the head admits.
 
-        This closes the loop: the reclaim is not busywork. Once the measured device-free rises to the
-        after-model-evict figure the head fits into, the same head admits rather than deferring forever.
+        This closes the loop: the reclaim is not busywork. The head is pinned whole-card, so it claims the card
+        however much room the lane's unload leaves and does not fall back to a co-resident admit on a roomy
+        reading. Once the measured device-free has risen to the after-model-evict figure and the idle siblings
+        the residency stops have exited, the same head admits rather than deferring forever.
         """
         _install_flux_forecast_inputs(monkeypatch)
-        scheduler, _process_map, job_tracker, pp_lane = _build_pp_contended_scheduler()
+        scheduler, process_map, job_tracker, pp_lane = _build_pp_contended_scheduler()
         assert pp_lane is not None
+
+        def end_idle_siblings(target: int, **kwargs: object) -> int:
+            """Stop idle unspared inference processes down to ``target``, as the real shrink does."""
+            spared = kwargs.get("spared_process_id")
+            for process_info in process_map.values():
+                if process_map.num_loaded_inference_processes() <= target:
+                    break
+                if (
+                    process_info.process_type is HordeProcessType.INFERENCE
+                    and process_info.process_id != spared
+                    and not process_info.is_process_busy()
+                ):
+                    process_info.last_process_state = HordeProcessState.PROCESS_ENDED
+            return process_map.num_loaded_inference_processes()
+
+        def move_safety_off_gpu(**_kwargs: object) -> bool:
+            """Take the safety context off the card, as the real pause does."""
+            scheduler._process_lifecycle.is_safety_gpu_paused = True
+            return True
+
+        scheduler._process_lifecycle.scale_inference_processes = Mock(side_effect=end_idle_siblings)
+        scheduler._process_lifecycle.pause_safety_on_gpu = Mock(side_effect=move_safety_off_gpu)
         head_job = await _queue_flux_head(job_tracker)
 
         # First pass reclaims the lane and defers.
@@ -537,6 +564,7 @@ class TestReclaimBoundaries:
             scheduler._process_map[pid].vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - _DEVICE_FREE_AFTER_PP_EVICT_MB
 
         admitted = scheduler.preload_models()
+        assert process_map.num_loaded_inference_processes() == 1, "precondition: the residency's teardown completed"
         assert admitted is True, "the head still did not admit after the lane's VRAM was reclaimed"
         assert scheduler._job_tracker.is_admitted_exclusive(head_job) is True
 

@@ -44,8 +44,14 @@ def _permitted(
     )
 
 
-def _running(tier: ModelSizeTier, progress: float, *, batched: bool = False) -> RunningSampler:
-    return RunningSampler(tier=tier, batched=batched, progress_fraction=progress)
+def _running(
+    tier: ModelSizeTier,
+    progress: float,
+    *,
+    batched: bool = False,
+    pair_fits: bool = True,
+) -> RunningSampler:
+    return RunningSampler(tier=tier, batched=batched, progress_fraction=progress, pair_fits=pair_fits)
 
 
 class TestHardBlocks:
@@ -57,12 +63,18 @@ class TestHardBlocks:
         assert _permitted(verdict=verdict) is True
         assert verdict.calls == 0
 
-    def test_two_extra_large_jobs_never_share_without_consulting_memory(self) -> None:
-        """An extra-large candidate never joins an extra-large sampler, whatever the memory answer."""
+    def test_a_pairing_the_dominance_arithmetic_refuses_never_shares(self) -> None:
+        """A pairing with a dominant side that leaves no room is refused before the memory question is asked."""
         verdict = _Verdict(True)
-        running = (_running(ModelSizeTier.EXTRA_LARGE, 1.0),)
-        assert _permitted(candidate_tier=ModelSizeTier.EXTRA_LARGE, running=running, verdict=verdict) is False
+        running = (_running(ModelSizeTier.HEAVY, 1.0, pair_fits=False),)
+        assert _permitted(candidate_tier=ModelSizeTier.LIGHT, running=running, verdict=verdict) is False
         assert verdict.calls == 0
+
+    def test_two_extra_large_jobs_share_where_the_arithmetic_fits_and_room_is_confirmed(self) -> None:
+        """The size tier alone keeps no two extra-large models apart. The pairing arithmetic and the arbiter decide."""
+        running = (_running(ModelSizeTier.EXTRA_LARGE, 1.0),)
+        assert _permitted(candidate_tier=ModelSizeTier.EXTRA_LARGE, running=running, verdict=_Verdict(True)) is True
+        assert _permitted(candidate_tier=ModelSizeTier.EXTRA_LARGE, running=running, verdict=_Verdict(None)) is False
 
     def test_extra_large_candidate_joins_only_on_confirmed_room(self) -> None:
         """An extra-large candidate joins a smaller sampler only when the arbiter confirms the priced pairing."""
@@ -177,9 +189,9 @@ class TestHeadwayPricedByClearance:
         running = (_running(ModelSizeTier.HEAVY, 0.0),)
         assert _permitted(running=running, verdict=_Verdict(None)) is False
 
-    def test_two_extra_large_jobs_are_still_never_paired(self) -> None:
-        """The extra-large pairing rule holds whatever prices the load."""
-        running = (_running(ModelSizeTier.EXTRA_LARGE, 1.0),)
+    def test_a_refused_pairing_is_still_never_paired(self) -> None:
+        """The dominance pairing rule holds whatever prices the load."""
+        running = (_running(ModelSizeTier.EXTRA_LARGE, 1.0, pair_fits=False),)
         assert (
             _permitted(
                 candidate_tier=ModelSizeTier.EXTRA_LARGE,

@@ -303,13 +303,21 @@ class StreamForecast:
     the first-context overhead), so an unmeasured host never re-charges the one-time runtime cost per extra
     context."""
     wants_whole_card: bool = False
-    """The baseline is declared to want sole residency regardless of how its weight estimate happens to fit.
+    """The card's dominance verdict demands sole residency for this model, or the operator pinned it.
 
-    Some baselines (Cascade/Flux/Qwen/Z-Image: the ``EXTRA_LARGE`` tier) are known to behave badly sharing the
-    card even when a conservative weight seed reads as comfortably co-resident, so the scheduler treats them as
-    whole-card models on intent rather than waiting for the weight estimate to cross a knife-edge VRAM
-    threshold. This only *biases toward* sole residency (see :attr:`needs_exclusive_residency`); it never makes
-    an un-loadable model loadable, since the ``fits_alone`` guard still applies."""
+    The verdict is rung 2 of the card's dominance ladder, where the model's sampling peak beside one sibling
+    context, with the foreign floor and the admission margin charged, exceeds the card. It is a property of the
+    card, the offered set, the learned footprints and the floor, computed by the scheduler and passed in, so the
+    forecast never decides it from a tier or a name. It grants the teardown (see :attr:`needs_exclusive_residency`) and
+    never makes an un-loadable model loadable, since the ``fits_alone`` guard still applies."""
+    whole_card_tier: bool = False
+    """Whether the model is in the ``EXTRA_LARGE`` size tier.
+
+    Read by the policy questions that key on the tier (:attr:`is_card_demanding`) and by the residency note
+    that names a tier model the dominance verdict releases. It grants no residency."""
+    sampling_peak_observations: int = 0
+    """How many observations back the sampling peak the dominance verdict priced this model at. Zero when the
+    verdict priced it from the static seed."""
 
     base_reserve_mb: float | None = None
     """The weight-fit floor: ComfyUI's own inference-reserve streaming threshold (``minimum_inference_memory``).
@@ -332,24 +340,22 @@ class StreamForecast:
     as ``footprint_mb``; None until the store has enough observations to answer.
 
     Distinct from the raise-only overlay already folded into ``footprint_mb``, and it does not replace it:
-    the static seeds still govern every fit decision. Its one job is to let a ``wants_whole_card`` baseline
-    give up its sole-residency claim on evidence (see :attr:`needs_exclusive_residency`), because a seed can
-    over-state a model by gigabytes and reserve a whole card for nothing."""
+    the static seeds still govern every fit decision. The figure decides nothing and is carried so a dispatch
+    hold can record the resident evidence the worker had for the model."""
     measured_observation_count: int = 0
     """How many observations back ``measured_footprint_mb``, so a residency verdict can be logged with the
     weight of the evidence behind it. Zero when there is no measured figure."""
     admission_noise_mb: float = 0.0
-    """The admission identity's noise buffer (MB) for this card. The alone frame is judged net of it so a
-    whole-card claim is retired only when the measured admission that will later price the dispatch would
-    admit the model beside a sibling context; zero keeps the pre-noise arithmetic for a directly-constructed
-    forecast."""
+    """The admission identity's noise buffer (MB) for this card. The alone frame a sole-residency job is priced
+    in is judged net of it, as the measured admission that later prices the dispatch is. Zero keeps the
+    pre-noise arithmetic for a directly-constructed forecast."""
     unpausable_tenancy_mb: float = 0.0
     """Device tenancy (MB) no sole-residency teardown returns: the sustained foreign floor and any lane with
     no off-GPU actuator. ``free_if_alone`` assumes every other tenant gone; this is what stays, so the alone
-    frame subtracts it before deciding a whole-card claim can be retired."""
+    frame a sole-residency job is priced in subtracts it."""
     whole_card_pinned: bool = False
-    """Whether the operator pinned this model as whole-card (``whole_card_models``), which keeps the claim
-    against any measured retirement."""
+    """Whether the operator pinned this model as whole-card (``whole_card_models``), an override that grants
+    the residency whatever the dominance verdict reads."""
 
     unreclaimable_charge_mb: float = 0.0
     """The share of the ``free_after_model_evict_mb`` deduction that stopping idle inference siblings cannot
@@ -437,27 +443,6 @@ class StreamForecast:
         return not self._fits_peak(self_plus_one_sibling)
 
     @property
-    def _persistent_weights_dominant(self) -> bool:
-        """Whether the *persistent* weights leave no room for even one sibling context (a sole-residency model).
-
-        The persistent-footprint counterpart to :attr:`_weights_dominant`: it decides whether a (non-whole-card-
-        intent) model needs *sole* residency, so stopping siblings down to one process is the only fit. Keyed on
-        ``_fits_weights`` (weights + bounded floor) against the same sole-occupancy-plus-one-sibling-context
-        ceiling, so a transient activation spike never forces a process teardown: a moderate-weight model whose
-        weights *do* fit beside a context is instead left to co-reside (evicting a sibling model) or, if the live
-        contexts over-commit its weights, to a *partial* reduction via :attr:`needs_process_count_reduction`
-        (which keeps the surviving contexts rather than collapsing to one). Only a model whose persistent weights
-        genuinely fill the card reads dominant here. Defaults True when the card cannot be sized, matching
-        :attr:`_weights_dominant`.
-        """
-        if self.total_vram_mb is None or self.per_process_overhead_mb <= 0:
-            return True
-        self_plus_one_sibling = (
-            self.total_vram_mb - self.per_process_overhead_mb - self._effective_marginal_overhead_mb
-        )
-        return not self._fits_weights(self_plus_one_sibling)
-
-    @property
     def _has_room_for_coresident_model(self) -> bool:
         """Whether sole-residency free VRAM holds another full model beside these weights (a genuinely roomy card).
 
@@ -498,47 +483,23 @@ class StreamForecast:
 
     @property
     def _residency_is_intent_driven(self) -> bool:
-        """Whether the sole-residency claim comes from the baseline's declared intent rather than its weights.
+        """Whether the card's dominance verdict or the operator's pin demands sole residency for this model.
 
-        The exact predicate :attr:`needs_exclusive_residency`'s first branch grants on, shared so the verdict
-        text and the grant can never drift apart. It is a property of the declaration and the room question,
-        not of the instantaneous free reading: a whole-card baseline claims the card for the same reason
-        whether the card currently reads full or empty.
+        The one predicate :attr:`needs_exclusive_residency` grants on, shared so the verdict text and the grant
+        can never drift apart. It is a property of the card's configuration and its measured footprints, so a
+        rung-2 model claims the card for the same reason whether the card currently reads full or empty.
         """
-        if self.wants_whole_card and self.whole_card_pinned:
-            return True
-        return (
-            self.wants_whole_card
-            and not self._has_room_for_coresident_model
-            and not self.measured_retires_whole_card_intent
-        )
+        return self.wants_whole_card or self.whole_card_pinned
 
     @property
     def measured_retires_whole_card_intent(self) -> bool:
-        """Whether measurement has disproved this whole-card-intent model's need for the device.
+        """Whether a tier model is released from sole residency by a measured sampling peak.
 
-        ``wants_whole_card`` is a statement about a baseline, made before any of this worker's hardware was
-        measured, and :attr:`_has_room_for_coresident_model` judges it against a static seed that can
-        over-state the model by gigabytes. Where the store has actually watched the checkpoint run, that
-        seed is no longer the best evidence available: the test becomes whether the *measured*, margined
-        resident cost leaves the card room for another process's context at sole residency. It does not
-        promise room for a whole sibling model (the seed-based floor's much stronger claim); it only says
-        the card is not full, which is the entire premise of tearing the siblings down.
-
-        The alone frame is taken net of the admission noise buffer and the tenancy no teardown returns
-        (:attr:`admission_noise_mb`, :attr:`unpausable_tenancy_mb`), because the dispatch that follows is priced
-        by the measured admission, which charges both; retiring the claim on a frame the admission does not
-        share leaves the siblings standing while the dispatch is refused for the room they hold.
-
-        False without a measured figure or without a sized card, so an unmeasured or unsizable case keeps
-        the declared intent exactly as before.
+        True when the model is in the ``EXTRA_LARGE`` tier, the card's dominance verdict, priced from a measured
+        sampling peak, does not place it on rung 2, and no pin overrides that. The residency note names the
+        release, since the tier alone would suggest a whole-card model. The property decides nothing.
         """
-        if self.whole_card_pinned:
-            return False
-        measured_mb = self.measured_footprint_mb
-        if measured_mb is None or self.free_if_alone_mb is None:
-            return False
-        return (self._free_if_alone_measured_mb - measured_mb) >= self._effective_marginal_overhead_mb
+        return self.whole_card_tier and not self._residency_is_intent_driven and self.sampling_peak_observations > 0
 
     @property
     def fits_coresident(self) -> bool:
@@ -597,35 +558,18 @@ class StreamForecast:
 
     @property
     def needs_exclusive_residency(self) -> bool:
-        """Streams co-resident, fits alone, and cannot usefully share the card: give it the whole device.
+        """Fits alone and cannot sample beside one sibling context: give it the whole device.
 
-        The grant rests on two different "room" questions, one per branch, neither keyed on the transient
-        activation peak:
-
-        - **Whole-card-intent models** (``wants_whole_card``, the EXTRA_LARGE tier) prefer the card to
-          themselves, so they reserve it *unless* there is room for another full model to co-reside
-          (:attr:`_has_room_for_coresident_model`). On a genuinely roomy card (Flux fp8 on 24 GB) they co-reside
-          like any other model; the "never shares well" contract is then upheld by the concurrency overlap gate
-          (no co-*sampling*), not by reserving the device, which where the budget shows ample room only churns it.
-          Once the checkpoint has been measured enough times, :attr:`measured_retires_whole_card_intent`
-          answers the same room question from the measurement instead of the seed, so a seed that over-states
-          the model stops reserving a card the hardware shows is not full.
-        - **Ordinary models** co-reside by default and need *sole* residency only when their persistent weights
-          are too heavy to fit beside even one sibling context (:attr:`_persistent_weights_dominant`). A
-          moderate-weight model with a large transient activation estimate (a 4.9 GB SDXL at a big batch) never
-          trips this: its weights leave ample room, so the spike is absorbed by evicting a sibling *model* and
-          sampling under the over-budget step grace. If the live contexts over-commit the weights, the *partial*
-          :attr:`needs_process_count_reduction` (which keeps the surviving contexts rather than collapsing to one)
-          covers that instead.
+        The grant is rung 2 of the card's dominance verdict (:attr:`wants_whole_card`) or the operator's pin. A
+        model on rung 1 (no other offered model can sample beside it, yet it samples beside a context) is never
+        demanded the teardown, since stopping contexts buys it nothing it lacks. A model whose live contexts
+        over-commit its weights takes the *partial* :attr:`needs_process_count_reduction` instead, which keeps the
+        surviving contexts rather than collapsing to one.
 
         ``fits_alone`` still gates the whole property, so a model that cannot be served alone is never forced down
         this path.
         """
-        if not (self.known and self.fits_alone):
-            return False
-        if self._residency_is_intent_driven:
-            return True
-        return not self.fits_coresident and self._persistent_weights_dominant
+        return self.known and self.fits_alone and self._residency_is_intent_driven
 
     @property
     def needs_process_count_reduction(self) -> bool:
@@ -664,8 +608,8 @@ class StreamForecast:
         hold through a cooldown) is disruptive and only pays off for a model whose weights genuinely dominate
         the card. A model whose weights-plus-bounded-floor occupy only a small fraction of total VRAM always
         regains ample room by evicting a sibling *model*, so its sibling *contexts* are never the binding
-        constraint; a teardown demand for it can only come from an over-counted per-context overhead. A
-        ``wants_whole_card`` baseline short-circuits True (the tier asserts it never shares well). This is the
+        constraint; a teardown demand for it can only come from an over-counted per-context overhead. A rung-2
+        or pinned model, and a model in the ``EXTRA_LARGE`` tier, short-circuits True. This is the
         teardown *warrant* (is a teardown demand trustworthy), kept deliberately conservative: it only matters
         once a teardown is actually demanded (``needs_exclusive_residency`` / the context-reduction path), which a
         roomy EXTRA_LARGE model never reaches because it co-resides, so leaving this eager never over-grants, it
@@ -673,7 +617,7 @@ class StreamForecast:
         preserving the prior, more eager behavior. See :data:`_WHOLE_CARD_WARRANT_FRACTION`; the share is taken
         against total VRAM so the verdict is hardware-relative.
         """
-        if self.wants_whole_card:
+        if self._residency_is_intent_driven or self.whole_card_tier:
             return True
         footprint_mb = self._effective_footprint_mb
         if footprint_mb is None or self.total_vram_mb is None or self.total_vram_mb <= 0:
@@ -757,14 +701,10 @@ class StreamForecast:
         alone = f"{self.free_if_alone_mb:.0f}" if self.free_if_alone_mb is not None else "?"
         if not self.fits_alone:
             verdict = "weights overflow the card alone: streams unavoidably"
-        elif self.needs_exclusive_residency and self._residency_is_intent_driven:
-            # The verdict names what actually granted the residency. An intent-driven claim is intent-driven
-            # whether or not the card happens to read full right now, and calling it "weight-dominant" sent a
-            # reader hunting for a weight estimate that was never the reason. The remaining branch is reached
-            # only through the weights test, so it can say so unconditionally.
-            verdict = "whole-card baseline: sole residency on intent (evict sibling models)"
         elif self.needs_exclusive_residency:
-            verdict = "weight-dominant: needs sole residency (evict sibling models)"
+            # The wording is a registered log signature. The claim behind it is the dominance verdict's rung 2 or
+            # the operator's pin, both decided for the card rather than read off this job's free figure.
+            verdict = "whole-card baseline: sole residency on intent (evict sibling models)"
         elif self.needs_process_count_reduction:
             verdict = "needs idle sibling processes stopped (their live contexts over-commit the card)"
         else:
@@ -969,6 +909,8 @@ def forecast_weight_streaming(
     admission_noise_mb: float = 0.0,
     unpausable_tenancy_mb: float = 0.0,
     whole_card_pinned: bool = False,
+    whole_card_tier: bool = False,
+    sampling_peak_observations: int = 0,
 ) -> StreamForecast:
     """Return a :class:`StreamForecast` for loading ``job``'s model given the device's measured state.
 
@@ -1018,15 +960,14 @@ def forecast_weight_streaming(
     or below the static estimate) leaves the forecast byte-identical to the static arithmetic.
 
     ``measured_resident_footprint_mb`` is the same checkpoint's *margined measured* at-rest charge, which
-    unlike ``learned_resident_footprint_mb`` may sit below the static seed. It changes no fit arithmetic; it
-    is carried through to :attr:`StreamForecast.measured_footprint_mb` where it can retire a whole-card-intent
-    claim the measurements have disproved. ``measured_observation_count`` is how many observations back it,
-    for the residency log line.
+    unlike ``learned_resident_footprint_mb`` may sit below the static seed. It changes no arithmetic and is
+    carried through to :attr:`StreamForecast.measured_footprint_mb` for the dispatch hold's record.
+    ``measured_observation_count`` is how many observations back it.
 
-    ``wants_whole_card`` flags a baseline the caller has classified as a sole-residency model on intent (the
-    ``EXTRA_LARGE`` tier: Cascade/Flux/Qwen/Z-Image), so a conservative weight seed that happens to fit
-    co-resident does not stop it claiming the card. It only biases the residency verdict; ``fits_alone`` still
-    governs whether sole residency is even achievable. Never raises.
+    ``wants_whole_card`` is the card's dominance verdict for the model (rung 2) or the operator's pin, which the
+    caller resolves. ``whole_card_tier`` and ``sampling_peak_observations`` are carried for the questions that
+    read the tier and for naming a tier model the verdict releases. ``fits_alone`` still governs whether
+    sole residency is even achievable. Never raises.
 
     ``disaggregated`` marks a job that runs on the pipeline-disaggregation path: its sampler process holds
     only the UNet (core diffusion weights plus sampling activation), not the support weights or the VAE
@@ -1174,8 +1115,10 @@ def forecast_weight_streaming(
         per_process_overhead_mb=overhead,
         marginal_process_overhead_mb=marginal,
         wants_whole_card=wants_whole_card,
-        # Carried, never folded into the fit arithmetic above: a measured figure below the seed must not
-        # quietly lower a load-feasibility judgment, only retire a residency claim the seed alone made.
+        whole_card_tier=whole_card_tier,
+        sampling_peak_observations=max(0, sampling_peak_observations),
+        # Carried and never folded into the fit arithmetic above, since a measured figure below the seed must
+        # not lower a load-feasibility judgment.
         measured_footprint_mb=(None if disaggregated else measured_resident_footprint_mb),
         measured_observation_count=(0 if disaggregated else max(0, measured_observation_count)),
         admission_noise_mb=max(0.0, admission_noise_mb),

@@ -1,11 +1,9 @@
-"""The forecast's alone frame retires a whole-card claim only against room the measured admission will find.
+"""The forecast's alone frame is the room the measured admission will find at sole residency.
 
 ``free_if_alone`` assumes every other tenant gone and charges no noise buffer; the dispatch that follows is
 priced by the measured admission, which subtracts the noise buffer and sees the foreign floor and any lane
-with no off-GPU actuator inside the device-free reading. On a card at its edge the two frames disagreed:
-the forecast retired the claim (siblings kept) and the admission then refused the dispatch for the room those
-siblings held. These tests pin the alone frame net of both terms, and that a model with ample room (Flux
-fp8 on a 24 GB card) still retires its claim, so the anti-churn purpose of the rule is unchanged.
+with no off-GPU actuator inside the device-free reading. A job priced against sole residency is compared with
+the alone frame net of both terms, so the two frames agree on a card at its edge.
 """
 
 from __future__ import annotations
@@ -17,12 +15,11 @@ _MARGINAL_MB = 487.0
 
 def _forecast(
     *,
-    measured_footprint_mb: float,
     admission_noise_mb: float = 0.0,
     unpausable_tenancy_mb: float = 0.0,
     total_vram_mb: float = 24074.0,
 ) -> resource_budget.StreamForecast:
-    """A whole-card-intent forecast on a 24 GB card with one context's overhead, measured over five runs."""
+    """A whole-card forecast on a 24 GB card with one context's overhead."""
     return resource_budget.StreamForecast(
         weights_mb=17000.0,
         footprint_mb=19500.0,
@@ -35,46 +32,26 @@ def _forecast(
         per_process_overhead_mb=488.0,
         marginal_process_overhead_mb=_MARGINAL_MB,
         wants_whole_card=True,
-        measured_footprint_mb=measured_footprint_mb,
-        measured_observation_count=5,
         admission_noise_mb=admission_noise_mb,
         unpausable_tenancy_mb=unpausable_tenancy_mb,
     )
 
 
-def test_without_the_measured_terms_the_rule_is_unchanged() -> None:
-    """Zero noise and zero unpausable tenancy reproduce the prior arithmetic exactly."""
-    forecast = _forecast(measured_footprint_mb=18580.0)
+def test_without_the_measured_terms_the_frame_is_the_alone_figure() -> None:
+    """Zero noise and zero unpausable tenancy leave the alone frame unchanged."""
+    forecast = _forecast()
 
     assert forecast._free_if_alone_measured_mb == forecast.free_if_alone_mb
-    assert forecast.measured_retires_whole_card_intent is True
+    assert forecast.sole_residency_room_mb(0.0) == forecast.free_if_alone_mb
 
 
-def test_a_measured_figure_inside_the_noise_and_lane_band_keeps_the_claim() -> None:
-    """Room the admission will not grant is not room the forecast may retire a claim on."""
-    forecast = _forecast(
-        measured_footprint_mb=18580.0,
-        admission_noise_mb=1203.7,
-        unpausable_tenancy_mb=2899.0 + 1250.0,
-    )
+def test_the_frame_is_net_of_the_noise_and_the_tenancy_no_teardown_returns() -> None:
+    """Room the admission will not grant is not room a sole-residency job is priced against."""
+    forecast = _forecast(admission_noise_mb=1203.7, unpausable_tenancy_mb=2899.0 + 1250.0)
     alone_measured = forecast.free_if_alone_mb - 1203.7 - (2899.0 + 1250.0)
 
     assert forecast._free_if_alone_measured_mb == alone_measured
-    assert alone_measured - 18580.0 < _MARGINAL_MB
-    assert forecast.measured_retires_whole_card_intent is False
-    assert forecast.needs_exclusive_residency is True
-
-
-def test_a_model_with_ample_room_still_retires_the_claim() -> None:
-    """Flux fp8 on a 24 GB card keeps its siblings: about nine gigabytes remain after every measured term."""
-    forecast = _forecast(
-        measured_footprint_mb=11500.0,
-        admission_noise_mb=1203.7,
-        unpausable_tenancy_mb=1250.0,
-    )
-
-    assert forecast.measured_retires_whole_card_intent is True
-    assert forecast.needs_exclusive_residency is False
+    assert forecast.sole_residency_room_mb(_MARGINAL_MB) == alone_measured - _MARGINAL_MB
 
 
 def test_the_builder_carries_the_terms_and_floors_them_at_zero() -> None:

@@ -8,12 +8,15 @@ records anything.
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterable, Sequence
+import uuid
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from hordelib.metrics import JobPhaseMetrics
 
+from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
@@ -35,13 +38,19 @@ from horde_worker_regen.process_management.resources.vram_arbiter import VramArb
 from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
+    LearnedFootprintStore,
+    ResolutionBucket,
     job_class_key,
     sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission.snapshot import SchedulingSnapshot, SlotSnapshot
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.concurrent_overlap import prices_sampler_only_beside
-from horde_worker_regen.process_management.scheduling.governance.whole_card import max_coresident_for_peak
+from horde_worker_regen.process_management.scheduling.diagnostic_throttle import DIAGNOSTIC_MB_BUCKET
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    DominanceRung,
+    max_coresident_for_peak,
+)
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
 
@@ -520,12 +529,20 @@ def partial_seat_activation_mb(
     leave free, so one reading that also held streamed weights or another model's cache would hold that room
     free on every later grant and force partial loads.
     """
+    return _partial_seat_activation_from_store_mb(snapshot.services.footprint_store, job, baseline)
+
+
+def _partial_seat_activation_from_store_mb(
+    store: LearnedFootprintStore | None,
+    job: ImageGenerateJobPopResponse,
+    baseline: str | None,
+) -> float | None:
+    """Return :func:`partial_seat_activation_mb` priced from ``store`` rather than a snapshot's."""
     weights_mb = predict_job_weight_mb(job, baseline)
     sampler_only_mb = predict_job_sampler_only_vram_mb(job, baseline)
     if weights_mb is None or sampler_only_mb is None:
         return None
     static_seed_mb = max(0.0, sampler_only_mb - weights_mb)
-    store = snapshot.services.footprint_store
     key = sampling_footprint_key(job, baseline, stage=FootprintStage.SAMPLE_ACTIVATION)
     if store is None or key is None:
         return static_seed_mb
@@ -537,7 +554,12 @@ def _sampling_non_weight_mb(
     snapshot: SchedulingSnapshot, activation_mb: float | None, *, device_index: int | None
 ) -> float:
     """Return the larger of the job's non-weight memory and ComfyUI's inference reserve (MB), or the reserve alone."""
-    comfy_reserve_mb = effective_inference_reserve_mb(snapshot.card(device_index).total_vram_mb, 0.0)
+    return _non_weight_on_card_mb(snapshot.card(device_index).total_vram_mb, activation_mb)
+
+
+def _non_weight_on_card_mb(total_vram_mb: float | None, activation_mb: float | None) -> float:
+    """Return :func:`_sampling_non_weight_mb` for a card of ``total_vram_mb``."""
+    comfy_reserve_mb = effective_inference_reserve_mb(total_vram_mb, 0.0)
     if activation_mb is None:
         return comfy_reserve_mb
     return max(activation_mb, comfy_reserve_mb)
@@ -580,19 +602,41 @@ def partial_seat_mb(
     its patch temporaries crash a child natively in this regime, and neither does any job on a card whose driver
     is paging the worker's allocations.
     """
-    if snapshot.ledgers.retention.wddm_paging_active:
+    return partial_seat_on_card_mb(
+        job,
+        baseline,
+        store=snapshot.services.footprint_store,
+        total_vram_mb=snapshot.card(device_index).total_vram_mb,
+        wddm_paging_active=snapshot.ledgers.retention.wddm_paging_active,
+        model_tier=size_tier(snapshot, job.model),
+        weight_fraction=weight_fraction,
+    )
+
+
+def partial_seat_on_card_mb(
+    job: ImageGenerateJobPopResponse,
+    baseline: str | None,
+    *,
+    store: LearnedFootprintStore | None,
+    total_vram_mb: float | None,
+    wddm_paging_active: bool,
+    model_tier: ModelSizeTier,
+    weight_fraction: float,
+) -> float | None:
+    """Return :func:`partial_seat_mb` from explicit figures, for a caller that prices a seat outside a snapshot."""
+    if wddm_paging_active:
         return None
-    if size_tier(snapshot, job.model) < ModelSizeTier.EXTRA_LARGE:
+    if model_tier < ModelSizeTier.EXTRA_LARGE:
         return None
     from hordelib.feature_impact import FEATURE_KIND
 
     if FEATURE_KIND.lora in _job_feature_kinds(job):
         return None
     weights_mb = predict_job_weight_mb(job, baseline)
-    activation_mb = partial_seat_activation_mb(snapshot, job, baseline)
+    activation_mb = _partial_seat_activation_from_store_mb(store, job, baseline)
     if weights_mb is None or activation_mb is None:
         return None
-    return weight_fraction * weights_mb + _sampling_non_weight_mb(snapshot, activation_mb, device_index=device_index)
+    return weight_fraction * weights_mb + _non_weight_on_card_mb(total_vram_mb, activation_mb)
 
 
 # ---- the streaming forecast and the co-resident maximum
@@ -602,10 +646,20 @@ def whole_card_pinned(
     snapshot: SchedulingSnapshot, model: str | None, baseline: Baseline, device_index: int | None
 ) -> bool:
     """Whether the operator pinned the model (by name or baseline id) as whole-card on the card."""
-    if model is None:
-        return False
-    pins = snapshot.config_for(device_index).whole_card_models
-    if not pins:
+    return pinned_by(whole_card_pins(snapshot.config_for(device_index)), model, baseline)
+
+
+def whole_card_pins(config: reGenBridgeData) -> frozenset[str]:
+    """Return the operator's whole-card pins (model names and baseline ids) for a card's config."""
+    pins = config.whole_card_models
+    if not isinstance(pins, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(str(pin) for pin in pins)
+
+
+def pinned_by(pins: frozenset[str], model: str | None, baseline: Baseline) -> bool:
+    """Whether ``pins`` names the model or its baseline id."""
+    if model is None or not pins:
         return False
     baseline_id = str(baseline) if baseline is not None else None
     return model in pins or (baseline_id is not None and baseline_id in pins)
@@ -670,7 +724,8 @@ def forecast_streaming(
         else sum(1 for slot in slots if slot.process_type is HordeProcessType.POST_PROCESS)
     )
     pinned = whole_card_pinned(snapshot, job.model, baseline, device_index)
-    wants_whole_card = pinned or size_tier(snapshot, job.model) >= ModelSizeTier.EXTRA_LARGE
+    verdict = model_dominance(card.dominance, snapshot.services.footprint_store, job.model, baseline)
+    wants_whole_card = pinned or (verdict is not None and verdict.cannot_co_reside)
     job_id = str(job.id_) if job.id_ is not None else None
     queued = snapshot.queue.jobs.get(job_id) if job_id is not None else None
     disaggregated = queued.disaggregation_class_eligible if queued is not None else False
@@ -698,7 +753,339 @@ def forecast_streaming(
         admission_noise_mb=admission_noise_mb(snapshot, device_index, card.total_vram_mb),
         whole_card_pinned=pinned,
         unpausable_tenancy_mb=unpausable_tenancy_mb(snapshot, device_index),
+        whole_card_tier=size_tier(snapshot, job.model) >= ModelSizeTier.EXTRA_LARGE,
+        sampling_peak_observations=verdict.peak.observation_count if verdict is not None else 0,
     )
+
+
+# ---- the dominance verdict
+
+
+DOMINANCE_SEED_BAND = ResolutionBucket.LE_1024
+"""The band a model with no observed band is priced at."""
+
+DOMINANCE_HYSTERESIS_MB = DIAGNOSTIC_MB_BUCKET
+"""How far (MB) a rung's slack must cross zero before a held rung changes, and the room a pairing with a dominant
+side must show to co-sample. It is the width the recompute key buckets the floor by, so a figure moving inside
+one bucket never moves a rung."""
+
+_SEED_SIDE_PX_BY_BAND: dict[ResolutionBucket, int] = {
+    ResolutionBucket.LE_512: 512,
+    ResolutionBucket.LE_768: 768,
+    ResolutionBucket.LE_1024: 1024,
+    ResolutionBucket.GT_1024: 1536,
+}
+"""The square side (px) an unmeasured model's static seed is taken at for each band. It is the band's upper side,
+or for the open top band the largest side a common job asks for."""
+
+
+def seed_side_px(band: ResolutionBucket) -> int:
+    """Return the square side (px) a representative job of ``band`` is priced at."""
+    return _SEED_SIDE_PX_BY_BAND[band]
+
+
+@dataclass(frozen=True)
+class ModelSamplingPeak:
+    """Represents the sampling peak (MB, net of context) the dominance verdict prices one model at."""
+
+    model: str
+    peak_mb: float | None
+    """None when neither the store nor the static seed can price the model; such a model reads as fitting."""
+    band: ResolutionBucket
+    """The band the figure belongs to, which is the most-observed band with a measured figure, else the seed band."""
+    observation_count: int
+    """Observations behind a measured figure. Zero for the static seed."""
+
+
+@dataclass(frozen=True)
+class ModelDominance:
+    """Represents one model's rung on a card, with the peak it was priced at."""
+
+    peak: ModelSamplingPeak
+    rung: DominanceRung
+
+    @property
+    def cannot_co_reside(self) -> bool:
+        """Whether the model is on rung 2, the rung the teardown serves."""
+        return self.rung is DominanceRung.CANNOT_CO_RESIDE
+
+
+@dataclass(frozen=True)
+class DominanceInputs:
+    """Represents every input the dominance verdict depends on, compared to decide whether it must be recomputed.
+
+    The floor enters bucketed, so its ordinary movement within a bucket never recomputes. The footprint evidence
+    enters as the observation counts of the offered baselines' pooled sampling keys, which move exactly when a
+    figure the verdict reads can.
+    """
+
+    offered_models: frozenset[str]
+    whole_card_pins: frozenset[str]
+    total_vram_mb: float
+    first_context_mb: float
+    marginal_context_mb: float
+    admission_noise_mb: float
+    foreign_floor_bucket: int | None
+    sample_observation_counts: tuple[tuple[str, tuple[int, ...]], ...]
+
+
+@dataclass(frozen=True)
+class CardDominance:
+    """Represents one card's dominance verdict over its offered set, computed once per change of its inputs.
+
+    Rung 2 for model M: ``total - P(M) - first context - marginal context - floor - margin < 0``. Rung 1: rung 2,
+    or no offered model B (M itself included) has ``total - P(M) - P(B) - first - marginal - floor - margin >= 0``.
+    ``P`` is the measured sampling peak at the most-observed band, else the static seed. A model the previous
+    verdict judged keeps its rung until a test's slack crosses zero by more than :data:`DOMINANCE_HYSTERESIS_MB`.
+    """
+
+    inputs: DominanceInputs
+    foreign_floor_mb: float
+    """The floor (MB) the verdict charged, read when it was computed."""
+    verdicts: Mapping[str, ModelDominance]
+    """Each offered model's rung."""
+    seats_mb: Mapping[str, float | None] = field(default_factory=dict)
+    """The partial-load seat (MB) of each offered rung-2 or pinned model, None where the model has none."""
+
+    @property
+    def _charges_mb(self) -> float:
+        """Return what every pairing charges besides the peaks, which is both contexts, the floor and the margin."""
+        return (
+            self.inputs.first_context_mb
+            + self.inputs.marginal_context_mb
+            + self.foreign_floor_mb
+            + self.inputs.admission_noise_mb
+        )
+
+    def pair_room_mb(self, peak_mb: float | None, partner_mb: float | None) -> float | None:
+        """Return the room (MB) the card leaves two models sampling together, or None when either is unpriced."""
+        if peak_mb is None or partner_mb is None:
+            return None
+        return self.inputs.total_vram_mb - peak_mb - partner_mb - self._charges_mb
+
+    def judge(self, peak: ModelSamplingPeak) -> ModelDominance:
+        """Return the rung of a model priced at ``peak`` against this card's offered set."""
+        return ModelDominance(
+            peak=peak,
+            rung=dominance_rung(
+                peak.peak_mb,
+                partner_peaks_mb=[verdict.peak.peak_mb for verdict in self.verdicts.values()],
+                total_vram_mb=self.inputs.total_vram_mb,
+                charges_mb=self._charges_mb,
+            ),
+        )
+
+    def describe(self) -> str:
+        """Return the verdict on one line, the charges first and then each model's rung, band, figure and evidence."""
+        rows = ", ".join(
+            f"{model} {verdict.rung} ({verdict.peak.band}, "
+            f"{'?' if verdict.peak.peak_mb is None else f'{verdict.peak.peak_mb:.0f}'}MB, "
+            f"n={verdict.peak.observation_count})"
+            for model, verdict in sorted(self.verdicts.items())
+        )
+        return (
+            f"total {self.inputs.total_vram_mb:.0f}MB, contexts {self.inputs.first_context_mb:.0f}+"
+            f"{self.inputs.marginal_context_mb:.0f}MB, floor {self.foreign_floor_mb:.0f}MB, margin "
+            f"{self.inputs.admission_noise_mb:.0f}MB: {rows}"
+        )
+
+
+def _crossed(slack_mb: float, *, held: bool | None, band_mb: float) -> bool:
+    """Return whether ``slack_mb`` says the rung's test is failed (no room), with hysteresis about a held answer.
+
+    With no earlier answer the test is the bare sign of the slack. A rung already held is left only once the slack
+    shows room by more than ``band_mb``. A rung not held is entered only once the slack is short by more than it.
+    """
+    if held is None:
+        return slack_mb < 0.0
+    if held:
+        return slack_mb < band_mb
+    return slack_mb < -band_mb
+
+
+def dominance_rung(
+    peak_mb: float | None,
+    *,
+    partner_peaks_mb: Iterable[float | None],
+    total_vram_mb: float,
+    charges_mb: float,
+    previous: DominanceRung | None = None,
+    band_mb: float = 0.0,
+) -> DominanceRung:
+    """Return the rung of a model of ``peak_mb`` among partners of ``partner_peaks_mb`` (its own copy included).
+
+    ``charges_mb`` is everything a pairing charges besides the two peaks. An unpriced model has no rung, and an
+    unpriced partner reads as fitting, so a missing figure never withholds a co-sample.
+
+    ``previous`` is the rung the card's last verdict gave the model. Each rung's test then moves only when its
+    slack crosses zero by more than ``band_mb``, so a measured peak drifting about a threshold does not flip the
+    rung, and with it the teardown, on every observation.
+    """
+    if peak_mb is None:
+        return DominanceRung.NONE
+    held_reside = None if previous is None else previous is DominanceRung.CANNOT_CO_RESIDE
+    if _crossed(total_vram_mb - peak_mb - charges_mb, held=held_reside, band_mb=band_mb):
+        return DominanceRung.CANNOT_CO_RESIDE
+    best_room_mb = max(
+        (
+            float("inf") if partner_mb is None else total_vram_mb - peak_mb - partner_mb - charges_mb
+            for partner_mb in (*partner_peaks_mb, peak_mb)
+        ),
+    )
+    held_sample = None if previous is None else previous is not DominanceRung.NONE
+    if _crossed(best_room_mb, held=held_sample, band_mb=band_mb):
+        return DominanceRung.CANNOT_CO_SAMPLE
+    return DominanceRung.NONE
+
+
+def decide_card_dominance(
+    inputs: DominanceInputs,
+    *,
+    foreign_floor_mb: float,
+    peaks: Sequence[ModelSamplingPeak],
+    seats_mb: Mapping[str, float | None] | None = None,
+    previous: CardDominance | None = None,
+) -> CardDominance:
+    """Return the card's dominance verdict for every model in ``peaks``, all of which are its partners.
+
+    ``previous`` is the card's last verdict. A model it judged keeps its rung until the new figures cross the
+    rung's threshold by more than :data:`DOMINANCE_HYSTERESIS_MB`.
+    """
+    charges_mb = (
+        inputs.first_context_mb + inputs.marginal_context_mb + max(0.0, foreign_floor_mb) + inputs.admission_noise_mb
+    )
+    partner_peaks_mb = [peak.peak_mb for peak in peaks]
+    previous_verdicts = previous.verdicts if previous is not None else {}
+    verdicts = {}
+    for peak in peaks:
+        held = previous_verdicts.get(peak.model)
+        verdicts[peak.model] = ModelDominance(
+            peak=peak,
+            rung=dominance_rung(
+                peak.peak_mb,
+                partner_peaks_mb=partner_peaks_mb,
+                total_vram_mb=inputs.total_vram_mb,
+                charges_mb=charges_mb,
+                previous=held.rung if held is not None else None,
+                band_mb=DOMINANCE_HYSTERESIS_MB,
+            ),
+        )
+    return CardDominance(
+        inputs=inputs,
+        foreign_floor_mb=max(0.0, foreign_floor_mb),
+        verdicts=verdicts,
+        seats_mb=dict(seats_mb or {}),
+    )
+
+
+def pooled_sample_key(baseline: str, band: ResolutionBucket, *, platform: str = sys.platform) -> FootprintKey:
+    """Return the pooled (all job classes) SAMPLE key for a baseline and band."""
+    return FootprintKey(
+        model_baseline=baseline, resolution_bucket=band, platform=platform, stage=FootprintStage.SAMPLE
+    )
+
+
+def representative_job(model: str, *, side_px: int) -> ImageGenerateJobPopResponse:
+    """Return a plain batch-1 square text-to-image job for ``model``, priced where no real job exists yet.
+
+    It carries no LoRA, controlnet, source image or post-processing, so every per-job figure read from it is the
+    model's figure at that size.
+    """
+    return ImageGenerateJobPopResponse.model_validate(
+        {
+            "id": str(_REPRESENTATIVE_JOB_ID),
+            "ids": [str(_REPRESENTATIVE_JOB_ID)],
+            "model": model,
+            "payload": {"width": side_px, "height": side_px, "n_iter": 1, "ddim_steps": 1},
+            "skipped": {},
+            "source_processing": "txt2img",
+        },
+    )
+
+
+_REPRESENTATIVE_JOB_ID = uuid.UUID(int=0)
+"""The id every representative job carries. No tracker ever holds it."""
+
+
+def model_sampling_peak(
+    store: LearnedFootprintStore | None,
+    model: str,
+    baseline: Baseline,
+) -> ModelSamplingPeak:
+    """Return the sampling peak the dominance verdict prices ``model`` at.
+
+    The figure is the measured SAMPLE window, net of context, at the baseline's most-observed band among the bands
+    with a measured figure. Without one, it is the static sampling seed of a plain batch-1 job at the most-observed
+    band's upper side, or at :data:`DOMINANCE_SEED_BAND` when the store has seen no band of it. The raise-only
+    watermark is never read, since it carries card-sized child peaks and would price a model off the card on one
+    reading.
+    """
+    baseline_id = str(baseline) if baseline is not None else None
+    seed_band = DOMINANCE_SEED_BAND
+    if store is not None and baseline_id is not None:
+        measured: tuple[ResolutionBucket, float, int] | None = None
+        most_seen: tuple[ResolutionBucket, int] | None = None
+        for band in ResolutionBucket:
+            key = pooled_sample_key(baseline_id, band)
+            count = store.observation_count(key)
+            if count > 0 and (most_seen is None or count > most_seen[1]):
+                most_seen = (band, count)
+            figure_mb = store.measured_estimate_net_of_context_mb(key)
+            if figure_mb is not None and (measured is None or count > measured[2]):
+                measured = (band, figure_mb, count)
+        if measured is not None:
+            return ModelSamplingPeak(model=model, peak_mb=measured[1], band=measured[0], observation_count=measured[2])
+        if most_seen is not None:
+            seed_band = most_seen[0]
+    seed_mb = predict_job_sampling_vram_mb(
+        representative_job(model, side_px=seed_side_px(seed_band)),
+        baseline_id,
+    )
+    return ModelSamplingPeak(model=model, peak_mb=seed_mb, band=seed_band, observation_count=0)
+
+
+def model_dominance(
+    dominance: CardDominance | None,
+    store: LearnedFootprintStore | None,
+    model: str | None,
+    baseline: Baseline,
+) -> ModelDominance | None:
+    """Return a model's rung on a card, cached when the model is offered there and otherwise judged against the offer.
+
+    None when the card has no verdict (its total is not yet known) or there is no model.
+    """
+    if dominance is None or model is None:
+        return None
+    cached = dominance.verdicts.get(model)
+    if cached is not None:
+        return cached
+    return dominance.judge(model_sampling_peak(store, model, baseline))
+
+
+def pair_co_samples(
+    dominance: CardDominance | None,
+    store: LearnedFootprintStore | None,
+    *,
+    candidate: tuple[str | None, Baseline],
+    running: tuple[str | None, Baseline],
+) -> bool:
+    """Whether a candidate may sample beside a running job on a card, by the dominance arithmetic.
+
+    A pairing with a side on rung 1 or above samples together only when ``total - P(A) - P(B) - contexts - floor -
+    margin`` shows at least :data:`DOMINANCE_HYSTERESIS_MB` of room. That is the verdict's rung-1 test and band, so
+    a model the verdict holds on rung 1 never has a partner this admits. A pairing of two models with partners is
+    left to the arbiter's memory verdict. An unpriced side, or a card with no verdict, admits.
+    """
+    if dominance is None:
+        return True
+    candidate_verdict = model_dominance(dominance, store, candidate[0], candidate[1])
+    running_verdict = model_dominance(dominance, store, running[0], running[1])
+    if candidate_verdict is None or running_verdict is None:
+        return True
+    if candidate_verdict.rung is DominanceRung.NONE and running_verdict.rung is DominanceRung.NONE:
+        return True
+    room_mb = dominance.pair_room_mb(candidate_verdict.peak.peak_mb, running_verdict.peak.peak_mb)
+    return room_mb is None or room_mb >= DOMINANCE_HYSTERESIS_MB
 
 
 def max_coresident_for_peak_mb(

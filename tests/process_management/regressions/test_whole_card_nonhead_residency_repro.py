@@ -26,6 +26,7 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -36,23 +37,25 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_model_metadata,
     mark_job_in_progress_async,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
-# A 16GB card. Flux fp8 genuinely needs sole residency here: its ~11.5GB weights leave under a full sibling
-# model's worth of room (``_CORESIDENT_SIBLING_MODEL_FLOOR_MB``) at sole residency, so it is a true whole-card
-# head: the case this file's head-gate must serve while still refusing a *non-head* Flux. (On a roomy 24GB
-# card Flux fp8 co-resides instead, which is a different regime covered by the budget-wins-on-a-roomy-card path.)
+# A 16GB card. Flux fp8 genuinely needs sole residency here: its sampling seed beside one context overflows the
+# card, so the dominance verdict puts it on rung 2 and it is a true whole-card head, the case this file's head-gate
+# must serve while still refusing a *non-head* Flux. (On a roomy 24GB card the same seed leaves room beside one
+# context, so Flux sits below rung 2 and is demanded no residency.)
 _DEVICE_TOTAL_VRAM_MB = 16375
 _PER_PROCESS_OVERHEAD_MB = 1288
 _VRAM_RESERVE_MB = 2048
 _RAM_RESERVE_MB = 4096
 
 _FLUX_MODEL = "Flux.1-Schnell fp8 (Compact)"
-_FLUX_BASELINE = "flux_schnell"
+_FLUX_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
 _FLUX_WEIGHTS_MB = 11500.0
 _FLUX_SAMPLING_PEAK_MB = 13500.0  # weights still fit alone on 16GB (the residency is the clean sole-residency case)
 
@@ -95,6 +98,8 @@ def _make_scheduler(
 
     Stubbing ``scale_inference_processes`` / ``pause_safety_on_gpu`` lets a test observe the scheduler's
     *decision* (whether a whole-card residency was recorded for a model) without driving real OS processes.
+    Flux carries its reference baseline, so the card's dominance verdict prices it at the Flux sampling seed,
+    which overflows this card beside one context and puts Flux on rung 2.
     """
     scheduler = _make_inference_scheduler(
         process_map=process_map,
@@ -102,6 +107,9 @@ def _make_scheduler(
         bridge_data=_wedge_bridge_data(),
         max_concurrent=1,
         max_inference=4,
+        model_metadata=make_test_model_metadata(
+            {_FLUX_MODEL: make_mock_model_reference_record(_FLUX_MODEL, baseline=_FLUX_BASELINE)},
+        ),
     )
     scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=len(list(process_map.values())))
     scheduler._process_lifecycle.pause_safety_on_gpu = Mock(return_value=True)
@@ -238,6 +246,10 @@ class TestHeadFluxStillClaimsCard:
         scheduler = _make_scheduler(process_map, job_tracker)
 
         await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX_MODEL, width=1216, height=1216))
+        dominance = scheduler.card_dominance(None)
+        assert dominance is not None and dominance.verdicts[_FLUX_MODEL].cannot_co_reside, (
+            "precondition: the card's verdict puts Flux on rung 2"
+        )
 
         scheduler.preload_models()
 

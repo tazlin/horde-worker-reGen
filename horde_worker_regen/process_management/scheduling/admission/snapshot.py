@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -57,6 +58,10 @@ from horde_worker_regen.process_management.scheduling.ledgers.retention import (
     RetentionLedger,
 )
 from horde_worker_regen.process_management.scheduling.ledgers.safety_placement import SafetyPlacementLedger
+
+if TYPE_CHECKING:
+    # The pricing module imports this one, so the verdict's type is named for the checker only.
+    from horde_worker_regen.process_management.scheduling.admission.pricing import CardDominance
 
 
 def job_key(job: ImageGenerateJobPopResponse) -> str | None:
@@ -143,6 +148,9 @@ class CardSnapshot:
     exclusive_job_in_progress: bool
     """Whether an exclusive over-budget job is pending or in progress in this card's scope (worker-wide for
     the card-agnostic view), which suppresses unrelated staging onto it."""
+    dominance: CardDominance | None = None
+    """The card's dominance verdict over its offered set, or None before its total is known. Computed by the
+    scheduler when one of its inputs changes, never per cycle."""
 
 
 @dataclass(frozen=True)
@@ -573,13 +581,15 @@ def build_scheduling_snapshot(
     ledgers: LedgerViews,
     remaining_sampling_seconds: Callable[[HordeProcessInfo], float | None] | None = None,
     dispatch_overhead_seconds: Callable[[ImageGenerateJobPopResponse, bool], float | None] | None = None,
+    dominance: Callable[[int | None], CardDominance | None] | None = None,
 ) -> SchedulingSnapshot:
     """Freeze the worker for one cycle.
 
     Takes the collaborators explicitly so the builder is testable without a scheduler; the scheduler's
     ``snapshot`` method is the one production caller and supplies its own accessors for the per-card
-    measurements. ``remaining_sampling_seconds`` and ``dispatch_overhead_seconds`` (job, resident at dispatch) are
-    optional. Without them every slot and job carries None for those figures.
+    measurements. ``remaining_sampling_seconds``, ``dispatch_overhead_seconds`` (job, resident at dispatch) and
+    ``dominance`` are optional. Without them every slot and job carries None for those figures and every card
+    carries no dominance verdict.
     """
     multi_gpu = len(card_runtimes) > 1
     card_keys: list[int | None] = [None]
@@ -613,6 +623,7 @@ def build_scheduling_snapshot(
             },
             foreign_floor_mb=foreign_floor_mb(key),
             exclusive_job_in_progress=job_tracker.has_exclusive_job_in_progress(key),
+            dominance=dominance(key) if dominance is not None else None,
         )
 
     in_progress_jobs = list(job_tracker.jobs_in_progress)

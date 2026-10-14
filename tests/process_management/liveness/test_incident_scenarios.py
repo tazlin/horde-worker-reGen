@@ -3356,6 +3356,10 @@ async def _drive_residency_safety_job(*, lora: bool) -> tuple[_DispatchWorld, Im
         tick_seconds=_LANE_RUNG_TICK_SECONDS,
         extra_model_classes=(_KREA2,),
     )
+    # The model's weights leave one context of room on this card, so the dominance verdict holds it on rung 1
+    # and grants no residency. The operator pin is the input that makes it a residency, which is the mechanism
+    # whose safety move this row reads.
+    world.scheduler._runtime_config.bridge_data.whole_card_models = [_KREA2.name]  # type: ignore[attr-defined]
     loras = [LorasPayloadEntry(name="some_lora", model=1.0, clip=1.0)] if lora else None
     job = make_job_pop_response(_KREA2.name, width=1024, height=1024, ddim_steps=8, loras=loras)
     started_at = world.now

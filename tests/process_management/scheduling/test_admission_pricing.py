@@ -8,6 +8,7 @@ own specification.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -29,10 +30,12 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    ResolutionBucket,
     sampling_footprint_key,
 )
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
+from horde_worker_regen.process_management.scheduling.governance.whole_card import DominanceRung
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -42,6 +45,7 @@ from tests.process_management.conftest import (
     mark_job_in_progress_async,
     track_popped_job_async,
 )
+from tests.process_management.liveness._session_replay import SESSION_FOOTPRINTS_PATH, load_footprint_store
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 
@@ -568,3 +572,416 @@ def test_a_jobs_upload_rate_is_its_peak_weights_over_its_device_load_seconds() -
         vram_footprint=JobVramFootprint(peak_resident_weights_mb=8000.0),
     )
     assert pricing.job_upload_mb_per_second(no_upload) is None
+
+
+_REPLAY_CATALOGUE: dict[str, str] = {
+    "Flux.1-Schnell fp8 (Compact)": "flux_1",
+    "Krea2-Turbo_fp8": "krea2_turbo",
+    "Z-Image-Turbo": "z_image_turbo",
+    "Qwen-Image": "qwen_image",
+    "Stable Cascade 1.0": "stable_cascade",
+    "AlbedoBase XL (SDXL)": "stable_diffusion_xl",
+    "stable_diffusion": "stable_diffusion_1",
+    "Anima-Turbo-v1.1": "anima",
+}
+"""One offered model per baseline the replay fixture's store measured, keyed to its baseline id."""
+
+
+def _replay_dominance(store: LearnedFootprintStore, *, foreign_floor_mb: float) -> pricing.CardDominance:
+    """Return the verdict over the replay catalogue on the replay fixture's 24 GB card figures."""
+    inputs = pricing.DominanceInputs(
+        offered_models=frozenset(_REPLAY_CATALOGUE),
+        whole_card_pins=frozenset(),
+        total_vram_mb=24074.0,
+        first_context_mb=462.0,
+        marginal_context_mb=488.0,
+        admission_noise_mb=602.0,
+        foreign_floor_bucket=None,
+        sample_observation_counts=(),
+    )
+    peaks = [pricing.model_sampling_peak(store, model, baseline) for model, baseline in _REPLAY_CATALOGUE.items()]
+    return pricing.decide_card_dominance(inputs, foreign_floor_mb=foreign_floor_mb, peaks=peaks)
+
+
+class TestDominanceVerdict:
+    """The two-rung verdict over a stated catalogue, its peak sources and its fallback."""
+
+    @pytest.fixture
+    def replay_store(self, tmp_path: Path) -> LearnedFootprintStore:
+        """Return the replay fixture's learned store from a 24 GB card, keyed for this platform."""
+        return load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path)
+
+    def test_the_measured_tenant_puts_four_models_on_rung_one_and_qwen_on_rung_two(
+        self,
+        replay_store: LearnedFootprintStore,
+    ) -> None:
+        """With the 3,300 MB tenant no offered model samples beside Flux, Krea2, Z-Image or Cascade.
+
+        Each partner is priced at its most-observed band, so Cascade's 15,532 MB at le_1024 misses beside SD1.5's
+        le_512 figure by about 130 MB. Qwen cannot sample beside even one context.
+        """
+        dominance = _replay_dominance(replay_store, foreign_floor_mb=3300.0)
+        rungs = {model: verdict.rung for model, verdict in dominance.verdicts.items()}
+
+        assert rungs == {
+            "Flux.1-Schnell fp8 (Compact)": DominanceRung.CANNOT_CO_SAMPLE,
+            "Krea2-Turbo_fp8": DominanceRung.CANNOT_CO_SAMPLE,
+            "Z-Image-Turbo": DominanceRung.CANNOT_CO_SAMPLE,
+            "Stable Cascade 1.0": DominanceRung.CANNOT_CO_SAMPLE,
+            "Qwen-Image": DominanceRung.CANNOT_CO_RESIDE,
+            "AlbedoBase XL (SDXL)": DominanceRung.NONE,
+            "stable_diffusion": DominanceRung.NONE,
+            "Anima-Turbo-v1.1": DominanceRung.NONE,
+        }
+        flux = dominance.verdicts["Flux.1-Schnell fp8 (Compact)"].peak
+        assert flux.band is ResolutionBucket.LE_1024
+        assert flux.observation_count > 0
+
+    def test_without_the_tenant_an_sd15_job_fits_beside_flux(self, replay_store: LearnedFootprintStore) -> None:
+        """At a zero floor Flux has a partner, and Qwen still cannot sample beside one context."""
+        dominance = _replay_dominance(replay_store, foreign_floor_mb=0.0)
+
+        assert dominance.verdicts["Flux.1-Schnell fp8 (Compact)"].rung is DominanceRung.NONE
+        assert dominance.verdicts["Qwen-Image"].rung is DominanceRung.CANNOT_CO_RESIDE
+
+    def test_rung_two_needs_the_peak_beside_one_context_to_overflow(self) -> None:
+        """Rung 2 is ``total - peak - both contexts - floor - margin < 0``. Rung 1 has no fitting partner."""
+        charges_mb = 462.0 + 488.0 + 3300.0 + 602.0
+        assert (
+            pricing.dominance_rung(19300.0, partner_peaks_mb=[], total_vram_mb=24074.0, charges_mb=charges_mb)
+            is DominanceRung.CANNOT_CO_RESIDE
+        )
+        assert (
+            pricing.dominance_rung(19200.0, partner_peaks_mb=[3821.0], total_vram_mb=24074.0, charges_mb=charges_mb)
+            is DominanceRung.CANNOT_CO_SAMPLE
+        )
+        assert (
+            pricing.dominance_rung(9475.0, partner_peaks_mb=[3821.0], total_vram_mb=24074.0, charges_mb=charges_mb)
+            is DominanceRung.NONE
+        )
+
+    def test_an_unpriced_figure_never_withholds_a_co_sample(self) -> None:
+        """An unpriced model has no rung, and an unpriced partner reads as fitting beside it."""
+        assert (
+            pricing.dominance_rung(None, partner_peaks_mb=[], total_vram_mb=24074.0, charges_mb=0.0)
+            is DominanceRung.NONE
+        )
+        assert (
+            pricing.dominance_rung(20000.0, partner_peaks_mb=[None], total_vram_mb=24074.0, charges_mb=2000.0)
+            is DominanceRung.NONE
+        )
+
+    def test_an_unmeasured_model_is_priced_at_the_le_1024_sampling_seed(self) -> None:
+        """With no observation the peak is the static sampling seed of a plain 1024x1024 job of the model."""
+        peak = pricing.model_sampling_peak(LearnedFootprintStore(), "Flux.1-Schnell fp8 (Compact)", "flux_1")
+
+        assert peak.band is ResolutionBucket.LE_1024
+        assert peak.observation_count == 0
+        job = make_job_pop_response("Flux.1-Schnell fp8 (Compact)", width=1024, height=1024)
+        assert peak.peak_mb == predict_job_sampling_vram_mb(job, "flux_1")
+
+    def test_flux_on_a_16_gb_card_is_rung_two_on_its_static_seed(self) -> None:
+        """The 16 GB card the whole-card goldens run on cannot hold Flux's seed beside one context."""
+        inputs = pricing.DominanceInputs(
+            offered_models=frozenset({"Flux.1-Schnell fp8 (Compact)", "stable_diffusion"}),
+            whole_card_pins=frozenset(),
+            total_vram_mb=16384.0,
+            first_context_mb=1354.0,
+            marginal_context_mb=384.0,
+            admission_noise_mb=819.2,
+            foreign_floor_bucket=None,
+            sample_observation_counts=(),
+        )
+        peaks = [
+            pricing.model_sampling_peak(None, "Flux.1-Schnell fp8 (Compact)", "flux_1"),
+            pricing.model_sampling_peak(None, "stable_diffusion", "stable_diffusion_1"),
+        ]
+        dominance = pricing.decide_card_dominance(inputs, foreign_floor_mb=0.0, peaks=peaks)
+
+        assert dominance.verdicts["Flux.1-Schnell fp8 (Compact)"].rung is DominanceRung.CANNOT_CO_RESIDE
+        assert dominance.verdicts["stable_diffusion"].rung is DominanceRung.NONE
+
+    def test_a_model_outside_the_offer_is_judged_against_it(self, replay_store: LearnedFootprintStore) -> None:
+        """A model the card does not offer gets the rung the offered set gives it, not a cached one."""
+        dominance = _replay_dominance(replay_store, foreign_floor_mb=3300.0)
+        verdict = pricing.model_dominance(dominance, replay_store, "Another Flux", "flux_1")
+
+        assert verdict is not None
+        assert verdict.rung is DominanceRung.CANNOT_CO_SAMPLE
+        assert pricing.model_dominance(None, replay_store, "Another Flux", "flux_1") is None
+
+
+_HYSTERESIS_TOTAL_MB = 24074.0
+_HYSTERESIS_CHARGES_MB = 4852.0
+_HYSTERESIS_BAND_MB = pricing.DOMINANCE_HYSTERESIS_MB
+
+
+def _held_rung(
+    peak_mb: float,
+    partner_mb: float,
+    previous: DominanceRung | None,
+) -> DominanceRung:
+    """Return the rung of ``peak_mb`` beside one partner, on a card with 24,074 MB and 4,852 MB of charges."""
+    return pricing.dominance_rung(
+        peak_mb,
+        partner_peaks_mb=[partner_mb],
+        total_vram_mb=_HYSTERESIS_TOTAL_MB,
+        charges_mb=_HYSTERESIS_CHARGES_MB,
+        previous=previous,
+        band_mb=_HYSTERESIS_BAND_MB,
+    )
+
+
+class TestDominanceHysteresis:
+    """A held rung moves only when its slack crosses zero by more than the floor bucket, on both edges."""
+
+    def test_the_band_is_the_floor_bucket_the_recompute_key_uses(self) -> None:
+        """One width governs both, so a figure moving inside one bucket never moves a rung."""
+        from horde_worker_regen.process_management.scheduling.diagnostic_throttle import DIAGNOSTIC_MB_BUCKET
+
+        assert pricing.DOMINANCE_HYSTERESIS_MB == DIAGNOSTIC_MB_BUCKET
+
+    @pytest.mark.parametrize(
+        ("slack_mb", "previous", "expected"),
+        [
+            (100.0, DominanceRung.CANNOT_CO_RESIDE, DominanceRung.CANNOT_CO_RESIDE),
+            (300.0, DominanceRung.CANNOT_CO_RESIDE, DominanceRung.CANNOT_CO_SAMPLE),
+            (-100.0, DominanceRung.CANNOT_CO_SAMPLE, DominanceRung.CANNOT_CO_SAMPLE),
+            (-300.0, DominanceRung.CANNOT_CO_SAMPLE, DominanceRung.CANNOT_CO_RESIDE),
+            (-100.0, None, DominanceRung.CANNOT_CO_RESIDE),
+        ],
+        ids=[
+            "held_rung_two_inside_the_band_stays",
+            "held_rung_two_past_the_band_leaves",
+            "rung_one_inside_the_band_is_not_promoted",
+            "rung_one_past_the_band_is_promoted",
+            "a_first_verdict_reads_the_bare_sign",
+        ],
+    )
+    def test_rung_two_edges(self, slack_mb: float, previous: DominanceRung | None, expected: DominanceRung) -> None:
+        """Rung 2's slack beside one context must cross zero by more than the band to change a held rung."""
+        peak_mb = _HYSTERESIS_TOTAL_MB - _HYSTERESIS_CHARGES_MB - slack_mb
+        assert _held_rung(peak_mb, 3821.0, previous) is expected
+
+    @pytest.mark.parametrize(
+        ("room_mb", "previous", "expected"),
+        [
+            (-100.0, DominanceRung.NONE, DominanceRung.NONE),
+            (-300.0, DominanceRung.NONE, DominanceRung.CANNOT_CO_SAMPLE),
+            (100.0, DominanceRung.CANNOT_CO_SAMPLE, DominanceRung.CANNOT_CO_SAMPLE),
+            (300.0, DominanceRung.CANNOT_CO_SAMPLE, DominanceRung.NONE),
+            (-100.0, None, DominanceRung.CANNOT_CO_SAMPLE),
+        ],
+        ids=[
+            "a_partner_short_inside_the_band_keeps_none",
+            "a_partner_short_past_the_band_enters_rung_one",
+            "held_rung_one_with_room_inside_the_band_stays",
+            "held_rung_one_with_room_past_the_band_leaves",
+            "a_first_verdict_reads_the_bare_sign",
+        ],
+    )
+    def test_rung_one_edges(self, room_mb: float, previous: DominanceRung | None, expected: DominanceRung) -> None:
+        """The best partner's room must cross zero by more than the band to change a held rung 1."""
+        peak_mb = 10000.0
+        partner_mb = _HYSTERESIS_TOTAL_MB - _HYSTERESIS_CHARGES_MB - peak_mb - room_mb
+        assert _held_rung(peak_mb, partner_mb, previous) is expected
+
+    def test_the_card_verdict_keeps_a_rung_through_drift_inside_the_band(self) -> None:
+        """A recompute whose peak moved by less than the band past the threshold keeps the earlier rung."""
+        inputs = pricing.DominanceInputs(
+            offered_models=frozenset({"big"}),
+            whole_card_pins=frozenset(),
+            total_vram_mb=_HYSTERESIS_TOTAL_MB,
+            first_context_mb=_HYSTERESIS_CHARGES_MB,
+            marginal_context_mb=0.0,
+            admission_noise_mb=0.0,
+            foreign_floor_bucket=None,
+            sample_observation_counts=(),
+        )
+        threshold_mb = _HYSTERESIS_TOTAL_MB - _HYSTERESIS_CHARGES_MB
+
+        def peak(peak_mb: float) -> list[pricing.ModelSamplingPeak]:
+            return [pricing.ModelSamplingPeak("big", peak_mb, ResolutionBucket.LE_1024, 10)]
+
+        first = pricing.decide_card_dominance(inputs, foreign_floor_mb=0.0, peaks=peak(threshold_mb - 50.0))
+        drifted = pricing.decide_card_dominance(
+            inputs,
+            foreign_floor_mb=0.0,
+            peaks=peak(threshold_mb + 100.0),
+            previous=first,
+        )
+        moved = pricing.decide_card_dominance(
+            inputs, foreign_floor_mb=0.0, peaks=peak(threshold_mb + 300.0), previous=first
+        )
+
+        assert first.verdicts["big"].rung is DominanceRung.CANNOT_CO_SAMPLE
+        assert drifted.verdicts["big"].rung is DominanceRung.CANNOT_CO_SAMPLE
+        assert moved.verdicts["big"].rung is DominanceRung.CANNOT_CO_RESIDE
+
+
+class TestDominancePairing:
+    """The co-sampling lever: a dominant side pairs only where the pair leaves room on the card."""
+
+    @pytest.fixture
+    def replay_store(self, tmp_path: Path) -> LearnedFootprintStore:
+        """Return the replay fixture's learned store from a 24 GB card, keyed for this platform."""
+        return load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path)
+
+    def test_nothing_samples_beside_a_rung_one_model(self, replay_store: LearnedFootprintStore) -> None:
+        """Behind the 3,300 MB tenant no offered model, not even SD1.5 at 512, may sample beside Flux."""
+        dominance = _replay_dominance(replay_store, foreign_floor_mb=3300.0)
+        flux = ("Flux.1-Schnell fp8 (Compact)", "flux_1")
+        for model, baseline in _REPLAY_CATALOGUE.items():
+            assert pricing.pair_co_samples(dominance, replay_store, candidate=(model, baseline), running=flux) is False
+            assert pricing.pair_co_samples(dominance, replay_store, candidate=flux, running=(model, baseline)) is False
+
+    def test_a_pair_with_no_dominant_side_is_left_to_the_arbiter(self, replay_store: LearnedFootprintStore) -> None:
+        """Two models with partners are not refused by the arithmetic, whatever room their pair leaves."""
+        dominance = _replay_dominance(replay_store, foreign_floor_mb=3300.0)
+        sdxl = ("AlbedoBase XL (SDXL)", "stable_diffusion_xl")
+        assert pricing.pair_co_samples(dominance, replay_store, candidate=sdxl, running=sdxl) is True
+
+    def test_without_the_tenant_flux_takes_a_partner(self, replay_store: LearnedFootprintStore) -> None:
+        """At a zero floor Flux is on no rung, so an SD1.5 job may join it."""
+        dominance = _replay_dominance(replay_store, foreign_floor_mb=0.0)
+        assert (
+            pricing.pair_co_samples(
+                dominance,
+                replay_store,
+                candidate=("stable_diffusion", "stable_diffusion_1"),
+                running=("Flux.1-Schnell fp8 (Compact)", "flux_1"),
+            )
+            is True
+        )
+
+    def test_an_unsized_card_admits(self) -> None:
+        """With no verdict nothing is refused, and the arbiter's memory answer stands alone."""
+        assert pricing.pair_co_samples(None, None, candidate=("a", None), running=("b", None)) is True
+
+
+class TestDominanceCache:
+    """The scheduler computes a card's verdict once per change of its inputs and the forecast reads it."""
+
+    _FLUX = "flux_model"
+    _SD15 = "sd15_model"
+
+    def _scheduler(self, offered: list[str]) -> InferenceScheduler:
+        reference = {
+            self._FLUX: make_mock_model_reference_record(self._FLUX, baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1),
+            self._SD15: make_mock_model_reference_record(
+                self._SD15,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+            ),
+        }
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({0: _slot(0, model=None)}),  # type: ignore[arg-type]
+            model_metadata=make_test_model_metadata(reference),
+            device_free_mb=14000.0,
+        )
+        scheduler._runtime_config.bridge_data.image_models_to_load = offered  # type: ignore[attr-defined]
+        # The first context the whole-card goldens' world charges, so the 16 GB card here is the goldens' card.
+        scheduler._runtime_config.bridge_data.vram_per_process_overhead_mb = 1354.0  # type: ignore[attr-defined]
+        scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=16384.0)  # type: ignore[method-assign]
+        return scheduler
+
+    def test_an_unchanged_input_returns_the_cached_verdict(self) -> None:
+        """Two reads with nothing moved return the same record, so nothing is recomputed per cycle."""
+        scheduler = self._scheduler([self._FLUX, self._SD15])
+        first = scheduler.card_dominance(None)
+
+        assert first is not None
+        assert scheduler.card_dominance(None) is first
+
+    def test_the_verdict_follows_the_offered_set(self) -> None:
+        """Taking a model out of the offer recomputes the verdict without it."""
+        scheduler = self._scheduler([self._FLUX, self._SD15])
+        first = scheduler.card_dominance(None)
+        scheduler._runtime_config.bridge_data.image_models_to_load = [self._FLUX]  # type: ignore[attr-defined]
+        second = scheduler.card_dominance(None)
+
+        assert first is not None
+        assert second is not None
+        assert second is not first
+        assert set(second.verdicts) == {self._FLUX}
+
+    def test_the_verdict_follows_the_foreign_floor(self) -> None:
+        """A floor that moves past its bucket recomputes the verdict with the new floor charged."""
+        scheduler = self._scheduler([self._FLUX, self._SD15])
+        floor_mb: list[float | None] = [None]
+        scheduler.current_foreign_floor_mb = lambda _device_index: floor_mb[0]  # type: ignore[method-assign]
+        first = scheduler.card_dominance(None)
+        floor_mb[0] = 3300.0
+        second = scheduler.card_dominance(None)
+
+        assert first is not None
+        assert second is not None
+        assert second is not first
+        assert first.foreign_floor_mb == 0.0
+        assert second.foreign_floor_mb == 3300.0
+
+    def test_the_verdict_follows_a_footprint_observation(self) -> None:
+        """An observation on an offered baseline's pooled sampling key recomputes the verdict."""
+        scheduler = self._scheduler([self._FLUX, self._SD15])
+        store = LearnedFootprintStore()
+        scheduler.set_footprint_store(store)
+        first = scheduler.card_dominance(None)
+        store.observe_peak(pricing.pooled_sample_key("flux_1", ResolutionBucket.LE_1024), 15000.0)
+
+        assert scheduler.card_dominance(None) is not first
+
+    async def test_the_snapshot_and_the_live_forecast_read_the_same_verdict(self) -> None:
+        """Both forecast forms demand the residency for a rung-2 model, and the snapshot carries the cache."""
+        scheduler = self._scheduler([self._FLUX, self._SD15])
+        job = make_job_pop_response(model=self._FLUX, width=1024, height=1024)
+        await track_popped_job_async(scheduler._job_tracker, job)  # type: ignore[attr-defined]
+        snapshot = scheduler.snapshot()
+        baseline = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
+
+        assert snapshot.card(None).dominance is scheduler.card_dominance(None)
+        live = scheduler._forecast_streaming(job, baseline)  # type: ignore[attr-defined]
+        assert pricing.forecast_streaming(snapshot, job, baseline) == live
+        assert live.wants_whole_card is True
+        assert live.whole_card_tier is True
+
+    async def test_a_rung_one_model_is_not_demanded_a_residency(self) -> None:
+        """Flux on a 24 GB card behind a 3,300 MB tenant samples beside a context, so no teardown is asked."""
+        scheduler = self._scheduler([self._FLUX, self._SD15])
+        scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=24074.0)  # type: ignore[method-assign]
+        scheduler.current_foreign_floor_mb = lambda _device_index: 3300.0  # type: ignore[method-assign]
+        dominance = scheduler.card_dominance(None)
+        job = make_job_pop_response(model=self._FLUX, width=1024, height=1024)
+
+        assert dominance is not None
+        assert dominance.verdicts[self._FLUX].rung is not DominanceRung.CANNOT_CO_RESIDE
+        forecast = scheduler._forecast_streaming(job, KNOWN_IMAGE_GENERATION_BASELINE.flux_1)  # type: ignore[attr-defined]
+        assert forecast.wants_whole_card is False
+        assert forecast.needs_exclusive_residency is False
+
+    def test_a_rung_two_model_carries_its_partial_seat_and_the_ceiling(self) -> None:
+        """The offer's seat is the one partial_seat_mb prices a plain job at. A model off rung 2 has none."""
+        scheduler = self._scheduler([self._FLUX, self._SD15])
+        seat = scheduler.whole_card_seat(self._FLUX, None)
+        job = make_job_pop_response(model=self._FLUX, width=1024, height=1024)
+        expected_seat_mb = pricing.partial_seat_mb(
+            scheduler.snapshot(),
+            job,
+            "flux_1",
+            device_index=None,
+            weight_fraction=pricing.PARTIAL_SEAT_FALLBACK_WEIGHT_FRACTION,
+        )
+
+        assert seat is not None
+        assert seat.seat_mb == expected_seat_mb
+        assert seat.ceiling_mb == scheduler.achievable_ceiling_mb(None)
+        assert scheduler.whole_card_seat(self._SD15, None) is None
+
+    def test_a_pin_overrides_the_verdict(self) -> None:
+        """A pinned model is demanded the residency on a card where it is on no rung."""
+        scheduler = self._scheduler([self._FLUX, self._SD15])
+        scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=24074.0)  # type: ignore[method-assign]
+        scheduler._runtime_config.bridge_data.whole_card_models = [self._FLUX]  # type: ignore[attr-defined]
+        job = make_job_pop_response(model=self._FLUX, width=1024, height=1024)
+
+        forecast = scheduler._forecast_streaming(job, KNOWN_IMAGE_GENERATION_BASELINE.flux_1)  # type: ignore[attr-defined]
+        assert forecast.wants_whole_card is True
+        assert forecast.whole_card_pinned is True

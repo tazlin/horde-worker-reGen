@@ -16,6 +16,10 @@ model, so the horde stops sending work that would force the resident weights bac
 is a residency fact, so its state and its two end conditions (the operator-configured maximum hold, and the
 run of empty pops that says the resident model's demand has dried up) are answered here too.
 
+Each grant carries the dominance rung it was made on (:class:`DominanceRung`). Rung 2 carries the teardown. The
+readers that stop siblings, move safety or pause lanes read :meth:`WholeCardResidencyLedger.teardown_held`, so a rung-1
+grant shares the claim, the holds and the cooldown without tearing anything down.
+
 The scheduler keeps the transitions that touch live processes (establish, converge,
 restore); it reads and writes residency state exclusively through
 [`WholeCardResidencyLedger`][horde_worker_regen.process_management.scheduling.governance.whole_card.WholeCardResidencyLedger].
@@ -49,6 +53,7 @@ __all__ = [
     "WHOLE_CARD_DRAIN_SETTLE_SECONDS",
     "WHOLE_CARD_ESTABLISH_GRACE_SECONDS",
     "WHOLE_CARD_RESTORE_GRACE_SECONDS",
+    "DominanceRung",
     "GraceBudgetStatus",
     "WholeCardGovernor",
     "WholeCardGovernorHold",
@@ -248,6 +253,21 @@ class WholeCardPopClaimRelease(StrEnum):
     """The residency behind the claim let go, and the claim went with it."""
 
 
+class DominanceRung(StrEnum):
+    """How far a model dominates a card, given the card, the offered set, the footprints and the foreign floor.
+
+    The rungs nest, since a model that cannot sample beside one context cannot sample beside another model
+    either. The verdict is computed in ``scheduling.admission.pricing``, and the residency grant carries it.
+    """
+
+    NONE = "none"
+    """Some offered model can sample beside it."""
+    CANNOT_CO_SAMPLE = "cannot_co_sample"
+    """Rung 1: no offered model, a second copy of itself included, can sample beside it."""
+    CANNOT_CO_RESIDE = "cannot_co_reside"
+    """Rung 2: its sampling peak beside one sibling context exceeds the card, so only the teardown seats it."""
+
+
 @dataclass
 class WholeCardResidency:
     """Mutable whole-card exclusive-residency state for one card (the worker, on a single-GPU host).
@@ -259,6 +279,9 @@ class WholeCardResidency:
 
     model: str | None = None
     """The model holding (or being given) sole residency on this card; None when no residency is held."""
+    rung: DominanceRung = DominanceRung.CANNOT_CO_RESIDE
+    """The dominance rung the grant was made on. Rung 2 carries the teardown (stopped siblings, safety off the
+    card, paused lanes). Rung 1 shares the claim, the holds and the cooldown and tears nothing down."""
     forecast: StreamForecast | None = None
     """The immutable forecast that granted this residency, cached for diagnostics and its fit guarantee."""
     repriced_target: int | None = None
@@ -384,6 +407,10 @@ class WholeCardResidencyLedger:
         """Return ``(device_index, state)`` for every card currently holding a residency (model set)."""
         return [(index, state) for index, state in self._residencies.items() if state.model is not None]
 
+    def teardown_held(self) -> list[tuple[int | None, WholeCardResidency]]:
+        """Return the held residencies granted on rung 2, the ones whose readers tear the card down."""
+        return [(index, state) for index, state in self.held() if state.rung is DominanceRung.CANNOT_CO_RESIDE]
+
     def any_held(self) -> bool:
         """Return whether any card currently holds a whole-card residency."""
         return any(state.model is not None for state in self._residencies.values())
@@ -411,6 +438,7 @@ class WholeCardResidencyLedger:
         now: float,
         establish_grace_seconds: float = 0.0,
         new_demand: bool = True,
+        rung: DominanceRung = DominanceRung.CANNOT_CO_RESIDE,
     ) -> WholeCardGrantKind:
         """Record a residency grant (an establishment or a RAM pre-stage) for ``device_index``.
 
@@ -434,6 +462,9 @@ class WholeCardResidencyLedger:
         for the residency to converge. Such a reuse is no new evidence of demand, so it leaves the empty-pop
         run alone; resetting the run on every re-ask would keep the claim from ever releasing while the head
         is parked.
+
+        ``rung`` is the dominance rung the grant is made on. A further ask on a higher rung promotes the held
+        grant in place. A lower one never demotes it while it is held.
         """
         state = self.state_for(device_index)
         kind = (
@@ -462,6 +493,8 @@ class WholeCardResidencyLedger:
         elif state.forecast is None:
             state.forecast = forecast
             state.repriced_target = forecast.max_resident_processes() if forecast is not None else None
+        if kind is WholeCardGrantKind.ESTABLISH or rung is DominanceRung.CANNOT_CO_RESIDE:
+            state.rung = rung
         state.model = model
         state.cooldown_until = cooldown_until
         return kind
@@ -480,6 +513,7 @@ class WholeCardResidencyLedger:
         """
         state = self.state_for(device_index)
         state.model = None
+        state.rung = DominanceRung.CANNOT_CO_RESIDE
         state.forecast = None
         state.repriced_target = None
         state.established_at = 0.0

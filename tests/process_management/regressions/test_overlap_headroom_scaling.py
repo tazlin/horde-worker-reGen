@@ -2,8 +2,8 @@
 
 The overlap gate exists to stop stacked weight loads and activation peaks from thrashing a sampler
 into a step-timeout teardown. It runs two guards. A temporal/structural guard keeps a newcomer off a
-running job's memory-hungry startup beat: two extra-large (whole-card tier) models never share a card, a
-pairing with one extra-large side needs confirmed room and the strictest headway, and a heavy pairing (or a
+running job's memory-hungry startup beat: a pairing the card's dominance arithmetic cannot fit never shares it, a
+pairing with an extra-large side needs confirmed room and the strictest headway, and a heavy pairing (or a
 batch) must let the running job make size-appropriate headway first. The memory guard is the VRAM arbiter's:
 it prices the candidate's marginal device cost against the cycle-frozen admission floor and answers whether
 the card can hold the overlap at all.
@@ -18,6 +18,7 @@ relaxes to admit and only the temporal guard applies.
 from __future__ import annotations
 
 import pytest
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
@@ -29,13 +30,16 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
     MeasuredVramSnapshot,
     VramArbiter,
 )
+from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.clearance_lease import CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.workload_flow import PRELOAD_ADMISSION_FLOW
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_model_metadata,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
@@ -43,6 +47,13 @@ _HEAVY_A = "sdxl_alpha"
 _HEAVY_B = "sdxl_beta"
 _EXTRA_LARGE = "flux_like"
 _EXTRA_LARGE_OTHER = "qwen_like"
+_EXTRA_LARGE_BASELINES: dict[str, KNOWN_IMAGE_GENERATION_BASELINE] = {
+    _EXTRA_LARGE: KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
+    _EXTRA_LARGE_OTHER: KNOWN_IMAGE_GENERATION_BASELINE.qwen_image,
+}
+"""The reference baselines a priced card gives the extra-large models, so the dominance verdict prices each."""
+_PRICED_CARD_TOTAL_MB = 24576.0
+"""A 24 GB card: no two of the extra-large models' sampling seeds fit on it together beside two contexts."""
 
 
 def _fitting_state() -> DeviceVramState:
@@ -84,9 +95,22 @@ def _make_overlap_scheduler(  # noqa: ANN202
     memory_admits: bool,
     high_performance_mode: bool = False,
     moderate_performance_mode: bool = False,
+    priced_card: bool = False,
 ):
-    """A two-slot scheduler with pinned model tiers and a crafted arbiter cycle for the memory question."""
+    """A two-slot scheduler with pinned model tiers and a crafted arbiter cycle for the memory question.
+
+    ``priced_card`` sizes the card and gives the extra-large models their reference baselines, so the card's
+    dominance verdict prices them and its pairing lever decides which pairings may sample together. Otherwise the
+    card is unsized, there is no verdict, and the lever admits every pairing.
+    """
     process_map = ProcessMap({1: make_mock_process_info(1), 2: make_mock_process_info(2)})
+    if priced_card:
+        for process_info in process_map.values():
+            process_info.total_vram_mb = _PRICED_CARD_TOTAL_MB
+    reference = {
+        model: make_mock_model_reference_record(model, baseline=baseline)
+        for model, baseline in _EXTRA_LARGE_BASELINES.items()
+    }
     scheduler = _make_inference_scheduler(
         process_map=process_map,
         job_tracker=job_tracker,
@@ -100,6 +124,7 @@ def _make_overlap_scheduler(  # noqa: ANN202
         ),
         max_concurrent=2,
         max_inference=2,
+        model_metadata=make_test_model_metadata(reference) if priced_card else None,
     )
     monkeypatch.setattr(
         scheduler,
@@ -319,12 +344,25 @@ class TestExtraLargePairingIsPriced:
     async def test_second_extra_large_job_never_joins_despite_headroom(
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Two extra-large jobs never share a card, whether two copies of one model or two different ones."""
+        """A pair the card's dominance arithmetic cannot fit never shares it, whatever headroom the arbiter reads.
+
+        The size tier alone keeps no two extra-large models apart. The pairing lever (:func:`pricing.pair_co_samples`)
+        decides: on this card neither two copies of one model nor two different ones fit together beside two
+        contexts, so it refuses both.
+        """
         tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _EXTRA_LARGE_OTHER: ModelSizeTier.EXTRA_LARGE}
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
+        scheduler = _make_overlap_scheduler(
+            job_tracker, monkeypatch, tiers=tiers, memory_admits=True, priced_card=True
+        )
         await _running(job_tracker, _EXTRA_LARGE)
         _pin_progress(monkeypatch, scheduler, 0.95)
 
+        dominance = scheduler.card_dominance(None)
+        running = (_EXTRA_LARGE, _EXTRA_LARGE_BASELINES[_EXTRA_LARGE])
+        for candidate in _EXTRA_LARGE_BASELINES.items():
+            assert pricing.pair_co_samples(dominance, None, candidate=candidate, running=running) is False, (
+                f"precondition: the card's arithmetic refuses {candidate[0]} beside {_EXTRA_LARGE}"
+            )
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE)) is False
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE_OTHER)) is False
 
@@ -588,7 +626,8 @@ class TestTwoPhaseRunningSetIsTheSamplingLanes:
     """Under two-phase clearance the pairing rule reads only the lanes that are sampling.
 
     A lane at full progress has released its sampling slot and is decoding; the clearance and the lease price
-    its remaining work, so it does not hold an extra-large head the way a sampler does.
+    its remaining work, so it does not hold an extra-large head the way a sampler does. The card is priced, so
+    the pairing a running sampler takes part in is the dominance pairing lever's (:func:`pricing.pair_co_samples`).
     """
 
     async def _extra_large_on_lane_one(
@@ -599,9 +638,11 @@ class TestTwoPhaseRunningSetIsTheSamplingLanes:
         two_phase: bool,
         steps_done: int,
     ) -> InferenceScheduler:
-        """A leased scheduler with an extra-large job on lane 1 at ``steps_done`` of 20 steps."""
+        """A leased scheduler on a priced card with an extra-large job on lane 1 at ``steps_done`` of 20 steps."""
         tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _EXTRA_LARGE_OTHER: ModelSizeTier.EXTRA_LARGE}
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
+        scheduler = _make_overlap_scheduler(
+            job_tracker, monkeypatch, tiers=tiers, memory_admits=True, priced_card=True
+        )
         scheduler._runtime_config.bridge_data.gpu_sampling_lease_enabled = True
         scheduler._runtime_config.bridge_data.gpu_sampling_lease_two_phase = two_phase
         running_job = await _running(job_tracker, _EXTRA_LARGE)
@@ -623,18 +664,33 @@ class TestTwoPhaseRunningSetIsTheSamplingLanes:
     async def test_a_sampling_extra_large_lane_still_holds_an_extra_large_head(
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Two extra-large samplers never share a card, however close the running one is to done."""
+        """A sampler the pairing lever refuses a partner holds the head, however close it is to done."""
         scheduler = await self._extra_large_on_lane_one(job_tracker, monkeypatch, two_phase=True, steps_done=19)
 
+        assert self._pair_refused(scheduler)
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE_OTHER)) is False
 
     async def test_without_two_phase_a_decoding_extra_large_lane_holds_the_head(
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """CONTROL: single-phase dispatch loads and samples in one window, so every in-flight job is in the set."""
+        """CONTROL: single-phase dispatch loads and samples in one window, so every in-flight job is in the set.
+
+        The decoding lane is a running sampler here, and the pairing lever refuses the head beside it.
+        """
         scheduler = await self._extra_large_on_lane_one(job_tracker, monkeypatch, two_phase=False, steps_done=20)
 
+        assert self._pair_refused(scheduler)
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE_OTHER)) is False
+
+    @staticmethod
+    def _pair_refused(scheduler: InferenceScheduler) -> bool:
+        """Whether the card's dominance arithmetic refuses the second extra-large model beside the running one."""
+        return not pricing.pair_co_samples(
+            scheduler.card_dominance(None),
+            None,
+            candidate=(_EXTRA_LARGE_OTHER, _EXTRA_LARGE_BASELINES[_EXTRA_LARGE_OTHER]),
+            running=(_EXTRA_LARGE, _EXTRA_LARGE_BASELINES[_EXTRA_LARGE]),
+        )
 
 
 class TestSinglePhaseRunningSetIsTheGrantedLanes:

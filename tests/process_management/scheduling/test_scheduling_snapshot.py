@@ -170,6 +170,7 @@ class TestSchedulingSnapshot:
         assert snapshot.queue.jobs[head_id].component_charge_mb is None
         assert snapshot.services.ram_budget is scheduler._ram_budget  # type: ignore[attr-defined]
         assert card.exclusive_job_in_progress is False
+        assert card.dominance is scheduler.card_dominance(None), "the card carries the scheduler's cached verdict"
         assert snapshot.draining_process_ids == frozenset()
         assert snapshot.shutting_down is False
         assert snapshot.max_concurrent_inference_processes == 1

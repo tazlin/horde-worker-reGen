@@ -2047,6 +2047,7 @@ class HordeWorkerProcessManager:
             whole_card_pop_claim=self._inference_scheduler.whole_card_pop_claim,
             whole_card_pop_outcome=self._inference_scheduler.note_whole_card_pop_outcome,
             admission_baseline_provider=self._inference_scheduler.serviceability_baseline_mb,
+            whole_card_seat_provider=self._inference_scheduler.whole_card_seat,
             extended_controlnet_ready_provider=self._extended_controlnet_ready,
             post_processing_lane_paused_provider=lambda: self._process_lifecycle.is_post_process_gpu_paused,
             safety_off_gpu_provider=lambda: self._process_lifecycle.is_safety_gpu_paused,
@@ -8058,6 +8059,7 @@ class HordeWorkerProcessManager:
                     model_metadata=self._model_metadata,
                     admission_baseline_provider=self._inference_scheduler.serviceability_baseline_mb,
                     max_pixels=max_power_to_pixels(card_runtime.config.max_power),
+                    whole_card_seat_provider=self._inference_scheduler.whole_card_seat,
                 ):
                     if verdict.tier is ModelServiceabilityTier.UNSERVICEABLE:
                         unserviceable_models.append(model)

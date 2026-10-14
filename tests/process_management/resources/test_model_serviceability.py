@@ -10,6 +10,7 @@ from horde_worker_regen.process_management.resources.model_serviceability import
     ConstrainedLaneState,
     ModelFootprintFigures,
     ModelServiceabilityTier,
+    WholeCardSeat,
     assess_model_serviceability,
     check_card_weight_budget,
     decide_constrained_offer,
@@ -446,6 +447,54 @@ class TestModelServiceabilityVerdicts:
         )
 
         assert verdicts[0][1].noise_buffer_mb == 0.0
+
+    @pytest.mark.parametrize(
+        ("seat_mb", "expected"),
+        [(19000.0, ModelServiceabilityTier.SERVICEABLE), (21000.0, ModelServiceabilityTier.UNSERVICEABLE)],
+        ids=["seat_fits_the_ceiling", "seat_over_the_ceiling"],
+    )
+    def test_a_rung_two_model_is_judged_by_its_seat_against_the_achievable_ceiling(
+        self,
+        seat_mb: float,
+        expected: ModelServiceabilityTier,
+    ) -> None:
+        """The seat against the ceiling decides the offer, whatever the recommended minimum card says."""
+        cards, metadata = self._flux_card(24576.0)
+        seen: list[tuple[str, int | None]] = []
+
+        def seat(model: str, device_index: int | None) -> WholeCardSeat:
+            seen.append((model, device_index))
+            return WholeCardSeat(seat_mb=seat_mb, ceiling_mb=20000.0)
+
+        verdicts = model_serviceability_verdicts(
+            "flux_model",
+            card_runtimes=cards,
+            model_metadata=metadata,
+            admission_baseline_provider=None,
+            max_pixels=None,
+            whole_card_seat_provider=seat,
+        )
+
+        assert [verdict.tier for _, verdict in verdicts] == [expected]
+        assert verdicts[0][1].whole_card_seat == WholeCardSeat(seat_mb=seat_mb, ceiling_mb=20000.0)
+        assert "achievable ceiling" in verdicts[0][1].reason()
+        assert seen == [("flux_model", next(iter(cards)))]
+
+    def test_a_model_with_no_seat_keeps_the_recommended_card_rule(self) -> None:
+        """A provider that has no seat for the model leaves the verdict on its other rules."""
+        cards, metadata = self._flux_card(16384.0)
+
+        verdicts = model_serviceability_verdicts(
+            "flux_model",
+            card_runtimes=cards,
+            model_metadata=metadata,
+            admission_baseline_provider=None,
+            max_pixels=None,
+            whole_card_seat_provider=lambda _model, _device: None,
+        )
+
+        assert [verdict.tier for _, verdict in verdicts] == [ModelServiceabilityTier.SERVICEABLE]
+        assert verdicts[0][1].whole_card_seat is None
 
     def test_no_serving_card_yields_no_verdict(self) -> None:
         """A model no card offers has nothing to judge."""

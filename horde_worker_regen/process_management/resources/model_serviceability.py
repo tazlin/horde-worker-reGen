@@ -34,6 +34,12 @@ names, and the job size is left to runtime admission, which prices the streamed 
 truth. A resident co-fit at the operator's ``max_power`` would otherwise cap such a model far below what the
 card runs, and the cap would ride every constrained pop.
 
+A model the card's dominance verdict places on rung 2, or the operator pins, is judged for the offer by its
+partial-load seat against the card's achievable ceiling (total net of the admission margin and the learned
+foreign floor) instead. After the teardown that seat is how the card serves it, so a seat the ceiling cannot hold
+is a model the card cannot serve. The preload gate keeps the recommended-minimum rule, so a job accepted before the
+floor rose still gets its load.
+
 A ``CONSTRAINED`` model is not allowed to lower every other model's ``max_power``: the horde's pop carries one
 ``max_pixels`` for the whole offer, so the constrained models are advertised on a pop of their own, one in a
 bounded run of full-size pops (:func:`decide_constrained_offer`). The full-size pops carry the unconstrained
@@ -239,6 +245,23 @@ def check_card_weight_budget(
 
 
 @dataclass(frozen=True)
+class WholeCardSeat:
+    """Represents the partial-load seat a rung-2 or pinned model needs on a card, and what the card can give.
+
+    The seat is the share of weights a partial load holds plus its sampling non-weight memory. The ceiling is the
+    card's total net of the admission margin and the learned foreign floor, the most one load could be given.
+    """
+
+    seat_mb: float
+    ceiling_mb: float
+
+    @property
+    def fits(self) -> bool:
+        """Whether the seat fits the achievable ceiling."""
+        return self.seat_mb <= self.ceiling_mb
+
+
+@dataclass(frozen=True)
 class ModelServiceabilityVerdict:
     """The result of checking a model's footprint against one card."""
 
@@ -253,6 +276,8 @@ class ModelServiceabilityVerdict:
     """Whether the model was judged as a whole-card model, by its recommended minimum card against the total."""
     weight_budget: CardWeightBudgetCheck | None = None
     """The card's weight-budget check of the model's core weights, or None when the verdict abstained."""
+    whole_card_seat: WholeCardSeat | None = None
+    """The partial-load seat the model was judged by, for a rung-2 or pinned model with a priced seat."""
 
     @property
     def over_weight_budget(self) -> bool:
@@ -299,6 +324,12 @@ class ModelServiceabilityVerdict:
             f"{self.noise_buffer_mb:.0f} = {self.capacity_mb:.0f} MB"
         )
         minimum = self.figures.minimum_footprint_mb
+        if self.whole_card_seat is not None:
+            fits = "fits" if self.whole_card_seat.fits else "does NOT fit"
+            return (
+                f"whole-card model judged by its partial-load seat {self.whole_card_seat.seat_mb:.0f} MB against the "
+                f"achievable ceiling {self.whole_card_seat.ceiling_mb:.0f} MB: {fits}"
+            )
         if self.whole_card:
             floor = self.figures.min_recommended_card_mb
             if floor <= 0:
@@ -347,8 +378,13 @@ def assess_model_serviceability(
     max_pixels: int | None = None,
     whole_card: bool = False,
     fixed_reserved_vram_mb: float = 0.0,
+    whole_card_seat: WholeCardSeat | None = None,
 ) -> ModelServiceabilityVerdict:
     """Return which tier a model falls in on one card.
+
+    A ``whole_card_seat`` (a rung-2 or pinned model's partial-load seat and the card's achievable ceiling) decides
+    the tier once the weight budget passes. The tier is ``SERVICEABLE`` when the seat fits the ceiling and
+    ``UNSERVICEABLE`` otherwise, whatever the recommended minimum card says.
 
     Unknown capacity or unknown footprint figures abstain as serviceable: the worker must not de-list a model
     on missing metadata. When both sides are known, core weights over the card's weight budget
@@ -382,6 +418,8 @@ def assess_model_serviceability(
         # A recommended minimum card that fits says nothing about weights over the budget: they stream every
         # step, and dispatch eligibility refuses the job on this card by the same check.
         tier = ModelServiceabilityTier.UNSERVICEABLE
+    elif whole_card_seat is not None:
+        tier = ModelServiceabilityTier.SERVICEABLE if whole_card_seat.fits else ModelServiceabilityTier.UNSERVICEABLE
     elif whole_card:
         floor_mb = figures.min_recommended_card_mb
         tier = (
@@ -414,6 +452,7 @@ def assess_model_serviceability(
         max_pixels=max_pixels,
         whole_card=whole_card,
         weight_budget=weight_budget,
+        whole_card_seat=whole_card_seat if weight_budget.fits else None,
     )
 
 
@@ -462,6 +501,7 @@ def model_serviceability_verdicts(
     model_metadata: ModelMetadata | None,
     admission_baseline_provider: Callable[[int | None], float | None] | None,
     max_pixels: int | None,
+    whole_card_seat_provider: Callable[[str, int | None], WholeCardSeat | None] | None = None,
 ) -> list[tuple[CardRuntime, ModelServiceabilityVerdict]]:
     """Return one serviceability verdict per card that serves ``model``.
 
@@ -471,6 +511,12 @@ def model_serviceability_verdicts(
     abstains (reads as serviceable) when the model's footprint or the card's total is unknown. The noise
     buffer is the card's admission margin (the operator's per-card override, else the platform default), the
     same slack runtime VRAM admission subtracts.
+
+    ``whole_card_seat_provider`` gives a rung-2 or pinned model's partial-load seat and the card's achievable
+    ceiling, which then decide the verdict (:func:`assess_model_serviceability`). The ceiling carries the learned
+    foreign floor, so the model leaves the offer while the floor leaves no room for its seat and returns when the
+    floor recedes. The offer passes it. The preload gate does not, because a job accepted before the floor rose is
+    owed its one real load.
 
     The weight-budget check reads the card's whole total: no per-card fixed reservation reaches this function,
     so a whole-card model beside a fixed on-GPU safety residency is judged here against a larger budget than
@@ -501,6 +547,11 @@ def model_serviceability_verdicts(
                     figures=figures,
                     max_pixels=max_pixels,
                     whole_card=whole_card,
+                    whole_card_seat=(
+                        whole_card_seat_provider(model, card.device_index)
+                        if whole_card_seat_provider is not None
+                        else None
+                    ),
                 ),
             ),
         )

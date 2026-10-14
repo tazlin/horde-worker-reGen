@@ -7,7 +7,7 @@ import statistics
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -69,6 +69,7 @@ from horde_worker_regen.process_management.resources.foreign_vram_floor import (
     floor_with_known_tenant_mb,
 )
 from horde_worker_regen.process_management.resources.model_serviceability import (
+    WholeCardSeat,
     model_serviceability_verdicts,
     serviceability_arithmetic,
 )
@@ -140,6 +141,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    ResolutionBucket,
     job_class_key,
     learned_post_process_vram_mb,
     plausible_sampling_peak_mb,
@@ -234,6 +236,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_DRAIN_SETTLE_SECONDS,
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
+    DominanceRung,
     WholeCardGrantKind,
     convergence_blockers,
     post_process_context_fits,
@@ -766,6 +769,11 @@ class InferenceScheduler:
         # systematically undershoots the reserved peak (calibration saw ~11GB against a 6158MB seed). None
         # until wired (and in standalone unit tests), where every estimate falls back to the static seed.
         self._footprint_store: LearnedFootprintStore | None = None
+        # Each card's dominance verdict, recomputed only when an input it depends on changes, and the pooled
+        # sampling keys of the offered baselines, rebuilt only when the offer changes, so the per-read change test
+        # is a handful of lookups.
+        self._card_dominance: dict[int | None, pricing.CardDominance] = {}
+        self._dominance_sample_keys: dict[frozenset[str], tuple[tuple[str, tuple[FootprintKey, ...]], ...]] = {}
 
         # Pipeline-disaggregation hooks, wired by the manager via set_disaggregation_hooks. The predicate
         # decides whether a job takes the disaggregated path (so its verdicts charge the UNet-only sampler
@@ -1149,13 +1157,13 @@ class InferenceScheduler:
         # first is the share of the after-model-evict deduction that stopping inference siblings cannot give
         # back, the second the context count the budget says already fits. A reduction demanded while
         # max_resident already covers the live processes is a deficit made of the unreclaimable charges.
-        # A whole-card baseline that stops claiming the card on measured evidence is a visible reversal of a
-        # declared policy, so the figure and the number of runs behind it are named where the reversal happens.
+        # An extra-large model the dominance verdict leaves off rung 2 on measured evidence takes no teardown
+        # although its tier suggests one, so the line carries the evidence behind the release.
         measured_note = ""
-        if forecast.measured_retires_whole_card_intent and forecast.measured_footprint_mb is not None:
+        if forecast.measured_retires_whole_card_intent:
             measured_note = (
-                f" [whole-card intent retired: measured {forecast.measured_footprint_mb:.0f}MB over "
-                f"{forecast.measured_observation_count} observations fits beside a sibling context]"
+                f" [whole-card intent retired: the sampling peak measured over "
+                f"{forecast.sampling_peak_observations} observations fits beside a sibling context]"
             )
         logger.debug(
             f"Stream forecast for {job.model}: {forecast.reason()}{measured_note} "
@@ -1529,12 +1537,17 @@ class InferenceScheduler:
             if self._process_lifecycle.is_post_process_gpu_paused
             else self._process_map.num_post_process_processes(device_index=device_index)
         )
-        # The EXTRA_LARGE tier (extra-large baselines plus the named VRAM-heavy checkpoints) is the single
-        # source of truth for "wants the whole card and never shares". Feed it to the forecast so a baseline
-        # whose conservative weight seed happens to fit co-resident still claims sole residency on intent,
-        # rather than co-residing and thrashing as Z-Image did.
+        # The teardown is demanded by the card's dominance verdict (rung 2: the model cannot sample beside one
+        # context with the floor charged) or by the operator's pin, never by the size tier. The tier is carried
+        # for the questions that read it.
         whole_card_pinned = self._whole_card_pinned(job.model, baseline, device_index=device_index)
-        wants_whole_card = whole_card_pinned or self._model_size_tier(job.model) >= ModelSizeTier.EXTRA_LARGE
+        verdict = pricing.model_dominance(
+            self.card_dominance(device_index),
+            self._footprint_store,
+            job.model,
+            baseline,
+        )
+        wants_whole_card = whole_card_pinned or (verdict is not None and verdict.cannot_co_reside)
         # A disaggregated job's sampler holds only the UNet, so its forecast charges the sampler-only figure
         # (keeping two samplers co-resident where the whole-job charge collapses them), and the image lane's
         # concurrent decode spike is charged as a sibling context. Class-eligibility (not the liveness-coupled
@@ -1570,6 +1583,8 @@ class InferenceScheduler:
             ),
             whole_card_pinned=whole_card_pinned,
             unpausable_tenancy_mb=self._unpausable_tenancy_mb(device_index),
+            whole_card_tier=self._model_size_tier(job.model) >= ModelSizeTier.EXTRA_LARGE,
+            sampling_peak_observations=verdict.peak.observation_count if verdict is not None else 0,
         )
 
     def _unpausable_tenancy_mb(self, device_index: int | None) -> float:
@@ -2398,13 +2413,7 @@ class InferenceScheduler:
         device_index: int | None,
     ) -> bool:
         """Whether the operator pinned ``model_name`` (by name or by its baseline id) as whole-card on this card."""
-        if model_name is None:
-            return False
-        pins = self._card_bridge_data(device_index).whole_card_models
-        if not pins:
-            return False
-        baseline_id = str(baseline) if baseline is not None else None
-        return model_name in pins or (baseline_id is not None and baseline_id in pins)
+        return pricing.pinned_by(pricing.whole_card_pins(self._card_bridge_data(device_index)), model_name, baseline)
 
     def _whole_card_warranted(self, forecast: StreamForecast) -> bool:
         """Whether a teardown demand is trustworthy enough to reserve the card.
@@ -2544,7 +2553,8 @@ class InferenceScheduler:
     def _held_residency_requests_safety_off_gpu(self) -> bool:
         """Return whether any live residency requires safety to remain off its card."""
         return any(
-            self._residency_should_pause_safety(device_index) for device_index, _ in self._whole_card_ledger.held()
+            self._residency_should_pause_safety(device_index)
+            for device_index, _ in self._whole_card_ledger.teardown_held()
         )
 
     def _held_residency_siblings_busy(self) -> bool:
@@ -2857,6 +2867,8 @@ class InferenceScheduler:
             cooldown_until=self._clock() + self._whole_card_cooldown_seconds(),
             now=self._clock(),
             establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+            # The demand path grants only for rung 2 or the operator's pin, which overrides to rung 2.
+            rung=DominanceRung.CANNOT_CO_RESIDE,
         )
         if target_process is not None:
             self._whole_card_ledger.state_for(device_index).prestage_process_id = target_process.process_id
@@ -2904,6 +2916,7 @@ class InferenceScheduler:
             now=self._clock(),
             establish_grace_seconds=WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
             new_demand=announce,
+            rung=DominanceRung.CANNOT_CO_RESIDE,
         )
         if target_override is not None:
             self._whole_card_ledger.tighten_target(device_index, target_override)
@@ -2983,7 +2996,7 @@ class InferenceScheduler:
         the head, which the generic scale-down guard would otherwise protect) and retries the lane pauses that
         establishment withheld while a decode was in flight. Idempotent at the target.
         """
-        for device_index, state in self._whole_card_ledger.held():
+        for device_index, state in self._whole_card_ledger.teardown_held():
             model = state.model
             if model is None or not self._whole_card_residency_has_holder(model, device_index):
                 continue
@@ -3018,7 +3031,7 @@ class InferenceScheduler:
         with the verified reclaim ladder as the single restore obligation; the residency's own release still
         performs the physical regrowth and discharges that debt.
         """
-        for device_index, state in self._whole_card_ledger.held():
+        for device_index, state in self._whole_card_ledger.teardown_held():
             model = state.model
             if model is None:
                 continue
@@ -4813,7 +4826,7 @@ class InferenceScheduler:
             for process_info in self._process_map.values()
             if process_info.process_type == HordeProcessType.INFERENCE
         )
-        residency_held_cards = {index for index, _residency in self._whole_card_ledger.held()}
+        residency_held_cards = {index for index, _residency in self._whole_card_ledger.teardown_held()}
         cards = tuple(
             CardProcessSnapshot(
                 device_index=device_index,
@@ -5379,9 +5392,8 @@ class InferenceScheduler:
         The bidirectional counterpart to :meth:`_learned_resident_footprint_mb`: where that one can only
         raise the static seed, this one reports what the hardware actually did, which may be well below the
         seed. It is returned separately rather than folded into the seed overlay because the fit arithmetic
-        must keep planning on the conservative figure; the measurement's only authority is to retire a
-        whole-card residency claim the seed alone was making (see
-        :attr:`~horde_worker_regen.process_management.resources.resource_budget.StreamForecast.measured_retires_whole_card_intent`).
+        must keep planning on the conservative figure. The measurement decides nothing and is carried to the
+        dispatch hold's record. The whole-card verdict reads the sampling peak instead (:meth:`card_dominance`).
 
         The context constant is netted out for the same reason it is in the raise-only accessor: the store
         keeps whole-device charges while the forecast charges contexts separately.
@@ -5929,6 +5941,157 @@ class InferenceScheduler:
         learned_floor_mb = self._foreign_vram_floor.current_floor_mb(device_key, now=self._foreign_floor_clock())
         return floor_with_known_tenant_mb(learned_floor_mb, self._managed_tenant_footprint_mb(device_index))
 
+    def card_dominance(self, device_index: int | None) -> pricing.CardDominance | None:
+        """Return the card's dominance verdict, recomputed only when one of its inputs has changed.
+
+        The inputs are the card's offered set and whole-card pins, its total, both context constants, the
+        admission margin, the foreign floor bucketed as the forecast log buckets it, and the observation counts
+        of the offered baselines' pooled sampling keys. Each read compares them with the cached verdict's, so a
+        verdict is computed once per change of the card's configuration, footprints or floor, never per cycle.
+        None until a child has reported the card's total.
+        """
+        inputs = self._dominance_inputs(device_index)
+        if inputs is None:
+            return None
+        cached = self._card_dominance.get(device_index)
+        if cached is not None and cached.inputs == inputs:
+            return cached
+        dominance = self._compute_card_dominance(device_index, inputs)
+        self._card_dominance[device_index] = dominance
+        rungs_changed = cached is None or {model: verdict.rung for model, verdict in cached.verdicts.items()} != {
+            model: verdict.rung for model, verdict in dominance.verdicts.items()
+        }
+        device_key = device_index if device_index is not None else 0
+        log = logger.info if rungs_changed else logger.debug
+        log(f"Dominance verdict for device {device_key}: {dominance.describe()}")
+        return dominance
+
+    def whole_card_seat(self, model: str, device_index: int | None) -> WholeCardSeat | None:
+        """Return the partial-load seat a rung-2 or pinned model needs on a card and the card's achievable ceiling.
+
+        None when the model is neither, when its seat cannot be priced (a paging card, a model outside the
+        extra-large tier) or when the card is not yet sized, so the serviceability verdict keeps its other rules.
+        The offer reads this. A job accepted before the ceiling moved is never faulted by it.
+        """
+        dominance = self.card_dominance(device_index)
+        if dominance is None:
+            return None
+        seat_mb = dominance.seats_mb.get(model)
+        ceiling_mb = self.achievable_ceiling_mb(device_index)
+        if seat_mb is None or ceiling_mb is None:
+            return None
+        return WholeCardSeat(seat_mb=seat_mb, ceiling_mb=ceiling_mb)
+
+    def _dominance_inputs(self, device_index: int | None) -> pricing.DominanceInputs | None:
+        """Return the figures the card's dominance verdict depends on, or None while the card is unsized."""
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        if total_vram_mb is None or total_vram_mb <= 0:
+            return None
+        config = self._card_bridge_data(device_index)
+        offered = config.image_models_to_load
+        offered_models = (
+            frozenset(str(model) for model in offered)
+            if isinstance(offered, (list, tuple, set, frozenset))
+            else frozenset()
+        )
+        store = self._footprint_store
+        counts = tuple(
+            (baseline_id, tuple(store.observation_count(key) for key in keys) if store is not None else ())
+            for baseline_id, keys in self._offered_sample_keys(offered_models)
+        )
+        return pricing.DominanceInputs(
+            offered_models=offered_models,
+            whole_card_pins=pricing.whole_card_pins(config),
+            total_vram_mb=float(total_vram_mb),
+            first_context_mb=self._per_process_overhead_mb(device_index),
+            marginal_context_mb=self._marginal_or_seed_mb(device_index),
+            admission_noise_mb=self._admission_margin_mb(device_index, total_vram_mb),
+            foreign_floor_bucket=diagnostic_mb_bucket(self.current_foreign_floor_mb(device_index)),
+            sample_observation_counts=counts,
+        )
+
+    def _offered_sample_keys(
+        self,
+        offered_models: frozenset[str],
+    ) -> tuple[tuple[str, tuple[FootprintKey, ...]], ...]:
+        """Return each offered baseline's pooled sampling keys, one per band, built once per offered set."""
+        cached = self._dominance_sample_keys.get(offered_models)
+        if cached is not None:
+            return cached
+        baseline_ids = sorted(
+            {
+                str(baseline)
+                for baseline in (self._model_metadata.get_baseline(model) for model in offered_models)
+                if baseline is not None
+            },
+        )
+        keys = tuple(
+            (baseline_id, tuple(pricing.pooled_sample_key(baseline_id, band) for band in ResolutionBucket))
+            for baseline_id in baseline_ids
+        )
+        self._dominance_sample_keys = {offered_models: keys}
+        return keys
+
+    def _marginal_or_seed_mb(self, device_index: int | None) -> float:
+        """Return the marginal context cost (MB), or the seeded figure when it is unmeasured or non-positive."""
+        marginal_mb = self._marginal_process_overhead_mb(device_index)
+        if marginal_mb is None or marginal_mb <= 0.0:
+            return _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
+        return marginal_mb
+
+    def _compute_card_dominance(
+        self,
+        device_index: int | None,
+        inputs: pricing.DominanceInputs,
+    ) -> pricing.CardDominance:
+        """Compute the card's dominance verdict and the partial-load seat of every rung-2 or pinned model."""
+        store = self._footprint_store
+        baselines = {model: self._model_metadata.get_baseline(model) for model in sorted(inputs.offered_models)}
+        peaks = [pricing.model_sampling_peak(store, model, baseline) for model, baseline in baselines.items()]
+        dominance = pricing.decide_card_dominance(
+            inputs,
+            foreign_floor_mb=self.current_foreign_floor_mb(device_index) or 0.0,
+            peaks=peaks,
+            previous=self._card_dominance.get(device_index),
+        )
+        seats_mb = {
+            model: self._representative_seat_mb(model, verdict.peak, device_index, total_vram_mb=inputs.total_vram_mb)
+            for model, verdict in dominance.verdicts.items()
+            if verdict.cannot_co_reside or pricing.pinned_by(inputs.whole_card_pins, model, baselines[model])
+        }
+        return replace(dominance, seats_mb=seats_mb)
+
+    def _representative_seat_mb(
+        self,
+        model: str,
+        peak: pricing.ModelSamplingPeak,
+        device_index: int | None,
+        *,
+        total_vram_mb: float,
+    ) -> float | None:
+        """Return the partial-load seat (MB) of a plain job of ``model`` at the band its peak was priced at.
+
+        It is the seat :func:`pricing.partial_seat_mb` prices a real job at, with the share of weights the card's
+        learned step time and upload rate give and the fallback share where either is unknown.
+        """
+        baseline = self._model_metadata.get_baseline(model)
+        baseline_id = str(baseline) if baseline is not None else None
+        job = pricing.representative_job(model, side_px=pricing.seed_side_px(peak.band))
+        weight_fraction = pricing.partial_seat_weight_fraction(
+            weights_mb=predict_job_weight_mb(job, baseline_id),
+            seconds_per_step=self._expected_seconds_per_step(job),
+            upload_mb_per_second=self._card_upload_mb_per_second(device_index if device_index is not None else 0),
+        )
+        return pricing.partial_seat_on_card_mb(
+            job,
+            baseline_id,
+            store=self._footprint_store,
+            total_vram_mb=total_vram_mb,
+            wddm_paging_active=self._retention.wddm_paging_active,
+            model_tier=self._model_size_tier(model),
+            weight_fraction=weight_fraction,
+        )
+
     def _managed_tenant_footprint_mb(self, device_index: int | None) -> float | None:
         """Return the managed text backend's measured footprint (MB) when it serves on this card, else None."""
         device_key = device_index if device_index is not None else 0
@@ -6018,6 +6181,7 @@ class InferenceScheduler:
             growth_held=self.is_vram_growth_held,
             arbiter_state=arbiter_state,
             foreign_floor_mb=self.current_foreign_floor_mb,
+            dominance=self.card_dominance,
             eligible_cards=self._eligible_card_indices,
             disaggregation_class_eligible=self._is_disaggregation_class_eligible,
             unserviceable_reason=self._unserviceable_job_reason,
@@ -6346,16 +6510,29 @@ class InferenceScheduler:
         worker-wide; under the clearance lease not the lanes still waiting for their grant, see
         :meth:`_running_sampler_jobs`)
         and defers to :func:`concurrent_overlap_permitted`, with the VRAM arbiter's dispatch verdict as the memory
-        answer. No actuations run on a DEFER; reclaim is driven only by the preload path. A blocked job keeps its
-        queue position and is re-asked on the next scheduling pass.
+        answer and the card's dominance arithmetic (:func:`pricing.pair_co_samples`) deciding which pairings may
+        sample together at all. No actuations run on a DEFER; reclaim is driven only by the preload path. A blocked
+        job keeps its queue position and is re-asked on the next scheduling pass.
         """
         in_progress_jobs = self._running_sampler_jobs(target_device_index)
+        dominance = self.card_dominance(target_device_index)
+
+        def baseline_of(model: str | None) -> KNOWN_IMAGE_GENERATION_BASELINE | str | None:
+            return self._model_metadata.get_baseline(model) if model is not None else None
+
+        candidate_side = (candidate_job.model, baseline_of(candidate_job.model))
 
         running = tuple(
             RunningSampler(
                 tier=self._model_size_tier(job.model),
                 batched=job_batch_amount(job) > 1,
                 progress_fraction=self._in_flight_progress_fraction(job),
+                pair_fits=pricing.pair_co_samples(
+                    dominance,
+                    self._footprint_store,
+                    candidate=candidate_side,
+                    running=(job.model, baseline_of(job.model)),
+                ),
             )
             for job in in_progress_jobs
         )
@@ -10220,7 +10397,9 @@ class InferenceScheduler:
 
         Judged by the verdicts the pop offer runs, so the gate faults only what the offer would not have
         advertised (a stale job popped before a card shrank, or one accepted under a promise this worker cannot
-        keep); a job the offer admits passes here.
+        keep); a job the offer admits passes here. The one input the offer reads and this gate does not is a
+        rung-2 model's partial-load seat against the achievable ceiling. The ceiling moves with the foreign floor,
+        and a job accepted before the floor rose is owed its one real load instead of a fault.
         """
         if job.model is None or not self._card_runtimes:
             return None

@@ -292,24 +292,42 @@ The arbiter keeps four concerns deliberately separate:
     card instead, which is the honest verdict for a file measured near the card's size; the residency churn
     limiter, not a buffer on the estimate, is what bounds the cost of that flip.
 
-    The measured resident figure additionally carries one authority the raise-only overlay does not: it can
-    **retire a whole-card residency claim**. A `wants_whole_card` baseline reserves the device unless the
-    forecast finds room for another full model beside it, and that room question is otherwise answered by a
-    seed that can over-state the model by gigabytes. Where the checkpoint has been measured enough times,
-    `StreamForecast.measured_retires_whole_card_intent` re-asks it of the measurement: if the margined
-    measured footprint leaves the card room for one more process context at sole residency, the intent branch
-    yields and the ordinary co-residency rules apply. It is a weaker claim than the seed-based floor makes
-    (room for a context, not for a whole sibling model), and deliberately so: the premise of tearing the
-    siblings down is that the card is full, and the measurement is what shows it is not. The retirement is
-    logged once per model, with the figure and the number of runs behind it, through the stream-forecast
-    diagnostic. Without measurements nothing changes, and the scheduler offers the measurement only once
-    the model has produced a result on this worker (`JobTracker.has_model_produced_result`): idle-slot
-    readings say nothing about whether the model runs, so a model that has never finished a job here keeps
-    its seed. This is why the resident observer's gates matter: a
-    slot holding its checkpoint in system RAM reports a nearly empty allocator, and hundreds of those readings
-    recorded as the checkpoint's resident cost would retire the whole-card claim of a model that needs the
-    whole card and admit it beside siblings it cannot fit with. The residency check and the weight-bytes
-    floor above keep those readings out of the store.
+    The measured resident figure decides no residency. It is carried on the forecast for the dispatch hold's
+    record, and the scheduler offers it only once the model has produced a result on this worker
+    (`JobTracker.has_model_produced_result`), since idle-slot readings say nothing about whether the model runs.
+    The residency itself is the dominance verdict's (below), which reads the sampling peak with the foreign
+    floor charged. A resident figure, priced without the floor, can show room for a context on a card whose
+    tenant leaves the model no room to sample beside one.
+
+    **The dominance verdict.** Whether a model takes the whole card is a property of the card, the offered
+    set, the learned footprints and the foreign floor, never of a size tier or a model name. For each offered
+    model `M` with sampling peak `P(M)` (the store's measured SAMPLE window net of context at the baseline's
+    most-observed band, else the static sampling seed of a plain batch-1 job at that band's upper side, 1024 px
+    when nothing is observed), on a card of total `T` with first and marginal context costs `K1`, `KM`, foreign
+    floor `F` and admission margin `N`:
+
+    - rung 2, *cannot co-reside*: `T - P(M) - K1 - KM - F - N < 0`. Only the teardown seats it, so a rung-2
+      model, or one the operator pins in `whole_card_models`, is demanded the residency
+      (`StreamForecast.wants_whole_card`), and every reader that tears down (the process-count target, the
+      safety move, the lane pauses, the pre-stage) acts on rung-2 grants only
+      (`WholeCardResidencyLedger.teardown_held`). The grant carries its rung.
+    - rung 1, *cannot co-sample*: rung 2, or no offered model `B` (a second copy of `M` included) has
+      `T - P(M) - P(B) - K1 - KM - F - N >= 0`. Stopping contexts buys such a model nothing it lacks, so it
+      is not demanded a residency. Its lever is co-sampling. The concurrent-overlap gate lets a pairing with a
+      side on rung 1 or above sample together only where the same sum shows at least the hysteresis band of
+      room (`pricing.pair_co_samples`), so nothing samples beside a rung-1 model. A pairing of two models that
+      each have a partner is left to the arbiter's memory verdict. The size tier alone keeps no two models
+      apart. Other rung-1 levers (a narrowed offer, retention for the run, no large preload beside it) are not
+      implemented.
+
+    A held rung changes only when its test's slack crosses zero by more than `DOMINANCE_HYSTERESIS_MB`, the
+    same 256 MB bucket the recompute key bands the floor with, so a measured peak drifting about a threshold
+    does not establish and release a residency on every observation. An unpriced figure never withholds a
+    co-sample. The verdict is cached per card on the scheduler
+    (`InferenceScheduler.card_dominance`) and recomputed only when an input changes: the offered set or the
+    pins, the total, either context cost, the margin, the floor moving past its diagnostic bucket, or an
+    observation on an offered baseline's pooled sampling key. The scheduling snapshot carries it as
+    `CardSnapshot.dominance`, and each change of a rung is logged once as `Dominance verdict for device N`.
 - **Arbitration** evaluates the
   [ledger-driven admission identity][horde_worker_regen.process_management.resources.admission_identity]
   plus the concurrent-sampling headroom, then resolves an actuator escalation ladder. It never overcommit-admits
@@ -1150,6 +1168,14 @@ seat = f x weights + max(activation, ComfyUI inference reserve)
   `ClearancePlan.booking_mb` books the dispatch reservation at the remaining charge capped at the measured
   available room, since the child grows only into what it was granted and a larger booking would stay
   outstanding through its whole sample.
+- **The offer.** The same seat, priced by `pricing.partial_seat_on_card_mb` for a plain batch-1 job at the
+  band the dominance verdict priced the model at (the learned share where the card has a step time and an upload
+  rate, the fallback otherwise), decides whether a rung-2 or pinned model is offered at all. It is offered while
+  the seat fits the card's achievable ceiling (total net of the admission margin and the learned foreign floor,
+  `InferenceScheduler.whole_card_seat`). The ceiling follows the floor, so a floor that rises takes such a model
+  out of the offer and a floor that falls brings it back. A job accepted before the floor rose is never faulted
+  for it, since the preload gate keeps the recommended-minimum rule and the job gets its one real load through
+  the ceiling attempt.
 
 ## Doomed model prevention
 

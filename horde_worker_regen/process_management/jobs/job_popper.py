@@ -73,6 +73,7 @@ from horde_worker_regen.process_management.resources.model_serviceability import
     _CONSTRAINED_LANE_FULL_CYCLES,
     ConstrainedLaneState,
     ModelServiceabilityTier,
+    WholeCardSeat,
     decide_constrained_offer,
     max_power_to_pixels,
     model_serviceability_verdicts,
@@ -228,6 +229,7 @@ def _select_models_for_pop(
     model_metadata: ModelMetadata | None = None,
     admission_baseline_provider: Callable[[int | None], float | None] | None = None,
     serviceability_logged: set[str] | None = None,
+    whole_card_seat_provider: Callable[[str, int | None], WholeCardSeat | None] | None = None,
 ) -> set[str] | None:
     """Choose which models to include in a pop request.
 
@@ -248,6 +250,8 @@ def _select_models_for_pop(
         admission_baseline_provider: Source of the shared device baseline (MB) per card. A missing baseline
             reads as zero so a quiet baseline that has not yet been captured does not falsely de-list models.
         serviceability_logged: Mutable set of log keys already emitted for serviceability exclusions.
+        whole_card_seat_provider: A rung-2 or pinned model's partial-load seat and the card's achievable
+            ceiling, which judge that model's serviceability. None leaves every model on its other rules.
 
     Returns:
         A set of model names, or ``None`` if no models are eligible (caller should skip the pop).
@@ -344,6 +348,7 @@ def _select_models_for_pop(
         model_metadata=model_metadata,
         admission_baseline_provider=admission_baseline_provider,
         serviceability_logged=serviceability_logged,
+        whole_card_seat_provider=whole_card_seat_provider,
     )
     if serviceability_held_back:
         models = models.difference(serviceability_held_back)
@@ -399,6 +404,7 @@ def _serviceability_held_back_models(
     model_metadata: ModelMetadata | None,
     admission_baseline_provider: Callable[[int | None], float | None] | None,
     serviceability_logged: set[str] | None,
+    whole_card_seat_provider: Callable[[str, int | None], WholeCardSeat | None] | None = None,
 ) -> set[str]:
     """Return models whose smallest legal job cannot fit any card in this pop scope.
 
@@ -416,6 +422,7 @@ def _serviceability_held_back_models(
             model_metadata=model_metadata,
             admission_baseline_provider=admission_baseline_provider,
             max_pixels=None,
+            whole_card_seat_provider=whole_card_seat_provider,
         )
         if not verdicts or any(verdict.serviceable for _, verdict in verdicts):
             continue
@@ -486,6 +493,7 @@ class JobPopper:
         whole_card_pop_claim: Callable[[], WholeCardPopClaim | None] | None = None,
         whole_card_pop_outcome: Callable[..., None] | None = None,
         admission_baseline_provider: Callable[[int | None], float | None] | None = None,
+        whole_card_seat_provider: Callable[[str, int | None], WholeCardSeat | None] | None = None,
         post_processing_lane_commitments_provider: Callable[[], int] | None = None,
         extended_controlnet_ready_provider: Callable[[], bool] | None = None,
         post_processing_lane_paused_provider: Callable[[], bool] | None = None,
@@ -526,6 +534,9 @@ class JobPopper:
         `admission_baseline_provider` supplies the shared device baseline for model serviceability offer
         shaping. A missing provider or uncaptured baseline reads as zero and only defers the exclusion until
         the arithmetic is known.
+
+        `whole_card_seat_provider` gives a rung-2 or pinned model's partial-load seat and the card's achievable
+        ceiling, by which the offer judges that model. Without it the model keeps the recommended-minimum rule.
 
         `post_processing_lane_commitments_provider` reports non-image work that also occupies the dedicated
         post-processing lane (currently graph alchemy). It is added to image-job post-processing commitments
@@ -597,6 +608,7 @@ class JobPopper:
         self._card_runtimes = card_runtimes if card_runtimes is not None else {}
         self._model_metadata = model_metadata
         self._admission_baseline_provider = admission_baseline_provider
+        self._whole_card_seat_provider = whole_card_seat_provider
         self._serviceability_exclusion_logged: set[str] = set()
         self._serviceability_cap_logged: dict[str, int] = {}
         self._constrained_lane_state = ConstrainedLaneState()
@@ -876,6 +888,7 @@ class JobPopper:
                 model_metadata=self._model_metadata,
                 admission_baseline_provider=self._admission_baseline_provider,
                 max_pixels=max_power_to_pixels(pop_max_power),
+                whole_card_seat_provider=self._whole_card_seat_provider,
             )
             if not verdicts or any(v.tier is ModelServiceabilityTier.SERVICEABLE for _, v in verdicts):
                 continue
@@ -2198,6 +2211,7 @@ class JobPopper:
             model_metadata=self._model_metadata,
             admission_baseline_provider=self._admission_baseline_provider,
             serviceability_logged=self._serviceability_exclusion_logged,
+            whole_card_seat_provider=self._whole_card_seat_provider,
         )
         if models is None:
             self._note_pop_gate(PopGate.NO_ELIGIBLE_MODELS)

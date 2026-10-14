@@ -13,7 +13,11 @@ The headway fractions below apply only where a dispatch is the moment a job load
 clearance a dispatched job only stages its encode working set; its weight upload is priced at the stage grant and
 its activation onset at the sample grant, each against measured free VRAM. The stacking the headway guards
 against is then priced at the grants, so the caller passes ``headway_priced_by_clearance`` and the progress test
-is skipped. The extra-large pairing rule, the confirmed-room requirement and the memory veto still apply.
+is skipped. The dominance pairing rule, the confirmed-room requirement and the memory veto still apply.
+
+Which pairings may sample together at all is the card's dominance arithmetic, computed by the caller. A side on
+rung 1 or above (no offered model samples beside it) pairs only where its sampling peak and the partner's leave
+room on the card. The size tier alone keeps no two models apart.
 """
 
 from __future__ import annotations
@@ -55,6 +59,9 @@ class RunningSampler:
     tier: ModelSizeTier
     batched: bool
     progress_fraction: float
+    pair_fits: bool = True
+    """Whether the card's dominance arithmetic lets the candidate sample beside this job
+    (``pricing.pair_co_samples``). False when either side is on rung 1 or above and the pair leaves no room."""
 
 
 def performance_mode_headway_scale(bridge_data: reGenBridgeData) -> float:
@@ -88,7 +95,8 @@ def prices_sampler_only_beside(candidate_tier: ModelSizeTier, co_tenant_tiers: I
     True when exactly one side of the pairing is extra-large. ComfyUI loads a job's text encoders, UNet and VAE
     separately and frees its own idle components when its next allocation is short, so beside an extra-large
     co-tenant a job's peak is its UNet and activation while it samples, not the whole-job figure that assumes
-    every component stays resident. Two extra-large jobs are never paired, so their price is never asked.
+    every component stays resident. Two extra-large jobs keep the whole-job price, the conservative one, where the
+    dominance arithmetic lets them pair at all.
     """
     candidate_extra_large = candidate_tier >= ModelSizeTier.EXTRA_LARGE
     return any((tier >= ModelSizeTier.EXTRA_LARGE) != candidate_extra_large for tier in co_tenant_tiers)
@@ -111,10 +119,11 @@ def concurrent_overlap_permitted(
     an unpriced demand keeps the strict headway yet admits on memory, since missing telemetry is not evidence of
     room.
 
-    With nothing running the candidate always starts. Two extra-large models never share a card, whether two
-    copies of one or two different ones. A pairing with one extra-large side, and a batched side, multiply what
-    a misjudged overlap costs, so each needs confirmed room and is then bounded by the strictest headway rather
-    than the relaxed one.
+    With nothing running the candidate always starts. A running job whose pairing with the candidate the card's
+    dominance arithmetic refuses (:attr:`RunningSampler.pair_fits`) is never joined, whatever the memory answer,
+    since a model no offered model can sample beside samples alone. A pairing with an extra-large side, and a batched
+    side, multiply what a misjudged overlap costs, so each needs confirmed room and is then bounded by the
+    strictest headway rather than the relaxed one.
 
     With ``headway_priced_by_clearance`` the required headway is zero for every pairing: the stage and sample
     grants price the candidate's load and onset, so only the pairing rule, the confirmed-room requirement and
@@ -122,9 +131,9 @@ def concurrent_overlap_permitted(
     """
     if not running:
         return True
-    candidate_extra_large = candidate_tier >= ModelSizeTier.EXTRA_LARGE
-    if candidate_extra_large and any(sampler.tier >= ModelSizeTier.EXTRA_LARGE for sampler in running):
+    if not all(sampler.pair_fits for sampler in running):
         return False
+    candidate_extra_large = candidate_tier >= ModelSizeTier.EXTRA_LARGE
 
     verdict_cache: list[bool | None] = []
 

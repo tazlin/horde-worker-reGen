@@ -31,6 +31,7 @@ from horde_worker_regen.process_management.resources.vram_footprints import (
     FootprintKey,
     FootprintStage,
     LearnedFootprintStore,
+    ResolutionBucket,
 )
 from tests.process_management.conftest import (
     device_wide_reading,
@@ -1247,11 +1248,11 @@ class TestLearnedResidentFootprint:
 
 
 class TestWholeCardIntent:
-    """A baseline declared whole-card (the EXTRA_LARGE tier) claims sole residency even when its weight seed fits.
+    """A model the card's dominance verdict places on rung 2 claims sole residency even when its weight seed fits.
 
-    Z-Image regressed here: its conservative ~8GB seed read as comfortably co-resident on a 16GB card, so the
-    forecast never gave it the card, it co-resided and thrashed. ``wants_whole_card`` biases the residency
-    verdict on the tier's intent rather than the knife-edge weight-vs-free fit.
+    A conservative weight seed can read as comfortably co-resident on a card where the model's sampling peak
+    cannot sit beside one context. ``wants_whole_card`` carries the verdict, so the knife-edge weight-vs-free fit
+    never decides the residency.
     """
 
     def _coresident_forecast(self, *, wants_whole_card: bool) -> resource_budget.StreamForecast:
@@ -1304,20 +1305,21 @@ class TestWholeCardIntent:
         assert forecast.streams_unavoidably is True
 
 
-class TestMeasuredWholeCardRetirement:
-    """A whole-card claim made by a seed is retired once the checkpoint has actually been measured.
+class TestRungTwoGrantsTheResidency:
+    """Sole residency is granted on the card's dominance verdict (rung 2) or a pin, never on a tier or a weight seed.
 
-    The seed for a Flux fp8 checkpoint charges 16.4 GB of resident footprint (11.5 GB core weights plus
-    4.9 GB of support components). On a 16 GB card that leaves no room for a sibling model by the seed's
-    own arithmetic, so the intent branch reserves the device. The card measurably holds the same job at
-    13.5 GB device-used, and the residency it bought changed nothing about how the job ran.
+    A weights-only test charges no floor, so on a card with a resident tenant it would release a model the
+    sampling arithmetic cannot seat beside a context. The verdict reads the sampling peak with the floor charged
+    and arrives on the forecast as ``wants_whole_card``.
     """
 
-    _MEASURED_MARGINED_MB = 14850.0
-    """The store's margined figure for five 13500 MB observations, with the context charge netted back out
-    the way the scheduler hands it to the forecast."""
-
-    def _flux_forecast(self, *, measured_footprint_mb: float | None) -> resource_budget.StreamForecast:
+    def _flux_forecast(
+        self,
+        *,
+        wants_whole_card: bool,
+        sampling_peak_observations: int = 0,
+        whole_card_pinned: bool = False,
+    ) -> resource_budget.StreamForecast:
         return resource_budget.StreamForecast(
             weights_mb=11500.0,
             footprint_mb=16400.0,
@@ -1329,187 +1331,35 @@ class TestMeasuredWholeCardRetirement:
             total_vram_mb=16375.0,
             per_process_overhead_mb=275.0,
             marginal_process_overhead_mb=275.0,
-            wants_whole_card=True,
-            measured_footprint_mb=measured_footprint_mb,
-            measured_observation_count=0 if measured_footprint_mb is None else 5,
+            wants_whole_card=wants_whole_card,
+            whole_card_tier=True,
+            sampling_peak_observations=sampling_peak_observations,
+            whole_card_pinned=whole_card_pinned,
+            measured_footprint_mb=14850.0,
+            measured_observation_count=5,
         )
 
-    def test_unmeasured_seed_still_claims_the_card(self) -> None:
-        """Without measurements the seed governs and the declared intent stands, exactly as before."""
-        forecast = self._flux_forecast(measured_footprint_mb=None)
-        assert forecast.fits_alone is True
-        assert forecast._has_room_for_coresident_model is False
-        assert forecast.measured_retires_whole_card_intent is False
+    def test_rung_two_grants_whatever_the_resident_measurement_says(self) -> None:
+        """A measured resident figure that leaves room for a context never releases a rung-2 model."""
+        forecast = self._flux_forecast(wants_whole_card=True, sampling_peak_observations=12)
         assert forecast.needs_exclusive_residency is True
+        assert forecast.measured_retires_whole_card_intent is False
 
-    def test_measured_footprint_retires_the_claim(self) -> None:
-        """Measured, margined, the model leaves the card room for a sibling context, so it stops reserving it."""
-        forecast = self._flux_forecast(measured_footprint_mb=self._MEASURED_MARGINED_MB)
-        assert forecast.measured_retires_whole_card_intent is True
+    def test_a_tier_model_off_rung_two_is_released_and_named(self) -> None:
+        """An extra-large model the measured verdict leaves off rung 2 is demanded nothing, and the release shows."""
+        forecast = self._flux_forecast(wants_whole_card=False, sampling_peak_observations=12)
         assert forecast.needs_exclusive_residency is False
-        # The retirement is not a claim that the weights fit everywhere: the ordinary tests still apply.
-        assert forecast.fits_coresident is False
-        assert forecast._persistent_weights_dominant is False
-
-    def test_a_measured_figure_that_fills_the_card_keeps_the_claim(self) -> None:
-        """Measurement retires the claim only when it disproves it; a full card still gets reserved."""
-        forecast = self._flux_forecast(measured_footprint_mb=16000.0)
-        assert forecast.measured_retires_whole_card_intent is False
-        assert forecast.needs_exclusive_residency is True
-
-    def test_retirement_needs_a_sized_card(self) -> None:
-        """A card whose capacity is unknown keeps the declared intent (the conservative direction)."""
-        forecast = resource_budget.StreamForecast(
-            weights_mb=11500.0,
-            footprint_mb=16400.0,
-            reserve_mb=2048.0,
-            free_now_mb=13000.0,
-            free_if_alone_mb=None,
-            free_after_model_evict_mb=None,
-            wants_whole_card=True,
-            measured_footprint_mb=self._MEASURED_MARGINED_MB,
-        )
-        assert forecast.measured_retires_whole_card_intent is False
-        assert forecast.needs_exclusive_residency is True
-
-
-class TestSchedulerMeasuredWholeCardRetirement:
-    """End to end through the scheduler: observations in the store retire the whole-card claim in the forecast.
-
-    The unit tests above pin the retirement rule on a hand-built forecast. This one drives the whole seam the
-    worker actually uses: a store the scheduler shares with the dispatcher, keyed and margined by the store,
-    netted of the context charge by the scheduler, and read by ``_forecast_streaming``. It fails if any link
-    in that chain is missing.
-    """
-
-    _FLUX_MODEL = "Flux.1-Schnell fp8 (Compact)"
-    _TOTAL_MB = 16375.0
-    _OVERHEAD_MB = 275.0
-    _CORE_WEIGHTS_MB = 11500.0
-    _SEED_FOOTPRINT_MB = 16400.0
-    _MEASURED_DEVICE_USED_MB = 13500.0
-
-    def _scheduler(self, monkeypatch: pytest.MonkeyPatch) -> tuple[object, LearnedFootprintStore]:
-        """A 16GB card serving a Flux checkpoint whose seed reserves the whole device."""
-        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda j, b: self._CORE_WEIGHTS_MB)
-        monkeypatch.setattr(resource_budget, "predict_job_footprint_mb", lambda j, b: self._SEED_FOOTPRINT_MB)
-        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda j, b: 15218.0)
-        monkeypatch.setattr(resource_budget, "effective_inference_reserve_mb", lambda *a, **k: 1519.0)
-
-        process_info = make_mock_process_info(1, model_name=self._FLUX_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
-        process_info.total_vram_mb = self._TOTAL_MB
-        process_info.vram_usage_mb = self._TOTAL_MB - 13000.0
-        reference = {
-            self._FLUX_MODEL: make_mock_model_reference_record(
-                self._FLUX_MODEL,
-                baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
-            ),
-        }
-        scheduler = _make_inference_scheduler(
-            process_map=ProcessMap({1: process_info}),
-            bridge_data=make_mock_bridge_data(
-                enable_vram_budget=True,
-                whole_card_exclusive_residency=True,
-                vram_per_process_overhead_mb=self._OVERHEAD_MB,
-                safety_on_gpu=False,
-            ),
-            model_metadata=make_test_model_metadata(reference),
-            device_free_mb=13000.0,
-        )
-        store = LearnedFootprintStore()
-        scheduler.set_footprint_store(store)
-        return scheduler, store
-
-    def _observe(self, store: LearnedFootprintStore, count: int) -> None:
-        key = FootprintKey(
-            model_baseline=str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1),
-            resolution_bucket=None,
-            platform=sys.platform,
-            stage=FootprintStage.RESIDENT,
-            checkpoint=self._FLUX_MODEL,
-        )
-        for _ in range(count):
-            store.observe_peak(key, self._MEASURED_DEVICE_USED_MB)
-
-    def test_unobserved_checkpoint_claims_the_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Nothing measured: the seed's arithmetic stands and the whole-card claim is granted."""
-        scheduler, _ = self._scheduler(monkeypatch)
-        job = make_job_pop_response(self._FLUX_MODEL, width=1024, height=1024)
-        forecast = scheduler._forecast_streaming(job, str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1))
-
-        assert forecast.measured_footprint_mb is None
-        assert forecast.needs_exclusive_residency is True
-
-    def test_under_observed_checkpoint_still_claims_the_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """One short of the threshold, the measurements do not yet answer and nothing changes."""
-        scheduler, store = self._scheduler(monkeypatch)
-        self._observe(store, 4)
-        job = make_job_pop_response(self._FLUX_MODEL, width=1024, height=1024)
-        forecast = scheduler._forecast_streaming(job, str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1))
-
-        assert forecast.measured_footprint_mb is None
-        assert forecast.needs_exclusive_residency is True
-
-    def test_observed_but_never_completed_checkpoint_still_claims_the_card(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Idle-slot measurements alone do not count until the model has finished a job on this worker."""
-        scheduler, store = self._scheduler(monkeypatch)
-        self._observe(store, 5)
-        job = make_job_pop_response(self._FLUX_MODEL, width=1024, height=1024)
-        forecast = scheduler._forecast_streaming(job, str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1))
-
-        assert forecast.measured_footprint_mb is None
-        assert forecast.needs_exclusive_residency is True
-
-    def test_observed_checkpoint_retires_the_claim(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """At the threshold the measured figure reaches the forecast and the card stops being reserved."""
-        scheduler, store = self._scheduler(monkeypatch)
-        self._observe(store, 5)
-        scheduler._job_tracker.record_model_inference_success(self._FLUX_MODEL)
-        job = make_job_pop_response(self._FLUX_MODEL, width=1024, height=1024)
-        forecast = scheduler._forecast_streaming(job, str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1))
-
-        assert forecast.measured_footprint_mb is not None
-        assert forecast.measured_observation_count == 5
         assert forecast.measured_retires_whole_card_intent is True
+        assert forecast.is_card_demanding is True, "the tier-keyed warrant stays on the tier"
+
+    def test_a_release_priced_from_the_seed_is_not_named_as_measured(self) -> None:
+        """Off rung 2 on the static seed alone, nothing is demanded and no measured release is claimed."""
+        forecast = self._flux_forecast(wants_whole_card=False, sampling_peak_observations=0)
         assert forecast.needs_exclusive_residency is False
-        # The seed still governs every fit decision: only the residency claim is retired.
-        assert forecast.footprint_mb == self._SEED_FOOTPRINT_MB
-        assert forecast.weights_mb == self._CORE_WEIGHTS_MB
+        assert forecast.measured_retires_whole_card_intent is False
 
-
-class TestResidencyVerdictWording:
-    """The logged verdict names what actually granted the residency.
-
-    An intent-driven residency printed "weight-dominant" whenever the card read full, sending a reader after
-    a weight estimate that was never the reason for the teardown.
-    """
-
-    def test_intent_driven_residency_is_named_as_intent(self) -> None:
-        """A whole-card baseline whose weights are not dominant reports intent, however full the card reads."""
-        forecast = resource_budget.StreamForecast(
-            weights_mb=11500.0,
-            footprint_mb=16400.0,
-            reserve_mb=2048.0,
-            base_reserve_mb=1519.0,
-            free_now_mb=13000.0,
-            free_if_alone_mb=16100.0,
-            free_after_model_evict_mb=13500.0,
-            total_vram_mb=16375.0,
-            per_process_overhead_mb=275.0,
-            marginal_process_overhead_mb=275.0,
-            wants_whole_card=True,
-        )
-        assert forecast.needs_exclusive_residency is True
-        assert forecast.fits_coresident is False
-        assert forecast._persistent_weights_dominant is False
-        assert "sole residency on intent" in forecast.reason()
-        assert "weight-dominant" not in forecast.reason()
-
-    def test_weight_dominant_residency_is_named_as_weight_dominant(self) -> None:
-        """A model whose persistent weights genuinely fill the card keeps the weight-dominant verdict."""
+    def test_heavy_weights_off_rung_two_are_not_demanded_the_teardown(self) -> None:
+        """Weights that crowd the card do not grant sole residency by themselves. The partial reduction covers them."""
         forecast = resource_budget.StreamForecast(
             weights_mb=14500.0,
             reserve_mb=2048.0,
@@ -1522,9 +1372,132 @@ class TestResidencyVerdictWording:
             marginal_process_overhead_mb=275.0,
             wants_whole_card=False,
         )
-        assert forecast._persistent_weights_dominant is True
+        assert forecast.needs_exclusive_residency is False
+        assert forecast.needs_process_count_reduction is True
+
+    def test_rung_two_needs_a_card_it_fits_alone(self) -> None:
+        """A rung-2 model on a card its weights overflow alone is never forced down the teardown path."""
+        forecast = resource_budget.StreamForecast(
+            weights_mb=20000.0,
+            reserve_mb=2048.0,
+            free_now_mb=13000.0,
+            free_if_alone_mb=15030.0,
+            free_after_model_evict_mb=14000.0,
+            total_vram_mb=16384.0,
+            per_process_overhead_mb=1354.0,
+            marginal_process_overhead_mb=300.0,
+            wants_whole_card=True,
+        )
+        assert forecast.needs_exclusive_residency is False
+        assert forecast.streams_unavoidably is True
+
+
+class TestSchedulerDominanceVerdict:
+    """End to end through the scheduler: observations in the store move the card's verdict and the forecast.
+
+    Drives the seam the worker uses: a store the scheduler shares with the dispatcher, keyed and margined by
+    the store, folded into the card's cached verdict, and read by ``_forecast_streaming``.
+    """
+
+    _FLUX_MODEL = "Flux.1-Schnell fp8 (Compact)"
+    _TOTAL_MB = 16375.0
+    _OVERHEAD_MB = 1354.0
+
+    def _scheduler(self) -> tuple[object, LearnedFootprintStore]:
+        """A 16 GB card offering a Flux checkpoint, with an empty store wired in."""
+        process_info = make_mock_process_info(1, model_name=self._FLUX_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
+        process_info.total_vram_mb = self._TOTAL_MB
+        process_info.vram_usage_mb = self._TOTAL_MB - 13000.0
+        reference = {
+            self._FLUX_MODEL: make_mock_model_reference_record(
+                self._FLUX_MODEL,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
+            ),
+        }
+        bridge_data = make_mock_bridge_data(
+            enable_vram_budget=True,
+            whole_card_exclusive_residency=True,
+            vram_per_process_overhead_mb=self._OVERHEAD_MB,
+            safety_on_gpu=False,
+        )
+        bridge_data.image_models_to_load = [self._FLUX_MODEL]
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({1: process_info}),
+            bridge_data=bridge_data,
+            model_metadata=make_test_model_metadata(reference),
+            device_free_mb=13000.0,
+        )
+        store = LearnedFootprintStore()
+        scheduler.set_footprint_store(store)
+        return scheduler, store
+
+    def _observe(self, store: LearnedFootprintStore, peak_mb: float, count: int) -> None:
+        key = FootprintKey(
+            model_baseline=str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1),
+            resolution_bucket=ResolutionBucket.LE_1024,
+            platform=sys.platform,
+            stage=FootprintStage.SAMPLE,
+        )
+        for _ in range(count):
+            store.observe_peak(key, peak_mb)
+
+    def _forecast(self, scheduler: object) -> resource_budget.StreamForecast:
+        job = make_job_pop_response(self._FLUX_MODEL, width=1024, height=1024)
+        return scheduler._forecast_streaming(job, str(KNOWN_IMAGE_GENERATION_BASELINE.flux_1))  # type: ignore[attr-defined]
+
+    def test_an_unmeasured_flux_is_rung_two_on_its_seed(self) -> None:
+        """With nothing measured, the 1024 sampling seed beside one context overflows the card, so it is demanded."""
+        scheduler, _ = self._scheduler()
+        forecast = self._forecast(scheduler)
+
+        assert forecast.wants_whole_card is True
+        assert forecast.sampling_peak_observations == 0
         assert forecast.needs_exclusive_residency is True
-        assert "weight-dominant" in forecast.reason()
+
+    def test_a_measured_peak_that_fits_beside_a_context_releases_it(self) -> None:
+        """A sampling window that leaves the card room for one context moves Flux off rung 2."""
+        scheduler, store = self._scheduler()
+        self._observe(store, 9000.0, 5)
+        forecast = self._forecast(scheduler)
+
+        assert forecast.wants_whole_card is False
+        assert forecast.sampling_peak_observations == 5
+        assert forecast.measured_retires_whole_card_intent is True
+        assert forecast.needs_exclusive_residency is False
+
+    def test_a_measured_peak_that_fills_the_card_keeps_it_on_rung_two(self) -> None:
+        """A sampling window too large to sit beside one context keeps the teardown."""
+        scheduler, store = self._scheduler()
+        self._observe(store, 14000.0, 5)
+        forecast = self._forecast(scheduler)
+
+        assert forecast.wants_whole_card is True
+        assert forecast.sampling_peak_observations == 5
+        assert forecast.needs_exclusive_residency is True
+
+
+class TestResidencyVerdictWording:
+    """The logged verdict names the residency the dominance verdict or the pin granted."""
+
+    def test_a_granted_residency_is_named_as_intent(self) -> None:
+        """A rung-2 model reports the whole-card wording however full the card reads."""
+        forecast = resource_budget.StreamForecast(
+            weights_mb=11500.0,
+            footprint_mb=16400.0,
+            reserve_mb=2048.0,
+            base_reserve_mb=1519.0,
+            free_now_mb=13000.0,
+            free_if_alone_mb=16100.0,
+            free_after_model_evict_mb=13500.0,
+            total_vram_mb=16375.0,
+            per_process_overhead_mb=275.0,
+            marginal_process_overhead_mb=275.0,
+            wants_whole_card=True,
+        )
+        assert forecast.needs_exclusive_residency is True
+        assert forecast.fits_coresident is False
+        assert "sole residency on intent" in forecast.reason()
+        assert "weight-dominant" not in forecast.reason()
 
 
 class TestWholeCardResidentProcessCount:

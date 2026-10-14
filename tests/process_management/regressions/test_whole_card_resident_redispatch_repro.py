@@ -21,6 +21,7 @@ launch the head to co-sample.
 from __future__ import annotations
 
 import pytest
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -30,7 +31,9 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_model_metadata,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -82,6 +85,16 @@ def _build_resident_whole_card_scheduler(
         bridge_data=bridge_data,
         max_concurrent=1,
         max_inference=3,
+        # Flux carries its reference baseline, so the card's dominance verdict prices it at the Flux sampling seed,
+        # which overflows this card beside one context and puts Flux on rung 2.
+        model_metadata=make_test_model_metadata(
+            {
+                _FLUX_MODEL: make_mock_model_reference_record(
+                    _FLUX_MODEL,
+                    baseline=KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
+                ),
+            },
+        ),
     )
     scheduler._process_lifecycle.is_safety_gpu_paused = False
     return scheduler, process_map, job_tracker, proc_sd15, proc_sdxl

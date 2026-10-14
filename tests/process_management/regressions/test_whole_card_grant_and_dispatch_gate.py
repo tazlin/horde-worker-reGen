@@ -8,8 +8,9 @@ the grant decision and the gate that releases a reserved head:
 
 - the grant is decided on the *persistent* weight footprint, never a transient activation spike
   (:class:`TestActivationReserveDoesNotForceResidency`);
-- a whole-card-intent (EXTRA_LARGE) model yields to the budget on a card roomy enough for another full model,
-  its "never co-sample" contract upheld by the overlap gate instead (:class:`TestIntentYieldsToRoomyBudget`);
+- an EXTRA_LARGE model the dominance verdict holds below rung 2 co-resides on a card roomy enough for another
+  full model, its "never co-sample" contract upheld by the pairing lever instead
+  (:class:`TestIntentYieldsToRoomyBudget`);
 - a legitimately reserved head, once the device has drained, always reaches dispatch within a bounded window
   rather than parking forever (:class:`TestReservedHeadNeverWaitsIndefinitely`);
 - the churn governors charge physical teardowns rather than the jobs riding one residency, and hold a head
@@ -31,6 +32,7 @@ import time
 from unittest.mock import Mock, patch
 
 import pytest
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
@@ -66,6 +68,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     _GRACE_BUDGET_WINDOW_SECONDS,
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
+    DominanceRung,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     InferenceScheduler,
@@ -105,6 +108,7 @@ _RAM_RESERVE_MB = 8192.0
 # A card-filling EXTRA_LARGE checkpoint (whole-card by name) and a moderate-weight SDXL whose activation reserve
 # can balloon at a large batch/resolution: the two model classes the grant decision must tell apart.
 _FLUX_MODEL = "Flux.1-Schnell fp8 (Compact)"  # EXTRA_LARGE by name (consts.VRAM_HEAVY_MODELS)
+_FLUX_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.flux_1
 _FLUX_WEIGHTS_MB = 11500.0
 _FLUX_ESTABLISH_RESERVE_MB = 4646.0
 _FLUX16_ESTABLISH_FREE_NOW_MB = 9129.0  # 16 GB device busy: four contexts + resident SDXL models
@@ -191,6 +195,32 @@ def _forecast_24gb(
     )
 
 
+def _card24_flux_dominance() -> pricing.CardDominance:
+    """Return the roomy card's dominance verdict over an offer of Flux alone, priced at Flux's static seed.
+
+    The charges are the ones the 24 GB forecast carries, so the verdict and the forecast describe one card.
+    """
+    forecast = _forecast_24gb(
+        weights_mb=_FLUX_WEIGHTS_MB,
+        reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
+        free_now_mb=_FLUX24_ESTABLISH_FREE_NOW_MB,
+        wants_whole_card=False,
+    )
+    assert forecast.total_vram_mb is not None
+    inputs = pricing.DominanceInputs(
+        offered_models=frozenset({_FLUX_MODEL}),
+        whole_card_pins=frozenset(),
+        total_vram_mb=forecast.total_vram_mb,
+        first_context_mb=forecast.per_process_overhead_mb,
+        marginal_context_mb=forecast.marginal_process_overhead_mb,
+        admission_noise_mb=forecast.admission_noise_mb,
+        foreign_floor_bucket=None,
+        sample_observation_counts=(),
+    )
+    peaks = [pricing.model_sampling_peak(None, _FLUX_MODEL, _FLUX_BASELINE)]
+    return pricing.decide_card_dominance(inputs, foreign_floor_mb=0.0, peaks=peaks)
+
+
 class TestForecastVerdicts:
     """Pin the representative forecast verdicts the grant tests reason about.
 
@@ -224,18 +254,24 @@ class TestForecastVerdicts:
         assert forecast.max_resident_processes() == 1
 
     def test_card_filling_model_is_budgeted_co_resident_on_a_roomy_card(self) -> None:
-        """On a roomy card the budget shows the heavy checkpoint co-resides, so the grant follows the budget."""
+        """On a roomy card the dominance verdict holds the heavy checkpoint below rung 2, so it co-resides.
+
+        The grant is the verdict's rung 2 (or the operator's pin), never the room the budget reads: the same
+        forecast on rung 2 needs sole residency on this card too.
+        """
+        verdict = _card24_flux_dominance().verdicts[_FLUX_MODEL]
         forecast = _forecast_24gb(
             weights_mb=_FLUX_WEIGHTS_MB,
             reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
             free_now_mb=_FLUX24_ESTABLISH_FREE_NOW_MB,
-            wants_whole_card=True,
+            wants_whole_card=verdict.cannot_co_reside,
         )
+        assert verdict.rung is DominanceRung.CANNOT_CO_SAMPLE
         assert forecast.fits_alone is True
         assert forecast.max_resident_processes() == 8
         assert forecast.needs_exclusive_residency is False
-        no_intent = dataclasses.replace(forecast, wants_whole_card=False)
-        assert no_intent.needs_exclusive_residency is False
+        on_rung_two = dataclasses.replace(forecast, wants_whole_card=True)
+        assert on_rung_two.needs_exclusive_residency is True
 
 
 class TestActivationReserveDoesNotForceResidency:
@@ -288,29 +324,36 @@ class TestActivationReserveDoesNotForceResidency:
 
 
 class TestIntentYieldsToRoomyBudget:
-    """A whole-card-intent model co-resides where another model fits; the overlap gate stops co-sampling."""
+    """A heavy model below rung 2 co-resides where another model fits; the pairing lever stops co-sampling."""
 
     def test_intent_model_co_resides_when_a_sibling_model_fits(self) -> None:
-        """On a card with room for another full model an intent model co-resides rather than reserving the device.
+        """On a card with room for another full model the heavy checkpoint co-resides rather than reserving it.
 
-        The criterion is room for a real sibling *model*, not the empty-context count: the budgeted context count
-        reads high here, and reads high too for a heavy model on a tight card that cannot host a second model (see
-        :meth:`test_intent_holds_when_no_sibling_model_fits`).
+        The rung ladder decides. Flux's seed leaves room beside one context on this card, so it sits on rung 1
+        and is demanded no teardown. No offered model fits beside it, so the dominance pairing lever
+        (:func:`pricing.pair_co_samples`) refuses every co-sample with it, which is the protection the teardown
+        would otherwise buy.
         """
+        dominance = _card24_flux_dominance()
+        verdict = dominance.verdicts[_FLUX_MODEL]
         forecast = _forecast_24gb(
             weights_mb=_FLUX_WEIGHTS_MB,
             reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
             free_now_mb=_FLUX24_ESTABLISH_FREE_NOW_MB,
-            wants_whole_card=True,
+            wants_whole_card=verdict.cannot_co_reside,
         )
         room_for_sibling = _CARD24_FREE_IF_ALONE_MB - _FLUX_WEIGHTS_MB - _CARD24_BASE_RESERVE_MB
         assert room_for_sibling >= _CORESIDENT_SIBLING_MODEL_FLOOR_MB, (
             f"precondition: the card holds a sibling model ({room_for_sibling:.0f} MB free after the weights, vs "
             f"the {_CORESIDENT_SIBLING_MODEL_FLOOR_MB:.0f} MB floor)"
         )
+        assert verdict.rung is DominanceRung.CANNOT_CO_SAMPLE
         assert forecast.needs_exclusive_residency is False, (
-            "where the budget shows room for another full model, intent must not force a process teardown; "
-            "the 'never co-sample' contract is enforced by the overlap gate, not by reserving the device"
+            "a model below rung 2 must not force a process teardown on a card with room for another full model"
+        )
+        flux = (_FLUX_MODEL, _FLUX_BASELINE)
+        assert pricing.pair_co_samples(dominance, None, candidate=flux, running=flux) is False, (
+            "the rung-1 model's 'never co-sample' contract is the pairing lever's, not a reserved device"
         )
 
     def test_intent_holds_when_no_sibling_model_fits(self) -> None:

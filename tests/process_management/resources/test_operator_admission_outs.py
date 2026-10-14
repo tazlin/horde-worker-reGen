@@ -86,10 +86,10 @@ class TestPerCardFields:
 
 
 class TestWholeCardPin:
-    """A pinned model keeps its whole-card claim whatever the measurement says."""
+    """A pinned model keeps its whole-card claim whatever the dominance verdict reads."""
 
-    def test_a_pinned_model_keeps_its_claim_against_measurement(self) -> None:
-        """The measured retirement never applies to a pinned model; an unpinned twin retires as before."""
+    def test_a_pinned_model_keeps_its_claim_against_the_verdict(self) -> None:
+        """A model the measured verdict leaves off rung 2 is released, and its pinned twin keeps the residency."""
         forecast = resource_budget.StreamForecast(
             weights_mb=11500.0,
             footprint_mb=16400.0,
@@ -101,11 +101,12 @@ class TestWholeCardPin:
             total_vram_mb=24074.0,
             per_process_overhead_mb=488.0,
             marginal_process_overhead_mb=487.0,
-            wants_whole_card=True,
-            measured_footprint_mb=11500.0,
-            measured_observation_count=5,
+            wants_whole_card=False,
+            whole_card_tier=True,
+            sampling_peak_observations=5,
         )
         assert forecast.measured_retires_whole_card_intent is True
+        assert forecast.needs_exclusive_residency is False
         pinned = replace(forecast, whole_card_pinned=True)
         assert pinned.measured_retires_whole_card_intent is False
         assert pinned.needs_exclusive_residency is True

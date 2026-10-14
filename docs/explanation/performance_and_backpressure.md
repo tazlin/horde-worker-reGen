@@ -278,6 +278,25 @@ so the resident co-fit at `max_power` is not the question. Its recommended minim
 the card's total, and a 16 GB card offers a Krea-class model at the configured `max_power` rather than at
 the reduced size the co-fit would allow.
 
+A model the card's dominance verdict places on rung 2 (it cannot sample beside one context with the foreign
+floor charged), or one the operator pins, is judged by its partial-load seat against the card's achievable
+ceiling instead, since after the teardown that seat is how the card serves it (see
+[The partial-load seat](vram_arbiter.md#the-partial-load-seat)). The ceiling carries the learned foreign floor,
+so such a model leaves the offer while a tenant leaves no room for its seat and returns when the tenant goes.
+The offer follows the card's tenancy by design. A job accepted before the floor rose is never faulted for it.
+
+### Dominance verdict
+
+Whole-card residency is a ladder of two rungs, decided for each card from its total, its offered set, the
+learned sampling footprints and the foreign floor
+([VRAM arbiter](vram_arbiter.md#the-four-layers), "The dominance verdict"). Rung 1, a model no offered model
+can sample beside, stops no context, and the concurrent-overlap gate lets nothing sample beside it. Rung 2, a
+model that cannot sample beside even one context, costs the teardown, which stops idle siblings and keeps safety
+and the service lanes off the card until the pool regrows. The same checkpoint can sit on different rungs on two
+cards, or on one card before and after its tenant arrives or its measured peak moves, though a held rung moves
+only once a figure crosses its threshold by more than one 256 MB bucket. The size tier names the models the
+offer narrowings above treat as large. The verdict decides the teardown and which pairings may sample together.
+
 The horde's pop carries one `max_pixels` for every model in it, so a constrained model cannot share a pop
 with the others without capping them all. The popper lanes it instead
 (`decide_constrained_offer`): a bounded run of full-size pops carries the unconstrained models at the
