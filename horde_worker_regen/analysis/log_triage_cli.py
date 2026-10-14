@@ -23,6 +23,7 @@ from .correlate import build_session_context, build_timeline
 from .diagnose import diagnose, select_sessions
 from .duty_log_report import add_duty_report_arguments, run_duty_report
 from .job_lifecycle import job_lifecycle_for
+from .replay_fixture import ReplayFixtureError, render_replay_fixture_summary, write_replay_fixture
 from .sessions import WorkerSession, segment_bundle_sessions
 from .support_bundle import build_support_bundle
 from .triage_report import (
@@ -217,6 +218,24 @@ def _run_watch(args: argparse.Namespace) -> int:
         return 0
 
 
+def _run_replay_fixture(args: argparse.Namespace) -> int:
+    """Write the selected session's job stream and platform-neutral footprint store as a replay fixture."""
+    try:
+        summary = write_replay_fixture(
+            args.path,
+            args.out_dir,
+            session_index=args.session,
+            last=args.last,
+            stats_dir=args.stats,
+            footprints_path=args.footprints,
+        )
+    except ReplayFixtureError as fixture_error:
+        print(f"Could not build the replay fixture: {fixture_error}")
+        return 1
+    print(render_replay_fixture_summary(summary, args.out_dir))
+    return 0
+
+
 def _add_common_source_args(parser: argparse.ArgumentParser) -> None:
     """Add the shared positional path + selection/format flags to a subcommand parser."""
     parser.add_argument(
@@ -376,6 +395,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_duty_report_arguments(duty_parser)
     duty_parser.set_defaults(func=lambda args: run_duty_report(args, duty_parser))
+
+    replay_parser = subparsers.add_parser(
+        "replay-fixture",
+        help="Write a session's jobs and learned VRAM usage as a replay fixture for the dispatch-world simulator.",
+        description=(
+            "Writes session_jobs.jsonl (one row per image job, times in seconds from the session start, no "
+            "prompts) and footprints.json (the learned VRAM usage file with each key's platform replaced by "
+            "<platform>)."
+        ),
+    )
+    replay_parser.add_argument(
+        "path",
+        type=Path,
+        help="A support bundle, its logs directory, or a worker's logs directory.",
+    )
+    replay_parser.add_argument("out_dir", type=Path, help="Directory to write the two fixture files into.")
+    replay_selector = replay_parser.add_mutually_exclusive_group(required=True)
+    replay_selector.add_argument(
+        "--session",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Worker session #N, as horde-log sessions numbers it.",
+    )
+    replay_selector.add_argument("--last", action="store_true", help="The most recent worker session.")
+    replay_parser.add_argument(
+        "--stats",
+        type=Path,
+        default=None,
+        help=(
+            "Stats directory containing stats-v*.jsonl[.gz] files. Default: the bundle's stats directory, "
+            "otherwise .horde_worker_regen/stats."
+        ),
+    )
+    replay_parser.add_argument(
+        "--footprints",
+        type=Path,
+        default=None,
+        help=(
+            "The learned VRAM usage file (vram_footprints.json). Default: config/vram_footprints.json beside "
+            "the stats directory in a support bundle, otherwise the worker's file."
+        ),
+    )
+    replay_parser.set_defaults(func=_run_replay_fixture)
 
     return parser
 

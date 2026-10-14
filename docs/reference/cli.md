@@ -705,6 +705,21 @@ horde-log bundle
 The same generator is available in the dashboard: the **Logs** tab has a **Support bundle** button
 (also `Ctrl+B`) that writes the zip and reports the path.
 
+### `replay-fixture`: a recorded session as simulator input
+
+`horde-log replay-fixture <path> (--session N | --last) <out_dir>` turns one worker session's `job_completed`
+stats rows and the learned VRAM footprint store into the two files the dispatch-world session replay reads
+(`session_jobs.jsonl`, one row per image job with its pop offset, parameters, stage offsets, phase seconds,
+load sums, post-processing window, kudos and measured peaks; `footprints.json`, the store with every key's
+platform rewritten to `<platform>`). `path` is a bundle root, a bundle's `logs/` directory or a worker's logs
+directory. `N` is the worker session number `horde-log sessions` prints, and the stats group is the one whose
+stamp sits within two minutes of that session's first log line. `--stats DIR` and `--footprints FILE` override
+the discovery. A session captured mid-run has no matching stats stamp and is reported as such.
+
+```bash
+horde-log replay-fixture logs/external_logs/<box>/horde_support_<stamp> --session 3 /tmp/replay
+```
+
 ## Environment variables
 
 ### Install and runtime

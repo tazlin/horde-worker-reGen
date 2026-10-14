@@ -338,8 +338,13 @@ def stats_session_local_start(report: SessionDutyReport) -> datetime | None:
     are epoch seconds. Matching a log epoch by the stamp needs no guess at the host's time zone. None for a
     file whose name carries no stamp.
     """
-    for source in report.source_files:
-        match = _STATS_SESSION_RE.match(Path(source).name)
+    return stats_files_local_start([Path(source) for source in report.source_files])
+
+
+def stats_files_local_start(paths: Iterable[Path]) -> datetime | None:
+    """Return the host-clock start stamp of the first of ``paths`` whose filename carries one, else None."""
+    for path in paths:
+        match = _STATS_SESSION_RE.match(path.name)
         if match is not None:
             return datetime.strptime(match.group("stamp"), "%Y%m%d-%H%M%S")
     return None
@@ -356,7 +361,7 @@ def analyze_stats_files(
     samples: list[dict[str, Any]] = []
     jobs: list[dict[str, Any]] = []
     unknown_event_count = 0
-    for payload in _read_stats_payloads(paths):
+    for payload in read_stats_payloads(paths):
         event = payload.get("event")
         if event == "stats_sample" and isinstance(payload.get("sample"), dict):
             samples.append(cast(dict[str, Any], payload["sample"]))
@@ -536,7 +541,12 @@ def _stats_file_order_key(path: Path) -> tuple[float, str]:
     return (mtime, path.name)
 
 
-def _read_stats_payloads(paths: list[Path]) -> Iterable[dict[str, Any]]:
+def read_stats_payloads(paths: list[Path]) -> Iterable[dict[str, Any]]:
+    """Yield every JSON object in a session's stats files, in rotation order.
+
+    A line that does not parse and a file that cannot be read are skipped, since an exporter cut off
+    mid-write leaves a partial last line and the rest of the session is still worth reading.
+    """
     for path in sorted(paths, key=_stats_file_order_key):
         compressed = path.name.endswith(".gz")
         try:
@@ -1251,6 +1261,8 @@ __all__ = [
     "analyze_stats_files",
     "analyze_stats_sessions",
     "discover_stats_sessions",
+    "read_stats_payloads",
     "render_session_duty_report",
+    "stats_files_local_start",
     "stats_session_local_start",
 ]

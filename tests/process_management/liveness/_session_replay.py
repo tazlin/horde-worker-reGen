@@ -1,9 +1,10 @@
 """A live session's job stream and learned footprints, fed to the dispatch world as its inputs.
 
 The fixture under ``replay/`` is one session's job stream (``session_24gb_two_lane.jsonl``, one row per finished
-job, built from the session's ``job_completed`` stats rows) and the learned footprint store the worker held
-(``footprints_24gb_two_lane.json``, every key's platform rewritten to ``<platform>``). This module turns them into
-the world's inputs, so a replay drives the real scheduler with that stream over that prior:
+job) and the learned footprint store the worker held (``footprints_24gb_two_lane.json``, every key's platform
+rewritten to ``<platform>``), the two files ``horde-log replay-fixture`` writes from a support bundle, renamed.
+This module turns them into the world's inputs, so a replay drives the real scheduler with that stream over that
+prior:
 
 - :func:`load_session_jobs` reads the stream as :class:`ReplayJob` rows, each with the pop response the world is
   offered.
@@ -48,6 +49,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasP
 from hordelib.feature_impact import get_baseline_burden
 from pydantic import BaseModel, ConfigDict
 
+from horde_worker_regen.analysis.replay_fixture import PLATFORM_PLACEHOLDER, ReplayJobRow, read_replay_job_rows
 from horde_worker_regen.process_management.resources.resource_budget import predict_job_sampling_vram_mb
 from horde_worker_regen.process_management.resources.vram_footprints import (
     POST_PROCESS_CHAIN_BASELINE,
@@ -68,44 +70,8 @@ SESSION_JOBS_PATH = REPLAY_FIXTURE_DIRECTORY / "session_24gb_two_lane.jsonl"
 SESSION_FOOTPRINTS_PATH = REPLAY_FIXTURE_DIRECTORY / "footprints_24gb_two_lane.json"
 """The learned footprint store the same worker held, with every key's platform replaced by a placeholder."""
 
-PLATFORM_PLACEHOLDER = "<platform>"
-"""The token the fixture's footprint keys carry where the recording host's ``sys.platform`` stood."""
-
 _REPLAY_CLASS_LABEL_PREFIX = "replay_"
 """Keeps a replayed class's label apart from the world's own pool labels."""
-
-
-class _FixtureRow(BaseModel):
-    """Represents one row of the session fixture as the fixture builder wrote it."""
-
-    model_config = ConfigDict(frozen=True, extra="ignore")
-
-    offset_s: float
-    dispatch_offset_s: float | None
-    finalized_offset_s: float | None
-    job_id: str
-    model: str
-    baseline: str
-    width: int
-    height: int
-    steps: int
-    batch: int
-    sampler: str
-    hires_fix: bool
-    loras: int
-    tis: int
-    post_processing: list[str]
-    sampling_s: float | None
-    vae_decode_s: float | None
-    clip_encode_s: float | None
-    ram_to_vram_s: float | None
-    post_processing_chain_s: float | None
-    safety_s: float | None
-    kudos: float | None
-    peak_device_used_mb: float | None
-    peak_resident_weights_mb: float | None
-    vram_used_high_water_mb: float | None
-    faulted: bool
 
 
 @dataclass(frozen=True)
@@ -146,19 +112,68 @@ class ReplayJob:
     """The job as the world is offered it. Its id is generated, so the per-job maps key on it."""
 
 
-def _pop_response(row: _FixtureRow) -> ImageGenerateJobPopResponse:
-    """Create the pop response carrying every request field the row records."""
-    return make_job_pop_response(
-        row.model,
-        width=row.width,
-        height=row.height,
-        ddim_steps=row.steps,
+def _required[T](row: ReplayJobRow, column: str, value: T | None) -> T:
+    """Return a column a replayed job cannot run without, raising when the row carries none.
+
+    Raises:
+        ValueError: The row has no value in ``column``.
+    """
+    if value is None:
+        raise ValueError(f"fixture row {row.job_id} has no {column}, which a replayed job needs")
+    return value
+
+
+def _replay_job(row: ReplayJobRow) -> ReplayJob:
+    """Create the replayed job for one fixture row, with the pop response carrying every request field it records.
+
+    Raises:
+        ValueError: The row lacks the model, baseline, resolution, steps or sampler a pop response needs.
+    """
+    model = _required(row, "model", row.model)
+    width = _required(row, "width", row.width)
+    height = _required(row, "height", row.height)
+    steps = _required(row, "steps", row.steps)
+    sampler = _required(row, "sampler", row.sampler)
+    pop_response = make_job_pop_response(
+        model,
+        width=width,
+        height=height,
+        ddim_steps=steps,
         n_iter=row.batch,
-        sampler_name=row.sampler,
+        sampler_name=sampler,
         loras=[LorasPayloadEntry(name=f"replay-lora-{index}") for index in range(row.loras)] or None,
         tis=[TIPayloadEntry(name=f"replay-ti-{index}") for index in range(row.tis)] or None,
         post_processing=list(row.post_processing) or None,
         hires_fix=row.hires_fix,
+    )
+    return ReplayJob(
+        offset_seconds=row.offset_s,
+        dispatch_offset_seconds=row.dispatch_offset_s,
+        finalized_offset_seconds=row.finalized_offset_s,
+        live_job_id=row.job_id,
+        model=model,
+        baseline=_required(row, "baseline", row.baseline),
+        width=width,
+        height=height,
+        steps=steps,
+        batch=row.batch,
+        sampler=sampler,
+        hires_fix=row.hires_fix,
+        lora_count=row.loras,
+        textual_inversion_count=row.tis,
+        post_processing=row.post_processing,
+        sampling_seconds=row.sampling_s,
+        decode_seconds=row.vae_decode_s,
+        encode_seconds=row.clip_encode_s,
+        ram_to_vram_seconds=row.ram_to_vram_s,
+        chain_seconds=row.post_processing_chain_s,
+        safety_seconds=row.safety_s,
+        kudos=row.kudos,
+        peak_device_used_mb=row.peak_device_used_mb,
+        peak_resident_weights_mb=row.peak_resident_weights_mb,
+        vram_used_high_water_mb=row.vram_used_high_water_mb,
+        faulted=row.faulted,
+        pop_response=pop_response,
     )
 
 
@@ -166,47 +181,12 @@ def load_session_jobs(path: Path) -> list[ReplayJob]:
     """Parse the session fixture at ``path`` into jobs, in pop order.
 
     Args:
-        path: A JSON-lines fixture written by the replay fixture builder.
+        path: A job stream written by ``horde-log replay-fixture``.
 
     Returns:
         list[ReplayJob]: One job per row, sorted by pop offset.
     """
-    jobs: list[ReplayJob] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        row = _FixtureRow.model_validate_json(line)
-        jobs.append(
-            ReplayJob(
-                offset_seconds=row.offset_s,
-                dispatch_offset_seconds=row.dispatch_offset_s,
-                finalized_offset_seconds=row.finalized_offset_s,
-                live_job_id=row.job_id,
-                model=row.model,
-                baseline=row.baseline,
-                width=row.width,
-                height=row.height,
-                steps=row.steps,
-                batch=row.batch,
-                sampler=row.sampler,
-                hires_fix=row.hires_fix,
-                lora_count=row.loras,
-                textual_inversion_count=row.tis,
-                post_processing=tuple(row.post_processing),
-                sampling_seconds=row.sampling_s,
-                decode_seconds=row.vae_decode_s,
-                encode_seconds=row.clip_encode_s,
-                ram_to_vram_seconds=row.ram_to_vram_s,
-                chain_seconds=row.post_processing_chain_s,
-                safety_seconds=row.safety_s,
-                kudos=row.kudos,
-                peak_device_used_mb=row.peak_device_used_mb,
-                peak_resident_weights_mb=row.peak_resident_weights_mb,
-                vram_used_high_water_mb=row.vram_used_high_water_mb,
-                faulted=row.faulted,
-                pop_response=_pop_response(row),
-            ),
-        )
+    jobs = [_replay_job(row) for row in read_replay_job_rows(path)]
     jobs.sort(key=lambda job: job.offset_seconds)
     return jobs
 

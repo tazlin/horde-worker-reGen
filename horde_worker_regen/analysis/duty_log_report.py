@@ -97,7 +97,7 @@ The arithmetic group is optional: a hold for the post-processing co-residency mu
 place. The line is edge-logged once per distinct ``(process, decision)``, so a count of these lines is a
 count of distinct holds, never of held ticks."""
 _NO_RECLAIM = "none"
-_STATS_EPOCH_MATCH_SECONDS = 120.0
+STATS_EPOCH_MATCH_SECONDS = 120.0
 """How far a stats file's start stamp may sit from its session's manager-init banner and still match it."""
 
 # Duty bands for the distribution, as (exclusive-upper-bound, label); the last catches the rest.
@@ -465,7 +465,7 @@ def epoch_lines_for_stats_session(lines: list[str], started_local: datetime) -> 
 
     Returns:
         The lines of the epoch whose first line sits closest to ``started_local``, within
-        ``_STATS_EPOCH_MATCH_SECONDS``; empty when no epoch starts that close (a tail-capped log, for one).
+        ``STATS_EPOCH_MATCH_SECONDS``; empty when no epoch starts that close (a tail-capped log, for one).
     """
     best: list[str] = []
     best_distance: float | None = None
@@ -474,7 +474,7 @@ def epoch_lines_for_stats_session(lines: list[str], started_local: datetime) -> 
         if epoch_start is None:
             continue
         distance = abs((epoch_start - started_local).total_seconds())
-        if distance > _STATS_EPOCH_MATCH_SECONDS:
+        if distance > STATS_EPOCH_MATCH_SECONDS:
             continue
         if best_distance is None or distance < best_distance:
             best, best_distance = epoch, distance
