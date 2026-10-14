@@ -11,7 +11,8 @@ The narrowing is duty-cycled. It engages for a bounded run of pop cycles, then r
 set for a run of cycles, so cold demand still reaches the worker and rare-model kudos stay reachable. The
 window is bounded by the duty cycle even if the backlog never clears; there is no path to a permanent
 narrowing. A narrowed pop the horde answers with no work ends the narrow phase early: the residents have
-no demand to feed, and holding the rest of the pool back from a card with nothing to do only starves it. Two safety rails hold regardless of phase: the narrowed offer is floored at resident+staged
+no demand to feed, and holding the rest of the pool back from a card with nothing to do only starves it.
+Two safety rails hold regardless of phase: the narrowed offer is floored at resident+staged
 (and falls back to the full offered set when that floor is empty), and narrowing only ever removes models
 from the offer, never adds one the worker does not already offer, so an advertised model is always one the
 worker would serve.
