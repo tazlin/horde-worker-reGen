@@ -1392,6 +1392,33 @@ The trailing history lives on the scheduler, keyed by slot, because it describes
 than one process's residency: it must outlive every job boundary, and a slot whose child was replaced is still
 serving the same shape of work.
 
+### A named successor does not by itself keep the weights
+
+A popped job that names the model a lane has just finished with looks like the ideal retention case: the
+successor adds no bytes to the card, and a release followed by a reload of the same weights is the worst
+exchange. The rule was tried as three changes together and measured as a loss on the session replay with
+work always available, so it is not in the tree: the governor gate waived when a popped job names the model,
+the static fit priced at the successor's staged clearance price in place of the dispatched job's whole-job peak,
+and the reclaim victim choice (the dispatch-hold eviction and the pressure sweep) taking a copy a popped job
+names last, and only when the unnamed copies do not cover the shortfall.
+
+Measured on a two-lane 24 GB card over the whole session, the rules on against off: card busy 71.4% against
+71.7% and kudos per hour 28.6k against 28.9k with the replay pricing a dispatch in the tick it is made; 66.2%
+either way with the older one-tick pricing, plus two over-committed ticks and 27 more partial loads with the
+rules on. The retention
+denial counts did not move (static fit 460 to 471 idle seconds, the dispatch-hold eviction 212 to 238), so the
+named case was not where the reloads came from. On this traffic the successor is usually popped after the
+predecessor ends, so at the decision instant no job names the model, and where one does the kept weights hold
+room the other lane's different-model job needs: the idle time moves from the reload into a clearance hold on
+the sibling, which is longer.
+
+The reason is the card's shape, not the rule's logic. Revisit it only when a measurement shows the premise
+changed: a card that seats two whole-job peaks of the offered mix beside each other (a larger card or a mix of
+smaller models), a single-lane worker where no sibling competes for the room, or staging that routinely pops and
+stages the successor before the predecessor ends, so the named case is the common one at the decision instant.
+Prove any retry on the on-demand replay before writing it (`docs/plans/bundle-20261014-db0-000114/`,
+`chronicle-retention-named-successor-handback.md`).
+
 ### A hold nothing comes back for is revoked under sustained pressure
 
 A grant is a prediction, and before this nothing revisited one: only an eviction actuation could end a

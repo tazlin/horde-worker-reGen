@@ -14220,22 +14220,8 @@ class InferenceScheduler:
                     continue
 
                 if process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
-                    logger.info(
-                        f"Unloading model {process_info.loaded_horde_model_name} from VRAM on process "
-                        f"{process_info.process_id}",
-                    )
-                    process_info.safe_send_message(
-                        HordeControlModelMessage(
-                            control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM,
-                            horde_model_name=process_info.loaded_horde_model_name,
-                        ),
-                    )
-                    process_info.clear_job_references()
-                    self._retention.note_evicted_unused(process_info)
-                    process_info.clear_retained_resident()
-                    process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+                    self._send_idle_model_vram_unload(process_info)
                     unloaded_any = True
-                    self._record_churn("vram_eviction")
             else:
                 if process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
                     logger.debug(f"Unloading all models from VRAM on process {process_info.process_id}")
@@ -14259,6 +14245,24 @@ class InferenceScheduler:
                     unloaded_any = True
 
         return unloaded_any
+
+    def _send_idle_model_vram_unload(self, process_info: HordeProcessInfo) -> None:
+        """Send one idle inference lane's model off the card and forget the lane's retained residency."""
+        model = process_info.loaded_horde_model_name
+        if model is None:
+            return
+        logger.info(f"Unloading model {model} from VRAM on process {process_info.process_id}")
+        process_info.safe_send_message(
+            HordeControlModelMessage(
+                control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM,
+                horde_model_name=model,
+            ),
+        )
+        process_info.clear_job_references()
+        self._retention.note_evicted_unused(process_info)
+        process_info.clear_retained_resident()
+        process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        self._record_churn("vram_eviction")
 
     def unload_from_ram(self, process_id: int) -> None:
         """Unload models from a process."""
