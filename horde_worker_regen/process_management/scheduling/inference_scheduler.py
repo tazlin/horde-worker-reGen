@@ -376,8 +376,9 @@ is its resident weights or components (a component/VAE/post-process lane holding
 reserved) has no such cache, so asking it to release frees nothing. Requiring this measured margin keeps a
 resident-weight lane out of the release-target set so the escalation ladder does not emit a rung that can
 never yield, which would otherwise keep the ladder non-empty forever and defer a head that reclaim can
-never actually relieve. An idle inference lane whose model is in host RAM is the exception: its reservation is
-its unretained components, which the release also drops, so the whole reservation is measured against this."""
+never actually relieve. An idle inference lane whose model is in host RAM is the exception. Its reservation is
+its cached components' device weights, which the release also moves to host RAM, so the whole reservation is
+measured against this."""
 
 _CONTEXT_REDUCTION_MIN_INTERVAL_SECONDS = 60.0
 """Minimum gap between live-context reductions on one card.
@@ -5537,13 +5538,13 @@ class InferenceScheduler:
         is not a target: asking it to release frees nothing, and emitting a rung that can never yield would keep
         the escalation ladder non-empty forever. An idle process that still holds a horde model is an eviction
         candidate (a distinct ladder rung), not a cache-release target, so it is left out here to keep the two
-        remedies separate, unless its model is in host RAM (:meth:`_releases_unretained_components`). A busy
+        remedies separate, unless its model is in host RAM (:meth:`_releases_component_device_weights`). A busy
         process is never a target. When the in-use allocation has not yet been reported the reclaimable margin
         cannot be measured, so the process is not targeted rather than assumed to hold cache. A process with a
         release outstanding is not targeted again, and one whose release returned nothing is not a target until it
         loads or unloads a model (:meth:`_release_cache_grade`). A lane that owns a dispatched job is counted busy
         whatever it last reported. It is committed to that job until its first step, and a release queued ahead
-        of the job's start drops the split components the job is about to load.
+        of the job's start moves off the device the split components the job is about to load.
         """
         cache_bearing = (
             HordeProcessType.INFERENCE,
@@ -5562,7 +5563,7 @@ class InferenceScheduler:
                 busy.add(process_info.process_id)
                 continue
             if process_info.loaded_horde_model_name is not None:
-                if self._releases_unretained_components(process_info) and not self._release_cache_withheld(
+                if self._releases_component_device_weights(process_info) and not self._release_cache_withheld(
                     process_info,
                 ):
                     idle.add(process_info.process_id)
@@ -5613,15 +5614,14 @@ class InferenceScheduler:
             )
         return grade
 
-    def _releases_unretained_components(self, process_info: HordeProcessInfo) -> bool:
+    def _releases_component_device_weights(self, process_info: HordeProcessInfo) -> bool:
         """Whether a cache release would return an idle inference lane's reservation though it holds a model.
 
-        A lane waiting for a job with its model in host RAM still holds whatever split text encoder and VAE its
-        last retained job left on the device, as live allocation an ``empty_cache`` alone cannot return. The
-        child drops those unretained components on the same release while it idles with its model off the
-        device, so such a lane is a target once its reservation reaches the release threshold. A lane whose
-        weights are on the device is the eviction rung's, and a retained lane keeps its components for its
-        next job.
+        A lane waiting for a job with its model in host RAM can still hold device weights of its cached split text
+        encoder and VAE, as live allocation an ``empty_cache`` alone cannot return. The child moves those weights
+        to host RAM on the same release while it idles with its model off the device, keeping the cache entries,
+        so such a lane is a target once its reservation reaches the release threshold. A lane whose weights are on
+        the device is the eviction rung's.
         """
         reserved_mb = process_info.process_reserved_mb
         return (

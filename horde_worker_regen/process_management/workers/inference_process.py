@@ -1702,16 +1702,17 @@ class HordeInferenceProcess(HordeProcess):
         per-process ``process_reserved_mb`` reflects the release promptly. Deliberately emits no model
         state change: nothing was unloaded.
 
-        On an idle lane whose model is in host RAM it first drops the component-cache entries held only
-        while the model is retained (a split graph's text encoder and VAE). A retained job leaves them on the
-        device, and a later VRAM unload frees the model but not them, so they are live allocation the cache
-        release alone cannot return. Retention has ended once the model is off the device, so nothing it holds
-        is released; a lane serving a job or holding its weights on the device keeps them.
+        On an idle lane whose model is in host RAM it first moves every cached component's device weights to
+        host RAM, keeping the cache entries. hordelib caches a split graph's text encoder and VAE across jobs,
+        retained or not, and a component weight still on the device beside an unloaded model is live
+        allocation the cache release alone cannot return. ComfyUI's full unload detaches every component it
+        tracks, so this normally finds nothing. It keeps the device consistent with the lane's reported host-RAM
+        state whatever ComfyUI still lists. A lane serving a job or holding its weights on the device keeps them.
         """
         logger.debug("Releasing allocator cache (resident models stay loaded)")
         if not self._dry_run_skip_inference:
             if self._idles_with_model_in_host_ram():
-                self._release_unretained_components()
+                self._release_component_device_weights()
             self.clear_gc_and_torch_cache()
         self.send_memory_report_message(include_vram=True)
 
@@ -1723,15 +1724,18 @@ class HordeInferenceProcess(HordeProcess):
             and self._active_model_load_state is ModelLoadState.LOADED_IN_RAM
         )
 
-    def _release_unretained_components(self) -> None:
-        """Drop the component-cache entries held only while the model is retained, logging what was dropped."""
+    def _release_component_device_weights(self) -> None:
+        """Move the cached components' device weights to host RAM, keeping the entries, and log how many moved."""
         if not self._reports_held_components:
             return
-        from hordelib.execution.component_cache import release_unretained_components
+        from hordelib.execution.component_cache import release_component_device_weights
 
-        released = release_unretained_components()
+        released = release_component_device_weights()
         if released:
-            logger.info(f"Released {released} unretained component(s) held on the device beside an unloaded model")
+            logger.info(
+                f"Moved the device weights of {released} cached component(s) held beside an unloaded model to "
+                "host RAM",
+            )
 
     @logger.catch(reraise=True)
     def unload_models_from_ram(self) -> None:

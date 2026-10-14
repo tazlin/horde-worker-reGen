@@ -4,8 +4,9 @@ Releasing the allocator cache must reclaim the torch caching allocator's free bl
 any model: the observable contract is that the child sends a fresh memory report and emits no
 model-unload state change. The component lane also has a model-unload handler. The service lanes are pinned
 on their dry-run instances (their ML paths are rig-only, so a dry-run instance exercises the message contract
-without a backend). The inference child is pinned on its actuator alone: it drops its unretained components
-before the cache release only while it idles with its model in host RAM, and reports after both.
+without a backend). The inference child is pinned on its actuator alone. It moves its cached components'
+device weights to host RAM before the cache release only while it idles with its model in host RAM, and reports
+after both.
 """
 
 from __future__ import annotations
@@ -187,7 +188,7 @@ def _inference_child(
 
 @pytest.fixture
 def component_release_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record every call into hordelib's unretained-component release on a shared list."""
+    """Record every call into hordelib's component device-weight release on a shared list."""
     from hordelib.execution import component_cache
 
     calls: list[str] = []
@@ -196,18 +197,18 @@ def component_release_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("release")
         return 2
 
-    monkeypatch.setattr(component_cache, "release_unretained_components", _record_release)
+    monkeypatch.setattr(component_cache, "release_component_device_weights", _record_release)
     return calls
 
 
 class TestInferenceCacheRelease:
-    """The inference child drops unretained components only while it idles with its model in host RAM."""
+    """The inference child moves its components' device weights only while it idles with its model in host RAM."""
 
     def test_idle_with_model_in_ram_releases_then_empties_then_reports(
         self,
         component_release_calls: list[str],
     ) -> None:
-        """The components go first, so the cache empty returns their blocks and the report shows it."""
+        """The component weights go first, so the cache empty returns their blocks and the report shows it."""
         child = _inference_child(component_release_calls, busy=False, load_state=ModelLoadState.LOADED_IN_RAM)
 
         child.release_allocator_cache()
@@ -215,7 +216,7 @@ class TestInferenceCacheRelease:
         assert component_release_calls == ["release", "empty", "report"]
 
     def test_busy_lane_only_empties_and_reports(self, component_release_calls: list[str]) -> None:
-        """A lane serving a job keeps its components."""
+        """A lane serving a job keeps its components on the device."""
         child = _inference_child(component_release_calls, busy=True, load_state=ModelLoadState.LOADED_IN_RAM)
 
         child.release_allocator_cache()
@@ -223,7 +224,7 @@ class TestInferenceCacheRelease:
         assert component_release_calls == ["empty", "report"]
 
     def test_model_on_the_device_only_empties_and_reports(self, component_release_calls: list[str]) -> None:
-        """A lane whose weights are on the device is the eviction rung's, and keeps its components."""
+        """A lane whose weights are on the device is the eviction rung's, and keeps its components there."""
         child = _inference_child(component_release_calls, busy=False, load_state=ModelLoadState.LOADED_IN_VRAM)
 
         child.release_allocator_cache()

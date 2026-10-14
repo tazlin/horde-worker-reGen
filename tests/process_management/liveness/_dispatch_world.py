@@ -1379,13 +1379,13 @@ class _DispatchWorld:
         packed with these is therefore squeezed by lanes that are idle and hold no running work, which is the
         regime a fit computed from live contexts and dispatched jobs alone cannot see."""
         self._unretained_component_mb: dict[int, float] = {}
-        """Per-lane split text-encoder and VAE entries left on the device after the lane's model went to RAM.
+        """Per-lane device share of split text-encoder and VAE entries left on the card after the model went to RAM.
 
-        hordelib keeps them only while retention holds the model, and drops them at the end of an unretained
-        job, but a model a retention grant kept and the parent later unloaded leaves them behind: the VRAM
-        unload frees the model and not the component cache. The lane reports them as live allocation, so an
-        allocator-cache release frees nothing of them; only the release of unretained components the child runs
-        on ``RELEASE_ALLOCATOR_CACHE`` while it idles with its model in RAM returns them."""
+        hordelib caches them across jobs, retained or not, and their host copies are not modelled here. A
+        component weight the VRAM unload did not detach stays on the device beside the unloaded model, and the
+        lane reports it as live allocation, so an allocator-cache release frees nothing of it. Only the
+        device-weight release the child runs on ``RELEASE_ALLOCATOR_CACHE`` while it idles with its model in RAM
+        returns it, and the entries stay cached."""
         self._granted_resident_evicted: set[int] = set()
         """Lanes whose committed weights the child freed mid-job while the parent still records them.
 
@@ -2737,16 +2737,16 @@ class _DispatchWorld:
             if not isinstance(message, HordeControlMessage):
                 continue
             if message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
-                self._release_unretained_components(lane)
+                self._release_component_device_weights(lane)
             elif message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM and not unload_flagged:
                 self._free_device_weights(lane)
 
-    def _release_unretained_components(self, lane: HordeProcessInfo) -> None:
-        """Return ``lane``'s unretained components to the card, as the child's cache release does when idle.
+    def _release_component_device_weights(self, lane: HordeProcessInfo) -> None:
+        """Return the device share of ``lane``'s cached components to the card, as the child's cache release does.
 
-        The child releases them only while it waits for a job with its model off the device, so a lane serving
-        a job or holding its weights on the card keeps them. With ``unretained_components_pinned`` nothing is
-        returned.
+        The child moves them to host RAM only while it waits for a job with its model off the device, so a lane
+        serving a job or holding its weights on the card keeps them there. The entries stay cached, so only the
+        device share is returned. With ``unretained_components_pinned`` nothing is returned.
         """
         if self.unretained_components_pinned:
             return

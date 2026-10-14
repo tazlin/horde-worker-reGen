@@ -7007,7 +7007,7 @@ async def test_unretained_components_defect_reinjection_no_rung_returns_them(mon
     ) -> dict[int, float]:
         return {}
 
-    monkeypatch.setattr(InferenceScheduler, "_releases_unretained_components", no_release_target)
+    monkeypatch.setattr(InferenceScheduler, "_releases_component_device_weights", no_release_target)
     monkeypatch.setattr(InferenceScheduler, "_held_idle_returns_mb", every_idle_sibling_bare)
 
     world, head = await _drive_head_past_unretained_components()

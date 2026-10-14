@@ -1002,8 +1002,9 @@ is only worth anything when another demand actually needs the memory. The arbite
 therefore the sole reclaim path: a deferred demand emits a release command targeting a specific idle
 process's cache, the preload adapter executes it, and the freed reservation shows up in the next cycle's
 measurement. An idle inference lane whose model is in host RAM is also a release target once its reservation
-reaches the release threshold: the child drops the split text encoder and VAE entries it kept only while the
-model was retained, which a VRAM unload leaves on the device as live allocation, before it empties the cache.
+reaches the release threshold. The child first returns to host RAM any device weights its cached split text
+encoder and VAE still hold, then empties the allocator cache. The cache entries stay, so the model's next job
+skips the disk read.
 A release is graded on what it returned, after the teardown settle the ladder gives a lane rung: a lane is not
 asked again while its release is inside the settle, and one whose reservation has still not moved by the release
 threshold after it is no longer a target, with the room counting nothing a rung returns from it, until the lane
