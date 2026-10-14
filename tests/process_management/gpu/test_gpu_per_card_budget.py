@@ -84,7 +84,11 @@ def _make_scheduler(
         job_tracker=job_tracker if job_tracker is not None else JobTracker(),
         process_lifecycle=process_lifecycle
         if process_lifecycle is not None
-        else Mock(is_model_load_quarantined=Mock(return_value=False), is_safety_gpu_paused=False),
+        else Mock(
+            is_model_load_quarantined=Mock(return_value=False),
+            is_safety_gpu_paused=False,
+            get_processes_with_model_for_queued_job=Mock(return_value=[]),
+        ),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=make_test_model_metadata(),
         card_runtimes=card_runtimes,
