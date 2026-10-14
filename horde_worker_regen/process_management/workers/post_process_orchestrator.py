@@ -967,6 +967,11 @@ class PostProcessOrchestrator:
             post_process_process.process_id,
             HordeProcessState.POST_PROCESSING,
         )
+        # The chain loads its modules onto the card, so an unload the lane served earlier no longer describes
+        # what it holds. The flag is the last command sent, as the inference and alchemy dispatches record
+        # theirs. Left standing, the VRAM sweep would read the served unload as one in flight and never ask the
+        # lane to give the modules back.
+        post_process_process.last_control_flag = HordeControlFlag.START_POST_PROCESS
         self._process_map.on_last_job_reference_change(
             post_process_process.process_id,
             completed_job_info.sdk_api_job_info,

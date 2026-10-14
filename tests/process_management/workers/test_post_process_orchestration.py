@@ -558,6 +558,26 @@ class TestStartPostProcessing:
         assert sent.images_bytes == [b"raw-image"]
         assert sent.post_processing == ["RealESRGAN_x4plus", "GFPGAN"]
 
+    async def test_a_dispatched_chain_retires_the_lanes_served_unload(self) -> None:
+        """The chain is the lane's last command, so a sweep may ask for the chain's modules back later.
+
+        A served VRAM unload left standing on the lane reads as one in flight to the sweep, which would then
+        never unload the modules the chain loads.
+        """
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        lane.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+
+        job_info = _make_pp_job_info(["RealESRGAN_x4plus"])
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        assert job_info in process_manager._job_tracker.jobs_being_post_processed
+        assert lane.last_control_flag == HordeControlFlag.START_POST_PROCESS
+
     async def test_dispatch_carries_the_jobs_facefixer_strength(self) -> None:
         """The control message carries the payload's face-fixer strength to the lane."""
         process_manager = make_testable_process_manager()

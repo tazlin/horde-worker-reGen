@@ -3370,6 +3370,10 @@ class _DispatchWorld:
             )
             lane.last_process_state = HordeProcessState.POST_PROCESSING
             lane.last_job_referenced = job_info.sdk_api_job_info
+            # The orchestrator records its dispatch on the lane as the inference dispatch does. That clears an
+            # unload the lane served before this chain, so a later sweep's unload is a fresh command.
+            lane.last_control_flag = HordeControlFlag.START_POST_PROCESS
+            self._unload_served.discard(lane.process_id)
             await self._job_tracker.begin_post_processing(
                 job_info,
                 process_id=lane.process_id,
