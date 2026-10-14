@@ -711,6 +711,16 @@ cap may offer the job to a different eligible card, but the failure never earns 
 card: the card was already converged and alone. When the normal cap is spent, the job faults through the usual
 terminal path.
 
+At clearance the request also carries the job's non-weight reserve (`VramRequest.sampling_reserve_mb`, from
+`pricing.sampling_reserve_mb`), the room the grant tells the child's load to keep free for the activation. The
+attempt is made only while the measured device free net of the outstanding reservations holds that reserve. The
+child sizes a partial load to the granted free figure less the reserve, so below it every weight stays in host
+RAM and the activation alone goes over the card. A child cannot leave room the card does not have. The head
+keeps waiting with the ordinary ladder (`VramVerdict.reserve_shortfall_mb` set, the one-shot unspent), and the
+clearance-hold line ends by naming the shortfall. The admission margin is not charged against the reserve: it
+covers the reading's drift and the prediction's error, while the reserve is room taken out of what the reading
+shows.
+
 For work the worker has not accepted, the shortfall's *size* does not gate an under-ceiling attempt, and the
 over-ceiling escape stays limited to the prediction-error allowance. Accepted RAM-staged work adds one case:
 when the checkpoint weights themselves fit the achievable ceiling, an activation-inclusive static prediction
@@ -1156,7 +1166,9 @@ seat = f x weights + max(activation, ComfyUI inference reserve)
   teardown run toward the most room the card can give, and `_ceiling_attempt_pending_convergence` keeps the
   verdict at DEFER while reclaim remains. On a converged card the seat's outstanding part (net of what the job
   holds) is priced against the reading ahead of the measured attempt, so a qualifying job never spends or needs
-  the one-shot. A seat that does not fit falls through to the ceiling attempt and the DENY unchanged.
+  the one-shot. A seat that does not fit falls through to the ceiling attempt and the DENY unchanged. A seat
+  that fits only by netting holdings larger than its weight share takes the measured attempt's reserve
+  condition, and defers while the free net of reservations is below the job's non-weight term.
 - **Grant and booking.** The grant carries the measured device free the admission priced against, and
   hordelib rebases ComfyUI's clamp on it. It also carries the seat's non-weight term
   (`pricing.sampling_reserve_mb`, the larger of the activation and ComfyUI's inference reserve), which
@@ -1548,7 +1560,11 @@ absent from the newer measurement. A grant with no reading, a timed-out acquire,
 keep the dispatch figure. Under two-phase clearance the stage grant carries the device free its own admission
 priced against, and hordelib rebases the clamp on it before the early weight upload. The sample grant's figure
 then replaces it at the sample acquire. The figure always comes from the parent. A child-side read of device free is the
-untruthful view the clamp exists to correct. The scenarios in
+untruthful view the clamp exists to correct. Children cleared in one controller step each get the reading less
+what the children cleared before them take of it, their weights plus their non-weight reserve capped at the
+figure they were handed (`clearance_lease._grant_charge_mb`, from `ClearanceWaiter.weights_mb` and
+`ClearanceWaiter.sampling_reserve_mb`). A partial load sizes itself to its figure, so a figure shared between two
+grants would let the second size itself into room the first fills. The scenarios in
 `tests/process_management/liveness/test_incident_scenarios.py` hold this: a streak whose true footprint nearly
 fills the card keeps its margin and its duty when the reading is on the dispatch, and craters when it is not.
 

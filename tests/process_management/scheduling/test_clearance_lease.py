@@ -850,6 +850,75 @@ class TestGrantCarriesClearanceTruth:
         assert proxy.acquire(True, 0.0) is True
         assert proxy.take_cleared_device_free_mb() is None
 
+    @pytest.mark.parametrize(
+        ("first_weights_mb", "first_reserve_mb", "first_charge_mb"),
+        [
+            pytest.param(6_000.0, 1_500.0, 7_500.0, id="weights_and_reserve"),
+            pytest.param(17_000.0, 2_000.0, 18_000.0, id="capped_at_the_figure"),
+        ],
+    )
+    def test_children_cleared_in_one_step_get_figures_net_of_the_earlier_grants(
+        self,
+        first_weights_mb: float,
+        first_reserve_mb: float,
+        first_charge_mb: float,
+    ) -> None:
+        """The second child's figure is the reading less what the first takes: its weights plus its reserve.
+
+        Each child sizes its load to the figure it is handed, so a figure shared between them hands both the room
+        the first one fills.
+        """
+        controller = _controller(slot_cap=2)
+        first = _StubProxy(cleared_device_free=_shared_figure())
+        second = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, first)
+        controller.register(3, second)
+        first.begin_job()
+        second.begin_job()
+        staged = (
+            ClearanceWaiter(
+                process_id=2,
+                priority=1,
+                job_id="job-a",
+                weights_mb=first_weights_mb,
+                sampling_reserve_mb=first_reserve_mb,
+            ),
+            ClearanceWaiter(process_id=3, priority=2, job_id="job-b", weights_mb=4_000.0, sampling_reserve_mb=1_500.0),
+        )
+
+        result = controller.step(_inputs(staged=staged, device_free_mb=18_000.0), admit_fn=_always_admit)
+
+        assert result.cleared_process_ids == (2, 3)
+        assert first.acquire(True, 0.0) is True
+        assert second.acquire(True, 0.0) is True
+        first_figure = first.take_cleared_device_free_mb()
+        second_figure = second.take_cleared_device_free_mb()
+        assert first_figure == 18_000.0
+        assert second_figure is not None
+        assert first_figure - second_figure == pytest.approx(first_charge_mb)
+
+    def test_a_held_child_takes_nothing_from_the_next_figure(self) -> None:
+        """A child admission held is not granted, so the next child cleared in the step gets the whole reading."""
+        controller = _controller(slot_cap=2)
+        held = _StubProxy(cleared_device_free=_shared_figure())
+        cleared = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, held)
+        controller.register(3, cleared)
+        cleared.begin_job()
+        staged = (
+            ClearanceWaiter(process_id=2, priority=1, job_id="job-a", weights_mb=6_000.0, sampling_reserve_mb=1_500.0),
+            ClearanceWaiter(process_id=3, priority=2, job_id="job-b", weights_mb=4_000.0, sampling_reserve_mb=1_500.0),
+        )
+
+        result = controller.step(
+            _inputs(staged=staged, device_free_mb=18_000.0),
+            admit_fn=lambda process_id: process_id == 3,
+        )
+
+        assert result.cleared_process_ids == (3,)
+        assert cleared.acquire(True, 0.0) is True
+        assert cleared.take_cleared_device_free_mb() == 18_000.0
+
 
 class TestTailOverlapObservability:
     """A tail-overlap early clear emits its own INFO signal exactly once per outgoing sampler."""

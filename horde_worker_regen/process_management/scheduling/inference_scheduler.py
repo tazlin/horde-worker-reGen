@@ -6880,7 +6880,8 @@ class InferenceScheduler:
         because a waiter behind another grant is not offered to :meth:`clearance_admit_process` at all.
 
         Each waiter carries its job's priced non-weight term (:func:`pricing.sampling_reserve_mb`), which the
-        controller writes with the child's grants.
+        controller writes with the child's grants, and the weights its grant puts on the card, from which the
+        controller nets one child's take out of the free figure it hands the next child cleared in the same step.
         """
         self._settle_staged_waiter_clocks(device_index)
         snapshot: SchedulingSnapshot | None = None
@@ -6903,6 +6904,7 @@ class InferenceScheduler:
                 dispatched_at = process_info.current_inference_started_at or float("inf")
                 snapshot = snapshot if snapshot is not None else self.snapshot()
                 baseline = self._model_metadata.get_baseline(referenced.model) if referenced.model else None
+                baseline_id = str(baseline) if baseline is not None else None
                 waiters.append(
                     ClearanceWaiter(
                         process_id=process_info.process_id,
@@ -6911,8 +6913,13 @@ class InferenceScheduler:
                         sampling_reserve_mb=pricing.sampling_reserve_mb(
                             snapshot,
                             referenced,
-                            str(baseline) if baseline is not None else None,
+                            baseline_id,
                             device_index=device_index,
+                        ),
+                        weights_mb=(
+                            0.0
+                            if pricing.candidate_weights_resident(snapshot, referenced.model, process_info.process_id)
+                            else predict_job_weight_mb(referenced, baseline_id)
                         ),
                     ),
                 )
@@ -7401,9 +7408,12 @@ class InferenceScheduler:
         but not why admission refused this specific child. This names the disposition, the measured terms
         (device free, reserve, outstanding reservations), the candidate charge net of what the child already
         holds, and the reclaim the arbiter ran, once per distinct ``(process, reason)`` rather than every
-        tick, so a held card's cause is readable from the line alone.
+        tick, so a held card's cause is readable from the line alone. A partial seat or measured attempt held
+        because the card's free memory is below the job's non-weight reserve says so at the end of the line and
+        coalesces apart from the job's other defers.
         """
-        suppressed = self._diagnostics.suppressed_count("clearance_hold", (str(process_id), reason))
+        reserve_held = verdict is not None and verdict.reserve_shortfall_mb is not None
+        suppressed = self._diagnostics.suppressed_count("clearance_hold", (str(process_id), reason, reserve_held))
         if suppressed is None:
             return
         if verdict is not None:
@@ -7437,6 +7447,11 @@ class InferenceScheduler:
                 f"noise buffer {measured.noise_buffer_mb:.0f}MB; reclaim run: {reclaim}; "
                 f"outstanding by unit: {composition}"
             )
+            if verdict.reserve_shortfall_mb is not None:
+                detail = (
+                    f"{detail}; the job's non-weight reserve does not fit, short by "
+                    f"{verdict.reserve_shortfall_mb:.0f}MB of device free net of outstanding reservations"
+                )
         else:
             detail = "post-processing co-residency mutex held the card for an in-flight or pending chain"
         logger.info(

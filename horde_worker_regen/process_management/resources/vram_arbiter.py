@@ -51,6 +51,10 @@ does or does not fit:
   full charge FITS at that seat ahead of every other non-fitting path, once the card has nothing left to
   reclaim and the seat fits the reading, whether or not the full charge is under the ceiling. ComfyUI serves it
   by loading a share of its weights, and room beyond a converged card only arrives if another tenant frees it.
+- A partial seat or a measured attempt for a job whose grant carries a non-weight reserve
+  (:attr:`VramRequest.sampling_reserve_mb`) DEFERS while the measured free net of the outstanding reservations
+  is below that reserve. The child's load keeps the reserve free, so with less than that on the card every
+  weight stays in host RAM and the activation alone goes over the card.
 - A card with no device-free reading yet DEFERS with a throttled diagnostic: the primary admission input is
   absent, so the arbiter neither denies nor fabricates a fictional free figure; it waits for the next reading.
 
@@ -62,7 +66,9 @@ worker-resident model, nothing left for make-room to reclaim), whose demand is u
 the conservative static prediction: a success teaches the learned peak the true figure, a failure is the
 strongest possible evidence and arms the ceiling hold. The attempt rides the ordinary FITS path, so every
 downstream safety applies unchanged, and it fires at most once per head-starvation episode. A shortfall beyond
-the band, or a card with reclaim still to do, keeps deferring.
+the band, or a card with reclaim still to do, keeps deferring. A grant that carries a non-weight reserve is
+attempted only once the measured free net of the outstanding reservations holds that reserve: the child's partial
+load leaves room for the activation out of what the card has, and cannot leave room the card does not have.
 
 The same one real load is reached from the other side of the arithmetic. A head at a converged-empty card whose
 predicted demand sits *above* the achievable ceiling by no more than
@@ -445,6 +451,14 @@ class VramRequest:
 
     Consulted only where the full need does not fit the reading: the seat admits once the card has nothing left
     to reclaim and the seat fits, since past that point the full need only fits if another tenant frees room."""
+    sampling_reserve_mb: float | None = None
+    """The non-weight memory (MB) the job's grant carries, the room the child's load leaves free for the
+    activation (:func:`~horde_worker_regen.process_management.scheduling.admission.pricing.sampling_reserve_mb`), or
+    None when the request carries none. Set by clearance alone, which hands the figure to the child.
+
+    A partial seat or a measured attempt admits only where the measured free net of the outstanding reservations
+    holds this figure. Below it the child's load keeps every weight in host RAM and the activation still goes over
+    the card."""
     head_outstanding_mb: float | None = None
     """For a non-head request, the true head of queue's priced outstanding demand (MB) on this device, or None
     when unknown or when this request is itself the head. Head protection: a non-head request that fits is still
@@ -733,6 +747,9 @@ class VramVerdict:
     """The measured room decomposed by tenant and reclaim rung for a non-admit on a card with a device-free
     reading, so the refusal names who holds the card and what could return it; None for an admit, an
     indeterminate reading, and request kinds the identity does not price."""
+    reserve_shortfall_mb: float | None = None
+    """How far (MB) the measured free net of the outstanding reservations falls below the job's non-weight
+    reserve, when that alone held a partial seat or a measured attempt; None for every other verdict."""
 
     @property
     def admits(self) -> bool:
@@ -1125,12 +1142,24 @@ class VramArbiter:
         Once the scheduler has tagged the job (``measured_attempt_in_progress``), the arbiter keeps admitting it
         so the preload -> dispatch progression completes without a second one-shot. Returns None for every
         request the escape hatch does not cover, so the caller's ordinary teardown/ladder/defer path runs.
+
+        A request carrying a non-weight reserve is held with a DEFER instead while the measured free net of the
+        outstanding reservations is below it (:meth:`_reserve_hold_verdict`), and its one-shot is not spent.
         """
         if not request.is_head_of_queue:
             return None
         if request.kind not in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH):
             return None
         if request.measured_attempt_in_progress:
+            reserve_shortfall_mb = self._non_weight_reserve_shortfall_mb(request, measured)
+            if reserve_shortfall_mb is not None:
+                return self._reserve_hold_verdict(
+                    request,
+                    measured,
+                    state,
+                    reserve_shortfall_mb=reserve_shortfall_mb,
+                    held_admission="measured load attempt",
+                )
             return self._measured_attempt_verdict(request, measured, first_emission=False)
         if request.measured_attempt_already_spent:
             return None
@@ -1142,6 +1171,15 @@ class VramArbiter:
         key = (request.head_job_id or request.job_label, request.device_index)
         if key in self._measured_attempts_started:
             return None
+        reserve_shortfall_mb = self._non_weight_reserve_shortfall_mb(request, measured)
+        if reserve_shortfall_mb is not None:
+            return self._reserve_hold_verdict(
+                request,
+                measured,
+                state,
+                reserve_shortfall_mb=reserve_shortfall_mb,
+                held_admission="measured load attempt",
+            )
         self._measured_attempts_started.add(key)
         self.measured_attempts += 1
         if impossible:
@@ -1269,6 +1307,10 @@ class VramArbiter:
         The card must have nothing left to reclaim, so the seat is taken only once the most room the card can
         give is in the reading: before that the full charge keeps driving the reclaim, and a fuller load samples
         faster. The seat's outstanding part, net of what the job already holds, must then fit the reading.
+
+        A seat that fits only by netting holdings larger than its weight share can still leave the card short of
+        the job's non-weight reserve. That seat is held with a DEFER (:meth:`_reserve_hold_verdict`), since the
+        child's load keeps the reserve free and cannot keep room the card does not have.
         """
         if not self._partial_seat_eligible(request, state) or request.partial_seat_mb is None:
             return None
@@ -1278,6 +1320,15 @@ class VramArbiter:
         seat_measured = self._measured(replace(request, candidate_delta_mb=seat_outstanding_mb), state)
         if not seat_measured.fits:
             return None
+        reserve_shortfall_mb = self._non_weight_reserve_shortfall_mb(request, seat_measured)
+        if reserve_shortfall_mb is not None:
+            return self._reserve_hold_verdict(
+                request,
+                measured,
+                state,
+                reserve_shortfall_mb=reserve_shortfall_mb,
+                held_admission="partial-load seat",
+            )
         return VramVerdict(
             disposition=VramDisposition.FITS,
             request_kind=request.kind,
@@ -1289,6 +1340,57 @@ class VramArbiter:
             measured=seat_measured,
             detail=seat_measured.reason(),
             partial_seat=True,
+        )
+
+    @staticmethod
+    def _non_weight_reserve_shortfall_mb(request: VramRequest, measured: AdmissionVerdict) -> float | None:
+        """Return how far (MB) the measured free net of reservations falls below the request's reserve, or None.
+
+        None when the request carries no reserve, the card has no reading, or the room holds the reserve. The
+        noise margin is not charged here: it covers the reading's drift and the prediction's error, while the
+        reserve is room the child's own load keeps free out of what the reading shows.
+        """
+        reserve_mb = request.sampling_reserve_mb
+        if reserve_mb is None or measured.device_free_mb is None:
+            return None
+        room_mb = measured.device_free_mb - measured.outstanding_reservations_mb
+        shortfall_mb = reserve_mb - room_mb
+        return shortfall_mb if shortfall_mb > 0.0 else None
+
+    def _reserve_hold_verdict(
+        self,
+        request: VramRequest,
+        measured: AdmissionVerdict,
+        state: DeviceVramState,
+        *,
+        reserve_shortfall_mb: float,
+        held_admission: str,
+    ) -> VramVerdict:
+        """Build the DEFER for a partial seat or measured attempt whose non-weight reserve does not fit.
+
+        The child sizes its load to leave the reserve free, so with less than the reserve on the card it loads
+        nothing and its activation alone goes over the card. The head keeps waiting with the ladder a non-fitting
+        demand gets, since room only arrives when another tenant frees it.
+        """
+        free_mb = measured.device_free_mb if measured.device_free_mb is not None else 0.0
+        room_mb = free_mb - measured.outstanding_reservations_mb
+        self._note_starvation_diagnostic(request, state, measured)
+        return VramVerdict(
+            disposition=VramDisposition.DEFER,
+            request_kind=request.kind,
+            device_index=request.device_index,
+            reason=(
+                f"{held_admission} held: the measured free net of reservations is below the job's non-weight "
+                "reserve, which the child's load keeps free"
+            ),
+            measured=measured,
+            detail=(
+                f"non-weight reserve {room_mb + reserve_shortfall_mb:.0f} MB vs device-free {free_mb:.0f} - "
+                f"reservations {measured.outstanding_reservations_mb:.0f} = {room_mb:.0f} MB; {measured.reason()}"
+            ),
+            required_actuations=self._escalation_ladder(state, request),
+            room=self._room(request, state, measured),
+            reserve_shortfall_mb=reserve_shortfall_mb,
         )
 
     def _ceiling_attempt_candidate_eligible(self, request: VramRequest, ceiling_mb: float) -> bool:

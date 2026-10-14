@@ -117,8 +117,8 @@ def build_materialization_request(
     are resident; a preload never does. The idle-context teardown is widened in the measured frame through the
     arbiter's deficit, the one thing here that is not read from the snapshot.
 
-    A staged waiter's dispatch also carries its partial-load seat, since only clearance hands the child a grant
-    whose free figure its partial load is sized against.
+    A staged waiter's dispatch also carries its partial-load seat and the non-weight reserve its grant hands the
+    child, since only clearance hands the child a grant whose free figure its partial load is sized against.
     """
     job = snapshot.queue.jobs[job_id]
     payload = snapshot.queue.payloads[job_id]
@@ -193,6 +193,11 @@ def build_materialization_request(
         if staged_waiter is not None and kind is VramRequestKind.MONOLITHIC_DISPATCH
         else None
     )
+    sampling_reserve_mb = (
+        pricing.sampling_reserve_mb(snapshot, payload, baseline, device_index=device_index)
+        if staged_waiter is not None and kind is VramRequestKind.MONOLITHIC_DISPATCH
+        else None
+    )
     request = VramRequest(
         kind=kind,
         job_label=str(job.model),
@@ -217,6 +222,7 @@ def build_materialization_request(
         head_job_id=job_id,
         wddm_paging_active=snapshot.ledgers.retention.wddm_paging_active,
         partial_seat_mb=partial_seat_mb,
+        sampling_reserve_mb=sampling_reserve_mb,
         candidate_measured=pricing.sampling_peak_measured(
             snapshot,
             payload,

@@ -113,7 +113,9 @@ class ClearanceLeaseProxy:
     child judge its load against the card the parent just admitted it to. The child reads the figure only on
     an acquire that obtained the permit, so a timed-out or passed-through acquire yields none. Until the child
     takes the permit the parent rewrites the figure from each control step's reading, since the child can reach
-    its sample call seconds after the grant, by which time it has moved its own encoder off the card.
+    its sample call seconds after the grant, by which time it has moved its own encoder off the card. Children
+    cleared in the same step each get the reading less what the children cleared before them take of it, since
+    each child sizes its load to the figure it is handed.
 
     A grant also carries the activation reserve the parent priced the window's non-weight memory at
     (:func:`~horde_worker_regen.process_management.scheduling.admission.pricing.sampling_reserve_mb`), in a
@@ -501,6 +503,31 @@ class ClearanceWaiter:
     """The non-weight memory (MB) the staged job's sampling window is priced with
     (:func:`~horde_worker_regen.process_management.scheduling.admission.pricing.sampling_reserve_mb`), carried
     with the child's stage and sample grants. None when the job's figure cannot be priced."""
+    weights_mb: float | None = None
+    """The diffusion weights (MB) the staged job's grant puts on the card, net of any its slot already holds
+    there, or None when they cannot be estimated. With :attr:`sampling_reserve_mb` it sizes what the child takes
+    of its grant's free figure, which a child cleared after it in the same step does not get
+    (:func:`_grant_charge_mb`)."""
+
+
+def _grant_charge_mb(device_free_mb: float | None, waiter: ClearanceWaiter | None) -> float:
+    """Return what (MB) a cleared child takes of the free figure its grant carries.
+
+    The child loads as much of its weights as the figure allows less the reserve, and keeps the reserve free for
+    its activation, so it takes its weights plus its reserve, or the whole figure when that is less. A figure or
+    waiter the controller does not have takes nothing.
+    """
+    if device_free_mb is None or waiter is None:
+        return 0.0
+    need_mb = (waiter.weights_mb or 0.0) + (waiter.sampling_reserve_mb or 0.0)
+    return min(max(0.0, device_free_mb), max(0.0, need_mb))
+
+
+def _free_after_earlier_grants_mb(device_free_mb: float | None, earlier_charges_mb: float) -> float | None:
+    """Return the measured free (MB) less what children cleared earlier in the step take, or None unread."""
+    if device_free_mb is None:
+        return None
+    return max(0.0, device_free_mb - earlier_charges_mb)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -876,6 +903,9 @@ class ClearanceController:
     ) -> ClearanceStepResult:
         """Retire completed windows, reconcile sampling onset, clear the chosen staged waiters, then stage one.
 
+        Each child cleared in the step is handed the measured free less what the children cleared before it take
+        of it (:func:`_grant_charge_mb`), so the figures handed out in one step sum to the card's free memory.
+
         Args:
             inputs: The per-tick snapshot; its ``active_grants`` is derived from this controller's own held
                 children (the scheduler reads :meth:`grant_state` to build it).
@@ -898,6 +928,7 @@ class ClearanceController:
         # is still reported as a primed waiter by the scheduler snapshot, so filter it out here rather than let a
         # slot pick be wasted on it (the per-child clear guard below would skip it anyway).
         job_id_by_pid = {waiter.process_id: waiter.job_id for waiter in inputs.staged_waiters}
+        waiter_by_pid = {waiter.process_id: waiter for waiter in inputs.staged_waiters}
         sampling_reserve_by_pid = {waiter.process_id: waiter.sampling_reserve_mb for waiter in inputs.staged_waiters}
         clearable_waiters = tuple(
             waiter
@@ -920,15 +951,21 @@ class ClearanceController:
 
         cleared: list[int] = []
         held: list[int] = []
+        earlier_charges_mb = 0.0
         for process_id in plan.clear_process_ids:
             if self._grant_state.get(process_id, GrantState.IDLE) not in _CLEARABLE_STATES:
                 # Already holds a sample grant; do not clear twice.
                 continue
             if admit_fn(process_id):
+                device_free_mb = _free_after_earlier_grants_mb(inputs.device_free_mb, earlier_charges_mb)
+                if process_id in self._proxies:
+                    # A clear that finds its permit already available still writes the figures, so the child
+                    # sizes its load to this one either way.
+                    earlier_charges_mb += _grant_charge_mb(device_free_mb, waiter_by_pid.get(process_id))
                 if self._clear(
                     process_id,
                     job_id_by_pid.get(process_id),
-                    device_free_mb=inputs.device_free_mb,
+                    device_free_mb=device_free_mb,
                     sampling_reserve_mb=sampling_reserve_by_pid.get(process_id),
                 ):
                     cleared.append(process_id)
@@ -1049,8 +1086,9 @@ class ClearanceController:
         moving off that job), never by a stale done permit from a prior job.
 
         ``device_free_mb`` is the measured device free the admission priced against, before any charge for
-        this child's materialisation. The child's clamp subtracts its own allocator growth from the figure, so
-        a figure already net of the child's charge would count that charge twice.
+        this child's materialisation and less what children cleared before it in the same step take. The child's
+        clamp subtracts its own allocator growth from the figure, so a figure already net of the child's charge
+        would count that charge twice.
 
         ``sampling_reserve_mb`` is the non-weight memory the job's window is priced with, written beside the
         device free on both permits so the child's partial load leaves that room. None writes no reserve.

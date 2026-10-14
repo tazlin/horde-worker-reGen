@@ -1231,6 +1231,42 @@ class TestPartialSeatUnderTheCeiling:
         assert verdict.disposition == VramDisposition.FITS
         assert verdict.partial_seat is False
 
+    _RESERVE_MB = 4000.0
+    """The non-weight reserve inside the seat: a 5000 MB weight share plus this makes the 9000 MB seat."""
+    _HELD_MB = 6000.0
+    """What the job already holds, more than the seat's weight share, so the seat fits by netting it."""
+
+    def _held_dispatch(self) -> VramRequest:
+        """A seat-carrying dispatch whose holdings exceed its weight share and whose grant carries the reserve."""
+        return self._dispatch(
+            candidate_held_mb=self._HELD_MB,
+            sampling_reserve_mb=self._RESERVE_MB,
+        )
+
+    def test_a_seat_fitting_by_its_holdings_waits_for_its_reserve(self) -> None:
+        """A seat that fits only by netting what the job holds defers while the card is short of its reserve."""
+        arbiter = VramArbiter()
+        # available = 3600 - 512 = 3088 holds the 3000 MB seat outstanding; free 3600 is short of the 4000 reserve.
+        arbiter.begin_cycle(_snapshot(self._card(device_free_mb=3600.0)))
+
+        verdict = arbiter.evaluate(self._held_dispatch())
+
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.partial_seat is False
+        assert verdict.reserve_shortfall_mb == pytest.approx(400.0)
+        assert "non-weight reserve" in verdict.reason
+
+    def test_a_seat_whose_reserve_fits_is_admitted(self) -> None:
+        """With free net of reservations at the reserve, the same seat is admitted as before."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._card(device_free_mb=self._RESERVE_MB)))
+
+        verdict = arbiter.evaluate(self._held_dispatch())
+
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.partial_seat is True
+        assert verdict.reserve_shortfall_mb is None
+
 
 class TestMeasuredAttemptEscapeHatch:
     """The measured-load escape hatch: a starved head at a converged-empty card gets one real load attempt.
@@ -1388,6 +1424,46 @@ class TestMeasuredAttemptEscapeHatch:
         verdict = arbiter.evaluate(self._starved_head(is_head_of_queue=False, starved_seconds=0.0))
         assert verdict.measured_attempt is False
         assert arbiter.measured_attempts == 0
+
+    def test_an_attempt_whose_reserve_exceeds_the_free_waits_without_spending_its_one_shot(self) -> None:
+        """Free below the grant's reserve: the child would load nothing and its activation would go over the card.
+
+        The head defers with the reserve named, and the one-shot stays unspent, so the attempt fires once the
+        card's free holds the reserve.
+        """
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card(device_free_mb=1024.0)))
+        held = arbiter.evaluate(self._starved_head(sampling_reserve_mb=1659.0))
+        assert held.disposition == VramDisposition.DEFER
+        assert held.measured_attempt is False
+        assert held.reserve_shortfall_mb == pytest.approx(635.0)
+        assert "non-weight reserve" in held.reason
+        assert arbiter.measured_attempts == 0
+
+        arbiter.begin_cycle(_snapshot(self._empty_card(device_free_mb=1659.0)))
+        granted = arbiter.evaluate(self._starved_head(sampling_reserve_mb=1659.0))
+        assert granted.disposition == VramDisposition.FITS
+        assert granted.measured_attempt is True
+        assert granted.reserve_shortfall_mb is None
+        assert arbiter.measured_attempts == 1
+
+    def test_an_attempt_at_or_above_its_reserve_is_granted_as_before(self) -> None:
+        """A reserve the measured free holds leaves the attempt exactly as it was without one."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card()))
+        verdict = arbiter.evaluate(self._starved_head(sampling_reserve_mb=2000.0))
+        assert verdict.disposition == VramDisposition.FITS
+        assert verdict.measured_attempt is True
+        assert arbiter.measured_attempts == 1
+
+    def test_an_attempt_in_progress_waits_for_its_reserve_too(self) -> None:
+        """A tagged attempt re-asked at clearance is held while the free is below its reserve."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._empty_card(device_free_mb=1024.0)))
+        verdict = arbiter.evaluate(self._starved_head(measured_attempt_in_progress=True, sampling_reserve_mb=1659.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.measured_attempt is False
+        assert verdict.reserve_shortfall_mb == pytest.approx(635.0)
 
 
 class TestCeilingMeasuredAttempt:
