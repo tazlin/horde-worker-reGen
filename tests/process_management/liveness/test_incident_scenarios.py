@@ -3071,13 +3071,49 @@ _CLEARANCE_JOB_SHAPE = (1024, 1024)
 """The staged job's resolution: a megapixel SDXL job, so its activation peak is worth several gigabytes and
 the fit at clearance turns on real terms rather than on rounding."""
 
-_CLEARANCE_CARD = _CardClass("clearance_fit", 7784.0)
+_CLEARANCE_CARD = _CardClass("clearance_fit", 6400.0)
 """A card on which the staged job's whole need sits just over what the emptied card offers.
 
-Its total less the admission noise buffer (512 MB) is a 7272 MB ceiling. The job's whole peak is 8258 MB: the
-2048 MB encode working set it holds once staged, and 6210 MB still to load. Beside the lane's CUDA context
-(1354 MB) the measured reading leaves 3870 MB available, so the outstanding charge alone never fits and never
-reads as impossible either; only the whole need against the ceiling settles the job, by its one real load."""
+Its total less the admission noise buffer (512 MB) is a 5888 MB ceiling. The job's whole need is its staged price
+(:func:`clearance_mod.staged_sampling_peak_mb`, 6319 MB): the 2048 MB encode working set it holds once staged, and
+4271 MB still to load. Beside the lane's CUDA context (1354 MB) the measured reading leaves 2486 MB available. The
+outstanding charge alone does not fit and does not read as impossible either. Only the whole need against the
+ceiling settles the job, by its one real load, and it is over the ceiling by less than the ceiling attempt's
+allowance."""
+
+
+def _first_clearance_price_mb(world: _DispatchWorld, job_id: str) -> tuple[float, float, float]:
+    """The job's first clearance pass, as (outstanding charge, what it holds, measured available room) in MB."""
+    first = next(
+        (
+            record
+            for record in world.decision_records
+            if record.decision_kind is DecisionKind.CLEARANCE and record.subject == job_id
+        ),
+        None,
+    )
+    assert first is not None, f"precondition: the job was never priced at clearance. {world.state_dump()}"
+    candidate_mb = first.inputs.get("candidate_delta_mb")
+    held_mb = first.inputs.get("candidate_held_mb")
+    available_mb = first.inputs.get("available_mb")
+    assert isinstance(candidate_mb, float) and isinstance(held_mb, float) and isinstance(available_mb, float), (
+        f"precondition: the first clearance pass carries no price ({first.inputs}). {world.state_dump()}"
+    )
+    return candidate_mb, held_mb, available_mb
+
+
+def _assert_the_staged_need_misses_the_reading(world: _DispatchWorld, job_id: str) -> float:
+    """Precondition: the job's first clearance pass found its outstanding charge over the measured available room.
+
+    Returns the shortfall (MB).
+    """
+    candidate_mb, _held_mb, available_mb = _first_clearance_price_mb(world, job_id)
+    assert candidate_mb > available_mb, (
+        f"precondition: the outstanding charge ({candidate_mb:.0f}MB) must miss the measured available room "
+        f"({available_mb:.0f}MB), or the job is granted by price and the row tests nothing. {world.state_dump()}"
+    )
+    return candidate_mb - available_mb
+
 
 _CLEARANCE_TICK_CEILING = 5
 """Ticks the staged job may take to reach sampling. A preload is commanded on one pass, reported on the next
@@ -3146,6 +3182,14 @@ async def test_r_a_staged_waiter_is_cleared_into_the_room_the_card_already_has()
     job = await _drive_lone_staged_waiter(world)
 
     context = "own staging charge"
+    _assert_the_staged_need_misses_the_reading(world, str(job.id_))
+    candidate_mb, held_mb, _available_mb = _first_clearance_price_mb(world, str(job.id_))
+    staged_need_mb = candidate_mb + held_mb
+    ceiling_mb = world.scheduler.achievable_ceiling_mb(None)
+    assert ceiling_mb is not None and staged_need_mb > ceiling_mb, (
+        f"precondition: the whole need ({staged_need_mb:.0f}MB) must sit over the card's achievable ceiling "
+        f"({ceiling_mb}MB), or the ceiling attempt never decides the job. {world.state_dump()}"
+    )
     dispatch_tick = world.dispatch_tick(job)
     assert dispatch_tick is not None, (
         f"{context}: the job never sampled, though the only lane on the card was staged with it and the card "
@@ -3246,13 +3290,15 @@ async def test_r_an_extra_large_checkpoint_over_the_ceiling_clears_at_its_partia
     )
 
 
-_LANE_STARVED_CARD = _CardClass("lane_starved", 10200.0)
+_LANE_STARVED_CARD = _CardClass("lane_starved", 8261.0)
 """A card on which the staged SDXL head is short by more than any two service lanes return.
 
 Beside the head's own context and staged encode sit the post-processing lane's context, safety's whole
-footprint and the image-utilities lane's context. The head's remaining charge exceeds the measured free by more
-than the post-processing lane and safety return together, and by less than all three lanes return, so it clears
-only once every lane is off the card."""
+footprint and the image-utilities lane's context. The head's remaining charge (its staged price,
+:func:`clearance_mod.staged_sampling_peak_mb`, less the encode it holds) exceeds the measured free by more than
+the post-processing lane and safety return together, and by less than all three lanes return, so it clears only
+once every lane is off the card. The staging charge its preload is admitted against still fits beside all three
+lanes, so the rungs are taken at clearance and not at the preload."""
 
 _LANE_EXIT_SECONDS = 0.1
 """How long a paused lane's process takes to exit, about what a lane's replacement state machine takes."""
@@ -3297,6 +3343,7 @@ async def test_r_a_head_starved_by_three_lanes_waits_one_grace_not_three() -> No
             break
 
     context = "graded lane rungs"
+    _assert_the_staged_need_misses_the_reading(world, str(job.id_))
     rungs = sorted(
         [(now, process_id) for _tick, now, process_id, _owner in world.service_lane_pauses]
         + [(now, _SAFETY_PROCESS_ID) for _tick, now, _owner in world.safety_pause_events],
@@ -3331,8 +3378,10 @@ async def test_r_a_head_starved_by_three_lanes_waits_one_grace_not_three() -> No
     )
 
 
-_RESIDENCY_SAFETY_CARD = _CardClass("residency_safety", 21504.0)
-"""A card on which the extra-large model's weights fit beside safety and its LoRA job's whole need does not."""
+_RESIDENCY_SAFETY_CARD = _CardClass("residency_safety", 20000.0)
+"""A card on which the extra-large model's weights fit beside safety and its LoRA job's whole need does not.
+
+The whole need is the clearance price of the staged job (:func:`clearance_mod.staged_sampling_peak_mb`)."""
 
 _RESIDENCY_SAFETY_GRANT_CEILING_SECONDS = 3.0
 """Seconds from the job's arrival to its grant, enough for the residency's establishment and one clearance pass."""
@@ -3414,32 +3463,53 @@ async def test_r_defect_reinjection_a_weight_test_holds_a_lora_job_beside_safety
 
     grant = next((tick for tick, _lane, job_id in world.clearance_grants if job_id == str(job.id_)), None)
     assert not world.safety_pause_events, f"weights alone moved safety: {world.safety_pause_events}"
+    _assert_the_staged_need_misses_the_reading(world, str(job.id_))
     assert grant is None or grant * _LANE_RUNG_TICK_SECONDS > _RESIDENCY_SAFETY_GRANT_CEILING_SECONDS, (
         f"the LoRA job was cleared at once beside safety with the weights deciding, so this row no longer "
         f"distinguishes the job's need from the weights. {world.state_dump()}"
     )
 
 
-_UNSEEN_TENANT_MB = 900.0
+_UNSEEN_TENANT_MB = 2500.0
 """Device memory no lane holds that the row puts on the card. It stands for what an idle lane kept after its model
-left for host RAM, in the shortfall that held a large model for its whole lease-acquire timeout."""
+left for host RAM, in the shortfall that held a large model for its whole lease-acquire timeout.
+
+It is sized so the head's shortfall once it arrives sits past the measured attempt band, the shortfall the
+diagnostic horizon applied to."""
 
 _UNSEEN_TENANT_SHAPES = {
     "from_the_start": 1,
-    "after_the_first_lane_rung": int(13.0 / _LANE_RUNG_TICK_SECONDS),
+    "after_the_first_lane_rung": int(12.5 / _LANE_RUNG_TICK_SECONDS),
 }
 """When the unseen tenant arrives, as the tick it is scripted on. From the start, no lane rung can close the
-shortfall and none is taken. Just after the first rung (the post-processing lane, paused near 12 s), the rung
-returns its room and the head is still short."""
+shortfall and none is taken. Just after the first rung (the post-processing lane, paused at 11 s) and the safety
+rung at 12 s, the rungs return their room and the head is still short. A tenant arriving any later finds the
+waiter already cleared into the room the safety rung returned."""
 
 _UNSEEN_TENANT_SLACK_SECONDS = 3.0
 """Seconds past the probe delay the grant may land, enough for a lane exit and the readings after it."""
 
+_UNSEEN_TENANT_MODEL = _FLUX
+"""The large model the waiter's job runs, as in the shortfall this row encodes.
+
+The job carries a LoRA, so :func:`pricing_mod.partial_seat_mb` does not seat it and clearance prices its whole
+need. An SDXL head cannot carry this row. Its diffusion weights less the encode it holds once staged are smaller
+than what the three service lanes return, so whenever its reading also leaves room for its non-weight reserve
+(which a measured attempt needs), a lane rung can close its shortfall."""
+
+_UNSEEN_TENANT_CARD = _CardClass("unseen_tenant", 17000.0)
+"""A card on which the staged Flux LoRA head is short by more than every service lane returns once the tenant is
+on it, while its preload's staging charge and its non-weight reserve still fit the reading.
+
+With the tenant on from the start, no rung closes the shortfall and the ladder does not take one. With the tenant
+arriving after the first rung, the head is short before it by less than the three lanes return, so the ladder
+starts on the lanes, and after it by more."""
+
 
 def _unseen_tenant_world(arrival_tick: int) -> _DispatchWorld:
-    """The three-lane starved card with an unseen tenant scripted onto it at ``arrival_tick``."""
+    """The service-lane card with an unseen tenant scripted onto it at ``arrival_tick``."""
     return _DispatchWorld(
-        card=_LANE_STARVED_CARD,
+        card=_UNSEEN_TENANT_CARD,
         lane_count=1,
         max_threads=1,
         queue_depth=1,
@@ -3667,16 +3737,16 @@ async def test_r_defect_reinjection_a_waiter_whose_holdings_are_not_presented_wa
 # --------------------------------------------------------------------------------------------------------
 
 _LONE_WAITER_CARDS = {
-    "inside_band": _CardClass("lone_waiter_inside_band", 9412.0),
-    "outside_band": _CardClass("lone_waiter_outside_band", 8970.0),
+    "inside_band": _CardClass("lone_waiter_inside_band", 7473.0),
+    "outside_band": _CardClass("lone_waiter_outside_band", 7031.0),
 }
 """Cards on which the staged job's whole need sits under the achievable ceiling while its outstanding charge
 misses the measured available room.
 
-The lane's context (1354 MB) is on the card and outside the ceiling's account, so the miss is the job's whole
-need less what the emptied card offers after that context: about 700 MB on the first card, inside the measured
-attempt band, and about 1150 MB on the second, past it. Nothing else is on either card, so no reclaim and no
-completion can close the miss."""
+The whole need is the staged price (:func:`clearance_mod.staged_sampling_peak_mb`). The lane's context (1354 MB)
+is on the card and outside the ceiling's account, so the miss is the job's whole need less what the emptied card
+offers after that context: about 700 MB on the first card, inside the measured attempt band, and about 1150 MB on
+the second, past it. Nothing else is on either card, so no reclaim and no completion can close the miss."""
 
 
 def _lone_waiter_world(card: _CardClass, *, model_already_staged: bool) -> _DispatchWorld:
@@ -3720,6 +3790,20 @@ async def test_z_a_lone_staged_waiter_is_priced_before_its_lease_runs_out(
     job = await _drive_lone_staged_waiter(world)
 
     context = f"lone staged waiter ({shortfall}, {'already in RAM' if model_already_staged else 'preloaded'})"
+    from horde_worker_regen.process_management.resources import vram_arbiter as arbiter_mod
+
+    shortfall_mb = _assert_the_staged_need_misses_the_reading(world, str(job.id_))
+    assert (shortfall_mb <= arbiter_mod._MEASURED_ATTEMPT_BAND_MB) is (shortfall == "inside_band"), (
+        f"precondition: the {shortfall_mb:.0f}MB miss must sit {shortfall.replace('_', ' ')} the "
+        f"{arbiter_mod._MEASURED_ATTEMPT_BAND_MB:.0f}MB measured attempt band. {world.state_dump()}"
+    )
+    candidate_mb, held_mb, _available_mb = _first_clearance_price_mb(world, str(job.id_))
+    ceiling_mb = world.scheduler.achievable_ceiling_mb(None)
+    assert ceiling_mb is not None and candidate_mb + held_mb <= ceiling_mb, (
+        f"precondition: the whole need ({candidate_mb + held_mb:.0f}MB) must sit under the card's achievable "
+        f"ceiling ({ceiling_mb}MB), or the ceiling attempt decides the job in place of the probe. "
+        f"{world.state_dump()}"
+    )
     dispatch_tick = world.dispatch_tick(job)
     assert dispatch_tick is not None and dispatch_tick < _CLEARANCE_TIMEOUT_TICKS, (
         f"{context}: the job reached sampling on tick {dispatch_tick}, not inside the "
@@ -6858,8 +6942,10 @@ async def test_a_process_local_view_that_overstates_free_still_serves_within_the
 _UNRETAINED_LANES = 3
 _UNRETAINED_COMPONENT_MB = 1800.0
 """Split text-encoder and VAE allocations (MB) an idle lane keeps on the device after its model went to RAM."""
-_UNRETAINED_FOREIGN_MB = 6000.0
-"""Device memory other programs hold, sized so the staged head is short by a few hundred MB."""
+_UNRETAINED_FOREIGN_MB = 8300.0
+"""Device memory other programs hold, sized so the staged head is short by a few hundred MB.
+
+The head is priced at its staged need (:func:`clearance_mod.staged_sampling_peak_mb`)."""
 _UNRETAINED_HEAD_BATCH = 4
 _UNRETAINED_TICK_SECONDS = 0.5
 _UNRETAINED_MAX_TICKS = 400
@@ -7038,11 +7124,15 @@ async def test_unretained_components_defect_reinjection_no_rung_returns_them(mon
 # --------------------------------------------------------------------------------------------------------
 
 _TWO_PHASE_TICK_SECONDS = 0.5
-_TWO_PHASE_WIDTH = 1536
-_TWO_PHASE_HEIGHT = 1536
-"""A 2.25 MP SDXL job. Beside the card's lane contexts, safety and the post-processing lane, one forecast peak and
-a second job's weights fit a 24 GB card and two forecast peaks do not, which is the shape that serialises the
-samples on the card and leaves the weight upload as the only work that can overlap."""
+_TWO_PHASE_WIDTH = 1792
+_TWO_PHASE_HEIGHT = 1792
+"""A 3.2 MP SDXL job. Beside the card's lane contexts, safety and the post-processing lane, one running sample and
+a second job's weights fit a 24 GB card and a second sampling window does not, which is the shape that serialises
+the samples on the card and leaves the weight upload as the only work that can overlap.
+
+Clearance prices a staged job at its weights and sampling reserve
+(:func:`clearance_mod.staged_sampling_peak_mb`). At 2.25 MP that price seats a second window beside a running one,
+so every successor is cleared whole and none is staged."""
 
 _TWO_PHASE_STEPS = 30
 """Steps that make one sample outlast its lane's decode, the redispatch onto that lane and the successor's weight
@@ -7231,6 +7321,9 @@ async def test_z_the_next_jobs_weights_load_while_one_samples_and_its_denoise_fo
 
     context = "two-phase clearance on a 24 GB card"
     windows = _sampled_windows(world)
+    # The successor's whole staged need must miss the room beside the running sample, or it is cleared whole.
+    for successor in windows[_TWO_PHASE_UNMEASURED_JOBS:]:
+        _assert_the_staged_need_misses_the_reading(world, successor.job_id)
     staged_job_ids = [job_id for _tick, _lane, job_id in world.stage_grants]
     assert staged_job_ids == [window.job_id for window in windows[_TWO_PHASE_UNMEASURED_JOBS:]], (
         f"{context}: stage grants went to {[job_id[:8] for job_id in staged_job_ids]}, where every job after the "

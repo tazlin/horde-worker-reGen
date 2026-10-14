@@ -204,14 +204,14 @@ async def test_a_decode_unloads_the_lanes_own_weights_and_the_next_job_returns_t
     )
 
 
-async def test_a_skip_listed_model_loads_partially_beside_its_resident_encoder() -> None:
-    """Flux, cleared at a price above what its child believes is free, offloads the rest and keeps its encoder.
+async def test_a_skip_listed_model_loads_partially_into_the_room_its_released_encoder_left() -> None:
+    """Flux, its weights above what its child believes is free, offloads the rest and samples with no encoder.
 
-    The load keeps clear the larger of the child's margin and the activation reserve its grant carried.
+    The encoder left the card before the clearance wait, so the child believes the whole lane's room is free. The
+    load keeps clear the larger of the child's margin and the activation reserve its grant carried.
     """
-    support_mb = _support_component_mb(_FLUX)
-    weights_mb = 19_000.0
-    believed_free_mb = _LANE_ROOM_MB - support_mb
+    weights_mb = 23_000.0
+    believed_free_mb = _LANE_ROOM_MB
     world = _one_lane_world(
         true_footprint_mb=_stated(weights_mb, 500.0),
         phase_resident_components=True,
@@ -223,7 +223,7 @@ async def test_a_skip_listed_model_loads_partially_beside_its_resident_encoder()
     margin_mb = served.window.load_margin_mb
     assert margin_mb is not None and margin_mb >= _CHILD_FREE_MARGIN_MB
     offload_mb = weights_mb + margin_mb - believed_free_mb
-    assert offload_mb > 0.0, "the stated weights fit beside the encoder, so the row would show no partial load"
+    assert offload_mb > 0.0, "the stated weights fit the lane, so the row would show no partial load"
     assert world.clearance_grants, "the job was never cleared, so the row says nothing about a clear"
     assert served.window.load_believed_free_mb == pytest.approx(believed_free_mb)
     assert served.window.load_offloaded_mb == pytest.approx(offload_mb), (
@@ -231,9 +231,9 @@ async def test_a_skip_listed_model_loads_partially_beside_its_resident_encoder()
         "free less the margin could not take"
     )
     assert served.window.load_moved_mb == pytest.approx(believed_free_mb - margin_mb)
-    assert served.support_while_sampling_mb == pytest.approx(support_mb), (
-        f"the lane held {served.support_while_sampling_mb} MB of support components while Flux sampled, not its "
-        f"whole {support_mb} MB encoder and VAE"
+    assert served.support_while_sampling_mb == 0.0, (
+        f"the lane held {served.support_while_sampling_mb} MB of support components while Flux sampled, after its "
+        "encoder left the card before the wait"
     )
 
 
@@ -298,11 +298,12 @@ async def test_tenant_only_reports_read_foreign_above_the_scripted_figure() -> N
     assert min(samples) > _SCRIPTED_FOREIGN_MB + 1000.0
 
 
-async def test_a_staged_encode_is_netted_against_the_support_components_its_lane_holds() -> None:
-    """A retained lane staged for its next job commits only the encode its support tenant does not already hold.
+async def test_a_retained_lane_stages_its_whole_encode_and_releases_it_before_the_wait() -> None:
+    """A retained lane keeps its weights and no encoder, so its next job encodes in full and waits without it.
 
-    The staging charge prices the text encoder, which the retained tenant already holds on the card, and
-    ComfyUI's component cache allocates nothing for a resident encoder. The parent's price is not netted.
+    The encoder of the retained job left the card before that job's wait, so nothing of it is on the lane when
+    the next job stages. That job's encode is the whole staging charge, and it leaves the card before the next
+    clearance wait as well.
     """
     staging_mb = staging_charge_mb(str(_SDXL.baseline))
     world = _one_lane_world(
@@ -314,24 +315,22 @@ async def test_a_staged_encode_is_netted_against_the_support_components_its_lane
     for job in (first_job, second_job):
         await world.pop(job)
     second_id = str(second_job.id_)
-    staged_mb: float | None = None
-    tenant_mb = 0.0
+    tenant_mb: float | None = None
     for _ in range(_MAX_TICKS):
         tenant_mb = world._support_resident_mb.get(0, 0.0)
         await world.step()
         if second_id in world.job_windows:
-            # Read on the staging tick itself. The same tick releases the first job's decode tail, so the card's
-            # total moves by more than the stage alone, and the stage's own charge is what the card took for it.
-            staged_mb = world._encode_staging_mb.get(world.job_windows[second_id].lane_id, 0.0)
             break
-    assert staged_mb is not None, f"the second job was never staged. {world.state_dump()}"
+    assert second_id in world.job_windows, f"the second job was never staged. {world.state_dump()}"
     first_window = world.job_windows[str(first_job.id_)]
-    assert first_window.retention_granted, "the first job was not retained, so no tenant stood on the lane"
-    assert tenant_mb == pytest.approx(_support_component_mb(_SDXL)), "the retained lane held no support tenant"
-    assert staged_mb <= max(0.0, staging_mb - tenant_mb) + 1e-6, (
-        f"staging the second job charged the card {staged_mb:.0f} MB, above the {staging_mb:.0f} MB encode less "
-        f"the {tenant_mb:.0f} MB tenant the lane already held"
+    assert first_window.retention_granted, "the first job was not retained, so the lane was not carried over"
+    assert tenant_mb == 0.0, f"the retained lane held a {tenant_mb:.0f} MB support tenant into the next stage"
+    second_window = world.job_windows[second_id]
+    assert second_window.support_released_before_wait_mb == pytest.approx(staging_mb), (
+        f"the second job released {second_window.support_released_before_wait_mb:.0f} MB before its wait, not its "
+        f"whole {staging_mb:.0f} MB encode"
     )
+    assert not world._encode_staging_mb, f"a staged lane still holds an encode: {world._encode_staging_mb}"
 
 
 _Z_IMAGE_WEIGHTS_MB = 18_000.0

@@ -189,21 +189,35 @@ def staged_attempt_deadline_seconds(*, probe_after_seconds: float, load_seconds:
     return max(0.0, CLEARANCE_LEASE_ACQUIRE_TIMEOUT_SECONDS - margin_seconds)
 
 
-def _staged_peak_and_holdings_mb(
-    snapshot: SchedulingSnapshot,
-    job_id: str,
-    process_id: int,
-) -> tuple[float, float] | None:
-    """The staged job's whole peak and what of it its slot reports holding (MB), or None when unpriceable.
+def staged_sampling_peak_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
+    """The staged job's whole need (MB) through its load and sample, before anything it holds is netted.
 
-    The report is the job's own only net of weights another model keeps on the slot, which stay beside the job.
-    Weights of the job's own model, whole or partial, are in the report too, so the peak carries them before
-    any resident-weight credit rather than having them credited whole. A slot with no report holds nothing.
+    A monolithic job is priced at the components its child holds from clearance to the end of its sample: its
+    diffusion weights (:func:`predict_job_weight_mb`) and the non-weight memory its sampling window is priced with
+    (:func:`pricing.sampling_reserve_mb`), the figures :func:`pricing.partial_seat_mb` seats a whole copy at.
+    hordelib releases the text encoder to its CPU origins before the clearance wait whenever a sampling lease is
+    set and no later node of the prompt takes it, so the encoder is not on the card through the window, and the
+    VAE loads with the decode, after the sample. The learned whole-job peak would charge both. A disaggregated
+    sampler, or a job whose weights or reserve cannot be predicted, keeps :func:`pricing.candidate_delta_mb` with
+    any resident-weight credit added back. None when the job is unpriceable.
+
+    The decode tail (the VAE and its decode spike) is not priced here. ComfyUI funds it by unloading the job's own
+    weights.
     """
     job = snapshot.queue.jobs[job_id]
     if job.model is None:
         return None
     payload = snapshot.queue.payloads[job_id]
+    if not job.disaggregation_class_eligible:
+        weights_mb = predict_job_weight_mb(payload, job.baseline)
+        reserve_mb = pricing.sampling_reserve_mb(
+            snapshot,
+            payload,
+            job.baseline,
+            device_index=snapshot.routing_device_index(snapshot.slots[process_id]),
+        )
+        if weights_mb is not None and reserve_mb is not None:
+            return weights_mb + reserve_mb
     priced_mb = pricing.candidate_delta_mb(
         snapshot,
         payload,
@@ -213,26 +227,45 @@ def _staged_peak_and_holdings_mb(
     )
     if priced_mb is None:
         return None
+    if pricing.candidate_weights_resident(snapshot, job.model, process_id):
+        priced_mb += predict_job_weight_mb(payload, job.baseline) or 0.0
+    return priced_mb
+
+
+def _staged_peak_and_holdings_mb(
+    snapshot: SchedulingSnapshot,
+    job_id: str,
+    process_id: int,
+) -> tuple[float, float] | None:
+    """The staged job's whole need and what of it its slot reports holding (MB), or None when unpriceable.
+
+    The report is the job's own only net of weights another model keeps on the slot, which stay beside the job.
+    Weights of the job's own model, whole or partial, are in the report too, so the need carries them before
+    any resident-weight credit rather than having them credited whole. A slot with no report holds nothing.
+    """
+    job = snapshot.queue.jobs[job_id]
+    if job.model is None:
+        return None
+    peak_mb = staged_sampling_peak_mb(snapshot, job_id, process_id)
+    if peak_mb is None:
+        return None
     reported_mb = snapshot.slots[process_id].reserved_mb
     if reported_mb is None:
-        return priced_mb, 0.0
-    peak_mb = priced_mb
-    if pricing.candidate_weights_resident(snapshot, job.model, process_id):
-        peak_mb += predict_job_weight_mb(payload, job.baseline) or 0.0
+        return peak_mb, 0.0
     own_holdings_mb = max(0.0, float(reported_mb) - _other_models_weights_mb(snapshot, process_id, job.model))
     return peak_mb, min(peak_mb, own_holdings_mb)
 
 
 def staged_materialization_delta_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
-    """The staged child's remaining materialisation (MB): its priced peak net of what it already holds on the card.
+    """The staged child's remaining materialisation (MB): its whole need net of what it already holds on the card.
 
-    By the clearance moment the child's text encoder, VAE and leftover allocator cache are on the device and
-    already missing from the measured device-free reading, while the priced peak is the whole sampling-time
-    reservation including them; charged gross, a child reads as further from fitting the more of its own job
-    it has staged. Clearance prices this figure and the cleared job's dispatch reservation is booked at it
-    against the same report, so the booking has decayed to nothing once the job reaches its peak.
+    Whatever the child holds by the clearance moment (staged weights, a partial copy, leftover allocator cache) is
+    already missing from the measured device-free reading. Charged gross, a child reads as further from fitting the
+    more of its own job it has staged. Clearance prices this figure and the cleared job's dispatch reservation is
+    booked at it against the same report, so the booking has decayed to nothing once the job reaches its peak.
 
-    An unpriceable job (None) passes through, and a slot with no report yet is charged its priced peak.
+    An unpriceable job (None) passes through, and a slot with no report yet is charged its whole need
+    (:func:`staged_sampling_peak_mb`).
     """
     peak_and_holdings = _staged_peak_and_holdings_mb(snapshot, job_id, process_id)
     if peak_and_holdings is None:
@@ -363,8 +396,8 @@ def decide_clearance_admit(
 def stage_weights_delta_mb(snapshot: SchedulingSnapshot, job_id: str, process_id: int) -> float | None:
     """The weights (MB) a stage grant puts on the card for the staged job, net of resident credit.
 
-    The stage uploads the diffusion model alone: the text encoder and VAE are on the card from the encode or load
-    at decode, and a disaggregated sampler holds the same core weights, so one figure serves both of
+    The stage uploads the diffusion model alone: the text encoder leaves the card before the wait and the VAE
+    loads at decode, and a disaggregated sampler holds the same core weights, so one figure serves both of
     :func:`pricing.candidate_delta_mb`'s pricing branches. Weights already resident on the slot upload nothing.
     None when the weights cannot be estimated.
     """

@@ -47,6 +47,7 @@ from horde_worker_regen.process_management.scheduling.admission.clearance import
     staged_attempt_deadline_seconds,
     staged_held_mb,
     staged_materialization_delta_mb,
+    staged_sampling_peak_mb,
 )
 from horde_worker_regen.process_management.scheduling.admission.materialization import head_starved_seconds
 from horde_worker_regen.process_management.scheduling.clearance_lease import (
@@ -196,9 +197,7 @@ async def test_the_staged_delta_nets_what_the_child_already_holds() -> None:
     scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0)
     job_id = str(job.id_)
     snapshot = scheduler.snapshot()
-    gross = pricing.candidate_delta_mb(
-        snapshot, job, snapshot.queue.jobs[job_id].baseline, process_id=0, disaggregated=False
-    )
+    gross = staged_sampling_peak_mb(snapshot, job_id, 0)
     assert gross is not None
     assert staged_materialization_delta_mb(snapshot, job_id, 0) == max(0.0, gross - 900.0)
 
@@ -220,9 +219,9 @@ async def test_own_weights_on_the_slot_are_netted_whole_or_partial() -> None:
     assert pricing.candidate_weights_resident(snapshot, _JOB_MODEL, 0)
     baseline = snapshot.queue.jobs[job_id].baseline
     weights_mb = predict_job_weight_mb(job, baseline)
-    credited_mb = pricing.candidate_delta_mb(snapshot, job, baseline, process_id=0, disaggregated=False)
-    assert weights_mb is not None and weights_mb > 0.0 and credited_mb is not None
-    peak_mb = credited_mb + weights_mb
+    peak_mb = staged_sampling_peak_mb(snapshot, job_id, 0)
+    assert weights_mb is not None and weights_mb > 0.0 and peak_mb is not None
+    credited_mb = peak_mb - weights_mb
 
     waiter.process_reserved_mb = int(weights_mb) + 900
     whole = staged_materialization_delta_mb(scheduler.snapshot(), job_id, 0)
@@ -247,9 +246,7 @@ async def test_another_models_weights_on_the_slot_are_not_netted() -> None:
     snapshot = scheduler.snapshot()
     assert _OTHER_MODEL in snapshot.slots[0].resident_weight_models
     assert not pricing.candidate_weights_resident(snapshot, _JOB_MODEL, 0)
-    gross = pricing.candidate_delta_mb(
-        snapshot, job, snapshot.queue.jobs[job_id].baseline, process_id=0, disaggregated=False
-    )
+    gross = staged_sampling_peak_mb(snapshot, job_id, 0)
     assert gross is not None
 
     own_holdings_mb = waiter.process_reserved_mb - other_weights_mb
@@ -265,9 +262,7 @@ async def test_a_cleared_job_books_what_clearance_priced_and_spends_it_at_its_pe
     scheduler, job, _waiter = await _staged_waiter(device_free_mb=24000.0)
     job_id = str(job.id_)
     snapshot = scheduler.snapshot()
-    gross = pricing.candidate_delta_mb(
-        snapshot, job, snapshot.queue.jobs[job_id].baseline, process_id=0, disaggregated=False
-    )
+    gross = staged_sampling_peak_mb(snapshot, job_id, 0)
     remaining = staged_materialization_delta_mb(snapshot, job_id, 0)
     assert gross is not None and remaining is not None and remaining == gross - 900.0
 
@@ -287,15 +282,61 @@ async def test_clearance_presents_what_the_staged_job_already_holds() -> None:
     scheduler, job, _waiter = await _staged_waiter(device_free_mb=100.0)
     job_id = str(job.id_)
     snapshot = scheduler.snapshot()
-    gross = pricing.candidate_delta_mb(
-        snapshot, job, snapshot.queue.jobs[job_id].baseline, process_id=0, disaggregated=False
-    )
+    gross = staged_sampling_peak_mb(snapshot, job_id, 0)
     plan = _decide(scheduler, 0)
     assert plan.priced is not None and gross is not None
     request = plan.priced.request
     assert request.candidate_held_mb == staged_held_mb(snapshot, job_id, 0) == 900.0
     assert request.candidate_delta_mb is not None
     assert request.candidate_delta_mb + request.candidate_held_mb == gross
+
+
+async def test_a_staged_head_is_priced_at_its_weights_and_sampling_reserve_without_its_encoder() -> None:
+    """A staged monolithic head's need is its diffusion weights and sampling reserve, below the whole-job price.
+
+    Its child releases the text encoder before the clearance wait and loads the VAE with the decode, so neither is
+    on the card through the load and sample the grant opens. The learned whole-job price charges both.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    waiter.process_reserved_mb = None
+    job_id = str(job.id_)
+    snapshot = scheduler.snapshot()
+    baseline = snapshot.queue.jobs[job_id].baseline
+    weights_mb = predict_job_weight_mb(job, baseline)
+    device_index = snapshot.routing_device_index(snapshot.slots[0])
+    reserve_mb = pricing.sampling_reserve_mb(snapshot, job, baseline, device_index=device_index)
+    whole_job_mb = pricing.candidate_delta_mb(snapshot, job, baseline, process_id=0, disaggregated=False)
+    assert weights_mb is not None and reserve_mb is not None and whole_job_mb is not None
+
+    assert staged_sampling_peak_mb(snapshot, job_id, 0) == weights_mb + reserve_mb
+    assert staged_materialization_delta_mb(snapshot, job_id, 0) == weights_mb + reserve_mb
+    assert weights_mb + reserve_mb < whole_job_mb
+
+
+async def test_an_encoder_the_child_still_holds_nets_out_only_up_to_the_held_set_peak() -> None:
+    """What a staged child reports holding is netted from its need and never past it.
+
+    A child that kept its encoder reports more than its diffusion weights and reserve, and that memory is already
+    outside the measured free reading, so the outstanding charge reaches zero and the presented holdings equal the
+    whole need.
+    """
+    scheduler, job, waiter = await _staged_waiter(device_free_mb=24000.0, model_metadata=_two_model_metadata())
+    job_id = str(job.id_)
+    snapshot = scheduler.snapshot()
+    peak_mb = staged_sampling_peak_mb(snapshot, job_id, 0)
+    weights_mb = predict_job_weight_mb(job, snapshot.queue.jobs[job_id].baseline)
+    assert peak_mb is not None and weights_mb is not None and peak_mb > weights_mb
+    encoder_mb = 1700
+
+    waiter.process_reserved_mb = encoder_mb
+    snapshot = scheduler.snapshot()
+    assert staged_materialization_delta_mb(snapshot, job_id, 0) == peak_mb - encoder_mb
+    assert staged_held_mb(snapshot, job_id, 0) == encoder_mb
+
+    waiter.process_reserved_mb = int(peak_mb) + encoder_mb
+    snapshot = scheduler.snapshot()
+    assert staged_materialization_delta_mb(snapshot, job_id, 0) == 0.0
+    assert staged_held_mb(snapshot, job_id, 0) == peak_mb
 
 
 async def test_the_waiter_clock_times_the_probe_and_its_deadline_precedes_the_lease_timeout() -> None:
@@ -1435,7 +1476,7 @@ async def test_the_sample_clearance_after_a_stage_prices_the_activation_alone() 
     job_id = str(job.id_)
     snapshot = scheduler.snapshot()
     baseline = snapshot.queue.jobs[job_id].baseline
-    gross_mb = pricing.candidate_delta_mb(snapshot, job, baseline, process_id=0, disaggregated=False)
+    gross_mb = staged_sampling_peak_mb(snapshot, job_id, 0)
     weights_mb = predict_job_weight_mb(job, baseline)
     assert gross_mb is not None and weights_mb is not None
     assert scheduler.clearance_stage_admit_process(0) is True

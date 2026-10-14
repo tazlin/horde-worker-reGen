@@ -923,7 +923,7 @@ class _DispatchWorld:
         decode_seconds_by_job: Mapping[str, float] | None = None,
         footprint_store: LearnedFootprintStore | None = None,
         partial_loads: bool = False,
-        text_encoder_released_before_wait: bool = False,
+        text_encoder_released_before_wait: bool | None = None,
         lane_start_seconds: float = 0.0,
         lane_reports_carry_context: bool = False,
         admission_noise_mb: float | None = None,
@@ -1059,8 +1059,10 @@ class _DispatchWorld:
                 against the whole-job figure.
             learned_footprints: Whether the children's per-tick memory reports reach the parent's learned
                 footprint store through the production dispatcher, so the scheduler prices later jobs from what
-                the children reported. Opt-in per row like the lease: a row about over-commit under a fixed
-                misprice must keep its misprice, and a parent that learns the children's true peaks stops
+                the children reported. Each finished job's resident weights reach the dispatcher as its job
+                metrics carry them, so a job that sampled with its weights whole also teaches the activation its
+                class's clearance reserve is priced from. Opt-in per row like the lease: a row about over-commit
+                under a fixed misprice must keep its misprice, and a parent that learns the children's true peaks stops
                 over-committing within a few jobs.
             safety_off_gpu_allowed: Whether the operator permits safety to be moved off the card to reclaim it.
                 Off, the ladder has no safety rung at all, so a run says nothing about what reaching one costs;
@@ -1200,8 +1202,10 @@ class _DispatchWorld:
                 its encode and before its clearance wait, as hordelib's sampling lease hook releases it to its CPU
                 origins. The lane then holds neither its encode working set nor a support tenant through the wait,
                 and its commit charges no support tenant, since the VAE loads with the decode, whose spike the
-                world charges. Needs the clearance lease, ``partial_loads`` and ``phase_resident_components``. Off, the
-                encode working set is held through the wait and the support tenant lands at the commit.
+                world charges. Needs the clearance lease, ``partial_loads`` and ``phase_resident_components``. None,
+                the default, turns it on wherever those three are on, as every hordelib that holds a sampling lease
+                releases the encoder. False states an older child: the encode working set is held through the wait
+                and the support tenant lands at the commit.
             lane_start_seconds: How long a lane the pool regrows spends in ``PROCESS_STARTING`` before it waits for
                 jobs. Its CUDA context is not on the card until the start completes, so the card is charged for
                 it only then. Zero adds the lane waiting for jobs with its context charged at once.
@@ -1286,12 +1290,15 @@ class _DispatchWorld:
         if partial_loads and not closed_loop:
             raise ValueError("a partial load carried across jobs is a claim about job phases, so it needs closed_loop")
         self.partial_loads = partial_loads
-        if text_encoder_released_before_wait and not (clearance_lease and partial_loads and phase_resident_components):
+        release_supported = clearance_lease and partial_loads and phase_resident_components
+        if text_encoder_released_before_wait and not release_supported:
             raise ValueError(
                 "the encoder release runs in the sampling lease hook and frees the support tenant, so it needs the "
                 "lease, partial_loads and phase_resident_components"
             )
-        self.text_encoder_released_before_wait = text_encoder_released_before_wait
+        self.text_encoder_released_before_wait = (
+            release_supported if text_encoder_released_before_wait is None else text_encoder_released_before_wait
+        )
         if lane_start_seconds < 0.0:
             raise ValueError("a lane cannot start before it is launched")
         self.lane_start_seconds = lane_start_seconds

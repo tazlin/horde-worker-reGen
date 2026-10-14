@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -48,6 +48,9 @@ from tests.process_management.liveness._session_replay import (
     SESSION_JOBS_PATH,
     PopDriverRecord,
     ReplayJob,
+    _at_rest_holds_support,
+    _measured_mb,
+    _resident_key,
     calibrated_load_seconds_per_gb,
     chain_seconds,
     decode_seconds_by_job,
@@ -66,6 +69,7 @@ from tests.process_management.liveness._session_replay import (
 )
 from tests.process_management.liveness._world_assertions import (
     SAMPLING_CONCURRENCY_TOP,
+    HandoffGapSegment,
     ModelLoadTotals,
     concurrency_shares,
     handoff_gap_segments,
@@ -280,20 +284,25 @@ def _figures(world: _DispatchWorld, driver: PopDriverRecord, jobs: list[ReplayJo
     )
 
 
-async def _replay_w3_window(scratch_directory: Path) -> _ReplayFigures:
+async def _replay_w3_window(scratch_directory: Path, *, on_demand: bool = False) -> _ReplayFigures:
     """Replay 15:05 to 15:25 from the residents the lanes held at 15:05, and read the figures back."""
-    _world, figures = await _run_w3_window(scratch_directory)
+    _world, figures = await _run_w3_window(scratch_directory, on_demand=on_demand)
     return figures
 
 
-async def _run_w3_window(scratch_directory: Path) -> tuple[_DispatchWorld, _ReplayFigures]:
-    """Replay 15:05 to 15:25 from the residents the lanes held at 15:05, returning the finished world and figures."""
+async def _run_w3_window(scratch_directory: Path, *, on_demand: bool = False) -> tuple[_DispatchWorld, _ReplayFigures]:
+    """Replay 15:05 to 15:25 from the residents the lanes held at 15:05, returning the finished world and figures.
+
+    At the recorded offsets the stream is the jobs popped in the stretch. On demand it is every job dispatched from
+    15:05 on, offered as fast as the world asks (:func:`pop_driver`), so the stretch's twenty minutes are bounded by
+    the card and not by what the live worker popped in them.
+    """
     window_end = _W3_START_OFFSET_SECONDS + _W3_SECONDS
     session_jobs = load_session_jobs(SESSION_JOBS_PATH)
     jobs = [
         job
         for job in session_jobs
-        if job.offset_seconds < window_end
+        if (on_demand or job.offset_seconds < window_end)
         and (job.dispatch_offset_seconds or job.offset_seconds) >= _W3_START_OFFSET_SECONDS
     ]
     world, classes = _replay_world(session_jobs, scratch_directory=scratch_directory)
@@ -309,6 +318,7 @@ async def _run_w3_window(scratch_directory: Path) -> tuple[_DispatchWorld, _Repl
         queue_size=_POP_BUDGET,
         start_offset_seconds=_W3_START_OFFSET_SECONDS,
         seconds=_W3_SECONDS,
+        on_demand=on_demand,
     )
     return world, _figures(world, driver, jobs)
 
@@ -362,6 +372,99 @@ async def test_replay_w3_window_reproduces_the_live_duty_shape(tmp_path: Path) -
     _assert_live_duty_shape(figures, context="15:05 to 15:25 window")
 
 
+_SPARSE_STREAM_ROWS = 8
+"""Rows of the sparse stream the on-demand row offers, more than the pop budget holds at once."""
+_SPARSE_STREAM_SPACING_SECONDS = 10_000.0
+"""How far apart the sparse stream's recorded offsets sit, far longer than the run, so offsets alone feed one row."""
+_SPARSE_STREAM_SECONDS = 240.0
+"""How long the on-demand row runs: long enough for the first jobs to finish and their successors to be offered."""
+
+
+async def _drive_sparse_stream(tmp_path: Path, *, on_demand: bool) -> tuple[_DispatchWorld, PopDriverRecord]:
+    """Offer the session's first SDXL rows, their offsets spread far apart, to a fresh replay world."""
+    session_jobs = load_session_jobs(SESSION_JOBS_PATH)
+    world, _classes = _replay_world(session_jobs, scratch_directory=tmp_path)
+    sdxl_rows = [job for job in session_jobs if job.baseline == "stable_diffusion_xl"][:_SPARSE_STREAM_ROWS]
+    sparse = [
+        replace(job, offset_seconds=index * _SPARSE_STREAM_SPACING_SECONDS) for index, job in enumerate(sdxl_rows)
+    ]
+    driver = await pop_driver(
+        world,
+        sparse,
+        queue_size=_POP_BUDGET,
+        start_offset_seconds=0.0,
+        seconds=_SPARSE_STREAM_SECONDS,
+        on_demand=on_demand,
+    )
+    return world, driver
+
+
+async def test_on_demand_supply_feeds_a_world_that_asks_faster_than_the_recorded_offsets(tmp_path: Path) -> None:
+    """On demand, every row the queue has room for is offered at once, so no handoff waits on an unpopped successor.
+
+    The same stream at its recorded offsets offers one row in the run, which is the calibration model starving a
+    world that runs ahead of the live worker.
+    """
+    _calibrated_world, calibrated = await _drive_sparse_stream(tmp_path / "calibrated", on_demand=False)
+    world, driver = await _drive_sparse_stream(tmp_path / "on_demand", on_demand=True)
+
+    assert calibrated.offered == 1
+    assert driver.offered > _POP_BUDGET, (
+        f"on demand the world took {driver.offered} rows in {_SPARSE_STREAM_SECONDS:.0f} s, no more than one pop "
+        f"budget ({_POP_BUDGET}), so no row was offered as an earlier one finished"
+    )
+    assert driver.refused_offers == 0 and driver.taken_out_of_order == 0
+    figures = _figures(world, driver, [])
+    assert figures.card_busy_share == pytest.approx(
+        sum(share for lanes, share in figures.concurrency.items() if lanes > 0)
+    ), f"the card-busy share is not the share of ticks with a lane sampling. {figures.describe()}"
+    not_popped_seconds = handoff_gap_segments(world).get(HandoffGapSegment.NOT_POPPED, 0.0)
+    assert not_popped_seconds == 0.0, (
+        f"handoffs waited {not_popped_seconds:.0f} s on a successor not yet popped while {driver.remaining} rows "
+        "were left to offer"
+    )
+
+
+_DRAINED_STREAM_SECONDS = 4_000.0
+"""A run length far beyond what the sparse stream takes to serve on demand, so only the drain can end the run."""
+
+
+async def test_an_on_demand_run_ends_when_its_last_job_completes(tmp_path: Path) -> None:
+    """Fed on demand, the run stops on the tick its last offered job completes, so its figures carry no dry tail.
+
+    The duty shares and the kudos per hour read over the world clock the run advanced, which is then the span the
+    stream was served.
+    """
+    session_jobs = load_session_jobs(SESSION_JOBS_PATH)
+    world, _classes = _replay_world(session_jobs, scratch_directory=tmp_path)
+    sdxl_rows = [job for job in session_jobs if job.baseline == "stable_diffusion_xl"][:_SPARSE_STREAM_ROWS]
+    completed_after_step: list[int] = []
+    world_step = world.step
+
+    async def recording_step() -> None:
+        await world_step()
+        completed_after_step.append(world.completed_jobs)
+
+    world.step = recording_step  # type: ignore[method-assign]
+
+    driver = await pop_driver(
+        world,
+        sdxl_rows,
+        queue_size=_POP_BUDGET,
+        start_offset_seconds=0.0,
+        seconds=_DRAINED_STREAM_SECONDS,
+        on_demand=True,
+    )
+
+    assert driver.offered == len(sdxl_rows) and driver.remaining == 0
+    assert world.completed_jobs == len(sdxl_rows), f"{world.completed_jobs} of {len(sdxl_rows)} jobs completed"
+    assert world.now - world.started_at < _DRAINED_STREAM_SECONDS, "the run went on to its full length"
+    first_drained_step = completed_after_step.index(len(sdxl_rows))
+    assert first_drained_step == len(completed_after_step) - 1, (
+        f"the run stepped {len(completed_after_step) - 1 - first_drained_step} ticks after its last job completed"
+    )
+
+
 @pytest.mark.slow
 async def test_replay_whole_session(tmp_path: Path) -> None:
     """The whole session, replayed from a cold pool, keeps the same duty shape as its middle stretch.
@@ -381,8 +484,10 @@ def test_the_truth_hook_leaves_the_encoder_and_vae_to_the_support_tenant(tmp_pat
 
     The sample key is the whole job's peak with the text encoder and VAE in it, and the world charges those
     again as the lane's support tenant, so a transient read off the sample key less the weights charges them
-    twice. A peak below the weights and the seed was taken partially loaded, so its transient is the class's
-    measured activation instead. Every replayed job is checked against the branch its figures put it in.
+    twice. A peak below the weights and the seed was taken partially loaded, and a peak of a class whose at-rest
+    key held its support components carries an unknown share of an encoder the fixture's child partially unloaded,
+    so either one's transient is the class's measured activation instead, where one is measured. Every replayed job
+    is checked against the branch its figures put it in.
     """
     jobs = load_session_jobs(SESSION_JOBS_PATH)
     store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path)
@@ -392,7 +497,7 @@ def test_the_truth_hook_leaves_the_encoder_and_vae_to_the_support_tenant(tmp_pat
 
     classes_by_name = {model_class.name: model_class for model_class in classes}
     decomposed_models: set[str] = set()
-    partial_peak_models: set[str] = set()
+    measured_activation_models: set[str] = set()
     for replay_job in jobs:
         job = replay_job.pop_response
         model_class = classes_by_name[replay_job.model]
@@ -400,26 +505,49 @@ def test_the_truth_hook_leaves_the_encoder_and_vae_to_the_support_tenant(tmp_pat
         _, peak_share_mb = whole(job)
         support_mb = _support_component_mb(model_class)
         assert weights_mb == model_class.weights_mb
-        if peak_share_mb > support_mb:
+        activation_key = sampling_footprint_key(job, str(model_class.baseline), stage=FootprintStage.SAMPLE_ACTIVATION)
+        assert activation_key is not None
+        measured_activation_mb = store.measured_job_estimate_net_of_context_mb(
+            activation_key, job_class_key(activation_key, job)
+        )
+        holds_residue = _at_rest_holds_support(store, model_class)
+        decomposes = peak_share_mb > support_mb and not (holds_residue and measured_activation_mb is not None)
+        if decomposes:
             decomposed_models.add(replay_job.model)
             assert transient_mb == pytest.approx(peak_share_mb - support_mb), (
                 f"{replay_job.model}: the transient is {transient_mb:.0f} MB, not its {peak_share_mb:.0f} MB peak "
                 f"share less the {support_mb:.0f} MB the support tenant already charges"
             )
             continue
-        partial_peak_models.add(replay_job.model)
-        activation_key = sampling_footprint_key(job, str(model_class.baseline), stage=FootprintStage.SAMPLE_ACTIVATION)
-        assert activation_key is not None
-        measured_activation_mb = store.measured_job_estimate_net_of_context_mb(
-            activation_key, job_class_key(activation_key, job)
-        )
+        measured_activation_models.add(replay_job.model)
         expected_mb = 0.0 if measured_activation_mb is None else measured_activation_mb / _MEASURED_ESTIMATE_MARGIN
         assert transient_mb == pytest.approx(expected_mb), (
-            f"{replay_job.model}: a peak below its weights and seed gave a {transient_mb:.0f} MB transient, not the "
+            f"{replay_job.model}: a peak that does not decompose gave a {transient_mb:.0f} MB transient, not the "
             f"{expected_mb:.0f} MB measured activation"
         )
-    assert _PEAK_PARTIAL_MODEL in partial_peak_models, "the Flux peak decomposes, so the partial branch is untested"
+    assert _PEAK_PARTIAL_MODEL in measured_activation_models, (
+        "the Flux peak decomposes, so the measured activation branch is untested"
+    )
     assert decomposed_models, "no replayed class decomposes, so the double count branch is untested"
+
+
+def test_a_resident_key_holding_the_support_components_charges_the_diffusion_weights_alone(tmp_path: Path) -> None:
+    """A class whose at-rest key covers hordelib's core and support seeds is charged that key less the support seed.
+
+    The support components are the world's support tenant, which a child that releases its encoder before the
+    wait does not hold while it samples, so the class's weights are the diffusion weights alone.
+    """
+    jobs = load_session_jobs(SESSION_JOBS_PATH)
+    store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path)
+    classes = {
+        model_class.name: model_class
+        for model_class in model_classes(jobs, store, load_footprint_keys(SESSION_FOOTPRINTS_PATH))
+    }
+    flux_class = classes[_FLUX.name]
+    assert _at_rest_holds_support(store, flux_class), "the fixture's Flux key reads as weights alone"
+    at_rest_mb = _measured_mb(store, _resident_key(flux_class.name, str(flux_class.baseline)))
+    assert at_rest_mb is not None
+    assert flux_class.weights_mb == pytest.approx(at_rest_mb - _support_component_mb(flux_class))
 
 
 _FLUX_SAMPLE_KEY = FootprintKey(
@@ -431,26 +559,39 @@ _FLUX_SAMPLE_KEY = FootprintKey(
 """The Flux sampling key most of the window's Flux jobs are learned under."""
 
 
-async def test_the_w3_window_leaves_the_learned_flux_sample_figure_where_it_began(tmp_path: Path) -> None:
-    """Over the window the parent's measured Flux sampling figure moves by less than the store's margin.
+async def test_the_w3_window_teaches_the_flux_sample_figure_a_released_child_reports(tmp_path: Path) -> None:
+    """Over the window the parent's measured Flux sampling figure never climbs and settles at the child's sample.
 
-    The live session ended with this key where the window begins, after thousands of observations, so a replay
-    that raises it is teaching the parent figures the live children never reported. Each of the world's reports
-    carries the job's sampling peak without the context share or the decode spike. Truth figures are read without
-    the store's margin, which the parent adds when it learns from them.
+    The fixture's figure was learned from a child that kept its text encoder on the card, so a child that releases
+    it reports less, and the parent's figure moves down toward the diffusion weights and activation the world
+    charges, priced through the store's margin. A figure that rises is teaching the parent figures no child
+    reported. Each of the world's reports carries the job's sampling peak without the context share or the decode
+    spike. Truth figures are read without the store's margin, which the parent adds when it learns from them.
     """
     start_store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path / "start")
     start_mb = start_store.measured_estimate_net_of_context_mb(_FLUX_SAMPLE_KEY)
     assert start_mb is not None, "the fixture's Flux key is under-observed, so the row is moot"
+    jobs = load_session_jobs(SESSION_JOBS_PATH)
+    truth_store = load_footprint_store(SESSION_FOOTPRINTS_PATH, scratch_directory=tmp_path / "truth")
+    classes = model_classes(jobs, truth_store, load_footprint_keys(SESSION_FOOTPRINTS_PATH))
+    weights_mb, activation_mb = true_footprint(truth_store, classes, phase_resident_components=True)(
+        make_job_pop_response(_FLUX.name, width=1024, height=1024, ddim_steps=4)
+    )
+    released_sample_mb = (weights_mb + activation_mb) * _MEASURED_ESTIMATE_MARGIN
 
     world, figures = await _run_w3_window(tmp_path / "replay")
 
     end_mb = world.footprint_store.measured_estimate_net_of_context_mb(_FLUX_SAMPLE_KEY)
     assert end_mb is not None
     tolerance_mb = start_mb * (_MEASURED_ESTIMATE_MARGIN - 1.0)
-    assert abs(end_mb - start_mb) <= tolerance_mb, (
-        f"the learned Flux le_1024 figure moved from {start_mb:.0f} MB to {end_mb:.0f} MB over the window, beyond "
+    assert end_mb <= start_mb + tolerance_mb, (
+        f"the learned Flux le_1024 figure climbed from {start_mb:.0f} MB to {end_mb:.0f} MB over the window, beyond "
         f"the store's {tolerance_mb:.0f} MB margin. {figures.describe()}"
+    )
+    assert abs(end_mb - released_sample_mb) <= tolerance_mb, (
+        f"the learned Flux le_1024 figure ended at {end_mb:.0f} MB, more than the store's {tolerance_mb:.0f} MB "
+        f"margin from the {released_sample_mb:.0f} MB a released child's weights and activation price at. "
+        f"{figures.describe()}"
     )
 
 

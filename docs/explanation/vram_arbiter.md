@@ -416,10 +416,17 @@ same netting covers the dispatch flow at clearance: a leased job's encode-only s
 outstanding when the job is re-priced at its full peak, and that peak already covers it, so the job's own
 staging entry is subtracted as well (`own_dispatch_unmaterialized_mb`). Without it a lone staged child on a
 card with room for its peak reads as short by exactly the encode charge and waits out its lease-acquire
-timeout for room the card had all along. The candidate itself gets the same treatment: what the staged child
-has already put on the card (its text encoder and VAE, any allocator cache left by its previous job, read as
-the process's measured reservation) is missing from the device-free reading and inside the full peak, so the
-clearance re-price charges the peak net of that reservation. Charged gross, a child reads as further from
+timeout for room the card had all along. The peak clearance prices for a staged monolithic job is the set its
+child holds from the grant to the end of its sample: the diffusion weights and the sampling reserve
+(`staged_sampling_peak_mb`, the figures a partial-load seat seats a whole copy at). hordelib returns the text
+encoder to its CPU origins before the clearance wait and loads the VAE with the decode. The learned whole-job
+peak carries both, and priced at it a large head waits for room it never uses. The decode tail is funded by
+ComfyUI unloading the job's own weights and is not priced here. A disaggregated sampler keeps its sampler-only
+price.
+The candidate itself gets the same treatment: what the staged child has already put on the card (staged
+weights, a partial copy, any allocator cache left by its previous job, read as the process's measured
+reservation) is missing from the device-free reading and inside the peak, so the clearance re-price charges the
+peak net of that reservation. Charged gross, a child reads as further from
 fitting the more of its own job it has staged; a multi-GB encoder alone costs it the timeout. The reservation
 is the job's own only net of weights another model keeps on the slot, which stay beside the job. Weights of
 the job's own model in it, whole or partial, are netted from the peak before any resident-weight credit, so a

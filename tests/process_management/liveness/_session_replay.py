@@ -13,8 +13,8 @@ prior:
   each job really costs the card.
 - :func:`sample_seconds_by_job`, :func:`decode_seconds_by_job` and the session medians state the stream's
   measured durations, and :func:`kudos_by_job` its kudos.
-- :func:`pop_driver` offers the stream to the world on its own clock, gated by the room the popper would have,
-  and optionally looks past a job the offer refuses.
+- :func:`pop_driver` offers the stream to the world on its own clock, or as fast as the world asks, gated by the
+  room the popper would have, and optionally looks past a job the offer refuses.
 
 Known mismatches between a replay and the live session:
 
@@ -50,7 +50,7 @@ from pathlib import Path
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry, TIPayloadEntry
-from hordelib.feature_impact import get_baseline_burden
+from hordelib.feature_impact import BaselineBurden, get_baseline_burden
 from pydantic import BaseModel, ConfigDict
 
 from horde_worker_regen.analysis.replay_fixture import PLATFORM_PLACEHOLDER, ReplayJobRow, read_replay_job_rows
@@ -288,26 +288,57 @@ def _resident_weights_mb(
     model: str,
     baseline: str,
 ) -> float:
-    """Return a checkpoint's resident weights: its own key, else its baseline's other checkpoints, else hordelib's.
+    """Return a checkpoint's diffusion weights: its own key, else its baseline's other checkpoints, else hordelib's.
 
     The store has no baseline-wide resident key, so a checkpoint the worker never learned takes the median of
-    the learned checkpoints of its baseline, and a baseline with none takes hordelib's weight seed.
+    the learned checkpoints of its baseline, and a baseline with none takes hordelib's weight seed. A learned key
+    is read through :func:`_diffusion_weights_mb`, since the at-rest reading can hold the support components too.
     """
+    burden = get_baseline_burden(baseline, model)
     own_mb = _measured_mb(store, _resident_key(model, baseline))
     if own_mb is not None:
-        return own_mb
+        return _diffusion_weights_mb(own_mb, burden)
     sibling_figures = [
-        measured_figure_mb
+        _diffusion_weights_mb(measured_figure_mb, burden)
         for sibling_key in keys
         if sibling_key.stage is FootprintStage.RESIDENT and sibling_key.model_baseline == baseline
         if (measured_figure_mb := _measured_mb(store, sibling_key)) is not None
     ]
     if sibling_figures:
         return statistics.median(sibling_figures)
-    burden = get_baseline_burden(baseline, model)
     if burden is None:
         raise ValueError(f"no resident figure for {model} ({baseline}): no learned key and no hordelib burden")
     return float(burden.vram_weights_mb)
+
+
+def _diffusion_weights_mb(resident_mb: float, burden: BaselineBurden | None) -> float:
+    """Return the diffusion weights in a learned at-rest reading, less the support components where it holds them.
+
+    The fixture's child kept its text encoder and VAE on the card beside the weights, so a RESIDENT key that reads
+    nearer hordelib's core seed plus support seed than the core seed alone holds both, and the support seed is
+    taken out. The world charges the support components as the support tenant under ``phase_resident_components``,
+    and a child that releases its encoder before the clearance wait does not hold them while it samples. A reading
+    nearer the core seed is the weights alone.
+    """
+    if burden is None:
+        return resident_mb
+    support_mb = float(burden.vram_support_weights_mb)
+    return resident_mb - support_mb if _covers_support(resident_mb, burden) else resident_mb
+
+
+def _covers_support(resident_mb: float, burden: BaselineBurden) -> bool:
+    """Return whether an at-rest reading sits nearer hordelib's core plus support seed than its core seed alone."""
+    support_mb = float(burden.vram_support_weights_mb)
+    return support_mb > 0.0 and resident_mb > float(burden.vram_weights_mb) + support_mb / 2.0
+
+
+def _at_rest_holds_support(store: LearnedFootprintStore, model_class: _ModelClass) -> bool:
+    """Return whether the class's own at-rest key held its support components beside its diffusion weights."""
+    burden = get_baseline_burden(str(model_class.baseline), model_class.name)
+    if burden is None:
+        return False
+    at_rest_mb = _measured_mb(store, _resident_key(model_class.name, str(model_class.baseline)))
+    return at_rest_mb is not None and _covers_support(at_rest_mb, burden)
 
 
 def _class_label(model: str) -> str:
@@ -369,7 +400,7 @@ def true_footprint(
 ) -> Callable[[ImageGenerateJobPopResponse], tuple[float, float]]:
     """Return the world's ``true_footprint_mb`` hook, stating what each job cost the live card.
 
-    The resident weights are the class's figure (its checkpoint's resident key). The sample key is the whole job's
+    The weights are the class's diffusion weights (:func:`_diffusion_weights_mb`). The sample key is the whole job's
     peak, matched on baseline, resolution band, batch and hires fix as the worker keys it, read as the lower of
     watermark and measured basis (:func:`_measured_mb`), so it holds the text encoder and VAE beside the weights
     and the activation. Every figure is the measurement without the store's margin, since the world reports what
@@ -384,7 +415,11 @@ def true_footprint(
     the transient is the job's measured activation (the peak less the diffusion weights it held, the figure the
     parent's grant reserve prices from), or zero where the class never measured one. The measured activation is
     not used where the peak decomposes, since it is taken against the weights held at the peak, which run below the
-    resident key the weights here come from, so adding it to them would charge more than the peak.
+    resident key the weights here come from, so adding it to them would charge more than the peak. The exception
+    is a class whose at-rest key held its support components (:func:`_at_rest_holds_support`): the fixture's child
+    kept that encoder on the card and ComfyUI partially unloaded it to fit the diffusion load, so the peak carries
+    an unknown share of it and decomposes into noise. Such a class takes its measured activation wherever one is
+    measured.
 
     The store must be one no run feeds. A replay with ``learned_footprints`` teaches its own store from the
     world's reports, and a truth read from that store would follow what the world charged.
@@ -415,8 +450,11 @@ def true_footprint(
             sample_mb = predict_job_sampling_vram_mb(job, baseline) or model_class.weights_mb
         support_mb = _support_component_mb(model_class) if phase_resident_components else 0.0
         transient_mb = sample_mb - model_class.weights_mb - support_mb
-        if phase_resident_components and transient_mb <= 0.0:
-            transient_mb = _measured_activation_mb(store, job, baseline) or 0.0
+        peak_holds_encoder_residue = phase_resident_components and _at_rest_holds_support(store, model_class)
+        if phase_resident_components and (transient_mb <= 0.0 or peak_holds_encoder_residue):
+            measured_activation_mb = _measured_activation_mb(store, job, baseline)
+            if measured_activation_mb is not None or transient_mb <= 0.0:
+                transient_mb = measured_activation_mb or 0.0
         figure = (model_class.weights_mb, max(0.0, transient_mb))
         figures[cache_key] = figure
         return figure
@@ -554,6 +592,7 @@ async def pop_driver(
     start_offset_seconds: float,
     seconds: float,
     look_ahead_rows: int = 0,
+    on_demand: bool = False,
 ) -> PopDriverRecord:
     """Step ``world`` for ``seconds``, offering the stream's jobs as their offsets pass and the queue has room.
 
@@ -566,6 +605,15 @@ async def pop_driver(
     jobs whose offset has passed are looked at, so the look-ahead never brings work forward in time. A host-RAM
     hold refuses every model, so it ends the tick's offers whatever the look-ahead.
 
+    The recorded offsets are the calibration model of supply: the world is fed no faster than the live worker
+    popped, so a replay compares with the live session's duty. A world that runs ahead of the live worker then
+    idles for want of a recorded row, which reads as ``no_local_work`` and says nothing about the card.
+    ``on_demand`` is the supply model for a duty bound: the offsets are ignored and the next row is offered
+    whenever the queue has room, under the same queue budget, look-ahead and refusal rules, so the card and the
+    scheduler are the only limits on what the world serves. An on-demand run ends once every row is taken and every
+    taken job has completed, or at ``seconds``, whichever comes first, so the duty shares and the kudos per hour
+    read over the span the stream was served and carry no dry tail. The recorded offsets run for ``seconds``.
+
     Args:
         world: A world built from this module's inputs.
         jobs: The stream to offer, in pop order.
@@ -574,6 +622,7 @@ async def pop_driver(
         start_offset_seconds: The stream offset the run's first tick stands for.
         seconds: How much world time to run.
         look_ahead_rows: How many untaken rows past the first a refusal may move on to in one pop.
+        on_demand: Whether every untaken row is due whatever its offset.
 
     Returns:
         PopDriverRecord: What was offered and refused.
@@ -582,13 +631,16 @@ async def pop_driver(
     untaken = list(range(len(jobs)))
     refused_offers = 0
     taken_out_of_order = 0
+    taken_job_ids: set[str] = set()
     for _ in range(math.ceil(seconds / world.tick_seconds)):
+        if on_demand and not untaken and taken_job_ids <= set(world.completed_job_ids):
+            break
         elapsed = world.now - began_at
         while untaken and len(world.job_tracker.jobs_pending_inference) < queue_size:
             due = [
                 position
                 for position, index in enumerate(untaken[: look_ahead_rows + 1])
-                if jobs[index].offset_seconds - start_offset_seconds <= elapsed
+                if on_demand or jobs[index].offset_seconds - start_offset_seconds <= elapsed
             ]
             taken_position: int | None = None
             for position in due:
@@ -602,7 +654,7 @@ async def pop_driver(
                 break
             if taken_position > 0:
                 taken_out_of_order += 1
-            untaken.pop(taken_position)
+            taken_job_ids.add(str(jobs[untaken.pop(taken_position)].pop_response.id_))
         await world.step()
     return PopDriverRecord(
         offered=len(jobs) - len(untaken),

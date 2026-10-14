@@ -37,6 +37,7 @@ from tests.process_management.liveness._dispatch_world import (
     _SD15_OTHER,
     _SDXL,
     _SDXL_OTHER,
+    _CardClass,
     _DispatchWorld,
     _ModelClass,
 )
@@ -288,6 +289,14 @@ async def _build_held_components() -> _DispatchWorld:
     return world
 
 
+_TWO_PHASE_CARD = _CardClass("18gb", 18_432.0)
+"""The two-phase row's card: one SDXL sampling window and the next job's weights fit on it beside safety and the
+post-processing lane, and two sampling windows do not.
+
+Clearance prices a staged SDXL job at its diffusion weights and sampling reserve, so on a 24 GB card two
+1536-pixel windows fit together and every job is granted whole, leaving no stage grant to trace."""
+
+
 async def _build_two_phase_clearance() -> _DispatchWorld:
     """Two-phase clearance: the next job's weights are staged beside a running sample and its denoise follows.
 
@@ -296,7 +305,7 @@ async def _build_two_phase_clearance() -> _DispatchWorld:
     reads to stage a job beside a sample, and the legacy unload hatch has every job load its weights.
     """
     world = _DispatchWorld(
-        card=_CARD_24GB,
+        card=_TWO_PHASE_CARD,
         lane_count=2,
         max_threads=2,
         queue_depth=4,
@@ -429,6 +438,20 @@ async def test_regenerate_golden_trace(scenario: _Scenario) -> None:
 
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     _golden_path(scenario).write_text(serialise(first), encoding="utf-8")
+
+
+_TWO_PHASE_SCENARIO = next(scenario for scenario in _SCENARIOS if scenario.label == "two_phase_clearance")
+
+
+@pytest.mark.usefixtures("_deterministic_job_ids")
+async def test_the_two_phase_row_stages_weights_beside_a_running_sample() -> None:
+    """The two-phase row grants at least one stage, so its golden traces the path the row exists for."""
+    world = await _TWO_PHASE_SCENARIO.build()
+    for _ in range(_TWO_PHASE_SCENARIO.ticks):
+        await world.step()
+
+    assert world.stage_grants, "the two-phase row granted no stage, so its golden traces only whole clearances"
+    assert not world.card_overcommits, f"the card was over-committed: {world.card_overcommits[:3]}"
 
 
 def test_the_catalog_covers_the_paths_the_redesign_cuts() -> None:
