@@ -69,6 +69,11 @@ line is registered, update the pattern, the sample, and any detector in the same
 | Inference slot retired, safety moved to the CPU | `inference_slot_retired`, `safety_start_escalated_to_cpu` | `horde-log timeline --last` for the `INFERENCE_START_RETIRED`, `INFERENCE_SLOT_RESTORED` and `SAFETY_START_ESCALATED_TO_CPU` ledger events | `action_ledger.jsonl` |
 | Benchmark beside a worker | findings tagged as the benchmark run | `horde-log diagnose --last-benchmark`, stopped with `.abort_benchmark` | `bridge_harness.log` |
 | GPU duty below target | the duty report | `horde-log duty --stats <bundle>/stats --logs <bundle>/logs` | `stats/*.jsonl`, `bridge.log` |
+| Jobs dropped as "took too long" behind a run | none yet | grep `skipped the line (` by reason and count skips per displaced head (`ahead of job <id>`) | `bridge.log` |
+| Card idle, queue full, a large model parked | none yet | grep `Deferring a new whole-card residency` and `does not open a recovery-supervisor grace window` | `bridge.log` |
+| Sampler crawling under WDDM, partial load turned full | none yet | lane log `loaded partially` followed by `loaded completely` for one job; `reserve_mb=0` on the overflow check | `bridge_<n>.log` |
+| Safety on the CPU for a whole session | none yet | `safety_placement` restore lines; replay `restore_headroom_fits` over the status inputs | `bridge.log` |
+| A small model's verdict or price jumps to a large model's | none yet | `Dominance verdict for device` lines; a different model dispatched onto a lane holding this one just before | `bridge.log`, `config/vram_footprints.json` |
 
 **Reading duty.** The duty report's "GPU time lost" labels are an order of precedence over what was outstanding
 (a pending submit outranks a pending safety check, which outranks every lane state), not costs; the costs are the
@@ -159,9 +164,37 @@ Start from the mechanism, not the file. Each line names the owner of one questio
   `WholeCardResidencyLedger`, `teardown_complete`, the pop claim and `WholeCardPopClaimRelease`), the scheduler's
   `_whole_card_*` methods, `wants_whole_card` in `pricing.py`, and the settings `whole_card_exclusive_residency`,
   `whole_card_residency_safety_off_gpu`, `whole_card_residency_max_hold_seconds`,
-  `large_model_reentry_cooldown_seconds`. The verdict is being redefined as a ladder of dominance (a model no
-  other offered model can sample beside gets the policy levers; a model that cannot co-reside with a context gets
-  the teardown); see the duty programme's plan under `docs/plans/`.
+  `large_model_reentry_cooldown_seconds`. The verdict is a two-rung dominance ladder computed per card by
+  `card_dominance` from `pricing.model_sampling_peak`, the offered set and the foreign floor (256 MB hysteresis):
+  rung 1 (`CANNOT_CO_SAMPLE`) gets a dominant-model run, rung 2 (`CANNOT_CO_RESIDE`) gets the teardown residency.
+  Both sit in one `WholeCardResidencyLedger`; `held()` returns every rung and `teardown_held()` rung 2 only, so a
+  reader whose premise is a teardown must read the latter (the cold-head residency-bypass exemption does; a run's
+  jobs reach the card only through the `dominant_run` seat). A run starts at its first step
+  (`_grant_dominant_runs_at_first_step`) and ends in `_restore_siblings_after_whole_card`: when the run's work
+  drains, or, with work still queued, once the undispatched head is for a different model and has waited past the
+  anti-starvation bound (`_head_aged_past_anti_starvation`; the horde deadline outranks run continuity). The
+  run's readers are the pop claim, `copy_belongs_to_dominant_run`, the `dominant_run` line-skip seat and the placement
+  promotion, all through the ledger, so the one end clears them together. The pop claim's max hold bounds the offer narrowing only, never the displaced head's
+  wait. Rung-2 entry is head-only, through admission or `_resident_whole_card_head_ready`. The establish-rate
+  limiter (`governor_hold`) defers a new residency, recorded as `DEFER_RESIDENCY_GOVERNOR`, which lets the preload
+  pass continue; the head never falls through to co-resident admission. The rolling grace allowance only withholds
+  the recovery supervisor's window (`grace_seconds_to_open`). The deferral record excuses the supervisor for at
+  most the limiter's window.
+- **How long a queue head may wait:** `scheduling/dispatch_affinity.py` owns the two clocks that read the horde
+  deadline (the skip budget, 6 skips or 0.2 x ttl, and the anti-starvation override at 0.3 x ttl from pop). Every
+  other hold has its own fixed clock (head protection, the RAM defer barrier, the establish-rate window, the claim's max
+  hold, the 60 s lease-acquire timeout, the structural-wedge minimum). Pin-wait, `residency_bypass_models` and the
+  `dominant_run` seat do not consult the deadline clocks. A new hold that can delay a head reads
+  `dispatch_affinity`'s clocks rather than adding one.
+- **Where a learned sampling reading is filed:** three feeders write the footprint store: the monolithic feeder
+  `MessageDispatcher._observe_footprint_peak` (per-reading plausibility bound, one peak folded per job), the
+  disaggregated feeder in the scheduler and the `RESIDENT` feeder in `vram_footprints.py`. Every feeder files
+  under the job's model, and a sampling reading is attributable only while the lane holds that model. A lane
+  still swapping reports the previous model's allocator high-water, so the monolithic feeder drops it.
+  `sanitize_sampling_observations` clamps `SAMPLE`, `SAMPLE_ISOLATED` and `SAMPLE_ACTIVATION` at load. Readers
+  price different figures for one job: the dispatch price (`pricing.candidate_delta_mb`), the clearance price
+  (`staged_sampling_peak_mb`, weights plus `sampling_reserve_mb`), the residency head need and the verdict's
+  `model_sampling_peak`. The scheduler keeps a second copy of `pricing.py`'s learned-peak helpers.
 - **Which lane a preload or a sweep may touch:** `scheduling/admission/preload.py` (`lanes_committed_elsewhere`,
   the three target selectors) and `pricing.sweep_spares_idle_copy`: a lane loading one model is no target for
   another, a lane that owns a dispatched job is busy whatever it last reported, and the queue head's ready seat is
@@ -172,7 +205,34 @@ Start from the mechanism, not the file. Each line names the owner of one questio
   `execution/comfy_patches.py` (`_load_models_gpu_hijack`, the class-list skip, the overflow check charging the
   held reserve, the free-view clamp); the worker's `workers/inference_process.py` handles one control message at
   a time, so a preload or unload queued ahead of `START_INFERENCE` delays the job. The force-load skip list is
-  `worker_entry_points.FORCE_LOAD_SKIP_BASELINES`.
+  `worker_entry_points.FORCE_LOAD_SKIP_BASELINES`. The grant can reach the child before the child starts the job.
+  The parent clears a staged waiter at dispatch, `ClearanceLeaseProxy.begin_job` unsets the shared figures, and
+  `_refresh_unconsumed_grant_figures` rewrites both the device free and the reserve of every unconsumed grant on
+  each step from the staged waiter's price, so a grant issued before the job start carries its reserve one step
+  later. The lease brackets the stage upload and
+  the denoise only; the encoder load, the encode and the VAE decode run outside it. In a run, the released
+  encoder's reload for each job pages part of the kept diffusion weights out of the card.
+- **Who may replace a process:** eleven paths, with no shared debounce or view of boot state.
+  `process_lifecycle.py` (`_reap_if_crashed`, `replace_hung_processes` and its watchdogs, the last reclaim rung
+  `_replace_if_paged_and_slow`, `rebuild_inference_pool`), `worker_recovery_coordinator.py` (the orphaned-verdict
+  watchdog, `perform_soft_reset`, `assess_wedge`), `recovery_supervisor.py` (`RecoverySupervisor`, whose give-up
+  and soft-reset branches both read `boot_in_progress`, bounded by the boot hard cap), and the scheduler's
+  clearance-refused and unload-failure paths. Only the `replace_hung_processes` branches share
+  `_recently_recovered`. The orphaned-verdict watchdog replaces safety only when nothing is alive to progress
+  (`is_safety_capacity_available`); `is_safety_pool_ready` (idle and accepting) is the intake question, never a
+  replacement trigger. A new replacement path reads boot and busy state and goes through that debounce.
+- **Where safety runs:** several mechanisms move safety off the GPU (runtime placement demotion, reclaim-ladder
+  requests from the governor, the arbiter and the SOS remedy, whole-card residency, start escalation, the per-check
+  CPU route, weight demotion in place); one reconciler, `_reconcile_runtime_safety_placement`, restores it,
+  gated by `SafetyPlacementInputs.restore_headroom_fits` and the restore dwell (`safety_placement.py`). Weight
+  promotion (`_promote_safety_weights_if_room`) has its own promoter.
+- **Lanes held down for a beneficiary:** the reclaim ladder's restore obligations stay held while
+  `ProcessManager._beneficiary_waiting` reports the booked job waiting, asked with the paused lane's kind, so a job
+  waiting for post-processing never holds the post-processing lane. The post-processing orchestrator's 90 s
+  age-out runs under a ladder pause regardless.
+- **Whether a LoRA is on disk:** two owners, the parent's `JobTracker._cached_lora_keys` and hordelib's ad-hoc
+  cache in the download process (eviction pins from `aux_prefetch_coordinator.py` cover every queued job). The
+  cache does not report an eviction to the parent.
 
 ## Code quality
 
@@ -346,6 +406,14 @@ uv run pytest -m chaos_sweep        # generated wedge-liveness sweep (pre-releas
   unless `admission_noise_mb` states the session's; regrown lanes, absent post-processing lanes and RAM-held idle
   lanes each had a path that wedged or crashed the row before they were modelled; and a replay that reads far from
   live is a simulator finding before it is a scheduling one.
+- **The world starts the child's job at dispatch.** It calls `begin_job` and enters the wait in the dispatch tick,
+  so a grant never precedes the job start and a clear never precedes the encode, and a run's per-job encoder
+  reload does not page the kept weights out. A clearance-transport or run-duty claim needs a row that drives that
+  order, or a live measurement.
+- **On one card the preload pass ends at its first stop of any kind.** `stop_is_card_scoped` in
+  `admission/preload.py` matters only with multi-GPU routing active; on a single card, whatever decision a parked
+  head records decides whether anything behind it preloads. `DEFER_RESIDENCY_GOVERNOR` is not a stop, since a head
+  standing down for the establish-rate limiter lets the pass go on.
 
 ## Changing scheduling, memory, or recovery behaviour
 
