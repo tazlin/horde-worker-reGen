@@ -252,9 +252,8 @@ from horde_worker_regen.process_management.scheduling.clearance_lease import (
 from horde_worker_regen.process_management.scheduling.concurrent_overlap import OVERLAP_HEADWAY_AMPLE_VRAM
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import card_preload_order
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
-    _GRACE_BUDGET_SECONDS,
-    WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
-    WHOLE_CARD_RESTORE_GRACE_SECONDS,
+    _ESTABLISH_WINDOW_LIMIT,
+    _ESTABLISH_WINDOW_SECONDS,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     InferenceScheduler,
@@ -2424,24 +2423,24 @@ async def test_n_defect_reinjection_an_unspared_reprice_takes_its_own_pre_stage_
 _GOVERNED_HEAD_TICK_SECONDS = 2.0
 """Seconds per tick for the governed-head scenarios.
 
-The windows that decide this scenario are the governor's deferral dwell (240s) and head protection's own
+The windows that decide this scenario are the establish-rate limiter's window (240s) and head protection's own
 starvation release (120s), and what it is about is the span between them. A tick worth a scheduling interval
 would step over that span in a handful of samples; at two seconds the idle run the defect produces is measured
 in the same units the incident was."""
 
 _GOVERNED_HEAD_TICKS = 90
-"""Ticks the governed-head scenarios run for: inside the governor's dwell, so the deferral is still in force
+"""Ticks the governed-head scenarios run for: inside the limiter's window, so the deferral is still in force
 at the end and the run says something about the deferral rather than about its expiry."""
 
 _GOVERNED_LIGHT_JOBS = 3
 """Light jobs queued behind the governed head. Three is enough that serving them is a streak rather than a
-single dispatch that could be luck, and few enough that the run stays inside the dwell."""
+single dispatch that could be luck, and few enough that the run stays inside the limiter's window."""
 
 
 def _governed_head_world(*, legacy_comfy_vram_unload: bool = False) -> _DispatchWorld:
-    """A 16 GB card whose whole-card grace allowance is spent, with the light class already resident.
+    """A 16 GB card whose establish-rate allowance is spent, with the light class already resident.
 
-    The allowance is spent through the ledger's own charge record, which is what a card that has recently
+    The allowance is spent through the ledger's own establishment record, which is what a card that has recently
     cycled a residency twice carries. The light checkpoint is seeded resident because the failure is about
     dispatch, not about staging: a line-skip only exists where a smaller ready job is already on a lane the
     card can dispatch it from.
@@ -2461,12 +2460,12 @@ def _governed_head_world(*, legacy_comfy_vram_unload: bool = False) -> _Dispatch
         legacy_comfy_vram_unload=legacy_comfy_vram_unload,
     )
     state = world.scheduler._whole_card_ledger.state_for(None)
-    cycle_seconds = WHOLE_CARD_ESTABLISH_GRACE_SECONDS + WHOLE_CARD_RESTORE_GRACE_SECONDS
-    for index in range(int(_GRACE_BUDGET_SECONDS // cycle_seconds) + 1):
-        state.grace_charges.append((world.now - index, WHOLE_CARD_ESTABLISH_GRACE_SECONDS))
-        state.grace_charges.append((world.now - index, WHOLE_CARD_RESTORE_GRACE_SECONDS))
-    assert world.scheduler._whole_card_ledger.grace_budget_exhausted(None, now=world.now), (
-        "precondition: the card's rolling grace allowance must be spent, or no governor defers anything"
+    state.establishments.extend([world.now] * _ESTABLISH_WINDOW_LIMIT)
+    assert world.scheduler._whole_card_ledger.establish_rate_exceeded(None, now=world.now), (
+        "precondition: the card's establish-rate allowance must be spent, or the governor does not defer the head"
+    )
+    assert _GOVERNED_HEAD_TICKS * _GOVERNED_HEAD_TICK_SECONDS < _ESTABLISH_WINDOW_SECONDS, (
+        "precondition: the run must end inside the limiter's window, or the deferral expires before it is read"
     )
     world.seed_resident(0, _SD15, in_vram=True)
     return world
@@ -2475,7 +2474,7 @@ def _governed_head_world(*, legacy_comfy_vram_unload: bool = False) -> _Dispatch
 async def _drive_governed_head(
     world: _DispatchWorld,
 ) -> tuple[ImageGenerateJobPopResponse, list[ImageGenerateJobPopResponse]]:
-    """Queue a whole-card head with light work behind it and run inside the governor's dwell.
+    """Queue a whole-card head with light work behind it and run inside the establish-rate limiter's window.
 
     Returns:
         The head, and the light jobs queued behind it in order.

@@ -369,6 +369,28 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         observable_at=_PRELOAD_ADMISSION_OBSERVABLE,
     ),
     GateEntry(
+        key="defer_residency_governor",
+        surface=GateSurface.PRELOAD_ADMISSION,
+        kind=GateKind.HOLD,
+        subsystem="process_management.scheduling.governance.whole_card",
+        engaged_by=(
+            "the queue head demands a new whole-card residency on a card that has already established as often "
+            "as the establish-rate limiter's rolling window allows. The head stands down and the card is free for "
+            "other work this cycle, so the preload pass goes on to the next job"
+        ),
+        released_by=(
+            "the oldest establishment aging out of the rolling window, at which point the head's next ask "
+            "establishes the residency"
+        ),
+        bound_seconds=240.0,
+        bound_source="whole_card._ESTABLISH_WINDOW_SECONDS",
+        backstop="",
+        observable_at=(
+            _PRELOAD_ADMISSION_OBSERVABLE + ", and the throttled whole_card_governor_hold warning, which identifies "
+            "the governor and quotes its arithmetic"
+        ),
+    ),
+    GateEntry(
         key="prestage",
         surface=GateSurface.PRELOAD_ADMISSION,
         kind=GateKind.OUTCOME,
@@ -718,33 +740,34 @@ GATE_REGISTRY: tuple[GateEntry, ...] = (
         bound_seconds=240.0,
         bound_source="whole_card._ESTABLISH_WINDOW_SECONDS",
         backstop=(
-            "the governor defer dwell, past which the head stops asking for the card and ordinary measured "
-            "admission decides, so a rate brake can never become an absolute park"
+            "the window itself. No deferral outlasts it, and the deferral record that excuses the recovery "
+            "supervisor and releases head protection expires with it (WholeCardResidencyLedger."
+            "governor_deferred_head), so a record nobody clears cannot hide a wedge"
         ),
-        observable_at="the throttled whole_card_governor_hold warning, which names the governor and its arithmetic",
+        observable_at=(
+            "the throttled whole_card_governor_hold warning, which identifies the governor and quotes its arithmetic"
+        ),
     ),
     GateEntry(
         key="grace_budget",
         surface=GateSurface.WHOLE_CARD_GOVERNOR,
-        kind=GateKind.HOLD,
+        kind=GateKind.OUTCOME,
         subsystem="process_management.scheduling.governance.whole_card",
         engaged_by=(
-            "the grace windows this card has opened inside the rolling window exceed its allowance, so opening "
+            "the grace windows this card has opened inside the rolling window reach its allowance, so opening "
             "another would disarm the recovery supervisor for longer than a wedge could hide behind"
         ),
         released_by=(
-            "enough charges aging out of the rolling window for the spend to fall back inside the allowance; "
-            "only a physical establish or restore is charged, so reuse of a held residency never spends it"
+            "not a hold. The establishment or restore proceeds and only the recovery-supervisor grace window is "
+            "withheld. The allowance returns as charges age out of the rolling window. Only a physical establish "
+            "or restore is charged, so reuse of a held residency never spends it"
         ),
         bound_seconds=1200.0,
         bound_source="whole_card._GRACE_BUDGET_WINDOW_SECONDS",
-        backstop=(
-            "the governor defer dwell, past which the head is served co-resident where the device reading "
-            "allows rather than waiting on the allowance"
-        ),
+        backstop="",
         observable_at=(
-            "the throttled whole_card_governor_hold warning, which quotes the spend, the remaining allowance and the "
-            "replenish wait"
+            "the info line logged when a whole-card establishment or restore does not open a grace window, quoting "
+            "the spend and the replenish wait"
         ),
     ),
     # endregion

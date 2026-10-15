@@ -40,7 +40,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
 )
 from horde_worker_regen.process_management.scheduling.admission import pricing
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
-    _GOVERNOR_DEFER_DWELL_SECONDS,
+    _ESTABLISH_WINDOW_SECONDS,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.head_admission import HEAD_PROTECTION_MAX_STARVE_SECONDS
@@ -331,8 +331,8 @@ class TestGovernorDeferredHeadStopsReservingRoom:
     The governor brakes how fast the card may be rotated and says so: normal scheduling continues around the
     deferred head, which takes no establishment for the length of the deferral. Charging its whole-card demand
     against the ready work behind it therefore reserves the card for a claim nobody is making, and the card
-    sits empty while smaller jobs that fit are turned away. Once the deferral clears or its dwell is spent the
-    head is served by ordinary admission and its normal charge applies again.
+    sits empty while smaller jobs that fit are turned away. Once the deferral clears, or its record outlives the
+    rate limiter's window, the head's normal charge applies again.
     """
 
     async def _deferrable_head(self):  # noqa: ANN202
@@ -359,15 +359,15 @@ class TestGovernorDeferredHeadStopsReservingRoom:
 
         assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is not None
 
-    async def test_a_spent_dwell_restores_the_normal_charge(self) -> None:
-        """Past the dwell the head is served co-resident by ordinary admission, so it reserves room again."""
+    async def test_a_record_past_the_establish_window_restores_the_normal_charge(self) -> None:
+        """A deferral record cannot outlast the limiter's window, so past it the head reserves room again."""
         now = [1_000.0]
         scheduler, job, _target = await self._deferrable_head()
         scheduler._clock = lambda: now[0]  # type: ignore[method-assign]
         scheduler._whole_card_ledger.note_governor_defer(None, model=job.model, now=now[0])
         assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is None
 
-        now[0] += _GOVERNOR_DEFER_DWELL_SECONDS + 1.0
+        now[0] += _ESTABLISH_WINDOW_SECONDS
 
         assert scheduler._displaced_head_outstanding_mb(job, device_index=None) is not None
 
@@ -416,6 +416,38 @@ class TestGovernorDeferredHeadStopsReservingRoom:
             )
             is False
         )
+
+
+class TestRateLimitedResidentHeadKeepsAsking:
+    """The dispatch-time residency check defers a rate-limited head for as long as the limiter holds.
+
+    A head whose weights are already resident reaches the card through this check rather than through preload
+    admission. The limiter brakes the rotation it would start, so the head waits for the card. It never
+    dispatches co-resident, since the forecast has already said its weights stream beside the siblings.
+    """
+
+    async def test_the_head_never_dispatches_co_resident_however_long_it_waits(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every ask defers while the limiter holds, far past one window."""
+        now = [10_000.0]
+        scheduler, job, target = await _scheduler_without_sibling()
+        scheduler._clock = lambda: now[0]  # type: ignore[method-assign]
+        monkeypatch.setattr(scheduler, "_budget_active", lambda: True)
+        monkeypatch.setattr(scheduler, "_whole_card_residency_enabled", lambda: True)
+        monkeypatch.setattr(scheduler, "_forecast_streaming", lambda *_args, **_kwargs: Mock())
+        monkeypatch.setattr(scheduler, "_whole_card_warranted", lambda _forecast: True)
+        ledger = scheduler._whole_card_ledger
+        monkeypatch.setattr(ledger, "residency_demanded", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(ledger, "establish_rate_exceeded", lambda _device_index, *, now: True)
+
+        for _ask in range(10):
+            assert scheduler._resident_whole_card_head_ready(job, target) is False
+            assert ledger.governor_deferred_head(None, now=now[0]) == job.model
+            now[0] += _ESTABLISH_WINDOW_SECONDS
+        assert scheduler.is_whole_card_residency_active() is False
+        assert scheduler._job_tracker.is_admitted_exclusive(job) is False
 
 
 class TestStarvedDispatchHeadSignals:

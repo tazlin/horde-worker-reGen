@@ -12,7 +12,6 @@ from horde_worker_regen.process_management.scheduling.governance import (
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _ESTABLISH_WINDOW_LIMIT,
     _ESTABLISH_WINDOW_SECONDS,
-    _GOVERNOR_DEFER_DWELL_SECONDS,
     _GRACE_BUDGET_SECONDS,
     _GRACE_BUDGET_WINDOW_SECONDS,
     _MIN_HOLD_SECONDS,
@@ -313,10 +312,10 @@ class TestEstablishRateLimit:
 
 
 class TestGraceBudget:
-    """Grace opened per card is capped over a rolling window, gating new establishments at admission."""
+    """Grace opened per card is capped over a rolling window, withholding the excuse window once spent."""
 
     def _cycle(self, ledger: WholeCardResidencyLedger, *, at: float) -> None:
-        """Run one establish/restore cycle on card 0, charging both nominal grace windows."""
+        """Run one establish/restore cycle on card 0, asking for both nominal grace windows."""
         ledger.record_grant(
             0,
             model="heavy-model",
@@ -327,30 +326,107 @@ class TestGraceBudget:
         )
         ledger.record_restore(0, now=at + 1.0, restore_grace_seconds=_RESTORE_GRACE)
 
-    def test_budget_accrues_gates_and_replenishes(self) -> None:
-        """Repeated cycles spend the allowance, gate further establishments, then replenish as they age out."""
+    @staticmethod
+    def _spend(ledger: WholeCardResidencyLedger, *, seconds: float, at: float = _NOW) -> None:
+        """Charge ``seconds`` of grace against card 0 directly, at ``at``."""
+        ledger.state_for(0).grace_charges.append((at, seconds))
+
+    def test_budget_accrues_withholds_and_replenishes(self) -> None:
+        """Repeated cycles spend the allowance, after which windows are withheld until the charges age out."""
         ledger = WholeCardResidencyLedger()
-        cycles = int(_GRACE_BUDGET_SECONDS // (_ESTABLISH_GRACE + _RESTORE_GRACE)) + 1
+        cycle_cost = _ESTABLISH_GRACE + _RESTORE_GRACE
+        cycles = int(_GRACE_BUDGET_SECONDS // cycle_cost) + 1
         for index in range(cycles):
             self._cycle(ledger, at=_NOW + index * 10.0)
             assert ledger.grace_budget_exhausted(0, now=_NOW + index * 10.0 + 2.0) is (
-                (index + 1) * (_ESTABLISH_GRACE + _RESTORE_GRACE) > _GRACE_BUDGET_SECONDS
+                (index + 1) * cycle_cost >= _GRACE_BUDGET_SECONDS
             )
+        spent = sum(seconds for _granted_at, seconds in ledger.state_for(0).grace_charges)
+        assert spent == (cycles - 1) * cycle_cost, (
+            "a cycle on a spent card does not open a window and does not charge the budget"
+        )
         assert ledger.grace_budget_exhausted(0, now=_NOW + _GRACE_BUDGET_WINDOW_SECONDS + 100.0) is False
 
-    def test_an_exhausted_budget_leaves_a_granted_window_intact(self) -> None:
+    def test_the_allowance_is_spent_at_its_boundary(self) -> None:
+        """Spend equal to the allowance is the allowance used up, so the next window is withheld."""
+        below = WholeCardResidencyLedger()
+        self._spend(below, seconds=_GRACE_BUDGET_SECONDS - 1.0)
+        assert below.grace_budget_exhausted(0, now=_NOW + 1.0) is False
+        assert below.grace_seconds_to_open(0, window_seconds=_ESTABLISH_GRACE, now=_NOW + 1.0) == _ESTABLISH_GRACE
+
+        at_allowance = WholeCardResidencyLedger()
+        self._spend(at_allowance, seconds=_GRACE_BUDGET_SECONDS)
+        assert at_allowance.grace_budget_exhausted(0, now=_NOW + 1.0) is True
+        assert at_allowance.grace_seconds_to_open(0, window_seconds=_ESTABLISH_GRACE, now=_NOW + 1.0) == 0.0
+
+    def test_a_spent_allowance_is_not_a_governor_hold(self) -> None:
+        """The budget does not refuse an establishment. Only the rate limiter holds the card off."""
+        ledger = WholeCardResidencyLedger()
+        self._spend(ledger, seconds=_GRACE_BUDGET_SECONDS * 2)
+        assert ledger.grace_budget_exhausted(0, now=_NOW + 1.0) is True, "precondition: the allowance is spent"
+
+        assert ledger.governor_hold(0, now=_NOW + 1.0) is None
+        assert ledger.grace_seconds_to_open(0, window_seconds=_ESTABLISH_GRACE, now=_NOW + 1.0) == 0.0
+
+    def test_an_unspent_card_opens_the_whole_window(self) -> None:
+        """A card with allowance left opens the window asked for, whatever its length."""
+        ledger = WholeCardResidencyLedger()
+        assert ledger.grace_seconds_to_open(0, window_seconds=_ESTABLISH_GRACE, now=_NOW) == _ESTABLISH_GRACE
+        assert ledger.grace_seconds_to_open(1, window_seconds=_RESTORE_GRACE, now=_NOW) == _RESTORE_GRACE
+
+    def test_an_establishment_on_a_spent_card_opens_no_window(self) -> None:
+        """The card is taken as asked, without an excuse window and without a charge.
+
+        The rate limiter still counts it, since the teardown is real churn whatever the supervisor is told.
+        """
+        ledger = WholeCardResidencyLedger()
+        self._spend(ledger, seconds=_GRACE_BUDGET_SECONDS)
+        kind = ledger.record_grant(
+            0,
+            model="heavy-model",
+            forecast=None,
+            cooldown_until=_NOW + 300.0,
+            now=_NOW + 1.0,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+        )
+
+        assert kind is WholeCardGrantKind.ESTABLISH
+        state = ledger.state_for(0)
+        assert state.model == "heavy-model"
+        assert list(state.grace_charges) == [(_NOW, _GRACE_BUDGET_SECONDS)], "the withheld window did not add a charge"
+        assert len(state.establishments) == 1
+        assert not ledger.grace_active(
+            now=_NOW + 2.0,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+            restore_grace_seconds=_RESTORE_GRACE,
+        ), "a withheld window does not excuse the held queue"
+        assert ledger.phase(0, now=_NOW + 2.0, establish_grace_seconds=_ESTABLISH_GRACE)[1] is (
+            WholeCardPhase.ESTABLISHING
+        ), "the residency is still physically establishing; only the excuse is withheld"
+
+    def test_a_restore_on_a_spent_card_opens_no_window(self) -> None:
+        """The restore still runs, but a spent card does not open a window for it and does not charge the budget."""
+        ledger = WholeCardResidencyLedger()
+        self._spend(ledger, seconds=_GRACE_BUDGET_SECONDS)
+        ledger.record_restore(0, now=_NOW + 1.0, restore_grace_seconds=_RESTORE_GRACE)
+
+        assert list(ledger.state_for(0).grace_charges) == [(_NOW, _GRACE_BUDGET_SECONDS)]
+        assert not ledger.grace_active(
+            now=_NOW + 2.0,
+            establish_grace_seconds=_ESTABLISH_GRACE,
+            restore_grace_seconds=_RESTORE_GRACE,
+        )
+
+    def test_a_window_granted_before_the_spend_runs_its_full_duration(self) -> None:
         """A window already granted excuses the held queue for its full duration whatever the spend says.
 
         The establishment the window covers is a teardown the scheduler commanded. Withdrawing its excuse
         part-way would have the recovery supervisor read that deliberate action as a structural wedge, so the
-        budget is answered at admission instead and never revokes an in-flight window.
+        budget is answered when a window opens and never revokes one in flight.
         """
         ledger = WholeCardResidencyLedger()
-        cycles = int(_GRACE_BUDGET_SECONDS // (_ESTABLISH_GRACE + _RESTORE_GRACE)) + 1
-        for index in range(cycles):
-            self._cycle(ledger, at=_NOW + index * 10.0)
-        # Re-establish so a residency is held and establishing at the moment of the read.
-        last = _NOW + cycles * 10.0
+        self._spend(ledger, seconds=_GRACE_BUDGET_SECONDS - 1.0)
+        last = _NOW + 10.0
         ledger.record_grant(
             0,
             model="heavy-model",
@@ -360,7 +436,7 @@ class TestGraceBudget:
             establish_grace_seconds=_ESTABLISH_GRACE,
         )
         assert ledger.grace_budget_exhausted(0, now=last + 1.0) is True, (
-            "precondition: the card's rolling grace budget is spent"
+            "precondition: the grant that opened the window spent the card's rolling grace budget"
         )
         for elapsed in (1.0, _ESTABLISH_GRACE / 2.0, _ESTABLISH_GRACE - 0.1):
             assert ledger.grace_active(
@@ -373,28 +449,6 @@ class TestGraceBudget:
             establish_grace_seconds=_ESTABLISH_GRACE,
             restore_grace_seconds=_RESTORE_GRACE,
         ), "the window's own duration is the liveness bound on a residency that never completes"
-
-    def test_a_restore_window_is_granted_regardless_of_the_budget(self) -> None:
-        """The restore churn is always excused: the budget gates establishments, not teardown reversal."""
-        ledger = WholeCardResidencyLedger()
-        cycles = int(_GRACE_BUDGET_SECONDS // (_ESTABLISH_GRACE + _RESTORE_GRACE)) + 1
-        for index in range(cycles):
-            self._cycle(ledger, at=_NOW + index * 10.0)
-        last = _NOW + cycles * 10.0
-        ledger.record_restore(0, now=last, restore_grace_seconds=_RESTORE_GRACE)
-        assert ledger.grace_budget_exhausted(0, now=last) is True, (
-            "precondition: the card's rolling grace budget is spent"
-        )
-        assert ledger.grace_active(
-            now=last + _RESTORE_GRACE - 0.1,
-            establish_grace_seconds=_ESTABLISH_GRACE,
-            restore_grace_seconds=_RESTORE_GRACE,
-        )
-        assert not ledger.grace_active(
-            now=last + _RESTORE_GRACE + 0.1,
-            establish_grace_seconds=_ESTABLISH_GRACE,
-            restore_grace_seconds=_RESTORE_GRACE,
-        )
 
     def test_a_single_cycle_is_well_inside_the_budget(self) -> None:
         """The ordinary one-establish-per-rotation shape is never refused."""
@@ -497,56 +551,46 @@ class TestGraceBudgetStatus:
         assert status.replenish_in_seconds == 0.0
 
 
-class TestGovernorDeferDwell:
-    """A head held off the card by a churn governor waits a bounded dwell, then stops preferring the card."""
+class TestGovernorDeferral:
+    """A head held off the card by the rate limiter is recorded as standing down, for the limiter's window."""
 
-    def test_the_dwell_runs_from_the_first_deferral_and_then_reports_exhausted(self) -> None:
-        """Consecutive deferrals of one head accumulate until the dwell is spent."""
+    def test_the_wait_runs_from_the_first_deferral(self) -> None:
+        """Consecutive deferrals of one head report the wait since the first."""
         ledger = WholeCardResidencyLedger()
-        elapsed, exhausted = ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
-        assert (elapsed, exhausted) == (0.0, False)
-        elapsed, exhausted = ledger.note_governor_defer(0, model="heavy-model", now=_NOW + 10.0)
-        assert (elapsed, exhausted) == (10.0, False)
-        _elapsed, exhausted = ledger.note_governor_defer(
-            0,
-            model="heavy-model",
-            now=_NOW + _GOVERNOR_DEFER_DWELL_SECONDS,
-        )
-        assert exhausted is True
+        assert ledger.note_governor_defer(0, model="heavy-model", now=_NOW) == 0.0
+        assert ledger.note_governor_defer(0, model="heavy-model", now=_NOW + 10.0) == 10.0
+        assert ledger.governor_deferred_head(0, now=_NOW + 10.0) == "heavy-model"
 
-    def test_a_new_head_does_not_inherit_the_previous_dwell(self) -> None:
-        """The dwell is one head's wait, so a different model starts its own."""
+    def test_the_record_is_bounded_by_the_establish_window(self) -> None:
+        """A deferral cannot outlast the limiter's window, so a stale record stops excusing the queue."""
         ledger = WholeCardResidencyLedger()
         ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
-        elapsed, exhausted = ledger.note_governor_defer(
-            0,
-            model="other-heavy-model",
-            now=_NOW + _GOVERNOR_DEFER_DWELL_SECONDS + 1.0,
-        )
-        assert (elapsed, exhausted) == (0.0, False)
 
-    def test_clearing_the_deferral_restarts_the_next_dwell(self) -> None:
-        """Once the governors let a head through, the next deferral is timed from scratch."""
+        assert ledger.governor_deferred_head(0, now=_NOW + _ESTABLISH_WINDOW_SECONDS - 1.0) == "heavy-model"
+        assert ledger.governor_deferred_head(0, now=_NOW + _ESTABLISH_WINDOW_SECONDS) is None
+        assert ledger.any_governor_defer_active(now=_NOW + _ESTABLISH_WINDOW_SECONDS) is False
+
+    def test_a_new_head_does_not_inherit_the_previous_wait(self) -> None:
+        """The wait is one head's, so a different model starts its own."""
+        ledger = WholeCardResidencyLedger()
+        ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
+        assert ledger.note_governor_defer(0, model="other-heavy-model", now=_NOW + _ESTABLISH_WINDOW_SECONDS) == 0.0
+        assert ledger.governor_deferred_head(0, now=_NOW + _ESTABLISH_WINDOW_SECONDS) == "other-heavy-model"
+
+    def test_clearing_the_deferral_restarts_the_next_wait(self) -> None:
+        """Once the limiter lets a head through, the next deferral is timed from scratch."""
         ledger = WholeCardResidencyLedger()
         ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
         ledger.clear_governor_defer(0)
-        elapsed, exhausted = ledger.note_governor_defer(
-            0,
-            model="heavy-model",
-            now=_NOW + _GOVERNOR_DEFER_DWELL_SECONDS + 1.0,
-        )
-        assert (elapsed, exhausted) == (0.0, False)
+        assert ledger.governor_deferred_head(0, now=_NOW + 1.0) is None
+        assert ledger.note_governor_defer(0, model="heavy-model", now=_NOW + _ESTABLISH_WINDOW_SECONDS + 1.0) == 0.0
 
-    def test_the_dwell_is_per_card(self) -> None:
+    def test_the_deferral_is_per_card(self) -> None:
         """One card's held head says nothing about another card's."""
         ledger = WholeCardResidencyLedger()
         ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
-        elapsed, _exhausted = ledger.note_governor_defer(
-            1,
-            model="heavy-model",
-            now=_NOW + _GOVERNOR_DEFER_DWELL_SECONDS,
-        )
-        assert elapsed == 0.0
+        assert ledger.note_governor_defer(1, model="heavy-model", now=_NOW + 100.0) == 0.0
+        assert ledger.governor_deferred_head(1, now=_NOW + 100.0) == "heavy-model"
 
 
 class TestMaxCoresidentForPeak:

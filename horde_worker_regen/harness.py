@@ -1344,9 +1344,12 @@ _HARNESS_STAGE_BUDGET_FIELDS: dict[JobStage, str] = {
 
 
 def _scheduler_budget_defer_reason(manager: HordeWorkerProcessManager) -> str | None:
-    """The reason the scheduler's last preload admission deferred on the VRAM budget, or None."""
+    """The reason the scheduler's last preload admission deferred on the budget or the residency governor, or None."""
     admission = manager._inference_scheduler.head_admission.last_preload_admission
-    if admission is None or admission.decision is not AdmissionDecision.DEFER_BUDGET:
+    if admission is None or admission.decision not in (
+        AdmissionDecision.DEFER_BUDGET,
+        AdmissionDecision.DEFER_RESIDENCY_GOVERNOR,
+    ):
         return None
     return admission.reason or None
 

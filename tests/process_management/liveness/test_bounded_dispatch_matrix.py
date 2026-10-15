@@ -121,7 +121,7 @@ class _GovernorState(Enum):
 
     FRESH = "fresh"
     GRACE_EXHAUSTED = "grace_exhausted"
-    """The card's rolling grace allowance is spent, so a new establishment is refused for its dwell."""
+    """The card's rolling grace allowance is spent, so a new establishment does not open a grace window."""
     ESTABLISH_RATE_EXCEEDED = "rate_exceeded"
     """The per-card establishment allowance is spent, so a new establishment is refused for its window."""
 
@@ -892,24 +892,25 @@ async def test_servable_work_is_never_faulted_out_of_the_queue(row: _Row) -> Non
     [row for row in _ROWS if row.governor is _GovernorState.GRACE_EXHAUSTED],
     ids=[row.label for row in _ROWS if row.governor is _GovernorState.GRACE_EXHAUSTED],
 )
-async def test_grace_governed_head_is_served_without_claiming_the_card(row: _Row) -> None:
-    """A head the grace budget refuses the card is still served, co-resident, without ever claiming it.
+async def test_grace_spent_head_is_served_without_opening_a_grace_window(row: _Row) -> None:
+    """A head on a card whose grace allowance is spent is served, and does not open a grace window.
 
-    The budget's window (1200s) far outlasts the governor dwell, so the brake cannot release before the
-    head stops asking for the card: the head must fall through to ordinary measured admission and sample
-    without spending the establishment the governor withheld.
+    The budget never refuses the card. A head that needs it establishes as usual, and a head that does not
+    samples co-resident. Either way the spent card does not open a recovery-supervisor window and does not
+    charge the budget,
+    since the allowance's window (1200s) outlasts the run.
     """
     world, jobs = await _build_world(row)
     head = jobs[0]
-    establishments_before = len(world.scheduler._whole_card_ledger.state_for(None).establishments)
+    charges_before = list(world.scheduler._whole_card_ledger.state_for(None).grace_charges)
 
     await _drive(world, row)
 
     assert world.dispatch_tick(head) is not None, (
-        f"{row.label}: a governed head that the card can hold must still be served. {world.state_dump()}"
+        f"{row.label}: a head that the card can hold must still be served. {world.state_dump()}"
     )
-    assert len(world.scheduler._whole_card_ledger.state_for(None).establishments) <= establishments_before, (
-        f"{row.label}: the governed head claimed the card the governor refused it. {world.state_dump()}"
+    assert list(world.scheduler._whole_card_ledger.state_for(None).grace_charges) == charges_before, (
+        f"{row.label}: a card with its grace allowance spent opened a grace window. {world.state_dump()}"
     )
 
 
@@ -921,10 +922,10 @@ async def test_grace_governed_head_is_served_without_claiming_the_card(row: _Row
 async def test_rate_governed_head_claims_the_card_once_the_brake_lifts(row: _Row) -> None:
     """A head the rate limiter defers is served by claiming the card after the brake's own window lapses.
 
-    The rate window and the governor dwell are the same span by design: a rate deferral always releases on
-    its own before the whole-card preference is abandoned, so the head takes the residency it is entitled
-    to (sole residency beats coerced co-resident streaming) rather than being downgraded. The limiter's
-    ceiling is still honored: the seeded establishments age out before the new one is counted.
+    A rate deferral always releases on its own within the limiter's window, and the head is never served
+    co-resident meanwhile, so it takes the residency it is entitled to (sole residency beats co-resident
+    streaming). The limiter's ceiling is still honored, since the seeded establishments age out before the new one is
+    counted.
     """
     world, jobs = await _build_world(row)
     head = jobs[0]

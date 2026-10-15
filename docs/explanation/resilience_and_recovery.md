@@ -913,12 +913,10 @@ Each of those excuses is bounded by its own window, but a window alone is not en
 an establish/restore cycle can re-arm a fresh window faster than the previous one expires, which would leave
 the supervisor disarmed for as long as the churn continued. So the whole-card grace is additionally charged
 against a per-card rolling budget, spent at admission and charged only for physical teardown events, never
-for jobs reusing a residency the card already holds. While a card is over its allowance it may not open
-another establish window: the new establishment is deferred for a bounded dwell and the refusal is
-re-disclosed periodically with the current spend and replenish wait, so the operator can see that residency
-churn, not a genuine setup, is what is holding the queue. Past the dwell the head stops asking for the card
-and ordinary measured admission serves it co-resident if the device holds its weights, so the budget brakes
-rotation without ever parking a servable head. A window already granted always runs to its own duration.
+for jobs reusing a residency the card already holds. While a card is over the allowance it does not open a
+further window. The establishment proceeds without one, so the supervisor assesses the queue as usual, and an
+info line quotes the spend and the replenish wait. The deferral that does excuse the queue is the establish-rate
+limiter's, bounded by its window. A window already granted always runs to its own duration.
 Withdrawing it part-way would have the supervisor classify a teardown the scheduler itself commanded as a
 wedge and reset the pools mid-teardown, adding a rebuild to the very churn the budget exists to stop. See
 [Bounding residency churn](resource_governance.md#bounding-residency-churn). The wedge assessment and the give-up that acts on it must not diverge: a give-up applying

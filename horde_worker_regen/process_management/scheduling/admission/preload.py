@@ -57,7 +57,8 @@ class PreloadPassControl(enum.Enum):
     """What one pending job's preload decision means for the rest of the scheduling pass."""
 
     NEXT_JOB = enum.auto()
-    """This job needs nothing (or was faulted); consider the next pending job."""
+    """This job does not need anything, was faulted, or stood down for the establish-rate limiter; consider the next
+    one."""
     STOP_PASS = enum.auto()
     """A gate deferred or consumed this cycle (RAM floor, no slot, serialization, budget); stop the pass."""
     PRELOAD_SENT = enum.auto()
@@ -74,6 +75,7 @@ def pass_control_for(decision: AdmissionDecision) -> PreloadPassControl:
             | AdmissionDecision.QUARANTINED
             | AdmissionDecision.UNSERVICEABLE
             | AdmissionDecision.ALREADY_LOADED
+            | AdmissionDecision.DEFER_RESIDENCY_GOVERNOR
         ):
             return PreloadPassControl.NEXT_JOB
         case _:

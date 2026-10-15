@@ -5360,10 +5360,10 @@ class _DispatchWorld:
         disclosed it cannot ever seat (the ceiling hold) and jobs still waiting on their pop-time preparation
         are not offers the card is refusing, so neither counts as work being passed over.
 
-        A job whose model is the one a churn governor is currently deferring is left out too, and only that
-        model. The deferral is a bounded brake on how fast this card may be rotated, and it is aimed at that
-        head: for its dwell the head is deliberately not being served, and past the dwell it stops asking for
-        the card and takes ordinary admission. What the deferral says nothing about is the rest of the queue,
+        A job whose model is the one the establish-rate limiter is currently deferring is left out too, and
+        only that model. The deferral is a bounded brake on how fast this card may be rotated, and it is aimed
+        at that head. While the limiter's window holds, the head is deliberately not being served, and it takes
+        the card once the window admits it. The deferral does not say anything about the rest of the queue,
         which is exactly why the work behind such a head stays counted here.
         """
         # Priced against the roomiest card, since a job the pool can seat anywhere is work the pool is

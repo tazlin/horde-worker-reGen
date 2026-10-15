@@ -505,21 +505,21 @@ call sites, bound that churn:
   the cooldown keeps alive; it costs no teardown, so it is neither charged nor counted by the rate limiter.
   An allowance sized for teardown churn spent on jobs that caused none would otherwise let the card's most
   efficient pattern, a burst of heavy jobs sharing one residency, talk the governors into refusing the next
-  legitimate establishment. The budget is answered at admission: while a card's spend is over the allowance,
-  a *new* establishment on that card is deferred, and the refusal is re-disclosed periodically with the
-  current spend and the replenish wait for as long as it persists. Refreshing or restoring a residency the
-  card already holds is not gated, and a window already granted is never withdrawn: the teardown it covers
-  is one the scheduler itself commanded, so cutting the excuse short would have the supervisor read that
-  deliberate action as the wedge. The liveness bound on a residency that never completes is therefore the
-  granted window's own duration. The budget replenishes as old grants age out of the window.
+  legitimate establishment. The budget never refuses the card. Once a card's spend reaches the allowance, an
+  establishment or restore still proceeds but does not open a window and does not
+  charge the budget (`WholeCardResidencyLedger.grace_seconds_to_open`, the one owner of that rule), and an
+  info line quotes the spend and the replenish wait. A window already granted is never withdrawn. The
+  teardown it covers is one the scheduler itself commanded, so cutting the excuse short would have the
+  supervisor read that deliberate action as the wedge. The liveness bound on a residency that never completes
+  is therefore the granted window's own duration. The budget replenishes as old grants age out of the window.
 
-A deferral from either of the two admission governors is recorded per card (the deferred model and when the
-deferral began) and has two consequences beyond the head's own re-ask. The deferred head stops charging its
-whole-card demand against the jobs behind it, because it is not asking for the card while the deferral stands
-(see [head protection](vram_arbiter.md)); and the recovery supervisor reads the deferral as a deliberate hold
-rather than a structural wedge, so it does not answer a rotation brake with reclaim remedies or a pool reset.
-Both are bounded by the deferral dwell, after which the head stops preferring the card, is served co-resident
-if the device can hold it, and both its normal charge and the ordinary wedge assessment resume.
+A deferral from the establish-rate limiter is recorded per card (the deferred model and when the deferral
+began) and has two consequences beyond the head's own re-ask. The deferred head stops charging its whole-card
+demand against the jobs behind it, because it is not asking for the card while the deferral stands (see [head
+protection](vram_arbiter.md)); and the recovery supervisor reads the deferral as a deliberate hold rather than
+a structural wedge, so it does not answer a rotation brake with reclaim remedies or a pool reset. Both are
+bounded by the limiter's window. The record expires with it, and the head takes the card when the window
+admits it.
 
 ### The residency claims intake
 
@@ -575,13 +575,12 @@ others. Setting the maximum hold to zero disables the claim along with the cap t
 post-release withholding of very large models from the offer is unchanged and sits beneath all of this, so a
 released residency does not immediately re-establish.
 
-A governor brakes how fast the card may be rotated; it is never a finding that the head cannot be served. A
-head either governor holds off the card keeps re-asking for a bounded dwell, and once the dwell is spent the
-whole-card preference is dropped for that head: ordinary measured admission decides, and a card that can
-demonstrably hold the weights serves the head co-resident (slower than sole residency) instead of leaving it
-parked behind a brake with no fallback. The dispatch-time residency check honours the same governors, so a
-head coerced onto the co-resident path cannot win the card back at dispatch time and re-spend the exhausted
-allowance. The dwell state lives in the residency ledger and is shared by both paths.
+The rate limiter brakes how fast the card may be rotated; it is never a finding that the head cannot be
+served. The held head keeps asking every cycle and is never admitted co-resident. A model whose verdict is
+that it cannot co-reside is not served beside siblings because a brake is in force. The deferral is recorded
+as `defer_residency_governor`, which ends that job's turn in the preload pass and lets the pass go on to later
+jobs, so the card is not parked. The dispatch-time residency check defers the same way, through the same
+ledger record, so a head cannot win the card back at dispatch time while the limiter holds.
 
 Only one reconciler may change safety placement. Whole-card residency contributes a persistent off-GPU veto,
 the reclaim ladder contributes a one-shot request, and runtime placement contributes a demand derived from

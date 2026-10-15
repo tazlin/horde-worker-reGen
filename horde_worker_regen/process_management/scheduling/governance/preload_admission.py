@@ -81,6 +81,8 @@ class AdmissionDecision(StrEnum):
     """The per-device preload concurrency gate is closed."""
     DEFER_BUDGET = auto()
     """The resource budget or reclamation ladder deferred the preload."""
+    DEFER_RESIDENCY_GOVERNOR = auto()
+    """The head stood down for the establish-rate limiter, so the card is free for other work this cycle."""
     PRESTAGE = auto()
     """A whole-card head should be pre-staged into RAM before it samples."""
 

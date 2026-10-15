@@ -100,8 +100,11 @@ class TestGovernorHold:
         """A card that has not established recently is free to take a residency."""
         assert WholeCardResidencyLedger().governor_hold(None, now=1000.0) is None
 
-    def test_rate_limit_is_named_first(self) -> None:
-        """Establishing as often as the window allows names the rate governor."""
+    def test_rate_limit_is_named_with_its_window(self) -> None:
+        """Establishing as often as the window allows identifies the rate governor.
+
+        The decision quotes when the next establishment is admitted.
+        """
         ledger = WholeCardResidencyLedger()
         for _ in range(whole_card_module._ESTABLISH_WINDOW_LIMIT):
             ledger.record_grant(None, model="flux", forecast=None, cooldown_until=0.0, now=1000.0)
@@ -109,7 +112,8 @@ class TestGovernorHold:
         hold = ledger.governor_hold(None, now=1001.0)
         assert hold is not None
         assert hold.governor is WholeCardGovernor.ESTABLISH_RATE
-        assert hold.detail is None
+        assert hold.detail is not None
+        assert f"{whole_card_module._ESTABLISH_WINDOW_SECONDS:.0f}s window" in hold.detail
 
 
 class TestPureQueries:

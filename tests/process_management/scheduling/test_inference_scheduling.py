@@ -56,7 +56,9 @@ from horde_worker_regen.process_management.scheduling.dispatch_affinity import (
 )
 from horde_worker_regen.process_management.scheduling.governance import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
-    _GOVERNOR_DEFER_DWELL_SECONDS,
+    _ESTABLISH_WINDOW_LIMIT,
+    _ESTABLISH_WINDOW_SECONDS,
+    _GRACE_BUDGET_SECONDS,
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
     DominanceRung,
@@ -2491,7 +2493,7 @@ class TestSchedulerClockIsInjectable:
     """Every window the scheduler owns is measured on its injected clock, not on real elapsed seconds.
 
     The governance windows are sized in tens of seconds (a residency's establish grace, a restore's wedge
-    grace, a churn governor's deferral dwell). A caller that must observe what happens on the far side of one
+    grace, a churn governor's deferral window). A caller that must observe what happens on the far side of one
     can move the injected clock instead of spending the seconds; without the injection those bounds are only
     reachable by waiting them out.
     """
@@ -2530,7 +2532,8 @@ class TestGovernorDeferralIsAGovernanceHold:
     While the deferral stands the head does not take the card and the work behind it is admitted by ordinary
     measured admission, which can legitimately present as an idle card with pending work: the raw shape the
     recovery supervisor reads a structural wedge from. The predicate is what tells it apart, and it is bounded
-    by the ledger's defer dwell so a governor that never releases still leaves the wedge assessment reachable.
+    by the rate limiter's window so a deferral record that is never cleared still leaves the wedge assessment
+    reachable.
     """
 
     def _scheduler_on(self, now: list[float]) -> InferenceScheduler:
@@ -2540,7 +2543,7 @@ class TestGovernorDeferralIsAGovernanceHold:
         )
 
     def test_a_recorded_deferral_arms_the_predicate(self) -> None:
-        """A card holding a head off with a governor reports the hold for as long as the dwell runs."""
+        """A card holding a head off with a governor reports the hold while the deferral stands."""
         now = [1_000.0]
         scheduler = self._scheduler_on(now)
 
@@ -2550,18 +2553,18 @@ class TestGovernorDeferralIsAGovernanceHold:
 
         assert scheduler.whole_card_governor_defer_active() is True
 
-    def test_a_spent_dwell_disarms_the_predicate(self) -> None:
-        """Past the dwell the head stops asking for the card, so the hold is over and a wedge is assessable."""
+    def test_the_predicate_is_bounded_by_the_establish_window(self) -> None:
+        """A record older than the limiter's window no longer excuses the queue, so a wedge is assessable."""
         now = [1_000.0]
         scheduler = self._scheduler_on(now)
         scheduler._whole_card_ledger.note_governor_defer(None, model="flux_model", now=now[0])
 
-        now[0] += _GOVERNOR_DEFER_DWELL_SECONDS + 1.0
+        now[0] += _ESTABLISH_WINDOW_SECONDS
 
         assert scheduler.whole_card_governor_defer_active() is False
 
     def test_a_cleared_deferral_disarms_the_predicate(self) -> None:
-        """The governor releasing the card ends the hold immediately rather than at the dwell."""
+        """The governor releasing the card ends the hold immediately."""
         now = [1_000.0]
         scheduler = self._scheduler_on(now)
         scheduler._whole_card_ledger.note_governor_defer(None, model="flux_model", now=now[0])
@@ -2569,6 +2572,150 @@ class TestGovernorDeferralIsAGovernanceHold:
         scheduler._whole_card_ledger.clear_governor_defer(None)
 
         assert scheduler.whole_card_governor_defer_active() is False
+
+
+class TestRateLimitedHeadStandsDown:
+    """A head the establish-rate limiter defers waits for the card and leaves it to other work meanwhile.
+
+    The limiter brakes how fast the card is rotated. The head keeps asking for the card until the window lets
+    it through, and is never admitted co-resident, since the forecast has already said its weights stream
+    beside the siblings. The card is not parked in the meantime, since the preload pass goes on to later jobs.
+    """
+
+    _HEAD_MODEL = "flux_model"
+    _LATER_MODEL = "stable_diffusion"
+
+    async def _scheduler(
+        self,
+        now: list[float],
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        models: list[str],
+    ) -> tuple[InferenceScheduler, list[ImageGenerateJobPopResponse]]:
+        """Build a two-lane card whose head alone demands the whole card, with every pending job tracked."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB),
+                1: make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB),
+            },
+        )
+        job_tracker = JobTracker()
+        jobs: list[ImageGenerateJobPopResponse] = []
+        for model in models:
+            job = make_job_pop_response(model)
+            await track_popped_job_async(job_tracker, job)
+            jobs.append(job)
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(
+                enable_vram_budget=True,
+                vram_reserve_mb=0,
+                ram_reserve_mb=4096.0,
+                whole_card_exclusive_residency=True,
+                image_models_to_load=[self._HEAD_MODEL, self._LATER_MODEL],
+            ),
+            max_concurrent=2,
+            max_inference=2,
+            clock=lambda: now[0],
+        )
+        assert scheduler._budget_active() is True, "precondition: preload admission runs the whole-card demand"
+        ledger = scheduler._whole_card_ledger
+
+        def head_demands_the_card(
+            forecast: object,
+            *,
+            enabled: bool,
+            is_head_blocker: bool,
+            live_inference_process_count: int,
+        ) -> bool:
+            del forecast, enabled, live_inference_process_count
+            return is_head_blocker
+
+        monkeypatch.setattr(ledger, "residency_demanded", head_demands_the_card)
+        monkeypatch.setattr(scheduler, "_whole_card_warranted", lambda _forecast: True)
+        return scheduler, jobs
+
+    @staticmethod
+    def _spend_the_establish_rate(scheduler: InferenceScheduler, *, now: float) -> None:
+        """Record as many establishments as the window allows, each since restored."""
+        ledger = scheduler._whole_card_ledger
+        for index in range(_ESTABLISH_WINDOW_LIMIT):
+            ledger.record_grant(None, model=f"earlier-{index}", forecast=None, cooldown_until=0.0, now=now - index)
+            ledger.record_restore(None, now=now - index)
+
+    async def test_a_rate_limited_head_is_recorded_as_a_governor_deferral(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The recorded decision identifies the limiter.
+
+        The pass and its readers can tell it from a budget defer.
+        """
+        now = [10_000.0]
+        scheduler, _jobs = await self._scheduler(now, monkeypatch, models=[self._HEAD_MODEL])
+        self._spend_the_establish_rate(scheduler, now=now[0])
+
+        assert scheduler.preload_models() is False
+        admission = scheduler.head_admission.last_preload_admission
+        assert admission is not None
+        assert admission.decision is AdmissionDecision.DEFER_RESIDENCY_GOVERNOR
+        assert scheduler.whole_card_governor_defer_active() is True
+
+    async def test_the_single_card_pass_goes_on_to_preload_a_later_job(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The head stood down, so a later job that fits is preloaded on the same card this cycle."""
+        now = [10_000.0]
+        scheduler, _jobs = await self._scheduler(now, monkeypatch, models=[self._HEAD_MODEL, self._LATER_MODEL])
+        self._spend_the_establish_rate(scheduler, now=now[0])
+
+        assert scheduler.preload_models() is True
+        loaded = {process.loaded_horde_model_name for process in scheduler._process_map.values()}
+        assert self._LATER_MODEL in loaded
+        assert self._HEAD_MODEL not in loaded
+        assert scheduler.is_whole_card_residency_active() is False
+
+    async def test_the_head_is_never_admitted_co_resident_however_long_it_waits(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """While the limiter holds, every ask defers, however far past one window the head has waited."""
+        now = [10_000.0]
+        scheduler, jobs = await self._scheduler(now, monkeypatch, models=[self._HEAD_MODEL])
+        monkeypatch.setattr(
+            scheduler._whole_card_ledger,
+            "establish_rate_exceeded",
+            lambda _device_index, *, now: True,
+        )
+        head = jobs[0]
+        lane = scheduler._process_map[0]
+
+        for _ask in range(10):
+            assert scheduler._admit_preload_under_budget(head, lane, is_head_blocker=True) is False
+            assert scheduler.whole_card_governor_defer_active() is True
+            now[0] += _ESTABLISH_WINDOW_SECONDS
+        assert scheduler.is_whole_card_residency_active() is False
+        assert scheduler._job_tracker.is_admitted_exclusive(head) is False
+
+    async def test_a_grace_exhausted_head_establishes_without_a_grace_window(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A spent allowance does not refuse the card. The head takes it, and the supervisor is not given an excuse."""
+        now = [10_000.0]
+        scheduler, jobs = await self._scheduler(now, monkeypatch, models=[self._HEAD_MODEL])
+        state = scheduler._whole_card_ledger.state_for(None)
+        state.grace_charges.append((now[0], _GRACE_BUDGET_SECONDS * 2))
+        charges_before = list(state.grace_charges)
+
+        scheduler._admit_preload_under_budget(jobs[0], scheduler._process_map[0], is_head_blocker=True)
+
+        assert scheduler.is_whole_card_residency_active() is True
+        assert scheduler.whole_card_governor_defer_active() is False
+        assert scheduler.whole_card_residency_grace_active() is False
+        assert list(state.grace_charges) == charges_before
 
 
 class TestRestoreGraceIsGrantedForChurn:

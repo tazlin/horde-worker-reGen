@@ -13,8 +13,9 @@ the grant decision and the gate that releases a reserved head:
   (:class:`TestIntentYieldsToRoomyBudget`);
 - a legitimately reserved head, once the device has drained, always reaches dispatch within a bounded window
   rather than parking forever (:class:`TestReservedHeadNeverWaitsIndefinitely`);
-- the churn governors charge physical teardowns rather than the jobs riding one residency, and hold a head
-  they refuse only for a bounded dwell before ordinary admission decides
+- the churn governors charge physical teardowns rather than the jobs riding one residency, a spent grace
+  allowance withholds only the supervisor's window, and a rate-limited head waits for the card without ever
+  being served co-resident
   (:class:`TestGovernorsBrakeChurnWithoutParkingTheQueue`);
 - a parked head re-asking for the residency its card already holds reserves nothing again
   (:class:`TestReaskingAHeldResidencyIsANoOp`);
@@ -60,10 +61,11 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 from horde_worker_regen.process_management.resources.vram_arbiter import VramDisposition
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
 from horde_worker_regen.process_management.scheduling.admission import pricing
+from horde_worker_regen.process_management.scheduling.governance import whole_card as whole_card_module
+from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     _ESTABLISH_WINDOW_LIMIT,
     _ESTABLISH_WINDOW_SECONDS,
-    _GOVERNOR_DEFER_DWELL_SECONDS,
     _GRACE_BUDGET_SECONDS,
     _GRACE_BUDGET_WINDOW_SECONDS,
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
@@ -714,9 +716,9 @@ class TestChurnGovernors:
     Sole residency is expensive to enter and to leave (every sibling process the establishment stopped is
     respawned on the way out, ~20s each), and each cycle also opens a window in which the recovery supervisor
     ignores a held queue. Left ungoverned, a demand signal that oscillates rebuilds the pool continuously and
-    keeps the supervisor disarmed the whole time. Both governors act at admission, deferring a new
-    establishment rather than withdrawing an excuse from one already under way. These pin them, plus the
-    disclosure for a residency that is off because its flag never resolved.
+    keeps the supervisor disarmed the whole time. The rate limiter defers a new establishment; the grace budget
+    lets it proceed with no window opened, and never withdraws an excuse from one already under way. These pin
+    them, plus the disclosure for a residency that is off because its flag never resolved.
     """
 
     @staticmethod
@@ -787,7 +789,7 @@ class TestChurnGovernors:
             is_head_blocker=True,
             target_device_index=None,
         )
-        assert outcome is _WholeCardDemandOutcome.DEFER
+        assert outcome is _WholeCardDemandOutcome.DEFER_GOVERNOR
         assert scheduler.is_whole_card_residency_active() is False, "the deferral must not have claimed the card"
 
         # Age the recorded establishments out of the limiter's window: the same ask now claims the card.
@@ -882,7 +884,7 @@ class TestChurnGovernors:
         )
 
     def test_an_in_flight_establishment_keeps_its_grace_for_the_whole_window(self) -> None:
-        """A granted window excuses the held queue for its full duration however much the card has spent.
+        """A granted window excuses the held queue for its full duration however much the card spends after it.
 
         The establishment is a teardown the scheduler commanded. Revoking its excuse part-way would have the
         recovery supervisor classify that deliberate action as a structural queue wedge and soft-reset the
@@ -890,12 +892,13 @@ class TestChurnGovernors:
         """
         scheduler, _available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
-        self._spend_the_grace_budget(scheduler, flux_job, forecast)
 
         scheduler._establish_whole_card_residency(flux_job, forecast, announce=True)
         state = scheduler._whole_card_ledger.state_for(None)
-        # Retire the preceding cycle's restore window so the establish window alone answers the question.
-        state.restore_at = time.time() - (WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+        assert state.establish_grace_withheld is False, "precondition: the establishment opened its window"
+        # Spend the allowance after the window opened, which is the only way a granted window meets a spent card.
+        state.grace_charges.append((time.time(), _GRACE_BUDGET_SECONDS))
+        assert scheduler._whole_card_ledger.grace_budget_exhausted(None, now=time.time()) is True
         # Walk the window by backdating the grant, which leaves the recorded charges (and so the spend) alone.
         for elapsed in (0.0, WHOLE_CARD_ESTABLISH_GRACE_SECONDS / 2.0, WHOLE_CARD_ESTABLISH_GRACE_SECONDS - 5.0):
             state.established_at = time.time() - elapsed
@@ -907,33 +910,42 @@ class TestChurnGovernors:
             "the window's own duration is the liveness bound on a residency that never completes"
         )
 
-    def test_a_spent_grace_budget_defers_a_new_establishment(self) -> None:
-        """With the budget spent the card may not open another establish window, so the head is deferred.
+    def test_a_spent_grace_budget_establishes_with_no_window_and_no_charge(self) -> None:
+        """With the budget spent the head still takes the card; only the supervisor's excuse is withheld.
 
-        Deferring keeps the head on the whole-card path so it re-asks, exactly as the establishment rate
-        limiter does; the card simply stops churning until the spend ages out of the rolling window.
+        The budget limits how long churn can keep the recovery supervisor disarmed. Refusing the card for it
+        would park a servable head behind an excuse it does not need, so the establishment proceeds without a
+        window or a charge, and says so once.
         """
         scheduler, available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
         self._spend_the_grace_budget(scheduler, flux_job, forecast)
         self._clear_the_establishment_rate_history(scheduler)
+        state = scheduler._whole_card_ledger.state_for(None)
+        # Retire the preceding cycle's restore window so the establishment alone answers the question.
+        state.restore_at = time.time() - (WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+        charges_before = list(state.grace_charges)
 
-        with patch.object(inference_scheduler_module.logger, "warning") as warning:
-            for _ask in range(3):
-                outcome = scheduler._decide_whole_card_demand(
-                    flux_job,
-                    available_process,
-                    forecast,
-                    None,
-                    is_head_blocker=True,
-                    target_device_index=None,
-                )
-                assert outcome is _WholeCardDemandOutcome.DEFER
-        assert scheduler.is_whole_card_residency_active() is False, "the deferral must not have claimed the card"
-        assert warning.call_count == 1, "the refusal is disclosed on the transition, not once per scheduling cycle"
+        with patch.object(whole_card_module.logger, "info") as info:
+            outcome = scheduler._decide_whole_card_demand(
+                flux_job,
+                available_process,
+                forecast,
+                None,
+                is_head_blocker=True,
+                target_device_index=None,
+            )
+        assert outcome is not _WholeCardDemandOutcome.DEFER_GOVERNOR
+        assert scheduler.is_whole_card_residency_active() is True, "a spent allowance does not refuse the card"
+        assert state.establish_grace_withheld is True
+        assert list(state.grace_charges) == charges_before, "the withheld window did not add a charge"
+        assert scheduler.whole_card_residency_grace_active() is False, "the supervisor is not given an excuse"
+        assert scheduler.whole_card_governor_defer_active() is False
+        emitted = " ".join(str(call) for call in info.call_args_list)
+        assert "does not open a recovery-supervisor grace window" in emitted, "the withheld window is disclosed"
 
-    def test_the_grace_budget_replenishes_and_admission_resumes(self) -> None:
-        """As the charges age out of the rolling window the card may establish again."""
+    def test_the_grace_budget_replenishes_and_windows_open_again(self) -> None:
+        """As the charges age out of the rolling window the card's establishments open their windows again."""
         scheduler, available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
         self._spend_the_grace_budget(scheduler, flux_job, forecast)
@@ -953,29 +965,33 @@ class TestChurnGovernors:
             is_head_blocker=True,
             target_device_index=None,
         )
+        state = scheduler._whole_card_ledger.state_for(None)
         assert scheduler.is_whole_card_residency_active() is True
+        assert state.establish_grace_withheld is False
+        assert state.grace_charges[-1][1] == WHOLE_CARD_ESTABLISH_GRACE_SECONDS, "the replenished card charged it"
+        assert scheduler.whole_card_residency_grace_active() is True
 
-    def test_a_restore_window_is_granted_even_with_the_budget_spent(self) -> None:
-        """A granted restore window keeps its excuse unconditionally: the budget gates establishments only.
+    def test_a_restore_on_a_spent_budget_opens_no_window(self) -> None:
+        """A restore runs whatever the spend.
 
-        The grant itself is conditional on the restore having churn to cover, which is pinned elsewhere;
-        here the window is granted directly so what is under test is that a spent budget never mutes a
-        window already open.
+        A spent card does not open a restore window and does not charge the budget.
         """
         scheduler, _available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
         self._spend_the_grace_budget(scheduler, flux_job, forecast)
+        state = scheduler._whole_card_ledger.state_for(None)
+        retired_restore_at = time.time() - (WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+        state.restore_at = retired_restore_at
+        charges_before = list(state.grace_charges)
 
         scheduler._whole_card_ledger.record_restore(
             None,
             now=time.time(),
             restore_grace_seconds=WHOLE_CARD_RESTORE_GRACE_SECONDS,
         )
-        state = scheduler._whole_card_ledger.state_for(None)
-        assert state.restore_at != 0.0, "precondition: a restore window is open"
-        state.restore_at = time.time() - (WHOLE_CARD_RESTORE_GRACE_SECONDS - 5.0)
-        assert scheduler.whole_card_residency_grace_active() is True
-        state.restore_at = time.time() - (WHOLE_CARD_RESTORE_GRACE_SECONDS + 1.0)
+
+        assert state.restore_at == retired_restore_at, "no window was stamped for the withheld restore"
+        assert list(state.grace_charges) == charges_before
         assert scheduler.whole_card_residency_grace_active() is False
 
     def test_an_unresolved_residency_flag_is_disclosed_once(self) -> None:
@@ -1005,9 +1021,8 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
 
     Two properties keep the brakes honest. Reuse is free: a burst of heavy jobs riding one residency costs the
     card one grace window and one establishment, because that is what the card physically paid. And a hold is
-    bounded: a head the governors bar from claiming the card falls back to ordinary measured admission after a
-    bounded dwell, so a card that can demonstrably hold the model serves it (slower, co-resident) instead of
-    standing idle behind a brake meant only to slow rotation.
+    bounded and narrow. Only the rate limiter holds a head off the card, for at most its window, while the
+    preload pass serves the jobs behind it. The head is never served co-resident in the meantime.
     """
 
     @staticmethod
@@ -1071,20 +1086,23 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
         )
         assert scheduler._whole_card_ledger.establish_rate_exceeded(None, now=time.time()) is False
 
-    async def test_a_governed_head_that_measurably_fits_is_served_after_the_bounded_dwell(
+    async def test_a_rate_limited_head_that_measurably_fits_is_never_served_co_resident(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With the allowance spent and the card demonstrably able to hold the head, the head is served.
+        """A head the rate limiter holds off waits for the card, however long, even when the card could hold it.
 
-        The grace budget bounds how often the card may be rotated; it is not a finding that the model cannot
-        run. Once the bounded dwell is spent the whole-card preference is dropped for this head and the
-        measured arbiter decides, which on a drained card admits it co-resident.
+        The limiter bounds how often the card may be rotated; it is not a finding that the model cannot run.
+        The head stands down for this cycle, recorded as a governor deferral so the pass moves on to later jobs,
+        and keeps asking until the window admits it. It is never admitted co-resident, since the forecast has
+        already said its weights stream beside the siblings.
         """
         scheduler, available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
         TestChurnGovernors._spend_the_grace_budget(scheduler, flux_job, forecast)
-        TestChurnGovernors._clear_the_establishment_rate_history(scheduler)
+        assert scheduler._whole_card_ledger.establish_rate_exceeded(None, now=time.time()) is True, (
+            "precondition: the cycles that spent the allowance also spent the establishment rate"
+        )
         _drain_device(scheduler._process_map, free_mb=_CARD16_FREE_IF_ALONE_MB)
         self._pin_the_whole_card_forecast(monkeypatch, scheduler, free_now_mb=_CARD16_FREE_IF_ALONE_MB)
 
@@ -1094,30 +1112,28 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
         )
 
         await track_popped_job_async(scheduler._job_tracker, flux_job)
-        assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is False, (
-            "inside the dwell the head keeps asking for the card rather than downgrading immediately"
-        )
+        assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is False
+        assert scheduler._last_budget_defer_decision is AdmissionDecision.DEFER_RESIDENCY_GOVERNOR
 
+        # A wait of several windows does not change the outcome while the limiter still holds.
         state = scheduler._whole_card_ledger.state_for(None)
-        state.governor_deferred_since = time.time() - (_GOVERNOR_DEFER_DWELL_SECONDS + 1.0)
+        state.governor_deferred_since = time.time() - (_ESTABLISH_WINDOW_SECONDS * 4)
 
-        assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is True, (
-            "past the bounded dwell a head the card can measurably hold must be admitted co-resident rather "
-            "than parked behind a churn brake with no fallback"
+        assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is False, (
+            "a rate-limited head is never admitted co-resident, however long it has waited"
         )
-        assert scheduler.is_whole_card_residency_active() is False, (
-            "the coerced head runs co-resident; it must not have claimed the card the governors refused it"
-        )
+        assert scheduler._last_budget_defer_decision is AdmissionDecision.DEFER_RESIDENCY_GOVERNOR
+        assert scheduler.is_whole_card_residency_active() is False
+        assert scheduler.whole_card_governor_defer_active() is True
 
-    async def test_a_head_the_arbiter_refuses_still_defers_after_the_dwell(
+    async def test_a_head_the_limiter_holds_is_refused_by_the_limiter_not_the_arbiter(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Dropping the whole-card preference is not an admit: the measured arbiter still has the last word."""
+        """While the limiter holds, the measured arbiter is never consulted; once it releases, the card is taken."""
         scheduler, available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
         TestChurnGovernors._spend_the_grace_budget(scheduler, flux_job, forecast)
-        TestChurnGovernors._clear_the_establishment_rate_history(scheduler)
         self._pin_the_whole_card_forecast(monkeypatch, scheduler, free_now_mb=_FLUX16_ESTABLISH_FREE_NOW_MB)
 
         arbiter = Mock()
@@ -1131,22 +1147,23 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
 
         await track_popped_job_async(scheduler._job_tracker, flux_job)
         assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is False
-        scheduler._whole_card_ledger.state_for(None).governor_deferred_since = time.time() - (
-            _GOVERNOR_DEFER_DWELL_SECONDS + 1.0
-        )
-
-        assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is False
-        assert arbiter.evaluate.called is True, (
-            "the coerced head is decided by the measured arbiter, not refused by the churn governor a second time"
-        )
+        assert arbiter.evaluate.called is False, "the limiter's deferral comes before any co-resident pricing"
         assert scheduler.is_whole_card_residency_active() is False
 
-    def test_the_budget_refusal_is_re_disclosed_while_it_persists(self) -> None:
-        """A sustained refusal keeps saying so periodically, quoting the spend and the replenish wait."""
+        TestChurnGovernors._clear_the_establishment_rate_history(scheduler)
+
+        assert scheduler._admit_preload_under_budget(flux_job, available_process, is_head_blocker=True) is False
+        assert scheduler._last_budget_defer_decision is None, "past the window the head is no longer governed"
+        assert scheduler.is_whole_card_residency_active() is True, (
+            "the released head takes the card, with no window, rather than falling to co-resident admission"
+        )
+
+    def test_the_rate_refusal_is_re_disclosed_while_it_persists(self) -> None:
+        """A sustained refusal is re-disclosed periodically and quotes the limiter's window."""
         scheduler, available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
         TestChurnGovernors._spend_the_grace_budget(scheduler, flux_job, forecast)
-        TestChurnGovernors._clear_the_establishment_rate_history(scheduler)
+        assert scheduler._whole_card_ledger.establish_rate_exceeded(None, now=time.time()) is True
 
         with patch.object(inference_scheduler_module.logger, "warning") as warning:
             for _ask in range(3):
@@ -1160,7 +1177,7 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
                 )
         assert warning.call_count == 1, "unchanged repeats within the diagnostic cadence are suppressed"
         emitted = " ".join(str(call) for call in warning.call_args_list)
-        assert "replenish" in emitted, "the refusal names when the allowance returns"
+        assert f"{_ESTABLISH_WINDOW_SECONDS:.0f}s window" in emitted, "the refusal quotes the limiter's window"
 
         # A later ask, past the diagnostic cadence, speaks again: the hold is still in force and still worth saying.
         scheduler._diagnostics.reset()
@@ -1177,44 +1194,39 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
             "a refusal that persists is re-disclosed rather than announced once and then silent"
         )
 
-    def test_a_coerced_head_does_not_reclaim_the_card_at_dispatch_time(
+    def test_a_rate_limited_head_does_not_claim_the_card_at_dispatch_time(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The dispatch-time residency check honours the same churn governors as preload admission.
+        """The dispatch-time residency check defers a rate-limited head exactly as preload admission does.
 
-        A head the governors pushed onto the co-resident path arrives here with its weights already resident.
-        Claiming the card for it now would spend the exhausted allowance and cycle the siblings after all, so
-        past the dwell it dispatches with the residency it already has: no establishment, no charge, no
-        exclusive admission.
+        A head whose weights are already resident arrives here. While the limiter holds it is held back, however
+        long it has waited, with no establishment, no charge and no exclusive admission; it is never dispatched
+        co-resident instead.
         """
         scheduler, available_process, forecast = self._scheduler_and_head()
         flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
         TestChurnGovernors._spend_the_grace_budget(scheduler, flux_job, forecast)
-        TestChurnGovernors._clear_the_establishment_rate_history(scheduler)
         self._pin_the_whole_card_forecast(monkeypatch, scheduler, free_now_mb=_CARD16_FREE_IF_ALONE_MB)
+        assert scheduler._whole_card_ledger.establish_rate_exceeded(None, now=time.time()) is True
 
         state = scheduler._whole_card_ledger.state_for(None)
         charges_before = len(state.grace_charges)
         establishments_before = len(state.establishments)
 
+        assert scheduler._resident_whole_card_head_ready(flux_job, available_process) is False
+
+        state.governor_deferred_since = time.time() - (_ESTABLISH_WINDOW_SECONDS * 4)
+
         assert scheduler._resident_whole_card_head_ready(flux_job, available_process) is False, (
-            "inside the dwell the head briefly holds for the governor rather than forfeiting sole residency"
-        )
-
-        state.governor_deferred_since = time.time() - (_GOVERNOR_DEFER_DWELL_SECONDS + 1.0)
-
-        assert scheduler._resident_whole_card_head_ready(flux_job, available_process) is True, (
-            "past the dwell the head dispatches with the residency it already has"
+            "a rate-limited head keeps asking for the card however long it has waited"
         )
         assert scheduler.is_whole_card_residency_active() is False, (
-            "the governed head must not win the card back at dispatch time"
+            "the governed head must not win the card at dispatch time"
         )
         assert len(state.grace_charges) == charges_before, "no grace was charged for a claim that never happened"
         assert len(state.establishments) == establishments_before, "the rate limiter counted no establishment"
-        assert scheduler._job_tracker.is_admitted_exclusive(flux_job) is False, (
-            "a co-resident dispatch is not an exclusive admission"
-        )
+        assert scheduler._job_tracker.is_admitted_exclusive(flux_job) is False
 
 
 class TestReaskingAHeldResidencyIsANoOp:

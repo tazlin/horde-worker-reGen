@@ -434,6 +434,9 @@ class _WholeCardDemandOutcome(enum.Enum):
     DEFER = enum.auto()
     """The reservation is mid-teardown (idle siblings stopping, safety cycling off-GPU, freed VRAM
     draining); defer this cycle and re-evaluate against the reduced topology next tick."""
+    DEFER_GOVERNOR = enum.auto()
+    """The establish-rate limiter holds the card's next residency off. The head stands down this cycle and keeps
+    asking, and the card is free for other work meanwhile."""
 
 
 @dataclass(frozen=True)
@@ -533,6 +536,7 @@ class InferenceScheduler:
     _ram_pressure_notified: bool
     _diagnostics: DiagnosticThrottle
     _last_budget_defer_reason: str | None
+    _last_budget_defer_decision: AdmissionDecision | None
     _context_reduction_at: dict[int | None, float]
     _post_processing_lane_commitments_provider: Callable[[], int]
     _pool_protected_models_provider: Callable[[], frozenset[str]]
@@ -614,7 +618,7 @@ class InferenceScheduler:
                 edge-triggered resource-state records. ``None`` in unit tests and until wired.
             clock (Callable[[], float] | None): The wall-clock source for every scheduling and governance
                 window the scheduler owns: residency grace and cooldown, the churn governors' rolling windows
-                and their deferral dwell, head starvation and the dispatch barriers, and the reclaim rate
+                and their deferral record, head starvation and the dispatch barriers, and the reclaim rate
                 limits. It is injectable so a harness can drive those windows on its own timeline instead of
                 having to spend the real seconds they are sized in. Timestamps shared with other components (a
                 process's spawn time, IPC report ages, action-ledger entries) stay on the real clock, since
@@ -844,6 +848,7 @@ class InferenceScheduler:
         self._reserve_ledger = reserve_ledger if reserve_ledger is not None else CommittedReserveLedger()
         self._ram_pressure_notified = False
         self._last_budget_defer_reason = None
+        self._last_budget_defer_decision = None
         self._context_reduction_at = {}
         # Reuse credits awaiting reconciliation and the clocks bounding RAM reclaim actuations.
         self._ram_reclaim = RamReclaimLedger(ledger_clock)
@@ -2756,11 +2761,11 @@ class InferenceScheduler:
             else None
         )
         if governor_hold is not None:
-            # A governor brakes how fast this card may be rotated; it never says the head cannot be served.
-            # Hold the whole-card ask for a bounded dwell (the head re-asks every cycle), then stop preferring
-            # the card and let the measured arbiter decide: a card that can demonstrably hold the weights
-            # serves the head co-resident rather than standing idle behind a brake with no fallback.
-            elapsed, dwell_exhausted = self._whole_card_ledger.note_governor_defer(
+            # The rate limiter brakes how fast this card may be rotated; it never says the head cannot be served.
+            # The head waits for the card (it re-asks every cycle until the window lets it through) and is never
+            # admitted co-resident, since the forecast has already said its weights stream beside the siblings.
+            # The card is not parked meanwhile, since the preload pass goes on to the jobs behind the head.
+            elapsed = self._whole_card_ledger.note_governor_defer(
                 target_device_index,
                 model=job.model,
                 now=self._clock(),
@@ -2770,12 +2775,9 @@ class InferenceScheduler:
                 governor_hold,
                 device_index=target_device_index,
                 elapsed=elapsed,
-                downgraded=dwell_exhausted,
             )
-            if dwell_exhausted:
-                return _WholeCardDemandOutcome.FALL_THROUGH
             self._last_budget_defer_reason = governor_hold.reason
-            return _WholeCardDemandOutcome.DEFER
+            return _WholeCardDemandOutcome.DEFER_GOVERNOR
         self._whole_card_ledger.clear_governor_defer(target_device_index)
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
@@ -3233,8 +3235,8 @@ class InferenceScheduler:
 
         The admission-time path misses a heavy head whose model is already resident on an idle slot while siblings
         hold their own models. That head is owed the same residency: establish it, evict sibling VRAM, and defer
-        dispatch until the teardown is complete. The same churn governors that gate an establishment at admission
-        gate it here, with the dwell shared through the ledger.
+        dispatch until the teardown is complete. The establish-rate limiter that defers an establishment at
+        admission defers it here too, with the deferral record shared through the ledger.
         """
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
@@ -3273,16 +3275,16 @@ class InferenceScheduler:
             self._log_whole_card_declined(job, forecast)
             return True
 
-        # The same churn governors that gate a new establishment at preload admission gate it here: this path
-        # otherwise claims the card for a head whose weights are already resident, so a head the governors
-        # coerced onto the co-resident path would win the card back at dispatch time, spending the exhausted
-        # allowance and cycling siblings all over again. The dwell state is shared with the admission path
-        # through the ledger, so a head that already sat out its dwell dispatches co-resident immediately.
+        # The establish-rate limiter that defers a new establishment at preload admission defers it here. This
+        # path otherwise claims the card for a head whose weights are already resident, cycling the siblings
+        # faster than the limiter allows. The head is not dispatched co-resident instead, since the forecast
+        # has already said its weights stream beside the siblings; it keeps asking until the window lets it
+        # through. The deferral record is shared with the admission path through the ledger.
         held = self._whole_card_ledger.get(target_device_index)
         if held is None or held.model is None or held.model != job.model:
             governor_hold = self._whole_card_ledger.governor_hold(target_device_index, now=self._clock())
             if governor_hold is not None:
-                elapsed, dwell_exhausted = self._whole_card_ledger.note_governor_defer(
+                elapsed = self._whole_card_ledger.note_governor_defer(
                     target_device_index,
                     model=job.model,
                     now=self._clock(),
@@ -3292,11 +3294,8 @@ class InferenceScheduler:
                     governor_hold,
                     device_index=target_device_index,
                     elapsed=elapsed,
-                    downgraded=dwell_exhausted,
                 )
-                # Past the dwell the head runs with whatever residency it already has; inside it, the brief
-                # hold gives the governor the chance to release before sole residency is forfeited.
-                return dwell_exhausted
+                return False
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
         # Disclose the arithmetic behind a dispatch-time claim, which is otherwise established silently:
@@ -3634,30 +3633,22 @@ class InferenceScheduler:
         *,
         device_index: int | None,
         elapsed: float,
-        downgraded: bool,
     ) -> None:
-        """Disclose a governor holding this head off the card, and the downgrade when the dwell is spent.
+        """Disclose a governor holding this head off the card, with the wait so far and its bound.
 
         A hold that persists is re-stated periodically rather than announced once: the operator needs the
-        current spend and the wait, not a single line from whenever the hold began. Repeats inside the
-        diagnostic cadence are counted and left at TRACE so a tick-rate loop cannot flood the log.
+        current wait, not a single line from whenever the hold began. Repeats inside the diagnostic cadence are
+        counted and left at TRACE so a tick-rate loop cannot flood the log.
         """
-        name = "whole_card_governor_downgrade" if downgraded else "whole_card_governor_hold"
-        suppressed = self._diagnostics.suppressed_count(name, (str(job.model), device_index, hold.governor))
+        suppressed = self._diagnostics.suppressed_count(
+            "whole_card_governor_hold",
+            (str(job.model), device_index, hold.governor),
+        )
         stated = hold.reason if hold.detail is None else f"{hold.reason} ({hold.detail})"
-        if downgraded:
-            message = (
-                f"Whole-card residency downgraded for {job.model}: {stated}. It has asked for the card for "
-                f"{elapsed:.0f}s, so the ask is dropped and ordinary admission decides; if the device holds its "
-                "weights it runs co-resident (slower than sole residency) instead of waiting for the allowance."
-            )
-        else:
-            message = (
-                f"Deferring a new whole-card residency for {job.model}: {stated}. Normal scheduling "
-                f"continues; after {self._whole_card_ledger.governor_defer_dwell_seconds:.0f}s held (currently "
-                f"{elapsed:.0f}s) the head stops asking for the card and is served co-resident if the device "
-                "can hold it."
-            )
+        message = (
+            f"Deferring a new whole-card residency for {job.model}: {stated}. Normal scheduling continues; the "
+            f"head has waited {elapsed:.0f}s and takes the card once the window admits it."
+        )
         if suppressed is None:
             logger.trace(message)
             return
@@ -3897,8 +3888,9 @@ class InferenceScheduler:
     def whole_card_governor_defer_active(self) -> bool:
         """Whether a churn governor is deferring a head's establishment, so an idle card with work is chosen.
 
-        Read by the recovery supervisor. Bounded by the ledger's defer dwell, after which the head is served
-        co-resident, so a governor that never releases still leaves the wedge assessment reachable.
+        Read by the recovery supervisor. The record counts for at most the establish-rate limiter's window, the
+        longest the limiter can hold one head off, so a record nobody clears still leaves the wedge assessment
+        reachable.
         """
         return self._whole_card_ledger.any_governor_defer_active(now=self._clock())
 
@@ -8383,8 +8375,11 @@ class InferenceScheduler:
         # line that quotes it) carries the deciding block instead of the generic gate label. The recorded text
         # is compared across cycles by the stall-line throttle and across recovery settling windows, so it is
         # the stable half of a verdict and never the arithmetic. Cleared per call so a later decline can never
-        # inherit an earlier one's reason.
+        # inherit an earlier one's reason. The decision is carried beside it, typed, for the one decline that is
+        # not a budget refusal. A head standing down for the establish-rate limiter leaves the card to the jobs
+        # behind it rather than ending the pass.
         self._last_budget_defer_reason = None
+        self._last_budget_defer_decision = None
 
         baseline = self._model_metadata.get_baseline(job.model)
         target_device_index = self._routing_device_index(available_process)
@@ -8425,6 +8420,9 @@ class InferenceScheduler:
             is_head_blocker=is_head_blocker,
             target_device_index=target_device_index,
         )
+        if whole_card is _WholeCardDemandOutcome.DEFER_GOVERNOR:
+            self._last_budget_defer_decision = AdmissionDecision.DEFER_RESIDENCY_GOVERNOR
+            return False
         if whole_card is _WholeCardDemandOutcome.DEFER:
             # The residency path names its own arithmetic where it has any (which governor, what it has spent);
             # the generic label only stands in when the deferral was the teardown itself still running.
@@ -8798,8 +8796,8 @@ class InferenceScheduler:
         It is released the same way while a churn governor is deferring this head's whole-card establishment
         on this card. For the length of that deferral the head is not asking for the card at all (normal
         scheduling continues around it by design), so reserving its whole-card demand against smaller ready
-        work would idle the card against a claim nobody is making. Once the deferral clears or its dwell is
-        spent the head is served by ordinary admission and its normal charge applies again.
+        work would idle the card against a claim nobody is making. Once the deferral clears, or its record
+        outlives the rate limiter's window, the head's normal charge applies again.
         """
         if displaced_head.model is None:
             return None
@@ -9877,7 +9875,7 @@ class InferenceScheduler:
                     None,
                     f"model already resident and a cold copy does not fit the card as it stands ({defer_reason})",
                 )
-            return AdmissionDecision.DEFER_BUDGET, process, defer_reason
+            return self._last_budget_defer_decision or AdmissionDecision.DEFER_BUDGET, process, defer_reason
         if plan.cold_copy and self._process_map.get(process.process_id) is not process:
             return (
                 AdmissionDecision.ALREADY_LOADED,

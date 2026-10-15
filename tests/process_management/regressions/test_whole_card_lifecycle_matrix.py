@@ -600,17 +600,17 @@ def test_residency_scenario_matrix_preserves_lifecycle_invariants(case: Residenc
         )
         dispatched += 1
         state = machine.state_for(0)
-        window_open = (state.model is not None and (now - state.established_at) < 120.0) or (
-            state.restore_at != 0.0 and (now - state.restore_at) < 60.0
-        )
+        window_open = (
+            state.model is not None and not state.establish_grace_withheld and (now - state.established_at) < 120.0
+        ) or (state.restore_at != 0.0 and (now - state.restore_at) < 60.0)
         grace_active = machine.grace_active(
             now=now,
             establish_grace_seconds=120.0,
             restore_grace_seconds=60.0,
         )
         assert grace_active is window_open, (
-            "the excuse tracks the granted window alone: the rolling grace budget gates a new establishment "
-            "at admission and never withdraws the window of one already under way"
+            "the excuse tracks the opened window alone. An establishment on a card whose grace allowance is "
+            "spent does not open a window and does not excuse the queue, and a window already open is never withdrawn"
         )
         now += 15.0
 
