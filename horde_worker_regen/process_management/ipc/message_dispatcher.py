@@ -1253,13 +1253,13 @@ class MessageDispatcher:
 
         The measured peaks recorded here raise admission pricing of sampling work (the scheduler reads the
         same store when pricing a job's sampling peak). Only the unambiguous case is wired here: a monolithic
-        inference process whose single tracked job is genuinely in progress, whose model baseline is known, and
-        whose peak reading is positive. The disaggregated case is observed by the orchestrator, not here.
-        Such a report's peak is attributed to the SAMPLE stage (the dominant activation term of a whole
-        monolithic job). Reports from the disaggregated lanes (VAE/text-encode/post-process), from idle or
-        between-job inference slots, from a slot still primed ahead of its first step, or with an unknown
-        baseline are left unattributed rather than guessed: the parent cannot reliably bind those peaks to one
-        stage/job at this seam.
+        inference process whose single tracked job is genuinely in progress on a lane that holds the job's
+        model, whose baseline is known, and whose peak reading is positive. The disaggregated case is observed
+        by the orchestrator, not here. Such a report's peak is attributed to the SAMPLE stage (the dominant
+        activation term of a whole monolithic job). Reports from the disaggregated lanes
+        (VAE/text-encode/post-process), from idle or between-job inference slots, from a slot still primed ahead
+        of its first step, or with an unknown baseline are left unattributed rather than guessed: the parent
+        cannot reliably bind those peaks to one stage/job at this seam.
         """
         if self._footprint_store is None:
             return
@@ -1273,9 +1273,12 @@ class MessageDispatcher:
         if process_info is None or process_info.process_type is not HordeProcessType.INFERENCE:
             return
 
-        model_name = process_info.loaded_horde_model_name
         job = process_info.current_inference_job()
-        if model_name is None or job is None or job.id_ is None:
+        if job is None or job.id_ is None or job.model is None:
+            return
+        # A lane still holding another model reports that model's allocator high-water, and the first reading
+        # freezes the job's key, so a swap's readings would raise the previous model's figure for the whole job.
+        if process_info.loaded_horde_model_name != job.model:
             return
 
         # Bind the peak to a genuinely-running job: the slot's referenced job must be in progress, which
@@ -1288,7 +1291,7 @@ class MessageDispatcher:
         if process_info.last_process_state is HordeProcessState.INFERENCE_PRIMED:
             return
 
-        baseline = self._model_metadata.get_baseline(model_name)
+        baseline = self._model_metadata.get_baseline(job.model)
         if baseline is None:
             return
 

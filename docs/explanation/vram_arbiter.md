@@ -168,7 +168,10 @@ The arbiter keeps four concerns deliberately separate:
   trusted measurement that lowers the job's price toward them. A child sends several reports per job, so the
   message dispatcher keeps each job's highest reading and commits that one figure to the store when the job
   ends: on its result, success or fault, or on the next report after the job has left progress some other
-  way (a replaced process). A job with no attributable reading commits nothing. Isolated-sampler peaks come
+  way (a replaced process). The figure is filed under the job's model, and a reading is attributable only
+  while the lane holds that model. A lane still swapping reports the previous model's allocator high-water,
+  and the first reading freezes the job's key. A job with no attributable reading does not commit a figure.
+  Isolated-sampler peaks come
   from the disaggregation orchestrator at sample completion, also once per job. A cold key
   prices at the static seed unchanged, so a first-of-kind job and small-resolution buckets keep their
   smaller peaks and their concurrency.

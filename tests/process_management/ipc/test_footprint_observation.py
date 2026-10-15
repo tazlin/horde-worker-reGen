@@ -182,6 +182,91 @@ async def test_running_inference_peak_is_recorded_with_the_right_key() -> None:
     assert len(store) == 2
 
 
+_LANE_MODEL = "lane_model"
+_LANE_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
+_JOB_MODEL = "job_model"
+_JOB_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+
+
+def _two_model_dispatcher(
+    *,
+    process_map: ProcessMap,
+    job_tracker: JobTracker,
+    store: LearnedFootprintStore,
+) -> MessageDispatcher:
+    """A dispatcher whose model reference knows the lane's and the job's models under different baselines."""
+    reference = {
+        _LANE_MODEL: make_mock_model_reference_record(_LANE_MODEL, baseline=_LANE_BASELINE),
+        _JOB_MODEL: make_mock_model_reference_record(_JOB_MODEL, baseline=_JOB_BASELINE),
+    }
+    dispatcher = MessageDispatcher(
+        process_map=process_map,
+        horde_model_map=HordeModelMap(root={}),
+        job_tracker=job_tracker,
+        process_message_queue=Mock(spec=queue.Queue),
+        runtime_config=make_test_runtime_config(bridge_data=make_mock_bridge_data()),
+        model_metadata=make_test_model_metadata(reference),
+        action_ledger=ActionLedger(),
+        reserve_ledger=CommittedReserveLedger(),
+        on_unload_vram=Mock(),
+        state=WorkerState(),
+    )
+    dispatcher.set_footprint_store(store)
+    return dispatcher
+
+
+def _sample_key_512(baseline: KNOWN_IMAGE_GENERATION_BASELINE) -> FootprintKey:
+    return FootprintKey(
+        model_baseline=str(baseline),
+        resolution_bucket=ResolutionBucket.LE_512,
+        platform=sys.platform,
+        stage=FootprintStage.SAMPLE,
+    )
+
+
+async def test_a_peak_from_a_lane_holding_another_model_is_not_recorded() -> None:
+    """A lane still holding another model reports that model's high-water, which belongs to neither key."""
+    process_info = make_mock_process_info(1, model_name=_LANE_MODEL, state=HordeProcessState.INFERENCE_STARTING)
+    job = make_job_pop_response(model=_JOB_MODEL, width=512, height=512)
+    process_info.record_inference_ownership(job, attempt_ordinal=1)
+    process_map = ProcessMap({1: process_info})
+    job_tracker = JobTracker()
+    await mark_job_in_progress_async(job_tracker, job)
+    store = LearnedFootprintStore()
+    dispatcher = _two_model_dispatcher(process_map=process_map, job_tracker=job_tracker, store=store)
+
+    dispatcher._handle_memory_report(_memory_message(1, peak_mb=3000))
+    assert job.id_ is not None
+    dispatcher._commit_job_sampling_peak(job.id_)
+
+    assert store.get_observation(_sample_key_512(_LANE_BASELINE)) is None
+    assert store.get_observation(_sample_key_512(_JOB_BASELINE)) is None
+    assert len(store) == 0
+
+
+async def test_a_peak_is_recorded_under_the_jobs_model_once_the_lane_holds_it() -> None:
+    """A reading taken mid-swap is dropped; readings after the lane holds the job's model file under its key."""
+    process_info = make_mock_process_info(1, model_name=_LANE_MODEL, state=HordeProcessState.INFERENCE_STARTING)
+    job = make_job_pop_response(model=_JOB_MODEL, width=512, height=512)
+    process_info.record_inference_ownership(job, attempt_ordinal=1)
+    process_map = ProcessMap({1: process_info})
+    job_tracker = JobTracker()
+    await mark_job_in_progress_async(job_tracker, job)
+    store = LearnedFootprintStore()
+    dispatcher = _two_model_dispatcher(process_map=process_map, job_tracker=job_tracker, store=store)
+
+    dispatcher._handle_memory_report(_memory_message(1, peak_mb=3000))
+    process_info.loaded_horde_model_name = _JOB_MODEL
+    dispatcher._handle_memory_report(_memory_message(1, peak_mb=5000))
+    assert job.id_ is not None
+    dispatcher._commit_job_sampling_peak(job.id_)
+
+    assert store.get_observation(_sample_key_512(_LANE_BASELINE)) is None
+    observation = store.get_observation(_sample_key_512(_JOB_BASELINE))
+    assert observation is not None
+    assert observation.watermark_mb == 5000.0
+
+
 async def test_a_primed_lanes_peak_is_not_attributed_until_its_first_step() -> None:
     """A lane primed ahead of its first step holds its encode set or a partial load, never the sampling peak.
 
