@@ -5166,7 +5166,7 @@ class _DispatchWorld:
             ),
             context_restore_ready=self._context_restore_ready(device_index),
             lane_restore_ready=not self._scheduler.head_of_queue_is_parked(),
-            beneficiary_waiting=self._scheduler.job_awaits_admission,
+            beneficiary_waiting=lambda job_id, _kind: self._scheduler.job_awaits_admission(job_id),
             now=self.now,
         )
 

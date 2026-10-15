@@ -4485,15 +4485,21 @@ class HordeWorkerProcessManager:
         if controller is not None:
             controller.register(process_id, proxy)
 
-    def _beneficiary_waiting(self, job_id: str) -> bool:
+    def _beneficiary_waiting(self, job_id: str, kind: ReclaimRungKind | None) -> bool:
         """Whether the job a reclaim obligation was booked for still needs the room it bought.
 
         An inference beneficiary waits until its sample ends, and a post-processing beneficiary until its chain
-        leaves the lane. One reading covers both, since the ladder records a job id without its kind.
+        leaves the lane. One reading covers both bookers, since the ladder records a job id without its role. A
+        job waiting for the post-processing lane cannot be the reason to keep that lane paused. Held for it, the
+        lane never drains the chain and the post-processing age-out faults the job.
+
+        Args:
+            job_id: The booked beneficiary.
+            kind: The paused lane's rung kind, or ``None`` for a context reduction.
         """
-        return self._inference_scheduler.job_awaits_admission(job_id) or self._job_tracker.job_awaits_post_processing(
-            job_id
-        )
+        if self._inference_scheduler.job_awaits_admission(job_id):
+            return True
+        return kind is not ReclaimRungKind.PAUSE_PP_LANE and self._job_tracker.job_awaits_post_processing(job_id)
 
     def _lane_holds_clearance(self, process_info: HordeProcessInfo) -> bool:
         """Whether an inference lane has been cleared to materialise its job, or is sampling it.

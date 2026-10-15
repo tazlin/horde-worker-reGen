@@ -1188,7 +1188,7 @@ class TestStarvedHeadLanePauseObligation:
                 actuator=actuator,
                 ladder_builder=tuple,
                 lane_restore_ready=True,
-                beneficiary_waiting=waiting.__contains__,
+                beneficiary_waiting=lambda job_id, _kind: job_id in waiting,
             )
             assert actuator.calls == [], "lane restarted while the waiter its pause served is still staged"
             assert engine.episode_holds_paused_lane(0) is True
@@ -1216,7 +1216,7 @@ class TestStarvedHeadLanePauseObligation:
                     actuator=actuator,
                     ladder_builder=tuple,
                     lane_restore_ready=True,
-                    beneficiary_waiting={"job-a"}.__contains__,
+                    beneficiary_waiting=lambda job_id, _kind: job_id == "job-a",
                 )
         finally:
             logger.remove(sink_id)
@@ -1238,7 +1238,7 @@ class TestStarvedHeadLanePauseObligation:
             "device_free_mb": 9000.0,
             "actuator": actuator,
             "ladder_builder": tuple,
-            "beneficiary_waiting": waiting.__contains__,
+            "beneficiary_waiting": lambda job_id, _kind: job_id in waiting,
         }
         engine.on_tick(0, **tick)
         assert actuator.calls == []
@@ -1247,6 +1247,75 @@ class TestStarvedHeadLanePauseObligation:
         engine.on_tick(0, **tick)
         assert actuator.calls == [("restore_pp", None)]
         assert engine.episode_holds_paused_lane(0) is False
+
+    @staticmethod
+    def _waiting_except_on_the_post_processing_lane(job_id: str, kind: ReclaimRungKind | None) -> bool:
+        return job_id == "job-a" and kind is not ReclaimRungKind.PAUSE_PP_LANE
+
+    def test_a_post_processing_pause_is_not_held_for_a_job_waiting_on_that_lane(self) -> None:
+        """A job whose chain waits for the post-processing lane cannot keep that lane paused.
+
+        Held, the lane never drains the chain and the post-processing age-out faults the job the pause was for.
+        """
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        engine.record_lane_pause(
+            0, ReclaimRungKind.PAUSE_PP_LANE, tenant_label="post_process_lane", promised_mb=487.0, beneficiary="job-a"
+        )
+
+        engine.on_tick(
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=actuator,
+            ladder_builder=tuple,
+            beneficiary_waiting=self._waiting_except_on_the_post_processing_lane,
+        )
+
+        assert actuator.calls == [("restore_pp", None)]
+        assert engine.episode_holds_paused_lane(0) is False
+
+    def test_another_lane_pause_is_still_held_for_a_job_waiting_on_post_processing(self) -> None:
+        """The same booking on a lane the job does not wait for keeps that lane down while the job waits."""
+        engine = VerifiedReclaimLadder()
+        actuator = _FakeActuator()
+        engine.record_lane_pause(
+            0,
+            ReclaimRungKind.PAUSE_UTILITIES_LANE,
+            tenant_label="utilities_lane",
+            promised_mb=487.0,
+            beneficiary="job-a",
+        )
+
+        engine.on_tick(
+            0,
+            saturated=False,
+            healthy=True,
+            device_free_mb=9000.0,
+            actuator=actuator,
+            ladder_builder=tuple,
+            beneficiary_waiting=self._waiting_except_on_the_post_processing_lane,
+        )
+
+        assert actuator.calls == []
+        assert engine.episode_holds_paused_lane(0) is True
+
+    def test_the_worker_does_not_count_a_post_processing_wait_against_the_post_processing_lane(self) -> None:
+        """The worker's reading is per lane, so a post-processing wait holds every lane but that one."""
+        from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
+
+        manager = Mock()
+        manager._inference_scheduler.job_awaits_admission.return_value = False
+        manager._job_tracker.job_awaits_post_processing.return_value = True
+        beneficiary_waiting = functools.partial(HordeWorkerProcessManager._beneficiary_waiting, manager)
+
+        assert beneficiary_waiting("job-a", ReclaimRungKind.PAUSE_PP_LANE) is False
+        assert beneficiary_waiting("job-a", ReclaimRungKind.PAUSE_UTILITIES_LANE) is True
+        assert beneficiary_waiting("job-a", None) is True
+
+        manager._inference_scheduler.job_awaits_admission.return_value = True
+        assert beneficiary_waiting("job-a", ReclaimRungKind.PAUSE_PP_LANE) is True
 
     def test_a_non_lane_kind_is_never_booked(self) -> None:
         """Only lane-pause rungs have a restore to book; anything else is ignored."""
@@ -1324,7 +1393,7 @@ class TestStarvedHeadLanePauseObligation:
             "device_free_mb": 9000.0,
             "actuator": actuator,
             "ladder_builder": tuple,
-            "beneficiary_waiting": waiting.__contains__,
+            "beneficiary_waiting": lambda job_id, _kind: job_id in waiting,
         }
 
         engine.on_tick(0, **tick)
@@ -1350,7 +1419,7 @@ class TestStarvedHeadLanePauseObligation:
             "device_free_mb": 9000.0,
             "actuator": actuator,
             "ladder_builder": tuple,
-            "beneficiary_waiting": waiting.__contains__,
+            "beneficiary_waiting": lambda job_id, _kind: job_id in waiting,
         }
 
         engine.on_tick(0, **tick)
