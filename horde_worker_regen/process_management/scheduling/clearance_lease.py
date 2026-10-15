@@ -287,6 +287,10 @@ class ClearanceLeaseProxy:
         timed out is still available to this job's acquire, and the figure written with it describes the card
         before the previous job sampled. The reserve figures and the stage permit's flag and figures are reset
         by the same rules.
+
+        The parent may grant this job before the child calls here. The parent's next step rewrites the device free and
+        reserve figures of a grant the child has not consumed, so a grant issued before job start reaches the
+        acquire with both figures one step later.
         """
         self._grant_consumed = False
         self._granted_device_free_mb = None
@@ -347,12 +351,15 @@ class ClearanceLeaseProxy:
         _write_shared_figure(self._cleared_sampling_reserve, sampling_reserve_mb)
         self._clearance.release()
 
-    def _parent_refresh_grant_figure(self, *, device_free_mb: float) -> bool:
-        """Parent-side: rewrite the figure of a grant the child has not consumed, returning whether it did.
+    def _parent_refresh_grant_figure(self, *, device_free_mb: float, sampling_reserve_mb: float | None) -> bool:
+        """Parent-side: rewrite the figures of a grant the child has not consumed, returning whether it did.
 
         The permit is held across the write. The child's acquire can return only once the permit is back, so it
-        reads the new figure, and a permit the child already took leaves nothing to hold, so a consumed grant is
+        reads the new figures, and a permit the child already took cannot be rewritten, so a consumed grant is
         never rewritten. A child that probes during the hold finds no permit and blocks until the release.
+
+        The reserve is written beside the device free because the child's job start unsets both; None unsets
+        the reserve.
         """
         if self._cleared_device_free is None:
             return False
@@ -360,6 +367,7 @@ class ClearanceLeaseProxy:
             return False
         try:
             self._cleared_device_free.value = device_free_mb
+            _write_shared_figure(self._cleared_sampling_reserve, sampling_reserve_mb)
         finally:
             self._clearance.release()
         return True
@@ -382,14 +390,15 @@ class ClearanceLeaseProxy:
         _write_shared_figure(self._staged_sampling_reserve, sampling_reserve_mb)
         self._stage.release()
 
-    def _parent_refresh_stage_figure(self, *, device_free_mb: float) -> bool:
-        """Parent-side: rewrite an unconsumed stage grant's figure, as :meth:`_parent_refresh_grant_figure` does."""
+    def _parent_refresh_stage_figure(self, *, device_free_mb: float, sampling_reserve_mb: float | None) -> bool:
+        """Parent-side: rewrite an unconsumed stage grant's figures, as :meth:`_parent_refresh_grant_figure` does."""
         if self._stage is None or self._staged_device_free is None:
             return False
         if not self._stage.acquire(False):
             return False
         try:
             self._staged_device_free.value = device_free_mb
+            _write_shared_figure(self._staged_sampling_reserve, sampling_reserve_mb)
         finally:
             self._stage.release()
         return True
@@ -922,14 +931,14 @@ class ClearanceController:
         self._drain_done_discard()
         self._reconcile_grants(inputs)
         self._prune_tail_dedup(inputs)
-        self._refresh_unconsumed_grant_figures(inputs.device_free_mb)
+        sampling_reserve_by_pid = {waiter.process_id: waiter.sampling_reserve_mb for waiter in inputs.staged_waiters}
+        self._refresh_unconsumed_grant_figures(inputs.device_free_mb, sampling_reserve_by_pid)
 
         # Only children the controller holds IDLE or STAGED are clearable; a cleared-but-not-yet-sampling child
         # is still reported as a primed waiter by the scheduler snapshot, so filter it out here rather than let a
         # slot pick be wasted on it (the per-child clear guard below would skip it anyway).
         job_id_by_pid = {waiter.process_id: waiter.job_id for waiter in inputs.staged_waiters}
         waiter_by_pid = {waiter.process_id: waiter for waiter in inputs.staged_waiters}
-        sampling_reserve_by_pid = {waiter.process_id: waiter.sampling_reserve_mb for waiter in inputs.staged_waiters}
         clearable_waiters = tuple(
             waiter
             for waiter in inputs.staged_waiters
@@ -1128,13 +1137,22 @@ class ClearanceController:
         )
         return True
 
-    def _refresh_unconsumed_grant_figures(self, device_free_mb: float | None) -> None:
-        """Rewrite every cleared child's grant figure from this step's reading until the child consumes it.
+    def _refresh_unconsumed_grant_figures(
+        self,
+        device_free_mb: float | None,
+        sampling_reserve_by_pid: Mapping[int, float | None],
+    ) -> None:
+        """Rewrite every cleared child's grant figures from this step's reading until the child consumes them.
 
         Between the grant and the child's sample call the child releases its encoder to host RAM and siblings
         unload, so the figure frozen at the grant tick understates the card the child loads into. A step with no
-        reading leaves the last figure in place. A staged child's stage figure is refreshed the same way, and a
-        cleared child's stage figure too while its stage permit is untaken.
+        reading leaves the last figures in place. A staged child's stage figures are refreshed the same way, and
+        a cleared child's stage figures too while the stage permit is untaken.
+
+        The reserve is rewritten beside the device free from the child's staged waiter, which the snapshot keeps
+        until the child reports sampling. The parent may grant before the child's job start, which unsets both
+        figures, so the rewrite restores the reserve one step later, as it does the device free. A waiter priced
+        with no reserve has its reserve unset.
         """
         if device_free_mb is None:
             return
@@ -1144,9 +1162,13 @@ class ClearanceController:
             proxy = self._proxies.get(process_id)
             if proxy is None:
                 continue
-            proxy._parent_refresh_stage_figure(device_free_mb=device_free_mb)
+            sampling_reserve_mb = sampling_reserve_by_pid.get(process_id)
+            proxy._parent_refresh_stage_figure(device_free_mb=device_free_mb, sampling_reserve_mb=sampling_reserve_mb)
             if state is GrantState.CLEARED:
-                proxy._parent_refresh_grant_figure(device_free_mb=device_free_mb)
+                proxy._parent_refresh_grant_figure(
+                    device_free_mb=device_free_mb,
+                    sampling_reserve_mb=sampling_reserve_mb,
+                )
 
     def _log_tail_overlap_clear(self, inputs: ClearanceInputs, *, outgoing_job_id: str) -> None:
         """Emit the dedicated INFO signal for a tail-overlap early clear so its firing rate is measurable.

@@ -838,6 +838,70 @@ class TestGrantCarriesClearanceTruth:
         assert proxy.clearance_value == 0, "the refresh must not hand a consumed grant a second permit"
         assert controller.grant_state(2) is GrantState.CLEARED
 
+    def test_a_grant_issued_before_job_start_keeps_its_reserve(self) -> None:
+        """The child's job start unsets the grant's figures; the next step rewrites the reserve beside device free.
+
+        The parent clears a dispatched waiter before the child starts the job, so the child's acquire would
+        otherwise read a fresh device free with no reserve and size the partial load to the whole figure.
+        """
+        controller = _controller()
+        proxy = ClearanceLeaseProxy(
+            clearance=_held_empty_clearance(),
+            done=_FakeSemaphore(),
+            cleared_device_free=_shared_figure(),
+            cleared_sampling_reserve=_shared_figure(),
+        )
+        controller.register(2, proxy)
+        staged = (
+            ClearanceWaiter(process_id=2, priority=1, job_id="job-a", weights_mb=6_000.0, sampling_reserve_mb=1_500.0),
+        )
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+
+        proxy.begin_job()
+        controller.step(_inputs(staged=staged, device_free_mb=15_000.0), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() == 1_500.0
+        assert proxy.take_cleared_device_free_mb() == 15_000.0
+
+    def test_a_stage_grant_issued_before_job_start_keeps_its_reserve(self) -> None:
+        """An unconsumed stage grant's reserve is rewritten after the child's job start, as the sample grant's is."""
+        controller = _controller(tail=False)
+        proxy = ClearanceLeaseProxy(
+            clearance=_held_empty_clearance(),
+            done=_FakeSemaphore(),
+            cleared_device_free=_shared_figure(),
+            stage=_held_empty_clearance(),
+            staged_device_free=_shared_figure(),
+            cleared_sampling_reserve=_shared_figure(),
+            staged_sampling_reserve=_shared_figure(),
+        )
+        controller.register(2, proxy)
+        staged = (
+            ClearanceWaiter(process_id=2, priority=1, job_id="job-a", weights_mb=6_000.0, sampling_reserve_mb=1_500.0),
+        )
+        controller.step(
+            _inputs(staged=staged, device_free_mb=13_500.0),
+            admit_fn=_always_admit,
+            stage_admit_fn=_always_admit,
+        )
+
+        proxy.begin_job()
+        controller.step(
+            _inputs(staged=staged, device_free_mb=15_000.0),
+            admit_fn=_always_admit,
+            stage_admit_fn=_always_admit,
+        )
+
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        assert stage_lease.acquire(True, 0.0) is True
+        assert stage_lease.take_cleared_sampling_reserve_mb() == 1_500.0
+        assert stage_lease.take_cleared_device_free_mb() == 15_000.0
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() == 1_500.0
+        assert proxy.take_cleared_device_free_mb() == 15_000.0
+
     def test_proxy_without_a_shared_figure_carries_none(self) -> None:
         """A proxy built with no shared figure behaves as before: grants carry nothing."""
         controller = _controller()
