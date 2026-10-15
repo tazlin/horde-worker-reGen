@@ -330,10 +330,12 @@ class RecoverySupervisor:
             boot_in_progress: Whether a replacement child is alive and still booting (state PROCESS_STARTING
                 with a live OS process). A live boot is capacity in flight, so it suppresses the boot
                 *allowance* backstop: the allowance would otherwise treat a merely slow-but-healthy boot as
-                ready and fault the jobs the finishing boot serves. The suppression is bounded by the boot
-                hard cap, past which even a still-live boot is deemed hung and the allowance applies again, so
-                a permanently stuck boot still escalates. A dead boot must report False here (the caller uses a
-                liveness-aware count) so it does not hold give-up. Defaults to False for an unwired caller.
+                ready and fault the jobs the finishing boot serves. It holds the soft reset too, since a
+                rebuild under a live boot replaces the replacement. Both holds are bounded by the boot hard
+                cap, past which even a still-live boot is deemed hung and the allowance and the reset apply
+                again, so a permanently stuck boot still escalates. A dead boot must report False here (the
+                caller uses a liveness-aware count) so it does not hold give-up. Defaults to False for an
+                unwired caller.
             constructive_remedy_available: Whether the caller has a constructive resource remedy left to
                 perform (one that changes the condition under the wedge instead of rebuilding identically),
                 or has just performed one that is still settling. While True the escalation returns
@@ -473,8 +475,10 @@ class RecoverySupervisor:
             self._give_up_cycles += 1
             return RecoveryAction.GIVE_UP
 
+        # A live boot holds the soft reset as it holds give-up, since rebuilding under it replaces the replacement.
         if (
             is_wedged
+            and not live_boot_holds
             and self._wedge_since is not None
             and (now - self._wedge_since) >= self._wedge_grace_seconds
             and (now - self._last_action_time) >= self._reset_interval_seconds

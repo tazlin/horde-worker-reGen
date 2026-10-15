@@ -841,9 +841,10 @@ The escalation, in order:
    liveness-aware `boot_in_progress` fact, so a child that died mid-boot does not
    count), the allowance is suppressed up to the hard cap: a merely slow-but-healthy
    boot has been observed to outlast the allowance yet still succeed, and faulting
-   there would drop the very jobs the finishing boot serves. Past the hard cap even a
-   still-live boot is deemed hung and the allowance applies again, so a permanently
-   stuck boot still escalates. Give-up is also **latched once per cycle** (repeat wedged ticks
+   there would drop the very jobs the finishing boot serves. The same live boot holds
+   the soft reset, since a rebuild under it replaces the replacement. Past the hard
+   cap even a still-live boot is deemed hung, so the allowance and the soft reset
+   apply again and a permanently stuck boot still escalates. Give-up is also **latched once per cycle** (repeat wedged ticks
    are no-ops, so the ledger is not spammed), and its `recovery_abandoned` ledger
    record is written only when the pass actually did something (faulted at least
    one job, or made a terminal abort decision), never a `jobs_faulted=0` no-op. If

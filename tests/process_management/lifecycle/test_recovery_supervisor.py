@@ -412,3 +412,24 @@ def test_progress_after_reset_resets_then_next_wedge_starts_at_one() -> None:
     clock.advance(2)
     assert supervisor.evaluate(is_wedged=True, pool_ready=True) is RecoveryAction.SOFT_RESET
     assert supervisor.limp_by_level == 1
+
+
+def test_soft_reset_waits_for_a_live_boot_until_the_hard_cap() -> None:
+    """A replacement child still booting is capacity in flight, so the soft reset waits for it as give-up does.
+
+    Rebuilding the pool under a live boot replaces the replacement; the wedge grace has elapsed, but the boot
+    holds the reset until the hard cap deems it hung.
+    """
+    supervisor, clock = _make(boot_hard_cap_seconds=6)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=False, boot_in_progress=True) is RecoveryAction.NONE
+
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=False, boot_in_progress=True) is RecoveryAction.NONE
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=False, boot_in_progress=True) is RecoveryAction.NONE
+    assert supervisor.limp_by_level == 0
+
+    # Past the hard cap even a live boot is deemed hung, so the reset proceeds.
+    clock.advance(2)
+    assert supervisor.evaluate(is_wedged=True, pool_ready=False, boot_in_progress=True) is RecoveryAction.SOFT_RESET
+    assert supervisor.limp_by_level == 1
