@@ -122,19 +122,27 @@ def plausible_sampling_peak_mb(key: FootprintKey, total_vram_mb: float | None, *
     charge, capped at what the card can give one process. A process's allocator high-water can hold another
     cached checkpoint or an overflow; bounded only by the card, such readings priced SD 1.5 at 20 GB. A
     non-sampling key, or one whose baseline the burden model does not know, gets the card bound alone.
+
+    A :attr:`FootprintStage.SAMPLE_ACTIVATION` key is bounded by the band's heaviest sampler-only seed itself, with
+    no factor or context charge, since the feeder bounds each job's activation by that job's sampler-only seed and
+    the band's heaviest one is the largest of those.
     """
     card_mb = plausible_activation_ceiling_mb(total_vram_mb)
-    if key.stage not in (FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED) or key.resolution_bucket is None:
+    sampling_stages = (FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED, FootprintStage.SAMPLE_ACTIVATION)
+    if key.stage not in sampling_stages or key.resolution_bucket is None:
         return card_mb
+    is_activation = key.stage is FootprintStage.SAMPLE_ACTIVATION
     seed_mb = _heaviest_sampling_seed_mb(
         key.model_baseline,
         str(key.resolution_bucket),
-        isolated=key.stage is FootprintStage.SAMPLE_ISOLATED,
+        isolated=key.stage is FootprintStage.SAMPLE_ISOLATED or is_activation,
         batch=batch,
     )
-    if seed_mb is None:
+    # A backend without the sampler-only split reports it as zero, which as a bound would clamp every activation
+    # figure away.
+    if seed_mb is None or (is_activation and seed_mb <= 0):
         return card_mb
-    bound_mb = seed_mb * _PLAUSIBLE_SAMPLE_SEED_FACTOR + platform_context_constant_mb()
+    bound_mb = seed_mb if is_activation else seed_mb * _PLAUSIBLE_SAMPLE_SEED_FACTOR + platform_context_constant_mb()
     return bound_mb if card_mb is None else min(bound_mb, card_mb)
 
 
@@ -183,26 +191,24 @@ class MeasuredJobFootprint(Protocol):
         """``whole_job`` for a monolithic run, ``sample_stage`` for a disaggregated sampler stage."""
 
 
-FOOTPRINT_STORE_SCHEMA_VERSION = 4
+FOOTPRINT_STORE_SCHEMA_VERSION = 5
 """Bumped when the file format changes, or when observations written by an older build can no longer be trusted.
-A file with another version is discarded on read, except :data:`_PER_READING_SAMPLE_SCHEMA_VERSION` and
-:data:`_POOLED_ONLY_SCHEMA_VERSION`. Version 2 drops files written before observations were bounds-checked (see
+A file with another version is discarded on read, except those in :data:`_MISKEYED_SAMPLING_SCHEMA_VERSIONS`.
+Version 2 drops files written before observations were bounds-checked (see
 :meth:`LearnedFootprintStore.observe_peak`): those can hold activation watermarks at the size of the card and
 resident figures smaller than the checkpoint's weights, and since watermarks only ever rise, the store would price
 from them forever. Version 3 marks :attr:`FootprintStage.SAMPLE` windows that hold one figure per job. Version 4
 adds job-class keys (:meth:`FootprintKey.for_job_class`). A build that predates them discards the file, since it
-would read a class key as its pooled key."""
+would read a class key as its pooled key. In version 5, :attr:`FootprintStage.SAMPLE` and
+:attr:`FootprintStage.SAMPLE_ACTIVATION` keys are filed under the job's own model."""
 
-_POOLED_ONLY_SCHEMA_VERSION = 3
-"""The last schema without job-class keys. Its pooled windows are still valid and load unchanged."""
+_MISKEYED_SAMPLING_SCHEMA_VERSIONS = frozenset({2, 3, 4})
+"""Older schemas still loaded, without any entry of a stage in :data:`_MISKEYED_SAMPLING_STAGES`.
 
-_PER_READING_SAMPLE_SCHEMA_VERSION = 2
-"""The last schema whose :attr:`FootprintStage.SAMPLE` windows hold one entry per memory report.
-
-Such a file is still loaded, with those windows emptied: several readings of one job are not several jobs, and
-priced as jobs they would let one job's readings stand for a key's whole recent traffic. The watermark, EWMA
-and count are kept, so the raise-only price survives and the measured price returns once jobs refill the
-window."""
+Their monolithic sampling figures were filed under the model the lane had loaded rather than the job's model, so
+a small model's key can hold a large model's peak. The watermark carries it as well as the window, and it only
+rises, so the whole entry is dropped and the key prices from its static seed until it is learned again. The
+isolated sampler's keys and the at-rest stages were always filed under their own model and load as written."""
 
 FOOTPRINT_STORE_FILENAME = "vram_footprints.json"
 """Name of the persisted store inside the worker's app-state directory (beside ``perf_model.json``)."""
@@ -492,6 +498,9 @@ _PER_JOB_STAGES = frozenset(
 The activation stages are fed once per job. The at-rest stages are fed a reading per report and keep the
 window's maximum, since their entries are repeated readings of one steady state."""
 
+_MISKEYED_SAMPLING_STAGES = frozenset({FootprintStage.SAMPLE, FootprintStage.SAMPLE_ACTIVATION})
+"""The stages a file of :data:`_MISKEYED_SAMPLING_SCHEMA_VERSIONS` may hold under another model's key."""
+
 _MEASURED_ESTIMATE_MARGIN = 1.10
 """The single conservatism knob applied to a measured estimate.
 
@@ -711,7 +720,7 @@ class LearnedFootprintStore:
         self,
         bound_for_key: Callable[[FootprintKey], float | None],
     ) -> list[FootprintKey]:
-        """Clamp stored sampling statistics to their key's plausible bound, returning the keys changed.
+        """Clamp stored sampling and activation statistics to their key's plausible bound, returning the keys changed.
 
         Watermarks only rise and are persisted, so a reading that predates a feeder's bound keeps mispricing
         its key until it is cut back. Counts and keys are kept; only the watermark, the recent window and the
@@ -719,7 +728,11 @@ class LearnedFootprintStore:
         """
         changed: list[FootprintKey] = []
         for key, observation in list(self._observations.items()):
-            if key.stage not in (FootprintStage.SAMPLE, FootprintStage.SAMPLE_ISOLATED):
+            if key.stage not in (
+                FootprintStage.SAMPLE,
+                FootprintStage.SAMPLE_ISOLATED,
+                FootprintStage.SAMPLE_ACTIVATION,
+            ):
                 continue
             bound_mb = bound_for_key(key)
             if bound_mb is None or observation.watermark_mb <= bound_mb:
@@ -865,8 +878,8 @@ class LearnedFootprintStore:
 
         A file the current build cannot parse is discarded rather than repaired: the store re-learns from
         live traffic within a handful of jobs, so nothing is worth failing a worker start over. A file of
-        :data:`_PER_READING_SAMPLE_SCHEMA_VERSION` loads with its :attr:`FootprintStage.SAMPLE` windows emptied, and
-        one of :data:`_POOLED_ONLY_SCHEMA_VERSION` loads as written.
+        :data:`_MISKEYED_SAMPLING_SCHEMA_VERSIONS` loads without its :data:`_MISKEYED_SAMPLING_STAGES` entries,
+        since those may carry another model's readings.
         """
         if self._path is None or not self._path.exists():
             return
@@ -879,13 +892,9 @@ class LearnedFootprintStore:
         if not isinstance(raw, dict):
             return
         schema_version = raw.get("schema_version")
-        if schema_version not in (
-            FOOTPRINT_STORE_SCHEMA_VERSION,
-            _POOLED_ONLY_SCHEMA_VERSION,
-            _PER_READING_SAMPLE_SCHEMA_VERSION,
-        ):
+        sampling_is_miskeyed = schema_version in _MISKEYED_SAMPLING_SCHEMA_VERSIONS
+        if schema_version != FOOTPRINT_STORE_SCHEMA_VERSION and not sampling_is_miskeyed:
             return
-        windows_hold_readings = schema_version == _PER_READING_SAMPLE_SCHEMA_VERSION
         entries = raw.get("observations")
         if not isinstance(entries, list):
             return
@@ -898,8 +907,8 @@ class LearnedFootprintStore:
                 observation = _FootprintObservation.model_validate(entry.get("observation"))
             except ValueError:
                 continue
-            if windows_hold_readings and key.stage is FootprintStage.SAMPLE:
-                observation = observation.model_copy(update={"recent_mb": []})
+            if sampling_is_miskeyed and key.stage in _MISKEYED_SAMPLING_STAGES:
+                continue
             self._observations[key] = observation
 
     # endregion

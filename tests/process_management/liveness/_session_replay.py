@@ -57,6 +57,7 @@ from horde_worker_regen.analysis.replay_fixture import PLATFORM_PLACEHOLDER, Rep
 from horde_worker_regen.process_management.resources.resource_budget import predict_job_sampling_vram_mb
 from horde_worker_regen.process_management.resources.vram_footprints import (
     _MEASURED_ESTIMATE_MARGIN,
+    FOOTPRINT_STORE_SCHEMA_VERSION,
     POST_PROCESS_CHAIN_BASELINE,
     SAFETY_PROCESS_BASELINE,
     FootprintKey,
@@ -243,8 +244,13 @@ def load_footprint_keys(path: Path) -> tuple[FootprintKey, ...]:
 
 
 def _rewritten_fixture_text(path: Path) -> str:
-    """Return the footprint fixture's text with :data:`PLATFORM_PLACEHOLDER` replaced by ``sys.platform``."""
-    return path.read_text(encoding="utf-8").replace(f'"{PLATFORM_PLACEHOLDER}"', f'"{sys.platform}"')
+    """Return the footprint fixture's text keyed for ``sys.platform`` and stamped with the current store schema.
+
+    The fixture's figures are the replay's stated inputs, so they load whole. A store file of an older schema
+    would otherwise shed the stages the store drops from a live file of that schema.
+    """
+    text = path.read_text(encoding="utf-8").replace(f'"{PLATFORM_PLACEHOLDER}"', f'"{sys.platform}"')
+    return re.sub(r'"schema_version":\s*\d+', f'"schema_version": {FOOTPRINT_STORE_SCHEMA_VERSION}', text, count=1)
 
 
 def _resident_key(model: str, baseline: str) -> FootprintKey:

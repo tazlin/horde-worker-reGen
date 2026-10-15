@@ -12,9 +12,9 @@ from horde_worker_regen.process_management.resources.resource_budget import plat
 from horde_worker_regen.process_management.resources.vram_footprints import (
     _MEASURED_ESTIMATE_MARGIN,
     _MIN_OBSERVATIONS_FOR_MEASURED,
-    _PER_READING_SAMPLE_SCHEMA_VERSION,
+    _MISKEYED_SAMPLING_SCHEMA_VERSIONS,
     _PERSIST_EVERY_N_OBSERVATIONS,
-    _POOLED_ONLY_SCHEMA_VERSION,
+    _PLAUSIBLE_SAMPLE_SEED_FACTOR,
     _RECENT_WINDOW_SIZE,
     FOOTPRINT_STORE_SCHEMA_VERSION,
     SAFETY_PROCESS_BASELINE,
@@ -528,55 +528,6 @@ class TestPersistence:
         assert len(store) == 1
         assert store.get_observation(good) is not None
 
-    def test_a_per_reading_file_rebuilds_its_sampling_windows_from_jobs(self, tmp_path: Path) -> None:
-        """A file whose SAMPLE windows hold per-report readings loads with those windows empty.
-
-        Its watermark, EWMA and count are kept, so the raise-only price survives the upgrade. Its readings are
-        not jobs, so the measured price waits for the window to refill with job figures.
-        """
-        path = tmp_path / "vram_footprints.json"
-        sample = _key()
-        isolated = _key(stage=FootprintStage.SAMPLE_ISOLATED)
-        resident = _resident_key()
-        readings = [9000.0, 14260.0, 9100.0, 9050.0, 9200.0, 9000.0]
-
-        def _entry(key: FootprintKey) -> dict[str, object]:
-            return {
-                "key": key.model_dump(mode="json"),
-                "observation": {
-                    "ewma_mb": 9500.0,
-                    "watermark_mb": 14260.0,
-                    "observation_count": len(readings),
-                    "recent_mb": readings,
-                },
-            }
-
-        path.write_text(
-            json.dumps(
-                {
-                    "schema_version": _PER_READING_SAMPLE_SCHEMA_VERSION,
-                    "observations": [_entry(sample), _entry(isolated), _entry(resident)],
-                },
-            ),
-            encoding="utf-8",
-        )
-
-        store = LearnedFootprintStore(path=path)
-
-        loaded_sample = store.get_observation(sample)
-        assert loaded_sample is not None
-        assert loaded_sample.recent_mb == []
-        assert loaded_sample.watermark_mb == pytest.approx(14260.0)
-        assert loaded_sample.ewma_mb == pytest.approx(9500.0)
-        assert loaded_sample.observation_count == len(readings)
-        assert store.measured_estimate_mb(sample) is None
-        assert store.estimate_mb(sample, static_seed_mb=6158.0) == pytest.approx(14260.0)
-        # The isolated sampler was always fed once per job, and resident windows hold readings by design.
-        for kept in (isolated, resident):
-            loaded = store.get_observation(kept)
-            assert loaded is not None
-            assert loaded.recent_mb == pytest.approx(readings)
-
     def test_a_saved_store_is_read_back_as_per_job_windows(self, tmp_path: Path) -> None:
         """A file this build writes keeps its SAMPLE windows on reload, since they already hold jobs."""
         path = tmp_path / "vram_footprints.json"
@@ -585,20 +536,21 @@ class TestPersistence:
             store.observe_peak(_key(), mb)
         store.save()
 
-        assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] != _PER_READING_SAMPLE_SCHEMA_VERSION
+        assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == FOOTPRINT_STORE_SCHEMA_VERSION
         reloaded = LearnedFootprintStore(path=path).get_observation(_key())
         assert reloaded is not None
         assert reloaded.recent_mb == pytest.approx([11000.0, 12000.0])
 
-    def test_a_pooled_only_file_loads_unchanged(self, tmp_path: Path) -> None:
-        """A file from before job-class keys keeps its pooled windows, which price every class until it has its own."""
+    @pytest.mark.parametrize("schema_version", sorted(_MISKEYED_SAMPLING_SCHEMA_VERSIONS))
+    def test_an_older_isolated_pooled_window_prices_every_class(self, tmp_path: Path, schema_version: int) -> None:
+        """An older file's pooled isolated window loads as written and prices every class until it has its own."""
         path = tmp_path / "vram_footprints.json"
-        pooled = _key()
+        pooled = _key(stage=FootprintStage.SAMPLE_ISOLATED)
         readings = [9000.0, 12500.0, 9100.0, 12400.0, 9200.0]
         path.write_text(
             json.dumps(
                 {
-                    "schema_version": _POOLED_ONLY_SCHEMA_VERSION,
+                    "schema_version": schema_version,
                     "observations": [
                         {
                             "key": pooled.model_dump(mode="json"),
@@ -624,6 +576,59 @@ class TestPersistence:
         assert store.measured_job_estimate_net_of_context_mb(pooled, single) == pytest.approx(
             store.measured_estimate_net_of_context_mb(pooled),
         )
+
+    @pytest.mark.parametrize("schema_version", sorted(_MISKEYED_SAMPLING_SCHEMA_VERSIONS))
+    def test_an_older_file_drops_its_monolithic_sampling_stages(self, tmp_path: Path, schema_version: int) -> None:
+        """An older file loses every SAMPLE and SAMPLE_ACTIVATION entry, pooled and class keys alike.
+
+        Those stages may hold another model's readings, in the watermark as well as the window, so the entries are
+        dropped whole. The isolated sampler and the at-rest stages were always keyed by their own model and load as
+        written.
+        """
+        path = tmp_path / "vram_footprints.json"
+        sample = _key()
+        activation = _key(stage=FootprintStage.SAMPLE_ACTIVATION)
+        dropped = [
+            sample,
+            sample.for_job_class(batch=1, hires_fix=False),
+            activation,
+            activation.for_job_class(batch=1, hires_fix=False),
+        ]
+        isolated = _key(stage=FootprintStage.SAMPLE_ISOLATED)
+        kept = [isolated, isolated.for_job_class(batch=1, hires_fix=False), _resident_key()]
+        readings = [9000.0, 13500.0, 9100.0, 9050.0, 9200.0, 9000.0]
+
+        def _entry(key: FootprintKey) -> dict[str, object]:
+            return {
+                "key": key.model_dump(mode="json"),
+                "observation": {
+                    "ewma_mb": 9500.0,
+                    "watermark_mb": 13500.0,
+                    "observation_count": len(readings),
+                    "recent_mb": readings,
+                },
+            }
+
+        path.write_text(
+            json.dumps(
+                {"schema_version": schema_version, "observations": [_entry(key) for key in dropped + kept]},
+            ),
+            encoding="utf-8",
+        )
+
+        store = LearnedFootprintStore(path=path)
+
+        for key in dropped:
+            assert store.get_observation(key) is None
+            assert store.estimate_mb(key, static_seed_mb=6158.0) == pytest.approx(6158.0)
+        for key in kept:
+            loaded = store.get_observation(key)
+            assert loaded is not None
+            assert loaded.watermark_mb == pytest.approx(13500.0)
+            assert loaded.ewma_mb == pytest.approx(9500.0)
+            assert loaded.observation_count == len(readings)
+            assert loaded.recent_mb == pytest.approx(readings)
+        assert len(store) == len(kept)
 
     def test_job_class_keys_are_read_back_apart_from_their_pooled_key(self, tmp_path: Path) -> None:
         """A saved class key reloads as its own key, never folded into the pooled key it narrows."""
@@ -722,6 +727,21 @@ class TestSamplingPlausibilityBound:
         assert plausible_sampling_peak_mb(_key(baseline="no_such_baseline"), 24576.0) == card
         assert plausible_sampling_peak_mb(_key(baseline="no_such_baseline"), None) is None
 
+    def test_an_activation_key_is_bounded_by_its_band_sampler_only_seed(self) -> None:
+        """An activation figure cannot exceed the sampler-only seed of the heaviest job its band can hold.
+
+        The feeder bounds each job's activation by that job's sampler-only seed, so the band's heaviest such
+        seed covers every figure the feeder accepts, without the margin and context the whole-job bounds add.
+        """
+        activation = _key(stage=FootprintStage.SAMPLE_ACTIVATION)
+        bound = plausible_sampling_peak_mb(activation, None)
+        isolated_bound = plausible_sampling_peak_mb(_key(stage=FootprintStage.SAMPLE_ISOLATED), None)
+        assert bound is not None and isolated_bound is not None
+        assert bound == pytest.approx(
+            (isolated_bound - platform_context_constant_mb()) / _PLAUSIBLE_SAMPLE_SEED_FACTOR
+        )
+        assert plausible_sampling_peak_mb(activation, 4096.0) == pytest.approx(plausible_activation_ceiling_mb(4096.0))
+
     def test_a_card_sized_sdxl_reading_is_refused_at_the_seam(self) -> None:
         """The feeder's bound keeps a 20 GB SDXL reading out of the raise-only watermark."""
         store = LearnedFootprintStore()
@@ -761,6 +781,25 @@ class TestSanitizeSamplingObservations:
         reloaded_observation = reloaded.get_observation(_key())
         assert reloaded_observation is not None
         assert reloaded_observation.watermark_mb == pytest.approx(bound)
+
+    def test_implausible_activation_statistics_are_clamped_and_kept(self) -> None:
+        """An activation key above the band's bound is cut back like the sampling keys; its count survives."""
+        activation = _key(stage=FootprintStage.SAMPLE_ACTIVATION)
+        store = LearnedFootprintStore()
+        for reading in (3000.0, 4200.0, 20584.0):
+            store.observe_peak(activation, reading)
+
+        changed = store.sanitize_sampling_observations(lambda key: plausible_sampling_peak_mb(key, None))
+
+        bound = plausible_sampling_peak_mb(activation, None)
+        assert bound is not None
+        assert changed == [activation]
+        clamped = store.get_observation(activation)
+        assert clamped is not None
+        assert clamped.watermark_mb == pytest.approx(bound)
+        assert clamped.recent_mb == pytest.approx([3000.0, 4200.0, bound])
+        assert clamped.ewma_mb <= bound
+        assert clamped.observation_count == 3
 
     def test_a_clean_store_is_untouched(self) -> None:
         """Nothing above its bound means nothing changes and nothing is reported."""

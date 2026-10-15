@@ -226,13 +226,12 @@ The arbiter keeps four concerns deliberately separate:
     A backend that reports no footprint (an older one, or a dry run) leaves the memory-report path as the
     only source for every key. The store persists to `.horde_worker_regen/vram_footprints.json` (schema-versioned,
     atomic write, debounced at 10 observations plus a save at shutdown), so a restart keeps its calibration.
-    A missing, corrupt, or older-schema file starts cold. The one exception is a
-    file of the schema whose `SAMPLE` windows held one entry per memory report
-    (`_PER_READING_SAMPLE_SCHEMA_VERSION`): it loads with those windows emptied and their watermark, EWMA and
-    count kept, so the raise-only price survives and the measured price returns once five jobs refill the
-    window. Its readings are never read back as jobs. A file of the last schema without job-class keys
-    (`_POOLED_ONLY_SCHEMA_VERSION`) loads unchanged. A build that predates class keys discards a newer file,
-    since it would read a class key as its pooled key.
+    A missing, corrupt, or unknown-schema file starts cold. A file of an older schema
+    (`_MISKEYED_SAMPLING_SCHEMA_VERSIONS`) loads without the `SAMPLE` and `SAMPLE_ACTIVATION` entries. The
+    monolithic feeder of those schemas filed a job's peak under the lane's loaded model rather than the job's,
+    so a small model's key, its watermark included, can hold a large model's peak. Each such key prices from
+    its static seed until it is learned again; the `SAMPLE_ISOLATED` and at-rest entries load as written. A
+    build that predates class keys discards a newer file, since it would read a class key as its pooled key.
 
     Every feeder reads a per-process allocator counter, and a process can hold things its key does not
     describe, so each reading is bounds-checked before the store accepts it (the `plausible_min_mb` and
@@ -244,8 +243,11 @@ The arbiter keeps four concerns deliberately separate:
     static price of the heaviest job its band admits (the bucket's largest square, every sampling-phase
     feature, the configured batch) times 1.25, plus the context charge, capped at the card bound. The card
     bound alone let a 20 GB reading into an SDXL or SD1.5 key, where it held every later job of the band at
-    clearance. The same bound is applied to the stored file when the store is attached
-    (`LearnedFootprintStore.sanitize_sampling_observations`): watermark, recent window and EWMA are clamped
+    clearance. A `SAMPLE_ACTIVATION` key is bounded by the band's heaviest sampler-only seed alone, with no
+    factor or context charge, since the feeder bounds each job's activation by that job's sampler-only seed
+    and the band's heaviest is the largest of those. The same bounds are applied to the stored file when the
+    store is attached (`LearnedFootprintStore.sanitize_sampling_observations`), the activation keys included:
+    watermark, recent window and EWMA are clamped
     to it while the observation counts and the plausible readings are kept, so a store poisoned before the
     bound existed recovers without discarding its calibration. A resident reading below the checkpoint's
     weight bytes (`predict_model_weight_mb`) is dropped: a file cannot be resident in less than its size, and a run that block-swapped most of it
