@@ -373,17 +373,29 @@ class WorkerRecoveryCoordinator:
             and self._process_lifecycle.pending_gpu_starts_backing_off()
         )
 
-    def is_safety_capacity_available(self) -> bool:
-        """Return whether any safety process is alive to serve pending safety checks."""
-        if self._safety_starts_backing_off():
-            return True
+    def _any_safety_process_alive(self) -> bool:
+        """Return whether any safety process is alive, whether idle or mid-check."""
         return any(
             process_info.process_type == HordeProcessType.SAFETY and process_info.is_process_alive()
             for process_info in self._process_map.values()
         )
 
+    def is_safety_capacity_available(self) -> bool:
+        """Return whether safety checks progress without a rebuild, because a process is alive or a start is deferred.
+
+        A process mid-check counts, since it is progressing although it cannot take another check. A deferred
+        start counts because the deferral is deliberate and another rebuild does not bring it forward.
+        """
+        if self._safety_starts_backing_off():
+            return True
+        return self._any_safety_process_alive()
+
     def is_safety_pool_ready(self) -> bool:
-        """Return whether at least one safety process is alive and able to accept a check."""
+        """Return whether at least one safety process is alive and idle, able to accept a check now.
+
+        The lane is single-serial, so the one process is unready for the whole of every check it runs. Intake
+        reads this. Whether safety is progressing is :meth:`is_safety_capacity_available`.
+        """
         return any(
             process_info.process_type == HordeProcessType.SAFETY and process_info.can_accept_job()
             for process_info in self._process_map.values()
@@ -561,12 +573,13 @@ class WorkerRecoveryCoordinator:
 
         With a live pool in that state the grace scales to what checks are actually measuring on this host
         (the average the post-inference backpressure model already maintains) plus one average check per job
-        in the safety backlog, bounded by :attr:`SAFETY_GRACE_MAX_SECONDS`. An unready pool keeps the
-        baseline: nothing is progressing for the grace to be generous towards.
+        in the safety backlog, bounded by :attr:`SAFETY_GRACE_MAX_SECONDS`. A process busy with a check is
+        live, and the running check is what the scaled grace is sized for. A pool with no live process, including
+        one whose start is deferred, keeps the baseline because nothing is progressing.
         """
         baseline_seconds = self.ORPHAN_SAFETY_GRACE_SECONDS
         safety_runs_on_gpu = self._process_lifecycle.safety_gpu_card_index() is not None
-        if safety_runs_on_gpu or not self.is_safety_pool_ready():
+        if safety_runs_on_gpu or not self._any_safety_process_alive():
             return baseline_seconds
         average_check_seconds = self._state.avg_safety_seconds
         if average_check_seconds <= 0:
@@ -636,17 +649,28 @@ class WorkerRecoveryCoordinator:
                 )
                 self.orphan_safety_since.pop(job_id, None)
                 self.safety_requeue_count.pop(job_id, None)
+                if not pool_unrecoverable and not self._process_lifecycle.safety_placement_transition_pending:
+                    # A job re-checked SAFETY_REQUEUE_MAX times with no verdict is evidence the safety process
+                    # does not progress, even while it is alive. This is the only watchdog that reads
+                    # safety-check progress, since the lifecycle hang watchdog has no safety-check state, so
+                    # without this a live but hung process is never replaced and faults every job it holds.
+                    self._process_lifecycle.safety_processes_should_be_replaced = True
                 self.engage_safety_soft_pause(reason)
                 continue
 
             if await self._job_tracker.requeue_one_being_safety_checked(job_id):
                 self.safety_requeue_count[job_id] = requeues + 1
                 self.orphan_safety_since.pop(job_id, None)
-                if not self.is_safety_pool_ready() and not self._process_lifecycle.safety_placement_transition_pending:
-                    # A pool that is unready because a placement change is mid-rebuild is already being
-                    # replaced, deliberately, and forcing another replacement restarts that rebuild from the
-                    # beginning. The requeue above is the whole remedy the job needs; the rebuild finishes on
-                    # its own and checks it.
+                if (
+                    not self.is_safety_capacity_available()
+                    and not self._process_lifecycle.safety_placement_transition_pending
+                ):
+                    # A replacement is for a pool with nothing alive to progress. A process mid-check is
+                    # unable to take a check but is progressing, and replacing it discards that check. A
+                    # deferred start is not brought forward by another rebuild. A pool that is unready because
+                    # a placement change is mid-rebuild is already being replaced, deliberately, and forcing
+                    # another replacement restarts that rebuild from the beginning. The requeue above is the
+                    # whole remedy the job needs in those cases.
                     self._process_lifecycle.safety_processes_should_be_replaced = True
                 logger.warning(
                     f"Job {job_id} awaited a safety verdict for {now - first_seen:.0f}s with none returned; "

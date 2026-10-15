@@ -744,3 +744,91 @@ class TestOffGpuSafetyGraceAndPlacementRebuilds:
         await coordinator.reconcile_orphaned_safety_jobs()
 
         assert pm._process_lifecycle.safety_processes_should_be_replaced is True
+
+
+def _add_busy_safety_process(pm: object, process_id: int = 10) -> None:
+    """Attach the only safety process, alive and mid-check, so it is progressing but cannot take a check."""
+    safety_proc = make_mock_process_info(
+        process_id,
+        model_name=None,
+        state=HordeProcessState.EVALUATING_SAFETY,
+        process_type=HordeProcessType.SAFETY,
+    )
+    pm._process_map[process_id] = safety_proc  # type: ignore[attr-defined]
+
+
+class TestBusySafetyProcessCountsAsAlive:
+    """The orphan watchdog judges a late verdict by whether safety is alive, not whether it is idle.
+
+    The safety lane is single-serial, so the one process is unable to accept a check for the whole time it is
+    running one. Read as an unready pool, a healthy process is replaced mid-check and an off-GPU check is held to
+    the on-GPU grace, though the check in progress is what the scaled grace is sized for.
+    """
+
+    async def test_requeue_beside_a_busy_safety_process_does_not_replace_it(self) -> None:
+        """A late verdict is requeued, and the alive process checking ahead of it is left running."""
+        pm = make_testable_process_manager()
+        _add_busy_safety_process(pm)
+        coordinator = pm._recovery_coordinator
+        safety_proc = pm._process_map[10]
+        assert safety_proc.can_accept_job() is False
+        assert safety_proc.is_process_alive() is True
+        assert pm._process_lifecycle.safety_placement_transition_pending is False
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+        coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1.0)
+
+        await coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+        assert coordinator.safety_requeue_count[job_id] == 1
+        assert pm._process_lifecycle.safety_processes_should_be_replaced is False
+
+    async def test_a_busy_off_gpu_safety_process_keeps_the_scaled_grace(self) -> None:
+        """An off-GPU process mid-check is progressing, so the grace scales to the measured check duration."""
+        pm = make_testable_process_manager()
+        _add_busy_safety_process(pm)
+        coordinator = pm._recovery_coordinator
+        pm._process_lifecycle._safety_gpu_paused = True
+        pm._state.avg_safety_seconds = 40.0
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+
+        assert coordinator._orphan_safety_grace_seconds() == 40.0 * (
+            coordinator.SAFETY_GRACE_OFF_GPU_CHECK_MULTIPLE + 1
+        )
+
+    async def test_a_live_process_that_never_returns_a_verdict_is_replaced_at_the_fault(self) -> None:
+        """Requeues leave a live process alone; exhausting them on one job is evidence it does not progress.
+
+        The lifecycle hang watchdog has no safety-check state, so without this a live but hung safety process
+        is never replaced and every job it holds is faulted in turn.
+        """
+        pm = make_testable_process_manager()
+        _add_busy_safety_process(pm)
+        coordinator = pm._recovery_coordinator
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info, process_id=10)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        for attempt in range(1, coordinator.SAFETY_REQUEUE_MAX + 1):
+            coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1.0)
+            await coordinator.reconcile_orphaned_safety_jobs()
+            assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+            assert coordinator.safety_requeue_count[job_id] == attempt
+            assert pm._process_lifecycle.safety_processes_should_be_replaced is False
+            # The orchestrator hands the requeued job back to the same live process.
+            await pm._job_tracker.begin_safety_check(job_info, process_id=10)
+
+        coordinator.orphan_safety_since[job_id] = time.time() - (coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1.0)
+        await coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
+        assert job_info.state == GENERATION_STATE.faulted
+        assert pm._process_lifecycle.safety_processes_should_be_replaced is True
