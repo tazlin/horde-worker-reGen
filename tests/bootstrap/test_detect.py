@@ -50,6 +50,8 @@ def test_cuda_build(version: tuple[int, int], expected: str) -> None:
         ("compute_cap\n7.5", (7, 5)),
         ("", (0, 0)),
         ("no caps here", (0, 0)),
+        ("Failed to initialize NVML: Driver/library version mismatch\nNVML library version: 580.178\n", (0, 0)),
+        ("8.6\r\n", (8, 6)),
     ],
 )
 def test_parse_compute_cap(smi_output: str, expected: tuple[int, int]) -> None:

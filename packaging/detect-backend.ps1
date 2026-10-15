@@ -114,7 +114,9 @@ function Get-NvidiaComputeCap {
     try {
         $out = & $exe --query-gpu=compute_cap --format=csv,noheader 2>$null | Out-String
         $best = $null
-        foreach ($m in [regex]::Matches($out, "(\d+)\.(\d+)")) {
+        # Whole-line only, mirroring worker_bootstrap.detect._COMPUTE_CAP_RE: an NVML failure prints the
+        # driver version to stdout, which an unanchored match reads as a capability.
+        foreach ($m in [regex]::Matches($out, "(?m)^\s*(\d{1,2})\.(\d)\s*$")) {
             $v = [version]("{0}.{1}" -f $m.Groups[1].Value, $m.Groups[2].Value)
             if (-not $best -or $v -gt $best) { $best = $v }
         }

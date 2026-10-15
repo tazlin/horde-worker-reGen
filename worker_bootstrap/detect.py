@@ -33,7 +33,9 @@ ROCM_GFX120X = "rocm-gfx120x"
 CPU = "cpu"
 
 _CUDA_VERSION_RE = re.compile(r"CUDA Version:\s*(\d+)\.(\d+)")
-_COMPUTE_CAP_RE = re.compile(r"(\d+)\.(\d+)")
+# Whole-line only: when NVML fails, nvidia-smi prints a diagnostic carrying the driver version (e.g.
+# "NVML library version: 580.95") to stdout, which an unanchored match reads as a capability.
+_COMPUTE_CAP_RE = re.compile(r"^\s*(\d{1,2})\.(\d)\s*$", re.MULTILINE)
 # The locked wheels cover overlapping but different architecture windows (verified against PyTorch's
 # CUDA build matrix and the NVIDIA CUDA 13 release notes):
 #   cu126 (CUDA 12.6): sm_50..sm_90  (Maxwell through Hopper; no Blackwell)
