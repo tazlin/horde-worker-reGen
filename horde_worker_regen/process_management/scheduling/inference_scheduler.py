@@ -3450,7 +3450,9 @@ class InferenceScheduler:
 
         Held while the residency model is pending or in progress and through the cooldown, so a burst of heavy
         jobs reuses one residency. The operator's maximum hold and the empty-pop release end that retention. A
-        ready different-model head may cut the cooldown short once the minimum hold has amortised the teardown.
+        rung-1 run also ends, with its own work still pending or in progress, once the undispatched head is for a
+        different model and has waited past the anti-starvation bound. A ready different-model head may cut a
+        rung-2 cooldown short once the minimum hold has amortised the teardown.
         The restore's wedge-grace window is granted before the churn is ordered and withdrawn again when the
         release turns out to have changed nothing, so the supervisor is never told to ignore a wedge for free.
         """
@@ -3469,6 +3471,28 @@ class InferenceScheduler:
                 now=now,
                 max_hold_seconds=max_hold_seconds,
             )
+            starved_head = self._job_tracker.undispatched_head()
+            run_starves_head = (
+                state.rung is DominanceRung.CANNOT_CO_SAMPLE
+                and starved_head is not None
+                and starved_head.model is not None
+                and starved_head.model != model
+                and self._head_aged_past_anti_starvation(starved_head)
+            )
+            if run_starves_head and starved_head is not None:
+                # The horde deadline outranks run continuity. The dominant_run seat would otherwise keep seating
+                # the run's queued jobs ahead of this head until the horde drops it. Every reader of a run goes
+                # through the ledger, so ending it here withdraws the copy spare, the seat and the pop claim
+                # together. Work in flight finishes; the run's queued jobs dispatch as ordinary jobs and may start
+                # a new run at their first step.
+                self._whole_card_ledger.record_run_end(device_index)
+                tracked = self._job_tracker.get_tracked_job(starved_head.id_) if starved_head.id_ is not None else None
+                age_since_pop = now - tracked.time_popped if tracked is not None and tracked.time_popped else 0.0
+                logger.info(
+                    f"Dominant-model run for {model} ended because the head job for {starved_head.model} has waited "
+                    f"{age_since_pop:.0f}s since pop, past the anti-starvation bound.",
+                )
+                continue
             if (
                 model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
             ) and not self._residency_can_never_converge(device_index, state, now=now):

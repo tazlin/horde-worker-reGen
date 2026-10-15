@@ -546,7 +546,7 @@ anything there. A rung-1 run does not tear anything down, so the run's jobs have
 the card through the `dominant_run` seat while the run holds it, and the run's own end bounds that seat.
 
 A claim that could stand indefinitely would be a worker that has advertised itself down to one model, so it
-has three ends, and the first to arrive wins:
+has four ends, and the first to arrive wins:
 
 - **The maximum hold.** `whole_card_residency_max_hold_seconds` caps one residency episode, measured from its
   establishment and covering the claim, the minimum hold and the cooldown alike. Past it the residency stops
@@ -562,6 +562,10 @@ has three ends, and the first to arrive wins:
   reading, which is not an operator preference. The hysteresis is what stops one unlucky pop ending a
   productive burst. A pop the horde refuses because the worker is in maintenance counts as an empty pop.
   Under maintenance that refusal is the only answer a pop with no work receives.
+- **A starved head.** A rung-1 run ends once the undispatched head is for a different model and has waited past
+  the anti-starvation fraction of its ttl, even while the run model has work queued, because the horde deadline
+  outranks run continuity. Work in flight finishes; the run's queued jobs dispatch as ordinary jobs and may start a new
+  run at their first step.
 - **The residency itself.** The claim is derived from the residency and the clock on every ask rather than
   latched, so a residency that drains and restores for any other reason takes its claim with it.
 

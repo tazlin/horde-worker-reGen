@@ -2304,6 +2304,70 @@ class TestDominantRunJobPassesAHeldHead:
         )
 
 
+class TestDominantRunEndsForAStarvedHead:
+    """A rung-1 run ends once a head for another model has waited past the anti-starvation bound.
+
+    The horde deadline outranks run continuity. Kept while the run model still has work queued, the run would seat
+    its own jobs ahead of the head until the horde drops it.
+    """
+
+    _TTL_SECONDS = 300.0
+
+    async def _scheduler_with_run_and_head(
+        self,
+        *,
+        head_model: str,
+        head_age_seconds: float,
+    ) -> InferenceScheduler:
+        """A rung-1 run on the card with one of its jobs pending behind an undispatched head."""
+        run_lane = make_mock_process_info(0, model_name="run-model")
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: run_lane}))
+        head = make_job_pop_response(head_model).model_copy(update={"ttl": int(self._TTL_SECONDS)})
+        run_job = make_job_pop_response("run-model")
+        await track_popped_job_async(scheduler._job_tracker, head, time_popped=time.time() - head_age_seconds)
+        await track_popped_job_async(scheduler._job_tracker, run_job)
+        assert scheduler._job_tracker.undispatched_head() is head
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model="run-model",
+            forecast=None,
+            cooldown_until=0.0,
+            now=0.0,
+            rung=DominanceRung.CANNOT_CO_SAMPLE,
+        )
+        return scheduler
+
+    async def test_an_aged_different_model_head_ends_the_run(self) -> None:
+        """The run ends although its own job is still pending."""
+        scheduler = await self._scheduler_with_run_and_head(
+            head_model="head-model",
+            head_age_seconds=self._TTL_SECONDS * (ANTI_STARVATION_TTL_FRACTION + 0.1),
+        )
+
+        scheduler._restore_siblings_after_whole_card()
+
+        assert list(scheduler._whole_card_ledger.held()) == []
+
+    async def test_a_young_different_model_head_keeps_the_run(self) -> None:
+        """A head inside the bound waits for the run's queued work."""
+        scheduler = await self._scheduler_with_run_and_head(head_model="head-model", head_age_seconds=1.0)
+
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._whole_card_ledger.holder_for_model("run-model")[0]
+
+    async def test_an_aged_head_for_the_run_model_keeps_the_run(self) -> None:
+        """A head the run itself serves is never starved by it."""
+        scheduler = await self._scheduler_with_run_and_head(
+            head_model="run-model",
+            head_age_seconds=self._TTL_SECONDS * (ANTI_STARVATION_TTL_FRACTION + 0.1),
+        )
+
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._whole_card_ledger.holder_for_model("run-model")[0]
+
+
 class TestPrivateArbiterCycleFreshness:
     """A scheduler with no manager driving it must still price against the card as it currently is.
 

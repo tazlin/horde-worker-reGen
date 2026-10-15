@@ -224,7 +224,8 @@ until the next cycle re-asks its gate, and the card it was aimed at is excluded 
 the same ground as the head's own. The exclusion is discarded in `begin_scheduling_cycle` and never persists.
 On one card the resumed walk has no other card to offer, so a withheld head ends the loop exactly as before,
 with two exceptions: work that fits beside the post-processing lane's chain, and a rung-1 run's job on the lane
-holding its weights when the head is withheld for residency. The walk's bound is the decline record itself: a
+holding its weights when the head is withheld for residency, until the head ages past the anti-starvation
+bound, which ends the run. The walk's bound is the decline record itself: a
 selection that offers a job the cycle has already declined ends the loop, so a cached pair that outlives its
 decline costs a stalled tick the starvation backstops break, never a loop with no exit inside one tick.
 
