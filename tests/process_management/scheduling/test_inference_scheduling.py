@@ -802,6 +802,34 @@ class TestGetNextJobAndProcess:
         assert result.line_skip.displaced_job is head_job
         assert result.line_skip.reason == "resident_bypass"
 
+    async def test_a_dominant_run_does_not_bypass_a_cold_head_past_the_budget(self) -> None:
+        """The exemption's premise is a teardown the head waits out; a rung-1 run does not tear anything down.
+
+        A run's jobs reach the card through the ``dominant_run`` seat while the run holds it. Past the affinity
+        budget they are ordinary resident work against a cold head, so the head reclaims the fall-through path as
+        it does against any other resident stream.
+        """
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        run_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, run_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        sched._affinity_skip_state = AffinitySkipState(
+            head_job_id=str(head_job.id_),
+            first_skip_time=time.time(),
+            skip_count=_AFFINITY_MAX_SKIPS,
+        )
+        run_state = sched._whole_card_ledger.state_for(None)
+        run_state.model = "resident_b"
+        run_state.rung = DominanceRung.CANNOT_CO_SAMPLE
+
+        assert await sched.get_next_job_and_process() is None
+
     async def test_residency_bypass_does_not_admit_an_unrelated_model(self) -> None:
         """The exemption is the residency's model only: other resident work still needs the affinity budget."""
         holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)

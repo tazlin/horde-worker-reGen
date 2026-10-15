@@ -11257,14 +11257,16 @@ class InferenceScheduler:
             # to prevent, and the job it would serve is one the queue can serve after the release. Only the
             # claimed model may still bypass, so a burst for it keeps flowing.
             pop_claim = self.whole_card_pop_claim()
-            # A residency held for a model other than the head's bars the head from loading at all until it
-            # drains, and the only work that drains it is that model's own queued jobs. Those jobs therefore
-            # bypass regardless of the affinity budget, on the same ground as the pin-wait exemption: they
-            # fund no fresh copy of anything, and the head was not going to run in the meantime, so no bypass
-            # budget is being spent against it. The pop-claim restriction above still applies.
+            # A teardown residency held for a model other than the head's bars the head from loading at all
+            # until it drains, and the only work that drains it is that model's own queued jobs. Those jobs
+            # therefore bypass regardless of the affinity budget, on the same ground as the pin-wait exemption.
+            # They do not fund a fresh copy, and the head was not going to run in the meantime, so no
+            # bypass budget is being spent against it. A rung-1 run does not tear anything down, so the run's jobs
+            # have no such claim here; they reach the card through the ``dominant_run`` seat while the run holds
+            # it. The pop-claim restriction above still applies.
             residency_bypass_models = {
                 residency.model
-                for _residency_device_index, residency in self._whole_card_ledger.held()
+                for _residency_device_index, residency in self._whole_card_ledger.teardown_held()
                 if residency.model is not None and residency.model != next_job.model
             }
             if pinned_resident is not None or within_affinity_budget or residency_bypass_models:

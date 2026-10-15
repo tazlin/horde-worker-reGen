@@ -538,10 +538,12 @@ the same reason, a foreign job cannot line-skip onto the residency card while th
 another model forward there is the very eviction the residency was taken out to prevent; only the resident
 model may still bypass, so a burst for it keeps flowing.
 
-That bypass is exempt from the affinity skip budget, on the same ground as a pin-waiting head: a residency
-held for some other model bars the head from loading at all until it drains, and the only work that drains it
-is the resident model's own queued jobs. Holding them behind the head funds no fresh copy of anything and
-leaves nothing that can release the card, so the budget has nothing to protect there.
+That bypass is exempt from the affinity skip budget, on the same ground as a pin-waiting head, for a teardown
+(rung-2) residency only. A residency held for some other model bars the head from loading at all until it
+drains, and the only work that drains it is the resident model's own queued jobs. Holding them behind the head
+does not fund a fresh copy and does not leave any work that can release the card, so the budget does not protect
+anything there. A rung-1 run does not tear anything down, so the run's jobs have no such exemption; they reach
+the card through the `dominant_run` seat while the run holds it, and the run's own end bounds that seat.
 
 A claim that could stand indefinitely would be a worker that has advertised itself down to one model, so it
 has three ends, and the first to arrive wins:
