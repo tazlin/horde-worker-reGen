@@ -176,8 +176,9 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   A run starts at its first step and ends in `_restore_siblings_after_whole_card`, either drained or with a
   different-model head past `_head_aged_past_anti_starvation`, and every reader of a run goes through the ledger.
   The establish-rate limiter is the only governor that defers (`DEFER_RESIDENCY_GOVERNOR`, which does not stop the
-  preload pass); the grace allowance only decides whether an excuse window opens (`grace_seconds_to_open`). The
-  owners, readers, fences and open questions are in
+  preload pass, and a head it withholds at dispatch is stepped past by a `diversity` line-skip); the grace
+  allowance only decides whether an excuse window opens (`grace_seconds_to_open`). The owners, readers, fences
+  and open questions are in
   [the runs and residency map](docs/reference/responsibility-map-runs-and-residency.md).
 - **How long a queue head may wait:** `scheduling/dispatch_affinity.py` owns the two clocks that read the horde
   deadline (the skip budget, 6 skips or 0.2 x ttl, and the anti-starvation override at 0.3 x ttl from pop). Every

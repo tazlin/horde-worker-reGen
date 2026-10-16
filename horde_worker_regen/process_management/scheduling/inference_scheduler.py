@@ -2755,31 +2755,18 @@ class InferenceScheduler:
             return _WholeCardDemandOutcome.FALL_THROUGH
 
         held = self._whole_card_ledger.get(target_device_index)
-        establishing_anew = held is None or held.model is None
-        governor_hold = (
-            self._whole_card_ledger.governor_hold(target_device_index, now=self._clock())
-            if establishing_anew
-            else None
+        governor_hold = self._whole_card_governor_defers(
+            job,
+            device_index=target_device_index,
+            establishing_anew=held is None or held.model is None,
         )
         if governor_hold is not None:
             # The rate limiter brakes how fast this card may be rotated; it never says the head cannot be served.
             # The head waits for the card (it re-asks every cycle until the window lets it through) and is never
             # admitted co-resident, since the forecast has already said its weights stream beside the siblings.
             # The card is not parked meanwhile, since the preload pass goes on to the jobs behind the head.
-            elapsed = self._whole_card_ledger.note_governor_defer(
-                target_device_index,
-                model=job.model,
-                now=self._clock(),
-            )
-            self._disclose_whole_card_governor_hold(
-                job,
-                governor_hold,
-                device_index=target_device_index,
-                elapsed=elapsed,
-            )
             self._last_budget_defer_reason = governor_hold.reason
             return _WholeCardDemandOutcome.DEFER_GOVERNOR
-        self._whole_card_ledger.clear_governor_defer(target_device_index, now=self._clock())
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
         self._job_tracker.mark_admitted_exclusive(job, device_index=target_device_index)
@@ -3282,21 +3269,15 @@ class InferenceScheduler:
         # has already said its weights stream beside the siblings; it keeps asking until the window lets it
         # through. The deferral record is shared with the admission path through the ledger.
         held = self._whole_card_ledger.get(target_device_index)
-        if held is None or held.model is None or held.model != job.model:
-            governor_hold = self._whole_card_ledger.governor_hold(target_device_index, now=self._clock())
-            if governor_hold is not None:
-                elapsed = self._whole_card_ledger.note_governor_defer(
-                    target_device_index,
-                    model=job.model,
-                    now=self._clock(),
-                )
-                self._disclose_whole_card_governor_hold(
-                    job,
-                    governor_hold,
-                    device_index=target_device_index,
-                    elapsed=elapsed,
-                )
-                return False
+        if (
+            self._whole_card_governor_defers(
+                job,
+                device_index=target_device_index,
+                establishing_anew=held is None or held.model is None or held.model != job.model,
+            )
+            is not None
+        ):
+            return False
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
         # Disclose the arithmetic behind a dispatch-time claim, which is otherwise established silently:
@@ -3647,6 +3628,29 @@ class InferenceScheduler:
             return
         self._min_hold_disclosed[device_index] = model
         logger.info(f"A ready different-model head may not release this residency yet: {disclosure}.")
+
+    def _whole_card_governor_defers(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        device_index: int | None,
+        establishing_anew: bool,
+    ) -> WholeCardGovernorHold | None:
+        """Return the establish-rate hold deferring ``job``'s whole-card claim, recording it, or None.
+
+        Preload admission and the dispatch-time claim both ask here, so a head the limiter lets through on
+        either path clears the record the other may have left. A record that outlived its deferral would go on
+        excusing the card for the limiter's whole window and time the next cleared line from a stale start.
+        """
+        governor_hold = (
+            self._whole_card_ledger.governor_hold(device_index, now=self._clock()) if establishing_anew else None
+        )
+        if governor_hold is None:
+            self._whole_card_ledger.clear_governor_defer(device_index, now=self._clock())
+            return None
+        elapsed = self._whole_card_ledger.note_governor_defer(device_index, model=job.model, now=self._clock())
+        self._disclose_whole_card_governor_hold(job, governor_hold, device_index=device_index, elapsed=elapsed)
+        return governor_hold
 
     def _disclose_whole_card_governor_hold(
         self,
@@ -11415,22 +11419,38 @@ class InferenceScheduler:
             and line_skip is None
             and not self._resident_whole_card_head_ready(next_job, process_with_model)
         ):
-            # The stall classifier re-derives most gates, but this one decides on the residency's live teardown
-            # and drain, which no later read reproduces exactly; the pass's own record names it.
-            if next_job.id_ is not None:
-                self._dispatch_holds.note_decline(
-                    DispatchDecline(
-                        job_id=str(next_job.id_),
-                        bucket=SlotDutyBucket.WHOLE_CARD_CONVERGENCE,
-                        device_index=process_with_model.device_index,
-                        detail=(
-                            "its whole-card residency has not yet cleared the card for it: the teardown is "
-                            "incomplete or the freed memory has not finished draining"
-                        ),
-                    ),
+            # A head the establish-rate limiter withholds is stepped past here as the preload pass steps past it,
+            # so a different model resident on a free lane runs while the head waits for the window. The diversity
+            # fill above does not reach this case, because it runs only when the head's own lane is busy.
+            governor_deferred = (
+                self._whole_card_ledger.governor_deferred_head(
+                    self._routing_device_index(process_with_model),
+                    now=self._clock(),
                 )
-            self._pending_line_skip = None
-            return None
+                == next_job.model
+            )
+            behind_governed_head = (
+                self._select_idle_thread_diversity_job(next_job, next_n_jobs) if governor_deferred else None
+            )
+            if behind_governed_head is None:
+                # The stall classifier re-derives most gates, but this one decides on the residency's live
+                # teardown and drain, which no later read reproduces exactly; the pass's own record names it.
+                if next_job.id_ is not None:
+                    self._dispatch_holds.note_decline(
+                        DispatchDecline(
+                            job_id=str(next_job.id_),
+                            bucket=SlotDutyBucket.WHOLE_CARD_CONVERGENCE,
+                            device_index=process_with_model.device_index,
+                            detail=(
+                                "its whole-card residency has not yet cleared the card for it: the teardown is "
+                                "incomplete or the freed memory has not finished draining"
+                            ),
+                        ),
+                    )
+                self._pending_line_skip = None
+                return None
+            line_skip = LineSkip(displaced_job=next_job, reason="diversity")
+            next_job, process_with_model = behind_governed_head
 
         # Hold a would-be concurrent job back until the in-flight job(s) have made size-appropriate
         # headway, so two heavy models (or a batch / extra-large model) do not stack their loads and
@@ -13898,6 +13918,17 @@ class InferenceScheduler:
                 skip_detail = (
                     "the displaced job waits for a dominant-model run's weights to leave the card, and this job is "
                     "that run's, on the lane already holding them"
+                )
+            elif (
+                self._whole_card_ledger.governor_deferred_head(
+                    self._routing_device_index(process_with_model),
+                    now=self._clock(),
+                )
+                == line_skip.displaced_job.model
+            ):
+                skip_detail = (
+                    "the establish-rate limiter is deferring the displaced job's whole-card residency, and this job's "
+                    "model is already resident on a free lane"
                 )
             else:
                 skip_detail = "the displaced job's process is busy sampling its own model"

@@ -1228,6 +1228,81 @@ class TestGovernorsBrakeChurnWithoutParkingTheQueue:
         assert len(state.establishments) == establishments_before, "the rate limiter counted no establishment"
         assert scheduler._job_tracker.is_admitted_exclusive(flux_job) is False
 
+    def test_a_dispatch_time_deferral_is_cleared_when_its_head_goes_through(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A head the limiter lets through at dispatch time leaves no deferral record behind it.
+
+        A record that outlives its deferral goes on excusing the card for the rest of the limiter's window, and the
+        next clear times its line from the stale record. The cleared line quotes the deferral's own duration.
+        """
+        scheduler, available_process, forecast = self._scheduler_and_head()
+        flux_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4)
+        TestChurnGovernors._spend_the_grace_budget(scheduler, flux_job, forecast)
+        self._pin_the_whole_card_forecast(monkeypatch, scheduler, free_now_mb=_CARD16_FREE_IF_ALONE_MB)
+        ledger = scheduler._whole_card_ledger
+        assert ledger.establish_rate_exceeded(None, now=time.time()) is True
+
+        assert scheduler._resident_whole_card_head_ready(flux_job, available_process) is False
+        assert ledger.governor_deferred_head(None, now=time.time()) == _FLUX_MODEL, (
+            "precondition: the dispatch-time path records its deferral"
+        )
+        deferral_seconds = 30.0
+        state = ledger.state_for(None)
+        state.governor_deferred_since = time.time() - deferral_seconds
+
+        TestChurnGovernors._clear_the_establishment_rate_history(scheduler)
+        with patch.object(whole_card_module.logger, "info") as info:
+            scheduler._resident_whole_card_head_ready(flux_job, available_process)
+
+        assert ledger.governor_deferred_head(None, now=time.time()) is None, (
+            "the head went through at dispatch time, so its deferral record must not go on excusing the card"
+        )
+        assert state.governor_deferred_since == 0.0
+        cleared_lines = [str(call) for call in info.call_args_list if "governor deferral" in str(call)]
+        assert len(cleared_lines) == 1, f"the deferral is cleared once, when its head goes through: {cleared_lines}"
+        assert f"cleared after {deferral_seconds:.0f}s held" in cleared_lines[0], (
+            f"the cleared line must quote the deferral's own duration: {cleared_lines[0]}"
+        )
+
+    async def test_a_head_withheld_at_dispatch_by_the_limiter_lets_a_resident_follower_run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A head the limiter withholds at dispatch does not hold a resident different-model job behind it.
+
+        The deferral is a brake on how fast the card is rotated, so normal scheduling continues around the head as
+        it does at preload. The follower's weights are resident on a free lane, so it runs while the head waits for
+        the window; the head itself is not dispatched and does not take the card.
+        """
+        scheduler, _holder, _forecast = self._scheduler_and_head()
+        ledger = scheduler._whole_card_ledger
+        ledger.state_for(None).establishments.extend([time.time()] * _ESTABLISH_WINDOW_LIMIT)
+        assert ledger.establish_rate_exceeded(None, now=time.time()) is True, (
+            "precondition: the card's establish-rate allowance is spent, so the limiter defers the head"
+        )
+        self._pin_the_whole_card_forecast(monkeypatch, scheduler, free_now_mb=_CARD16_FREE_IF_ALONE_MB)
+        head = await track_popped_job_async(
+            scheduler._job_tracker,
+            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216, ddim_steps=4),
+        )
+        follower = await track_popped_job_async(scheduler._job_tracker, make_job_pop_response(_SDXL_A))
+        assert scheduler.resident_process_for_job(head) is not None, "precondition: the head's weights are resident"
+
+        selection = await scheduler.get_next_job_and_process()
+
+        assert ledger.governor_deferred_head(None, now=time.time()) == _FLUX_MODEL, (
+            "precondition: the head was withheld by the limiter at dispatch time"
+        )
+        assert selection is not None, "the resident follower on a free lane waited behind the governed head"
+        assert selection.next_job is follower
+        assert selection.process_with_model.loaded_horde_model_name == _SDXL_A
+        assert selection.line_skip is not None
+        assert selection.line_skip.displaced_job is head
+        assert scheduler.is_whole_card_residency_active() is False, "the governed head must not take the card"
+        assert scheduler._job_tracker.is_admitted_exclusive(head) is False
+
 
 class TestReaskingAHeldResidencyIsANoOp:
     """A parked head re-asking for the residency its card already holds changes nothing.

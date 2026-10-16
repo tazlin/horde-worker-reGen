@@ -580,7 +580,9 @@ served. The held head keeps asking every cycle and is never admitted co-resident
 that it cannot co-reside is not served beside siblings because a brake is in force. The deferral is recorded
 as `defer_residency_governor`, which ends that job's turn in the preload pass and lets the pass go on to later
 jobs, so the card is not parked. The dispatch-time residency check defers the same way, through the same
-ledger record, so a head cannot win the card back at dispatch time while the limiter holds.
+ledger record, so a head cannot win the card back at dispatch time while the limiter holds. The dispatch pass
+steps past a head held there to a different model resident on a free lane (a `diversity` line-skip), so the
+card is not parked at dispatch either. Either path clears the record when it lets the head through.
 
 Only one reconciler may change safety placement. Whole-card residency contributes a persistent off-GPU veto,
 the reclaim ladder contributes a one-shot request, and runtime placement contributes a demand derived from
