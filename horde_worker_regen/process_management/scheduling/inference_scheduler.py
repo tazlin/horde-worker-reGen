@@ -6434,6 +6434,7 @@ class InferenceScheduler:
             unserviceable_reason=self._unserviceable_job_reason,
             component_charge_mb=self._unet_component_charge_mb,
             staging_charge_mb=self._checkpoint_staging_charge_mb,
+            checkpoint_file_mb=lambda job: None if job.model is None else self._checkpoint_file_mb(job.model),
             feature_ram_mb=lambda job: self._job_feature_ram(job).total_mb,
             swap_charge_mb=self._learned_swap_charge_mb,
             checkpoint_models_held=self._checkpoint_models_held_on,

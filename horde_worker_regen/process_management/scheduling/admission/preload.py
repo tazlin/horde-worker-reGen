@@ -1186,9 +1186,10 @@ def decide_commit_admission(snapshot: SchedulingSnapshot, job_id: str, process_i
     """Judge the checkpoint mapping a load makes against the host's available commit.
 
     A child maps the checkpoint as a copy-on-write view, which on Windows charges the whole file to commit at map
-    time however few of its pages are resident. The charge is therefore the job's whole staging charge plus its
-    feature RAM (private allocations charge commit too), with no page-reuse or component credit; the reserve,
-    the danger floor and the outstanding planned RAM are the RAM verdict's own.
+    time however few of its pages are resident. The charge is therefore the checkpoint's file size plus the job's
+    feature RAM (private allocations charge commit too), with no page-reuse or component credit. The staging
+    charge can be a learned resident-set peak, which does not see the mapping, so it does not price commit. The
+    reserve, the danger floor and the outstanding planned RAM are the RAM verdict's own.
 
     Returns:
         The verdict, or None when the load is not priced against commit: the host reports no commit figure
@@ -1196,7 +1197,7 @@ def decide_commit_admission(snapshot: SchedulingSnapshot, job_id: str, process_i
     """
     committable_mb = snapshot.host_ram.available_commit_mb
     job = snapshot.queue.jobs[job_id]
-    if committable_mb is None or job.model is None or job.staging_charge_mb is None:
+    if committable_mb is None or job.model is None or job.checkpoint_file_mb is None:
         return None
     if job.model in snapshot.slots[process_id].checkpoint_models_held:
         return None
@@ -1206,7 +1207,7 @@ def decide_commit_admission(snapshot: SchedulingSnapshot, job_id: str, process_i
         committable_mb,
         committed_reserve_mb=snapshot.services.reserve_ledger.total_ram_mb(),
         danger_floor_mb=snapshot.host_ram.danger_floor_mb,
-        staging_charge_mb=job.staging_charge_mb + job.feature_ram_mb,
+        staging_charge_mb=job.checkpoint_file_mb + job.feature_ram_mb,
         outstanding_planned_mb=snapshot.host_ram.outstanding_planned_mb,
     )
 

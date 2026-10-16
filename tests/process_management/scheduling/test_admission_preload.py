@@ -657,6 +657,7 @@ class TestCommitAdmission:
             available_ram_mb=available_ram_mb,
         )
         scheduler._checkpoint_staging_charge_mb = lambda _job: 7000.0  # type: ignore[method-assign]
+        scheduler._checkpoint_file_mb = lambda _model: 7000.0  # type: ignore[method-assign]
         scheduler.set_available_commit_mb_provider(lambda: available_commit_mb)
         return scheduler, str(jobs[0].id_)
 
@@ -673,6 +674,42 @@ class TestCommitAdmission:
         assert admission.commit_verdict is not None
         assert admission.commit_verdict.predicted_mb == 7000.0 + snapshot.queue.jobs[job_id].feature_ram_mb
         assert "(commit-bound: 1000 MB committable): does NOT fit" in admission.reason()
+
+    async def test_commit_charges_the_file_size_where_the_learned_staging_charge_is_lower(self) -> None:
+        """A mapping charges its whole file to commit, so a learned resident-set peak under it does not admit."""
+        scheduler, job_id = await self._commit_worker(available_commit_mb=1_000_000.0)
+        scheduler._checkpoint_staging_charge_mb = lambda _job: 3500.0  # type: ignore[method-assign]
+        scheduler._checkpoint_file_mb = lambda _model: 12533.0  # type: ignore[method-assign]
+        ample = decide_ram_admission(scheduler.snapshot(), job_id, 0).commit_verdict
+        assert ample is not None
+        # The reserve scales with the host's measured RAM, so the committable figure is set from it: between the
+        # learned charge and the file size, whatever machine runs the row.
+        before = scheduler.snapshot()
+        features_mb = before.queue.jobs[job_id].feature_ram_mb
+        kept_mb = (
+            max(ample.reserve_mb, before.host_ram.danger_floor_mb or 0.0) + before.host_ram.outstanding_planned_mb
+        )
+        between_mb = kept_mb + features_mb + (3500.0 + 12533.0) / 2
+        scheduler.set_available_commit_mb_provider(lambda: between_mb)
+        snapshot = scheduler.snapshot()
+
+        admission = decide_ram_admission(snapshot, job_id, 0)
+
+        assert admission.verdict.fits, "physical RAM admits the load at the learned charge"
+        assert admission.commit_verdict is not None
+        assert admission.commit_verdict.predicted_mb == 12533.0 + features_mb
+        assert admission.commit_bound is True
+        assert admission.fits is False
+
+    async def test_an_unknown_file_size_leaves_commit_unpriced(self) -> None:
+        """Without the checkpoint's file size there is no mapping charge, whatever staging charge is known."""
+        scheduler, job_id = await self._commit_worker(available_commit_mb=1000.0)
+        scheduler._checkpoint_file_mb = lambda _model: None  # type: ignore[method-assign]
+
+        admission = decide_ram_admission(scheduler.snapshot(), job_id, 0)
+
+        assert admission.commit_verdict is None
+        assert admission.fits is admission.verdict.fits
 
     async def test_a_commit_bound_deferral_still_matches_the_registered_log_line(self) -> None:
         """The commit-bound reason keeps the registered RAM-defer signature's fields parseable."""
@@ -745,6 +782,7 @@ class TestPageReuseCreditAgainstCommit:
         mark_ram_unload_settled(retaining)
         scheduler, jobs = await _worker(slots={0: retaining}, pending=["sd"], available_ram_mb=available_ram_mb)
         scheduler._checkpoint_staging_charge_mb = lambda _job: cls._MAPPING_MB  # type: ignore[method-assign]
+        scheduler._checkpoint_file_mb = lambda _model: cls._MAPPING_MB  # type: ignore[method-assign]
         scheduler.set_available_commit_mb_provider(lambda: available_commit_mb)
         return scheduler, str(jobs[0].id_)
 

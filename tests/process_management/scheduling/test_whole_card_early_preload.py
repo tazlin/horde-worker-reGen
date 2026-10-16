@@ -237,6 +237,7 @@ class TestEarlyRamPreStage:
         scheduler._measured_available_ram_mb = lambda: 64000.0  # type: ignore[method-assign]
         scheduler._measured_total_ram_mb = lambda: 64000.0  # type: ignore[method-assign]
         scheduler._checkpoint_staging_charge_mb = lambda _job: _FLUX_WEIGHTS_MB  # type: ignore[method-assign]
+        scheduler._checkpoint_file_mb = lambda _model: _FLUX_WEIGHTS_MB  # type: ignore[method-assign]
         # Commit sits above the 9600 MB danger floor of a 64000 MB host, so the governor's floor does not hold the
         # host, yet below the mapping plus reserve and floor the admission prices, so only the admission defers.
         scheduler.set_available_commit_mb_provider(lambda: 20000.0)

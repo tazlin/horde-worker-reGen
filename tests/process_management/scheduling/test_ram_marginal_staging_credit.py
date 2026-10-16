@@ -137,6 +137,7 @@ class TestCreditAgainstCommit:
         scheduler._measured_available_ram_mb = lambda: 60000.0  # type: ignore[method-assign]
         scheduler._ram_danger_floor_mb = lambda: 4800.0  # type: ignore[method-assign]
         scheduler._checkpoint_staging_charge_mb = lambda _job: _MAPPING_MB  # type: ignore[method-assign]
+        scheduler._checkpoint_file_mb = lambda _model: _MAPPING_MB  # type: ignore[method-assign]
         scheduler.set_available_commit_mb_provider(lambda: available_commit_mb)
         job = make_job_pop_response("head_model")
         await track_popped_job_async(scheduler._job_tracker, job)

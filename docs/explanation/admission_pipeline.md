@@ -134,8 +134,9 @@ available figure cannot see it, and at the commit limit the child's next mapping
 carries `HostRamSnapshot.available_commit_mb` (`GlobalMemoryStatusEx`'s `ullAvailPageFile`, read by
 [`measure_available_commit_mb`][horde_worker_regen.process_management.scheduling.host_commit.measure_available_commit_mb];
 None on POSIX). A preload whose target does not already hold the checkpoint is judged against it as well as
-against available RAM: the charge is the whole staging charge plus feature RAM, with no page-reuse or component
-credit, under the same reserve, danger floor and outstanding planned RAM. The preload fits only when both do,
+against available RAM: the charge is the checkpoint's file size plus feature RAM, with no page-reuse or
+component credit, under the same reserve, danger floor and outstanding planned RAM. The learned staging charge
+is a resident-set peak, which does not see the mapping, so it does not price commit. The preload fits only when both do,
 and a deferral that commit alone caused says so in its log line (`(commit-bound: N MB committable)`). The
 idle-lane warm re-reads pages of a mapping that already exists, so it is not priced against commit. With no
 commit figure the RAM verdict stands alone, as before.

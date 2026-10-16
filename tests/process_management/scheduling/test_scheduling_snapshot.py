@@ -199,6 +199,18 @@ class TestSchedulingSnapshot:
         assert snapshot.host_ram.outstanding_planned_mb == 1200
         assert scheduler.snapshot().host_ram.outstanding_planned_mb == 5000
 
+    async def test_the_checkpoint_file_size_is_frozen_apart_from_the_staging_charge(self) -> None:
+        """The commit verdict's file size is captured at build, separately from the learned staging charge."""
+        _initial, scheduler = await self._scheduler()
+        scheduler._checkpoint_staging_charge_mb = lambda _job: 3500.0
+        scheduler._checkpoint_file_mb = lambda _model: 12533.0
+        snapshot = scheduler.snapshot()
+        scheduler._checkpoint_file_mb = lambda _model: None
+        jobs = [job for job in snapshot.queue.jobs.values() if job.model is not None]
+        assert jobs, "the harness queues at least one job with a model"
+        assert all(job.checkpoint_file_mb == 12533.0 and job.staging_charge_mb == 3500.0 for job in jobs)
+        assert all(job.checkpoint_file_mb is None for job in scheduler.snapshot().queue.jobs.values())
+
     async def test_available_commit_is_captured_from_its_provider(self) -> None:
         """The snapshot carries the commit reading of its build, and None where the host reports none."""
         _initial, scheduler = await self._scheduler()

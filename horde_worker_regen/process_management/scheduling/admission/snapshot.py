@@ -191,6 +191,9 @@ class JobSnapshot:
     staging_charge_mb: float | None = None
     """The whole checkpoint's RAM staging charge (MB): trusted measured peak, else file bytes, else the
     context seed. Excludes feature RAM."""
+    checkpoint_file_mb: float | None = None
+    """The checkpoint file's size (MB), or None when it cannot be resolved or statted. A mapped file charges its
+    whole size to commit, which no resident-set reading sees, so the commit verdict prices this figure."""
     feature_ram_mb: float = 0.0
     """RAM (MB) the job's features allocate in every process, added to whichever checkpoint charge applies."""
     swap_charge_mb: float | None = None
@@ -571,6 +574,7 @@ def build_scheduling_snapshot(
     unserviceable_reason: Callable[[ImageGenerateJobPopResponse], str | None],
     component_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
     staging_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
+    checkpoint_file_mb: Callable[[ImageGenerateJobPopResponse], float | None],
     feature_ram_mb: Callable[[ImageGenerateJobPopResponse], float],
     swap_charge_mb: Callable[[ImageGenerateJobPopResponse], float | None],
     checkpoint_models_held: Callable[[int], frozenset[str]],
@@ -680,6 +684,7 @@ def build_scheduling_snapshot(
             unserviceable_reason=unserviceable_reason(job),
             component_charge_mb=component_charge_mb(job),
             staging_charge_mb=staging_charge_mb(job),
+            checkpoint_file_mb=checkpoint_file_mb(job),
             feature_ram_mb=feature_ram_mb(job),
             swap_charge_mb=swap_charge_mb(job),
             resident_overhead_seconds=(
