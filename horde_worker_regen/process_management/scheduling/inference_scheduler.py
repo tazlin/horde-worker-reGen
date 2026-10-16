@@ -4682,6 +4682,15 @@ class InferenceScheduler:
                 f"pass withheld it: {declined.detail}"
             )
 
+        # Selection and preload admission skip a head whose LoRAs or textual inversions are still being placed
+        # on disk, so no dispatch gate is reached and no decline is stamped for it. The hold is the registered
+        # aux-preparation gate, and the head becomes dispatchable once the prefetch pipeline marks it prepared.
+        if self._job_tracker.job_requires_aux_preparation(head):
+            return SlotDutyBucket.AUX_PREPARATION, (
+                f"its model is resident and idle on process {process.process_id}, but its auxiliary models are "
+                "still being placed on disk, so it holds no lane and cannot sample"
+            )
+
         return SlotDutyBucket.UNEXPLAINED, (
             f"its model is resident and idle on process {process.process_id} but dispatch was withheld with no "
             "matching gate; this is a scheduler stall worth reporting"

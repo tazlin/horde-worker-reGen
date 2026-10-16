@@ -17,7 +17,7 @@ import dataclasses
 import time
 from unittest.mock import Mock, patch
 
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -380,6 +380,27 @@ class TestSchedulerClassifierBuckets:
 
         assert bucket is SlotDutyBucket.UNEXPLAINED
         assert "no matching gate" in text
+
+    async def test_aux_unprepared_resident_head_classifies_aux_preparation(self) -> None:
+        """A resident-idle head whose LoRAs are still being placed on disk is named AUX_PREPARATION.
+
+        Selection skips such a head, so the dispatch pass does not stamp a decline for it, and the hold is the
+        registered ``aux_preparation`` gate rather than the gate-less stall.
+        """
+        job_tracker = JobTracker()
+        head = make_job_pop_response(model="model-a", loras=[LorasPayloadEntry(name="123", is_version=False)])
+        await job_tracker.record_popped_job(head)
+        holder = make_mock_process_info(1, model_name="model-a", state=HordeProcessState.PRELOADED_MODEL)
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(horde_model_name="model-a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+        scheduler = self._scheduler(ProcessMap({1: holder}), horde_model_map, job_tracker)
+        assert job_tracker.job_requires_aux_preparation(head)
+
+        bucket, text = scheduler._classify_dispatch_stall(head, {})
+
+        assert bucket is SlotDutyBucket.AUX_PREPARATION
+        assert "auxiliary models" in text
+        assert "no matching gate" not in text
 
 
 class TestStallReasonStability:

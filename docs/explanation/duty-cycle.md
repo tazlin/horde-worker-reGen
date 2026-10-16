@@ -270,6 +270,9 @@ Under two-phase clearance (`gpu_sampling_lease_two_phase`) the dispatch-time ove
 leased jobs, because the stage and sample grants price the weight load and the denoise onset. `overlap_headway`
 therefore reads zero there, and the scheduler logs once per overlap episode on a card that the headway is not
 applied.
+An `aux_preparation` slot is a head whose LoRAs or textual inversions the pop-time prefetch pipeline is still
+placing on disk. Selection skips that head, so the dispatch pass does not decline it, and the classifier names the
+hold from the job tracker's preparation flag. The head becomes dispatchable once the job is marked prepared.
 `unexplained`
 growing is itself a finding: an empty slot with queued work that no gate claims (and no reconcile hold
 explains) is the scheduler-bug-shaped case. The cumulative totals also ride every stats sample (`slot_duty_totals`),
