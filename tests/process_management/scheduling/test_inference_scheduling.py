@@ -42,6 +42,7 @@ from horde_worker_regen.process_management.models.model_metadata import ModelMet
 from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
+from horde_worker_regen.process_management.resources.vram_footprints import ResolutionBucket
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.admission import preload, pricing
 from horde_worker_regen.process_management.scheduling.admission.commands import FaultCause, FaultJob
@@ -2468,6 +2469,160 @@ class TestDominantRunEndsWhenSuperseded:
         scheduler._establish_whole_card_residency(make_job_pop_response("run-model"), forecast, announce=False)
 
         assert self._run_ends(scheduler) == []
+
+
+class TestLineSkipSeatsReadTheRung:
+    """A line-skip seat never places a job the card's dominance rung says cannot run beside the work it assumes.
+
+    The diversity seat places a different model beside the head's sampling lane, so rung 1 and rung 2 candidates
+    are skipped. The resident-bypass seat places a resident model while the head is cold, so only rung 2 is skipped:
+    a rung-1 run may start from an idle card.
+    """
+
+    @staticmethod
+    def _pin_rung(
+        monkeypatch: pytest.MonkeyPatch, scheduler: InferenceScheduler, model: str, rung: DominanceRung
+    ) -> None:
+        """Pin the card's verdict so ``model`` sits on ``rung``."""
+        inputs = pricing.DominanceInputs(
+            offered_models=frozenset({model}),
+            whole_card_pins=frozenset(),
+            total_vram_mb=24000.0,
+            first_context_mb=0.0,
+            marginal_context_mb=0.0,
+            admission_noise_mb=0.0,
+            foreign_floor_bucket=None,
+            sample_observation_counts=(),
+        )
+        peak = pricing.ModelSamplingPeak(
+            model=model,
+            peak_mb=None,
+            band=next(iter(ResolutionBucket)),
+            observation_count=0,
+        )
+        dominance = pricing.CardDominance(
+            inputs=inputs,
+            foreign_floor_mb=0.0,
+            verdicts={model: pricing.ModelDominance(peak=peak, rung=rung)},
+        )
+        monkeypatch.setattr(scheduler, "card_dominance", lambda _device_index: dominance)
+
+    @staticmethod
+    async def _busy_head_world() -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, HordeProcessInfo]:
+        """A head whose own lane is sampling its model, and a different model resident on a free lane behind it."""
+        head_lane = make_mock_process_info(1, model_name="model_a", state=HordeProcessState.INFERENCE_STARTING)
+        candidate_lane = make_mock_process_info(2, model_name="model_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: head_lane, 2: candidate_lane})
+        hmm = HordeModelMap(root={})
+        hmm.update_entry(horde_model_name="model_a", load_state=ModelLoadState.IN_USE, process_id=1)
+        hmm.update_entry(horde_model_name="model_b", load_state=ModelLoadState.LOADED_IN_RAM, process_id=2)
+        job_tracker = JobTracker()
+        await mark_job_in_progress_async(job_tracker, make_job_pop_response("model_a"))
+        follower = make_job_pop_response("model_b")
+        for job in (make_job_pop_response("model_a"), follower):
+            await track_popped_job_async(job_tracker, job)
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=hmm,
+            job_tracker=job_tracker,
+            max_concurrent=2,
+            max_inference=2,
+        )
+        return scheduler, follower, candidate_lane
+
+    @staticmethod
+    async def _cold_head_world() -> tuple[InferenceScheduler, ImageGenerateJobPopResponse, HordeProcessInfo]:
+        """A cold head with a different model resident on a free lane behind it."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        job_tracker = JobTracker()
+        bypass_job = make_job_pop_response("resident_b")
+        for job in (make_job_pop_response("big_a"), bypass_job):
+            await track_popped_job_async(job_tracker, job)
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({1: holder}), job_tracker=job_tracker)
+        return scheduler, bypass_job, holder
+
+    @pytest.mark.parametrize("rung", [DominanceRung.CANNOT_CO_RESIDE, DominanceRung.CANNOT_CO_SAMPLE])
+    async def test_the_diversity_seat_skips_a_rung_1_or_2_candidate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        rung: DominanceRung,
+    ) -> None:
+        """A rung-1 or rung-2 model is not seated beside the head's sampling lane, and the head keeps its turn."""
+        scheduler, _follower, _candidate_lane = await self._busy_head_world()
+        self._pin_rung(monkeypatch, scheduler, "model_b", rung)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_a_rung_1_candidate_is_barred_only_while_its_card_has_work(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A rung-1 follower is not seated while its card has a job running, and may start a run on an idle card."""
+        scheduler, follower, candidate_lane = await self._busy_head_world()
+        self._pin_rung(monkeypatch, scheduler, "model_b", DominanceRung.CANNOT_CO_SAMPLE)
+        head = scheduler._job_tracker.jobs_pending_inference[0]
+        candidates = list(scheduler._job_tracker.jobs_pending_inference)
+
+        assert scheduler._select_idle_thread_diversity_job(head, candidates) is None
+
+        monkeypatch.setattr(scheduler, "_card_has_job_in_progress", lambda _process: False)
+        assert scheduler._select_idle_thread_diversity_job(head, candidates) == (
+            follower,
+            candidate_lane,
+        ), "on a card with nothing running, a rung-1 follower may start its run"
+
+    async def test_the_diversity_seat_seats_a_rung_none_candidate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A model that co-samples is still seated beside the head's sampling lane."""
+        scheduler, follower, candidate_lane = await self._busy_head_world()
+        self._pin_rung(monkeypatch, scheduler, "model_b", DominanceRung.NONE)
+
+        result = await scheduler.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is follower
+        assert result.process_with_model is candidate_lane
+        assert result.line_skip is not None
+        assert result.line_skip.reason == "diversity"
+
+    async def test_the_resident_bypass_seat_skips_a_rung_2_candidate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A rung-2 model needs the teardown that only the head path performs, so it does not pass a cold head."""
+        scheduler, _bypass_job, _holder = await self._cold_head_world()
+        self._pin_rung(monkeypatch, scheduler, "resident_b", DominanceRung.CANNOT_CO_RESIDE)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    @pytest.mark.parametrize("rung", [DominanceRung.NONE, DominanceRung.CANNOT_CO_SAMPLE])
+    async def test_the_resident_bypass_seat_seats_a_rung_none_or_1_candidate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        rung: DominanceRung,
+    ) -> None:
+        """A model below rung 2 still passes a cold head, since a rung-1 run starts from an idle card this way."""
+        scheduler, bypass_job, holder = await self._cold_head_world()
+        self._pin_rung(monkeypatch, scheduler, "resident_b", rung)
+
+        result = await scheduler.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is bypass_job
+        assert result.process_with_model is holder
+        assert result.line_skip is not None
+        assert result.line_skip.reason == "resident_bypass"
+
+    async def test_a_held_teardown_residency_still_drains_through_the_bypass(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A rung-2 model holding its teardown residency on the card has had its teardown, so its jobs still pass."""
+        scheduler, bypass_job, holder = await self._cold_head_world()
+        self._pin_rung(monkeypatch, scheduler, "resident_b", DominanceRung.CANNOT_CO_RESIDE)
+        scheduler._whole_card_ledger.record_grant(None, model="resident_b", forecast=None, cooldown_until=0.0, now=0.0)
+
+        result = await scheduler.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is bypass_job
+        assert result.process_with_model is holder
 
 
 class TestPrivateArbiterCycleFreshness:

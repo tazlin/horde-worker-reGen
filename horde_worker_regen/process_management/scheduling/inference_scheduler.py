@@ -10408,8 +10408,13 @@ class InferenceScheduler:
         model (a run of one checkpoint followed by another), threading the different model alongside the run
         processes it for free under the run, rather than idling a thread and tacking the second model on at
         the end as its own load. The overlap-headway gate still applies (two heavy models are not stacked
-        without headway), degraded retries that must run isolated are skipped, and the head keeps its queue
-        position (the caller records a line-skip) so it dispatches the moment its process frees.
+        without headway), degraded retries that must run isolated are skipped, a model the card's rung bars
+        from sampling beside other work is skipped (:meth:`_line_skip_seat_barred_by_rung`), and the head keeps
+        its queue position (the caller records a line-skip) so it dispatches the moment its process frees.
+
+        The rung question is asked of the candidate's card: a rung-1 candidate is barred only while that card
+        has a job in progress, so behind a head the establish-rate limiter withholds on a free lane it may
+        start its run on an otherwise idle card.
         """
         for candidate_job in candidates:
             if candidate_job.model is None or candidate_job.model == head_job.model:
@@ -10419,8 +10424,52 @@ class InferenceScheduler:
             candidate_process = self._seatable_resident_process(candidate_job)
             if candidate_process is None:
                 continue
+            if self._line_skip_seat_barred_by_rung(
+                candidate_job.model,
+                candidate_process,
+                beside_sampling_work=self._card_has_job_in_progress(candidate_process),
+            ):
+                continue
             return candidate_job, candidate_process
         return None
+
+    def _card_has_job_in_progress(self, process: HordeProcessInfo) -> bool:
+        """Whether a job is in progress on ``process``'s card, or anywhere on the worker without card routing."""
+        if self._multi_gpu_routing_active:
+            return bool(self._jobs_in_progress_on_card(process.device_index))
+        return bool(self._job_tracker.jobs_in_progress)
+
+    def _line_skip_seat_barred_by_rung(
+        self,
+        model: str,
+        process: HordeProcessInfo,
+        *,
+        beside_sampling_work: bool,
+    ) -> bool:
+        """Whether the card's dominance rung bars a line-skip seat from placing ``model`` on ``process``'s card.
+
+        A line skip bypasses :meth:`_resident_whole_card_head_ready`, which only a head dispatch runs, so the seat
+        asks the rung itself. Rung 2 needs the teardown that only the head path performs, unless the model already
+        holds its teardown residency on the card. Rung 1 cannot sample beside any other model, which bars a seat
+        placed ``beside_sampling_work`` and leaves a seat on a cold card free to start the run. A card with no
+        verdict yet does not bar anything.
+        """
+        device_index = self._routing_device_index(process)
+        verdict = pricing.model_dominance(
+            self.card_dominance(device_index),
+            self._footprint_store,
+            model,
+            self._model_metadata.get_baseline(model),
+        )
+        if verdict is None or verdict.rung is DominanceRung.NONE:
+            return False
+        if verdict.cannot_co_reside:
+            held = self._whole_card_ledger.get(device_index)
+            teardown_held_for_model = (
+                held is not None and held.model == model and held.rung is DominanceRung.CANNOT_CO_RESIDE
+            )
+            return beside_sampling_work or not teardown_held_for_model
+        return beside_sampling_work
 
     def _seatable_resident_process(
         self,
@@ -11405,7 +11454,15 @@ class InferenceScheduler:
                     if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
                         continue
                     candidate_process = self.resident_process_for_job(candidate_job)
-                    if candidate_process is not None and candidate_process.can_accept_job():
+                    if (
+                        candidate_process is not None
+                        and candidate_process.can_accept_job()
+                        and not self._line_skip_seat_barred_by_rung(
+                            candidate_job.model,
+                            candidate_process,
+                            beside_sampling_work=False,
+                        )
+                    ):
                         line_skip = LineSkip(displaced_job=next_job, reason="resident_bypass")
                         next_job = candidate_job
                         process_with_model = candidate_process
