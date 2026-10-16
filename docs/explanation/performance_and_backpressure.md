@@ -892,7 +892,10 @@ job will start on this cycle keeps its copy, since unloading it only for the job
 worst exchange the sweep can make. The head escalation keeps only the head's own seat. A job the post-processing
 gate is holding claims none, and neither does a job held on room the permitted reclaim rungs cannot close, since
 neither will start whatever its lane holds. A job held on room the rungs can close keeps its seat, because the
-sweep that frees that room is what would otherwise take its copy. One rule owns all of this
+sweep that frees that room is what would otherwise take its copy. Ahead of every one of these, a copy that
+belongs to a rung-1 run with a next job it can seat is spared outright, the head escalation included, since the
+run's next job would reload what the sweep took. A head for another model that needs the room waits for the run
+to end. One rule owns all of this
 ([`sweep_spares_idle_copy`][horde_worker_regen.process_management.scheduling.admission.pricing.sweep_spares_idle_copy]).
 
 Underneath the scheduler's retention lever sits ComfyUI's own model management. ComfyUI's *smart memory*
@@ -1717,8 +1720,11 @@ from a teardown, but each foreign job accepted beside it still costs its weights
 (see [The VRAM arbiter](vram_arbiter.md#the-four-layers)) narrows the offer to the model once its first job
 reaches its first step, and the worker keeps earning on the loaded weights instead of swapping to another large
 model and back. The claim does not engage at the dispatch commit, since it would then narrow intake for the
-whole load and for a load that never lands. The run's length is set by demand alone: it lasts while its jobs
-keep arriving.
+whole load and for a load that never lands. The run lasts while its jobs keep arriving and no head for another
+model has waited past the anti-starvation bound. It ends once its own work has drained and the cooldown has
+passed, a head for another model waits, or the claim has ended. It also ends with its own work still queued once
+a different-model head ages past the anti-starvation bound (`InferenceScheduler._restore_siblings_after_whole_card`),
+and when a teardown residency for another model takes the card (`_end_run_superseded_by`).
 
 The claim is bounded by `whole_card_residency_max_hold_seconds` and released early when a run of pops comes
 back with no work for the resident model, or when a job for the claimed model faults terminally (the

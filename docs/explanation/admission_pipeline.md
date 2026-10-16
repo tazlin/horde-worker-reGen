@@ -134,12 +134,14 @@ available figure cannot see it, and at the commit limit the child's next mapping
 carries `HostRamSnapshot.available_commit_mb` (`GlobalMemoryStatusEx`'s `ullAvailPageFile`, read by
 [`measure_available_commit_mb`][horde_worker_regen.process_management.scheduling.host_commit.measure_available_commit_mb];
 None on POSIX). A preload whose target does not already hold the checkpoint is judged against it as well as
-against available RAM: the charge is the checkpoint's file size plus feature RAM, with no page-reuse or
-component credit, under the same reserve, danger floor and outstanding planned RAM. The learned staging charge
-is a resident-set peak, which does not see the mapping, so it does not price commit. The preload fits only when both do,
-and a deferral that commit alone caused says so in its log line (`(commit-bound: N MB committable)`). The
-idle-lane warm re-reads pages of a mapping that already exists, so it is not priced against commit. With no
-commit figure the RAM verdict stands alone, as before.
+against available RAM: the charge is the checkpoint's file size (`JobSnapshot.checkpoint_file_mb`) plus feature
+RAM, with no page-reuse or component credit, under the same reserve, danger floor and outstanding planned RAM.
+The physical-RAM verdict keeps the staging charge, which is a learned resident-set peak once one is trusted. A
+resident-set reading does not see the mapping, so the staging charge does not price commit. The preload fits
+only when both verdicts do, and a deferral that commit alone caused says so in its log line
+(`(commit-bound: N MB committable)`). The idle-lane warm re-reads pages of a mapping that already exists, so it
+is not priced against commit. Where the host reports no commit figure or the checkpoint's file size is unknown,
+the RAM verdict stands alone.
 
 Still inline on the scheduler, and the next cuts in order: the whole-card residency demand
 (`_decide_whole_card_demand`, which establishes residencies and unloads siblings inside the budget step),
@@ -197,13 +199,13 @@ model is not offered, since it would be seated on the lane the head is waiting t
 the same hold: a head the gate is holding is not about to dispatch, so the loads behind it go ahead
 (`_post_processing_hold_frees_preload`), and head protection reserves no room for it while the hold stands.
 
-The four line-skip reasons differ in what they cost the head:
+The five line-skip reasons differ in what they cost the head:
 
 | Reason | When | Effect on the head's affinity skip window |
 | --- | --- | --- |
 | `resident_bypass` | the head's model is not resident and a resident-model job passes it, unless the job's model is rung 2 on its card and does not hold the card's teardown residency | counted; bounded by the skip budget and the anti-starvation override, except for a teardown (rung-2) residency's own jobs, which pass the head until the residency drains |
 | `dominant_run` | the head is withheld for a rung-1 run and a job of the run's model is seatable on the lane holding the run's weights | untouched; bounded by the run's end, which a different-model head past the anti-starvation bound forces |
-| `diversity` | the head's own lane is busy sampling its model, or the establish-rate limiter withholds the head at dispatch, and a distinct model is resident and idle. A model on rung 2 of its card is not seated. Nor is a rung-1 model, except behind a limiter-withheld head on a card with no job in progress, where it starts its run | untouched |
+| `diversity` | the head's own lane is busy sampling its model, or the establish-rate limiter withholds the head at dispatch, and a distinct model is resident and idle. While the candidate's card has a job in progress, a model on rung 1 or rung 2 of that card is not seated. On a card with no job in progress a rung-1 model is seated and starts its run, and a rung-2 model is seated only if it holds the card's teardown residency (`_line_skip_seat_barred_by_rung`) | untouched |
 | `cross_card` | the head's card cannot seat it, and another card can run a later job now | untouched: the dispatch takes nothing the head is waiting for |
 | `post_processing_hold` | the head cannot share the card with the post-processing lane's work, and a later job can | untouched: the head waits for the lane, which the dispatch does not delay |
 
@@ -224,10 +226,11 @@ and the placement-order walk resumes through the same cross-card path, seating w
 now. The withheld job keeps its queue position and its gate keeps its clocks; it is simply not offered again
 until the next cycle re-asks its gate, and the card it was aimed at is excluded for the rest of the cycle on
 the same ground as the head's own. The exclusion is discarded in `begin_scheduling_cycle` and never persists.
-On one card the resumed walk has no other card to offer, so a withheld head ends the loop exactly as before,
-with two exceptions: work that fits beside the post-processing lane's chain, and a rung-1 run's job on the lane
-holding its weights when the head is withheld for residency, until the head ages past the anti-starvation
-bound, which ends the run. The walk's bound is the decline record itself: a
+On one card the resumed walk has no other card to offer, so a withheld head ends the loop, with three
+exceptions: work that fits beside the post-processing lane's chain; a rung-1 run's job on the lane holding its
+weights when the head is withheld for residency, until the head ages past the anti-starvation bound, which ends
+the run; and a different model resident on a free lane when the establish-rate limiter withholds the head (the
+`diversity` seat). The walk's bound is the decline record itself: a
 selection that offers a job the cycle has already declined ends the loop, so a cached pair that outlives its
 decline costs a stalled tick the starvation backstops break, never a loop with no exit inside one tick.
 

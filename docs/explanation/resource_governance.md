@@ -79,11 +79,13 @@ The danger-floor verdict (`assess_ram_pressure`) carries both figures, and its r
 degrade response with its process reduction and over-ceiling reclaim, the shed restore headroom, the
 head-of-queue reclaim and the idle-lane warm's room all read the admissible figure. The preload
 admission prices the job's own mapping against commit separately, on the same measured commit figure.
-That commit charge is the whole checkpoint plus the job's features, with no retained-page or component
-credit, because a new mapping charges the whole file to commit whichever of its pages are cached. A
+That commit charge is the checkpoint's file size plus the job's feature RAM, with no retained-page or
+component credit, because a new mapping charges the whole file to commit whichever of its pages are cached.
+The physical-RAM charge can be a learned resident-set peak, which does not see the mapping, so it does not
+price commit (`decide_commit_admission`). A
 retained-page credit therefore lowers only the physical-RAM charge, and the `RAM credit admitting` line
 says so beside the commit charge it left whole (or `commit not priced` where the host reports no commit
-figure or the target already holds the checkpoint). The credit counts a slot's retained pages only from
+figure, the checkpoint's file size is unknown, or the target already holds the checkpoint). The credit counts a slot's retained pages only from
 a memory reading sampled at least one report interval after its last RAM unload. An earlier reading
 still includes the released model.
 
@@ -117,10 +119,14 @@ One tick measures the RAM danger-floor verdict and one
 [`HostMemorySnapshot`][horde_worker_regen.process_management.scheduling.governance.snapshots.HostMemorySnapshot],
 then decides and executes both regimes:
 
-- **Pressured host** (below the danger floor): the degrade response. Arm the self-throttle pop pause,
-  set the soft pop hold, evict idle resident models, shed idle inference contexts (per card on a
-  multi-GPU host, never emptying a card), and reclaim a process whose resident RAM crossed the
-  per-process ceiling (recycled if idle, drained first if busy). The idle-model eviction is *not* gated on
+- **Pressured host** (below the danger floor): the soft pop hold, then the degrade response
+  ([`decide_degrade_response`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_degrade_response]),
+  whose actions run in order. `PausePops` arms the self-throttle pop pause. `EvictIdleModels` first drops
+  idle staged components no queued or in-flight job needs from the budgeted RAM cache, and only when none
+  can be dropped unloads one idle inference model from RAM. `decide_process_reduction` sheds idle inference
+  contexts: on a multi-GPU host per card, toward the card's busy count and never emptying a card, and on
+  one card one context below the loaded count. `decide_over_ceiling_reclaim` takes the largest inference process whose resident RAM crossed the
+  per-process ceiling, recycling it if idle and marking it draining if busy. The idle-model eviction is *not* gated on
   there being queued work: the pop hold drains the queue, so the footprint left to reclaim is exactly the
   idle resident set on an empty queue, and eviction must still reach it. When no idle model remains to
   unload, an idle slot that kept the freed model's allocator pages is cycled to return that RAM to the OS.
@@ -132,7 +138,8 @@ then decides and executes both regimes:
   cold-child baseline plus the larger of 2% of total RAM and 512 MB, so a freshly spawned child can never
   qualify and a cycle cannot select its own successor), and at most once per slot every two minutes. Creep
   containment is a separate trigger and none of these bounds apply to it.
-- **Recovered host**: the restore response, and the drain follow-through. Cards the reduction shed grow
+- **Recovered host**: the soft pop hold (with `EvictIdleModels` while the hold is engaged), the drain
+  follow-through, and the restore response (`decide_shed_restore`). Cards the reduction shed grow
   back toward their planned process count, one context per card per tick, gated on measured RAM headroom
   actually fitting another resident working set. A drain the pressure episode initiated but did not
   finish still resolves here
@@ -185,18 +192,18 @@ process cycle; the only cost is one reload. A control message cannot interrupt a
 pipe serially and finishes any in-flight encode or decode first), and a per-lane throttle
 (`LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS`) keeps the reload cost negligible against the RAM returned.
 
-The containment ceiling sits well below the host RAM danger floor, so this actuates as a bounded sawtooth
-before the floor is threatened as well as under active pressure: the lanes participate in the RAM-pressure
-response rather than being exempt from it. Lane processes are deliberately left out of the creep-cycling
-path (which only cycles inference slots); the in-process unload is the whole containment for a lane.
+Containment runs on every tick whatever the danger-floor verdict, and the ceiling sits well below the host
+RAM danger floor, so it actuates as a bounded sawtooth before the floor is threatened. The degrade response
+does not act on the lanes, so this per-tick unload is the whole of their containment. Lane processes are
+left out of the creep-cycling path, which cycles inference slots only.
 
-Alchemy has two additional resident owners that do not cross the generic 10 GB service-lane ceiling reliably:
-the post-processing lane retains each upscaler/face-fixer backend, and CPU safety can retain optional BLIP,
-interrogation tables, and the aesthetic head. Whenever the host is actually below its RAM danger floor, the
-pressure response therefore sends `UNLOAD_MODELS_FROM_RAM` to either owner as soon as it is idle. The
+Containment covers the COMPONENT and VAE lanes only. Alchemy has two further resident owners: the
+post-processing lane retains each upscaler and face-fixer backend, and CPU safety can retain optional BLIP,
+interrogation tables and the aesthetic head. Both children honour `UNLOAD_MODELS_FROM_RAM` (the
 post-processing process calls the backend's full RAM free; safety discards only those optional companions and
-keeps its base CLIP/NSFW stack ready. A busy alchemy form is never interrupted by this control—the serial child
-handles it after returning to idle—and the state-duration watchdog remains the bound if it never returns.
+keeps its base CLIP and NSFW stack ready), but neither the governor's action list nor the containment pass
+sends it to them. Under host RAM pressure their resident sets are therefore not reclaimed. The one sender is the
+benchmark harness's cleanup between warm levels (`request_benchmark_memory_cleanup`).
 
 A complementary release happens inside `hordelib`: when the component cache drops an entry (a budget
 eviction or a single-slot replacement), it issues a throttled, best-effort `gc.collect()` plus host trim
@@ -243,12 +250,17 @@ trusted the credit applies. Only swap evidence prices a swap: a cold load's grow
 how much of the retained pages a swap reuses.
 
 Children report RSS for the dashboard and private bytes for reclaim and restore. The private reading
-is the kernel's counter of private resident pages, which excludes reclaimable clean checkpoint
-mappings: `RssAnon + RssShmem` from `/proc/<pid>/status` on Linux and `PrivateWorkingSetSize` on
-Windows. A walk of the process's pages gives the same figure (the `smaps_rollup` anonymous or
-private-dirty maximum on Linux, USS elsewhere) but its cost scales with the working set and on
-Windows it holds the GIL throughout, so it is only the fallback when the counter is unavailable.
-Other platforms use USS. Platforms without a private reading fall back to RSS. The effective process ceiling is the larger of the
+is the kernel's counter of private resident pages
+([`private_ram_usage_bytes`][horde_worker_regen.utils.private_memory.private_ram_usage_bytes]):
+`RssAnon + RssShmem` from `/proc/<pid>/status` on Linux and `PrivateWorkingSetSize` on Windows. It
+excludes reclaimable clean checkpoint mappings and includes written copy-on-write pages and pinned host
+memory, which on Linux can be shmem. A walk of the process's pages (the `smaps_rollup` anonymous or
+private-dirty maximum on Linux, USS from `memory_full_info` elsewhere) measures the same quantity, and the two
+differ by less than the finest threshold a parent consumer compares against. The walk is the fallback only, used
+where the counter cannot be read and on platforms with no counter, because its cost scales with the working
+set and on Windows it holds the GIL for its whole duration. A child reads the figure several times per job
+on its report path and on the load-time peak sampler's thread, so a walk there stalls the child's main
+thread as an inline read would. Where no private reading is available at all, consumers fall back to RSS. The effective process ceiling is the larger of the
 configured ceiling and the largest offered context seed plus ten percent and a cold-child allowance.
 Config load warns about a configured ceiling below an offered seed. The same model-aware ceiling
 protects the idle creep path. Below the hard floor, idle models and contexts are shed before a busy
@@ -393,6 +405,14 @@ Two scoping rules keep these last-resort remedies from taxing a healthy host:
 
 ## Whole-card residency state
 
+A whole-card residency is a grant that gives one model a card. On rung 2 of the card's dominance verdict
+the grant tears the card down to that model (siblings stopped, safety and the service lanes moved off). On
+rung 1 it is a run, which does not tear anything down and keeps the model's weights between its jobs (see
+[VRAM arbiter](vram_arbiter.md#the-four-layers)). This section covers where the grant's state lives, the
+refusals on the demand decision, the process target and its tightening, when a residency is retained and
+released, the governors that bound how fast a card is cycled, the claim a residency places on the pop offer,
+and the one owner of safety placement.
+
 The whole-card exclusive-residency records (which model holds which card, when the hold was
 established, its cooldown and restore stamps) live in the
 [`WholeCardResidencyMachine`][horde_worker_regen.process_management.scheduling.governance.whole_card.WholeCardResidencyMachine].
@@ -487,7 +507,9 @@ Entering and leaving sole residency are both expensive: the establishment stops 
 and may move safety off-GPU, and the restore respawns each of those siblings (a ~20s spawn apiece, plus the
 preload that follows). A demand signal that oscillates can therefore rebuild the pool continuously without
 ever serving more work. Three governors, all held in the residency machine and actuated at the scheduler's
-call sites, bound that churn:
+call sites, bound that churn. Only the establish-rate limiter defers a head
+(`WholeCardResidencyLedger.governor_hold`). The minimum hold and the grace budget shape what a residency
+does once taken:
 
 - **Minimum hold.** A ready queue head for a *different* model may cut a drained residency's cooldown short,
   but not before the grant has held long enough to amortize the teardown and the regrowth the release itself
@@ -550,7 +572,7 @@ anything there. A rung-1 run does not tear anything down, so the run's jobs have
 the card through the `dominant_run` seat while the run holds it, and the run's own end bounds that seat.
 
 A claim that could stand indefinitely would be a worker that has advertised itself down to one model, so it
-has four ends, and the first to arrive wins:
+has five ends, and the first to arrive wins:
 
 - **The maximum hold.** `whole_card_residency_max_hold_seconds` caps one residency episode, measured from its
   establishment and covering the claim, the minimum hold and the cooldown alike. Past it the residency stops
@@ -568,8 +590,12 @@ has four ends, and the first to arrive wins:
   Under maintenance that refusal is the only answer a pop with no work receives.
 - **A starved head.** A rung-1 run ends once the undispatched head is for a different model and has waited past
   the anti-starvation fraction of its ttl, even while the run model has work queued, because the horde deadline
-  outranks run continuity. Work in flight finishes; the run's queued jobs dispatch as ordinary jobs and may start a new
-  run at their first step.
+  outranks run continuity. Work in flight finishes. The run's queued jobs dispatch as ordinary jobs and may
+  start a new run at their first step.
+- **A terminal fault.** A job for the claimed model that faults terminally releases the claim
+  (`InferenceScheduler.note_terminal_job_fault`, fed by the job tracker's terminal-fault observer), since a
+  narrowed offer would feed the card more of the failing work. The release ends the claim's retention as the
+  empty-pop release does, so the residency lets go once its accepted work has drained.
 - **The residency itself.** The claim is derived from the residency and the clock on every ask rather than
   latched, so a residency that drains and restores for any other reason takes its claim with it.
 

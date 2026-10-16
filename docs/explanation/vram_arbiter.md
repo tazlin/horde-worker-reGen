@@ -328,8 +328,12 @@ The arbiter keeps four concerns deliberately separate:
       [Cross-job retention](#cross-job-retention)) and tears nothing down. The grant waits for the first step
       because the claim narrows intake, and a claim taken at the dispatch commit narrows it for the whole load. A
       run opens no establish or restore window, counts toward neither churn governor, has no minimum hold, and
-      ends without regrowing anything (`WholeCardResidencyLedger.record_run_end`) once its own work has drained
-      and the claim has ended or a head for another model waits. A card already holding a grant for another
+      ends without regrowing anything (`WholeCardResidencyLedger.record_run_end`). It ends once its own work has
+      drained and the cooldown has passed, a head for another model waits, or the claim has ended. It also ends
+      with its own work still queued once the undispatched head is for another model and has waited past the
+      anti-starvation fraction of its ttl, since the horde deadline outranks run continuity, and when a rung-2
+      grant for another model takes the card. Each end is logged and recorded as a `DOMINANT_RUN_ENDED` ledger
+      row with its cause (`DominantRunEndCause`). A card already holding a grant for another
       model keeps it, and a rung-2 ask for the run's model promotes the grant to a teardown with every clock
       restarted. The reclaim ladder's context and lane restores stand down for rung-2 grants only, since a run
       cleared nothing.
@@ -346,8 +350,8 @@ The arbiter keeps four concerns deliberately separate:
       model (`preload.lanes_committed_elsewhere`). A head for another model that needs the room waits for the
       run to end. On one card a held head ends the dispatch pass, so a run job queued behind it would keep the
       run, and the head, waiting on itself. The run's job is therefore seated past the held head on the lane
-      holding its weights (`_select_dominant_run_job`, line-skip reason `dominant_run`) until the run's work
-      drains.
+      holding its weights (`_select_dominant_run_job`, line-skip reason `dominant_run`) until the run ends,
+      which a different-model head past the anti-starvation bound forces.
 
     A held rung changes only when its test's slack crosses zero by more than `DOMINANCE_HYSTERESIS_MB`, the
     same 256 MB bucket the recompute key bands the floor with, so a measured peak drifting about a threshold
@@ -374,6 +378,13 @@ The arbiter keeps four concerns deliberately separate:
   card (a rebuild with a cooldown) remains reserved for the post-processing lane's own deferral.
 
 ## The decision pipeline
+
+A request moves through four questions in order: whether it fits the measured admission identity (with each
+anchor of planned and in-flight work, and the request's own footprint counted once); whether a phantom ledger
+explains a miss; whether reclaim can still make progress, which yields `DEFER` with a reclaim plan; and, once
+reclaim is exhausted, whether the demand is under the card's achievable ceiling (`DEFER`, the whole-card
+escalation, the measured-load attempt) or over it (`DENY`). Head protection, the foreign-floor reading and the
+clearance-time reserve shape the inputs of those questions, and the passages below take them in that order.
 
 For a request the arbiter first evaluates the measured admission identity: committed floor plus planned
 overlay plus candidate delta against capacity (device total net of the measured shared baseline, less a
@@ -586,15 +597,16 @@ keeps the protection, as does a head with no lane on the card. The head keeps it
 which is dispatch order: a skipper staged first is cleared first, so where both full jobs do not fit the head
 waits behind the skipper's sample.
 
-Protection is released the same way, and immediately, while a churn governor is deferring that head's
-whole-card establishment on the target card (see
+Protection is released the same way, and immediately, while the establish-rate limiter is deferring that
+head's whole-card establishment on the target card (see
 [Bounding residency churn](resource_governance.md#bounding-residency-churn)). For the length of that deferral
-the head is deliberately not asking for the card: the governor's own disclosure says normal scheduling
-continues around it. Charging its whole-card demand against the ready work behind it would reserve the card
-for a claim nobody is making, so the card stands empty while smaller jobs that measurably fit are turned
-away. The pricing seam reads the deferral from the whole-card ledger and omits the head's demand for as long
-as it stands; once the governor releases the card, or the deferral's dwell is spent and the head is served
-co-resident by ordinary admission, the head's normal charge applies again.
+the head is not asking for the card, and the limiter's disclosure says normal scheduling continues around it.
+Charging its whole-card demand against the ready work behind it would reserve the card for a claim nobody is
+making, so the card would stand empty while smaller jobs that measurably fit are turned away. The pricing seam
+reads the deferral record from the whole-card ledger and omits the head's demand for as long as it stands. The
+record expires with the limiter's window and is cleared when the preload pass or the dispatch-time check lets
+the head through (`_whole_card_governor_defers`), and the head's normal charge then applies again. A head the
+limiter defers is never served co-resident.
 
 The "foreign" label is earned, not assumed. Before a non-fitting head is charged to foreign pressure, the
 arbiter separates a shortfall the worker can itself reclaim: a head whose deficit is held by its own idle
@@ -680,8 +692,8 @@ whose jobs will end in a safety check, and a parked preload has none to come.
 
 **After the teardown, a head that does not fit alone.** The residency's frame (`fits_alone`, the card total less
 one context) charges no foreign tenant, so on a card that carries one a head can need more than the finished
-teardown leaves. A Qwen-class head is priced about 22 GB, and a 24 GB card with a 3.3 GB tenant offers about
-18 GB once its siblings are stopped and safety has moved off. Under the clearance lease the head is staged, and
+teardown leaves. A head priced near the card's total does not fit beside a foreign tenant of a few gigabytes,
+even with its siblings stopped and safety moved off. Under the clearance lease the head is staged, and
 clearance prices it with its partial-load seat (see [The partial-load seat](#the-partial-load-seat)). The seat
 is taken only on a converged-empty card. Once the teardown is structurally complete, the card reads so as soon as
 nothing reclaimable is left. The post-processing lane counts as reclaimable until its VRAM unload has been sent,
@@ -870,7 +882,10 @@ actually ran. The deadlock detector does see an all-idle queue whose head model 
 deadlock, but only a queue deadlock sustained past the structural-wedge horizon reaches the recovery
 supervisor: a transient hold (reclaim frees the idle resident within a few ticks) clears far below it, while a
 hold that genuinely never clears (foreign pressure, reclaim exhausted) is exactly the case the recovery
-supervisor exists to reroute, identical to a never-admittable preload.
+supervisor exists to reroute, identical to a never-admittable preload. Time under an excuse does not count
+toward the horizon. When an excuse lifts, or an inference slot finishes booting, the horizon is measured again
+from that moment (`DeadlockSnapshot.indicates_structural_wedge(measured_from=...)`; see
+[Resilience and recovery](resilience_and_recovery.md)).
 
 **Source-latent routing.** Whether a disaggregated job enters at the source-latent encode stage or straight
 at conditioning derives from the SDK's effective (post-fallback) source processing, never the raw pop field. A
@@ -1405,36 +1420,28 @@ serving the same shape of work.
 
 ### A named successor does not by itself keep the weights
 
-A popped job that names the model a lane has just finished with looks like the ideal retention case: the
+A popped job that names the model a lane has just finished with looks like the ideal retention case. The
 successor adds no bytes to the card, and a release followed by a reload of the same weights is the worst
-exchange. The rule was tried as three changes together and measured as a loss on the session replay with
-work always available, so it is not in the tree: the governor gate waived when a popped job names the model,
-the static fit priced at the successor's staged clearance price in place of the dispatched job's whole-job peak,
-and the reclaim victim choice (the dispatch-hold eviction and the pressure sweep) taking a copy a popped job
-names last, and only when the unnamed copies do not cover the shortfall.
+exchange. Retention nevertheless does not treat a named successor as grounds to keep the weights. The governor
+gate is not waived when a popped job names the model, the static fit prices the dispatched job's sampling peak
+and not the successor's staged clearance price, and the reclaim victim choice (the dispatch-hold eviction and
+the pressure sweep) does not take a copy a popped job names last. Beyond the sweep's ready-seat and lookahead
+rules (`pricing.sweep_spares_idle_copy`), a queued job naming a model keeps the copy only as the next job of a
+rung-1 run (`pricing.queued_jobs_naming`, read by `pricing.copy_belongs_to_dominant_run`).
 
-Measured on a two-lane 24 GB card over the whole session, the rules on against off: card busy 71.4% against
-71.7% and kudos per hour 28.6k against 28.9k with the replay pricing a dispatch in the tick it is made; 66.2%
-either way with the older one-tick pricing, plus two over-committed ticks and 27 more partial loads with the
-rules on. The retention
-denial counts did not move (static fit 460 to 471 idle seconds, the dispatch-hold eviction 212 to 238), so the
-named case was not where the reloads came from. On this traffic the successor is usually popped after the
-predecessor ends, so at the decision instant no job names the model, and where one does the kept weights hold
-room the other lane's different-model job needs: the idle time moves from the reload into a clearance hold on
-the sibling, which is longer.
-
-The reason is the card's shape, not the rule's logic. Revisit it only when a measurement shows the premise
-changed: a card that seats two whole-job peaks of the offered mix beside each other (a larger card or a mix of
-smaller models), a single-lane worker where no sibling competes for the room, or staging that routinely pops and
-stages the successor before the predecessor ends, so the named case is the common one at the decision instant.
-Prove any retry on the on-demand replay before writing it (`docs/plans/bundle-20261014-db0-000114/`,
-`chronicle-retention-named-successor-handback.md`).
+The rule rests on two premises about a card that seats one whole-job peak of the offered mix at a time. The
+successor is usually popped after the predecessor ends, so at the decision instant no job names the model. And
+where one does, a copy kept for it holds room the other lane's different-model job needs, so the idle time moves
+from the reload into a clearance hold on the sibling, which is longer. A named-successor rule is worth measuring
+again on a card where either premise fails: one that seats two whole-job peaks of the offered mix beside each
+other, a single-lane worker where no sibling competes for the room, or staging that routinely pops and stages
+the successor before the predecessor ends. A duty claim for such a rule is proven on a session replay with on-demand
+supply (`pop_driver(on_demand=True)` in `tests/process_management/liveness/_session_replay.py`).
 
 ### A hold nothing comes back for is revoked under sustained pressure
 
-A grant is a prediction, and before this nothing revisited one: only an eviction actuation could end a
-retention, so a hold taken in a healthy moment outlived every subsequent change in what its slot was being
-asked to run.
+A grant is a prediction. If only an eviction actuation could end a retention, a hold taken in a healthy
+moment would outlive every later change in what its slot is asked to run, so a sweep revisits held grants.
 
 Re-asking the *issuance* question is not what re-opens it. A live grant's own dispatch heads the slot's
 history, so the window a sweep would read is the window that issued the grant and every live retention passes
