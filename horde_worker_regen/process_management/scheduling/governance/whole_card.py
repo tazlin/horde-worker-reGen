@@ -188,6 +188,15 @@ class WholeCardGovernor(StrEnum):
     open a window."""
 
 
+class DominantRunEndCause(StrEnum):
+    """Why a dominant-model run (rung 1) ended, as recorded in the action ledger's run-end event."""
+
+    DRAINED = "drained"
+    """The run's own jobs drained and nothing held the run through its cooldown."""
+    STARVED_HEAD = "starved_head"
+    """A head for a different model waited past the anti-starvation bound while the run still had work."""
+
+
 @dataclass(frozen=True)
 class GraceBudgetStatus:
     """One card's rolling grace spend against its allowance, and the wait for the next replenishment."""
@@ -894,11 +903,20 @@ class WholeCardResidencyLedger:
             state.governor_deferred_since = now
         return max(0.0, now - state.governor_deferred_since)
 
-    def clear_governor_defer(self, device_index: int | None) -> None:
-        """Forget any governor deferral recorded for this card, so the next one is timed from its own start."""
+    def clear_governor_defer(self, device_index: int | None, *, now: float) -> None:
+        """Forget any governor deferral recorded for this card, so the next one is timed from its own start.
+
+        Clearing a recorded deferral logs how long the limiter held its model. The caller clears on every head
+        the limiter lets through, so a card with no record logs nothing.
+        """
         state = self._residencies.get(device_index)
         if state is None:
             return
+        if state.governor_deferred_since != 0.0:
+            logger.info(
+                f"Whole-card governor deferral of {state.governor_deferred_model} on card {device_index} cleared "
+                f"after {now - state.governor_deferred_since:.0f}s held.",
+            )
         state.governor_deferred_model = None
         state.governor_deferred_since = 0.0
 

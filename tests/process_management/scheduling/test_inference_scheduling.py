@@ -16,6 +16,7 @@ from loguru import logger
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeImageResult,
@@ -62,6 +63,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
     DominanceRung,
+    DominantRunEndCause,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _RESIDENCY_GRACE_SECONDS,
@@ -2350,6 +2352,24 @@ class TestDominantRunEndsForAStarvedHead:
 
         assert list(scheduler._whole_card_ledger.held()) == []
 
+    async def test_the_starved_run_end_is_recorded_in_the_ledger(self) -> None:
+        """The record carries the run model, the cause, the head's model and its age since pop."""
+        head_age_seconds = self._TTL_SECONDS * (ANTI_STARVATION_TTL_FRACTION + 0.1)
+        scheduler = await self._scheduler_with_run_and_head(head_model="head-model", head_age_seconds=head_age_seconds)
+
+        scheduler._restore_siblings_after_whole_card()
+
+        process_lifecycle = scheduler._process_lifecycle
+        assert isinstance(process_lifecycle, Mock)
+        record = process_lifecycle.action_ledger.record
+        run_ends = [call for call in record.call_args_list if call.args[0] is LedgerEventType.DOMINANT_RUN_ENDED]
+        assert len(run_ends) == 1
+        detail = run_ends[0].kwargs["detail"]
+        assert detail["run_model"] == "run-model"
+        assert detail["cause"] == DominantRunEndCause.STARVED_HEAD
+        assert detail["head_model"] == "head-model"
+        assert detail["head_seconds_since_pop"] >= head_age_seconds - 1.0
+
     async def test_a_young_different_model_head_keeps_the_run(self) -> None:
         """A head inside the bound waits for the run's queued work."""
         scheduler = await self._scheduler_with_run_and_head(head_model="head-model", head_age_seconds=1.0)
@@ -2569,7 +2589,7 @@ class TestGovernorDeferralIsAGovernanceHold:
         scheduler = self._scheduler_on(now)
         scheduler._whole_card_ledger.note_governor_defer(None, model="flux_model", now=now[0])
 
-        scheduler._whole_card_ledger.clear_governor_defer(None)
+        scheduler._whole_card_ledger.clear_governor_defer(None, now=now[0])
 
         assert scheduler.whole_card_governor_defer_active() is False
 

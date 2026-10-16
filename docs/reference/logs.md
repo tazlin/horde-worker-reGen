@@ -205,6 +205,25 @@ inferring it from throughput. All are registered in `analysis/log_signatures.py`
 | `Upload encode for job <id>: <t>s in a worker thread.` | DEBUG | Submit encoded the image for upload. |
 | `Upload for job <id>: bytes already in the upload encoding, not re-encoded.` | DEBUG | Submit uploaded the bytes as the lane produced them. |
 
+These lines belong with the ones above but are not registered in `analysis/log_signatures.py`, so `horde-log`
+does not detect them yet.
+
+| Line | Level | Logged when |
+| ---- | ----- | ----------- |
+| `Clearance lease on device <d>: restored the <n>MB activation reserve of process <p>'s unconsumed grant after its job start.` | DEBUG | A grant reached the child before its job start, the job start unset the grant's figures, and the next clearance step wrote the reserve back. Once per grant. The session count is `ClearanceController.reserves_restored_after_job_start`. |
+| `Whole-card governor deferral of <model> on card <d> cleared after <n>s held.` | INFO | The establish-rate limiter let a head through that it had deferred. `<n>` is the time since the first deferral of that head. |
+| `Save-our-ship: holding the soft reset while a replacement child is still alive and booting (boot elapsed <n>s, hard cap <c>s). Rebuilding the pool now would replace the replacement.` | INFO | The recovery supervisor would rebuild the pool, but a replacement child is still booting inside the hard cap. Once per hold. |
+| `Reclaim ladder: restoring the <lane> lane while job <id> still waits, since the job waits on that lane.` | DEBUG | A lane pause booked for a job is restored although the job still waits, because the job waits on the paused lane itself. In practice the post-processing lane. |
+
+## Action-ledger events for runs and safety replacement
+
+`action_ledger.jsonl` records these two events with the fields below in `detail`.
+
+| Event | Fields | Recorded when |
+| ----- | ------ | ------------- |
+| `dominant_run_ended` | `device_index`, `run_model`, `cause` (`drained` or `starved_head`); for `starved_head` also `head_model`, `head_seconds_since_pop`, and the head's id as `job_id` | A dominant-model run ends, either because its jobs drained or because a different-model head waited past the anti-starvation bound. |
+| `safety_replacement_requested` | `safety_requeues`, `safety_process_alive`, and the faulted job's id as `job_id` | The orphaned-verdict watchdog faults a job that ran out of safety requeues and asks for the safety pool to be replaced. The replacement itself is recorded as `process_replaced`. |
+
 ## Supervisor stall forgiveness
 
 Two lines in `bridge_tui.log` / `bridge_host.log` describe the *supervisor's* own liveness rather than the

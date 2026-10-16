@@ -237,6 +237,7 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
     WHOLE_CARD_RESTORE_GRACE_SECONDS,
     DominanceRung,
+    DominantRunEndCause,
     WholeCardGrantKind,
     convergence_blockers,
     post_process_context_fits,
@@ -2778,7 +2779,7 @@ class InferenceScheduler:
             )
             self._last_budget_defer_reason = governor_hold.reason
             return _WholeCardDemandOutcome.DEFER_GOVERNOR
-        self._whole_card_ledger.clear_governor_defer(target_device_index)
+        self._whole_card_ledger.clear_governor_defer(target_device_index, now=self._clock())
 
         first_time = not self._job_tracker.is_admitted_exclusive(job)
         self._job_tracker.mark_admitted_exclusive(job, device_index=target_device_index)
@@ -3491,6 +3492,18 @@ class InferenceScheduler:
                     f"Dominant-model run for {model} ended because the head job for {starved_head.model} has waited "
                     f"{age_since_pop:.0f}s since pop, past the anti-starvation bound.",
                 )
+                self._process_lifecycle.action_ledger.record(
+                    LedgerEventType.DOMINANT_RUN_ENDED,
+                    job_id=str(starved_head.id_) if starved_head.id_ is not None else None,
+                    reason="different-model head past the anti-starvation bound",
+                    detail={
+                        "device_index": device_index,
+                        "run_model": model,
+                        "cause": str(DominantRunEndCause.STARVED_HEAD),
+                        "head_model": starved_head.model,
+                        "head_seconds_since_pop": round(age_since_pop, 1),
+                    },
+                )
                 continue
             if (
                 model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
@@ -3509,6 +3522,15 @@ class InferenceScheduler:
                     continue
                 self._whole_card_ledger.record_run_end(device_index)
                 logger.debug(f"Dominant-model run for {model} ended: its jobs drained.")
+                self._process_lifecycle.action_ledger.record(
+                    LedgerEventType.DOMINANT_RUN_ENDED,
+                    reason="run jobs drained",
+                    detail={
+                        "device_index": device_index,
+                        "run_model": model,
+                        "cause": str(DominantRunEndCause.DRAINED),
+                    },
+                )
                 continue
             # A ready head for a different model may cut the cooldown short, but not before the residency has
             # held long enough to amortize the teardown and the regrowth the release itself will pay for;

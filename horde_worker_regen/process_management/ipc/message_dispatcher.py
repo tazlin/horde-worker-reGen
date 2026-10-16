@@ -452,6 +452,8 @@ class MessageDispatcher:
         Read by the channel-silence rule in :meth:`check_message_channel_health`."""
         self._stale_messages_ignored = 0
         """Messages rejected because their process slot or launch identity is no longer current."""
+        self._footprint_readings_on_other_model = 0
+        """Sampling readings dropped because the lane still held a model other than its job's."""
         self._last_model_load_change_at: dict[int, float] = {}
         """Epoch time each process last had a child-confirmed model-load state change.
 
@@ -485,6 +487,11 @@ class MessageDispatcher:
     def stale_messages_ignored(self) -> int:
         """Return how many messages this dispatcher rejected for a missing or replaced launch."""
         return self._stale_messages_ignored
+
+    @property
+    def footprint_readings_on_other_model(self) -> int:
+        """Return how many sampling readings were dropped because the lane held a model other than its job's."""
+        return self._footprint_readings_on_other_model
 
     def set_alchemy_result_handler(self, handler: Callable[[HordeAlchemyResultMessage], None]) -> None:
         """Register the callback invoked when a child process reports an alchemy form result."""
@@ -1279,6 +1286,11 @@ class MessageDispatcher:
         # A lane still holding another model reports that model's allocator high-water, and the first reading
         # freezes the job's key, so a swap's readings would raise the previous model's figure for the whole job.
         if process_info.loaded_horde_model_name != job.model:
+            self._footprint_readings_on_other_model += 1
+            logger.trace(
+                f"Learned footprint: dropping process {message.process_id}'s {peak_mb:.0f} MB reading for "
+                f"{job.model}, since the lane holds {process_info.loaded_horde_model_name}.",
+            )
             return
 
         # Bind the peak to a genuinely-running job: the slot's referenced job must be in progress, which

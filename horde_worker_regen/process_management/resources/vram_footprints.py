@@ -899,6 +899,7 @@ class LearnedFootprintStore:
         if not isinstance(entries, list):
             return
 
+        miskeyed_entries_dropped = 0
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -908,7 +909,13 @@ class LearnedFootprintStore:
             except ValueError:
                 continue
             if sampling_is_miskeyed and key.stage in _MISKEYED_SAMPLING_STAGES:
+                miskeyed_entries_dropped += 1
                 continue
             self._observations[key] = observation
+        if miskeyed_entries_dropped > 0:
+            logger.info(
+                f"Learned VRAM footprints at {self._path}: dropped {miskeyed_entries_dropped} sampling entries "
+                f"written under schema {schema_version}, since they may carry another model's readings.",
+            )
 
     # endregion

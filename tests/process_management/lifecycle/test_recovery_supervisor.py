@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from loguru import logger
+
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoveryAction, RecoverySupervisor
 
 
@@ -433,3 +435,21 @@ def test_soft_reset_waits_for_a_live_boot_until_the_hard_cap() -> None:
     clock.advance(2)
     assert supervisor.evaluate(is_wedged=True, pool_ready=False, boot_in_progress=True) is RecoveryAction.SOFT_RESET
     assert supervisor.limp_by_level == 1
+
+
+def test_a_live_boot_holding_a_due_soft_reset_logs_once() -> None:
+    """The hold is edge-triggered, so ticks spent under one live boot log a single line."""
+    supervisor, clock = _make(boot_hard_cap_seconds=10)
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+    try:
+        supervisor.evaluate(is_wedged=True, pool_ready=False, boot_in_progress=True)
+        clock.advance(2)
+        supervisor.evaluate(is_wedged=True, pool_ready=False, boot_in_progress=True)
+        clock.advance(2)
+        supervisor.evaluate(is_wedged=True, pool_ready=False, boot_in_progress=True)
+    finally:
+        logger.remove(sink_id)
+
+    held = [line for line in messages if "holding the soft reset" in line]
+    assert len(held) == 1

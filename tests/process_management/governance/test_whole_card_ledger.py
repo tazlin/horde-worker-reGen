@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from loguru import logger
+
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.scheduling.governance import (
     WholeCardPhase,
@@ -581,9 +583,24 @@ class TestGovernorDeferral:
         """Once the limiter lets a head through, the next deferral is timed from scratch."""
         ledger = WholeCardResidencyLedger()
         ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
-        ledger.clear_governor_defer(0)
+        ledger.clear_governor_defer(0, now=_NOW + 1.0)
         assert ledger.governor_deferred_head(0, now=_NOW + 1.0) is None
         assert ledger.note_governor_defer(0, model="heavy-model", now=_NOW + _ESTABLISH_WINDOW_SECONDS + 1.0) == 0.0
+
+    def test_clearing_a_recorded_deferral_logs_the_seconds_held(self) -> None:
+        """A cleared record logs its model and hold; a clear with no record logs nothing."""
+        ledger = WholeCardResidencyLedger()
+        ledger.note_governor_defer(0, model="heavy-model", now=_NOW)
+        messages: list[str] = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+        try:
+            ledger.clear_governor_defer(0, now=_NOW + 42.0)
+            ledger.clear_governor_defer(0, now=_NOW + 50.0)
+        finally:
+            logger.remove(sink_id)
+
+        cleared = [line for line in messages if "governor deferral" in line]
+        assert cleared == ["Whole-card governor deferral of heavy-model on card 0 cleared after 42s held."]
 
     def test_the_deferral_is_per_card(self) -> None:
         """One card's held head says nothing about another card's."""

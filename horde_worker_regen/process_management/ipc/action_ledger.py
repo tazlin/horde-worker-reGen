@@ -70,6 +70,15 @@ class LedgerEventType(enum.StrEnum):
     MODEL_POOL_RESCUE_RELEASED = "model_pool_rescue_released"
     MODEL_POOL_DOWNLOAD_PENDING = "model_pool_download_pending"
     MODEL_POOL_DOWNLOAD_READY = "model_pool_download_ready"
+    DOMINANT_RUN_ENDED = "dominant_run_ended"
+    """A dominant-model run on one device ended, either because its jobs drained or because a different-model
+    head waited past the anti-starvation bound. The detail carries the run model and the cause, and for a
+    starved head the head's model and its seconds since pop."""
+    SAFETY_REPLACEMENT_REQUESTED = "safety_replacement_requested"
+    """The orphaned-verdict watchdog asked for the safety pool to be replaced after faulting a job that exhausted
+    its safety requeues. The detail carries the requeue count and whether a safety process was alive, since a
+    live process that does not progress is the case this request exists for. The replacement itself is recorded
+    as ``PROCESS_REPLACED``."""
 
 
 class LedgerEvent(BaseModel):

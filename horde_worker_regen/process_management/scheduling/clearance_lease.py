@@ -351,26 +351,38 @@ class ClearanceLeaseProxy:
         _write_shared_figure(self._cleared_sampling_reserve, sampling_reserve_mb)
         self._clearance.release()
 
-    def _parent_refresh_grant_figure(self, *, device_free_mb: float, sampling_reserve_mb: float | None) -> bool:
-        """Parent-side: rewrite the figures of a grant the child has not consumed, returning whether it did.
+    def _parent_refresh_grant_figure(
+        self,
+        *,
+        device_free_mb: float,
+        sampling_reserve_mb: float | None,
+    ) -> GrantFigureRefresh:
+        """Parent-side: rewrite the figures of a grant the child has not consumed, returning what the write did.
 
         The permit is held across the write. The child's acquire can return only once the permit is back, so it
         reads the new figures, and a permit the child already took cannot be rewritten, so a consumed grant is
         never rewritten. A child that probes during the hold finds no permit and blocks until the release.
 
         The reserve is written beside the device free because the child's job start unsets both; None unsets
-        the reserve.
+        the reserve. A reserve found unset under an unconsumed permit and written with a figure is reported as
+        restored, since the job start unset it after the grant.
         """
         if self._cleared_device_free is None:
-            return False
+            return GrantFigureRefresh.NOT_REWRITTEN
         if not self._clearance.acquire(False):
-            return False
+            return GrantFigureRefresh.NOT_REWRITTEN
         try:
+            reserve_was_unset = (
+                self._cleared_sampling_reserve is not None
+                and _read_shared_figure(self._cleared_sampling_reserve) is None
+            )
             self._cleared_device_free.value = device_free_mb
             _write_shared_figure(self._cleared_sampling_reserve, sampling_reserve_mb)
         finally:
             self._clearance.release()
-        return True
+        if reserve_was_unset and sampling_reserve_mb is not None:
+            return GrantFigureRefresh.RESERVE_RESTORED
+        return GrantFigureRefresh.REWRITTEN
 
     def _parent_reclaim_unconsumed_permit(self) -> bool:
         """Parent-side: non-blockingly take back a granted permit the child never consumed; return whether one was."""
@@ -488,6 +500,18 @@ class GrantState(enum.Enum):
     """The parent released this child's clearance permit; the child has not yet entered its denoise loop."""
     SAMPLING = "sampling"
     """The child consumed its grant and is inside its denoise loop (observed in ``INFERENCE_STARTING``)."""
+
+
+class GrantFigureRefresh(enum.Enum):
+    """What :meth:`ClearanceLeaseProxy._parent_refresh_grant_figure` did to an outstanding grant's figures."""
+
+    NOT_REWRITTEN = "not_rewritten"
+    """The proxy carries no figure, or the child already consumed the permit."""
+    REWRITTEN = "rewritten"
+    """The figures of an unconsumed grant were rewritten from this step's reading."""
+    RESERVE_RESTORED = "reserve_restored"
+    """As ``REWRITTEN``, and the reserve was unset before the write. The child's job start unsets both figures,
+    so the grant reached the child before its job start and the write restored the reserve."""
 
 
 _SLOT_HOLDING_STATES = frozenset({GrantState.CLEARED, GrantState.SAMPLING})
@@ -859,6 +883,7 @@ class ClearanceController:
         # the duty-cycle summary so one session's log answers which clause starves the overlap.
         self._tail_overlap_grants = 0
         self._grants_issued = 0
+        self._reserves_restored_after_job_start = 0
         self._unpriced_sampling_windows = 0
         self._tail_overlap_denials: collections.Counter[TailOverlapDenialReason] = collections.Counter()
         self._tail_denial_diagnostics = DiagnosticThrottle(self._clock)
@@ -1164,10 +1189,17 @@ class ClearanceController:
                 continue
             sampling_reserve_mb = sampling_reserve_by_pid.get(process_id)
             proxy._parent_refresh_stage_figure(device_free_mb=device_free_mb, sampling_reserve_mb=sampling_reserve_mb)
-            if state is GrantState.CLEARED:
-                proxy._parent_refresh_grant_figure(
-                    device_free_mb=device_free_mb,
-                    sampling_reserve_mb=sampling_reserve_mb,
+            if state is not GrantState.CLEARED:
+                continue
+            refresh = proxy._parent_refresh_grant_figure(
+                device_free_mb=device_free_mb,
+                sampling_reserve_mb=sampling_reserve_mb,
+            )
+            if refresh is GrantFigureRefresh.RESERVE_RESTORED:
+                self._reserves_restored_after_job_start += 1
+                logger.debug(
+                    f"Clearance lease on device {self._device_index}: restored the {sampling_reserve_mb:.0f}MB "
+                    f"activation reserve of process {process_id}'s unconsumed grant after its job start.",
                 )
 
     def _log_tail_overlap_clear(self, inputs: ClearanceInputs, *, outgoing_job_id: str) -> None:
@@ -1200,6 +1232,16 @@ class ClearanceController:
         :attr:`unpriced_sampling_windows` counts.
         """
         return self._grants_issued
+
+    @property
+    def reserves_restored_after_job_start(self) -> int:
+        """How many grants reached the child's job start before the child read them, this session.
+
+        The child's job start unsets a grant's figures, so a reserve found unset under an unconsumed permit means
+        the grant was issued before the job started. The step's refresh restores the reserve, and this tally
+        counts each restore.
+        """
+        return self._reserves_restored_after_job_start
 
     @property
     def unpriced_sampling_windows(self) -> int:

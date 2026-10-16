@@ -1201,6 +1201,22 @@ class VerifiedReclaimLadder:
             if not unwind_restore_obligation(obligation, actuator):
                 retained.append(obligation)
             elif isinstance(obligation, ReclaimRung):
+                if beneficiary_waiting is not None:
+                    # Asked with no lane kind, the callback reports a beneficiary waiting on any lane. Asked once
+                    # per restore, so a lane restored past a beneficiary waiting on that lane is visible.
+                    passed_over = next(
+                        (
+                            job_id
+                            for job_id in sorted(episode.lane_pause_beneficiaries.get(obligation.kind, set()))
+                            if beneficiary_waiting(job_id, None)
+                        ),
+                        None,
+                    )
+                    if passed_over is not None:
+                        logger.debug(
+                            f"Reclaim ladder: restoring the {_paused_lane_name(obligation.kind)} lane while job "
+                            f"{passed_over} still waits, since the job waits on that lane.",
+                        )
                 episode.lane_pause_beneficiaries.pop(obligation.kind, None)
                 episode.lane_holds_logged.discard(obligation.kind)
             else:

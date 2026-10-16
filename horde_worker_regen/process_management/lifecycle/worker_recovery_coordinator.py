@@ -655,6 +655,15 @@ class WorkerRecoveryCoordinator:
                     # safety-check progress, since the lifecycle hang watchdog has no safety-check state, so
                     # without this a live but hung process is never replaced and faults every job it holds.
                     self._process_lifecycle.safety_processes_should_be_replaced = True
+                    self._action_ledger.record(
+                        LedgerEventType.SAFETY_REPLACEMENT_REQUESTED,
+                        job_id=str(job_id),
+                        reason=f"safety check unrecoverable ({reason})",
+                        detail={
+                            "safety_requeues": requeues,
+                            "safety_process_alive": self._any_safety_process_alive(),
+                        },
+                    )
                 self.engage_safety_soft_pause(reason)
                 continue
 

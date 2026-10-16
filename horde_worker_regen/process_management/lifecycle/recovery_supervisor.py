@@ -234,6 +234,8 @@ class RecoverySupervisor:
         self._give_up_is_terminal = False
         # Edge latch so the live-boot give-up deferral is logged once per hold engagement, not every tick.
         self._boot_hold_deferral_logged = False
+        # Edge latch so a live boot holding a due soft reset is logged once per hold engagement.
+        self._boot_hold_soft_reset_logged = False
 
     @property
     def limp_by_level(self) -> int:
@@ -269,6 +271,7 @@ class RecoverySupervisor:
         self._give_up_cycles = 0
         self._give_up_is_terminal = False
         self._boot_hold_deferral_logged = False
+        self._boot_hold_soft_reset_logged = False
 
     def reset_episode(self) -> None:
         """Discard all episode state so the next :meth:`evaluate` starts a fresh escalation cycle.
@@ -476,14 +479,25 @@ class RecoverySupervisor:
             return RecoveryAction.GIVE_UP
 
         # A live boot holds the soft reset as it holds give-up, since rebuilding under it replaces the replacement.
-        if (
+        soft_reset_due = (
             is_wedged
-            and not live_boot_holds
             and self._wedge_since is not None
             and (now - self._wedge_since) >= self._wedge_grace_seconds
             and (now - self._last_action_time) >= self._reset_interval_seconds
             and self._soft_resets_done < self._max_soft_resets
-        ):
+        )
+        # Edge-triggered as the give-up deferral is, so a hold that lasts many ticks logs once.
+        if soft_reset_due and live_boot_holds:
+            if not self._boot_hold_soft_reset_logged:
+                logger.info(
+                    "Save-our-ship: holding the soft reset while a replacement child is still alive and booting "
+                    f"(boot elapsed {boot_elapsed:.0f}s, hard cap {self._boot_hard_cap_seconds:.0f}s). Rebuilding "
+                    "the pool now would replace the replacement.",
+                )
+                self._boot_hold_soft_reset_logged = True
+        else:
+            self._boot_hold_soft_reset_logged = False
+        if soft_reset_due and not live_boot_holds:
             if unrelated_progress_deferral_available:
                 self._last_action_time = now
                 return RecoveryAction.OBSERVE

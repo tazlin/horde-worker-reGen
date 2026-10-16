@@ -864,6 +864,29 @@ class TestGrantCarriesClearanceTruth:
         assert proxy.take_cleared_sampling_reserve_mb() == 1_500.0
         assert proxy.take_cleared_device_free_mb() == 15_000.0
 
+    def test_a_reserve_restored_after_job_start_is_counted_once(self) -> None:
+        """Only the step that finds the reserve unset under the unconsumed permit counts a restore."""
+        controller = _controller()
+        proxy = ClearanceLeaseProxy(
+            clearance=_held_empty_clearance(),
+            done=_FakeSemaphore(),
+            cleared_device_free=_shared_figure(),
+            cleared_sampling_reserve=_shared_figure(),
+        )
+        controller.register(2, proxy)
+        staged = (
+            ClearanceWaiter(process_id=2, priority=1, job_id="job-a", weights_mb=6_000.0, sampling_reserve_mb=1_500.0),
+        )
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+        controller.step(_inputs(staged=staged, device_free_mb=14_000.0), admit_fn=_always_admit)
+        assert controller.reserves_restored_after_job_start == 0
+
+        proxy.begin_job()
+        controller.step(_inputs(staged=staged, device_free_mb=15_000.0), admit_fn=_always_admit)
+        controller.step(_inputs(staged=staged, device_free_mb=15_500.0), admit_fn=_always_admit)
+
+        assert controller.reserves_restored_after_job_start == 1
+
     def test_a_stage_grant_issued_before_job_start_keeps_its_reserve(self) -> None:
         """An unconsumed stage grant's reserve is rewritten after the child's job start, as the sample grant's is."""
         controller = _controller(tail=False)
