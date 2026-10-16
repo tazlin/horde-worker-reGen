@@ -195,6 +195,8 @@ class DominantRunEndCause(StrEnum):
     """The run's own jobs drained and nothing held the run through its cooldown."""
     STARVED_HEAD = "starved_head"
     """A head for a different model waited past the anti-starvation bound while the run still had work."""
+    SUPERSEDED = "superseded"
+    """A rung-2 residency for a different model took the card, and its grant replaces the run's state."""
 
 
 @dataclass(frozen=True)

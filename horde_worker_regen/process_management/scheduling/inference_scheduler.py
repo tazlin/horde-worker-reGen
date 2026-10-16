@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import psutil
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -2860,6 +2860,7 @@ class InferenceScheduler:
         the pre-stage loads into is remembered so the convergence shrink can spare a slot that does not yet
         carry the model name.
         """
+        self._end_run_superseded_by(device_index, superseding_model=job.model)
         self._whole_card_ledger.record_grant(
             device_index,
             model=job.model,
@@ -2908,6 +2909,7 @@ class InferenceScheduler:
         lane that was busy at the establishment may have drained since, and the reservation line is written
         only when this call established the residency or actually stopped something.
         """
+        self._end_run_superseded_by(device_index, superseding_model=job.model)
         grant_kind = self._whole_card_ledger.record_grant(
             device_index,
             model=job.model,
@@ -3059,6 +3061,65 @@ class InferenceScheduler:
                 "offered model can sample beside it, so the offer narrows to it and its weights stay on the card "
                 "between its jobs; nothing is torn down.",
             )
+
+    def _end_dominant_run(
+        self,
+        device_index: int | None,
+        *,
+        run_model: str | None,
+        cause: DominantRunEndCause,
+        reason: str,
+        message: str,
+        job_id: str | None = None,
+        extra_detail: dict[str, str | int | float | bool | None] | None = None,
+        log_level: Literal["INFO", "DEBUG"] = "INFO",
+    ) -> None:
+        """End the rung-1 run on ``device_index``: clear it, log ``message`` and record the run-end ledger row.
+
+        Every run end goes through here so the line and the ``DOMINANT_RUN_ENDED`` row are written together for
+        every cause, which the duty and recovery analyses count runs by.
+        """
+        self._whole_card_ledger.record_run_end(device_index)
+        logger.log(log_level, message)
+        detail: dict[str, str | int | float | bool | None] = {
+            "device_index": device_index,
+            "run_model": run_model,
+            "cause": str(cause),
+        }
+        if extra_detail is not None:
+            detail.update(extra_detail)
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.DOMINANT_RUN_ENDED,
+            job_id=job_id,
+            reason=reason,
+            detail=detail,
+        )
+
+    def _end_run_superseded_by(self, device_index: int | None, *, superseding_model: str | None) -> None:
+        """End a rung-1 run on ``device_index`` that a rung-2 grant for a different model is about to replace.
+
+        The grant overwrites the card's state, so the run's end is recorded first. A rung-2 grant for the run's
+        own model is the teardown starting on the same weights and is left to the grant.
+        """
+        state = self._whole_card_ledger.get(device_index)
+        if (
+            state is None
+            or state.model is None
+            or state.rung is not DominanceRung.CANNOT_CO_SAMPLE
+            or state.model == superseding_model
+        ):
+            return
+        self._end_dominant_run(
+            device_index,
+            run_model=state.model,
+            cause=DominantRunEndCause.SUPERSEDED,
+            reason="rung-2 residency for a different model took the card",
+            message=(
+                f"Dominant-model run for {state.model} ended because a whole-card residency for "
+                f"{superseding_model} takes the card."
+            ),
+            extra_detail={"superseding_model": superseding_model},
+        )
 
     def _weights_belong_to_dominant_run(
         self,
@@ -3466,21 +3527,19 @@ class InferenceScheduler:
                 # through the ledger, so ending it here withdraws the copy spare, the seat and the pop claim
                 # together. Work in flight finishes; the run's queued jobs dispatch as ordinary jobs and may start
                 # a new run at their first step.
-                self._whole_card_ledger.record_run_end(device_index)
                 tracked = self._job_tracker.get_tracked_job(starved_head.id_) if starved_head.id_ is not None else None
                 age_since_pop = now - tracked.time_popped if tracked is not None and tracked.time_popped else 0.0
-                logger.info(
-                    f"Dominant-model run for {model} ended because the head job for {starved_head.model} has waited "
-                    f"{age_since_pop:.0f}s since pop, past the anti-starvation bound.",
-                )
-                self._process_lifecycle.action_ledger.record(
-                    LedgerEventType.DOMINANT_RUN_ENDED,
-                    job_id=str(starved_head.id_) if starved_head.id_ is not None else None,
+                self._end_dominant_run(
+                    device_index,
+                    run_model=model,
+                    cause=DominantRunEndCause.STARVED_HEAD,
                     reason="different-model head past the anti-starvation bound",
-                    detail={
-                        "device_index": device_index,
-                        "run_model": model,
-                        "cause": str(DominantRunEndCause.STARVED_HEAD),
+                    message=(
+                        f"Dominant-model run for {model} ended because the head job for {starved_head.model} has "
+                        f"waited {age_since_pop:.0f}s since pop, past the anti-starvation bound."
+                    ),
+                    job_id=str(starved_head.id_) if starved_head.id_ is not None else None,
+                    extra_detail={
                         "head_model": starved_head.model,
                         "head_seconds_since_pop": round(age_since_pop, 1),
                     },
@@ -3501,16 +3560,13 @@ class InferenceScheduler:
                 different_model_head = head is not None and head.model is not None and head.model != model
                 if now < state.cooldown_until and not different_model_head and not retention_ended:
                     continue
-                self._whole_card_ledger.record_run_end(device_index)
-                logger.debug(f"Dominant-model run for {model} ended: its jobs drained.")
-                self._process_lifecycle.action_ledger.record(
-                    LedgerEventType.DOMINANT_RUN_ENDED,
+                self._end_dominant_run(
+                    device_index,
+                    run_model=model,
+                    cause=DominantRunEndCause.DRAINED,
                     reason="run jobs drained",
-                    detail={
-                        "device_index": device_index,
-                        "run_model": model,
-                        "cause": str(DominantRunEndCause.DRAINED),
-                    },
+                    message=f"Dominant-model run for {model} ended: its jobs drained.",
+                    log_level="DEBUG",
                 )
                 continue
             # A ready head for a different model may cut the cooldown short, but not before the residency has

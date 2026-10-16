@@ -40,6 +40,7 @@ from horde_worker_regen.process_management.models.horde_model_map import (
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.reclaim_ladder import VerifiedReclaimLadder
+from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
 from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.admission import preload, pricing
@@ -2388,6 +2389,85 @@ class TestDominantRunEndsForAStarvedHead:
         scheduler._restore_siblings_after_whole_card()
 
         assert scheduler._whole_card_ledger.holder_for_model("run-model")[0]
+
+
+class TestDominantRunEndsWhenSuperseded:
+    """A rung-1 run replaced by a rung-2 grant for another model ends with the same record as every other run end.
+
+    The rung-2 grant overwrites the card's state, so without its own end the run leaves no line and no ledger row.
+    """
+
+    async def _scheduler_with_run(self) -> InferenceScheduler:
+        """A rung-1 run for ``run-model`` on the card, with a head for ``heavy-model`` queued."""
+        run_lane = make_mock_process_info(0, model_name="run-model")
+        scheduler = _make_inference_scheduler(process_map=ProcessMap({0: run_lane}))
+        await track_popped_job_async(scheduler._job_tracker, make_job_pop_response("heavy-model"))
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model="run-model",
+            forecast=None,
+            cooldown_until=0.0,
+            now=0.0,
+            rung=DominanceRung.CANNOT_CO_SAMPLE,
+        )
+        return scheduler
+
+    @staticmethod
+    def _whole_card_forecast() -> StreamForecast:
+        """A forecast for a model that needs the card to itself, one resident process."""
+        return StreamForecast(
+            weights_mb=20000.0,
+            reserve_mb=3000.0,
+            base_reserve_mb=1000.0,
+            free_now_mb=23500.0,
+            free_if_alone_mb=23500.0,
+            free_after_model_evict_mb=23500.0,
+            total_vram_mb=24000.0,
+            per_process_overhead_mb=500.0,
+            marginal_process_overhead_mb=500.0,
+            wants_whole_card=True,
+        )
+
+    @staticmethod
+    def _run_ends(scheduler: InferenceScheduler) -> list[dict[str, object]]:
+        process_lifecycle = scheduler._process_lifecycle
+        assert isinstance(process_lifecycle, Mock)
+        record = process_lifecycle.action_ledger.record
+        return [
+            call.kwargs["detail"]
+            for call in record.call_args_list
+            if call.args[0] is LedgerEventType.DOMINANT_RUN_ENDED
+        ]
+
+    @pytest.mark.parametrize("grant", ["establish", "prestage"])
+    async def test_a_rung_2_grant_for_another_model_ends_the_run(self, grant: str) -> None:
+        """One run-end row with cause ``superseded`` names the run model and the superseding model."""
+        scheduler = await self._scheduler_with_run()
+        heavy_job = make_job_pop_response("heavy-model")
+        forecast = self._whole_card_forecast()
+
+        if grant == "establish":
+            scheduler._establish_whole_card_residency(heavy_job, forecast, announce=False)
+        else:
+            scheduler._begin_whole_card_residency(heavy_job, forecast, announce=False)
+
+        run_ends = self._run_ends(scheduler)
+        assert len(run_ends) == 1
+        assert run_ends[0]["run_model"] == "run-model"
+        assert run_ends[0]["cause"] == DominantRunEndCause.SUPERSEDED
+        assert run_ends[0]["superseding_model"] == "heavy-model"
+        state = scheduler._whole_card_ledger.state_for(None)
+        assert state.model == "heavy-model"
+        assert state.rung is DominanceRung.CANNOT_CO_RESIDE
+
+    async def test_a_rung_2_grant_for_the_run_model_records_no_run_end(self) -> None:
+        """A rung-2 ask for the run's own model is the teardown starting on the same weights, so no run ends."""
+        scheduler = await self._scheduler_with_run()
+        forecast = self._whole_card_forecast()
+
+        scheduler._establish_whole_card_residency(make_job_pop_response("run-model"), forecast, announce=False)
+
+        assert self._run_ends(scheduler) == []
 
 
 class TestPrivateArbiterCycleFreshness:

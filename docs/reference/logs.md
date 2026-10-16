@@ -221,7 +221,7 @@ does not detect them yet.
 
 | Event | Fields | Recorded when |
 | ----- | ------ | ------------- |
-| `dominant_run_ended` | `device_index`, `run_model`, `cause` (`drained` or `starved_head`); for `starved_head` also `head_model`, `head_seconds_since_pop`, and the head's id as `job_id` | A dominant-model run ends, either because its jobs drained or because a different-model head waited past the anti-starvation bound. |
+| `dominant_run_ended` | `device_index`, `run_model`, `cause` (`drained`, `starved_head` or `superseded`); for `starved_head` also `head_model`, `head_seconds_since_pop`, and the head's id as `job_id`; for `superseded` also `superseding_model` | A dominant-model run ends because its jobs drained, because a different-model head waited past the anti-starvation bound, or because a rung-2 residency for a different model took the card. |
 | `safety_replacement_requested` | `safety_requeues`, `safety_process_alive`, and the faulted job's id as `job_id` | The orphaned-verdict watchdog faults a job that ran out of safety requeues and asks for the safety pool to be replaced. The replacement itself is recorded as `process_replaced`. |
 
 ## Supervisor stall forgiveness

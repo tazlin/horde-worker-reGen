@@ -174,7 +174,9 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   (`CANNOT_CO_SAMPLE`) is a dominant-model run, rung 2 (`CANNOT_CO_RESIDE`) the teardown residency. `held()`
   returns every rung and `teardown_held()` rung 2 only, so a reader whose premise is a teardown reads the latter.
   A run starts at its first step and ends in `_restore_siblings_after_whole_card`, either drained or with a
-  different-model head past `_head_aged_past_anti_starvation`, and every reader of a run goes through the ledger.
+  different-model head past `_head_aged_past_anti_starvation`, or when a rung-2 grant for a different model takes
+  the card (`_end_run_superseded_by`). Every run end is written by `_end_dominant_run`, and every reader of a run
+  goes through the ledger.
   The establish-rate limiter is the only governor that defers (`DEFER_RESIDENCY_GOVERNOR`, which does not stop the
   preload pass, and a head it withholds at dispatch is stepped past by a `diversity` line-skip); the grace
   allowance only decides whether an excuse window opens (`grace_seconds_to_open`). The owners, readers, fences
