@@ -803,7 +803,12 @@ class HordeDownloadProcess(HordeProcess):
         for pin in pins:
             try:
                 if pin.kind is AuxModelKind.LORA and lora is not None:
-                    key = lora.fuzzy_find_lora_key(pin.name)
+                    # The fuzzy lookup reads a number as a model id, so a version id resolves to another LoRA or none.
+                    key = (
+                        lora.find_lora_key_by_version(pin.name)
+                        if pin.is_version
+                        else lora.fuzzy_find_lora_key(pin.name)
+                    )
                     if key is not None:
                         lora_keys.add(key)
                 elif pin.kind is AuxModelKind.TI and ti is not None:

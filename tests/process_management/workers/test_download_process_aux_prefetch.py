@@ -52,6 +52,12 @@ class _FakeLoraManager:
         self.reject_reason = reject_reason
         self.fetch_calls: list[tuple[str, bool]] = []
         self.pins: set[str] | None = None
+        # CivitAI version id to reference key, as hordelib's version index resolves it; kept apart from the
+        # fuzzy present-set so a test can tell which lookup resolved a ref.
+        self.keys_by_version: dict[str, str] = {}
+
+    def find_lora_key_by_version(self, version: str) -> str | None:
+        return self.keys_by_version.get(version)
 
     def is_lora_available(self, name: str, is_version: bool = False) -> bool:
         return name in self.present
@@ -403,6 +409,38 @@ def test_pins_are_applied_to_both_managers(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert lora.pins == {"pinnedL"}
     assert ti.pins == {"pinnedT"}
+
+
+def test_version_referenced_lora_pin_resolves_through_the_version_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A LoRA pin carrying ``is_version`` pins the key that owns the version, never a fuzzy match of the id."""
+    lora = _FakeLoraManager(present={"unrelated_lora"})
+    lora.keys_by_version = {"123456": "versioned_lora"}
+    process = _make_process(monkeypatch, lora=lora, ti=None)
+
+    process._handle_aux_prefetch_request(
+        HordeAuxPrefetchControlMessage(
+            entries=[],
+            pins=[AuxModelRef(kind=AuxModelKind.LORA, name="123456", is_version=True)],
+        ),
+    )
+
+    assert lora.pins == {"versioned_lora"}
+
+
+def test_name_referenced_lora_pin_stays_on_the_fuzzy_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A LoRA pin without ``is_version`` resolves through the fuzzy lookup even when the name is a version id."""
+    lora = _FakeLoraManager(present={"123456"})
+    lora.keys_by_version = {"123456": "versioned_lora"}
+    process = _make_process(monkeypatch, lora=lora, ti=None)
+
+    process._handle_aux_prefetch_request(
+        HordeAuxPrefetchControlMessage(
+            entries=[],
+            pins=[AuxModelRef(kind=AuxModelKind.LORA, name="123456")],
+        ),
+    )
+
+    assert lora.pins == {"123456"}
 
 
 def test_prefetch_before_managers_load_emits_no_failure(monkeypatch: pytest.MonkeyPatch) -> None:
