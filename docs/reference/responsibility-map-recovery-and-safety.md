@@ -1,105 +1,100 @@
 # Recovery and safety responsibility map
 
-This page lists the one owner of each decision about replacing a process, judging the worker wedged, placing the
-safety check and holding a lane down for a waiting job. The reasoning behind each rule is in
+Recovery works in layers. The lifecycle replaces a single process that died or stopped reporting. The recovery
+coordinator judges whether the worker as a whole has stopped making progress, and the recovery supervisor escalates
+that judgement from a resource remedy to a soft reset and then to a give-up. Beside that ladder, one actuator moves
+the safety process on and off the GPU for a named owner and one reconciler returns it. A per-check window can send a
+single check to the CPU without moving the process, and an orphan watchdog recovers jobs whose verdict does not
+return. The reasoning behind the rules is in
 [Resilience and recovery](../explanation/resilience_and_recovery.md),
 [Process lifecycle](../explanation/process_lifecycle.md), [VRAM arbiter](../explanation/vram_arbiter.md) and
 [Process lanes and chaining](../explanation/process_lanes_and_chaining.md).
 
 Paths are relative to `horde_worker_regen/process_management/`. The lifecycle is `ProcessLifecycleManager` in
 `lifecycle/process_lifecycle.py`, the coordinator is `WorkerRecoveryCoordinator` in
-`lifecycle/worker_recovery_coordinator.py`, and the scheduler is `InferenceScheduler`.
+`lifecycle/worker_recovery_coordinator.py`, the supervisor is `RecoverySupervisor` in
+`lifecycle/recovery_supervisor.py`, and the scheduler is `InferenceScheduler` in
+`scheduling/inference_scheduler.py`.
 
-## Decisions and owners
+```mermaid
+flowchart TD
+    assess["coordinator assess_wedge<br/>(five inputs)"] -->|wedged for 1.5 s| reclaim["RECLAIM<br/>a constructive resource remedy"]
+    reclaim -->|still wedged| reset["SOFT_RESET<br/>perform_soft_reset rebuilds the pools"]
+    reset -->|"still wedged once the pool is ready<br/>or a boot backstop has elapsed"| giveup["GIVE_UP<br/>fault the jobs that cannot be served"]
+    giveup -->|wedge outlives a fresh soft-reset cycle| terminal["terminal give-up"]
+    terminal -->|a relauncher exists| restart["RESTART_PROCESS<br/>exit with failure status"]
+    terminal -->|no relauncher| park["recovery park<br/>pops and rebuilds stop, re-probe later"]
+    reset -.->|progress resumes| assess
+```
 
-| Decision | Owner | Readers | Rule in one sentence |
-| --- | --- | --- | --- |
-| A dead child is replaced | lifecycle `_reap_if_crashed` | every process type | Death is definitive, so the reap is not debounced and does not read boot state. |
-| A live inference slot is hung or broken | lifecycle `replace_hung_processes` (silence timeout widened by `_effective_inference_step_timeout`, stuck-step watchdog, state timeouts through `_check_and_replace_process`, all-processes-timed-out), `_replace_faulting_inference_lanes` | the main loop | Each branch has its own timer, and the branches share the `_recently_recovered` debounce. |
-| A crawling sampler is killed as the last rung | lifecycle `_replace_if_paged_and_slow`, `SATURATION_KILL_MIN_SECONDS`; clock `HordeWorkerProcessManager._device_saturation_duration_seconds` | the reclaim ladder's end | An `INFERENCE_STARTING` slot that crawls is replaced once the card has been SATURATED for 10 s with the ladder unresolved. |
-| A slot is replaced for another owner's reason | scheduler `clearance_admit_process` (refused outright), `unload_models_from_vram` (send failure), `_replace_stale_ram_unload_process`; `PlanExecutor.execute_commands`, `execute_governance_actions`; `HordeWorkerProcessManager._control_loop_tick` (maintenance), `_apply_supervisor_command` (operator) | lifecycle `_replace_inference_process` | Each calls `_replace_inference_process` directly, whose only gate is the recovery park. |
-| The inference pool is rebuilt | coordinator `perform_soft_reset`, `maybe_reset_stuck_governance_hold`; lifecycle `rebuild_inference_pool` | `RecoverySupervisor` | A rebuild replaces every live inference slot, one in `PROCESS_STARTING` included. |
-| The worker is wedged | coordinator `assess_wedge`, `structural_queue_wedge_active`; the dispatcher's queue-deadlock latch, `_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS` | `RecoverySupervisor.evaluate` | One assessor over five inputs, each with its own clock, and a queue deadlock counts once 20 s have passed since the latest of the latch's start, the last excuse lifting and the last inference-slot boot ending. |
-| The save-our-ship action | `lifecycle/recovery_supervisor.py` `RecoverySupervisor.evaluate` | the coordinator | A wedge held 1.5 s earns one soft reset, and both the soft reset and give-up are held under `live_boot_holds`, a live boot short of the boot hard cap. |
-| The safety process is replaced | lifecycle `_reap_if_crashed`; coordinator `reconcile_orphaned_safety_jobs`; `SafetyOrchestrator.start_evaluate_safety` (dispatch failure); the soft reset; `pause_safety_on_gpu`, `restore_safety_on_gpu` | lifecycle `safety_processes_should_be_replaced` | The orphaned-verdict watchdog replaces safety only when `is_safety_capacity_available` is false, or flags it when a job is faulted after `SAFETY_REQUEUE_MAX` re-checks while a process is live, and never while `safety_placement_transition_pending` holds. |
-| How long a job may await a verdict | coordinator `_orphan_safety_grace_seconds`, `ORPHAN_SAFETY_GRACE_SECONDS` | `reconcile_orphaned_safety_jobs` | The 45 s baseline holds on the GPU or with no live safety process, and the grace scales with measured checks and the backlog while a process is alive off the GPU. |
-| Whether safety may take a check | coordinator `is_safety_pool_ready` | intake | An idle process able to accept a check, read for intake and never as a replacement trigger. |
-| Safety leaves the GPU | scheduler `_reconcile_runtime_safety_placement` (runtime demotion), reclaim requests from the governor ladder, the arbiter and the SOS remedy (`RECLAIM_LADDER`), whole-card residency (`WHOLE_CARD`), lifecycle deferred start escalation, permission withdrawn on reload | lifecycle `pause_safety_on_gpu` with a `PauseOwner` | Every process move goes through the one actuator under a named pause owner. |
-| A single check runs on the CPU | scheduler `safety_check_window`, `safety_check_patience_seconds` | `SafetyOrchestrator` | A check the arbiter cannot seat within the patience runs on the CPU, with no process move. |
-| Safety returns to the GPU | scheduler `_reconcile_runtime_safety_placement`; weights through `_promote_safety_weights_if_room` | lifecycle `restore_safety_on_gpu` | The reconciler alone restores the process, after `SafetyPlacementInputs.restore_headroom_fits`, the restore dwell and the arbiter, while weight promotion needs only an unpressured card the arbiter admits. |
-| The restore dwell | scheduler `_safety_placement_restore_dwell_seconds`; `scheduling/ledgers/safety_placement.py` `SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR`, `MEMORY_PRESSURE_PAUSE_OWNERS` | the reconciler | Twice the measured safety readiness latency (`safety_readiness_latency_seconds`, at least 30 s), for pauses whose owner is a memory-pressure owner. |
-| The restore headroom's marginal need | scheduler `_sampling_peak_jobs_for_card`, `_resident_committed_mb_for_model` | `restore_headroom_fits` | The heaviest learned peak among in-progress and eligible queued jobs, less what a lane already holds for that model. |
-| A lane stays paused for a beneficiary | `resources/reclaim_ladder.py` `ReclaimLadder._unwind_restore_obligations`, `lane_pause_beneficiaries`; `HordeWorkerProcessManager._beneficiary_waiting` | the ladder's restore | The ladder asks `beneficiary_waiting(job_id, kind)` with the paused lane's `ReclaimRungKind`, and a job waiting for post-processing never holds the post-processing lane. |
-| A post-processing job waits for room | `workers/post_process_orchestrator.py` `PostProcessOrchestrator._age_out_unfittable`, `_ADMISSION_PATIENCE_SECONDS` | the job tracker | A chain that cannot be admitted for 90 s is faulted, and the clock runs under a reclaim-ladder pause. |
-| A child ends on a handler exception | `lifecycle/horde_process.py` `receive_and_handle_control_messages` | the parent's reap | Any exception from a supported handler ends the child. |
-| A LoRA is on disk | `JobTracker._cached_lora_keys`; hordelib's ad-hoc cache in the download process; pins from `AuxPrefetchCoordinator._current_pins` applied by the download process's `_apply_eviction_pins` | aux preparation | The parent's set is "seen present this session", dropped only on a resolve failure, and every queued job's files are pinned. |
+## Replacing one process
 
-## Fences
+| Decision | Owner | Rule |
+| --- | --- | --- |
+| A dead child is replaced | lifecycle `_reap_if_crashed` | Death is definitive, so the reap is not debounced and does not read boot state. |
+| A live inference slot is hung or broken | lifecycle `replace_hung_processes` (silence timeout widened by `_effective_inference_step_timeout`, the stuck-step watchdog, state timeouts through `_check_and_replace_process`, all-processes-timed-out), `_replace_faulting_inference_lanes` | Each branch has its own timer, and the branches share the `_recently_recovered` debounce. |
+| A crawling sampler is killed as the last reclaim rung | lifecycle `_replace_if_paged_and_slow`, `SATURATION_KILL_MIN_SECONDS` (10 s); clock `HordeWorkerProcessManager._device_saturation_duration_seconds` | An `INFERENCE_STARTING` slot that crawls is replaced once the card has been continuously SATURATED for 10 s with the verified reclaim ladder unresolved, so a card a softer rung could still rescue is not killed. |
+| A slot is replaced for another owner's reason | scheduler `clearance_admit_process` (refused outright), `unload_models_from_vram` (send failure), `_replace_stale_ram_unload_process`; `PlanExecutor.execute_commands`, `execute_governance_actions`; `HordeWorkerProcessManager._control_loop_tick` (maintenance), `_apply_supervisor_command` (operator) | Each calls lifecycle `_replace_inference_process` directly, whose only gate is the recovery park. These paths do not share the `_recently_recovered` debounce and `_replace_inference_process` does not guard a slot already in `PROCESS_STARTING`, so a new path reads boot and busy state itself. |
+| A child ends on a handler exception | `lifecycle/horde_process.py` `receive_and_handle_control_messages` | Any exception from a supported handler ends the child, because a handler that failed mid-action leaves the process state unknown. A message the child does not support is dropped, since no handler ran. |
 
-- **One soft reset on a 1.5 s wedge** (`RecoverySupervisor`). A transient wedge, such as a bad model load or a
-  one-off deadlock, recovers at this rung.
-- **`live_boot_holds` and the boot hard cap** (`RecoverySupervisor.evaluate`). A progressing replacement protects
-  queued work, and a rebuild under it replaces the replacement. The hard cap keeps a stuck boot from masking the wedge.
-- **The 20 s structural-wedge minimum** (`_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS`). Transient all-idle gaps and preload
-  windows are not definitive wedges. The minimum restarts when an excuse lifts or an inference slot finishes booting
-  (`structural_queue_wedge_active`), so a hold's end is not read as a sustained wedge.
-- **The latch held while a process starts, re-armed only for a booting inference slot.** A respawning slot must not
-  clear a real deadlock, and remedies that cycle safety or service lanes must not hold the wedge clock at zero.
-- **The scaled orphan grace and the capacity test** (`_orphan_safety_grace_seconds`,
-  `is_safety_capacity_available`). The safety lane is single-serial, so the one process is unready for the whole of
-  every check. A busy process is progressing, and replacing it discards the check it holds.
-- **The flag after `SAFETY_REQUEUE_MAX` re-checks.** The watchdog is the only reader of safety-check progress, since
-  the lifecycle hang watchdog does not keep safety-check state.
-- **The restore dwell.** Safety leaves promptly and comes back once room is durable, so a restore does not re-trip.
-- **The restore forecast charges queued peaks** (`_sampling_peak_jobs_for_card`). Readmitting safety on room the next
-  peak takes back is how one restore buys the next eviction.
-- **Weight promotion has no dwell** (`_promote_safety_weights_if_room`). A flip that keeps the process and the CUDA
-  context costs too little to earn a forecast.
-- **The post-processing clause in `_beneficiary_waiting`.** Without it, a lane paused for a chain would be
-  restored on the next HEALTHY sample, which the pause itself produces. The rung kind keeps that clause off the
-  post-processing lane.
-- **The post-processing age-out under a ladder pause.** The ladder restores a lane only when the card reaches
-  HEALTHY, which may never come.
-- **10 s of SATURATED before the kill** (`SATURATION_KILL_MIN_SECONDS`). A card a softer rung could still rescue is
-  never killed.
-- **A child exits on a handler exception.** A handler that failed mid-action leaves the process state unknown, so
-  the parent recovers it. A message the child does not support is dropped instead, since no handler ran.
+## Judging the worker wedged
 
-## Friction
+| Decision | Owner | Rule |
+| --- | --- | --- |
+| The worker is wedged | coordinator `assess_wedge` | Any of five inputs, each with its own clock: the inference pool unrecoverable, the safety pool unrecoverable, a structural queue wedge, an orphan wedge, a pop-gate wedge. Shutdown, the downloads-only hold and the recovery park mask the assessment. |
+| A queue deadlock is a structural wedge | coordinator `structural_queue_wedge_active`; dispatcher `DeadlockSnapshot.indicates_structural_wedge`, `_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS` (20 s) | The dispatcher's latch must hold for 20 s, measured from the later of the latch's start and the wedge clock's last restart. The clock restarts on every tick an excuse holds the queue (the residency grace, the residency governor's deferral, the heavy-head load grace, the RAM-reclaim cycle grace, a live dispatch hold, inference starts backing off) and on the tick an inference slot finishes booting. Inference in progress disproves the wedge. The latch keeps its age under an excuse, so without the restart a hold's end would read as a sustained wedge. |
+| The save-our-ship action | `RecoverySupervisor.evaluate` | A wedge held 1.5 s earns the next constructive remedy, then one soft reset, then a give-up. While a replacement child is alive and booting (`live_boot_holds`), the give-up waits, up to the boot hard cap, so a stuck boot cannot mask the wedge. |
+| The inference pool is rebuilt | coordinator `perform_soft_reset`, `maybe_reset_stuck_governance_hold`; lifecycle `rebuild_inference_pool` | A rebuild replaces every live inference slot, one in `PROCESS_STARTING` included. |
+| The terminal give-up | coordinator give-up through `RecoveryDisposition` | With a relauncher the process exits with failure status. Without one the coordinator enters the recovery park (`enter_recovery_park`), which stops pops and rebuilds and re-probes after `RECOVERY_PARK_REPROBE_SECONDS`. |
 
-- **Eleven replacement paths, one debounce.** Only the `replace_hung_processes` branches share `_recently_recovered`.
-  The supervisor keeps its own action spacing, and the other paths call `_replace_inference_process`, which does not
-  guard against a slot already in `PROCESS_STARTING`. A new path has to read boot and busy state itself.
-- **Two pricers of safety's room.** `restore_headroom_fits` charges the heaviest queued peak through
-  `_sampling_peak_jobs_for_card`, while the arbiter prices the same load on measured free. A queued job of a model no
-  lane holds is charged its whole peak whether or not it would sample beside safety, so on a busy card the forecast
-  can hold safety on the CPU for a whole session.
-- **A memory-pressure dwell for any ladder pause.** `MEMORY_PRESSURE_PAUSE_OWNERS` includes `RECLAIM_LADDER` whatever
-  filed the request, so an SOS rung for a wedge unrelated to memory earns the same forecast as a pressure eviction.
-- **Remedy demotion against promotion.** The SOS `DEMOTE_SAFETY_WEIGHTS` rung frees room, and
-  `_promote_safety_weights_if_room` takes it back on the next cycle because the card is not pressured. The promoter
-  does not read a settling remedy, as `WorkerRecoveryCoordinator.holds_lane_pause` does for lane pauses.
-- **Two readings of saturation in one ladder.** The kill's clock in `HordeWorkerProcessManager` is set only while the
-  governor reads SATURATED, while the ladder it ends runs under SATURATED or the per-step floor's force. The ladder
-  can run to unresolved under PRESSURE with the kill's clock at zero.
-- **Known-lost verdicts cover retired launches only.** `MessageDispatcher.take_safety_verdicts_known_lost` is filled
-  when a retired launch's verdict is dropped. `_reap_if_crashed` knows a safety child died mid-check but does not mark
-  its jobs, so they wait out the full grace.
-- **The per-check CPU route reads VRAM only.** `safety_check_window` sends a check to the CPU on the arbiter's
-  verdict while the host RAM danger floor may be engaged, and `receive_and_handle_control_messages` then ends the
-  child on the allocation failure.
-- **LoRA presence has two owners.** hordelib's ad-hoc cache evicts without telling the parent, so
-  `_cached_lora_keys` reports a file present until a resolve fails. Pins cannot hold a file evicted before its job
-  was popped.
+## Safety-check jobs
 
-## Not determined
+| Decision | Owner | Rule |
+| --- | --- | --- |
+| How long a job may await a verdict | coordinator `_orphan_safety_grace_seconds`, `ORPHAN_SAFETY_GRACE_SECONDS` (45 s) | The baseline holds while safety runs on a GPU or no safety process is alive. With a live process off the GPU the grace is the average check x (3 + the safety backlog), at least the baseline and at most 300 s, because the lane is single-serial and a verdict waits for every check ahead of it. |
+| A stranded job is requeued or faulted | coordinator `reconcile_orphaned_safety_jobs`, `SAFETY_REQUEUE_MAX` (3) | A job past the grace is requeued for a fresh check. After 3 requeues, or with the safety pool unrecoverable, it is faulted so the horde reissues it. A verdict dropped from a retired launch (`MessageDispatcher.take_safety_verdicts_known_lost`) skips the grace. |
+| The safety process is replaced | lifecycle `_reap_if_crashed`, `_check_and_replace_process`; coordinator `reconcile_orphaned_safety_jobs`; `SafetyOrchestrator.start_evaluate_safety` (dispatch failure); the soft reset | A requeue asks for a replacement only when `is_safety_capacity_available` is false, since a busy process is progressing and replacing it discards its check. A job faulted after `SAFETY_REQUEUE_MAX` requeues asks for one while a process is live, since that watchdog is the only reader of safety-check progress. Neither asks while `safety_placement_transition_pending` holds. |
+| Whether safety may take a check | coordinator `is_safety_pool_ready` | An idle process able to accept a check, read by intake and never as a replacement trigger. |
 
-- Whether the restore forecast should charge queued jobs at all, or only in-progress jobs and models a lane holds.
-- Whether a `RECLAIM_LADDER` pause filed by SOS or for a starved head should earn the memory-pressure dwell.
-- Which state timeouts in `_check_and_replace_process` read boot state for the safety and post-processing lanes.
-- Whether a rung-2 residency restores safety without the dwell on release.
-- Whether the kill's clock should count the episode the ladder runs, and what horizon then applies.
-- Whether a CPU allocation failure inside a safety check should fail that check and keep the child.
+## Safety placement
+
+The safety process is on its card with its weights resident, on its card with its weights demoted to host RAM, or
+off the GPU. Every move goes through one actuator under a named `PauseOwner`, and the reconciler alone restores.
+
+| Decision | Owner | Rule |
+| --- | --- | --- |
+| Safety leaves the GPU | scheduler `_reconcile_runtime_safety_placement`; lifecycle `pause_safety_on_gpu` with a `PauseOwner` | A whole-card residency (`WHOLE_CARD`), a reclaim-ladder request (`RECLAIM_LADDER`) and measured pressure held for the dwell (`RUNTIME_SAFETY_PLACEMENT`) are the owners, in that order of precedence. Under pressure the weights are demoted first while that is possible, and the process moves only if the pressure persists. A config reload that withdraws `safety_on_gpu` from the pinned card moves the process through `demote_safety_from_unpermitted_card`, and a deferred on-GPU start that stalls is started on the CPU instead (`_escalate_safety_start_off_gpu`). |
+| A single check runs on the CPU | scheduler `safety_check_window`, `safety_check_patience_seconds` | A check whose growth the arbiter cannot seat waits with its booking standing and runs on the CPU after the patience, the measured CPU check time. The process does not move. The window reads VRAM only, not the host RAM verdict. |
+| Safety returns to the GPU | scheduler `_reconcile_runtime_safety_placement`; lifecycle `restore_safety_on_gpu` | The restore is held while another owner asks for the card, a residency vetoes it, a shallow safety backlog drains on the CPU (not for a ladder pause), the post-processing backlog is deep, or the VRAM growth hold is on. A memory-pressure owner's pause also needs the restore dwell of forecast headroom. If the arbiter still withholds the load, the reconciler evicts the coldest idle resident not needed by queued work and asks again on the next cycle. |
+| The restore forecast | `scheduling/ledgers/safety_placement.py` `SafetyPlacementInputs.restore_headroom_fits`; scheduler `_safety_placement_marginal_need_mb`, `_sampling_peak_jobs_for_card`, `_resident_committed_mb_for_model` | Measured free must cover the safety footprint, the noise buffer and the marginal need on a HEALTHY card. The marginal need is the heaviest learned peak among the card's in-progress and eligible queued jobs, less what a lane already holds for that model, since readmitting on room the next peak takes back buys the next eviction. |
+| The restore dwell | scheduler `_safety_placement_restore_dwell_seconds`; `SAFETY_PLACEMENT_RESTORE_DWELL_FACTOR` (2), `MEMORY_PRESSURE_PAUSE_OWNERS` | Twice the measured safety readiness latency (`safety_readiness_latency_seconds`, 30 s to 300 s), for pauses whose owner is `RUNTIME_SAFETY_PLACEMENT` or `RECLAIM_LADDER`, so safety leaves promptly and returns once room is durable. A whole-card residency's pause ends when its model drains. |
+| Safety's weights return to the GPU | scheduler `_promote_safety_weights_if_room` | With no owner asking for the card, demoted weights are promoted on an unpressured card the arbiter admits, with no dwell, since a flip that keeps the process and its CUDA context is cheap. |
+
+`MEMORY_PRESSURE_PAUSE_OWNERS` holds `RECLAIM_LADDER` whatever filed the ladder request, so a ladder pause taken for a
+save-our-ship remedy earns the same dwell as a pressure eviction. The weight promoter does not read a settling
+remedy, so a `DEMOTE_SAFETY_WEIGHTS` remedy's room can be taken back on the next cycle.
+
+## Lanes held for a waiting job
+
+| Decision | Owner | Rule |
+| --- | --- | --- |
+| A lane stays paused for a beneficiary | `resources/reclaim_ladder.py` `ReclaimLadder._unwind_restore_obligations`, `lane_pause_beneficiaries`; `HordeWorkerProcessManager._beneficiary_waiting` | The ladder asks whether the booked job still waits, with the paused lane's `ReclaimRungKind`. An inference beneficiary waits until its sample ends and a post-processing one until its chain leaves the lane. A job waiting for post-processing does not hold the post-processing lane paused, since that lane is the one that drains it. |
+| A post-processing job waits for room | `workers/post_process_orchestrator.py` `PostProcessOrchestrator._age_out_unfittable`, `_ADMISSION_PATIENCE_SECONDS` (90 s) | A chain that cannot be admitted for 90 s is faulted, and the clock runs under a reclaim-ladder pause, because the ladder restores a lane only when the card reaches HEALTHY. |
+
+## Auxiliary files on disk
+
+| Decision | Owner | Rule |
+| --- | --- | --- |
+| A LoRA is on disk | `JobTracker._cached_lora_keys`; hordelib's ad-hoc cache in the download process | The parent's set is "seen present this session" and is withdrawn only when a child fails to resolve a file. hordelib's cache evicts without telling the parent. |
+| Which LoRAs are protected from eviction | `models/aux_prefetch_coordinator.py` `AuxPrefetchCoordinator._current_pins`; `workers/download_process.py` `_apply_eviction_pins` | Every file a not-yet-terminal tracked job references is pinned. A version reference resolves through `find_lora_key_by_version` and a name through `fuzzy_find_lora_key`, since the fuzzy lookup reads a number as a model id. A file evicted before its job was popped is not held by a pin. |
+
+## Limits of what can be read from a log
+
+- The kill's clock runs only while the governor reads SATURATED, while the reclaim ladder also runs under PRESSURE
+  when the per-step floor forces it. A ladder that ran to unresolved under PRESSURE therefore does not end in a kill. The
+  run-metrics `RECLAIM_RUNG` decision records carry `forced_by_per_step_floor` and `saturation_unresolved`.
+- A safety child that dies mid-check does not mark its jobs' verdicts known lost, so those jobs wait out the full
+  grace before the requeue line appears.
 
 ## Where to read next
 
@@ -110,6 +105,8 @@ Paths are relative to `horde_worker_regen/process_management/`. The lifecycle is
 - [Runtime safety placement](../explanation/vram_arbiter.md#runtime-safety-placement) and
   [the kill as last rung][kill-rung].
 - [Process lanes and chaining](../explanation/process_lanes_and_chaining.md) for the restore rule on paused lanes.
+- [Host RAM responsibility map](responsibility-map-host-ram.md) for the host-memory remedies the governor and the
+  reclaim cycle apply.
 - [Logs](logs.md#runtime-safety-placement-diagnostics) and
   [Supervisor stall forgiveness](logs.md#supervisor-stall-forgiveness). The `safety_stage_stall`,
   `safety_start_escalated_to_cpu`, `inference_lane_replaced`, `inference_slot_quarantined` and

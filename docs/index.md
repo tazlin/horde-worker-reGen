@@ -32,11 +32,12 @@ as needed.
 - **Reference** (look something up): [command line](reference/cli.md),
   [update bootstrap](reference/update_bootstrap.md), [logs](reference/logs.md),
   [log findings](reference/log_findings.md),
-  [codebase map](reference/codebase-map.md), and the responsibility maps that list each scheduling decision's
-  owner, readers and fence: [runs and residency](reference/responsibility-map-runs-and-residency.md),
+  [codebase map](reference/codebase-map.md), and the responsibility maps that state each scheduling decision's
+  owner and rule: [runs and residency](reference/responsibility-map-runs-and-residency.md),
   [clearance and child loads](reference/responsibility-map-clearance-and-child-loads.md),
   [footprints and pricing](reference/responsibility-map-footprints-and-pricing.md),
-  [recovery and safety](reference/responsibility-map-recovery-and-safety.md).
+  [recovery and safety](reference/responsibility-map-recovery-and-safety.md),
+  [host RAM](reference/responsibility-map-host-ram.md).
 
 ## Understanding the worker
 

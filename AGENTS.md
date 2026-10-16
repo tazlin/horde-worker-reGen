@@ -30,12 +30,13 @@ children over IPC. See [Architecture](docs/explanation/architecture.md).
 - [Documentation home](docs/index.md): Diátaxis tree (tutorials / how-to / reference / explanation).
 - [Architecture](docs/explanation/architecture.md): process model, shared-state pattern, asyncio loop.
 - [Codebase map](docs/reference/codebase-map.md): file → responsibility quick reference.
-- Responsibility maps, one per cluster, each a table of decisions with their owner, readers, rule and fences:
-  [runs and residency](docs/reference/responsibility-map-runs-and-residency.md),
+- Responsibility maps, one per cluster, each a summary, a diagram and tables of decisions with their owner and
+  rule: [runs and residency](docs/reference/responsibility-map-runs-and-residency.md),
   [clearance and child loads](docs/reference/responsibility-map-clearance-and-child-loads.md),
   [footprints and pricing](docs/reference/responsibility-map-footprints-and-pricing.md),
-  [recovery and safety](docs/reference/responsibility-map-recovery-and-safety.md). Read the map for the cluster a
-  change touches before the code; a decision with two owners there is the first thing to fix.
+  [recovery and safety](docs/reference/responsibility-map-recovery-and-safety.md),
+  [host RAM](docs/reference/responsibility-map-host-ram.md). Read the map for the cluster a change touches
+  before the code; a decision with two owners there is the first thing to fix.
 - [Job lifecycle](docs/explanation/job_lifecycle.md),
   [Job state machine](docs/explanation/job_state_machine.md),
   [Resilience and recovery](docs/explanation/resilience_and_recovery.md),
@@ -179,9 +180,13 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   goes through the ledger.
   The establish-rate limiter is the only governor that defers (`DEFER_RESIDENCY_GOVERNOR`, which does not stop the
   preload pass, and a head it withholds at dispatch is stepped past by a `diversity` line-skip); the grace
-  allowance only decides whether an excuse window opens (`grace_seconds_to_open`). The owners, readers, fences
-  and open questions are in
+  allowance only decides whether an excuse window opens (`grace_seconds_to_open`). The owners and rules, and
+  which head each reader means, are in
   [the runs and residency map](docs/reference/responsibility-map-runs-and-residency.md).
+- **Whether the host has room for a load:** `scheduling/admission/preload.py` (`decide_ram_admission` against
+  physical RAM, `decide_commit_admission` against commit at the checkpoint's file size), the governor's tiers in
+  `scheduling/governance/ram_governor.py`, and the child's private reading in `utils/private_memory.py`. Every
+  consumer of each figure is in [the host RAM map](docs/reference/responsibility-map-host-ram.md).
 - **How long a queue head may wait:** `scheduling/dispatch_affinity.py` owns the two clocks that read the horde
   deadline (the skip budget, 6 skips or 0.2 x ttl, and the anti-starvation override at 0.3 x ttl from pop). Every
   other hold has its own fixed clock (head protection, the RAM defer barrier, the establish-rate window, the claim's max
