@@ -131,24 +131,26 @@ def _set_available_ram(scheduler: InferenceScheduler, monkeypatch: pytest.Monkey
 class TestRamPressureReductionIsDeviceAware:
     """The RAM-pressure footprint reduction must not empty a card of every inference context."""
 
-    def test_reduction_keeps_one_context_per_driven_card(self) -> None:
+    def test_reduction_keeps_one_context_per_driven_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With card 1 busy and card 0 idle, the reduction keeps a context on each card instead of stranding card 0."""
         process_map = _full_two_card_process_map(busy_card1_lead=True)
         scheduler = _two_card_scheduler(process_map)
+        _set_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
-        scheduler._reduce_processes_under_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         card0 = process_map.num_loaded_inference_processes(device_index=0)
         card1 = process_map.num_loaded_inference_processes(device_index=1)
         assert card1 >= 1, "the busy card must keep its in-flight context"
         assert card0 >= 1, "the idle card must not be stripped of every context (the GPU would go idle)"
 
-    def test_reduction_records_each_shed_card(self) -> None:
+    def test_reduction_records_each_shed_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every card the reduction shrank is recorded so the recovery path knows what to grow back."""
         process_map = _full_two_card_process_map(busy_card1_lead=True)
         scheduler = _two_card_scheduler(process_map)
+        _set_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
-        scheduler._reduce_processes_under_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         assert scheduler._ram_pressure_shed_cards == {0, 1}
 
@@ -169,7 +171,7 @@ class TestRamPressureReExpansion:
         scheduler._ram_pressure_shed_cards = {0, 1}
         _set_available_ram(scheduler, monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
 
-        scheduler._restore_processes_after_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         assert process_map.num_loaded_inference_processes(device_index=0) == _CARD_TARGET_PROCESSES
         assert process_map.num_loaded_inference_processes(device_index=1) == _CARD_TARGET_PROCESSES
@@ -185,7 +187,7 @@ class TestRamPressureReExpansion:
         scheduler._ram_pressure_shed_cards = {0}
         _set_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
-        scheduler._restore_processes_after_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         assert process_map.num_loaded_inference_processes(device_index=0) == 1, "no growth while RAM is critical"
         assert scheduler._ram_pressure_shed_cards == {0}, "the episode is still pending until RAM recovers"
@@ -207,7 +209,7 @@ class TestRamPressureReExpansion:
         # second context would retain.
         _set_available_ram(scheduler, monkeypatch, 6000.0)
 
-        scheduler._restore_processes_after_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         assert process_map.num_loaded_inference_processes(device_index=0) == 1, "no growth without RAM headroom"
         assert scheduler._ram_pressure_shed_cards == {0}, "the card stays pending until RAM can hold another context"
@@ -223,7 +225,7 @@ class TestRamPressureReExpansion:
         scheduler._whole_card_ledger.state_for(0).model = "Flux.1-Schnell fp8 (Compact)"
         _set_available_ram(scheduler, monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
 
-        scheduler._restore_processes_after_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         assert process_map.num_loaded_inference_processes(device_index=0) == 1, (
             "a residency-held card must not be regrown by the RAM-pressure restore"
@@ -233,7 +235,7 @@ class TestRamPressureReExpansion:
 class TestSingleGpuRamPressureRecovery:
     """The worker-wide (single-GPU) reduction is incremental and restorable."""
 
-    def test_single_card_reduces_by_one_and_records_worker_shed(self) -> None:
+    def test_single_card_reduces_by_one_and_records_worker_shed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A single-GPU pressure tick sheds one context, not the whole idle pool, and records restore state."""
         process_map = ProcessMap(
             {
@@ -244,8 +246,9 @@ class TestSingleGpuRamPressureRecovery:
         )
         scheduler = _make_inference_scheduler(process_map=process_map, max_inference=3)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=2)
+        _set_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
-        scheduler._reduce_processes_under_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once()
         _, kwargs = scheduler._process_lifecycle.scale_inference_processes.call_args
@@ -283,7 +286,7 @@ class TestSingleGpuRamPressureRecovery:
 
         scheduler._process_lifecycle.scale_inference_processes = Mock(side_effect=_scale)
 
-        scheduler._restore_processes_after_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         assert process_map.num_loaded_inference_processes() == 3
         assert scheduler._ram_governor_state.worker_shed is not None
@@ -301,7 +304,7 @@ class TestSingleGpuRamPressureRecovery:
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=2)
         _set_available_ram(scheduler, monkeypatch, 6000.0)
 
-        scheduler._restore_processes_after_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
 
         scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
         assert scheduler._ram_governor_state.worker_shed is not None

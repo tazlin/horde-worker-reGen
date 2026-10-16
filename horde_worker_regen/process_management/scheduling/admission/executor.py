@@ -81,6 +81,10 @@ class ExecutionHost(VramActuator, Protocol):
         """The host RAM reclaim ledger."""
         ...
 
+    def _reclaim_idle_alchemy_lanes_under_pressure(self) -> None:
+        """Unload idle safety and post-processing residents from RAM."""
+        ...
+
     def _evict_unprotected_components_under_pressure(self) -> bool:
         """Drop idle, unprotected staged components from the budgeted RAM cache."""
         ...
@@ -234,7 +238,10 @@ class PlanExecutor:
                         "into an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
                     )
                 case EvictIdleModels():
-                    # First reclaim the cheap, targeted way: drop idle, unprotected staged components from the
+                    # Idle safety and post-processing residents go first: no inference job needs them while the
+                    # host is under its floor, and the unload is a message, not a process cycle.
+                    self._host._reclaim_idle_alchemy_lanes_under_pressure()
+                    # Then reclaim the cheap, targeted way: drop idle, unprotected staged components from the
                     # budgeted RAM cache, keeping a queued job's staged model resident. Only when nothing
                     # unprotected can be evicted (or the budgeted cache is off) does the coarser whole-RAM
                     # unload run: unload an idle resident model, and when none remains, cycle the slot whose

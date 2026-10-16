@@ -2247,7 +2247,7 @@ class RamPressureVerdict:
     """
 
     under_pressure: bool
-    """True when admissible RAM is below the danger floor (or, conservatively, when no reading exists)."""
+    """True when admissible RAM is below the danger floor, and False when no reading exists."""
     available_mb: float | None
     """Admissible host RAM (MB) at check time: the lower of physical available and available commit where
     the host reports commit, else physical available. None when no telemetry exists."""

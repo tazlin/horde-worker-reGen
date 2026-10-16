@@ -226,10 +226,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
     WholeCardResidency,
     WholeCardResidencyMachine,
     card_preload_order,
-    decide_degrade_response,
-    decide_process_reduction,
     decide_ram_reclaim_outcome,
-    decide_shed_card_restore,
 )
 from horde_worker_regen.process_management.scheduling.governance.whole_card import (
     HEAVY_HEAD_LOAD_GRACE_SECONDS,
@@ -5114,21 +5111,13 @@ class InferenceScheduler:
             ),
         )
 
-    def _govern_ram_pressure(self, verdict: RamPressureVerdict) -> None:
-        """Degrade the worker's footprint and intake while system RAM is below the danger floor.
-
-        The proactive counterpart to the marginal RAM budget: rather than admit a load that the absolute
-        reading says will trip the kernel OOM-killer, the worker pauses job pops, evicts idle resident
-        models, reduces the resident inference-process count, and reclaims a process whose resident RAM
-        crossed the per-process ceiling. The decision logic lives in
-        [`decide_degrade_response`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_degrade_response].
-        """
-        self._reclaim_idle_alchemy_lanes_under_pressure()
-        snapshot = self._build_host_memory_snapshot(verdict)
-        self._executor.execute_governance_actions(decide_degrade_response(snapshot))
-
     def _reclaim_idle_alchemy_lanes_under_pressure(self) -> None:
-        """Unload idle safety/post-process alchemy residents during a host-RAM pressure episode."""
+        """Unload idle safety and post-processing residents from RAM during a host-RAM pressure episode.
+
+        Part of the governor's degrade response (the ``EvictIdleModels`` action): these lanes hold multi-GB
+        residents that no inference job needs while the host is under its floor, and a busy lane keeps its
+        models until it returns to idle. A lane already asked to unload is not asked again.
+        """
         for process_info in self._process_map.values():
             if process_info.process_type not in (HordeProcessType.SAFETY, HordeProcessType.POST_PROCESS):
                 continue
@@ -5145,12 +5134,14 @@ class InferenceScheduler:
     def _govern_ram_pressure_if_pressured(self) -> bool:
         """Evaluate the absolute RAM danger floor and degrade the worker if it is breached.
 
-        The per-tick entry point (distinct from the per-job :meth:`_preload_blocked_by_ram_pressure`),
-        delegated to the resource governor: it updates the soft pop hold, runs the whole-host degrade
-        response whenever the host is under its floor, and restores past shedding once the host recovers,
-        so a worker that never attempts a new preload still throttles and reclaims instead of growing
-        into an OS OOM kill. Returns whether the host was under pressure. Clears the one-shot notice when
-        the host is healthy.
+        The per-tick entry point, delegated to the resource governor. The per-job preload gate
+        (`DEFER_RAM_PRESSURE` in
+        [`decide_preload_gates`][horde_worker_regen.process_management.scheduling.admission.preload.decide_preload_gates])
+        reads the verdict this tick records and does not govern. The tick updates the soft pop hold, runs the
+        whole-host degrade response whenever the host is under its floor, and restores past shedding once the
+        host recovers, so a worker that never attempts a new preload still throttles and reclaims instead of
+        growing into an OS OOM kill. Returns whether the host was under pressure. Clears the one-shot notice
+        when the host is healthy.
         """
         under_pressure = self._governor.tick()
         if not under_pressure:
@@ -5236,19 +5227,6 @@ class InferenceScheduler:
         largest_seed = max((seed for seed in seeds if seed is not None), default=0.0)
         return ram_headroom(None, context_cost_mb=largest_seed, per_process_max_mb=ceiling).per_process_ceiling_mb
 
-    def _reduce_processes_under_ram_pressure(self) -> None:
-        """Shed idle resident inference processes to return their resident-weight RAM to the OS.
-
-        The RAM analogue of :attr:`StreamForecast.needs_process_count_reduction`: with the host over the
-        danger floor, the structural remedy is fewer resident contexts, not another load on top. Only idle
-        processes are stopped (``scale_inference_processes`` never kills a busy slot), so live work is
-        spared. The reduction targets are decided by
-        [`decide_process_reduction`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_process_reduction]
-        (per card on a multi-GPU host, worker-wide otherwise).
-        """
-        snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
-        self._executor.execute_governance_actions(decide_process_reduction(snapshot))
-
     def _outstanding_planned_ram_mb(self) -> float:
         """Return admitted RAM the available reading does not yet reflect, net of each entry's measured growth.
 
@@ -5294,20 +5272,6 @@ class InferenceScheduler:
             for model in self._runtime_config.bridge_data.image_models_to_load
         ]
         return max((seed for seed in seeds if seed is not None), default=FRESH_INFERENCE_CHILD_BASELINE_MB)
-
-    def _restore_processes_after_ram_pressure(self) -> None:
-        """Grow RAM-pressure-shed inference contexts back toward plan as system RAM proves headroom.
-
-        The reduction sheds idle contexts to walk the host back above its absolute RAM floor; nothing else
-        re-establishes them, so without this a card or single-GPU worker-wide pool that lost contexts to a
-        RAM spike stays reduced for the rest of the run. The restore grants (incremental, RAM-gated,
-        residency-aware) are decided by
-        [`decide_shed_card_restore`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_shed_card_restore].
-        """
-        if not self._ram_governor_state.shed_cards and self._ram_governor_state.worker_shed is None:
-            return
-        snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
-        self._executor.execute_governance_actions(decide_shed_card_restore(snapshot))
 
     def _committed_vram_reserve_mb(self, *, device_index: int | None = None) -> float:
         """Return the combined committed VRAM (MB) across every flow in the shared ledger.

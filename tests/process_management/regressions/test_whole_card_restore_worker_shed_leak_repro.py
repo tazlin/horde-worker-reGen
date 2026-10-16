@@ -103,7 +103,7 @@ class TestRamShedOwnsItsRestore:
         scheduler, process_map = _single_gpu_scheduler_with_scaling(monkeypatch)
         _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
-        scheduler._reduce_processes_under_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
         assert process_map.num_loaded_inference_processes() == 1
         assert scheduler._ram_governor_state.worker_shed is not None
 
@@ -119,16 +119,20 @@ class TestRamShedOwnsItsRestore:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Healthy RAM after the residency's release returns the pool to plan and resolves the shed record."""
+        """Healthy RAM after the residency's release returns the pool to plan and resolves the shed record.
+
+        The restore waits out the pop pause the degrade response set, so the row lets that pause lapse.
+        """
         scheduler, process_map = _single_gpu_scheduler_with_scaling(monkeypatch)
         _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
-        scheduler._reduce_processes_under_ram_pressure()
+        scheduler._govern_ram_pressure_if_pressured()
         _arm_drained_residency(scheduler, "CyberRealistic Pony")
         scheduler._restore_siblings_after_whole_card()
 
         _pin_available_ram(scheduler, monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
+        monkeypatch.setattr(scheduler._state, "self_throttle_paused_until", 0.0)
         for _ in range(_MAX_INFERENCE):
-            scheduler._restore_processes_after_ram_pressure()
+            scheduler._govern_ram_pressure_if_pressured()
 
         assert process_map.num_loaded_inference_processes() == _MAX_INFERENCE
         assert scheduler._ram_governor_state.worker_shed is None, (
@@ -144,7 +148,7 @@ class TestRamShedOwnsItsRestore:
         _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
         for cycle in range(5):
-            scheduler._reduce_processes_under_ram_pressure()
+            scheduler._govern_ram_pressure_if_pressured()
             assert process_map.num_loaded_inference_processes() == 1
 
             _arm_drained_residency(scheduler, f"model-{cycle}")

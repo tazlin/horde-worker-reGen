@@ -18,6 +18,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.ledgers.ram_reclaim import (
     LANE_RAM_CONTAINMENT_MIN_INTERVAL_SECONDS,
     LANE_RAM_CONTAINMENT_RSS_BYTES,
@@ -181,8 +182,18 @@ class TestUnloadFromRamLaneTargeting:
         assert _unload_ram_message_count(lane) == 0
 
 
+_TOTAL_RAM_MB = 65536.0
+_CRITICAL_AVAILABLE_RAM_MB = 500.0
+
+
+def _pin_host_ram_under_pressure(scheduler: InferenceScheduler) -> None:
+    """Pin the measured system RAM below the danger floor so the governance tick runs its degrade response."""
+    scheduler._measured_available_ram_mb = lambda: _CRITICAL_AVAILABLE_RAM_MB  # type: ignore[method-assign]
+    scheduler._measured_total_ram_mb = lambda: _TOTAL_RAM_MB  # type: ignore[method-assign]
+
+
 class TestAlchemyLaneRamPressureReclaim:
-    """Host pressure reaches the safety/post-process residents that alchemy grows."""
+    """Host pressure reaches the safety/post-process residents that alchemy grows, through the governance tick."""
 
     def test_idle_alchemy_lanes_receive_ram_unload(self) -> None:
         """Pressure unloads both idle alchemy service processes regardless of the generic lane ceiling."""
@@ -199,8 +210,9 @@ class TestAlchemyLaneRamPressureReclaim:
             ram_usage_bytes=5 * 1024 * 1024 * 1024,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({0: safety, 1: post_process}))
+        _pin_host_ram_under_pressure(scheduler)
 
-        scheduler._reclaim_idle_alchemy_lanes_under_pressure()
+        assert scheduler._govern_ram_pressure_if_pressured() is True
 
         assert _unload_ram_message_count(safety) == 1
         assert _unload_ram_message_count(post_process) == 1
@@ -214,8 +226,9 @@ class TestAlchemyLaneRamPressureReclaim:
             ram_usage_bytes=5 * 1024 * 1024 * 1024,
         )
         scheduler = _make_inference_scheduler(process_map=ProcessMap({1: post_process}))
+        _pin_host_ram_under_pressure(scheduler)
 
-        scheduler._reclaim_idle_alchemy_lanes_under_pressure()
+        assert scheduler._govern_ram_pressure_if_pressured() is True
 
         assert _unload_ram_message_count(post_process) == 0
 

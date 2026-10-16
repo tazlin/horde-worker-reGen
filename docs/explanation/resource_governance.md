@@ -121,9 +121,10 @@ then decides and executes both regimes:
 
 - **Pressured host** (below the danger floor): the soft pop hold, then the degrade response
   ([`decide_degrade_response`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_degrade_response]),
-  whose actions run in order. `PausePops` arms the self-throttle pop pause. `EvictIdleModels` first drops
-  idle staged components no queued or in-flight job needs from the budgeted RAM cache, and only when none
-  can be dropped unloads one idle inference model from RAM. `decide_process_reduction` sheds idle inference
+  whose actions run in order. `PausePops` arms the self-throttle pop pause. `EvictIdleModels` asks every
+  idle safety and post-processing lane to unload its residents from RAM (a busy lane keeps them until it
+  returns to idle), then drops idle staged components no queued or in-flight job needs from the budgeted
+  RAM cache, and only when none can be dropped unloads one idle inference model from RAM. `decide_process_reduction` sheds idle inference
   contexts: on a multi-GPU host per card, toward the card's busy count and never emptying a card, and on
   one card one context below the loaded count. `decide_over_ceiling_reclaim` takes the largest inference process whose resident RAM crossed the
   per-process ceiling, recycling it if idle and marking it draining if busy. The idle-model eviction is *not* gated on

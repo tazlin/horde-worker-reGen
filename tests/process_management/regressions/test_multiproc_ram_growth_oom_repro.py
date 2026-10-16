@@ -9,9 +9,9 @@ reports show ``Process N ... ram: 30670069760`` (30.7 GB) and a peak of 35.4 GB 
 The absolute RAM danger-floor machinery shipped in the running version, yet the kill still happened. These
 tests pin the two orchestration gaps that let it through, independent of any tuning constant:
 
-* **The danger floor is dormant on a steady-state worker.** ``_govern_ram_pressure`` is only reached from
-  inside the preload loop, which early-returns when every pending job's model is already resident (nothing
-  to preload). A worker serving already-resident models across busy processes therefore never evaluates the
+* **The danger floor is dormant on a steady-state worker.** A floor check reached only from inside the
+  preload loop does not run when every pending job's model is already resident, since the loop early-returns
+  with nothing to preload. A worker serving already-resident models across busy processes therefore never evaluates the
   floor and never sheds or throttles, so the resident set grows to OOM with the governor asleep. A scheduling
   pass must govern the floor every tick, not only when a new preload is attempted.
 
@@ -139,7 +139,7 @@ class TestLoneOverCeilingProcessIsReclaimed:
         recycle = Mock()
         scheduler._process_lifecycle._replace_inference_process = recycle  # type: ignore[method-assign]
 
-        scheduler._govern_ram_pressure(scheduler._ram_pressure_verdict())
+        scheduler._govern_ram_pressure_if_pressured()
 
         assert recycle.called, (
             "a lone over-ceiling process under the RAM floor must be recycled to return its retained RAM"
@@ -155,7 +155,7 @@ class TestLoneOverCeilingProcessIsReclaimed:
         recycle = Mock()
         scheduler._process_lifecycle._replace_inference_process = recycle  # type: ignore[method-assign]
 
-        scheduler._govern_ram_pressure(scheduler._ram_pressure_verdict())
+        scheduler._govern_ram_pressure_if_pressured()
 
         assert not recycle.called, "a busy process must not be recycled mid-job; it must be drained first"
         assert 1 in scheduler._processes_draining_for_ram, (
