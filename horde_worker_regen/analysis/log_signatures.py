@@ -526,6 +526,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         ),
         dry_run_reason=_NO_FAULT,
     ),
+    _signature(
+        "soft_reset_held_for_boot",
+        r"Save-our-ship: holding the soft reset while a replacement child is still alive and booting "
+        r"\(boot elapsed (?P<boot_elapsed>\d+)s, hard cap (?P<hard_cap>\d+)s\)",
+        emitter="process_management.lifecycle.recovery_supervisor:RecoverySupervisor.evaluate",
+        sample=(
+            "Save-our-ship: holding the soft reset while a replacement child is still alive and booting (boot "
+            "elapsed 47s, hard cap 120s). Rebuilding the pool now would replace the replacement."
+        ),
+        dry_run_reason=_NO_FAULT,
+    ),
     # --- Inference process replacement ---
     _signature(
         "inference_lane_cuda_context_fault",
@@ -1114,6 +1125,14 @@ _SIGNATURE_LIST: list[LogSignature] = [
         dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
         field_of="stream_forecast",
     ),
+    _signature(
+        "whole_card_governor_defer_cleared",
+        r"Whole-card governor deferral of (?P<model>.+) on card (?P<device>\d+|None) cleared after "
+        r"(?P<held>\d+)s held\.",
+        emitter="process_management.scheduling.governance.whole_card:WholeCardResidencyLedger.clear_governor_defer",
+        sample="Whole-card governor deferral of Krea2-Turbo_fp8 on card None cleared after 2448s held.",
+        dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
+    ),
     # --- Blank/malformed model-name pop cascade ---
     _signature(
         "empty_model_pop",
@@ -1575,9 +1594,18 @@ _SIGNATURE_LIST: list[LogSignature] = [
     _signature(
         "reclaim_lane_hold",
         r"Reclaim ladder: keeping the (?P<lane>[\w-]+) lane down until job (?P<job_id>\S+) finishes sampling.",
-        emitter="process_management.resources.reclaim_ladder:ReclaimLadder._unwind_restore_obligations",
+        emitter="process_management.resources.reclaim_ladder:VerifiedReclaimLadder._unwind_restore_obligations",
         sample="Reclaim ladder: keeping the post-processing lane down until job "
         "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0 finishes sampling.",
+        dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
+    ),
+    _signature(
+        "reclaim_lane_restored_for_waiting_job",
+        r"Reclaim ladder: restoring the (?P<lane>[\w-]+) lane while job (?P<job_id>\S+) still waits, since the job "
+        r"waits on that lane\.",
+        emitter="process_management.resources.reclaim_ladder:VerifiedReclaimLadder._unwind_restore_obligations",
+        sample="Reclaim ladder: restoring the post-processing lane while job 9dcb145f-ebfb-4585-99e5-311e343a8511 "
+        "still waits, since the job waits on that lane.",
         dry_run_reason=_RECLAIM_HOLD_NOT_EXERCISED,
     ),
     _signature(
@@ -1687,6 +1715,17 @@ _SIGNATURE_LIST: list[LogSignature] = [
         r"Clearance lease on device (?P<device>\d+): stage grant for process (?P<process>\d+) refused by admission",
         emitter="process_management.scheduling.clearance_lease:ClearanceController._note_stage_refusal",
         sample="Clearance lease on device 0: stage grant for process 2 refused by admission.",
+        dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
+    ),
+    _signature(
+        "clearance_reserve_restored",
+        r"Clearance lease on device (?P<device>\d+): restored the (?P<reserve_mb>\d+)MB activation reserve of "
+        r"process (?P<process>\d+)'s unconsumed grant after its job start\.",
+        emitter=(
+            "process_management.scheduling.clearance_lease:ClearanceController._refresh_unconsumed_grant_figures"
+        ),
+        sample="Clearance lease on device 0: restored the 1219MB activation reserve of process 4's unconsumed "
+        "grant after its job start.",
         dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
     ),
     _signature(

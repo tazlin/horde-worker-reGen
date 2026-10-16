@@ -204,14 +204,8 @@ inferring it from throughput. All are registered in `analysis/log_signatures.py`
 | `Post-processing finished for job <id> in <t> seconds on process <n> (chain <a>s, encode <b>s, <w>x<h>, <operations>).` | INFO | A post-processing job returns with the lane's measurements. The short form without the parenthesis is logged when the lane sent none. |
 | `Upload encode for job <id>: <t>s in a worker thread.` | DEBUG | Submit encoded the image for upload. |
 | `Upload for job <id>: bytes already in the upload encoding, not re-encoded.` | DEBUG | Submit uploaded the bytes as the lane produced them. |
-
-These lines belong with the ones above but are not registered in `analysis/log_signatures.py`, so `horde-log`
-does not detect them yet.
-
-| Line | Level | Logged when |
-| ---- | ----- | ----------- |
 | `Clearance lease on device <d>: restored the <n>MB activation reserve of process <p>'s unconsumed grant after its job start.` | DEBUG | A grant reached the child before its job start, the job start unset the grant's figures, and the next clearance step wrote the reserve back. Once per grant. The session count is `ClearanceController.reserves_restored_after_job_start`. |
-| `Whole-card governor deferral of <model> on card <d> cleared after <n>s held.` | INFO | The establish-rate limiter let a head through that it had deferred, at preload admission or at dispatch. `<n>` is the time since the first deferral of that head. |
+| `Whole-card governor deferral of <model> on card <d> cleared after <n>s held.` | INFO | The establish-rate limiter let a head through that it had deferred, at preload admission or at dispatch. `<n>` is the time since the first deferral of that head. `<d>` is `None` on a single-GPU worker, whose one residency state is keyed worker-wide. |
 | `Save-our-ship: holding the soft reset while a replacement child is still alive and booting (boot elapsed <n>s, hard cap <c>s). Rebuilding the pool now would replace the replacement.` | INFO | The recovery supervisor would rebuild the pool, but a replacement child is still booting inside the hard cap. Once per hold. |
 | `Reclaim ladder: restoring the <lane> lane while job <id> still waits, since the job waits on that lane.` | DEBUG | A lane pause booked for a job is restored although the job still waits, because the job waits on the paused lane itself. In practice the post-processing lane. |
 
