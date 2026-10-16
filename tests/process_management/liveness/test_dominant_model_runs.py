@@ -76,21 +76,12 @@ def test_a_runs_next_job_on_the_same_lane_loads_nothing(run_window: _RunWindow) 
     assert warm_successors, f"every {_RUN_MODEL} job loaded its weights. {run_window.figures.describe()}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "a staged head of another model is held for its whole lease-acquire timeout beside the run's idle copy, "
-        "which the clearance sweep spares for a run job that cannot dispatch, while the ladder counts that copy as "
-        "closable room through a rung it never takes, so the head's measured attempt never comes due"
-    ),
-)
 def test_a_head_held_for_a_runs_weights_does_not_wedge_the_window(run_window: _RunWindow) -> None:
     """A head for another model waits for the run, and the run's queued jobs pass it so the run can end.
 
-    The run's weights stay while it has a next job, and it ends only once its work drains. A run job left queued
-    behind the held head keeps both waiting, which reads as residency reconciliation for the rest of the window.
-    The same hold can also end at the head's lease-acquire timeout: the run's idle copy is spared for a next run
-    job that cannot dispatch, and the room it holds reads as closable, so the head is neither cleared nor probed.
+    The run's weights stay while it has a next job that can be seated, and it ends once its work drains or a
+    different-model head is starved. A run job held at dispatch without release does not keep the copy, so a staged
+    head of another model is cleared into the room the copy returns instead of waiting for its lease-acquire timeout.
     """
     figures = run_window.figures
     reconciliation_share = figures.slot_duty.get("residency_reconciliation", 0.0)

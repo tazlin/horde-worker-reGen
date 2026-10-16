@@ -16,7 +16,7 @@ Module paths are under `horde_worker_regen/process_management/`. `InferenceSched
 | --- | --- | --- | --- |
 | Which rung a model is on | `InferenceScheduler.card_dominance`, from `pricing.model_sampling_peak` | the run grant, `StreamForecast.needs_exclusive_residency`, `pricing.pair_co_samples` | The rung is computed per card from the offered set, the learned peaks and the foreign floor, and changes only when the slack crosses zero by more than `pricing.DOMINANCE_HYSTERESIS_MB`. |
 | A rung-1 run starts | `InferenceScheduler._grant_dominant_runs_at_first_step`, `_dominant_run_grantable`, `_note_dominant_run`; ledger `record_grant` at `DominanceRung.CANNOT_CO_SAMPLE` | the preload pass, each cycle | A run is granted when a rung-1 job reaches its first step and the card holds no other grant. |
-| A run's copy stays on the card | `pricing.copy_belongs_to_dominant_run` | `pricing.sweep_spares_idle_copy`, `InferenceScheduler._issue_retention_eviction`, `preload.lanes_committed_elsewhere`, the retention governor gate through `InferenceScheduler._weights_belong_to_dominant_run` | The copy belongs to the run while the ledger holds the model on that card and the run has a next job, either a queued job for the model or the standing pop claim. |
+| A run's copy stays on the card | `pricing.copy_belongs_to_dominant_run` | `pricing.sweep_spares_idle_copy`, `InferenceScheduler._issue_retention_eviction`, `preload.lanes_committed_elsewhere`, the retention governor gate through `InferenceScheduler._weights_belong_to_dominant_run` | The copy belongs to the run while the ledger holds the model on that card and the run has a next job that can be seated, either a queued job for the model that no dispatch gate holds without a reclaim able to release it, or, with no job for the model queued, the standing pop claim. |
 | The pop offer narrows to the held model | ledger `pop_claim`, applied last in `jobs/job_popper.py` through `offer_under_pop_claim` | `JobPopper` | Every held grant of either rung claims the offer until `pop_claim_retention_ended`, which reads the max hold, three empty pops inside 10 s (`note_pop_outcome`) and a terminal fault of the model (`note_terminal_fault`). |
 | How long the claim lasts | setting `whole_card_residency_max_hold_seconds` (`bridge_data/data_model.py`), read through `InferenceScheduler._whole_card_max_hold_seconds` | `pop_claim_retention_ended` | The cap runs from the establishment and ends the claim and retention only, so work already accepted still drains. |
 | A run job passes a held head | `InferenceScheduler._select_dominant_run_job`, line-skip reason `dominant_run` | `get_next_job_and_process` | A run job is seated on the lane holding the run's weights when the head was declined this cycle, and does not spend the head's skip budget. |
@@ -87,9 +87,10 @@ Module paths are under `horde_worker_regen/process_management/`. `InferenceSched
 - **The run copy and the reclaim ladder.** `resources/reclaim_ladder.py` `build_reclaim_ladder` emits
   `UNLOAD_IDLE_MODEL` from `InferenceScheduler.build_reclaim_ladder_candidates` without asking
   `copy_belongs_to_dominant_run`. The sweep, retention and preload do ask, so the ladder alone can evict a run's copy.
-- **A run's next job may be one that cannot dispatch.** `copy_belongs_to_dominant_run` counts any queued job for the
-  model through `queued_job_naming`. A run keeps its copy for a job that cannot run until the run end's head-age
-  condition fires.
+- **A run's next job may be one that cannot dispatch.** `copy_belongs_to_dominant_run` counts every queued job for
+  the model through `queued_jobs_naming` except one a dispatch gate holds with no reclaim able to release it. A job
+  awaiting its auxiliary files still counts, so a run keeps its copy for it until the run end's head-age condition
+  fires.
 - **Size tier against the measured rung.** `JobPopper._is_large_model` drives the switch throttle, the re-entry
   cooldown and the VRAM-pressure narrowing, while `card_dominance` decides runs and teardowns. The narrowing runs
   before `_apply_whole_card_pop_claim`, so it can empty a claim's offer, and the claim then withholds the pop.

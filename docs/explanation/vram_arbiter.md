@@ -334,8 +334,12 @@ The arbiter keeps four concerns deliberately separate:
       restarted. The reclaim ladder's context and lane restores stand down for rung-2 grants only, since a run
       cleared nothing.
 
-      While the run has a next job (a pending job for its model, or its standing claim), its copy belongs to the
-      run (`pricing.copy_belongs_to_dominant_run`, the one owner every reader below asks). The VRAM sweep
+      While the run has a next job that can be seated (a pending job for its model, or its standing claim while
+      none is pending), its copy belongs to the run (`pricing.copy_belongs_to_dominant_run`, the one owner every
+      reader below asks). A pending job a dispatch gate holds with no reclaim able to release it does not count,
+      and while every pending job for the model is held that way the claim does not count either. Such a hold is
+      typically the booking of a different-model job cleared beside the run, which waits for room only the copy
+      can return, and a spared copy would hold both until the lease times the waiter out. The VRAM sweep
       (`pricing.sweep_spares_idle_copy`, and so the materialisation verdict's eviction and its
       `has_reclaimable_idle_model` mirror) spares it, the head escalation included. A retention eviction for
       another dispatch (`_issue_retention_eviction`) leaves it. Preload does not target its lane for another

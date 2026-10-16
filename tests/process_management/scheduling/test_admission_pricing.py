@@ -7,6 +7,7 @@ own specification.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 from unittest.mock import Mock
@@ -466,6 +467,82 @@ class TestDominantRunCopy:
             is True
         )
         assert run_lane.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM  # type: ignore[attr-defined]
+
+    async def _stranger_beside_run(self, *, room_closable: bool):  # noqa: ANN202
+        """The run's copy idle on slot 1, a different-model job dispatched to slot 0, the run's next job held.
+
+        The next job's dispatch hold carries the room breakdown the reconciliation gate records, which the
+        permitted reclaim rungs either cover or do not.
+        """
+        run_lane = _slot(1, model="run")
+        stranger_lane = _slot(0, model="other", state=HordeProcessState.INFERENCE_STARTING)
+        scheduler, jobs = await _worker(
+            slots={0: stranger_lane, 1: run_lane},
+            pending=["run"],
+            in_progress=["other"],
+        )
+        stranger_lane.record_inference_ownership(jobs[1], attempt_ordinal=1)  # type: ignore[attr-defined]
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model="run",
+            forecast=None,
+            cooldown_until=0.0,
+            now=scheduler._clock(),
+            rung=DominanceRung.CANNOT_CO_SAMPLE,
+        )
+        scheduler._dispatch_holds.note_hold(
+            str(jobs[0].id_),
+            reclaim_applied=False,
+            room_inputs={"room_closable": room_closable},
+        )
+        return scheduler
+
+    async def test_a_copy_whose_next_job_cannot_be_seated_is_not_spared_for_it(self) -> None:
+        """The run's next job held with no reclaim able to release it does not keep the copy from a waiting stranger.
+
+        The stranger was cleared beside the run and waits for room only the copy can return, while the run's job
+        is held against the stranger's booking. Spared, the copy holds both until the lease times the stranger
+        out. The run's standing claim does not keep it either, since a further pop of the model queues behind
+        the same hold.
+        """
+        scheduler = await self._stranger_beside_run(room_closable=False)
+        snapshot = scheduler.snapshot()
+        claimed = dataclasses.replace(snapshot, pop_claim_model="run")
+        for view in (snapshot, claimed):
+            assert pricing.copy_belongs_to_dominant_run(view, "run", None) is False
+            assert (
+                pricing.sweep_spares_idle_copy(
+                    view, view.slots[1], target_process_id=0, for_head_of_queue=True, device_index=None
+                )
+                is False
+            )
+            assert pricing.has_reclaimable_idle_model(view, 0, for_head_of_queue=True, device_index=None) is True
+
+    async def test_a_copy_whose_next_job_waits_on_closable_room_stays_with_the_run(self) -> None:
+        """A next job held on room the permitted rungs can close keeps the copy, since it starts once they land."""
+        scheduler = await self._stranger_beside_run(room_closable=True)
+        snapshot = scheduler.snapshot()
+        assert pricing.copy_belongs_to_dominant_run(snapshot, "run", None) is True
+        assert pricing.has_reclaimable_idle_model(snapshot, 0, for_head_of_queue=True, device_index=None) is False
+
+    async def test_a_run_lane_idle_between_two_run_jobs_keeps_its_copy(self) -> None:
+        """The ordinary run: the lane idle between two run jobs, nothing cleared beside it, the next job unheld."""
+        scheduler, _jobs, _run_lane = await self._run_worker(pending=["run"])
+        snapshot = scheduler.snapshot()
+        assert pricing.copy_belongs_to_dominant_run(snapshot, "run", None) is True
+        assert (
+            pricing.sweep_spares_idle_copy(
+                snapshot, snapshot.slots[1], target_process_id=0, for_head_of_queue=True, device_index=None
+            )
+            is True
+        )
+        claim_only = dataclasses.replace(
+            (await self._run_worker(pending=[]))[0].snapshot(),
+            pop_claim_model="run",
+        )
+        assert pricing.copy_belongs_to_dominant_run(claim_only, "run", None) is True, (
+            "with no queued successor the next pop under the claim is the run's next job"
+        )
 
     async def test_a_run_lane_is_no_preload_target_for_another_model(self) -> None:
         """The lane holding a run's copy is committed to the run's next job, so another model's preload has no target.

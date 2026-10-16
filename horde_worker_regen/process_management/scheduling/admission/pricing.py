@@ -1176,6 +1176,17 @@ def cards_able_to_start_job(snapshot: SchedulingSnapshot) -> frozenset[int | Non
     )
 
 
+def _dispatch_held_without_release(snapshot: SchedulingSnapshot, job_id: str) -> bool:
+    """Whether a dispatch gate holds ``job_id`` with no reclaim able to release it.
+
+    That is a room hold the permitted rungs cannot close, or the post-processing hold. A hold on room the rungs
+    can close is not one, since the job starts once that reclaim lands.
+    """
+    holds = snapshot.ledgers.dispatch_holds
+    held_without_reclaim = job_id in holds.hold_since and job_id not in holds.closable_holds
+    return held_without_reclaim or job_id in holds.pp_defer_holds
+
+
 def ready_seat_process_ids(snapshot: SchedulingSnapshot, claimants: Iterable[str] | None = None) -> frozenset[int]:
     """The idle lanes a pending job could be dispatched onto this cycle with no load, by process id.
 
@@ -1191,15 +1202,13 @@ def ready_seat_process_ids(snapshot: SchedulingSnapshot, claimants: Iterable[str
     """
     startable_cards = cards_able_to_start_job(snapshot)
     in_progress = frozenset(snapshot.queue.in_progress)
-    holds = snapshot.ledgers.dispatch_holds
     seat_cards_by_model: dict[str, set[int | None]] = {}
     job_ids = snapshot.queue.pending_in_placement_order if claimants is None else tuple(claimants)
     for job_id in job_ids:
         job = snapshot.queue.jobs[job_id]
         if job_id in in_progress or job.model is None or job.requires_aux_preparation:
             continue
-        held_without_reclaim = job_id in holds.hold_since and job_id not in holds.closable_holds
-        if held_without_reclaim or job_id in holds.pp_defer_holds:
+        if _dispatch_held_without_release(snapshot, job_id):
             continue
         allowed: frozenset[int | None] = (
             frozenset(job.eligible_cards) if snapshot.multi_gpu_routing_active else frozenset({None})
@@ -1223,49 +1232,53 @@ def copy_belongs_to_dominant_run(
     *,
     besides_job_id: str | None = None,
 ) -> bool:
-    """Whether a copy of ``model`` on the card belongs to a rung-1 run that has a next job.
+    """Whether a copy of ``model`` on the card belongs to a rung-1 run whose next job can be seated on it.
 
-    The run holds the model on that card, and its next job is either a pending job for the model or the next pop
-    under the run's standing claim over the offer. The sweep spares such a copy, preload does not target its lane
-    for another model, and retention keeps it under governor pressure. The run's own end
+    The run holds the model on that card, and its next job is either a pending job for the model or, when none is
+    pending, the next pop under the run's standing claim over the offer. The sweep spares such a copy, preload
+    does not target its lane for another model, and retention keeps it under governor pressure. The run's own end
     (``_restore_siblings_after_whole_card``) frees it once the run's work drains and a head for another model
-    waits. ``besides_job_id`` leaves out a job being dispatched now, which would otherwise count as its own
-    successor.
+    waits.
+
+    A pending job that a dispatch gate holds with no reclaim able to release it does not count, and while every
+    pending job for the model is held that way the claim does not count either, since a further pop queues behind
+    the same hold. Such a hold is typically a different-model job cleared beside the run, whose booking holds the
+    run's job while it waits for room only the copy can return. Spared, the copy holds both until the lease times
+    the waiter out, the same rule :func:`ready_seat_process_ids` applies to a seat. ``besides_job_id`` leaves out a
+    job being dispatched now, which would otherwise count as its own successor.
     """
     if model is None or model not in snapshot.dominant_runs:
         return False
     holder = snapshot.dominant_runs[model]
     if holder is not None and device_index is not None and holder != device_index:
         return False
-    if snapshot.pop_claim_model == model:
+    successors = queued_jobs_naming(snapshot, model, besides_job_id=besides_job_id)
+    if any(not _dispatch_held_without_release(snapshot, job_id) for job_id in successors):
         return True
-    return queued_job_naming(snapshot, model, besides_job_id=besides_job_id) is not None
+    return not successors and snapshot.pop_claim_model == model
 
 
-def queued_job_naming(
+def queued_jobs_naming(
     snapshot: SchedulingSnapshot,
     model: str | None,
     *,
     besides_job_id: str | None = None,
-) -> str | None:
-    """The first popped job not yet dispatched that names ``model``, in pop order, or None.
+) -> tuple[str, ...]:
+    """The popped jobs not yet dispatched that name ``model``, in pop order.
 
-    A rung-1 run reads it as the run's next job (:func:`copy_belongs_to_dominant_run`). It is not a retention or
-    eviction rule on its own: keeping a copy for a named successor was measured as a loss on a two-lane card, where
-    the kept weights hold room the other lane's different-model job needs (see the retention section of
+    A rung-1 run reads them as the run's next job (:func:`copy_belongs_to_dominant_run`). They are not a retention
+    or eviction rule on their own. Keeping a copy for a named successor was measured as a loss on a two-lane card,
+    where the kept weights hold room the other lane's different-model job needs (see the retention section of
     ``docs/explanation/vram_arbiter.md``). ``besides_job_id`` leaves out a job being dispatched now, which would
     otherwise count as its own successor.
     """
     if model is None:
-        return None
+        return ()
     in_progress = frozenset(snapshot.queue.in_progress)
-    return next(
-        (
-            job_id
-            for job_id in snapshot.queue.pending_in_pop_order
-            if job_id not in in_progress and job_id != besides_job_id and snapshot.queue.jobs[job_id].model == model
-        ),
-        None,
+    return tuple(
+        job_id
+        for job_id in snapshot.queue.pending_in_pop_order
+        if job_id not in in_progress and job_id != besides_job_id and snapshot.queue.jobs[job_id].model == model
     )
 
 
