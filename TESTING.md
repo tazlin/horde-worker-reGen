@@ -108,7 +108,9 @@ Markers:
   written by hand, and carry no host or worker names. A replay row states its calibration band against
   the live session in its docstring; it is a calibration, not a gate. A scheduling change is judged by its
   outcome against the replay at the previous commit, and a window that runs far from live is a simulator
-  finding to report before anything is tuned.
+  finding to report before anything is tuned. The fixture store is loaded as the current store schema
+  (`_session_replay.load_footprint_store` stamps the copy), because its figures are the replay's stated inputs;
+  a live file of an older schema loses the sampling stages that schema may have misfiled, and a fixture must not.
 - A marker decorator must be on the test function itself. On a helper beside it, `-m` deselects the test
   silently.
 

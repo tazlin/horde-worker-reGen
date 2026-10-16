@@ -200,7 +200,8 @@ The four line-skip reasons differ in what they cost the head:
 
 | Reason | When | Effect on the head's affinity skip window |
 | --- | --- | --- |
-| `resident_bypass` | the head's model is not resident and a resident-model job passes it | counted; bounded by the skip budget and the anti-starvation override |
+| `resident_bypass` | the head's model is not resident and a resident-model job passes it | counted; bounded by the skip budget and the anti-starvation override, except for a teardown (rung-2) residency's own jobs, which pass the head until the residency drains |
+| `dominant_run` | the head is withheld for a rung-1 run and a job of the run's model is seatable on the lane holding the run's weights | untouched; bounded by the run's end, which a different-model head past the anti-starvation bound forces |
 | `diversity` | the head's own lane is busy sampling its model, and a distinct model is resident and idle | untouched |
 | `cross_card` | the head's card cannot seat it, and another card can run a later job now | untouched: the dispatch takes nothing the head is waiting for |
 | `post_processing_hold` | the head cannot share the card with the post-processing lane's work, and a later job can | untouched: the head waits for the lane, which the dispatch does not delay |

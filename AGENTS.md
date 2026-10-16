@@ -30,6 +30,12 @@ children over IPC. See [Architecture](docs/explanation/architecture.md).
 - [Documentation home](docs/index.md): Diátaxis tree (tutorials / how-to / reference / explanation).
 - [Architecture](docs/explanation/architecture.md): process model, shared-state pattern, asyncio loop.
 - [Codebase map](docs/reference/codebase-map.md): file → responsibility quick reference.
+- Responsibility maps, one per cluster, each a table of decisions with their owner, readers, rule and fences:
+  [runs and residency](docs/reference/responsibility-map-runs-and-residency.md),
+  [clearance and child loads](docs/reference/responsibility-map-clearance-and-child-loads.md),
+  [footprints and pricing](docs/reference/responsibility-map-footprints-and-pricing.md),
+  [recovery and safety](docs/reference/responsibility-map-recovery-and-safety.md). Read the map for the cluster a
+  change touches before the code; a decision with two owners there is the first thing to fix.
 - [Job lifecycle](docs/explanation/job_lifecycle.md),
   [Job state machine](docs/explanation/job_state_machine.md),
   [Resilience and recovery](docs/explanation/resilience_and_recovery.md),
@@ -131,7 +137,7 @@ owned_pids.json, action_ledger.jsonl, perf_model.json, vram_footprints.json), al
 
 ### Scheduling and admission, by mechanism
 
-Start from the mechanism, not the file. Each line names the owner of one question; read outward from it.
+Start from the mechanism, not the file. Each line states the owner of one question; read outward from it.
 
 - **What an empty sampling slot was waiting on:** `InferenceScheduler.record_slot_duty` and `slot_duty.py`.
   The `clearance_hold` bucket is keyed on the lane state and a cleared child stays `INFERENCE_PRIMED` until its
@@ -164,37 +170,28 @@ Start from the mechanism, not the file. Each line names the owner of one questio
   `WholeCardResidencyLedger`, `teardown_complete`, the pop claim and `WholeCardPopClaimRelease`), the scheduler's
   `_whole_card_*` methods, `wants_whole_card` in `pricing.py`, and the settings `whole_card_exclusive_residency`,
   `whole_card_residency_safety_off_gpu`, `whole_card_residency_max_hold_seconds`,
-  `large_model_reentry_cooldown_seconds`. The verdict is a two-rung dominance ladder computed per card by
-  `card_dominance` from `pricing.model_sampling_peak`, the offered set and the foreign floor (256 MB hysteresis):
-  rung 1 (`CANNOT_CO_SAMPLE`) gets a dominant-model run, rung 2 (`CANNOT_CO_RESIDE`) gets the teardown residency.
-  Both sit in one `WholeCardResidencyLedger`; `held()` returns every rung and `teardown_held()` rung 2 only, so a
-  reader whose premise is a teardown must read the latter (the cold-head residency-bypass exemption does; a run's
-  jobs reach the card only through the `dominant_run` seat). A run starts at its first step
-  (`_grant_dominant_runs_at_first_step`) and ends in `_restore_siblings_after_whole_card`: when the run's work
-  drains, or, with work still queued, once the undispatched head is for a different model and has waited past the
-  anti-starvation bound (`_head_aged_past_anti_starvation`; the horde deadline outranks run continuity). The
-  run's readers are the pop claim, `copy_belongs_to_dominant_run`, the `dominant_run` line-skip seat and the placement
-  promotion, all through the ledger, so the one end clears them together. The pop claim's max hold bounds the offer narrowing only, never the displaced head's
-  wait. Rung-2 entry is head-only, through admission or `_resident_whole_card_head_ready`. The establish-rate
-  limiter (`governor_hold`) defers a new residency, recorded as `DEFER_RESIDENCY_GOVERNOR`, which lets the preload
-  pass continue; the head never falls through to co-resident admission. The rolling grace allowance only withholds
-  the recovery supervisor's window (`grace_seconds_to_open`). The deferral record excuses the supervisor for at
-  most the limiter's window.
+  `large_model_reentry_cooldown_seconds`. The verdict is a two-rung dominance ladder (`card_dominance`): rung 1
+  (`CANNOT_CO_SAMPLE`) is a dominant-model run, rung 2 (`CANNOT_CO_RESIDE`) the teardown residency. `held()`
+  returns every rung and `teardown_held()` rung 2 only, so a reader whose premise is a teardown reads the latter.
+  A run starts at its first step and ends in `_restore_siblings_after_whole_card`, either drained or with a
+  different-model head past `_head_aged_past_anti_starvation`, and every reader of a run goes through the ledger.
+  The establish-rate limiter is the only governor that defers (`DEFER_RESIDENCY_GOVERNOR`, which does not stop the
+  preload pass); the grace allowance only decides whether an excuse window opens (`grace_seconds_to_open`). The
+  owners, readers, fences and open questions are in
+  [the runs and residency map](docs/reference/responsibility-map-runs-and-residency.md).
 - **How long a queue head may wait:** `scheduling/dispatch_affinity.py` owns the two clocks that read the horde
   deadline (the skip budget, 6 skips or 0.2 x ttl, and the anti-starvation override at 0.3 x ttl from pop). Every
   other hold has its own fixed clock (head protection, the RAM defer barrier, the establish-rate window, the claim's max
   hold, the 60 s lease-acquire timeout, the structural-wedge minimum). Pin-wait, `residency_bypass_models` and the
   `dominant_run` seat do not consult the deadline clocks. A new hold that can delay a head reads
   `dispatch_affinity`'s clocks rather than adding one.
-- **Where a learned sampling reading is filed:** three feeders write the footprint store: the monolithic feeder
-  `MessageDispatcher._observe_footprint_peak` (per-reading plausibility bound, one peak folded per job), the
-  disaggregated feeder in the scheduler and the `RESIDENT` feeder in `vram_footprints.py`. Every feeder files
-  under the job's model, and a sampling reading is attributable only while the lane holds that model. A lane
-  still swapping reports the previous model's allocator high-water, so the monolithic feeder drops it.
-  `sanitize_sampling_observations` clamps `SAMPLE`, `SAMPLE_ISOLATED` and `SAMPLE_ACTIVATION` at load. Readers
-  price different figures for one job: the dispatch price (`pricing.candidate_delta_mb`), the clearance price
-  (`staged_sampling_peak_mb`, weights plus `sampling_reserve_mb`), the residency head need and the verdict's
-  `model_sampling_peak`. The scheduler keeps a second copy of `pricing.py`'s learned-peak helpers.
+- **Where a learned sampling reading is filed:** three feeders write the footprint store (the monolithic feeder
+  `MessageDispatcher._observe_footprint_peak`, the disaggregated feeder in the scheduler and the `RESIDENT` feeder
+  in `vram_footprints.py`), every one under the job's model, and a sampling reading counts only while the lane
+  holds that model. The store bounds readings at the feeder, at commit and at load
+  (`sanitize_sampling_observations`). Four readers price different figures for one job (dispatch, clearance,
+  residency head need, verdict), listed with their owners in
+  [the footprints and pricing map](docs/reference/responsibility-map-footprints-and-pricing.md).
 - **Which lane a preload or a sweep may touch:** `scheduling/admission/preload.py` (`lanes_committed_elsewhere`,
   the three target selectors) and `pricing.sweep_spares_idle_copy`: a lane loading one model is no target for
   another, a lane that owns a dispatched job is busy whatever it last reported, and the queue head's ready seat is

@@ -736,7 +736,8 @@ permit. hordelib then rebases the run's free-VRAM clamp on it (see [VRAM arbiter
 figure is the card before this child materialises, since the clamp subtracts the child's own growth from it.
 Until the child takes the permit the controller rewrites the figure from each step's reading, because the
 child reaches its sample call seconds after the grant, after it has moved its own encoder off the card. A
-timed-out or passed-through acquire carries none, a job start unsets the figure, and a grant that retires
+timed-out or passed-through acquire carries none, a job start unsets the figures until the next step rewrites
+the device free and the reserve of a grant still unconsumed, and a grant that retires
 with its permit never taken has that permit taken back by the controller, so a leftover permit never lets
 the next job on the slot sample unpriced. A clearance held for VRAM fit is
 attributed to the `clearance_hold`

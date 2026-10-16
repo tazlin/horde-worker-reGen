@@ -1320,7 +1320,9 @@ to the card. It is instead a governed live gate that grants only when:
   reads is often that run's own retained copy beside a sibling's job, the reclaim ladder answers pressure by
   evicting idle residents elsewhere, and dropping the run's weights would only make its next job reload them.
   The first job of a run counts too when another job for its model is queued, since its run is granted at its
-  first step, after this verdict. Outside a run the gate applies as written.
+  first step, after this verdict. The exception lasts only as long as the run, which ends when the run's work
+  drains or when a different-model head has waited past the anti-starvation bound. Outside a run the gate
+  applies as written.
 - **The slot's own recent traffic repeats this model.** The dispatched model must appear among the slot's
   previous `RETENTION_REPEAT_EVIDENCE_DISPATCHES` (3, in `scheduling/ledgers/retention.py`) dispatches. See
   [Retention is granted on repeat evidence](#retention-is-granted-on-repeat-evidence).
