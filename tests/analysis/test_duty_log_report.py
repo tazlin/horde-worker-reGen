@@ -10,6 +10,10 @@ from pathlib import Path
 import pytest
 
 from horde_worker_regen.analysis.duty_log_report import (
+    ArbiterCause,
+    IdleAttribution,
+    IdleContext,
+    IdleSegment,
     analyze_log,
     build_epoch_report,
     epoch_lines_for_stats_session,
@@ -17,9 +21,11 @@ from horde_worker_regen.analysis.duty_log_report import (
     parse_clearance_hold,
     parse_duty_window,
     render_clearance_hold_digest,
+    render_idle_attribution,
     render_report,
     split_into_epochs,
     summarize_clearance_holds,
+    summarize_idle_attribution,
 )
 from horde_worker_regen.analysis.log_triage_cli import build_parser
 from horde_worker_regen.process_management.resources.vram_footprints import (
@@ -409,3 +415,228 @@ class TestDutyReportCli:
         assert exit_code == 0
         assert "== Stats session 20260620-010203 v1.0.0" in output
         assert "This Session Model: 1 (defer 1)" in output
+
+
+_HOST_UTC_OFFSET_SECONDS = 7200.0
+"""The synthetic host runs two hours ahead of UTC; the attribution recovers that from the dispatch stamps."""
+_IDLE_DAY = "2026-06-20"
+_DISPATCH_PREFIX = (
+    "INFO     | horde_worker_regen.process_management.scheduling.inference_scheduler:_commit_dispatch:1 - "
+)
+_LEASE_PREFIX = "DEBUG    | horde_worker_regen.process_management.scheduling.clearance_lease:_clear:1 - "
+_FIRST_STEP_PREFIX = (
+    "DEBUG    | horde_worker_regen.process_management.scheduling.performance_model:on_job_finalized:1 - "
+)
+_GOVERNOR_PREFIX = (
+    "INFO     | horde_worker_regen.process_management.scheduling.pop_governor_registry:_default_log:1 - "
+)
+
+
+def _local(clock: str) -> str:
+    return f"{_IDLE_DAY} {clock}"
+
+
+def _epoch_of(clock: str) -> float:
+    local = datetime.strptime(_local(clock), "%Y-%m-%d %H:%M:%S.%f")
+    return (local - datetime(1970, 1, 1)).total_seconds() - _HOST_UTC_OFFSET_SECONDS
+
+
+_IDLE_LOG_LINES = [
+    _init_line(_local("01:01:58.000")),
+    f"{_local('01:10:03.500')} | {_DISPATCH_PREFIX}Starting inference for job aaaaaaaa on process 2",
+    f"{_local('01:10:05.500')} | {_LEASE_PREFIX}Clearance lease on device 0: cleared process 2 into its "
+    "load-and-sample window.",
+    f"{_local('01:10:11.500')} | {_DISPATCH_PREFIX}Starting inference for job bbbbbbbb on process 1",
+    f"{_local('01:10:12.000')} | {_FIRST_STEP_PREFIX}Job aaaaaaaa took 5.60s from dispatch to first step (cold) "
+    "for signature stable_diffusion_xl|<=1.3MP|<=20|1|nocn|nohires",
+    f"{_local('01:10:15.000')} | {_GOVERNOR_PREFIX}Pop governor ENTER: whole_card_residency (Model C holds the "
+    "card (established)); expected ~45s",
+    f"{_local('01:10:19.200')} | {_DISPATCH_PREFIX}Starting inference for job cccccccc on process 1",
+    f"{_local('01:10:30.000')} | {_GOVERNOR_PREFIX}Pop governor EXIT: whole_card_residency after 15s "
+    "(1x this session, 15s total)",
+    f"{_local('01:10:31.000')} | {_GOVERNOR_PREFIX}Pop governor ENTER: model_stickiness",
+]
+"""One epoch with three idle stretches.
+
+The first stretch (one to eight seconds past 01:10:00) ends when process 2 samples job aaaaaaaa: three seconds
+before its dispatch, two before its sample grant and three after it. The second (11 to 13) ends on job
+bbbbbbbb, which has no grant line. The third (16 to 18) has no local work inside a whole-card residency spell.
+"""
+
+
+def _idle_sample(second: int, *, sampling: int | None, hold: str | None = None, pending: int = 1) -> dict:
+    lanes = " ".join(
+        f"inference#{process}={'INFERENCE_STARTING' if process == sampling else 'WAITING_FOR_JOB'}"
+        for process in (1, 2)
+    )
+    return {
+        "timestamp": _epoch_of(f"01:10:{second:02d}.000"),
+        "process_state_summary": f"post_process#3=WAITING_FOR_JOB {lanes}",
+        "jobs_pending_inference": pending,
+        "jobs_in_progress": 0 if sampling is None else 1,
+        "dispatch_hold_bucket": hold,
+    }
+
+
+def _idle_samples() -> list[dict]:
+    samples = [_idle_sample(0, sampling=1)]
+    samples += [_idle_sample(second, sampling=None, hold="clearance_hold") for second in range(1, 9)]
+    samples += [_idle_sample(9, sampling=2), _idle_sample(10, sampling=2)]
+    samples += [_idle_sample(second, sampling=None, hold="resident_slot_busy") for second in range(11, 14)]
+    samples += [_idle_sample(14, sampling=1), _idle_sample(15, sampling=1)]
+    samples += [_idle_sample(second, sampling=None, pending=0) for second in range(16, 19)]
+    samples += [_idle_sample(19, sampling=1), _idle_sample(20, sampling=1)]
+    return samples
+
+
+def _idle_jobs() -> list[dict]:
+    dispatches = {"aaaaaaaa": ("01:10:03.500", "Model A"), "bbbbbbbb": ("01:10:11.500", "Model B")}
+    return [
+        {
+            "job_id": f"{short}-0000-0000-0000-000000000000",
+            "model_name": model,
+            "stage_timestamps": {"INFERENCE_IN_PROGRESS": _epoch_of(clock)},
+        }
+        for short, (clock, model) in dispatches.items()
+    ]
+
+
+def _bucket_seconds(attribution: IdleAttribution, segment: IdleSegment, cause: str, model: str | None) -> float:
+    return sum(
+        bucket.seconds
+        for bucket in attribution.buckets
+        if bucket.segment is segment and bucket.cause == cause and bucket.model == model
+    )
+
+
+class TestIdleAttribution:
+    """Each idle card-second lands on the timeline of the job whose sampling ended its stretch."""
+
+    def test_a_stretch_splits_at_the_dispatch_and_the_grant(self) -> None:
+        """Pre-dispatch, arbiter and child-load seconds follow the dispatch, grant and first-step lines."""
+        attribution = summarize_idle_attribution(_idle_samples(), _IDLE_LOG_LINES, _idle_jobs())
+
+        assert attribution is not None
+        assert (attribution.window_seconds, attribution.idle_seconds, len(attribution.stretches)) == (21.0, 14.0, 3)
+        assert _bucket_seconds(attribution, IdleSegment.PRE_DISPATCH, "pre-dispatch hold (clearance_hold)", None) == 3
+        assert _bucket_seconds(attribution, IdleSegment.ARBITER, str(ArbiterCause.GRANTED), "Model A") == 2
+        assert _bucket_seconds(attribution, IdleSegment.CHILD_LOAD, "cold", "Model A") == 3
+
+    def test_a_stretch_without_a_grant_line_lands_in_the_no_grant_bucket(self) -> None:
+        """A job that sampled with no sample grant logged puts its post-dispatch seconds in the no-grant bucket."""
+        attribution = summarize_idle_attribution(_idle_samples(), _IDLE_LOG_LINES, _idle_jobs())
+
+        assert attribution is not None
+        assert _bucket_seconds(attribution, IdleSegment.ARBITER, str(ArbiterCause.NO_GRANT), "Model B") == 2
+        assert (
+            _bucket_seconds(attribution, IdleSegment.PRE_DISPATCH, "pre-dispatch hold (resident_slot_busy)", None) == 1
+        )
+
+    def test_a_stretch_inside_a_residency_spell_carries_the_residency_context(self) -> None:
+        """Idle samples inside a whole-card residency spell are named by it and carry its context."""
+        attribution = summarize_idle_attribution(_idle_samples(), _IDLE_LOG_LINES, _idle_jobs())
+
+        assert attribution is not None
+        (bucket,) = [
+            bucket
+            for bucket in attribution.buckets
+            if bucket.cause == "no local work: pop governor whole_card_residency"
+        ]
+        assert bucket.segment is IdleSegment.PRE_DISPATCH
+        assert bucket.context_seconds == {str(IdleContext.RUNG_2_RESIDENCY): 3.0}
+        assert attribution.rung_2_episodes == 1
+
+    def test_the_rendered_section_carries_the_figures(self) -> None:
+        """The text groups the seconds by segment, cause and model with their share of idle."""
+        attribution = summarize_idle_attribution(_idle_samples(), _IDLE_LOG_LINES, _idle_jobs())
+
+        rendered = "\n".join(render_idle_attribution(attribution))
+
+        assert "idle card-seconds by the next job's timeline: 14s of 21s (66.7%) over 3 stretches" in rendered
+        assert "     pre-dispatch: 7s (50.0%)" in rendered
+        assert "     arbiter: 4s (28.6%)" in rendered
+        assert "       cold: 3s (21.4%); neither 3s" in rendered
+        assert "         Model A: 3s (21.4%) over 1 stretches; neither 3s" in rendered
+        assert "       no local work: pop governor whole_card_residency: 3s (21.4%); rung-2 residency 3s" in rendered
+
+
+def _write_idle_bundle(root: Path, *, stats_stamp: str) -> Path:
+    """Write a bundle whose stats session holds the idle samples and jobs beside the idle log."""
+    stats_dir = root / "stats"
+    stats_dir.mkdir(parents=True)
+    rows = [{"event": "stats_sample", "sample": sample} for sample in _idle_samples()]
+    rows += [{"event": "job_completed", "job": job} for job in _idle_jobs()]
+    (stats_dir / f"stats-v1.0.0-{stats_stamp}-000.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    logs_dir = root / "logs"
+    logs_dir.mkdir()
+    (logs_dir / "bridge.log").write_text("\n".join(_IDLE_LOG_LINES) + "\n", encoding="utf-8")
+    return root
+
+
+class TestIdleAttributionInTheDutyReport:
+    """``horde-log duty`` adds the idle attribution when a log is beside the stats."""
+
+    def test_stats_report_adds_the_idle_attribution(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The session's own epoch supplies the section."""
+        bundle = _write_idle_bundle(tmp_path / "bundle", stats_stamp="20260620-010203")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["horde-duty-report", "--stats", str(bundle / "stats"), "--logs", str(bundle / "logs")],
+        )
+
+        main()
+
+        output = capsys.readouterr().out
+        assert "idle card-seconds by the next job's timeline: 14s of 21s (66.7%) over 3 stretches" in output
+        assert "       no sample grant line: 2s (14.3%); neither 2s" in output
+
+    def test_json_carries_the_idle_attribution(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The JSON carries the same totals and buckets."""
+        bundle = _write_idle_bundle(tmp_path / "bundle", stats_stamp="20260620-010203")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["horde-duty-report", "--stats", str(bundle / "stats"), "--logs", str(bundle / "logs"), "--json"],
+        )
+
+        main()
+
+        idle = json.loads(capsys.readouterr().out)[0]["idle_attribution"]
+        assert (idle["window_seconds"], idle["idle_seconds"], idle["stretch_count"]) == (21.0, 14.0, 3)
+        assert idle["segment_seconds"] == {"pre-dispatch": 7.0, "arbiter": 4.0, "child load after grant": 3.0}
+        child_load = [bucket for bucket in idle["buckets"] if bucket["segment"] == "child load after grant"]
+        assert [(bucket["cause"], bucket["model"], bucket["seconds"]) for bucket in child_load] == [
+            ("cold", "Model A", 3.0),
+        ]
+
+    def test_a_session_with_no_epoch_near_it_renders_no_section(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A stats session whose start matches no epoch banner gets no idle attribution."""
+        bundle = _write_idle_bundle(tmp_path / "bundle", stats_stamp="20260621-090000")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["horde-duty-report", "--stats", str(bundle / "stats"), "--logs", str(bundle / "logs")],
+        )
+
+        main()
+
+        assert "idle card-seconds" not in capsys.readouterr().out

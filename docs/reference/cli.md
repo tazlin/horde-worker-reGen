@@ -169,7 +169,7 @@ options.
 |-----------------|---------|
 | `LOG` | Optional `bridge.log` path for the legacy log parser. Supplying this makes the command log-focused unless `--stats` is also supplied. |
 | `--stats DIR` | Analyze `stats-v*.jsonl` and `stats-v*.jsonl.gz` files from a stats directory. Rotated files with the same filename stamp are grouped into one session. |
-| `--logs PATH` | Log file or directory containing `bridge.log`. Beside `--stats` it adds each session's clearance-hold digest; alone it selects log-only analysis. |
+| `--logs PATH` | Log file or directory containing `bridge.log`. Beside `--stats` it adds each session's clearance-hold digest and idle attribution; alone it selects log-only analysis. |
 | `--footprints PATH` | Learned VRAM footprint store to list sampling prices from. Defaults to the bundle's `config/vram_footprints.json` when `--stats` sits in a support bundle, else the worker's `.horde_worker_regen/vram_footprints.json`; a missing default store prints nothing. |
 | `--last` | Only report the newest stats session or log epoch. |
 | `--json` | Emit the machine-readable report schema. Stats-backed JSON uses `SessionDutyReport.to_dict()`. |
@@ -186,7 +186,7 @@ horde-log duty --stats <bundle>/stats --logs <bundle>/logs --last
 
 The stats-backed report separates idle loss from partial-utilization loss, reports popped-job `inference_queue_wait` before inference starts, reports sampled `inference_dispatch_gap` when queued inference work has no active inference process, and keeps `unknown` as a first-class bucket when older files lack enough state to attribute a sampled interval.
 
-Three more views read what a support bundle carries:
+Four more views read what a support bundle carries:
 
 - **Sampling concurrency.** `jobs in progress at once` counts jobs in progress, and a staged job counts there
   while its lane waits. `image processes sampling at once` counts the inference lanes in `INFERENCE_STARTING`
@@ -198,12 +198,28 @@ Three more views read what a support bundle carries:
   Per model it prints the hold count, the median VRAM needed, available and reserved for other jobs,
   and how many holds took each set of steps to free VRAM (`none` included). The worker logs a hold once per process and
   decision, so the count is distinct holds, not held time.
+- **Idle attribution.** With `--logs`, every idle card-second of the same epoch is placed on the timeline of the
+  job that ended it. A stats sample with no inference lane in `INFERENCE_STARTING` is idle and stands for the
+  gap to the next sample, at most 5 s. Consecutive idle samples form a stretch, which ends at the first sample
+  where a lane samples; the job most recently dispatched on that lane (`Starting inference for job`) owns the
+  stretch. Each idle second lands in one segment of that job's timeline: `pre-dispatch` (named from the sample:
+  no local work and why, a rung-2 residency, lanes starting, a preloading lane, or the dispatch hold bucket),
+  `arbiter` (dispatch to the `cleared process N into its load-and-sample window` grant, or `no sample grant
+  line` when none was logged, marked `unpriced after timeout` when the lane entered its denoise loop without a
+  recorded grant), or `child load after grant` (grant to first step, split by the `from dispatch to first step`
+  kind, `cold` or `resident`, and by model). A stretch that reaches the epoch's end is `window end`, named from
+  its samples. Every line carries its seconds split by context: a rung-2 residency spell, a rung-1
+  dominant-model run, or neither. The header gives the idle share and the idle seconds above the 90% card-busy
+  target, so the biggest segment is where that gap is. The log's host clock is aligned to the stats' epoch
+  seconds from the dispatch stamps both record; a session whose epoch has no dispatch of a recorded job, or
+  whose log has no epoch near its start, prints no section.
 - **Learned footprints.** Each sampling key in the footprint store, tagged `[all]` for the pooled key or with
   its job class (`[b4]`, `[b1 hires]`), and each learned post-processing chain, tagged with its operations, with
   the two terms admission prices it from: the raise-only watermark and the margined measured figure net of the context charge (`n/a` until the
   key's window holds enough jobs), beside the `sample_activation` watermark for the same band and the
   resident figures of the baseline's checkpoints. The text report prints figures only; the JSON output
-  carries the sampling concurrency and the clearance holds, not the footprints.
+  carries the sampling concurrency, the clearance holds and the idle attribution (`idle_attribution`: totals,
+  per-segment seconds and every bucket; the per-stretch rows are left out), not the footprints.
 
 ## `horde-stats`
 
@@ -581,7 +597,7 @@ an operator sent you.
 | `job <ID> [PATH]` | Trace one job across the parent and the inference slot that ran it. |
 | `watch [PATH]` | Live-poll the logs and alert when a new warning/critical finding or a rising recovery count appears. |
 | `bundle [PATH]` | Build a single redacted `.zip` (logs + diagnosis + config + system/cache info) to send a maintainer. |
-| `duty` | The GPU duty report, with the options of [`horde-duty-report`](#horde-duty-report): stats-backed sampling concurrency, the session's clearance holds and the learned footprint prices. |
+| `duty` | The GPU duty report, with the options of [`horde-duty-report`](#horde-duty-report): stats-backed sampling concurrency, the session's clearance holds and idle attribution, and the learned footprint prices. |
 
 `PATH` defaults to `logs/`. `sessions`, `diagnose`, `timeline`, and `jobs` take `--session N` or
 `--last` to select a worker session, `--benchmark N` or `--last-benchmark` to select a benchmark run, and

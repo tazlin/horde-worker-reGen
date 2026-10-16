@@ -1740,6 +1740,46 @@ _SIGNATURE_LIST: list[LogSignature] = [
         ),
         dry_run_reason=_CLEARANCE_LEASE_NOT_EXERCISED,
     ),
+    _signature(
+        "dispatch_to_first_step",
+        r"Job (?P<job>[0-9a-fA-F]{8}) took (?P<seconds>[\d.]+)s from dispatch to first step \((?P<residency>\w+)\)",
+        emitter="process_management.scheduling.performance_model:PerformanceModel.on_job_finalized",
+        sample=(
+            "Job 3b2aba51 took 1.36s from dispatch to first step (resident) for signature "
+            "stable_diffusion_xl|<=1.3MP|<=20|1|nocn|hires"
+        ),
+    ),
+    _signature(
+        "dominant_run_opened",
+        r"Dominant-model run for (?P<model>.+?) on device (?P<device>\d+): no offered model",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._note_dominant_run",
+        sample=(
+            "Dominant-model run for Flux.1-Schnell fp8 (Compact) on device 0: no offered model can sample beside "
+            "it, so the offer narrows to it and its weights stay on the card between its jobs; nothing is torn down."
+        ),
+        dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
+    ),
+    _signature(
+        "dominant_run_ended",
+        r"Dominant-model run for (?P<model>.+?) ended(?: because|: its jobs drained)",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._end_dominant_run",
+        sample=(
+            "Dominant-model run for Flux.1-Schnell fp8 (Compact) ended because the head job for Krea2-Turbo_fp8 "
+            "has waited 135s since pop, past the anti-starvation bound."
+        ),
+        dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
+    ),
+    _signature(
+        "whole_card_prestage",
+        r"Pre-staging whole-card head (?P<model>.+?) into a spare process's RAM",
+        emitter="process_management.scheduling.inference_scheduler:InferenceScheduler._begin_whole_card_residency",
+        sample=(
+            "Pre-staging whole-card head Qwen-Image_fp8 into a spare process's RAM while the in-flight job "
+            "finishes; the device will be reserved for it (idle siblings stopped and safety moved off-GPU) once it "
+            "frees, so its weights are loaded before it samples instead of after."
+        ),
+        dry_run_reason=_WHOLE_CARD_NOT_EXERCISED,
+    ),
 ]
 
 SIGNATURES: dict[str, LogSignature] = {signature.name: signature for signature in _SIGNATURE_LIST}

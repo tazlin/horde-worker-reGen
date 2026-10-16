@@ -27,11 +27,12 @@ _DEFAULT_TARGET_DUTY_PERCENT = 90.0
 _DEFAULT_BUSY_THRESHOLD = 0.10
 _MAX_INFERRED_INTERVAL_SECONDS = 300.0
 
-_LANE_STATE_RE = re.compile(r"(?P<label>[a-z_]+)#\d+=(?:[a-z_]+:)?(?P<state>[A-Z_]+)")
+_LANE_STATE_RE = re.compile(r"(?P<label>[a-z_]+)#(?P<process>\d+)=(?:[a-z_]+:)?(?P<state>[A-Z_]+)")
 """Matches one lane entry of ``process_state_summary`` (``post_process#1=WAITING_FOR_JOB``).
 
 An optional lower-case ``temperature:`` segment sits between ``=`` and the state in the
-richer per-slot rendering, so the state is read after it rather than from the raw token.
+richer per-slot rendering, so the state is read after it rather than from the raw token. The number
+after ``#`` is the process id the parent log names in ``on process N``.
 """
 
 _INFERENCE_LANE_LABEL = "inference"

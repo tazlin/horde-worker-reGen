@@ -8,8 +8,9 @@ per-job-gap attribution they now carry), the effective worker config, and any di
 and prints a compact per-epoch verdict plus the biggest loss buckets.
 
 When stats JSONL is present the stats-backed report leads (:mod:`horde_worker_regen.analysis.session_duty`).
-A log named beside it adds each session's clearance-hold digest from the matching epoch, and the learned
-footprint store's sampling prices follow (:mod:`horde_worker_regen.analysis.footprint_view`).
+A log named beside it adds each session's clearance-hold digest and idle attribution (every idle card-second
+placed on the timeline of the job that ended it) from the matching epoch, and the learned footprint store's
+sampling prices follow (:mod:`horde_worker_regen.analysis.footprint_view`).
 
 It imports without the inference stack; usable from the CLI (``horde-duty-report``, or ``horde-log duty``)
 or the benchmark/TUI. The grep-friendly log format is the contract: see the regexes below, which mirror
@@ -20,12 +21,15 @@ what ``process_manager._log_duty_cycle_summary``, ``status_reporter`` and
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import re
 import statistics
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from horde_worker_regen.analysis.footprint_view import (
     default_footprint_store_path,
@@ -37,12 +41,21 @@ from horde_worker_regen.analysis.governor_signatures import (
     GOVERNOR_EXIT_RE,
     GOVERNOR_LABELS,
 )
+from horde_worker_regen.analysis.log_signatures import SIGNATURES
 from horde_worker_regen.analysis.session_duty import (
+    _INFERENCE_LANE_LABEL,
+    _LANE_STATE_RE,
+    _POST_PROCESS_LANE_LABEL,
+    _POST_PROCESSING_LANE_STATES,
+    _SAMPLING_LANE_STATES,
     SessionDutyReport,
+    _lane_states,
     analyze_stats_sessions,
+    read_stats_payloads,
     render_session_duty_report,
     stats_session_local_start,
 )
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyBucket
 from horde_worker_regen.stats_operations import default_stats_dir
 
 _TS_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)")
@@ -532,6 +545,565 @@ def _mb_or_na(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.0f}MB"
 
 
+_IDLE_SAMPLE_WEIGHT_CAP_SECONDS = 5.0
+"""The most wall clock one stats sample stands for, so a gap in the stream does not land on one sample as idle."""
+_LAST_SAMPLE_WEIGHT_SECONDS = 1.0
+"""The weight of the window's last sample, which has no successor to measure its gap against."""
+_DISPATCH_LOOKAHEAD_SECONDS = 0.5
+"""How far after the sample that first sees a lane sampling its dispatch line may be stamped."""
+_GRANT_LOOKBACK_SECONDS = 0.05
+"""A sample grant logged this far before its job's dispatch line still belongs to that job."""
+_GRANT_LOOKAHEAD_SECONDS = 1.0
+"""How far after the stretch's ending sample the ending job's sample grant may be stamped."""
+_UNPRICED_LOOKAHEAD_SECONDS = 2.0
+"""How far after the stretch's ending sample an unpriced-sampling line may be stamped and still count."""
+_RUNG_2_RESTART_SECONDS = 120.0
+"""Lanes starting within this long after a rung-2 residency ends are the siblings it tore down restarting."""
+_HOST_OFFSET_STEP_SECONDS = 900.0
+"""Host UTC offsets are whole quarter hours, so the measured offset is rounded to one."""
+_DISPATCH_STAGE = "INFERENCE_IN_PROGRESS"
+"""The ``stage_timestamps`` key the job tracker stamps at dispatch (``JobStage.INFERENCE_IN_PROGRESS.name``).
+
+Spelled out because importing the job tracker pulls the SDK into this import-light module."""
+_PROCESS_STARTING_STATE = "PROCESS_STARTING"
+_PRELOADING_STATE = "PRELOADING_MODEL"
+_RESIDENCY_GOVERNOR = "whole_card_residency"
+_NO_LOCAL_WORK_GOVERNORS = (
+    "consecutive_failure_pause",
+    "self_throttle_pause",
+    _RESIDENCY_GOVERNOR,
+    "large_model_reentry",
+    "megapixelstep_wait",
+)
+"""Pop governors that explain an empty local queue, in the order the first engaged one is named."""
+_RUNG_2_HOLD_BUCKETS = frozenset(
+    {SlotDutyBucket.WHOLE_CARD_CONVERGENCE.value, SlotDutyBucket.WHOLE_CARD_RESERVED.value},
+)
+_PRELOAD_HOLD_BUCKETS = frozenset({SlotDutyBucket.PRELOAD_DEFERRED.value, SlotDutyBucket.OVERLAP_HEADWAY.value})
+"""Hold buckets under which a preloading lane, not the hold, is what the head waits on (an unset bucket too)."""
+_NO_FIRST_STEP = "none"
+"""The first-step kind of a job whose ``from dispatch to first step`` line is absent."""
+_UNKNOWN_MODEL = "unknown model"
+_RENDERED_MODELS_PER_CAUSE = 8
+
+
+class IdleContext(StrEnum):
+    """The whole-card state an idle sample fell in."""
+
+    RUNG_2_RESIDENCY = "rung-2 residency"
+    """A whole-card residency episode held the card (``Pop governor ENTER: whole_card_residency`` to its exit)."""
+    RUNG_1_RUN = "rung-1 run"
+    """A dominant-model run narrowed the offer, from its open line to its end line."""
+    NEITHER = "neither"
+
+
+class IdleSegment(StrEnum):
+    """Where on the ending job's timeline an idle sample sits."""
+
+    PRE_DISPATCH = "pre-dispatch"
+    """Before the ending job was dispatched."""
+    ARBITER = "arbiter"
+    """Dispatch to the job's sample grant, or to its first step when no grant line was logged."""
+    CHILD_LOAD = "child load after grant"
+    """Sample grant to the first step: the child loading and preparing to sample."""
+    WINDOW_END = "window end"
+    """The stretch runs to the window's end, so no job ends it."""
+
+
+class ArbiterCause(StrEnum):
+    """How the arbiter segment of an idle stretch ended."""
+
+    GRANTED = "dispatch to sample grant"
+    NO_GRANT = "no sample grant line"
+    NO_GRANT_UNPRICED = "no sample grant line (unpriced after timeout)"
+    """The lane entered its denoise loop without a recorded grant inside the stretch."""
+
+
+@dataclass
+class IdleStretch:
+    """Represents consecutive idle stats samples and the job whose sampling ended them."""
+
+    start_timestamp: float
+    """The first idle sample's epoch timestamp."""
+    idle_seconds: float
+    ending_process: int | None
+    """The lane that turned sampling at the stretch's end, None for a stretch that reaches the window's end."""
+    ending_job: str | None
+    """The short id of the job most recently dispatched on the ending lane."""
+    model: str | None
+    first_step_kind: str | None
+    segment_seconds: dict[str, float]
+
+
+@dataclass
+class IdleBucket:
+    """Represents the idle seconds of one cause on the ending job's timeline."""
+
+    segment: IdleSegment
+    cause: str
+    """The pre-dispatch cause, the :class:`ArbiterCause`, or the first-step kind (``cold`` or ``resident``)."""
+    model: str | None
+    """The ending job's model for the arbiter and child-load segments, None before dispatch."""
+    seconds: float = 0.0
+    stretches: int = 0
+    context_seconds: dict[str, float] = field(default_factory=dict)
+    """Seconds by :class:`IdleContext` value."""
+
+
+@dataclass
+class IdleAttribution:
+    """Represents every idle card-second of a session's log epoch, placed on the next job's timeline."""
+
+    window_seconds: float
+    idle_seconds: float
+    target_duty_percent: float
+    rung_1_runs: int
+    rung_2_episodes: int
+    stretches: list[IdleStretch]
+    buckets: list[IdleBucket]
+    """Biggest first."""
+
+    @property
+    def seconds_above_target(self) -> float:
+        """Idle seconds that would have to become sampling for the window to reach the card-busy target."""
+        return self.idle_seconds - (1.0 - self.target_duty_percent / 100.0) * self.window_seconds
+
+    def segment_seconds(self) -> dict[IdleSegment, float]:
+        """Idle seconds per segment, in timeline order, segments with none left out."""
+        totals = dict.fromkeys(IdleSegment, 0.0)
+        for bucket in self.buckets:
+            totals[bucket.segment] += bucket.seconds
+        return {segment: seconds for segment, seconds in totals.items() if seconds > 0.0}
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the totals and buckets as JSON-ready values; the per-stretch rows are left out for size."""
+        return {
+            "window_seconds": self.window_seconds,
+            "idle_seconds": self.idle_seconds,
+            "target_duty_percent": self.target_duty_percent,
+            "seconds_above_target": self.seconds_above_target,
+            "stretch_count": len(self.stretches),
+            "rung_1_runs": self.rung_1_runs,
+            "rung_2_episodes": self.rung_2_episodes,
+            "segment_seconds": {str(segment): seconds for segment, seconds in self.segment_seconds().items()},
+            "buckets": [asdict(bucket) | {"segment": str(bucket.segment)} for bucket in self.buckets],
+        }
+
+
+@dataclass
+class _Dispatch:
+    seconds: float
+    job: str
+
+
+@dataclass
+class _Spell:
+    start: float
+    end: float
+    name: str
+
+
+@dataclass
+class _EpochTimeline:
+    """The epoch's lines the attribution reads, stamped in seconds of the host clock read as UTC."""
+
+    start: float
+    end: float
+    dispatches: dict[int, list[_Dispatch]] = field(default_factory=dict)
+    grants: dict[int, list[float]] = field(default_factory=dict)
+    unpriced: dict[int, list[float]] = field(default_factory=dict)
+    first_step_kind: dict[str, str] = field(default_factory=dict)
+    runs: list[_Spell] = field(default_factory=list)
+    residencies: list[_Spell] = field(default_factory=list)
+    governor_spells: list[_Spell] = field(default_factory=list)
+    pop_claims: list[_Spell] = field(default_factory=list)
+
+    def context(self, seconds: float) -> IdleContext:
+        if any(spell.start <= seconds <= spell.end for spell in self.residencies):
+            return IdleContext.RUNG_2_RESIDENCY
+        if any(spell.start <= seconds <= spell.end for spell in self.runs):
+            return IdleContext.RUNG_1_RUN
+        return IdleContext.NEITHER
+
+
+_EPOCH_ORIGIN = datetime(1970, 1, 1)
+
+
+def _host_seconds(stamp: datetime) -> float:
+    """Seconds since the epoch of a naive host-clock stamp read as if it were UTC."""
+    return (stamp - _EPOCH_ORIGIN).total_seconds()
+
+
+def _read_epoch_timeline(epoch_lines: list[str]) -> _EpochTimeline | None:
+    """Parse the dispatch, grant, first-step, run, residency and governor lines of one epoch."""
+    stamped = [(stamp, line) for line in epoch_lines if (stamp := _parse_ts(line)) is not None]
+    if not stamped:
+        return None
+    timeline = _EpochTimeline(start=_host_seconds(stamped[0][0]), end=_host_seconds(stamped[-1][0]))
+    open_runs: dict[str, float] = {}
+    open_residency: float | None = None
+    open_governors: dict[str, float] = {}
+    open_claim: float | None = None
+    for stamp, line in stamped:
+        seconds = _host_seconds(stamp)
+        if "Starting inference for job" in line and (match := SIGNATURES["inference_dispatched"].pattern.search(line)):
+            timeline.dispatches.setdefault(int(match.group("process")), []).append(
+                _Dispatch(seconds=seconds, job=match.group("job").lower()),
+            )
+        elif "into its load-and-sample window" in line and (
+            match := SIGNATURES["clearance_sample_granted"].pattern.search(line)
+        ):
+            timeline.grants.setdefault(int(match.group("process")), []).append(seconds)
+        elif "from dispatch to first step" in line and (
+            match := SIGNATURES["dispatch_to_first_step"].pattern.search(line)
+        ):
+            timeline.first_step_kind[match.group("job").lower()] = match.group("residency")
+        elif "without a recorded grant" in line and (
+            match := SIGNATURES["unpriced_sampling_window"].pattern.search(line)
+        ):
+            timeline.unpriced.setdefault(int(match.group("process")), []).append(seconds)
+        elif "Dominant-model run for" in line:
+            if (match := SIGNATURES["dominant_run_opened"].pattern.search(line)) is not None:
+                open_runs.setdefault(match.group("model"), seconds)
+            elif (match := SIGNATURES["dominant_run_ended"].pattern.search(line)) is not None:
+                start = open_runs.pop(match.group("model"), timeline.start)
+                timeline.runs.append(_Spell(start=start, end=seconds, name=match.group("model")))
+        elif ("Pre-staging whole-card head" in line or "Whole-card residency: reserving" in line) and (
+            SIGNATURES["whole_card_prestage"].pattern.search(line)
+            or SIGNATURES["whole_card_establish"].pattern.search(line)
+        ):
+            # A rung-2 grant overwrites the whole-card ledger's state, so an open run ends here without its
+            # own end line.
+            for model, start in open_runs.items():
+                timeline.runs.append(_Spell(start=start, end=seconds, name=model))
+            open_runs.clear()
+        elif "Pop governor " in line:
+            if (enter := GOVERNOR_ENTER_RE.search(line)) is not None:
+                open_governors[enter.group("name")] = seconds
+                if SIGNATURES["residency_governor_model"].pattern.search(line):
+                    open_residency = seconds
+            elif (governor_exit := GOVERNOR_EXIT_RE.search(line)) is not None:
+                name = governor_exit.group("name")
+                if name in open_governors:
+                    timeline.governor_spells.append(_Spell(start=open_governors.pop(name), end=seconds, name=name))
+                if name == _RESIDENCY_GOVERNOR and open_residency is not None:
+                    timeline.residencies.append(_Spell(start=open_residency, end=seconds, name=name))
+                    open_residency = None
+        elif "Whole-card pop claim" in line:
+            if SIGNATURES["pop_claim_engaged"].pattern.search(line):
+                open_claim = seconds
+            elif SIGNATURES["pop_claim_released"].pattern.search(line) and open_claim is not None:
+                timeline.pop_claims.append(_Spell(start=open_claim, end=seconds, name="pop_claim"))
+                open_claim = None
+    for model, start in open_runs.items():
+        timeline.runs.append(_Spell(start=start, end=timeline.end, name=model))
+    if open_residency is not None:
+        timeline.residencies.append(_Spell(start=open_residency, end=timeline.end, name=_RESIDENCY_GOVERNOR))
+    timeline.runs.sort(key=lambda spell: spell.start)
+    timeline.residencies.sort(key=lambda spell: spell.start)
+    return timeline
+
+
+def _host_clock_offset(timeline: _EpochTimeline, jobs: list[dict[str, Any]]) -> float | None:
+    """Return the host clock's offset from UTC in seconds, from dispatch lines paired with the jobs' stamps.
+
+    The log is stamped on the host's clock and the stats in epoch seconds; each job's dispatch is recorded in
+    both, so their median difference is the offset with no guess at the host's time zone. None when no
+    dispatch line names a job the stats recorded.
+    """
+    dispatched_at: dict[str, float] = {}
+    for job in jobs:
+        stages = job.get("stage_timestamps")
+        job_id = job.get("job_id")
+        if isinstance(stages, dict) and isinstance(job_id, str):
+            stamp = stages.get(_DISPATCH_STAGE)
+            if isinstance(stamp, int | float):
+                dispatched_at[job_id[:8].lower()] = float(stamp)
+    differences = [
+        dispatch.seconds - dispatched_at[dispatch.job]
+        for dispatches in timeline.dispatches.values()
+        for dispatch in dispatches
+        if dispatch.job in dispatched_at
+    ]
+    if not differences:
+        return None
+    return round(statistics.median(differences) / _HOST_OFFSET_STEP_SECONDS) * _HOST_OFFSET_STEP_SECONDS
+
+
+def _inference_lane_states(sample: dict[str, Any]) -> dict[int, str]:
+    """Each inference lane's state in ``sample``, keyed by its process id."""
+    summary = str(sample.get("process_state_summary") or "")
+    return {
+        int(match.group("process")): match.group("state")
+        for match in _LANE_STATE_RE.finditer(summary)
+        if match.group("label") == _INFERENCE_LANE_LABEL
+    }
+
+
+def _sampling_processes(sample: dict[str, Any]) -> list[int]:
+    return sorted(
+        process for process, state in _inference_lane_states(sample).items() if state in _SAMPLING_LANE_STATES
+    )
+
+
+def _pre_dispatch_cause(sample: dict[str, Any], seconds: float, timeline: _EpochTimeline) -> str:
+    """Name what held an idle sample that falls before its ending job's dispatch, from the sample itself."""
+    inference_states = set(_inference_lane_states(sample).values())
+    if not sample.get("jobs_pending_inference") and not sample.get("jobs_in_progress"):
+        active = {spell.name for spell in timeline.governor_spells if spell.start <= seconds <= spell.end}
+        for name in _NO_LOCAL_WORK_GOVERNORS:
+            if name in active:
+                return f"no local work: pop governor {name}"
+        if any(spell.start <= seconds <= spell.end for spell in timeline.pop_claims):
+            return "no local work: pop claim narrows the offer"
+        if sample.get("jobs_pending_safety_check") or sample.get("jobs_being_safety_checked"):
+            return "no local work: safety outstanding"
+        if sample.get("jobs_pending_submit"):
+            return "no local work: submit outstanding"
+        if any(
+            label == _POST_PROCESS_LANE_LABEL and state in _POST_PROCESSING_LANE_STATES
+            for label, state in _lane_states(sample)
+        ):
+            return "no local work: post-processing outstanding"
+        return "no local work: nothing outstanding"
+    hold = sample.get("dispatch_hold_bucket")
+    if timeline.context(seconds) is IdleContext.RUNG_2_RESIDENCY or hold in _RUNG_2_HOLD_BUCKETS:
+        return f"rung-2 residency ({hold})"
+    if _PROCESS_STARTING_STATE in inference_states:
+        residency_ended_recently = any(
+            0.0 <= seconds - spell.end <= _RUNG_2_RESTART_SECONDS for spell in timeline.residencies
+        )
+        if residency_ended_recently:
+            return "rung-2 exit: lanes restarting"
+        return f"lanes starting ({hold})"
+    if _PRELOADING_STATE in inference_states and (hold is None or hold in _PRELOAD_HOLD_BUCKETS):
+        return f"model preloading ({hold})"
+    return f"pre-dispatch hold ({hold})"
+
+
+def _first_between(stamps: list[float], low: float, high: float) -> float | None:
+    index = bisect.bisect_left(stamps, low)
+    if index < len(stamps) and stamps[index] <= high:
+        return stamps[index]
+    return None
+
+
+@dataclass
+class _EndingJob:
+    process: int
+    job: str
+    dispatched: float
+    granted: float | None
+    unpriced: bool
+    model: str
+    first_step_kind: str
+
+
+def _ending_job(
+    processes: list[int],
+    ending_seconds: float,
+    timeline: _EpochTimeline,
+    models: dict[str, str],
+) -> _EndingJob | None:
+    """Pick the job most recently dispatched on a lane that turned sampling at ``ending_seconds``."""
+    best: tuple[int, _Dispatch] | None = None
+    for process in processes:
+        dispatches = timeline.dispatches.get(process, [])
+        index = bisect.bisect_right([d.seconds for d in dispatches], ending_seconds + _DISPATCH_LOOKAHEAD_SECONDS) - 1
+        if index >= 0 and (best is None or dispatches[index].seconds > best[1].seconds):
+            best = (process, dispatches[index])
+    if best is None:
+        return None
+    process, dispatch = best
+    granted = _first_between(
+        timeline.grants.get(process, []),
+        dispatch.seconds - _GRANT_LOOKBACK_SECONDS,
+        ending_seconds + _GRANT_LOOKAHEAD_SECONDS,
+    )
+    unpriced = _first_between(
+        timeline.unpriced.get(process, []),
+        dispatch.seconds,
+        ending_seconds + _UNPRICED_LOOKAHEAD_SECONDS,
+    )
+    return _EndingJob(
+        process=process,
+        job=dispatch.job,
+        dispatched=dispatch.seconds,
+        granted=granted,
+        unpriced=unpriced is not None,
+        model=models.get(dispatch.job, _UNKNOWN_MODEL),
+        first_step_kind=timeline.first_step_kind.get(dispatch.job, _NO_FIRST_STEP),
+    )
+
+
+def _place_idle_sample(
+    sample: dict[str, Any],
+    seconds: float,
+    ending: _EndingJob | None,
+    timeline: _EpochTimeline,
+) -> tuple[IdleSegment, str, str | None]:
+    """Return the segment, cause and model an idle sample lands in on its ending job's timeline."""
+    if ending is None:
+        return IdleSegment.WINDOW_END, _pre_dispatch_cause(sample, seconds, timeline), None
+    if seconds < ending.dispatched:
+        return IdleSegment.PRE_DISPATCH, _pre_dispatch_cause(sample, seconds, timeline), None
+    if ending.granted is None:
+        cause = ArbiterCause.NO_GRANT_UNPRICED if ending.unpriced else ArbiterCause.NO_GRANT
+        return IdleSegment.ARBITER, str(cause), ending.model
+    if seconds < ending.granted:
+        return IdleSegment.ARBITER, str(ArbiterCause.GRANTED), ending.model
+    return IdleSegment.CHILD_LOAD, ending.first_step_kind, ending.model
+
+
+def summarize_idle_attribution(
+    samples: list[dict[str, Any]],
+    epoch_lines: list[str],
+    jobs: list[dict[str, Any]],
+    *,
+    target_duty_percent: float = _DUTY_TARGET,
+) -> IdleAttribution | None:
+    """Place every idle card-second of a stats session's log epoch on the timeline of the job that ended it.
+
+    An idle sample is one with no inference lane in a sampling state, weighted by the gap to the next sample
+    capped at :data:`_IDLE_SAMPLE_WEIGHT_CAP_SECONDS`. Consecutive idle samples form a stretch, which ends at
+    the first sample where a lane samples; every idle sample of the stretch lands on the timeline of the job
+    most recently dispatched on that lane: before its dispatch (named from the sample), dispatch to its sample
+    grant (the arbiter), or grant to its first step (the child loading, split by the first-step kind). A
+    stretch that reaches the window's end has no ending job and is named from its samples alone.
+
+    Args:
+        samples: The session's ``stats_sample`` payloads.
+        epoch_lines: The log epoch the session belongs to.
+        jobs: The session's ``job_completed`` payloads, which pair the log's clock with the stats' and name
+            each job's model.
+        target_duty_percent: The card-busy target the idle seconds are measured against.
+
+    Returns:
+        The attribution over the samples inside the epoch's span, or None when the epoch has no stamped line,
+        no dispatch line names a recorded job, or no sample falls inside the span.
+    """
+    timeline = _read_epoch_timeline(epoch_lines)
+    if timeline is None:
+        return None
+    offset = _host_clock_offset(timeline, jobs)
+    if offset is None:
+        return None
+    window: list[tuple[float, float, dict[str, Any]]] = []
+    for sample in samples:
+        stamp = sample.get("timestamp")
+        if not isinstance(stamp, int | float):
+            continue
+        seconds = float(stamp) + offset
+        if timeline.start <= seconds <= timeline.end:
+            window.append((seconds, float(stamp), sample))
+    if not window:
+        return None
+    window.sort(key=lambda entry: entry[0])
+    weights = [
+        min(_IDLE_SAMPLE_WEIGHT_CAP_SECONDS, max(0.0, window[index + 1][0] - seconds))
+        if index + 1 < len(window)
+        else _LAST_SAMPLE_WEIGHT_SECONDS
+        for index, (seconds, _, _) in enumerate(window)
+    ]
+    sampling = [_sampling_processes(sample) for _, _, sample in window]
+    models = {
+        job["job_id"][:8].lower(): str(job.get("model_name") or _UNKNOWN_MODEL)
+        for job in jobs
+        if isinstance(job.get("job_id"), str)
+    }
+
+    buckets: dict[tuple[IdleSegment, str, str | None], IdleBucket] = {}
+    stretches: list[IdleStretch] = []
+    index = 0
+    while index < len(window):
+        if sampling[index]:
+            index += 1
+            continue
+        stop = index
+        while stop < len(window) and not sampling[stop]:
+            stop += 1
+        ending = _ending_job(sampling[stop], window[stop][0], timeline, models) if stop < len(window) else None
+        segment_seconds: dict[str, float] = {}
+        touched: set[tuple[IdleSegment, str, str | None]] = set()
+        for position in range(index, stop):
+            seconds, _, sample = window[position]
+            weight = weights[position]
+            key = _place_idle_sample(sample, seconds, ending, timeline)
+            bucket = buckets.setdefault(key, IdleBucket(segment=key[0], cause=key[1], model=key[2]))
+            bucket.seconds += weight
+            context = str(timeline.context(seconds))
+            bucket.context_seconds[context] = bucket.context_seconds.get(context, 0.0) + weight
+            segment_seconds[str(key[0])] = segment_seconds.get(str(key[0]), 0.0) + weight
+            touched.add(key)
+        for key in touched:
+            buckets[key].stretches += 1
+        stretches.append(
+            IdleStretch(
+                start_timestamp=window[index][1],
+                idle_seconds=sum(weights[index:stop]),
+                ending_process=ending.process if ending else None,
+                ending_job=ending.job if ending else None,
+                model=ending.model if ending else None,
+                first_step_kind=ending.first_step_kind if ending else None,
+                segment_seconds=segment_seconds,
+            ),
+        )
+        index = stop
+
+    return IdleAttribution(
+        window_seconds=sum(weights),
+        idle_seconds=sum(stretch.idle_seconds for stretch in stretches),
+        target_duty_percent=target_duty_percent,
+        rung_1_runs=len(timeline.runs),
+        rung_2_episodes=len(timeline.residencies),
+        stretches=stretches,
+        buckets=sorted(buckets.values(), key=lambda bucket: bucket.seconds, reverse=True),
+    )
+
+
+def render_idle_attribution(attribution: IdleAttribution | None) -> list[str]:
+    """Render the idle attribution as report lines grouped by segment, cause and model; empty without one."""
+    if attribution is None or attribution.idle_seconds <= 0.0:
+        return []
+    idle = attribution.idle_seconds
+
+    def share(seconds: float) -> str:
+        return f"{seconds:.0f}s ({seconds / idle * 100:.1f}%)"
+
+    def contexts(context_seconds: dict[str, float]) -> str:
+        parts = [
+            f"{context} {context_seconds[context]:.0f}s"
+            for context in map(str, IdleContext)
+            if context in context_seconds
+        ]
+        return "; " + ", ".join(parts) if parts else ""
+
+    out = [
+        f"   idle card-seconds by the next job's timeline: {idle:.0f}s of {attribution.window_seconds:.0f}s "
+        f"({idle / attribution.window_seconds * 100:.1f}%) over {len(attribution.stretches)} stretches, "
+        f"{max(0.0, attribution.seconds_above_target):.0f}s above the {attribution.target_duty_percent:.0f}% "
+        f"card-busy target; rung-1 runs {attribution.rung_1_runs}, rung-2 episodes {attribution.rung_2_episodes}",
+    ]
+    for segment, segment_total in attribution.segment_seconds().items():
+        out.append(f"     {segment}: {share(segment_total)}")
+        by_cause: dict[str, list[IdleBucket]] = {}
+        for bucket in attribution.buckets:
+            if bucket.segment is segment:
+                by_cause.setdefault(bucket.cause, []).append(bucket)
+        for cause, cause_buckets in sorted(by_cause.items(), key=lambda kv: -sum(b.seconds for b in kv[1])):
+            context_seconds: dict[str, float] = {}
+            for bucket in cause_buckets:
+                for context, seconds in bucket.context_seconds.items():
+                    context_seconds[context] = context_seconds.get(context, 0.0) + seconds
+            out.append(f"       {cause}: {share(sum(b.seconds for b in cause_buckets))}{contexts(context_seconds)}")
+            for bucket in [b for b in cause_buckets if b.model is not None][:_RENDERED_MODELS_PER_CAUSE]:
+                out.append(
+                    f"         {bucket.model}: {share(bucket.seconds)} over {bucket.stretches} stretches"
+                    f"{contexts(bucket.context_seconds)}"
+                )
+    return out
+
+
 def _verdict(report: EpochReport) -> str:
     """A one-line plain-language read of the epoch's headline number."""
     mean = report.mean_duty()
@@ -683,17 +1255,26 @@ def run_duty_report(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     log_path = _resolve_log_path(args.logs or args.log or Path("logs/bridge.log"))
     if stats_reports:
         log_lines = _read_log_lines(log_path) if explicit_log and log_path.exists() else []
-        holds = [_clearance_holds_for(report, log_lines) for report in stats_reports]
+        epochs = [_epoch_lines_for(report, log_lines) for report in stats_reports]
+        holds = [summarize_clearance_holds(lines) for lines in epochs]
+        idle = [_idle_attribution_for(report, lines) for report, lines in zip(stats_reports, epochs, strict=True)]
         if args.json:
             payload = [report.to_dict() for report in stats_reports]
             if log_lines:
-                for session_payload, digests in zip(payload, holds, strict=True):
+                for session_payload, digests, attribution in zip(payload, holds, idle, strict=True):
                     session_payload["clearance_holds"] = [asdict(digest) for digest in digests]
+                    session_payload["idle_attribution"] = attribution.to_dict() if attribution else None
             print(json.dumps(payload, indent=2))
             return 0
         blocks = [
-            "\n".join([render_session_duty_report([report]), *render_clearance_hold_digest(digests)])
-            for report, digests in zip(stats_reports, holds, strict=True)
+            "\n".join(
+                [
+                    render_session_duty_report([report]),
+                    *render_clearance_hold_digest(digests),
+                    *render_idle_attribution(attribution),
+                ],
+            )
+            for report, digests, attribution in zip(stats_reports, holds, idle, strict=True)
         ]
         print("\n\n".join(blocks))
         _print_footprints(args)
@@ -729,12 +1310,27 @@ def _read_log_lines(log_path: Path) -> list[str]:
     return log_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
-def _clearance_holds_for(report: SessionDutyReport, log_lines: list[str]) -> list[ClearanceHoldDigest]:
-    """Return the clearance-hold digest from the log epoch the stats session belongs to, empty without one."""
+def _epoch_lines_for(report: SessionDutyReport, log_lines: list[str]) -> list[str]:
+    """Return the log epoch the stats session belongs to, empty without one."""
     started_local = stats_session_local_start(report)
     if not log_lines or started_local is None:
         return []
-    return summarize_clearance_holds(epoch_lines_for_stats_session(log_lines, started_local))
+    return epoch_lines_for_stats_session(log_lines, started_local)
+
+
+def _idle_attribution_for(report: SessionDutyReport, epoch_lines: list[str]) -> IdleAttribution | None:
+    """Return the session's idle attribution over its log epoch, None without an epoch."""
+    if not epoch_lines:
+        return None
+    samples: list[dict[str, Any]] = []
+    jobs: list[dict[str, Any]] = []
+    for payload in read_stats_payloads([Path(source) for source in report.source_files]):
+        event = payload.get("event")
+        if event == "stats_sample" and isinstance(payload.get("sample"), dict):
+            samples.append(payload["sample"])
+        elif event == "job_completed" and isinstance(payload.get("job"), dict):
+            jobs.append(payload["job"])
+    return summarize_idle_attribution(samples, epoch_lines, jobs, target_duty_percent=report.target_duty_percent)
 
 
 def _print_footprints(args: argparse.Namespace) -> None:
