@@ -907,7 +907,9 @@ progress would let a looping remedy hold the wedge clock at zero for as long as 
 The same rule governs the wedge verdict itself. A structural queue deadlock is excused while the scheduler
 is deliberately holding the queue (a whole-card model establishing residency, a heavy head loading, a RAM
 reclaim cycle, backing-off process starts) or while inference is actually running, and every consumer reads
-that one verdict.
+that one verdict. Time under an excuse does not count toward the wedge. When an excuse lifts, or an inference
+slot finishes booting, the structural-wedge minimum is measured again from that moment, because the
+dispatcher's latch keeps its age underneath both and would otherwise read as sustained the tick the hold ends.
 
 Each of those excuses is bounded by its own window, but a window alone is not enough for the whole-card one:
 an establish/restore cycle can re-arm a fresh window faster than the previous one expires, which would leave

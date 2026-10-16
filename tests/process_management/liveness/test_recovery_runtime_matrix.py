@@ -193,7 +193,7 @@ class _RecoveryRuntime:
         self.lifecycle.rebuild_safety_pool = Mock()  # type: ignore[method-assign]
 
         deadlock_snapshot = Mock()
-        deadlock_snapshot.indicates_structural_wedge.side_effect = lambda: self.structural_wedge
+        deadlock_snapshot.indicates_structural_wedge.side_effect = lambda **_: self.structural_wedge
         self.dispatcher.get_deadlock_snapshot = Mock(return_value=deadlock_snapshot)  # type: ignore[method-assign]
 
         supervisor = RecoverySupervisor(

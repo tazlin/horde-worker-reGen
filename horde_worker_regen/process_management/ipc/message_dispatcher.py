@@ -231,7 +231,7 @@ class DeadlockSnapshot:
         """Return whether any deadlock detector is currently active (diagnostics-grade)."""
         return self.in_deadlock or self.in_queue_deadlock
 
-    def indicates_structural_wedge(self, now: float | None = None) -> bool:
+    def indicates_structural_wedge(self, now: float | None = None, *, measured_from: float | None = None) -> bool:
         """Return whether the deadlock state is a genuine, recoverable inference-pool wedge.
 
         Only a *sustained* queue deadlock qualifies: pending inference work exists, every process is
@@ -241,11 +241,19 @@ class DeadlockSnapshot:
         save-our-ship reset, whose give-up budget assumes only definitive signals reach it. The general
         ``in_deadlock`` flag is deliberately excluded too: it also fires for a job legitimately draining
         through the post-inference safety/submit tail during a queue lull.
+
+        Args:
+            now: The time the age is read at; the wall clock when omitted.
+            measured_from: A time before which the caller excused the queue. The age runs from the later of
+                this and the latch's start, because the latch keeps its age under an excuse it does not see.
         """
         if not self.in_queue_deadlock:
             return False
         reference = time.time() if now is None else now
-        return (reference - self.queue_deadlock_started_at) >= _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS
+        started_at = self.queue_deadlock_started_at
+        if measured_from is not None:
+            started_at = max(started_at, measured_from)
+        return (reference - started_at) >= _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS
 
 
 class MessageDispatcher:

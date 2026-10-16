@@ -278,6 +278,8 @@ class WorkerRecoveryCoordinator:
         self.limp_by_active = False
         self.episode_saw_unrecoverable_pool = False
         self._deferring_to_dispatch_hold = False
+        self._wedge_clock_restarted_at: float | None = None
+        self._wedge_assessment_saw_inference_boot = False
         self.episode_progress_baseline: int | None = None
         self.episode_inference_start_baseline: int | None = None
         self.episode_post_processing_progress_baseline: int | None = None
@@ -777,8 +779,18 @@ class WorkerRecoveryCoordinator:
         Every consumer reads this one verdict. The wedge assessment and the give-up that acts on it must not
         diverge: a give-up applying a narrower set of excuses would fault exactly the backlog the scheduler
         is holding for capacity that is about to arrive.
+
+        Time spent under an excuse, or waiting for an inference slot to boot, does not count toward the
+        wedge: the bound is measured again from the moment either ends. The dispatcher's latch keeps its age
+        underneath both, so without the restart the wedge reads as sustained the tick the hold lifts.
         """
-        if not self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge():
+        now = self._clock()
+        inference_booting = self._process_map.num_starting_inference_processes() > 0
+        if self._wedge_assessment_saw_inference_boot and not inference_booting:
+            self._wedge_clock_restarted_at = now
+        self._wedge_assessment_saw_inference_boot = inference_booting
+        snapshot = self._message_dispatcher.get_deadlock_snapshot()
+        if not snapshot.indicates_structural_wedge():
             self._note_dispatch_hold_deferral(False)
             return False
         hold_alive = bool(self._inference_scheduler.dispatch_hold_liveness_active())
@@ -792,6 +804,10 @@ class WorkerRecoveryCoordinator:
             or self._inference_starts_backing_off()
         )
         if queue_held_for_capacity:
+            self._wedge_clock_restarted_at = now
+            return False
+        restarted_at = self._wedge_clock_restarted_at
+        if restarted_at is not None and not snapshot.indicates_structural_wedge(measured_from=restarted_at):
             return False
         return not self._process_map.has_inference_in_progress()
 
