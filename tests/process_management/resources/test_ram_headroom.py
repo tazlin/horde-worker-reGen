@@ -1,5 +1,16 @@
 """RAM threshold ordering, conservation of admitted allocations and marginal load pricing."""
 
+import contextlib
+import mmap
+import multiprocessing
+import sys
+import tempfile
+import time
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import psutil
 import pytest
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.generation_parameters import KNOWN_FACEFIXERS, KNOWN_UPSCALERS
@@ -261,6 +272,175 @@ def test_linux_private_reading_excludes_clean_checkpoint_mappings() -> None:
         == 8200000 * 1024
     )
     assert linux_private_ram_bytes("Rss: 100 kB\n") is None
+
+
+def _write_proc_fixture(root: Path, pid: int, *, status: str, smaps_rollup: str | None) -> None:
+    process_directory = root / str(pid)
+    process_directory.mkdir(parents=True)
+    (process_directory / "status").write_text(status, encoding="utf-8")
+    if smaps_rollup is not None:
+        (process_directory / "smaps_rollup").write_text(smaps_rollup, encoding="utf-8")
+
+
+def test_linux_private_reading_comes_from_the_status_counters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The reading is RssAnon plus RssShmem from the status file; no mapping walk is read."""
+    from horde_worker_regen.utils import private_memory
+
+    process = psutil.Process()
+    _write_proc_fixture(
+        tmp_path,
+        process.pid,
+        status=(
+            "Name:\tpython\nVmRSS:\t28804000 kB\nRssAnon:\t8200000 kB\nRssFile:\t18480000 kB\nRssShmem:\t2124000 kB\n"
+        ),
+        smaps_rollup=None,
+    )
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(private_memory, "_PROC_ROOT", tmp_path)
+
+    assert private_memory.private_ram_usage_bytes(process) == (8200000 + 2124000) * 1024
+
+
+def test_linux_private_reading_falls_back_to_the_walk_without_the_counters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A status file without RssAnon leaves the reading to the smaps_rollup walk."""
+    from horde_worker_regen.utils import private_memory
+
+    process = psutil.Process()
+    _write_proc_fixture(
+        tmp_path,
+        process.pid,
+        status="Name:\tpython\nVmRSS:\t26680000 kB\nRssShmem:\t0 kB\n",
+        smaps_rollup=(
+            "Rss: 26680000 kB\nPrivate_Clean: 18000000 kB\nPrivate_Dirty: 8300000 kB\nAnonymous: 8200000 kB\n"
+        ),
+    )
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(private_memory, "_PROC_ROOT", tmp_path)
+
+    assert private_memory.private_ram_usage_bytes(process) == 8300000 * 1024
+
+
+def _write_checkpoint_file(path: Path, size_bytes: int) -> None:
+    chunk = b"\x5a" * (64 * _MB)
+    with path.open("wb") as checkpoint_file:
+        for _ in range(size_bytes // len(chunk)):
+            checkpoint_file.write(chunk)
+
+
+@contextlib.contextmanager
+def _touched_read_only_mapping(path: Path, size_bytes: int) -> Iterator[mmap.mmap]:
+    """Map a written file read-only and touch every page, as a loaded checkpoint's view is."""
+    # The write buffer is private memory; it is released before the view is read so it does not count against it.
+    _write_checkpoint_file(path, size_bytes)
+    with path.open("rb") as checkpoint_file, mmap.mmap(checkpoint_file.fileno(), 0, access=mmap.ACCESS_READ) as view:
+        _ = view[:: mmap.PAGESIZE]
+        yield view
+
+
+def _write_every_page(buffer: bytearray | mmap.mmap) -> None:
+    buffer[:: mmap.PAGESIZE] = b"\x01" * (len(buffer) // mmap.PAGESIZE)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(sys.platform != "win32", reason="reads the Windows process counters")
+def test_windows_private_reading_matches_the_walk_and_does_not_walk(tmp_path: Path) -> None:
+    """The reading counts written private pages, excludes a read-only file view, and costs a fraction of the walk."""
+    from horde_worker_regen.utils.private_memory import private_ram_usage_bytes
+
+    process = psutil.Process()
+    baseline = private_ram_usage_bytes(process)
+    with _touched_read_only_mapping(tmp_path / "checkpoint.bin", 256 * _MB):
+        after_mapping = private_ram_usage_bytes(process)
+        written = bytearray(256 * _MB)
+        _write_every_page(written)
+        after_writing = private_ram_usage_bytes(process)
+        walk_started = time.perf_counter()
+        unique_set_bytes = process.memory_full_info().uss
+        walk_seconds = time.perf_counter() - walk_started
+        read_seconds: list[float] = []
+        for _ in range(5):
+            read_started = time.perf_counter()
+            private_ram_usage_bytes(process)
+            read_seconds.append(time.perf_counter() - read_started)
+        del written
+
+    assert baseline is not None and after_mapping is not None and after_writing is not None
+    assert after_mapping - baseline < 64 * _MB, "the read-only file view is not private"
+    assert after_writing - after_mapping >= 192 * _MB, "written private pages are counted"
+    assert abs(after_writing - unique_set_bytes) <= 128 * _MB
+    assert min(read_seconds) < 0.001
+    assert walk_seconds > min(read_seconds)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(sys.platform != "win32", reason="the Windows walk is the one that holds the GIL")
+def test_peak_sampler_does_not_hold_the_main_thread(tmp_path: Path) -> None:
+    """A sampler polling every 10 ms beside a 2 GB mapped working set leaves the main thread running."""
+    from horde_worker_regen.utils.private_memory import PrivateRamPeakSampler
+
+    longest_gap_seconds = 0.0
+    with (
+        _touched_read_only_mapping(tmp_path / "checkpoint.bin", 2048 * _MB),
+        PrivateRamPeakSampler(interval_seconds=0.01) as sampler,
+    ):
+        last = time.perf_counter()
+        deadline = last + 1.0
+        while last < deadline:
+            now = time.perf_counter()
+            longest_gap_seconds = max(longest_gap_seconds, now - last)
+            last = now
+
+    assert sampler.peak_bytes is not None
+    assert longest_gap_seconds < 0.02
+
+
+def _measure_linux_private_readings(directory: str) -> tuple[int | None, int | None, int | None, int | None]:
+    """Return the reading at baseline, after a read-only file view, after anonymous and shmem writes, and the walk."""
+    from horde_worker_regen.utils.private_memory import linux_private_ram_bytes, private_ram_usage_bytes
+
+    process = psutil.Process()
+    baseline = private_ram_usage_bytes(process)
+    with _touched_read_only_mapping(Path(directory) / "checkpoint.bin", 256 * _MB):
+        after_mapping = private_ram_usage_bytes(process)
+        written = bytearray(256 * _MB)
+        _write_every_page(written)
+        with tempfile.TemporaryFile(dir="/dev/shm") as shmem_file:
+            shmem_file.truncate(64 * _MB)
+            with mmap.mmap(shmem_file.fileno(), 64 * _MB) as shmem_view:
+                _write_every_page(shmem_view)
+                after_writing = private_ram_usage_bytes(process)
+                walk = linux_private_ram_bytes(
+                    Path(f"/proc/{process.pid}/smaps_rollup").read_text(encoding="utf-8"),
+                )
+        del written
+    return baseline, after_mapping, after_writing, walk
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(sys.platform != "linux", reason="reads /proc and /dev/shm")
+def test_linux_private_reading_keeps_the_walks_meaning(tmp_path: Path) -> None:
+    """In a spawned child the status counters equal the smaps_rollup walk within 4 MB.
+
+    Shmem pages (which is what pinned CUDA host memory is under WSL2) are counted beside anonymous pages, since the
+    walk counts them through Private_Dirty, and a touched read-only file view is excluded. A spawned child shares
+    no anonymous pages, which is the condition under which the two readings agree.
+    """
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as executor:
+        baseline, after_mapping, after_writing, walk = executor.submit(
+            _measure_linux_private_readings,
+            str(tmp_path),
+        ).result(timeout=120)
+
+    assert baseline is not None and after_mapping is not None and after_writing is not None and walk is not None
+    assert after_mapping - baseline < 64 * _MB, "the read-only file view is not private"
+    assert after_writing - after_mapping >= 256 * _MB, "anonymous and shmem writes are counted"
+    assert abs(after_writing - walk) <= 4 * _MB
 
 
 def test_peak_sampler_keeps_the_highest_reading(monkeypatch: pytest.MonkeyPatch) -> None:

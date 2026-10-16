@@ -242,10 +242,13 @@ the job's features, in place of the retained-page credit and its 3,500 MB floor.
 trusted the credit applies. Only swap evidence prices a swap: a cold load's growth says nothing about
 how much of the retained pages a swap reuses.
 
-Children report RSS for the dashboard and private bytes for reclaim and restore. On Linux, the
-anonymous/private-dirty reading excludes reclaimable clean checkpoint mappings; USS alone would
-still charge those mappings if no other process shares them. Other platforms use USS. Platforms
-without a private reading fall back to RSS. The effective process ceiling is the larger of the
+Children report RSS for the dashboard and private bytes for reclaim and restore. The private reading
+is the kernel's counter of private resident pages, which excludes reclaimable clean checkpoint
+mappings: `RssAnon + RssShmem` from `/proc/<pid>/status` on Linux and `PrivateWorkingSetSize` on
+Windows. A walk of the process's pages gives the same figure (the `smaps_rollup` anonymous or
+private-dirty maximum on Linux, USS elsewhere) but its cost scales with the working set and on
+Windows it holds the GIL throughout, so it is only the fallback when the counter is unavailable.
+Other platforms use USS. Platforms without a private reading fall back to RSS. The effective process ceiling is the larger of the
 configured ceiling and the largest offered context seed plus ten percent and a cold-child allowance.
 Config load warns about a configured ceiling below an offered seed. The same model-aware ceiling
 protects the idle creep path. Below the hard floor, idle models and contexts are shed before a busy

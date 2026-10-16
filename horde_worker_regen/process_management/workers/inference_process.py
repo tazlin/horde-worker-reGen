@@ -1202,9 +1202,9 @@ class HordeInferenceProcess(HordeProcess):
             if not self._first_step_report_sent:
                 self._first_step_report_sent = True
                 # The report runs on the sampler thread between the first and second steps. Its device reads
-                # do not synchronise the stream, but the private-RAM read walks the process's mappings, which
-                # on Linux grows with the checkpoints mapped into the process. The cost lands in the second
-                # step's rate sample, so it is timed here.
+                # do not synchronise the stream, and the private-RAM read is a kernel counter, but a fallback
+                # walk of the process's pages grows with the checkpoints mapped into it. The cost lands in the
+                # second step's rate sample, so it is timed here.
                 report_started_at = time.perf_counter()
                 self._send_inference_memory_report()
                 logger.debug(
