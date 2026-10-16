@@ -3545,9 +3545,9 @@ class InferenceScheduler:
                     },
                 )
                 continue
-            if (
-                model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
-            ) and not self._residency_can_never_converge(device_index, state, now=now):
+            serving = model in active_models or self._job_tracker.has_exclusive_job_in_progress(device_index)
+            never_converges = serving and self._residency_can_never_converge(device_index, state, now=now)
+            if serving and not never_converges:
                 # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
                 # back-to-back heavy jobs).
                 if not retention_ended:
@@ -3568,6 +3568,8 @@ class InferenceScheduler:
                     message=f"Dominant-model run for {model} ended: its jobs drained.",
                     log_level="DEBUG",
                 )
+                if never_converges and model is not None:
+                    self._job_tracker.release_pending_exclusive_admits(model, device_index=device_index)
                 continue
             # A ready head for a different model may cut the cooldown short, but not before the residency has
             # held long enough to amortize the teardown and the regrowth the release itself will pay for;
@@ -3597,6 +3599,10 @@ class InferenceScheduler:
                 now=granted_at,
                 restore_grace_seconds=WHOLE_CARD_RESTORE_GRACE_SECONDS,
             )
+            if never_converges and model is not None:
+                # The pending exclusive admits for this model claimed the card for this residency. Left marked
+                # after its release, they would keep declining every other head's preload with nothing to protect.
+                self._job_tracker.release_pending_exclusive_admits(model, device_index=device_index)
             self._min_hold_disclosed.pop(device_index, None)
             if self._reclaim_ladder is not None:
                 self._reclaim_ladder.discharge_context_reduction(device_index)

@@ -443,8 +443,9 @@ work has lost every route to the card. A held model that is staged and resident 
 nothing loading it and no exclusive job of its own in flight, while the undispatched head is a different
 model, can neither converge nor drain: the preload pass serves the head, and the head is barred by this very
 residency. Such a residency releases through the normal restore path instead of being retained by its queued
-work. The no-holder reading is only trusted past the establish grace, since a residency legitimately has no
-holder for as long as its pre-stage preload takes to land.
+work, and the pending exclusive admits for its model lose their mark with it, since the claim they held on the
+card was for that residency. The no-holder reading is only trusted past the establish grace, since a residency
+legitimately has no holder for as long as its pre-stage preload takes to land.
 
 The dispatch gate releases the head either on a live free-VRAM reading that genuinely holds the weights, or,
 once the bounded drain window is spent, on the forecast's sole-residency guarantee. That guarantee is sized

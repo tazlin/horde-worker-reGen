@@ -2445,6 +2445,28 @@ class JobTracker:
             tracked.admitted_exclusive = True
             tracked.admitted_exclusive_device_index = device_index
 
+    def release_pending_exclusive_admits(self, model: str, *, device_index: int | None) -> None:
+        """Clear the exclusive mark of every pending admit for ``model`` planned for ``device_index``.
+
+        Called when that card's residency for ``model`` is released as unable to converge. The pending admits'
+        claim on the card was for that residency, and left in place it keeps declining every other head's
+        preload with nothing on the card to protect. A job already in progress keeps the mark, since its
+        footprint is on the card; a pending job is marked again if it later claims the card.
+
+        Args:
+            model: The released residency's model.
+            device_index: The released residency's card, or None for the worker-wide card.
+        """
+        for tracked in self._jobs.values():
+            if (
+                tracked.admitted_exclusive
+                and tracked.stage is JobStage.PENDING_INFERENCE
+                and tracked.sdk_api_job_info.model == model
+                and tracked.admitted_exclusive_device_index == device_index
+            ):
+                tracked.admitted_exclusive = False
+                tracked.admitted_exclusive_device_index = None
+
     def is_admitted_exclusive(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether this job was admitted to run exclusively (over-budget, device to itself)."""
         tracked = self._tracked_for(job)

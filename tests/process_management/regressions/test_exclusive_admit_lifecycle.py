@@ -19,6 +19,7 @@ triage tooling and operators read, not the configured mode.
 
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock
 
 from loguru import logger
@@ -171,6 +172,52 @@ class TestExclusivePreloadGate:
         plan = decide_preload_gates(scheduler.snapshot(), job_id, head_job_id=job_id, loaded_models=frozenset())
 
         assert plan.decision is not AdmissionDecision.EXCLUSIVE_IN_PROGRESS
+
+
+class TestNeverConvergeReleaseClearsPendingAdmits:
+    """A residency released as unable to converge takes the pending exclusive claims for its model with it."""
+
+    async def test_other_model_head_preload_admitted_after_release(self, job_tracker: JobTracker) -> None:
+        """The other-model head may stage once the residency its blocker was waiting on is released.
+
+        The pending admit's claim on the card was for that residency. Left marked, it keeps declining every
+        other head's preload with nothing on the card to protect, so the queue can neither drain nor converge.
+        """
+        scheduler = _make_scheduler(job_tracker)
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=2)
+        head_job = make_job_pop_response(model=_SIBLING_MODEL)
+        await job_tracker.record_popped_job(head_job)
+        heavy_job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(heavy_job)
+        job_tracker.mark_admitted_over_budget(heavy_job)
+        job_tracker.mark_admitted_exclusive(heavy_job, device_index=None)
+        scheduler._whole_card_ledger.record_grant(
+            None,
+            model=_CARD_DEMANDING_MODEL,
+            forecast=None,
+            cooldown_until=0.0,
+            now=time.time() - 600.0,
+        )
+
+        scheduler._restore_siblings_after_whole_card()
+
+        assert scheduler._whole_card_ledger.state_for(None).model is None
+        job_id = str(head_job.id_)
+        plan = decide_preload_gates(scheduler.snapshot(), job_id, head_job_id=job_id, loaded_models=frozenset())
+        assert plan.decision is not AdmissionDecision.EXCLUSIVE_IN_PROGRESS
+        assert job_tracker.is_admitted_exclusive(heavy_job) is False
+
+    async def test_in_progress_admit_keeps_its_mark(self, job_tracker: JobTracker) -> None:
+        """Only pending admits lose the mark: a sampling job's footprint is on the card whatever the ledger says."""
+        running_job = await _exclusive_job_in_progress(job_tracker)
+        pending_job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(pending_job)
+        job_tracker.mark_admitted_exclusive(pending_job)
+
+        job_tracker.release_pending_exclusive_admits(_CARD_DEMANDING_MODEL, device_index=None)
+
+        assert job_tracker.is_admitted_exclusive(running_job) is True
+        assert job_tracker.is_admitted_exclusive(pending_job) is False
 
 
 class TestOverbudgetAdmitLogContract:
