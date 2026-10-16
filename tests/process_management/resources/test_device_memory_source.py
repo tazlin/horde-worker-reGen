@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
+
 import pytest
 
 from horde_worker_regen.process_management.resources.device_memory_source import (
+    DeviceMemoryReading,
     DeviceMemorySourceKind,
     ReadingProvenance,
     adapter_counter_reading,
@@ -222,3 +226,47 @@ def test_an_nvml_reading_is_device_wide() -> None:
 
     assert reading.source is DeviceMemorySourceKind.NVML
     assert reading.is_device_wide
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda: nvml_reading(free_mb=9000.0, total_mb=16376.0), id="nvml"),
+        pytest.param(lambda: adapter_counter_reading(dedicated_used_mb=7071.0, total_mb=16375.0), id="adapter"),
+        pytest.param(
+            lambda: child_reported_reading(
+                reported_free_mb=11000.0, reported_total_mb=16375.0, committed_mb=0.0, platform="linux"
+            ),
+            id="child_report",
+        ),
+    ],
+)
+def test_a_reading_carries_the_monotonic_time_it_was_taken(build: Callable[[], DeviceMemoryReading | None]) -> None:
+    """Every source stamps its reading with ``time.monotonic()`` at construction, the clock children share."""
+    before = time.monotonic()
+    reading = build()
+    after = time.monotonic()
+
+    assert reading is not None
+    assert before <= reading.measured_at <= after
+
+
+def test_readings_with_equal_figures_compare_equal_whatever_their_time() -> None:
+    """The measurement time is not part of a reading's value, so equal figures still compare and hash equal."""
+    earlier = DeviceMemoryReading(
+        free_mb=9000.0,
+        total_mb=16376.0,
+        source=DeviceMemorySourceKind.NVML,
+        provenance=ReadingProvenance.DEVICE_WIDE,
+        measured_at=1.0,
+    )
+    later = DeviceMemoryReading(
+        free_mb=9000.0,
+        total_mb=16376.0,
+        source=DeviceMemorySourceKind.NVML,
+        provenance=ReadingProvenance.DEVICE_WIDE,
+        measured_at=2.0,
+    )
+
+    assert earlier == later
+    assert hash(earlier) == hash(later)

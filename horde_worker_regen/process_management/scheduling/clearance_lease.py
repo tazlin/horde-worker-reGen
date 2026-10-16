@@ -117,6 +117,11 @@ class ClearanceLeaseProxy:
     cleared in the same step each get the reading less what the children cleared before them take of it, since
     each child sizes its load to the figure it is handed.
 
+    The figure travels with the ``time.monotonic()`` of the reading behind it, in a shared float written and
+    rewritten with it and served once through :meth:`take_cleared_device_free_measured_at`. The child releases
+    its text encoder between that reading and its acquire, and only the time tells it whether the figure
+    counts the encoder. A figure with no reading carries no time. The parent does not decide anything on it.
+
     A grant also carries the activation reserve the parent priced the window's non-weight memory at
     (:func:`~horde_worker_regen.process_management.scheduling.admission.pricing.sampling_reserve_mb`), in a
     second shared figure written beside the first. ComfyUI sizes a partial load to leave only its own activation
@@ -148,6 +153,8 @@ class ClearanceLeaseProxy:
         staged_device_free: _SharedFigure | None = None,
         cleared_sampling_reserve: _SharedFigure | None = None,
         staged_sampling_reserve: _SharedFigure | None = None,
+        cleared_device_free_at: _SharedFigure | None = None,
+        staged_device_free_at: _SharedFigure | None = None,
     ) -> None:
         """Wrap the parent-created clearance and done semaphores, and the stage semaphore when there is one.
 
@@ -167,19 +174,28 @@ class ClearanceLeaseProxy:
                 activation reserve (MB) before each grant, NaN when it priced none. None carries no reserve.
             staged_sampling_reserve: The stage grant's reserve, set the way ``cleared_sampling_reserve`` is. None
                 carries no reserve with any stage grant.
+            cleared_device_free_at: A parent-created shared float the parent sets to the ``time.monotonic()`` of
+                the reading behind ``cleared_device_free``, NaN when there is no figure or no time. None carries no
+                time with any grant.
+            staged_device_free_at: The stage grant's measurement time, set the way ``cleared_device_free_at`` is.
+                None carries no time with any stage grant.
         """
         self._clearance = clearance
         self._done = done
         self._cleared_device_free = cleared_device_free
+        self._cleared_device_free_at = cleared_device_free_at
         self._cleared_sampling_reserve = cleared_sampling_reserve
         self._grant_consumed = False
         self._granted_device_free_mb: float | None = None
+        self._granted_device_free_measured_at: float | None = None
         self._granted_sampling_reserve_mb: float | None = None
         self._stage = stage
         self._staged_device_free = staged_device_free
+        self._staged_device_free_at = staged_device_free_at
         self._staged_sampling_reserve = staged_sampling_reserve
         self._stage_consumed = False
         self._stage_granted_device_free_mb: float | None = None
+        self._stage_granted_device_free_measured_at: float | None = None
         self._stage_granted_sampling_reserve_mb: float | None = None
         self._stage_lease = ClearanceStageLease(self) if stage is not None else None
 
@@ -209,6 +225,7 @@ class ClearanceLeaseProxy:
         self._grant_consumed = True
         if acquired:
             self._granted_device_free_mb = self._read_cleared_device_free_mb()
+            self._granted_device_free_measured_at = _read_shared_figure(self._cleared_device_free_at)
             self._granted_sampling_reserve_mb = _read_shared_figure(self._cleared_sampling_reserve)
         return acquired
 
@@ -259,6 +276,16 @@ class ClearanceLeaseProxy:
         self._granted_device_free_mb = None
         return figure
 
+    def take_cleared_device_free_measured_at(self) -> float | None:
+        """Return the parent's ``time.monotonic()`` when the reading behind this grant's figure was taken, once.
+
+        Set and cleared by the same rules as :meth:`take_cleared_device_free_mb`, and read apart from it. None
+        when that figure would be None, or the parent had no time for the reading.
+        """
+        measured_at = self._granted_device_free_measured_at
+        self._granted_device_free_measured_at = None
+        return measured_at
+
     def take_cleared_sampling_reserve_mb(self) -> float | None:
         """Return the activation reserve (MB) the parent priced this child's grant with, once.
 
@@ -294,13 +321,17 @@ class ClearanceLeaseProxy:
         """
         self._grant_consumed = False
         self._granted_device_free_mb = None
+        self._granted_device_free_measured_at = None
         self._granted_sampling_reserve_mb = None
         _unset_shared_figure(self._cleared_device_free)
+        _unset_shared_figure(self._cleared_device_free_at)
         _unset_shared_figure(self._cleared_sampling_reserve)
         self._stage_consumed = False
         self._stage_granted_device_free_mb = None
+        self._stage_granted_device_free_measured_at = None
         self._stage_granted_sampling_reserve_mb = None
         _unset_shared_figure(self._staged_device_free)
+        _unset_shared_figure(self._staged_device_free_at)
         _unset_shared_figure(self._staged_sampling_reserve)
 
     def _read_cleared_device_free_mb(self) -> float | None:
@@ -322,6 +353,7 @@ class ClearanceLeaseProxy:
         self._stage_consumed = True
         if acquired:
             self._stage_granted_device_free_mb = _read_shared_figure(self._staged_device_free)
+            self._stage_granted_device_free_measured_at = _read_shared_figure(self._staged_device_free_at)
             self._stage_granted_sampling_reserve_mb = _read_shared_figure(self._staged_sampling_reserve)
         return acquired
 
@@ -331,23 +363,37 @@ class ClearanceLeaseProxy:
         self._stage_granted_device_free_mb = None
         return figure
 
+    def _take_staged_device_free_measured_at(self) -> float | None:
+        """Child-side: return the stage grant's measurement time once, then clear it."""
+        measured_at = self._stage_granted_device_free_measured_at
+        self._stage_granted_device_free_measured_at = None
+        return measured_at
+
     def _take_staged_sampling_reserve_mb(self) -> float | None:
         """Child-side: return the stage grant's activation reserve once, then clear it."""
         figure = self._stage_granted_sampling_reserve_mb
         self._stage_granted_sampling_reserve_mb = None
         return figure
 
-    def _parent_grant(self, *, device_free_mb: float | None, sampling_reserve_mb: float | None = None) -> None:
+    def _parent_grant(
+        self,
+        *,
+        device_free_mb: float | None,
+        sampling_reserve_mb: float | None = None,
+        device_free_measured_at: float | None = None,
+    ) -> None:
         """Parent-side: release one clearance permit to grant this child a load-and-sample window.
 
-        The admitted device free and the priced activation reserve are written before the release, so the
-        child's acquire, which returns only after the release, reads this grant's figures.
+        The admitted device free, its measurement time and the priced activation reserve are written before the
+        release, so the child's acquire, which returns only after the release, reads this grant's figures. A
+        grant with no device free carries no time.
 
         A bounded clearance semaphore raises ``ValueError`` if a permit is already available (a prior grant
         the child has not consumed), which the controller treats as already-cleared. The figures are still
         replaced, since they are the newer admission of the same child's waiting job.
         """
         _write_shared_figure(self._cleared_device_free, device_free_mb)
+        _write_shared_figure(self._cleared_device_free_at, _figure_time(device_free_mb, device_free_measured_at))
         _write_shared_figure(self._cleared_sampling_reserve, sampling_reserve_mb)
         self._clearance.release()
 
@@ -356,6 +402,7 @@ class ClearanceLeaseProxy:
         *,
         device_free_mb: float,
         sampling_reserve_mb: float | None,
+        device_free_measured_at: float | None = None,
     ) -> GrantFigureRefresh:
         """Parent-side: rewrite the figures of a grant the child has not consumed, returning what the write did.
 
@@ -377,6 +424,7 @@ class ClearanceLeaseProxy:
                 and _read_shared_figure(self._cleared_sampling_reserve) is None
             )
             self._cleared_device_free.value = device_free_mb
+            _write_shared_figure(self._cleared_device_free_at, device_free_measured_at)
             _write_shared_figure(self._cleared_sampling_reserve, sampling_reserve_mb)
         finally:
             self._clearance.release()
@@ -388,7 +436,13 @@ class ClearanceLeaseProxy:
         """Parent-side: non-blockingly take back a granted permit the child never consumed; return whether one was."""
         return bool(self._clearance.acquire(False))
 
-    def _parent_grant_stage(self, *, device_free_mb: float | None, sampling_reserve_mb: float | None = None) -> None:
+    def _parent_grant_stage(
+        self,
+        *,
+        device_free_mb: float | None,
+        sampling_reserve_mb: float | None = None,
+        device_free_measured_at: float | None = None,
+    ) -> None:
         """Parent-side: release the stage permit so the child may upload its weights ahead of its sample window.
 
         The figures are written before the release, as :meth:`_parent_grant` writes its own. A bounded stage
@@ -399,10 +453,17 @@ class ClearanceLeaseProxy:
         if self._stage is None:
             raise ValueError("this proxy carries no stage permit")
         _write_shared_figure(self._staged_device_free, device_free_mb)
+        _write_shared_figure(self._staged_device_free_at, _figure_time(device_free_mb, device_free_measured_at))
         _write_shared_figure(self._staged_sampling_reserve, sampling_reserve_mb)
         self._stage.release()
 
-    def _parent_refresh_stage_figure(self, *, device_free_mb: float, sampling_reserve_mb: float | None) -> bool:
+    def _parent_refresh_stage_figure(
+        self,
+        *,
+        device_free_mb: float,
+        sampling_reserve_mb: float | None,
+        device_free_measured_at: float | None = None,
+    ) -> bool:
         """Parent-side: rewrite an unconsumed stage grant's figures, as :meth:`_parent_refresh_grant_figure` does."""
         if self._stage is None or self._staged_device_free is None:
             return False
@@ -410,6 +471,7 @@ class ClearanceLeaseProxy:
             return False
         try:
             self._staged_device_free.value = device_free_mb
+            _write_shared_figure(self._staged_device_free_at, device_free_measured_at)
             _write_shared_figure(self._staged_sampling_reserve, sampling_reserve_mb)
         finally:
             self._stage.release()
@@ -448,13 +510,18 @@ def _unset_shared_figure(shared_figure: _SharedFigure | None) -> None:
     _write_shared_figure(shared_figure, None)
 
 
+def _figure_time(device_free_mb: float | None, measured_at: float | None) -> float | None:
+    """Return the measurement time a grant's device free carries, which is None when the grant has no figure."""
+    return None if device_free_mb is None else measured_at
+
+
 class ClearanceStageLease:
     """The child-side stage lease: block on the parent's stage grant before uploading the weights.
 
     A view over one :class:`ClearanceLeaseProxy`, which owns the permit and its per-job state, registered with
-    hordelib as its stage lease. It satisfies hordelib's ``SamplingLease``, ``ClearanceTruthLease`` and
-    ``ClearanceReserveLease`` protocols. The parent reconciles a stage grant by job correlation, so
-    :meth:`release` signals nothing.
+    hordelib as its stage lease. It satisfies hordelib's ``SamplingLease``, ``ClearanceTruthLease``,
+    ``ClearanceFigureTimeLease`` and ``ClearanceReserveLease`` protocols. The parent reconciles a stage grant by
+    job correlation, so :meth:`release` signals nothing.
     """
 
     def __init__(self, proxy: ClearanceLeaseProxy) -> None:
@@ -479,6 +546,13 @@ class ClearanceStageLease:
         None when the last stage acquire timed out or passed through, or the parent had no reading.
         """
         return self._proxy._take_staged_device_free_mb()
+
+    def take_cleared_device_free_measured_at(self) -> float | None:
+        """Return the parent's ``time.monotonic()`` when the reading behind this stage grant's figure was taken, once.
+
+        None when :meth:`take_cleared_device_free_mb` would be None, or the parent had no time for the reading.
+        """
+        return self._proxy._take_staged_device_free_measured_at()
 
     def take_cleared_sampling_reserve_mb(self) -> float | None:
         """Return the activation reserve (MB) the parent priced this child's stage grant with, once.
@@ -600,6 +674,9 @@ class ClearanceInputs:
     """The configured VRAM reserve (MB) held back from admission."""
     paging_active: bool
     """Whether the parent's WDDM demand-paging detector is flagging this worker's allocations."""
+    device_free_measured_at: float | None = None
+    """``time.monotonic()`` when the reading behind ``device_free_mb`` was taken, or None when unknown. It goes
+    to the child with every grant of the figure. Nothing here decides on it."""
     device_free_is_device_wide: bool = True
     """Whether ``device_free_mb`` covers every tenant of the card. The tail-overlap handoff spends measured
     headroom on the strength of the figure alone, so it is offered only on a device-wide one. The figure is
@@ -957,7 +1034,11 @@ class ClearanceController:
         self._reconcile_grants(inputs)
         self._prune_tail_dedup(inputs)
         sampling_reserve_by_pid = {waiter.process_id: waiter.sampling_reserve_mb for waiter in inputs.staged_waiters}
-        self._refresh_unconsumed_grant_figures(inputs.device_free_mb, sampling_reserve_by_pid)
+        self._refresh_unconsumed_grant_figures(
+            inputs.device_free_mb,
+            inputs.device_free_measured_at,
+            sampling_reserve_by_pid,
+        )
 
         # Only children the controller holds IDLE or STAGED are clearable; a cleared-but-not-yet-sampling child
         # is still reported as a primed waiter by the scheduler snapshot, so filter it out here rather than let a
@@ -1000,6 +1081,7 @@ class ClearanceController:
                     process_id,
                     job_id_by_pid.get(process_id),
                     device_free_mb=device_free_mb,
+                    device_free_measured_at=inputs.device_free_measured_at,
                     sampling_reserve_mb=sampling_reserve_by_pid.get(process_id),
                 ):
                     cleared.append(process_id)
@@ -1052,6 +1134,7 @@ class ClearanceController:
                 head.process_id,
                 job_id_by_pid.get(head.process_id),
                 device_free_mb=inputs.device_free_mb,
+                device_free_measured_at=inputs.device_free_measured_at,
                 sampling_reserve_mb=head.sampling_reserve_mb,
             )
             self._stage_refusal_diagnostics.forget(_STAGE_REFUSAL_DIAGNOSTIC)
@@ -1079,17 +1162,23 @@ class ClearanceController:
         *,
         device_free_mb: float | None,
         sampling_reserve_mb: float | None = None,
+        device_free_measured_at: float | None = None,
     ) -> bool:
         """Release one child's stage permit so its weights may land ahead of its sample window. Returns success.
 
         Records the job the grant is issued for, so a staged grant retires by the same job correlation as a
-        cleared one. ``device_free_mb`` and ``sampling_reserve_mb`` carry the same meaning as in :meth:`_clear`.
+        cleared one. ``device_free_mb``, ``device_free_measured_at`` and ``sampling_reserve_mb`` carry the same
+        meaning as in :meth:`_clear`.
         """
         proxy = self._proxies.get(process_id)
         if proxy is None or proxy.stage_lease is None:
             return False
         try:
-            proxy._parent_grant_stage(device_free_mb=device_free_mb, sampling_reserve_mb=sampling_reserve_mb)
+            proxy._parent_grant_stage(
+                device_free_mb=device_free_mb,
+                sampling_reserve_mb=sampling_reserve_mb,
+                device_free_measured_at=device_free_measured_at,
+            )
         except ValueError:
             # The stage permit is already available (one the child has not consumed); treat it as staged.
             self._grant_state[process_id] = GrantState.STAGED
@@ -1113,6 +1202,7 @@ class ClearanceController:
         *,
         device_free_mb: float | None,
         sampling_reserve_mb: float | None = None,
+        device_free_measured_at: float | None = None,
     ) -> bool:
         """Release one child's clearance permit exactly once, guarding a double clear. Returns success.
 
@@ -1127,6 +1217,9 @@ class ClearanceController:
         ``sampling_reserve_mb`` is the non-weight memory the job's window is priced with, written beside the
         device free on both permits so the child's partial load leaves that room. None writes no reserve.
 
+        ``device_free_measured_at`` is the time of the reading behind ``device_free_mb``, written beside it on both
+        permits.
+
         An idle child with a stage permit is granted it in the same clear, so a single clear lets the child
         stage and sample without a second wait; a staged child already holds its stage permit and is granted
         only the sample permit. A stage permit already available is left as it is.
@@ -1136,7 +1229,11 @@ class ClearanceController:
             return False
         if self._grant_state.get(process_id, GrantState.IDLE) is GrantState.IDLE and proxy.stage_lease is not None:
             try:
-                proxy._parent_grant_stage(device_free_mb=device_free_mb, sampling_reserve_mb=sampling_reserve_mb)
+                proxy._parent_grant_stage(
+                    device_free_mb=device_free_mb,
+                    sampling_reserve_mb=sampling_reserve_mb,
+                    device_free_measured_at=device_free_measured_at,
+                )
             except ValueError:
                 # The stage permit is already available (one the child has not consumed); the child takes it.
                 logger.debug(
@@ -1144,7 +1241,11 @@ class ClearanceController:
                     f"unconsumed stage permit.",
                 )
         try:
-            proxy._parent_grant(device_free_mb=device_free_mb, sampling_reserve_mb=sampling_reserve_mb)
+            proxy._parent_grant(
+                device_free_mb=device_free_mb,
+                sampling_reserve_mb=sampling_reserve_mb,
+                device_free_measured_at=device_free_measured_at,
+            )
         except ValueError:
             # The child's clearance permit is already available (a prior grant it has not consumed, e.g. the
             # degraded timeout path). The bounded semaphore caps it at one, so treat it as already cleared.
@@ -1165,6 +1266,7 @@ class ClearanceController:
     def _refresh_unconsumed_grant_figures(
         self,
         device_free_mb: float | None,
+        device_free_measured_at: float | None,
         sampling_reserve_by_pid: Mapping[int, float | None],
     ) -> None:
         """Rewrite every cleared child's grant figures from this step's reading until the child consumes them.
@@ -1172,7 +1274,8 @@ class ClearanceController:
         Between the grant and the child's sample call the child releases its encoder to host RAM and siblings
         unload, so the figure frozen at the grant tick understates the card the child loads into. A step with no
         reading leaves the last figures in place. A staged child's stage figures are refreshed the same way, and
-        a cleared child's stage figures too while the stage permit is untaken.
+        a cleared child's stage figures too while the stage permit is untaken. Each rewrite carries the reading's
+        time beside the figure.
 
         The reserve is rewritten beside the device free from the child's staged waiter, which the snapshot keeps
         until the child reports sampling. The parent may grant before the child's job start, which unsets both
@@ -1188,12 +1291,17 @@ class ClearanceController:
             if proxy is None:
                 continue
             sampling_reserve_mb = sampling_reserve_by_pid.get(process_id)
-            proxy._parent_refresh_stage_figure(device_free_mb=device_free_mb, sampling_reserve_mb=sampling_reserve_mb)
+            proxy._parent_refresh_stage_figure(
+                device_free_mb=device_free_mb,
+                sampling_reserve_mb=sampling_reserve_mb,
+                device_free_measured_at=device_free_measured_at,
+            )
             if state is not GrantState.CLEARED:
                 continue
             refresh = proxy._parent_refresh_grant_figure(
                 device_free_mb=device_free_mb,
                 sampling_reserve_mb=sampling_reserve_mb,
+                device_free_measured_at=device_free_measured_at,
             )
             if refresh is GrantFigureRefresh.RESERVE_RESTORED:
                 self._reserves_restored_after_job_start += 1

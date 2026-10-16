@@ -258,11 +258,13 @@ def _inputs(
     paging: bool = False,
     load_seconds: float | None = _LOAD_SECONDS,
     device_wide: bool = True,
+    measured_at: float | None = None,
 ) -> ClearanceInputs:
     return ClearanceInputs(
         staged_waiters=staged,
         active_grants=active,
         device_free_mb=device_free_mb,
+        device_free_measured_at=measured_at,
         device_free_is_device_wide=device_wide,
         vram_reserve_mb=reserve_mb,
         paging_active=paging,
@@ -475,6 +477,8 @@ class _StubProxy(ClearanceLeaseProxy):
         cleared_device_free: Synchronized[float] | None = None,
         with_stage: bool = False,
         staged_device_free: Synchronized[float] | None = None,
+        cleared_device_free_at: Synchronized[float] | None = None,
+        staged_device_free_at: Synchronized[float] | None = None,
     ) -> None:
         super().__init__(
             clearance=_held_empty_clearance(),
@@ -482,6 +486,8 @@ class _StubProxy(ClearanceLeaseProxy):
             cleared_device_free=cleared_device_free,
             stage=_held_empty_clearance() if with_stage else None,
             staged_device_free=staged_device_free,
+            cleared_device_free_at=cleared_device_free_at,
+            staged_device_free_at=staged_device_free_at,
         )
 
     @property
@@ -1005,6 +1011,199 @@ class TestGrantCarriesClearanceTruth:
         assert result.cleared_process_ids == (3,)
         assert cleared.acquire(True, 0.0) is True
         assert cleared.take_cleared_device_free_mb() == 18_000.0
+
+
+def _timed_proxy(*, with_stage: bool = False) -> _StubProxy:
+    """A proxy carrying every figure the spawn site creates, the measurement times included."""
+    return _StubProxy(
+        cleared_device_free=_shared_figure(),
+        cleared_device_free_at=_shared_figure(),
+        with_stage=with_stage,
+        staged_device_free=_shared_figure() if with_stage else None,
+        staged_device_free_at=_shared_figure() if with_stage else None,
+    )
+
+
+class TestGrantCarriesMeasurementTime:
+    """A grant's device-free figure travels with the monotonic time its reading was taken, read once like it."""
+
+    def test_the_child_reads_the_reading_time_once(self) -> None:
+        """The cleared child takes the time of the reading its figure came from, then None."""
+        controller = _controller()
+        proxy = _timed_proxy()
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0, measured_at=1_234.5), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_measured_at() == 1_234.5
+        assert proxy.take_cleared_device_free_measured_at() is None, "the time is handed over once per grant"
+        assert proxy.take_cleared_device_free_mb() == 13_500.0, "taking the time leaves the figure to its own read"
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_measured_at() is None, "a passed-through acquire carries no time"
+
+    def test_a_refresh_rewrites_the_time_with_the_figure(self) -> None:
+        """Each step before the child's sample call rewrites both; the child reads the last reading's time."""
+        controller = _controller()
+        proxy = _timed_proxy()
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0, measured_at=100.0), admit_fn=_always_admit)
+
+        for reading, measured_at in ((12_000.0, 101.0), (16_500.0, 102.0)):
+            controller.step(
+                _inputs(staged=staged, device_free_mb=reading, measured_at=measured_at),
+                admit_fn=_always_admit,
+            )
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 16_500.0
+        assert proxy.take_cleared_device_free_measured_at() == 102.0
+
+    def test_a_step_without_a_reading_keeps_the_last_time(self) -> None:
+        """An unread step leaves the unconsumed grant's time beside the figure it kept."""
+        controller = _controller()
+        proxy = _timed_proxy()
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0, measured_at=100.0), admit_fn=_always_admit)
+
+        controller.step(_inputs(staged=staged, device_free_mb=None, measured_at=105.0), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 13_500.0
+        assert proxy.take_cleared_device_free_measured_at() == 100.0
+
+    @pytest.mark.parametrize("measured_at", [None, 50.0], ids=["no_time", "time_without_figure"])
+    def test_a_grant_without_a_reading_carries_no_time(self, measured_at: float | None) -> None:
+        """A grant with no device-free figure carries no measurement time, whatever the inputs hold."""
+        controller = _controller()
+        proxy = _timed_proxy()
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+
+        controller.step(_inputs(staged=staged, device_free_mb=None, measured_at=measured_at), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_measured_at() is None
+
+    def test_a_figure_with_no_time_carries_none(self) -> None:
+        """A reading with no known time grants its figure and leaves the time unset."""
+        controller = _controller()
+        proxy = _timed_proxy()
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 13_500.0
+        assert proxy.take_cleared_device_free_measured_at() is None
+
+    def test_a_late_permit_from_a_timed_out_job_carries_no_time(self) -> None:
+        """Job start unsets the time with the figure, so an inherited permit carries neither."""
+        controller = _controller()
+        proxy = _timed_proxy()
+        controller.register(2, proxy)
+        proxy.begin_job()
+        assert proxy.acquire(True, 0.0) is False
+        controller.step(
+            _inputs(
+                staged=(ClearanceWaiter(process_id=2, priority=1, job_id="job-a"),),
+                device_free_mb=9_000.0,
+                measured_at=77.0,
+            ),
+            admit_fn=_always_admit,
+        )
+
+        proxy.begin_job()
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_measured_at() is None
+
+    def test_a_proxy_without_the_shared_time_carries_none(self) -> None:
+        """A proxy built before the time existed still carries the figure, and no time."""
+        controller = _controller()
+        proxy = _StubProxy(cleared_device_free=_shared_figure())
+        controller.register(2, proxy)
+        staged = _staged_child(proxy, job_id="job-a")
+
+        controller.step(_inputs(staged=staged, device_free_mb=13_500.0, measured_at=10.0), admit_fn=_always_admit)
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 13_500.0
+        assert proxy.take_cleared_device_free_measured_at() is None
+
+    def test_a_single_clear_carries_the_time_on_both_permits(self) -> None:
+        """An idle waiter cleared with both permits reads the same reading's time through each lease."""
+        controller = _controller(tail=False)
+        proxy = _timed_proxy(with_stage=True)
+        controller.register(2, proxy)
+        proxy.begin_job()
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+
+        controller.step(
+            _inputs(staged=(_job_waiter(2, 1),), device_free_mb=13_500.0, measured_at=300.0),
+            admit_fn=_always_admit,
+            stage_admit_fn=_RecordingAdmit(True),
+        )
+
+        assert stage_lease.acquire(True, 0.0) is True
+        assert stage_lease.take_cleared_device_free_measured_at() == 300.0
+        assert stage_lease.take_cleared_device_free_measured_at() is None
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_measured_at() == 300.0
+
+    def test_a_stage_grant_carries_its_own_time(self) -> None:
+        """A stage grant beside a running sampler carries its reading's time, apart from the sample permit."""
+        controller = _controller(slot_cap=1, tail=False)
+        sampler = _StubProxy(with_stage=True)
+        proxy = _timed_proxy(with_stage=True)
+        controller.register(1, sampler)
+        controller.register(2, proxy)
+        sampler.begin_job()
+        proxy.begin_job()
+        controller.step(_inputs(staged=(_job_waiter(1, 0),), measured_at=10.0), admit_fn=_always_admit)
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+
+        controller.step(
+            _inputs(
+                staged=(_job_waiter(2, 1),),
+                active=(_sampler(1),),
+                device_free_mb=9_000.0,
+                measured_at=42.0,
+            ),
+            admit_fn=_always_admit,
+            stage_admit_fn=_RecordingAdmit(True),
+        )
+
+        assert controller.grant_state(2) is GrantState.STAGED
+        assert stage_lease.acquire(True, 0.0) is True
+        assert stage_lease.take_cleared_device_free_mb() == 9_000.0
+        assert stage_lease.take_cleared_device_free_measured_at() == 42.0
+        assert stage_lease.take_cleared_device_free_measured_at() is None
+        assert proxy.acquire(True, 0.0) is False, "the stage grant carries no sample permit"
+        assert proxy.take_cleared_device_free_measured_at() is None
+
+    def test_an_unconsumed_stage_grant_takes_the_refreshed_time(self) -> None:
+        """A stage grant the child has not taken is refreshed with the figure and its time."""
+        proxy = _timed_proxy(with_stage=True)
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        proxy.begin_job()
+        proxy._parent_grant_stage(device_free_mb=9_000.0, device_free_measured_at=5.0)
+
+        assert proxy._parent_refresh_stage_figure(
+            device_free_mb=9_500.0,
+            device_free_measured_at=6.0,
+            sampling_reserve_mb=None,
+        )
+
+        assert stage_lease.acquire(True, 0.0) is True
+        assert stage_lease.take_cleared_device_free_mb() == 9_500.0
+        assert stage_lease.take_cleared_device_free_measured_at() == 6.0
 
 
 class TestTailOverlapObservability:

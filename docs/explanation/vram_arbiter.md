@@ -1644,7 +1644,10 @@ dispatch reading and the child's growth is counted from that moment, since its e
 absent from the newer measurement. A grant with no reading, a timed-out acquire, and a run without the lease
 keep the dispatch figure. Under two-phase clearance the stage grant carries the device free its own admission
 priced against, and hordelib rebases the clamp on it before the early weight upload. The sample grant's figure
-then replaces it at the sample acquire. The figure always comes from the parent. A child-side read of device free is the
+then replaces it at the sample acquire. Each grant's figure travels with the parent's `time.monotonic()` of the
+reading behind it (`take_cleared_device_free_measured_at` on both leases), rewritten with the figure and absent
+when there is no reading, so the child can tell whether the figure predates the encoder release it made before
+the wait. The figure always comes from the parent. A child-side read of device free is the
 untruthful view the clamp exists to correct. Children cleared in one controller step each get the reading less
 what the children cleared before them take of it, their weights plus their non-weight reserve capped at the
 figure they were handed (`clearance_lease._grant_charge_mb`, from `ClearanceWaiter.weights_mb` and

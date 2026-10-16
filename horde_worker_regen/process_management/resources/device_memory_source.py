@@ -13,6 +13,7 @@ process holds as free. A host-memory figure is system RAM a unified-memory card 
 from __future__ import annotations
 
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -56,6 +57,11 @@ class DeviceMemoryReading:
     process_used_mb: Mapping[int, float] | None = field(default=None, hash=False)
     """Device memory (MB) each compute process on the card uses, keyed by OS pid, taken with the free figure.
     None where the driver does not report usage per process (WDDM) or the source cannot list processes."""
+    measured_at: float = field(default_factory=time.monotonic, compare=False, hash=False)
+    """``time.monotonic()`` when the reading was constructed. NVML and the adapter counter construct it at their
+    read. A reading formed from process reports is constructed when the parent forms it, which can be after the
+    reports were sent. The clock is system-wide on every supported platform, so a child can order the reading
+    against its own events. Two readings with equal figures still compare equal whatever their times."""
 
     @property
     def is_device_wide(self) -> bool:

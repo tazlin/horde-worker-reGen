@@ -7152,6 +7152,7 @@ class InferenceScheduler:
             staged_waiters=tuple(waiters),
             active_grants=tuple(samplers),
             device_free_mb=self._measured_device_free_mb(device_index),
+            device_free_measured_at=self._measured_device_free_at(device_index),
             device_free_is_device_wide=self._device_wide_free_mb(device_index) is not None,
             vram_reserve_mb=self._vram_budget.reserve_mb,
             paging_active=self._retention.wddm_paging_active,
@@ -12427,6 +12428,11 @@ class InferenceScheduler:
         """
         reading = self._device_reading(device_index)
         return None if reading is None else reading.free_mb
+
+    def _measured_device_free_at(self, device_index: int | None) -> float | None:
+        """Return the ``time.monotonic()`` of the reading :meth:`_measured_device_free_mb` answers from, or None."""
+        reading = self._device_reading(device_index)
+        return None if reading is None else reading.measured_at
 
     def _device_reading(self, device_index: int | None) -> DeviceMemoryReading | None:
         """Return the parent's memory reading for this card, or None when unread. None resolves to card 0."""
