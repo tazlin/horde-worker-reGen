@@ -9269,9 +9269,15 @@ class InferenceScheduler:
         """Return the idle inference residents on the card an unload could take, ranked by their recency key.
 
         The reclaim ladder and the post-processing chain's single-step eviction share this exclusion rule. A slot
-        is skipped when it is busy, holds no model, has an unload outstanding, owns a dispatched job, or holds a
-        model a job in progress or a name in ``protected_models`` needs. Only inference slots are considered, so a
-        lane's models are never chosen.
+        is skipped when it is busy, holds no model, holds its model only in system RAM, has an unload outstanding,
+        owns a dispatched job, or holds a model a job in progress or a name in ``protected_models`` needs. Only
+        inference slots are considered, so a lane's models are never chosen.
+
+        A slot keeps ``loaded_horde_model_name`` after its copy moves back to system RAM, and unloading that copy
+        does not free anything on the card. Offering it would promise the model's footprint for a release an
+        unload cannot realize. On-card residency is read from
+        :meth:`~horde_worker_regen.process_management.models.horde_model_map.HordeModelMap.weights_resident_on_process`,
+        the same check admission and the resident-footprint observer use.
         """
         now_monotonic = time.monotonic()
         now_wall = time.time()
@@ -9283,6 +9289,11 @@ class InferenceScheduler:
             if device_index is not None and process_info.device_index != device_index:
                 continue
             if process_info.is_process_busy() or process_info.loaded_horde_model_name is None:
+                continue
+            if not self._horde_model_map.weights_resident_on_process(
+                process_info.loaded_horde_model_name,
+                process_info,
+            ):
                 continue
             if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
                 # An unload is already outstanding on this slot, so :meth:`unload_idle_model` would refuse it

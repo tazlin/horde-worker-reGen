@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind, build_reclaim_ladder
 from tests.process_management.conftest import make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -19,6 +20,14 @@ def _resident(process_id: int, *, materialized: float | None, last_received: flo
     return info
 
 
+def _on_card(**models_by_process: int) -> HordeModelMap:
+    """Build a model map recording each named model as in VRAM on its process."""
+    model_map = HordeModelMap(root={})
+    for model, process_id in models_by_process.items():
+        model_map.update_entry(model, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=process_id)
+    return model_map
+
+
 def test_materialization_stamp_drives_lifo_over_report_time() -> None:
     """The more-recently-materialized resident is evicted first even when its report time is older.
 
@@ -29,7 +38,10 @@ def test_materialization_stamp_drives_lifo_over_report_time() -> None:
     # its last report is NEW (9999). Report-time ranking would put B first; the stamp must put A first.
     resident_a = _resident(1, materialized=200.0, last_received=10.0)
     resident_b = _resident(2, materialized=100.0, last_received=9999.0)
-    scheduler = _make_inference_scheduler(process_map=ProcessMap({1: resident_a, 2: resident_b}))  # type: ignore[dict-item]
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({1: resident_a, 2: resident_b}),  # type: ignore[dict-item]
+        horde_model_map=_on_card(m1=1, m2=2),
+    )
 
     ladder = build_reclaim_ladder(scheduler.build_reclaim_ladder_candidates(None))
     unloads = [rung.target_process_id for rung in ladder if rung.kind is ReclaimRungKind.UNLOAD_IDLE_MODEL]
@@ -53,7 +65,10 @@ def test_unset_stamp_falls_back_to_the_report_time_proxy() -> None:
     # Neither resident has a stamp; ranking falls back to report time, newest-first.
     resident_old = _resident(1, materialized=None, last_received=10.0)
     resident_new = _resident(2, materialized=None, last_received=20.0)
-    scheduler = _make_inference_scheduler(process_map=ProcessMap({1: resident_old, 2: resident_new}))  # type: ignore[dict-item]
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({1: resident_old, 2: resident_new}),  # type: ignore[dict-item]
+        horde_model_map=_on_card(m1=1, m2=2),
+    )
 
     ladder = build_reclaim_ladder(scheduler.build_reclaim_ladder_candidates(None))
     unloads = [rung.target_process_id for rung in ladder if rung.kind is ReclaimRungKind.UNLOAD_IDLE_MODEL]

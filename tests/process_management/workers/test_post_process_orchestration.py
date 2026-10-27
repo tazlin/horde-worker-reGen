@@ -16,6 +16,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordePostProcessControlMessage,
     HordePostProcessResultMessage,
     HordeProcessState,
+    ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -50,6 +51,13 @@ def _make_pp_job_info(post_processing: list[str] | None = None) -> HordeJobInfo:
         state=GENERATION_STATE.ok,
         censored=False,
         time_popped=time.time(),
+    )
+
+
+def _mark_on_card(process_manager: HordeWorkerProcessManager, *, model: str, process_id: int) -> None:
+    """Record ``model`` as in VRAM on ``process_id``, since only an on-card copy is an eviction candidate."""
+    process_manager._horde_model_map.update_entry(
+        model, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=process_id
     )
 
 
@@ -107,6 +115,7 @@ class _TwoRungRig:
         idle_inference = make_mock_process_info(3, model_name="cold-model", state=HordeProcessState.WAITING_FOR_JOB)
         process_manager._process_map.clear()
         process_manager._process_map.update({7: lane, 3: idle_inference})
+        _mark_on_card(process_manager, model="cold-model", process_id=3)
         job_info = _make_pp_job_info(["RealESRGAN_x4plus"])
         await process_manager._job_tracker.queue_for_post_processing(job_info)
         rig = cls(process_manager=process_manager, actuator=actuator, lane=lane, job_info=job_info, clock=clock)
@@ -753,6 +762,7 @@ class TestStartPostProcessing:
         )
         process_manager._process_map.clear()
         process_manager._process_map.update({7: lane, 3: idle_inference})
+        _mark_on_card(process_manager, model="cold-model", process_id=3)
 
         full_card = DeviceVramState(
             total_vram_mb=24000.0,
@@ -956,6 +966,7 @@ class TestColdestIdleResidentSelection:
         slot = make_mock_process_info(3, model_name="resident-model", state=state)
         process_manager._process_map.clear()
         process_manager._process_map.update({3: slot, 7: _make_lane_process()})
+        _mark_on_card(process_manager, model="resident-model", process_id=3)
         tracker = process_manager._job_tracker
         if slot_condition == "unloading":
             slot.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM

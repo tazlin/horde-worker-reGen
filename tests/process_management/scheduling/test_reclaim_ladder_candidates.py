@@ -7,11 +7,17 @@ from collections.abc import Callable
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import (
+    HordeControlFlag,
+    HordeImageResult,
+    HordeProcessState,
+    ModelLoadState,
+)
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
 from horde_worker_regen.process_management.scheduling.admission.preload import select_preload_target
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
@@ -28,6 +34,14 @@ def _idle_resident(process_id: int, *, model: str, reserved_mb: int) -> object:
     info = make_mock_process_info(process_id, model_name=model, state=HordeProcessState.WAITING_FOR_JOB)
     info.process_reserved_mb = reserved_mb
     return info
+
+
+def _on_card(**models_by_process: int) -> HordeModelMap:
+    """Build a model map recording each named model as in VRAM on its process."""
+    model_map = HordeModelMap(root={})
+    for model, process_id in models_by_process.items():
+        model_map.update_entry(model, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=process_id)
+    return model_map
 
 
 def _scheduler_with_reclaimable_lanes(
@@ -69,7 +83,10 @@ def test_busy_inference_process_is_not_a_reclaim_candidate() -> None:
     idle = _idle_resident(1, model="m_idle", reserved_mb=5000)
     busy = make_mock_process_info(2, model_name="m_busy", state=HordeProcessState.INFERENCE_STARTING)
     busy.process_reserved_mb = 6000  # type: ignore[attr-defined]
-    scheduler = _make_inference_scheduler(process_map=ProcessMap({1: idle, 2: busy}))  # type: ignore[dict-item]
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({1: idle, 2: busy}),  # type: ignore[dict-item]
+        horde_model_map=_on_card(m_idle=1, m_busy=2),
+    )
 
     candidates = scheduler.build_reclaim_ladder_candidates(None)
 
@@ -79,12 +96,35 @@ def test_busy_inference_process_is_not_a_reclaim_candidate() -> None:
 def test_idle_resident_promises_its_measured_reservation() -> None:
     """An idle resident's promised free is its measured device reservation."""
     idle = _idle_resident(1, model="m_idle", reserved_mb=5000)
-    scheduler = _make_inference_scheduler(process_map=ProcessMap({1: idle}))  # type: ignore[dict-item]
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({1: idle}),  # type: ignore[dict-item]
+        horde_model_map=_on_card(m_idle=1),
+    )
 
     candidates = scheduler.build_reclaim_ladder_candidates(None)
 
     assert len(candidates.idle_residents) == 1
     assert candidates.idle_residents[0].footprint_mb == 5000.0
+
+
+def test_idle_resident_list_names_only_models_on_the_card() -> None:
+    """A slot whose model is only in host RAM is not a candidate, since unloading it does not free card memory.
+
+    Both slots still name their model and report a zero reservation. The model map decides which copy is on
+    the card.
+    """
+    on_card = _idle_resident(1, model="m_on_card", reserved_mb=0)
+    in_ram = _idle_resident(2, model="m_in_ram", reserved_mb=0)
+    model_map = _on_card(m_on_card=1)
+    model_map.update_entry("m_in_ram", load_state=ModelLoadState.LOADED_IN_RAM, process_id=2)
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({1: on_card, 2: in_ram}),  # type: ignore[dict-item]
+        horde_model_map=model_map,
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert {resident.process_id for resident in candidates.idle_residents} == {1}
 
 
 async def test_idle_resident_needed_by_pending_work_is_not_a_reclaim_candidate() -> None:
@@ -100,6 +140,7 @@ async def test_idle_resident_needed_by_pending_work_is_not_a_reclaim_candidate()
     scheduler = _make_inference_scheduler(
         process_map=ProcessMap({1: idle}),  # type: ignore[dict-item]
         job_tracker=tracker,
+        horde_model_map=_on_card(**{"head-model": 1}),
     )
 
     candidates = scheduler.build_reclaim_ladder_candidates(None, protected_models=frozenset({"head-model"}))

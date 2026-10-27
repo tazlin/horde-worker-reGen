@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from tests.process_management.conftest import make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
@@ -17,11 +18,22 @@ def _idle_resident(process_id: int, *, model: str, reserved_mb: int, materialize
     return info
 
 
+def _on_card(**models_by_process: int) -> HordeModelMap:
+    """Build a model map recording each named model as in VRAM on its process."""
+    model_map = HordeModelMap(root={})
+    for model, process_id in models_by_process.items():
+        model_map.update_entry(model, load_state=ModelLoadState.LOADED_IN_VRAM, process_id=process_id)
+    return model_map
+
+
 def test_pdh_flagged_idle_newcomer_is_the_first_sweep_target() -> None:
     """The newest idle resident (the PDH-flagged newcomer) is evicted first; it is never protected."""
     newcomer = _idle_resident(1, model="new", reserved_mb=6000, materialized=100.0)  # newest
     older = _idle_resident(2, model="old", reserved_mb=6000, materialized=50.0)  # older
-    scheduler = _make_inference_scheduler(process_map=ProcessMap({1: newcomer, 2: older}))  # type: ignore[dict-item]
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({1: newcomer, 2: older}),  # type: ignore[dict-item]
+        horde_model_map=_on_card(new=1, old=2),
+    )
 
     swept: list[int] = []
     scheduler.unload_idle_model = lambda process_id, device_index=None: swept.append(process_id) or True  # type: ignore[assignment,method-assign]
@@ -41,7 +53,10 @@ def test_actively_sampling_process_is_never_swept() -> None:
     busy.process_type = HordeProcessType.INFERENCE  # type: ignore[attr-defined]
     busy.process_reserved_mb = 6000  # type: ignore[attr-defined]
     busy.vram_materialized_monotonic = 100.0  # type: ignore[attr-defined]
-    scheduler = _make_inference_scheduler(process_map=ProcessMap({1: idle, 2: busy}))  # type: ignore[dict-item]
+    scheduler = _make_inference_scheduler(
+        process_map=ProcessMap({1: idle, 2: busy}),  # type: ignore[dict-item]
+        horde_model_map=_on_card(idle=1, busy=2),
+    )
 
     swept: list[int] = []
     scheduler.unload_idle_model = lambda process_id, device_index=None: swept.append(process_id) or True  # type: ignore[assignment,method-assign]

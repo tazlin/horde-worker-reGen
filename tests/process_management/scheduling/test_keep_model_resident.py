@@ -471,7 +471,7 @@ async def test_wddm_paging_rising_edge_reclaims_idle_vram_once() -> None:
     rather than protecting it, routed through the same reclaim actuator the governor's ladder uses.
     """
     job_tracker = JobTracker()
-    scheduler = _budget_on_scheduler(job_tracker)
+    scheduler = _budget_on_scheduler(job_tracker, horde_model_map=_map_with_model_on_process(_MODEL, _PROCESS_ID))
     paging_process = scheduler._process_map[_PROCESS_ID]
     unloaded: list[int] = []
 

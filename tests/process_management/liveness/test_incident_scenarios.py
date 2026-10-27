@@ -1356,6 +1356,20 @@ Sized per card so every class runs the regime the scenario is about: two checkpo
 over its hard floor. One workload cannot do both on cards this far apart, and the sizes are what make the run a
 statement about the verification budget rather than about one card's arithmetic."""
 
+_SLOW_RELEASE_WORKLOAD: dict[str, tuple[tuple[_ModelClass, ...], tuple[int, int], int]] = {
+    _CARD_16GB.label: ((_SD15, _SD15_OTHER), (1280, 1280), 120),
+    _CARD_24GB.label: (*_PRESSURE_WORKLOAD[_CARD_24GB.label], 30),
+}
+"""The rotation, generation size and step count the slow-release scenario drives each card class with.
+
+The graded release is the unload of a copy retained on one lane while the other lane samples, so each card needs
+two checkpoints that fit side by side at their priced footprint and cross the hard floor at their real one. The
+24 GB card's pressure workload does that. On the 16 GB card an SDXL job fills the card by itself, so the dispatch
+evicts any copy retained beside it and the ladder has nothing on the card to release. Two SD 1.5 checkpoints at
+1280x1280 fit that card's forecast together and cross its floor. At 120 steps the sampling window outlasts the
+unload's release delay, so the free memory the rung is credited with is its own release and not the end of the
+job beside it."""
+
 
 async def _drive_pressure(
     world: _DispatchWorld,
@@ -1499,15 +1513,25 @@ async def test_g_a_slow_release_is_not_graded_a_failed_rung(
     Run across the card classes operators actually have, because the budget a release needs scales with the
     bytes being released: a verdict that only holds on the card it was measured on is a constant in disguise.
 
-    The feed holds one job at a time. The release being graded is one the ladder orders against an idle copy
-    nobody retained; a deeper feed names each model's successor at its dispatch, every copy is then retained,
-    and the residency reconciliation takes it back before the ladder has anything to release. With nothing
-    pending, the first round on each lane is refused on an empty history and leaves the ladder its copy.
+    The release being graded is the ladder's unload of a copy retained on the idle lane. The end-of-job
+    evictor moves an unretained copy to host RAM, so a retained copy is the only idle copy on the card. Each
+    lane's first round is refused retention on an empty dispatch history; from its second round the lane keeps
+    its model, the other lane's job samples beside that copy, and the card crosses its floor with the retained
+    copy as the idle resident the ladder names. The feed holds one job at a time.
     """
     _blind_children_to_device_truth(monkeypatch)
     world = _pressure_world(card=card)
+    models, shape, ddim_steps = _SLOW_RELEASE_WORKLOAD[card.label]
 
-    await _drive_pressure(world, job_count=_PRESSURE_JOBS, ticks=_PRESSURE_TICKS, queue_depth=1)
+    await _drive_pressure(
+        world,
+        job_count=_PRESSURE_JOBS,
+        ticks=_PRESSURE_TICKS,
+        models=models,
+        shape=shape,
+        ddim_steps=ddim_steps,
+        queue_depth=1,
+    )
 
     _assert_slow_release_was_not_misjudged(world, context=f"slow release on {card.label}")
 
@@ -1528,8 +1552,17 @@ async def test_g_defect_reinjection_a_sample_counted_window_escalates_past_a_wor
     _blind_children_to_device_truth(monkeypatch)
     _reinject_sample_counted_verification(monkeypatch)
     world = _pressure_world(card=card)
+    models, shape, ddim_steps = _SLOW_RELEASE_WORKLOAD[card.label]
 
-    await _drive_pressure(world, job_count=_PRESSURE_JOBS, ticks=_PRESSURE_TICKS)
+    await _drive_pressure(
+        world,
+        job_count=_PRESSURE_JOBS,
+        ticks=_PRESSURE_TICKS,
+        models=models,
+        shape=shape,
+        ddim_steps=ddim_steps,
+        queue_depth=1,
+    )
 
     assert _escalations_while_a_release_is_in_flight(world), (
         "the engine never escalated while one of its own releases was still landing, so the in-flight verdict "
