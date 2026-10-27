@@ -274,7 +274,47 @@ uv run horde-benchmark soak          # sustained throughput
 uv run horde-benchmark report        # the last run, rendered
 ```
 
-Its unit tests in `tests/benchmark/` run in the default sweep against a fake executor.
+The default `tests/benchmark/` selection covers adaptive selection, per-card evidence, local HTTP
+pop/upload/submit, terminal accounting and configuration application without a GPU. The legacy executor
+and warm harness retain their existing tests. The spawned inference-gate and torch-free import checks
+run with `-m slow`; they verify that existing children observe a drained capacity increase, blind
+recovery cannot increase the permit bound, and the orchestrator remains torch-free. Capacity changes
+also have default-band refusal and positive continuation tests under `tests/process_management/`.
+
+The operator assessment has no overall time limit by default. A work limit derived from the selected
+checks covers a small capacity search and combined-settings confirmation. `--seconds` and
+`--job-budget` add explicit limits. It does not establish sustained reliability or earnings; use
+`soak` for sustained throughput comparisons. See the [CLI
+reference](docs/reference/cli.md#run-bounded-operator-assessment) for progress-aware waits and the
+measured/predicted/unknown distinction.
+
+Controller tests cover slow sampling progress, repeated heartbeats, derived coverage, final counts
+and card-scoped readings. TUI tests render active sampling details and retain final metrics after
+rapid jobs. Application tests cover global single-card output, optional per-card output and
+known-good override cleanup. Loading tests distinguish first/repeat events, duplicate events and
+missing measurements.
+
+Service-offer tests use the normal form expansion and SDK alchemy request models. They also require
+the loopback server to answer the normal capability-schema probe. If a form is unavailable, the
+assessment must report why before the job inactivity timeout. Follow-up completions count toward
+both check and run totals, and exactly consuming the derived allowance must still report completed
+coverage.
+
+The operator controller tests include a sequential-completion negative case: raising the configured
+thread cap must not validate concurrency without overlapping child sampling windows. Run-metrics
+tests verify window/card retention for both monolithic inference and disaggregated SAMPLE stages.
+
+Retry tests require a check to remain inconclusive if success follows same-process OOM recovery, a
+degraded retry or a host commit refusal. Older records without retry history cannot confirm
+settings.
+
+Feature-application tests exercise the production per-card resolver and SDK feature adapter,
+including inherited LoRA/img2img/painting permissions and integer/string card keys.
+
+Shared-service tests finalize forms on a different or unreported lane and check that evidence does
+not claim the companion image's card. The slow gate tests terminate a releasing process after its
+counter update but before notification. An existing waiter without an acquisition timeout must then
+acquire the returned permit without another release.
 
 Run only one of the `gpu` band, the benchmark and a live worker at a time on a card. Each one budgets
 VRAM from the free memory it measures at start and assumes nothing else will take it, so a second tenant
