@@ -304,6 +304,15 @@ def test_a_full_cache_volume_fails_and_says_how_much_to_free() -> None:
     assert "free up 10.0 GB" in check_named(report, "free disk").fix
 
 
+def test_a_tier_without_lora_cells_does_not_need_free_disk() -> None:
+    """Models are on disk before the run starts, and only LoRA cells download during it."""
+    probes = healthy_probes(free_bytes=lambda path: CORPUS_FREE_DISK_BYTES // 2)
+
+    report = run_preflight("heavy", "alice-l40s", models=MODELS, require_manifest=True, probes=probes)
+
+    assert check_named(report, "free disk").severity == "ok"
+
+
 def test_every_model_measured_under_the_card_passes() -> None:
     """A card that has already held every model of the tier is admitted on that evidence."""
     probes = healthy_probes(vram_mb=lambda: 24074, footprint_observation=measured_at(6000.0))

@@ -82,7 +82,10 @@ MACHINE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,40}$")
 """Machine ids are lowercase, dash-separated and stable across runs, since rows are keyed on them."""
 
 CORPUS_FREE_DISK_BYTES = 20 * 1024**3
-"""Free space the cache volume needs: the corpus fetches LoRAs and re-fetches evicted ones as it runs."""
+"""Free space the cache volume needs for a tier with LoRA cells.
+
+Those cells download LoRAs during the run and download them again after an eviction. Every model is already on
+disk when a run starts, so a tier without LoRA cells does not download anything."""
 
 _MANIFEST_TIERS: frozenset[str] = frozenset({"census", "heavy"})
 """Tiers whose vocabularies are read from the kudos feature manifest."""
@@ -706,8 +709,14 @@ def _check_models(probes: Probes, tier: str, models: list[str]) -> PreflightChec
     return PreflightCheck(name="models", severity="ok", detail=f"{len(models)} model(s) on disk")
 
 
-def _check_free_disk(probes: Probes, cache_path: Path | None) -> PreflightCheck:
-    """Judge free space on the cache volume; the LoRA cells fetch and re-fetch as the run proceeds."""
+def _check_free_disk(probes: Probes, tier: str, cache_path: Path | None) -> PreflightCheck:
+    """Judge free space on the cache volume for a tier whose LoRA cells download during the run."""
+    if not tier_has_lora_cells(tier):
+        return PreflightCheck(
+            name="free disk",
+            severity="ok",
+            detail=f"not needed: the {tier} tier has no LoRA cells",
+        )
     if cache_path is None:
         return PreflightCheck(
             name="free disk",
@@ -820,7 +829,7 @@ def run_preflight(
     cache_check, cache_path = _check_cache_home(probes)
     checks.append(cache_check)
     checks.append(_check_models(probes, tier, models))
-    checks.append(_check_free_disk(probes, cache_path))
+    checks.append(_check_free_disk(probes, tier, cache_path))
     checks.append(_check_civitai_token(probes, tier))
     checks.append(_check_utilities_lane(probes, tier))
     checks.append(_check_live_worker(probes))
