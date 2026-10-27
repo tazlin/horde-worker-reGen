@@ -30,7 +30,7 @@ from horde_worker_regen.benchmark.ladder import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from horde_model_reference.model_reference_records import GenericModelRecord
 
@@ -218,30 +218,37 @@ def beta_post_processor_names() -> frozenset[str]:
     Returns an empty set when beta is not opted into or cannot be read; never None (absence of beta is a
     fact, not an unknown).
     """
+    return frozenset(_beta_records(_POST_PROCESSOR_CATEGORIES))
+
+
+def _beta_records(categories: Collection[str]) -> dict[str, GenericModelRecord]:
+    """Pending (beta) records by name, for the ``categories`` the environment opted into beta.
+
+    :func:`beta_post_processor_names` explains when this reads the network and how it fails. Returns an
+    empty mapping when no category is opted in or the read fails.
+    """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
         from hordelib.beta_models import beta_model_categories, build_pending_provider
 
-        opted_in = beta_model_categories() & {
-            MODEL_REFERENCE_CATEGORY(category) for category in _POST_PROCESSOR_CATEGORIES
-        }
+        opted_in = beta_model_categories() & {MODEL_REFERENCE_CATEGORY(category) for category in categories}
         if not opted_in:
-            return frozenset()
+            return {}
 
-        # Catalog construction is a foreground path, and beta is additive: an unreachable PRIMARY
-        # should cost seconds, not the provider's full production retry budget, before degrading to
-        # the canonical-only view.
+        # Catalog construction and the corpus preflight run in the foreground, and the beta records only add to
+        # the canonical view. One short attempt keeps an unreachable PRIMARY from stalling them for the
+        # provider's full retry budget.
         provider = build_pending_provider(timeout_seconds=5.0, retry_max_attempts=1)
         if provider is None:
-            return frozenset()
+            return {}
 
-        names: set[str] = set()
+        records: dict[str, GenericModelRecord] = {}
         for category in sorted(opted_in, key=lambda value: value.value):
-            names.update(provider.fetch_category(category) or {})
-        return frozenset(names)
+            records.update(provider.fetch_category(category) or {})
+        return records
     except Exception as e:  # noqa: BLE001 - beta is best-effort; fail open to the canonical picture
-        logger.debug(f"Could not read the beta (pending) post-processor references: {e}")
-        return frozenset()
+        logger.debug(f"Could not read the beta (pending) references for {sorted(categories)}: {e}")
+        return {}
 
 
 def post_processor_names_in_reference() -> frozenset[str] | None:
@@ -429,6 +436,12 @@ def models_disk_plan(model_names: list[str]) -> DownloadPlan | None:
     on-disk cache does not spare the round-trip), which can outlast the caller's timeout. Forcing the read
     offline keeps the preview bounded to local disk; the parent/TUI keeps that disk copy current. Fails
     open (returns None) so callers fall back to a cheap, presence-only path offline or in tests.
+
+    A beta model's record exists only in the PRIMARY's pending queue, which is never written to disk. When
+    image generation is opted into beta, the pending records are added on top of the canonical ones, so a
+    beta model whose files are present is reported as present. That adds one network read, bounded and
+    failing open as :func:`beta_post_processor_names` describes. A pending record replaces a canonical record
+    of the same name, which matches how the inference children resolve models.
     """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
@@ -437,7 +450,10 @@ def models_disk_plan(model_names: list[str]) -> DownloadPlan | None:
         from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
         manager = ensure_offline_reference_manager()
-        records = manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+        records = {
+            **(manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}),
+            **_beta_records((MODEL_REFERENCE_CATEGORY.image_generation.value,)),
+        }
         return compute_download_plan(model_names, records)
     except Exception as e:  # noqa: BLE001 - disk sizing is best-effort; fail open to the presence-only path
         logger.debug(f"Could not compute a disk plan for {model_names!r}: {e}")

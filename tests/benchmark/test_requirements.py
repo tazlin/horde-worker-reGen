@@ -197,6 +197,34 @@ def test_sizing_helpers_read_offline_never_network(monkeypatch: pytest.MonkeyPat
     assert offline_calls == 2
 
 
+def test_disk_plan_lays_pending_records_over_the_canonical_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A beta model's record exists only in the pending queue, so the plan needs it to find the model's files."""
+    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+
+    import horde_worker_regen.model_download_plan as model_download_plan
+    import horde_worker_regen.reference_helper as reference_helper
+
+    canonical = {"Deliberate": "canonical-deliberate", "Shared": "canonical-shared"}
+    pending = {"Beta-Model": "pending-beta", "Shared": "pending-shared"}
+
+    class _FakeOfflineManager:
+        def get_all_model_references(self) -> dict:
+            return {MODEL_REFERENCE_CATEGORY.image_generation: canonical}
+
+    seen: dict[str, object] = {}
+
+    def _capture(model_names: list[str], records: dict[str, object]) -> None:
+        seen.update(records)
+
+    monkeypatch.setattr(reference_helper, "ensure_offline_reference_manager", _FakeOfflineManager)
+    monkeypatch.setattr(requirements_mod, "_beta_records", lambda categories: pending)
+    monkeypatch.setattr(model_download_plan, "compute_download_plan", _capture)
+
+    requirements_mod.models_disk_plan(["Beta-Model"])
+
+    assert seen == {"Deliberate": "canonical-deliberate", "Beta-Model": "pending-beta", "Shared": "pending-shared"}
+
+
 def _sd15_controlnet_level() -> RampLevel:
     """Build an sd15 feature ladder and return the classic controlnet (preprocessor) level."""
     ladder = build_default_ladder(
