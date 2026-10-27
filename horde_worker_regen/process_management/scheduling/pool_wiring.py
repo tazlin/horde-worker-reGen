@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from horde_model_reference.model_consts.image import get_baselines_by_resolution
+
 from horde_worker_regen.process_management.scheduling.model_pool import PinnedModel, PoolParams
 from horde_worker_regen.process_management.scheduling.performance_model import baseline_signature
 
@@ -43,23 +45,19 @@ __all__ = [
 
 _SDXL_BASELINE = "stable_diffusion_xl"
 
-_NATIVE_1024_BASELINES = frozenset(
-    {
-        _SDXL_BASELINE,
-        "stable_cascade",
-        "flux_1",
-        "qwen_image",
-        "z_image_turbo",
-        "krea2_turbo",
-    },
-)
-"""Baselines whose benchmark and normal operating signature uses a 1024-pixel native square."""
-
 _NATIVE_1024_SIGNATURE_RESOLUTION = 1024
 """Canonical square resolution for large-model baselines measured by the benchmark at 1024x1024."""
 
 _DEFAULT_SIGNATURE_RESOLUTION = 512
 """Canonical square resolution for smaller or unknown baselines."""
+
+_NATIVE_1024_BASELINES = frozenset(
+    str(baseline) for baseline in get_baselines_by_resolution(_NATIVE_1024_SIGNATURE_RESOLUTION)
+)
+"""Baselines whose benchmark and normal operating signature uses a 1024-pixel native square.
+
+Built from the model reference's baseline registry, so a new 1024 baseline gets its native signature without
+an edit here."""
 
 
 def build_pool_params(
