@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 34
+SUPERVISOR_PROTOCOL_VERSION = 35
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -151,6 +151,7 @@ own maintenance and paused flags, so the snapshot gains ``worker_details_by_work
 The two aggregate flags stay as "any" over the map, so a reader of the whole-worker view is unchanged.
 v34 adds ``post_processing_offered`` and ``post_processing_offer_withheld_reason``, the ``allow_post_processing``
 value the last image pop carried and why it was withheld, which can differ from the configured flag.
+v35 adds drained ``RESIZE_CAPACITY`` requests, correlated outcomes with retryability, and ``config_revision``.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -1625,6 +1626,17 @@ class HordeWorkerDetailsSnapshot(BaseModel):
     """The horde holds this worker paused (polled, advisory)."""
 
 
+class CapacityChangeResult(BaseModel):
+    """The acknowledged outcome of a card-capacity request after accepted work has finished."""
+
+    request_id: str | None = None
+    device_index: int
+    requested_threads: int
+    accepted: bool
+    reason: str
+    retryable: bool = False
+
+
 class WorkerStateSnapshot(BaseModel):
     """One frame of worker state pushed from the worker to its supervisor over the pipe.
 
@@ -1636,6 +1648,10 @@ class WorkerStateSnapshot(BaseModel):
     protocol_version: int = SUPERVISOR_PROTOCOL_VERSION
     timestamp: float = Field(default_factory=time.time)
     session_start_time: float = 0.0
+    capacity_change: CapacityChangeResult | None = None
+    """Most recent capacity acknowledgement, retained until another request is handled."""
+    config_revision: int = 0
+    """Number of completed live config applications in this worker session."""
 
     shutting_down: bool = False
     maintenance_mode: bool = False
@@ -1936,6 +1952,8 @@ class SupervisorCommand(enum.Enum):
     """Re-read ``bridgeData.yaml`` from disk and hot-swap the runtime config."""
     SET_CONCURRENCY = enum.auto()
     """Adjust the live inference concurrency: thread cap and/or running process count."""
+    RESIZE_CAPACITY = enum.auto()
+    """Resize one card's capacity while intake is paused and accepted image/alchemy work is drained."""
     PAUSE_DOWNLOADS = enum.auto()
     """Hold background model downloads (the current chunk loop blocks) until resumed."""
     RESUME_DOWNLOADS = enum.auto()
@@ -1970,6 +1988,10 @@ class SupervisorControlMessage(BaseModel):
     """A command sent from the supervisor to the worker over the pipe."""
 
     command: SupervisorCommand
+    device_index: int | None = None
+    """Card addressed by :attr:`SupervisorCommand.RESIZE_CAPACITY`."""
+    request_id: str | None = None
+    """Correlation id for a capacity request and its acknowledgement."""
     process_id: int | None = None
     """The target process slot (an inference slot or a service-lane id), required for \
 :attr:`SupervisorCommand.RESTART_PROCESS`."""

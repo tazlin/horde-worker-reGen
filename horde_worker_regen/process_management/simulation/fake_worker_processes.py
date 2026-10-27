@@ -34,6 +34,7 @@ from loguru import logger
 
 from horde_worker_regen.alchemy_forms import DEFAULT_AUXILIARY_FETCH_NEEDS, AuxiliaryFetchNeeds
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.ipc.inference_gate import InferenceGate
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
     AuxPrefetchOutcome,
@@ -246,7 +247,7 @@ class FakeInferenceProcess(HordeProcess):
 
     _active_model_name: str | None = None
     _periodic_report_includes_vram = True
-    _inference_semaphore: Semaphore
+    _inference_semaphore: InferenceGate
     _job_delay_seconds: float
     _fail_every_n: int
     _jobs_started: int = 0
@@ -264,7 +265,7 @@ class FakeInferenceProcess(HordeProcess):
         process_id: int,
         process_message_queue: ProcessQueue,
         pipe_connection: Connection,
-        inference_semaphore: Semaphore,
+        inference_semaphore: InferenceGate,
         disk_lock: Lock,
         process_launch_identifier: int,
         *,
@@ -1073,7 +1074,7 @@ def start_fake_inference_process(
     process_id: int,
     process_message_queue: ProcessQueue,
     pipe_connection: Connection,
-    inference_semaphore: Semaphore,
+    inference_semaphore: InferenceGate,
     disk_lock: Lock,
     vae_decode_semaphore: Semaphore,
     process_launch_identifier: int,

@@ -31,6 +31,7 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Obtaining, launching and keeping alive the external text backend | `process_management/lifecycle/text_backend_supervisor.py` (`TextBackendSupervisor`, which owns the backend's whole life from `TextBackendState.PROVISIONING` onwards and is also its dashboard row via `to_process_snapshot`); it is handed a `LaunchSpecFactory` that renders the command line through `text_backends/launch.py` (`build_launch_spec`, keyed by `TEXT_BACKENDS`) over an executable from `text_backends/provision.py`, which also fetches the model file (`ensure_text_model_file`) |
 | Parsing child-to-parent messages       | `process_management/ipc/message_dispatcher.py` (`MessageDispatcher`) |
 | IPC message and enum definitions       | `process_management/ipc/messages.py`                               |
+| Shared resizable inference permits | `process_management/ipc/inference_gate.py` (bounded recovery releases, resize only when drained) |
 | Starting / replacing child processes, and pinning each auxiliary lane to its card | `process_management/lifecycle/process_lifecycle.py` (`ProcessLifecycleManager`) |
 | Live process state and per-card queries (running job, busy load, reservations, bare-context residual) | `process_management/lifecycle/process_map.py` (`ProcessMap`), `process_info.py` |
 | Result upload & submission             | `process_management/jobs/job_submitter.py` (`JobSubmitter`)        |

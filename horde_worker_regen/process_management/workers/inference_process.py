@@ -25,6 +25,7 @@ from loguru import logger
 
 from horde_worker_regen.consts import SamplerTruncationRecord, sampler_truncation_disclosure
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.ipc.inference_gate import InferenceGate
 from horde_worker_regen.process_management.ipc.messages import (
     AUX_RESOLVE_FAILED_INFO,
     HOST_COMMIT_FAILED_INFO,
@@ -245,7 +246,7 @@ class HordeInferenceProcess(HordeProcess):
     _periodic_report_includes_vram: bool = True
     """Inference processes own the GPU, so their interval memory report samples device-wide VRAM."""
 
-    _inference_semaphore: Semaphore
+    _inference_semaphore: InferenceGate
     """A semaphore used to limit the number of concurrent inference jobs."""
 
     _vae_decode_semaphore: Semaphore
@@ -272,7 +273,7 @@ class HordeInferenceProcess(HordeProcess):
         process_id: int,
         process_message_queue: ProcessQueue,
         pipe_connection: Connection,
-        inference_semaphore: Semaphore,
+        inference_semaphore: InferenceGate,
         vae_decode_semaphore: Semaphore,
         disk_lock: Lock,
         process_launch_identifier: int,

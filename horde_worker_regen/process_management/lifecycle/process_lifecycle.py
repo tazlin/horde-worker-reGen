@@ -35,6 +35,7 @@ from horde_worker_regen.process_management.config.runtime_config import RuntimeC
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime, safety_permitted_card_indices
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
+from horde_worker_regen.process_management.ipc.inference_gate import InferenceGate
 from horde_worker_regen.process_management.ipc.messages import (
     AuxModelRef,
     AuxPrefetchEntry,
@@ -3477,8 +3478,17 @@ class ProcessLifecycleManager:
         if self._max_inference_processes_listener is not None:
             self._max_inference_processes_listener(self._max_inference_processes)
 
+    def resize_card_target(self, device_index: int, target_count: int) -> None:
+        """Replace a drained card's target after its concurrency gates have been resized."""
+        card = self._card_runtimes[device_index]
+        self._card_runtimes[device_index] = replace(card, target_process_count=target_count)
+        self._retired_inference_slots_by_device.pop(device_index, None)
+        self._retired_slot_room_since_by_device.pop(device_index, None)
+        self.refresh_max_inference_processes()
+        self.scale_inference_processes(target_count, device_index=device_index)
+
     def set_max_inference_processes_listener(self, listener: Callable[[int], None]) -> None:
-        """Register the callback told the new worker-wide ceiling on every :meth:`refresh_max_inference_processes`."""
+        """Register a callback for ceiling updates from :meth:`refresh_max_inference_processes`."""
         self._max_inference_processes_listener = listener
 
     def cap_inference_targets(self, *, per_card_limit: int) -> bool:
@@ -4642,7 +4652,7 @@ class ProcessLifecycleManager:
         # Release the dead child's own card's GPU semaphores (single-GPU = the one card), plus the shared
         # disk lock. A child with an unknown device falls back to the lowest configured card.
         card = self._card_runtimes.get(process_info.device_index) or self._card_runtimes[min(self._card_runtimes)]
-        candidates: list[tuple[str, Semaphore | Lock_MultiProcessing]] = [
+        candidates: list[tuple[str, InferenceGate | Lock_MultiProcessing]] = [
             ("inference_semaphore", card.inference_semaphore),
             ("disk_lock", self._disk_lock),
             ("vae_decode_semaphore", card.vae_decode_semaphore),

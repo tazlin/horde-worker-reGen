@@ -1000,6 +1000,19 @@ class ClearanceController:
         """
         return self.grant_state(process_id) in _SLOT_HOLDING_STATES
 
+    def resize_slots(self, slot_cap: int) -> None:
+        """Change the grant cap while every registered child is outside a granted window."""
+        if slot_cap < 1:
+            raise ValueError("sampling slot capacity must be positive")
+        if any(state is not GrantState.IDLE for state in self._grant_state.values()):
+            raise RuntimeError("cannot resize sampling slots with outstanding grants")
+        self._slot_cap = slot_cap
+
+    @property
+    def has_outstanding_grants(self) -> bool:
+        """Whether a stage or sample grant prevents a drained capacity change."""
+        return any(state is not GrantState.IDLE for state in self._grant_state.values())
+
     @property
     def held_grant_count(self) -> int:
         """How many registered children currently hold a sampling slot (see :meth:`holds_sampling_slot`)."""

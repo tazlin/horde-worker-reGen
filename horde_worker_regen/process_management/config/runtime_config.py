@@ -20,10 +20,10 @@ class RuntimeConfig:
     across multiple reads.
 
     ``effective_max_threads`` is the *live* concurrent-inference cap the scheduler and popper read
-    each decision. It is bounded by ``max_threads_ceiling`` (the value the IPC semaphores were
-    provisioned for at construction, which cannot grow at runtime). A config reload re-derives it
-    from ``bridge_data.max_threads``; a supervisor command can set it directly. This split lets the
-    worker change its thread count at runtime without resizing multiprocessing primitives.
+    each decision. It is bounded by ``max_threads_ceiling``, the current shared inference-gate
+    capacity. A config reload re-derives it from ``bridge_data.max_threads``; the supervisor may
+    resize that ceiling only after intake is paused and all accepted work has finalized. Existing
+    children retain the same shared gate when its capacity changes.
     """
 
     _bridge_data: reGenBridgeData
@@ -60,6 +60,13 @@ class RuntimeConfig:
         """
         self._effective_max_threads = max(1, min(value, self._max_threads_ceiling))
         return self._effective_max_threads
+
+    def resize_ceiling(self, value: int) -> None:
+        """Update the ceiling after the drained card gates have acknowledged their new capacities."""
+        if value < 1:
+            raise ValueError("concurrency ceiling must be positive")
+        self._max_threads_ceiling = value
+        self._effective_max_threads = min(self._effective_max_threads, value)
 
     def update(self, new: reGenBridgeData) -> None:
         """Replace the current configuration with ``new`` and re-derive the effective thread cap."""

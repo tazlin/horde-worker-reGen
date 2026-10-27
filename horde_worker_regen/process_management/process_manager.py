@@ -87,6 +87,7 @@ from horde_worker_regen.process_management.config.worker_state import PopGate, P
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
+from horde_worker_regen.process_management.ipc.inference_gate import InferenceGate, ResizableInferenceGate
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import (
     GENERATION_STATE,
@@ -107,6 +108,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PENDING_JOBS_IN_SNAPSHOT,
     RECENT_JOBS_IN_SNAPSHOT,
     WORK_LEDGER_ENTRIES_IN_SNAPSHOT,
+    CapacityChangeResult,
     CardSnapshot,
     DisaggStageRow,
     FeatureInfoRow,
@@ -843,7 +845,7 @@ class MultiprocessingPrimitives:
     """
 
     process_message_queue: ProcessQueue
-    inference_semaphores: dict[int, Semaphore]
+    inference_semaphores: dict[int, InferenceGate]
     disk_lock: Lock_MultiProcessing
     vae_decode_semaphores: dict[int, Semaphore]
     download_bandwidth_semaphore: Semaphore
@@ -891,7 +893,7 @@ class MultiprocessingPrimitives:
             # doc). The status queue is the only one today; a future one is added here at its creation.
             child_facing_queues=[process_message_queue],
             inference_semaphores={
-                index: BoundedSemaphore_MultiProcessing(card.inference_semaphore_size, ctx=ctx)
+                index: ResizableInferenceGate(card.inference_semaphore_size, ctx=ctx)
                 for index, card in per_card.items()
             },
             disk_lock=Lock_MultiProcessing(ctx=ctx),
@@ -1335,6 +1337,8 @@ class HordeWorkerProcessManager:
 
         ceiling = max(bridge_data.max_threads, max_threads_ceiling if max_threads_ceiling is not None else 0)
         self._runtime_config = RuntimeConfig(initial=bridge_data, max_threads_ceiling=ceiling)
+        self._capacity_change: CapacityChangeResult | None = None
+        self._config_revision = 0
         self._api_sessions = ApiSessions()
         self._model_metadata = ModelMetadata()
         self._model_availability = ModelAvailability()
@@ -6726,6 +6730,8 @@ class HordeWorkerProcessManager:
                 self._bridge_data_reloader.schedule_config_reload()
             case SupervisorCommand.SET_CONCURRENCY:
                 self._apply_set_concurrency(command.target_threads, command.target_processes)
+            case SupervisorCommand.RESIZE_CAPACITY:
+                self._apply_resize_capacity(command)
             case SupervisorCommand.PAUSE_DOWNLOADS:
                 logger.info("Supervisor requested download pause.")
                 self._process_lifecycle.set_download_controls(paused=True)
@@ -6801,6 +6807,118 @@ class HordeWorkerProcessManager:
             result = self._process_lifecycle.scale_inference_processes(target_processes)
             self._download_coordinator.inference_processes_started = True
             logger.info(f"Supervisor scaled inference processes to {result} (requested {target_processes}).")
+
+    def _apply_resize_capacity(self, command: SupervisorControlMessage) -> None:
+        """Resize shared card capacity only at a paused, fully drained boundary."""
+        device_index = command.device_index
+        threads = command.target_threads
+        if device_index is None or threads is None:
+            logger.warning("Capacity resize requires a card and a positive thread count.")
+            return
+        reason = self._resize_capacity_refusal(device_index, threads)
+        retryable = (
+            reason is not None
+            and device_index in self._card_runtimes
+            and threads > 0
+            and (
+                self._state.supervisor_paused
+                and isinstance(self._card_runtimes[device_index].inference_semaphore, ResizableInferenceGate)
+            )
+        )
+        if reason is None:
+            card = self._card_runtimes[device_index]
+            concurrency = resolve_card_concurrency(
+                max_threads=threads,
+                queue_size=card.config.queue_size,
+                num_models_to_load=len(card.config.image_models_to_load),
+                gpu_sampling_lease_enabled=card.config.gpu_sampling_lease_enabled,
+                gpu_sampling_lease_slots=card.config.gpu_sampling_lease_slots,
+                gpu_sampling_lease_tail_overlap=card.config.gpu_sampling_lease_tail_overlap is True,
+                max_threads_ceiling=threads,
+            )
+            targets = {index: item.target_process_count for index, item in self._card_runtimes.items()}
+            targets[device_index] = concurrency.target_process_count
+            targets = cap_card_processes_to_vram_fit(
+                per_card_target_processes=targets,
+                total_vram_mb_by_card={index: item.total_vram_mb for index, item in self._card_runtimes.items()},
+                idle_context_overhead_mb=_EstimatedContextFootprint.IDLE_CONTEXT_VRAM_MB,
+                working_set_footprint_mb=_EstimatedContextFootprint.SDXL_CONTEXT_VRAM_MB,
+            )
+            targets = cap_card_process_counts(
+                per_card_target_processes=targets,
+                total_ram_bytes=self.total_ram_bytes,
+                target_ram_overhead_bytes=self.target_ram_overhead_bytes,
+            )
+            if targets[device_index] < threads or any(
+                count < self._card_runtimes[index].target_process_count
+                for index, count in targets.items()
+                if index != device_index
+            ):
+                reason = "normal host RAM or VRAM process sizing withholds the requested capacity"
+            else:
+                gate = card.inference_semaphore
+                assert isinstance(gate, ResizableInferenceGate)
+                controller = self._clearance_controllers.get(device_index)
+                try:
+                    if controller is not None:
+                        controller.resize_slots(concurrency.gpu_sampling_lease_slots)
+                    gate.resize(concurrency.inference_semaphore_size)
+                except (ValueError, RuntimeError) as error:
+                    reason = str(error)
+                else:
+                    self._card_runtimes[device_index] = dataclasses.replace(
+                        card,
+                        max_concurrent_inference=threads,
+                        config=card.config.model_copy(update={"max_threads": threads}),
+                    )
+                    ceiling = max(item.max_concurrent_inference for item in self._card_runtimes.values())
+                    self._runtime_config.resize_ceiling(ceiling)
+                    self._runtime_config.set_effective_max_threads(ceiling)
+                    self._max_concurrent_inference_processes = ceiling
+                    self._process_lifecycle.resize_card_target(device_index, targets[device_index])
+        self._capacity_change = CapacityChangeResult(
+            request_id=command.request_id,
+            device_index=device_index,
+            requested_threads=threads,
+            accepted=reason is None,
+            reason=reason or "capacity updated; child starts remain subject to normal resource admission",
+            retryable=reason is not None and retryable,
+        )
+        logger.info(f"Card capacity request: {self._capacity_change.model_dump()}")
+
+    def _resize_capacity_refusal(self, device_index: int, threads: int) -> str | None:
+        """Return why a capacity change would cross a live-work or fixed-gate boundary."""
+        if threads < 1 or device_index not in self._card_runtimes:
+            return "unknown card or nonpositive capacity"
+        if not self._state.supervisor_paused:
+            return "pause intake before resizing capacity"
+        tracker = self._job_tracker
+        outstanding = (
+            tracker.jobs_pending_inference,
+            tracker.jobs_in_progress,
+            tracker.jobs_disaggregation_decoding,
+            tracker.jobs_pending_post_processing,
+            tracker.jobs_being_post_processed,
+            tracker.jobs_pending_safety_check,
+            tracker.jobs_being_safety_checked,
+            tracker.jobs_pending_submit,
+        )
+        if any(outstanding) or self._alchemy_coordinator.num_in_flight:
+            return "accepted image or alchemy work has not finalized"
+        if any(
+            item.process_type == HordeProcessType.INFERENCE and not item.can_accept_job()
+            for item in self._process_map.values()
+        ):
+            return "an inference child is busy or booting"
+        gate = self._card_runtimes[device_index].inference_semaphore
+        if not isinstance(gate, ResizableInferenceGate):
+            return "the supplied inference gate has fixed capacity"
+        if gate.get_value() != gate.capacity:
+            return "an inference permit is still held"
+        controller = self._clearance_controllers.get(device_index)
+        if controller is not None and controller.has_outstanding_grants:
+            return "a child still holds a stage or sample grant"
+        return None
 
     def install_benchmark_scenario(
         self,
@@ -6893,6 +7011,8 @@ class HordeWorkerProcessManager:
         )
         return (
             per_process,
+            self._config_revision,
+            self._capacity_change.request_id if self._capacity_change is not None else None,
             download_fingerprint,
             self.num_jobs_total,
             self._job_tracker.total_num_completed_jobs,
@@ -8498,6 +8618,8 @@ class HordeWorkerProcessManager:
         )
 
         return WorkerStateSnapshot(
+            capacity_change=self._capacity_change,
+            config_revision=self._config_revision,
             session_start_time=self.session_start_time,
             shutting_down=self._state.shutting_down,
             maintenance_mode=maintenance_mode,
@@ -8794,6 +8916,7 @@ class HordeWorkerProcessManager:
             previously_configured=previously_configured,
         )
         self._download_coordinator.forward_download_gating_if_changed(previous_download_flags)
+        self._config_revision += 1
 
     def _refresh_card_configs(self) -> None:
         """Re-derive each driven card's effective config from the current bridge data.

@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+    from horde_worker_regen.process_management.ipc.inference_gate import InferenceGate
+from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,7 @@ class CardRuntime:
     total_vram_mb: float | None
     """This card's total VRAM in MB (from the device map), for the heterogeneous weight-fit eligibility check.
     None when the device's capacity is unknown (CPU/dry-run/test paths), where the weight check abstains."""
-    inference_semaphore: Semaphore
+    inference_semaphore: InferenceGate
     """This card's concurrent-inference gate. Distinct per card so one card's sampling cannot block another's."""
     vae_decode_semaphore: Semaphore
     """This card's concurrent-VAE-decode gate."""
