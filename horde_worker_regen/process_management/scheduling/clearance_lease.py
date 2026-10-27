@@ -93,6 +93,16 @@ class _SharedFigure(Protocol):
     """The shared figure; NaN when unset."""
 
 
+@dataclasses.dataclass(frozen=True)
+class JobLeaseWait:
+    """How long one job's child blocked on its stage and clearance permits."""
+
+    seconds: float = 0.0
+    """Seconds the job's blocking acquires took, the wait-entry callback included."""
+    timed_out: bool = False
+    """Whether a blocking acquire returned without a permit, so the job loaded or sampled unpriced."""
+
+
 class ClearanceLeaseProxy:
     """The child-side sampling lease: block on the parent's clearance grant, signal when the window closes.
 
@@ -138,6 +148,10 @@ class ClearanceLeaseProxy:
     Built with a ``stage`` semaphore, the proxy also exposes :attr:`stage_lease`, the view the child registers
     as hordelib's stage lease. The stage permit, its consumed flag and its shared figure follow the clearance
     permit's rules and are reset by the same :meth:`begin_job`.
+
+    The proxy also measures, per job, how long the child blocked on both permits and whether either acquire
+    returned without a permit, served once through :meth:`take_job_lease_wait`. The child's own clock times the
+    wait, so a late first sampling step from a cold model load is never read as a clearance hold.
     """
 
     _wait_entry_callback: Callable[[], None] | None = None
@@ -200,6 +214,8 @@ class ClearanceLeaseProxy:
         self._stage_granted_device_free_measured_at: float | None = None
         self._stage_granted_sampling_reserve_mb: float | None = None
         self._stage_lease = ClearanceStageLease(self) if stage is not None else None
+        self._job_lease_wait_seconds = 0.0
+        self._job_lease_timed_out = False
 
     @property
     def stage_lease(self) -> ClearanceStageLease | None:
@@ -244,6 +260,20 @@ class ClearanceLeaseProxy:
 
     def _acquire_with_wait_entry(self, permit: _ClearanceSemaphore, block: bool, timeout: float | None) -> bool:
         """Take ``permit``, running the wait-entry callback only when the acquire is about to block.
+
+        A blocking acquire adds its duration to the job's lease wait, and one that returns without a permit marks
+        the job timed out.
+        """
+        started_at = time.monotonic()
+        acquired = self._take_permit(permit, block, timeout)
+        if block:
+            self._job_lease_wait_seconds += time.monotonic() - started_at
+            if not acquired:
+                self._job_lease_timed_out = True
+        return acquired
+
+    def _take_permit(self, permit: _ClearanceSemaphore, block: bool, timeout: float | None) -> bool:
+        """Take ``permit``, probing first so the wait-entry callback runs only before a real wait.
 
         Without a callback the permit is taken in the single call the semaphore was always given; the probe
         exists only to tell a waiting grant from a wait.
@@ -298,6 +328,17 @@ class ClearanceLeaseProxy:
         self._granted_sampling_reserve_mb = None
         return figure
 
+    def take_job_lease_wait(self) -> JobLeaseWait:
+        """Return the time this job blocked on its permits and whether it went without one, once.
+
+        Accumulated over the job's stage and clearance acquires and cleared on read, so a disaggregated batch
+        reports the wait on the slice that paid it. :meth:`begin_job` clears it too.
+        """
+        lease_wait = JobLeaseWait(seconds=self._job_lease_wait_seconds, timed_out=self._job_lease_timed_out)
+        self._job_lease_wait_seconds = 0.0
+        self._job_lease_timed_out = False
+        return lease_wait
+
     def release(self) -> None:
         """Signal the parent that a sampling window closed; never touches the clearance permit.
 
@@ -314,8 +355,8 @@ class ClearanceLeaseProxy:
 
         The shared figure is unset here too. A permit the parent released after the previous job had already
         timed out is still available to this job's acquire, and the figure written with it describes the card
-        before the previous job sampled. The reserve figures and the stage permit's flag and figures are reset
-        by the same rules.
+        before the previous job sampled. The reserve figures, the stage permit's flag and figures, and the job's
+        lease wait are reset by the same rules.
 
         The parent may grant this job before the child calls here. The parent's next step rewrites the device free and
         reserve figures of a grant the child has not consumed, so a grant issued before job start reaches the
@@ -335,6 +376,8 @@ class ClearanceLeaseProxy:
         _unset_shared_figure(self._staged_device_free)
         _unset_shared_figure(self._staged_device_free_at)
         _unset_shared_figure(self._staged_sampling_reserve)
+        self._job_lease_wait_seconds = 0.0
+        self._job_lease_timed_out = False
 
     def _read_cleared_device_free_mb(self) -> float | None:
         """Child-side: the figure the parent wrote with the grant just acquired, or None when unset."""

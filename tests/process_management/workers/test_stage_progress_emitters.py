@@ -19,6 +19,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessHeartbeatMessage,
     SamplingWindow,
 )
+from horde_worker_regen.process_management.scheduling.clearance_lease import JobLeaseWait
 from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
 
@@ -103,6 +104,28 @@ class TestSampleStageEmitter:
         _emit_sample(fake, _progress(current_step=30, total_steps=30))
         assert fake._sampling_window.first_step == first
         assert fake._sampling_window.last_step >= first
+
+    def test_the_reported_window_carries_the_measured_lease_wait(self) -> None:
+        """The window sent with the job's metrics carries the proxy's lease wait, taken once per report."""
+        lease = Mock()
+        lease.take_job_lease_wait.return_value = JobLeaseWait(seconds=12.0, timed_out=True)
+        fake = SimpleNamespace(
+            _sampling_window=SamplingWindow(first_step=1.0, last_step=2.0), _gpu_sampling_lease=lease
+        )
+
+        window = HordeInferenceProcess._sampling_window_with_lease_wait(fake)  # type: ignore[arg-type]
+
+        assert window == SamplingWindow(first_step=1.0, last_step=2.0, lease_wait_seconds=12.0, lease_timed_out=True)
+        lease.take_job_lease_wait.assert_called_once_with()
+
+    def test_a_job_without_a_window_still_takes_its_lease_wait(self) -> None:
+        """A job that never stepped reports no window, and its wait does not carry into the next report."""
+        lease = Mock()
+        lease.take_job_lease_wait.return_value = JobLeaseWait(seconds=12.0)
+        fake = SimpleNamespace(_sampling_window=None, _gpu_sampling_lease=lease)
+
+        assert HordeInferenceProcess._sampling_window_with_lease_wait(fake) is None  # type: ignore[arg-type]
+        lease.take_job_lease_wait.assert_called_once_with()
 
     def test_advancing_step_emits_inference_step_with_populated_fields(self) -> None:
         """A mid-sampling step becomes an INFERENCE_STEP heartbeat carrying the step counts."""

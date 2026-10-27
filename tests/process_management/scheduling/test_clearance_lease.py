@@ -250,6 +250,140 @@ class TestProxyWaitEntryCallback:
         assert len(stage.blocking_timeouts) == 1, "the stage acquire must still block after the callback"
 
 
+class _ClockedSemaphore(_FakeSemaphore):
+    """A fake permit whose blocking acquire advances a fake monotonic clock by the time the child waits.
+
+    With ``grant_after`` set, the wait ends with a grant after that many seconds; otherwise the acquire waits its
+    whole timeout and returns without a permit.
+    """
+
+    def __init__(self, clock: list[float], *, grant_after: float | None = None) -> None:
+        super().__init__(0, bound=1)
+        self._clock = clock
+        self._grant_after = grant_after
+
+    def acquire(self, block: bool = True, timeout: float | None = None) -> bool:
+        if not block or self.value > 0:
+            return super().acquire(block, timeout)
+        if self._grant_after is not None:
+            self._clock[0] += self._grant_after
+            return True
+        self._clock[0] += timeout or 0.0
+        return False
+
+
+class TestProxyLeaseWait:
+    """The proxy measures how long each job blocked on its permits, and whether it sampled without a grant.
+
+    The assessment grades on this wait, so a job that waited out the clearance timeout is told apart from one
+    whose first step came late for another reason, such as a cold model load.
+    """
+
+    @pytest.fixture
+    def clock(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        """Replace the lease module's monotonic clock with one the fake permits advance."""
+        import horde_worker_regen.process_management.scheduling.clearance_lease as clearance_lease_module
+
+        now = [100.0]
+        monkeypatch.setattr(clearance_lease_module.time, "monotonic", lambda: now[0])
+        return now
+
+    @pytest.mark.parametrize("with_callback", [False, True])
+    def test_a_granted_wait_reports_its_seconds(self, clock: list[float], with_callback: bool) -> None:
+        """A child cleared after a 7 s wait reports 7 s and no timeout, with or without the wait-entry callback."""
+        proxy = ClearanceLeaseProxy(clearance=_ClockedSemaphore(clock, grant_after=7.0), done=_FakeSemaphore())
+        if with_callback:
+            proxy.set_wait_entry_callback(lambda: None)
+        proxy.begin_job()
+
+        assert proxy.acquire(True, 60.0) is True
+        assert proxy.acquire(True, 60.0) is True, "a later sample passes through"
+
+        lease_wait = proxy.take_job_lease_wait()
+        assert lease_wait.seconds == pytest.approx(7.0)
+        assert lease_wait.timed_out is False
+
+    def test_a_timed_out_wait_reports_the_timeout_and_the_flag(self, clock: list[float]) -> None:
+        """A child that waits out the timeout samples without a grant, and the record says so."""
+        proxy = ClearanceLeaseProxy(clearance=_ClockedSemaphore(clock), done=_FakeSemaphore())
+        proxy.begin_job()
+
+        assert proxy.acquire(True, 60.0) is False
+
+        lease_wait = proxy.take_job_lease_wait()
+        assert lease_wait.seconds == pytest.approx(60.0)
+        assert lease_wait.timed_out is True
+
+    def test_stage_and_sample_waits_add_up(self, clock: list[float]) -> None:
+        """Under two-phase clearance a job waits on its stage permit and then its sample permit."""
+        proxy = ClearanceLeaseProxy(
+            clearance=_ClockedSemaphore(clock, grant_after=4.0),
+            done=_FakeSemaphore(),
+            stage=_ClockedSemaphore(clock, grant_after=3.0),
+        )
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        proxy.begin_job()
+
+        assert stage_lease.acquire(True, 60.0) is True
+        assert proxy.acquire(True, 60.0) is True
+
+        assert proxy.take_job_lease_wait().seconds == pytest.approx(7.0)
+
+    def test_a_timed_out_stage_wait_sets_the_flag(self, clock: list[float]) -> None:
+        """The stage permit's timeout lets the child load unpriced, so it counts as a timeout too."""
+        proxy = ClearanceLeaseProxy(
+            clearance=_ClockedSemaphore(clock, grant_after=1.0), done=_FakeSemaphore(), stage=_ClockedSemaphore(clock)
+        )
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        proxy.begin_job()
+
+        assert stage_lease.acquire(True, 60.0) is False
+        assert proxy.acquire(True, 60.0) is True
+
+        lease_wait = proxy.take_job_lease_wait()
+        assert lease_wait.seconds == pytest.approx(61.0)
+        assert lease_wait.timed_out is True
+
+    def test_a_waiting_grant_reports_no_wait(self, clock: list[float]) -> None:
+        """A permit released before the acquire is taken at once."""
+        proxy = ClearanceLeaseProxy(clearance=_FakeSemaphore(1, bound=1), done=_FakeSemaphore())
+        proxy.begin_job()
+
+        assert proxy.acquire(True, 60.0) is True
+
+        lease_wait = proxy.take_job_lease_wait()
+        assert lease_wait.seconds == 0.0
+        assert lease_wait.timed_out is False
+
+    def test_a_non_blocking_miss_is_not_a_timeout(self, clock: list[float]) -> None:
+        """Only a blocking acquire that returns without a permit sampled unpriced."""
+        proxy = ClearanceLeaseProxy(clearance=_held_empty_clearance(), done=_FakeSemaphore())
+        proxy.begin_job()
+
+        assert proxy.acquire(False) is False
+
+        assert proxy.take_job_lease_wait().timed_out is False
+
+    def test_take_and_job_start_reset_the_wait(self, clock: list[float]) -> None:
+        """The wait is read once, and a job never inherits the previous job's wait."""
+        proxy = ClearanceLeaseProxy(clearance=_ClockedSemaphore(clock), done=_FakeSemaphore())
+        proxy.begin_job()
+        proxy.acquire(True, 60.0)
+
+        assert proxy.take_job_lease_wait().timed_out is True
+        assert proxy.take_job_lease_wait().seconds == 0.0
+
+        proxy.begin_job()
+        proxy.acquire(True, 60.0)
+        proxy.begin_job()
+
+        lease_wait = proxy.take_job_lease_wait()
+        assert lease_wait.seconds == 0.0
+        assert lease_wait.timed_out is False
+
+
 def _inputs(
     *,
     staged: tuple[ClearanceWaiter, ...] = (),
@@ -1977,6 +2111,7 @@ class _SampleStageFake:
     process_id = 3
     process_launch_identifier = 1
     _dry_run_skip_inference = True
+    _sampling_window_with_lease_wait = HordeInferenceProcess._sampling_window_with_lease_wait
 
     def __init__(self, lease: ClearanceLeaseProxy) -> None:
         self._gpu_sampling_lease = lease

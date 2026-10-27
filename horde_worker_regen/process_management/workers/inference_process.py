@@ -1081,6 +1081,21 @@ class HordeInferenceProcess(HordeProcess):
         else:
             self._sampling_window.last_step = now
 
+    def _sampling_window_with_lease_wait(self) -> SamplingWindow | None:
+        """Return the job's sampling window carrying the lease wait the proxy measured, taking the wait once.
+
+        A job that never reached its first step has no window, and its wait is dropped with it.
+        """
+        window = self._sampling_window
+        if self._gpu_sampling_lease is None:
+            return window
+        lease_wait = self._gpu_sampling_lease.take_job_lease_wait()
+        if window is None:
+            return None
+        return window.model_copy(
+            update={"lease_wait_seconds": lease_wait.seconds, "lease_timed_out": lease_wait.timed_out}
+        )
+
     def _send_inference_memory_report(self) -> None:
         """Send a precise boundary VRAM report at a stage transition (sampling done, VAE decode).
 
@@ -1304,7 +1319,7 @@ class HordeInferenceProcess(HordeProcess):
                     job_id=job_id,
                     is_alchemy=is_alchemy,
                     phase_metrics=get_metrics_collector().snapshot_and_reset_job(),
-                    sampling_window=self._sampling_window,
+                    sampling_window=self._sampling_window_with_lease_wait(),
                 ),
             )
         except Exception as e:
@@ -1589,7 +1604,9 @@ class HordeInferenceProcess(HordeProcess):
             # Drained per slice (success or fault) so the slice that triggered a UNet load owns the
             # load events; same-model siblings in the batch then correctly report none.
             self.send_stage_job_metrics_message(
-                str(job_slice.job_id), stage=PipelineStageTag.SAMPLE, sampling_window=self._sampling_window
+                str(job_slice.job_id),
+                stage=PipelineStageTag.SAMPLE,
+                sampling_window=self._sampling_window_with_lease_wait(),
             )
 
         self.process_message_queue.put(

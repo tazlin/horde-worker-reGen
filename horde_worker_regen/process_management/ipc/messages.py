@@ -561,6 +561,10 @@ class SamplingWindow(BaseModel):
 
     first_step: float
     last_step: float
+    lease_wait_seconds: float = 0.0
+    """Seconds the child blocked on its stage and clearance permits before this window, timed by the child."""
+    lease_timed_out: bool = False
+    """Whether a permit acquire returned without a grant, so the job loaded or sampled without being priced."""
 
 
 class HordeJobMetricsMessage(HordeProcessMessage):

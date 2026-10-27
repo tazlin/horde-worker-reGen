@@ -103,7 +103,9 @@ stays untagged (`stage is None`).
 Image inference also attaches an optional `SamplingWindow` to that metrics message. The child stamps
 its first and last reported sampling steps on the host's shared monotonic clock. The aggregator
 retains that window and the sampling card on the finalized `JobMetricsRecord`, including the SAMPLE
-stage of a disaggregated job. The operator assessment uses overlapping windows to establish actual
+stage of a disaggregated job. The window also carries `lease_wait_seconds`, the seconds the child
+blocked on its stage and clearance permits as its own clock timed them, and `lease_timed_out`, set when an
+acquire returned without a grant. The operator assessment uses overlapping windows to establish actual
 sampling concurrency; configured limits, loading and decode overlap cannot establish it. Older records
 without the optional window remain readable and provide no concurrency proof.
 
