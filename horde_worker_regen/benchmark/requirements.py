@@ -296,9 +296,7 @@ def _feature_model_file(
     from horde_worker_regen.model_download_plan import is_model_present
 
     record = reference[record_name]
-    size = getattr(record, "size_on_disk_bytes", None) or (
-        sum(download.size_bytes or 0 for download in record.config.download) or None
-    )
+    size = record.declared_total_size_bytes
     on_disk = is_model_present(
         record_name,
         reference,
