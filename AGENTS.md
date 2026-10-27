@@ -214,7 +214,8 @@ Start from the mechanism, not the file. Each line states the owner of one questi
   The parent clears a staged waiter at dispatch, `ClearanceLeaseProxy.begin_job` unsets the shared figures, and
   `_refresh_unconsumed_grant_figures` rewrites both the device free and the reserve of every unconsumed grant on
   each step from the staged waiter's price, so a grant issued before the job start carries its reserve one step
-  later. The lease brackets the stage upload and
+  later. The parent stops refreshing device free VRAM when the child takes its stage permit. A reading during
+  upload would cause hordelib's clamp to count uploaded weights twice. The lease brackets the stage upload and
   the denoise only; the encoder load, the encode and the VAE decode run outside it. In a run, the released
   encoder's reload for each job pages part of the kept diffusion weights out of the card.
 - **Who may replace a process:** eleven paths, with no shared debounce or view of boot state.

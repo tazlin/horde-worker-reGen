@@ -1222,6 +1222,116 @@ class TestGrantCarriesMeasurementTime:
         assert stage_lease.take_cleared_device_free_mb() == 9_500.0
         assert stage_lease.take_cleared_device_free_measured_at() == 6.0
 
+    def test_a_reading_after_the_stage_take_does_not_reach_the_sample_grant(self) -> None:
+        """Once the child takes its stage permit, the sample grant keeps the figure and time from before its upload.
+
+        The child subtracts allocation growth from the grant's reading, using reservation checkpoints taken
+        after each load. Refreshing that reading during upload would count uploaded weights twice and
+        understate the free memory available to the child.
+        """
+        controller = _controller(tail=False)
+        proxy = _timed_proxy(with_stage=True)
+        controller.register(2, proxy)
+        proxy.begin_job()
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        waiters = (_job_waiter(2, 1),)
+        controller.step(
+            _inputs(staged=waiters, device_free_mb=9_373.0, measured_at=300.0),
+            admit_fn=_always_admit,
+            stage_admit_fn=_RecordingAdmit(True),
+        )
+        assert controller.grant_state(2) is GrantState.CLEARED
+        assert stage_lease.acquire(True, 0.0) is True
+
+        for reading, measured_at in ((7_476.0, 302.0), (6_178.0, 302.4)):
+            controller.step(
+                _inputs(staged=waiters, device_free_mb=reading, measured_at=measured_at),
+                admit_fn=_always_admit,
+                stage_admit_fn=_RecordingAdmit(True),
+            )
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 9_373.0
+        assert proxy.take_cleared_device_free_measured_at() == 300.0
+
+    def test_the_reserve_is_restored_after_the_stage_take_without_a_new_figure(self) -> None:
+        """Job start clears both grant figures. After the stage permit is taken, refresh restores only the reserve.
+
+        The child then keeps the free-VRAM view its stage grant rebased, which already counts its upload as growth.
+        """
+        controller = _controller(tail=False)
+        proxy = ClearanceLeaseProxy(
+            clearance=_held_empty_clearance(),
+            done=_FakeSemaphore(),
+            cleared_device_free=_shared_figure(),
+            cleared_device_free_at=_shared_figure(),
+            stage=_held_empty_clearance(),
+            staged_device_free=_shared_figure(),
+            staged_device_free_at=_shared_figure(),
+            cleared_sampling_reserve=_shared_figure(),
+            staged_sampling_reserve=_shared_figure(),
+        )
+        controller.register(2, proxy)
+        waiters = (
+            ClearanceWaiter(process_id=2, priority=1, job_id="job-a", weights_mb=4_900.0, sampling_reserve_mb=1_519.0),
+        )
+        controller.step(
+            _inputs(staged=waiters, device_free_mb=8_198.0, measured_at=100.0),
+            admit_fn=_always_admit,
+            stage_admit_fn=_always_admit,
+        )
+        proxy.begin_job()
+        stage_lease = proxy.stage_lease
+        assert stage_lease is not None
+        assert stage_lease.acquire(True, 0.0) is True
+
+        controller.step(
+            _inputs(staged=waiters, device_free_mb=6_178.0, measured_at=102.4),
+            admit_fn=_always_admit,
+            stage_admit_fn=_always_admit,
+        )
+
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_sampling_reserve_mb() == 1_519.0
+        assert proxy.take_cleared_device_free_mb() is None
+        assert proxy.take_cleared_device_free_measured_at() is None
+        assert controller.reserves_restored_after_job_start == 1
+
+    @staticmethod
+    def _staged_beside_a_sampler(controller: ClearanceController) -> _StubProxy:
+        """Clear process 1 for its job, then stage process 2 beside it on a reading of 6560 MB at time 49.0."""
+        sampler = _StubProxy(with_stage=True)
+        proxy = _timed_proxy(with_stage=True)
+        controller.register(1, sampler)
+        controller.register(2, proxy)
+        sampler.begin_job()
+        proxy.begin_job()
+        controller.step(_inputs(staged=(_job_waiter(1, 0),), measured_at=10.0), admit_fn=_always_admit)
+        controller.step(
+            _inputs(staged=(_job_waiter(2, 1),), active=(_sampler(1),), device_free_mb=6_560.0, measured_at=49.0),
+            admit_fn=_always_admit,
+            stage_admit_fn=_RecordingAdmit(True),
+        )
+        assert controller.grant_state(2) is GrantState.STAGED
+        return proxy
+
+    def test_a_staged_child_still_waiting_for_its_stage_permit_gets_the_sample_reading(self) -> None:
+        """Before the stage permit is taken, upload has not begun and the grant can use the latest reading."""
+        controller = _controller(slot_cap=1, tail=False)
+        proxy = self._staged_beside_a_sampler(controller)
+
+        controller.step(
+            _inputs(staged=(_job_waiter(2, 1),), device_free_mb=8_100.0, measured_at=50.69),
+            admit_fn=_always_admit,
+            stage_admit_fn=_RecordingAdmit(True),
+        )
+
+        assert controller.grant_state(2) is GrantState.CLEARED
+        assert proxy.acquire(True, 0.0) is True
+        assert proxy.take_cleared_device_free_mb() == 8_100.0
+        assert proxy.take_cleared_device_free_measured_at() == 50.69
+
 
 class TestTailOverlapObservability:
     """A tail-overlap early clear emits its own INFO signal exactly once per outgoing sampler."""

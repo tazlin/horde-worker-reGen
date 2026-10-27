@@ -64,20 +64,24 @@ it; the preload pass's own ceiling of one send per cycle is what bounds the pair
 until nothing more can start, and a gate withholding one selected job is not that: on a multi-card worker the
 walk resumes for work another card can take (see [Dispatch selection](#dispatch-selection)).
 
-The clearance branch reads each inference slot against the job it owns. A slot that owns a dispatched job it
-has not started sampling is a staged waiter
+The clearance branch reads each inference slot against the job it owns. A slot that owns a
+dispatched job it has not started sampling is a staged waiter
 ([`is_staged_short_of_sampling`][horde_worker_regen.process_management.lifecycle.process_info.HordeProcessInfo.is_staged_short_of_sampling]),
-whatever state it reports: a child sent its job with a preload reports the preload's states before it primes,
-and a grant the controller issued at dispatch has to survive them or the child's onset reads as an unpriced
-sampling window. A disaggregated job's pinned sampler is the exception: the pin binds it at admission, before
-the encode runs on another lane, so it is a waiter only once its sample stage reports `INFERENCE_PRIMED`. A
-slot reporting `INFERENCE_STARTING` for its owned job is an active sampler. A completion report ends the
-staging, so a finished sample is never cleared again while its result is in flight. The device free a grant
-carries is rewritten from each cycle's reading until the child takes its permit, because the child reaches its
-sample call seconds after the grant, with its encoder already moved to host RAM. Until it is cleared a staged
-job is charged its family's staging figure
+whatever state it reports: a child sent its job with a preload reports the preload's states before
+it primes, and a grant the controller issued at dispatch has to survive them or the child's onset
+reads as an unpriced sampling window. A disaggregated job's pinned sampler is the exception: the pin
+binds it at admission, before the encode runs on another lane, so it is a waiter only once its
+sample stage reports `INFERENCE_PRIMED`. A slot reporting `INFERENCE_STARTING` for its owned job is
+an active sampler. A completion report ends the staging, so a finished sample is never cleared again
+while its result is in flight. The device free a grant carries is rewritten from each cycle's
+reading until the child takes its permit, because the child reaches its sample call seconds after
+the grant, with its encoder already moved to host RAM. The parent stops refreshing device free VRAM
+once the child takes its stage permit. Later readings include uploaded weights that the child also
+subtracts as allocation growth, so those weights would be counted twice. Until clearance, a staged
+job is charged the family's staging figure
 ([`staging_charge_mb`][horde_worker_regen.process_management.scheduling.admission.pricing.staging_charge_mb]),
-hordelib's support weights for the job's baseline plus a fixed encode allowance, never below SDXL's 2048 MB.
+hordelib's support weights for the job's baseline plus a fixed encode allowance, never below SDXL's
+2048 MB.
 
 Under the clearance lease a third step follows dispatch: `warm_idle_lanes`. A lane holding a model keeps its
 weights as views over the checkpoint file, and the host may drop those pages while the lane idles, so the

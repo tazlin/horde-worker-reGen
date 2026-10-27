@@ -706,63 +706,70 @@ parent a checkpoint at the true VRAM moment. Two-phase clearance (below) keeps t
 grant is priced against measured device free like any admission, so a tight card refuses it and the child
 waits for the single clearance as before.
 
-Two admission consequences follow. First, staging is cheap: a staged job's device footprint is only its
-encode working set (`pricing.staging_charge_mb`: the family's text-encoder and VAE weights from hordelib's
-`vram_support_weights_mb` plus a fixed allowance for the latents and conditioning, never below SDXL's 2048 MB),
-because its weights have not loaded yet. So `_max_jobs_in_progress_allowed` admits a spare process to stage
-ahead whenever measured free net of the reserve covers the encode charge of the job it would dispatch, rather than
-gating on a flat multi-GB device-free floor that mid-sampling rarely cleared (which stranded the spare
-process idle through nearly every sampling window despite queued work). When it does hold the cap at the
-sampling-slot count it records why (no device reading yet, or free net of the reserve short of the encode
-charge), logging the reason on its edge and tallying the shares onto the duty-cycle summary line, so spare
-processes sitting idle beside a queue name the measurement that kept them there. The dispatch reservation books only
-the encode charge while staged; siblings staging ahead therefore never reserve the head's
-full-materialisation room. Second, the full-price fit-or-evict moves to **clearance**: before clearing a
-child the scheduler prices its job's full weights-plus-activation peak against measured device truth through
-the same `MONOLITHIC_DISPATCH` admission identity the dispatch residency gate uses, running the single reclaim
-owner's eviction on a non-fit and upgrading the reservation from the encode charge on a grant, to the peak
-net of what the slot already reports, the figure the admit priced. Weights the target slot already holds are credited out of that price: a slot carrying a retention
-grant for the model its next job needs never left those weights on the card, and the device-free reading
-already excludes them, so charging the whole peak would hold a same-model streak for room the card has
-already given it. Only the weights are credited; the activation peak and the noise buffer are charged in
-full. The parent's own retention record is what says the weights are there, which is the only truth that
-covers a disaggregated sampler: its sample stage reports no model-load transition, so the model map never
-shows a pinned sampler's UNet VRAM-resident however long the slot holds it.
-The post-processing co-residency mutex is applied at clearance too, since clearance, not dispatch, is
-now the VRAM moment for a leased job. A grant also carries the measured device free the admission priced
-against. The controller writes it to a shared float beside the child's clearance semaphore before releasing
-the permit, and the child's `ClearanceLeaseProxy` hands it to hordelib once, on the acquire that obtained the
-permit. hordelib then rebases the run's free-VRAM clamp on it (see [VRAM arbiter](vram_arbiter.md)). The
-figure is the card before this child materialises, since the clamp subtracts the child's own growth from it.
-Until the child takes the permit the controller rewrites the figure from each step's reading, because the
-child reaches its sample call seconds after the grant, after it has moved its own encoder off the card. A
-timed-out or passed-through acquire carries none, a job start unsets the figures until the next step rewrites
-the device free and the reserve of a grant still unconsumed, and a grant that retires
-with its permit never taken has that permit taken back by the controller, so a leftover permit never lets
-the next job on the slot sample unpriced. A clearance held for VRAM fit is
-attributed to the `clearance_hold`
-slot-duty bucket (see [GPU duty cycle](duty-cycle.md)). Liveness always wins over pricing: a child whose
-clearance is starved past hordelib's bounded lease-acquire timeout samples anyway, and the parent logs that
-unpriced window once rather than ever wedging the pool. A lone waiter that nothing else on its card can help
-earns its one measured load before that timeout, on a clearance clock of its own (see the staged-waiter bullet
-in [VRAM arbiter](vram_arbiter.md)). The lease brackets a disaggregated sample stage
-exactly as it brackets a whole job: the sampler resets its per-job grant when a sample control message
-arrives, so each stage waits for its own clearance and a multi-slice batch consumes one grant between them.
-Without that reset a pinned sampler blocks once, for its first stage, and passes straight through
-afterwards, which shows up as grants far outnumbered by unpriced sampling windows and a tail-overlap handoff
-that never fires for want of a waiter. When `gpu_sampling_lease_tail_overlap` is set the
-controller clears one extra child early so the next sampling window opens before the current one closes
-(one early clear per outgoing sampler). The trigger is time-based: the early clear fires when the
-soonest-finishing sampler's estimated remaining seconds drop to the incoming child's measured
-RAM-to-VRAM load estimate plus a small pad, and measured free clears a margin. A progress-fraction
-trigger cannot do this job, because a fixed fraction opens a window whose width scales with the job's
-own duration, starving the handoff on exactly the fast jobs whose loads dominate their wall time. Every
-tick the handoff is applicable and does not fire records a denial reason (no staged waiter, paging,
-progress not yet estimable, remaining time above the window, headroom short), tallied on the duty-cycle
-summary line so a starved handoff names its binding clause. Where two-phase clearance is on, the controller
-does not run the tail-overlap pass. The stage grant hides the incoming job's weight load behind the running job
-on measured fit, which is the work the time-based handoff did on an estimate. With the lease disabled the
-whole-job inference semaphore is the sole denoise gate and dispatch is the VRAM moment exactly as before.
+Two admission consequences follow. First, staging is cheap: a staged job's device footprint is only
+its encode working set (`pricing.staging_charge_mb`: the family's text-encoder and VAE weights from
+hordelib's `vram_support_weights_mb` plus a fixed allowance for the latents and conditioning, never
+below SDXL's 2048 MB), because its weights have not loaded yet. So `_max_jobs_in_progress_allowed`
+admits a spare process to stage ahead whenever measured free net of the reserve covers the encode
+charge of the job it would dispatch, rather than gating on a flat multi-GB device-free floor that
+mid-sampling rarely cleared (which stranded the spare process idle through nearly every sampling
+window despite queued work). When it does hold the cap at the concurrent-inference ceiling it
+records why (no device reading yet, or free net of the reserve short of the encode charge), logging
+the reason on its edge and tallying the shares onto the duty-cycle summary line, so spare processes
+sitting idle beside a queue name the measurement that kept them there. The dispatch reservation
+books only the encode charge while staged; siblings staging ahead therefore never reserve the head's
+full-materialisation room. Second, the full-price fit-or-evict moves to **clearance**: before
+clearing a child the scheduler prices its job's full weights-plus-activation peak against measured
+device truth through the same `MONOLITHIC_DISPATCH` admission identity the dispatch residency gate
+uses, running the single reclaim owner's eviction on a non-fit and upgrading the reservation from
+the encode charge on a grant, to the peak net of what the slot already reports, the figure the admit
+priced. Weights the target slot already holds are credited out of that price: a slot carrying a
+retention grant for the model its next job needs never left those weights on the card, and the
+device-free reading already excludes them, so charging the whole peak would hold a same-model streak
+for room the card has already given it. Only the weights are credited; the activation peak and the
+noise buffer are charged in full. The parent's own retention record is what says the weights are
+there, which is the only truth that covers a disaggregated sampler: its sample stage reports no
+model-load transition, so the model map never shows a pinned sampler's UNet VRAM-resident however
+long the slot holds it. The post-processing co-residency mutex is applied at clearance too, since
+clearance, not dispatch, is now the VRAM moment for a leased job. A grant also carries the measured
+device free the admission priced against. The controller writes it to a shared float beside the
+child's clearance semaphore before releasing the permit, and the child's `ClearanceLeaseProxy` hands
+it to hordelib once, on the acquire that obtained the permit. hordelib then rebases the run's
+free-VRAM clamp on it (see [VRAM arbiter](vram_arbiter.md)). The figure is the card before this
+child materialises, since the clamp subtracts the child's own growth from it. Until the child takes
+the permit the controller rewrites the figure from each step's reading, because the child reaches
+its sample call seconds after the grant, after it has moved its own encoder off the card. The parent
+stops refreshing device free VRAM once the child takes its stage permit. A later reading includes
+uploaded weights that hordelib's clamp also subtracts as allocation growth since the reading.
+Counting those weights twice would cause ComfyUI to unload them immediately. A timed-out or
+passed-through acquire does not carry a reading, a job start unsets the figures until the next step
+rewrites the device free and the reserve of a grant still unconsumed, and a grant that retires with
+its permit never taken has that permit taken back by the controller, so a leftover permit never lets
+the next job on the slot sample unpriced. A clearance held for VRAM fit is attributed to the
+`clearance_hold` slot-duty bucket (see [GPU duty cycle](duty-cycle.md)). Liveness always wins over
+pricing: a child whose clearance is starved past hordelib's bounded lease-acquire timeout samples
+anyway, and the parent logs that unpriced window once rather than ever wedging the pool. A lone
+waiter that nothing else on its card can help earns its one measured load before that timeout, on a
+clearance clock of its own (see the staged-waiter bullet in [VRAM arbiter](vram_arbiter.md)). The
+lease brackets a disaggregated sample stage exactly as it brackets a whole job: the sampler resets
+its per-job grant when a sample control message arrives, so each stage waits for its own clearance
+and a multi-slice batch consumes one grant between them. Without that reset a pinned sampler blocks
+once, for its first stage, and passes straight through afterwards, which shows up as grants far
+outnumbered by unpriced sampling windows and a tail-overlap handoff that never fires for want of a
+waiter. When `gpu_sampling_lease_tail_overlap` is set the controller clears one extra child early so
+the next sampling window opens before the current one closes (one early clear per outgoing sampler).
+The trigger is time-based: the early clear fires when the soonest-finishing sampler's estimated
+remaining seconds drop to the incoming child's measured RAM-to-VRAM load estimate plus a small pad,
+and measured free clears a margin. A progress-fraction trigger cannot do this job, because a fixed
+fraction opens a window whose width scales with the job's own duration, starving the handoff on
+exactly the fast jobs whose loads dominate their wall time. Every tick the handoff is applicable and
+does not fire records a denial reason (no staged waiter, paging, progress not yet estimable,
+remaining time above the window, headroom short), tallied on the duty-cycle summary line so a
+starved handoff names its binding clause. Where two-phase clearance is on, the controller does not
+run the tail-overlap pass. The stage grant hides the incoming job's weight load behind the running
+job on measured fit, which is the work the time-based handoff did on an estimate. With the lease
+disabled the whole-job inference semaphore is the sole denoise gate and dispatch is the VRAM moment
+exactly as before.
 
 **Two-phase clearance** (`gpu_sampling_lease_two_phase`, on by default when the lease is enabled) gives each
 child two permits the parent holds empty. The stage permit lets hordelib upload the job's diffusion weights

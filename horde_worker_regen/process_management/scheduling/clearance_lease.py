@@ -113,9 +113,11 @@ class ClearanceLeaseProxy:
     child judge its load against the card the parent just admitted it to. The child reads the figure only on
     an acquire that obtained the permit, so a timed-out or passed-through acquire yields none. Until the child
     takes the permit the parent rewrites the figure from each control step's reading, since the child can reach
-    its sample call seconds after the grant, by which time it has moved its own encoder off the card. Children
-    cleared in the same step each get the reading less what the children cleared before them take of it, since
-    each child sizes its load to the figure it is handed.
+    its sample call seconds after the grant, by which time it has moved its own encoder off the card. The parent
+    stops refreshing device free VRAM once the child takes its stage permit. Later readings include weights
+    uploaded by that child. The child also subtracts allocation growth since the reading, so refreshing the
+    figure during upload would count those weights twice. For children cleared in the same step, each grant
+    subtracts earlier grants from the reading so the children do not budget the same free memory.
 
     The figure travels with the ``time.monotonic()`` of the reading behind it, in a shared float written and
     rewritten with it and served once through :meth:`take_cleared_device_free_measured_at`. The child releases
@@ -400,7 +402,7 @@ class ClearanceLeaseProxy:
     def _parent_refresh_grant_figure(
         self,
         *,
-        device_free_mb: float,
+        device_free_mb: float | None,
         sampling_reserve_mb: float | None,
         device_free_measured_at: float | None = None,
     ) -> GrantFigureRefresh:
@@ -408,10 +410,11 @@ class ClearanceLeaseProxy:
 
         The permit is held across the write. The child's acquire can return only once the permit is back, so it
         reads the new figures, and a permit the child already took cannot be rewritten, so a consumed grant is
-        never rewritten. A child that probes during the hold finds no permit and blocks until the release.
+        never rewritten. A child that probes during the hold does not get a permit and blocks until the release.
 
         The reserve is written beside the device free because the child's job start unsets both; None unsets
-        the reserve. A reserve found unset under an unconsumed permit and written with a figure is reported as
+        the reserve. A ``device_free_mb`` of None leaves the device free and its time as they stand and writes the
+        reserve alone. A reserve found unset under an unconsumed permit and written with a figure is reported as
         restored, since the job start unset it after the grant.
         """
         if self._cleared_device_free is None:
@@ -423,8 +426,9 @@ class ClearanceLeaseProxy:
                 self._cleared_sampling_reserve is not None
                 and _read_shared_figure(self._cleared_sampling_reserve) is None
             )
-            self._cleared_device_free.value = device_free_mb
-            _write_shared_figure(self._cleared_device_free_at, device_free_measured_at)
+            if device_free_mb is not None:
+                self._cleared_device_free.value = device_free_mb
+                _write_shared_figure(self._cleared_device_free_at, device_free_measured_at)
             _write_shared_figure(self._cleared_sampling_reserve, sampling_reserve_mb)
         finally:
             self._clearance.release()
@@ -482,6 +486,20 @@ class ClearanceLeaseProxy:
         if self._stage is None:
             return False
         return bool(self._stage.acquire(False))
+
+    def _parent_stage_permit_taken(self) -> bool:
+        """Return whether the child has taken its stage permit and begun uploading weights.
+
+        Read for a child whose sample grant is outstanding, which always carries a stage permit released with it
+        or before it, so a permit that is not available is one the child took. The probe holds the permit only
+        across the check, as a refresh does.
+        """
+        if self._stage is None:
+            return False
+        if not self._stage.acquire(False):
+            return True
+        self._stage.release()
+        return False
 
     def _parent_drain_done(self) -> bool:
         """Parent-side: non-blockingly take one done signal, returning whether one was present."""
@@ -1303,6 +1321,11 @@ class ClearanceController:
         a cleared child's stage figures too while the stage permit is untaken. Each rewrite carries the reading's
         time beside the figure.
 
+        Once a cleared child takes its stage permit, keep the sample grant's free-VRAM reading from before upload.
+        The child subtracts allocation growth using reservation checkpoints taken after each load. Refreshing the
+        reading during upload would count uploaded weights twice. ComfyUI would then unload those weights to
+        restore the reserve and reload them repeatedly during sampling.
+
         The reserve is rewritten beside the device free from the child's staged waiter, which the snapshot keeps
         until the child reports sampling. The parent may grant before the child's job start, which unsets both
         figures, so the rewrite restores the reserve one step later, as it does the device free. A waiter priced
@@ -1324,8 +1347,9 @@ class ClearanceController:
             )
             if state is not GrantState.CLEARED:
                 continue
+            upload_begun = proxy._parent_stage_permit_taken()
             refresh = proxy._parent_refresh_grant_figure(
-                device_free_mb=device_free_mb,
+                device_free_mb=None if upload_begun else device_free_mb,
                 sampling_reserve_mb=sampling_reserve_mb,
                 device_free_measured_at=device_free_measured_at,
             )
