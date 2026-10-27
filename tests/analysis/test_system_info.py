@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from horde_worker_regen.analysis import system_info
 from horde_worker_regen.analysis.cache_inventory import collect_cache_inventory
 from horde_worker_regen.analysis.system_info import (
     collect_system_info,
     config_secret_values,
     resolve_cache_home,
+    rotational_storage,
 )
 
 
@@ -30,6 +34,90 @@ class TestSystemInfo:
         info = collect_system_info(cache_home=str(tmp_path))
         assert info["cache_home"] == str(tmp_path)
         assert info["disk"]["cache_home"]["total_bytes"] > 0
+
+
+@pytest.fixture
+def fake_sysfs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the probe at a sysfs tree under tmp_path, with device entries named ``major_minor``.
+
+    The real entries are named ``major:minor``, which is not a valid file name on Windows.
+    """
+    monkeypatch.setattr(system_info, "_SYSFS_ROOT", tmp_path)
+    monkeypatch.setattr(
+        system_info, "_block_device_entry", lambda *, major, minor: tmp_path / "dev" / "block" / f"{major}_{minor}"
+    )
+    return tmp_path
+
+
+def _write_block_device(sysfs: Path, *, number: str, device_name: str, device_type: str) -> None:
+    entry = sysfs / "dev" / "block" / number
+    entry.mkdir(parents=True)
+    (entry / "uevent").write_text(f"MAJOR=8\nDEVNAME={device_name}\nDEVTYPE={device_type}\n", encoding="utf-8")
+
+
+class TestRotationalStorage:
+    """The storage-type probe, which reports None whenever the media type cannot be read."""
+
+    @pytest.mark.parametrize(("flag", "expected"), [("1\n", True), ("0\n", False)])
+    def test_linux_partition_reads_its_disk_flag(self, fake_sysfs: Path, flag: str, expected: bool) -> None:
+        """A partition is walked to its parent disk, whose queue/rotational flag determines the result."""
+        _write_block_device(fake_sysfs, number="8_1", device_name="sda1", device_type="partition")
+        (fake_sysfs / "block" / "sda" / "sda1").mkdir(parents=True)
+        (fake_sysfs / "block" / "sda" / "queue").mkdir()
+        (fake_sysfs / "block" / "sda" / "queue" / "rotational").write_text(flag, encoding="utf-8")
+        assert system_info._linux_rotational(major=8, minor=1) is expected
+
+    def test_linux_whole_disk_reads_its_own_flag(self, fake_sysfs: Path) -> None:
+        """A device-mapper or unpartitioned disk carries the flag itself."""
+        _write_block_device(fake_sysfs, number="253_0", device_name="dm-0", device_type="disk")
+        (fake_sysfs / "block" / "dm-0" / "queue").mkdir(parents=True)
+        (fake_sysfs / "block" / "dm-0" / "queue" / "rotational").write_text("0\n", encoding="utf-8")
+        assert system_info._linux_rotational(major=253, minor=0) is False
+
+    @pytest.mark.usefixtures("fake_sysfs")
+    def test_linux_anonymous_device_is_undetermined(self) -> None:
+        """A filesystem with no block device entry (btrfs subvolume, overlay, tmpfs) reports None."""
+        assert system_info._linux_rotational(major=0, minor=42) is None
+
+    def test_linux_partition_without_parent_is_undetermined(self, fake_sysfs: Path) -> None:
+        """A partition whose disk cannot be found reports None rather than guessing."""
+        _write_block_device(fake_sysfs, number="8_1", device_name="sda1", device_type="partition")
+        (fake_sysfs / "block").mkdir()
+        assert system_info._linux_rotational(major=8, minor=1) is None
+
+    def test_unsupported_platform_is_undetermined(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MacOS and other platforms report None."""
+        monkeypatch.setattr(system_info.sys, "platform", "darwin")
+        assert rotational_storage(tmp_path) is None
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="a drive letter only parses as one on Windows")
+    @pytest.mark.parametrize(
+        ("stdout", "expected"), [("HDD\r\n", True), ("SSD\r\n", False), ("Unspecified\r\n", None), ("", None)]
+    )
+    def test_windows_media_type_mapping(
+        self, monkeypatch: pytest.MonkeyPatch, stdout: str, expected: bool | None
+    ) -> None:
+        """The probe returns the physical disk's media type, or None when the type is unknown or missing."""
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(system_info.subprocess, "run", fake_run)
+        assert system_info._windows_rotational(Path("C:/models")) is expected
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="a drive letter only parses as one on Windows")
+    def test_windows_probe_timeout_is_undetermined(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A PowerShell call that exceeds its bound reports None instead of raising."""
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(command, 10.0)
+
+        monkeypatch.setattr(system_info.subprocess, "run", fake_run)
+        assert system_info._windows_rotational(Path("C:/models")) is None
+
+    def test_windows_unc_path_is_undetermined(self) -> None:
+        """A network share has no drive letter to map to a physical disk."""
+        assert system_info._windows_rotational(Path("//server/share/models")) is None
 
 
 class TestConfigReads:

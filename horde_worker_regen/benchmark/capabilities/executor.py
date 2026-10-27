@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from horde_worker_regen.analysis.system_info import resolve_cache_home, rotational_storage
 from horde_worker_regen.benchmark.capabilities.capability import Capability, CapabilityKind, CapabilityVerdict
 from horde_worker_regen.benchmark.capabilities.catalog import (
     CatalogOptions,
@@ -86,7 +87,8 @@ def detect_machine_info(*, probe_devices: bool = True) -> MachineInfo:
     RAM is always read (cheap, via psutil). GPU enumeration is skipped when ``probe_devices`` is False:
     it runs out-of-process (see :func:`accelerator_probe.probe_accelerators`) to keep this caller
     torch-free, but that subprocess loads torch and is pointless in fake/dry-run mode, which never
-    touches the GPU. Real runs leave it on so the report and fit verdicts see the actual device.
+    touches the GPU. Real runs leave it on so the report and fit verdicts see the actual device. The storage
+    type of the model cache is probed under the same switch, since only a real run loads weights from it.
     """
     info = MachineInfo()
     try:
@@ -107,6 +109,9 @@ def detect_machine_info(*, probe_devices: bool = True) -> MachineInfo:
             info.total_vram_mb = primary.total_vram_mb
     except Exception:  # noqa: BLE001 - purely informational
         pass
+    cache_home = resolve_cache_home()
+    if cache_home:
+        info.storage[cache_home] = rotational_storage(Path(cache_home))
     return info
 
 

@@ -79,6 +79,8 @@ class MachineInfo(BaseModel):
     gpu_name: str | None = None
     total_vram_mb: int | None = None
     total_ram_bytes: int | None = None
+    storage: dict[str, bool | None] = Field(default_factory=dict)
+    """Model directory to whether it is on rotational media (True), solid state (False) or undetermined (None)."""
 
 
 class SuggestionBasis(StrEnum):

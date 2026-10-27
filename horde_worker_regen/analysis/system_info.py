@@ -1,12 +1,14 @@
-"""Collect the host context a maintainer needs to reason about a worker incident.
+"""Collect system information for diagnosing worker problems.
 
-The logs say *what* happened; this says *where*. Worker version (with git state), OS/python, CPU/RAM,
-free disk on the working volume and the model-cache volume, and optionally a GPU inventory. All of it is
-torch-free in-process: the only torch-touching collector, the accelerator probe, runs out of process and
-is opt-in, so generating a bundle never drags the inference stack into the orchestrator/CLI.
+Include the worker version and Git state, OS/Python versions, CPU/RAM, free disk space on the working
+and model-cache volumes, and an optional GPU inventory. The accelerator probe runs in a separate process
+and requires explicit opt-in, so generating a bundle does not load torch into the orchestrator or CLI.
 
-Reads ``bridgeData.yaml`` directly (best-effort) rather than importing the Textual-laden config module,
-so this stays importable without the TUI.
+``rotational_storage`` reports whether a path is on spinning or solid-state media, for advice that depends on
+how expensive a model reload from disk is.
+
+Read ``bridgeData.yaml`` directly when available to avoid importing the config module and its Textual
+dependency. This module can be used without the TUI.
 """
 
 from __future__ import annotations
@@ -16,11 +18,13 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import psutil
+from loguru import logger
 
 from horde_worker_regen.runtime_version import runtime_version
 
@@ -83,6 +87,107 @@ def _disk_free(path: Path) -> dict[str, int] | None:
         return {"free_bytes": usage.free, "total_bytes": usage.total}
     except OSError:
         return None
+
+
+_SYSFS_ROOT = Path("/sys")
+# Get-PhysicalDisk and its Storage module take several seconds to load on a cold PowerShell.
+_WINDOWS_STORAGE_PROBE_TIMEOUT_SECONDS = 10.0
+_WINDOWS_MEDIA_TYPE_ROTATIONAL: dict[str, bool] = {"HDD": True, "SSD": False, "SCM": False}
+
+
+def rotational_storage(path: Path) -> bool | None:
+    """Return whether ``path`` is on rotational media: True for a spinning disk, False for solid state.
+
+    Linux reads the ``queue/rotational`` flag of the block device behind the path, walking a partition to its
+    disk. Windows asks ``Get-PhysicalDisk`` for the media type of the disk behind the path's drive letter, in a
+    bounded PowerShell subprocess. Every other platform, and any failure, returns None.
+
+    Args:
+        path: A file or directory on the volume to probe.
+
+    Returns:
+        True for rotational media, False for solid state, None when the type could not be determined.
+
+    Performance:
+        The Windows probe spawns PowerShell and takes a few seconds, so call it once per path and off any
+        event loop.
+    """
+    if sys.platform == "linux":
+        try:
+            device_number = os.stat(path).st_dev
+        except OSError as error:
+            logger.debug(f"Storage type of {path} not determined: {error}")
+            return None
+        return _linux_rotational(major=os.major(device_number), minor=os.minor(device_number))
+    if sys.platform == "win32":
+        return _windows_rotational(path)
+    return None
+
+
+def _block_device_entry(*, major: int, minor: int) -> Path:
+    """Return the sysfs directory of block device ``major:minor``."""
+    return _SYSFS_ROOT / "dev" / "block" / f"{major}:{minor}"
+
+
+def _linux_rotational(*, major: int, minor: int) -> bool | None:
+    """Return the rotational flag of the disk holding block device ``major:minor``, or None when unreadable."""
+    try:
+        uevent = (_block_device_entry(major=major, minor=minor) / "uevent").read_text(encoding="utf-8")
+    except OSError as error:
+        # Filesystems with anonymous devices (btrfs subvolumes, overlay, tmpfs) have no block device entry.
+        logger.debug(f"Storage type of block device {major}:{minor} not determined: {error}")
+        return None
+    fields = dict(line.split("=", 1) for line in uevent.splitlines() if "=" in line)
+    device_name = fields.get("DEVNAME")
+    if not device_name:
+        return None
+    disk_name = device_name
+    if fields.get("DEVTYPE") == "partition":
+        parents = [disk.name for disk in (_SYSFS_ROOT / "block").iterdir() if (disk / device_name).is_dir()]
+        if not parents:
+            return None
+        disk_name = parents[0]
+    try:
+        flag = (_SYSFS_ROOT / "block" / disk_name / "queue" / "rotational").read_text(encoding="utf-8").strip()
+    except OSError as error:
+        logger.debug(f"Storage type of {disk_name} not determined: {error}")
+        return None
+    if flag not in ("0", "1"):
+        return None
+    return flag == "1"
+
+
+def _windows_rotational(path: Path) -> bool | None:
+    """Return the media type of the physical disk behind the path's drive letter, or None when unknown."""
+    try:
+        drive = path.resolve().drive
+    except (OSError, RuntimeError) as error:
+        logger.debug(f"Storage type of {path} not determined: {error}")
+        return None
+    if len(drive) != 2 or not drive.endswith(":") or not drive[0].isalpha():
+        # A UNC share or a volume mounted without a letter cannot be mapped through Get-Partition.
+        return None
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$partition = Get-Partition -DriveLetter {drive[0]}; "
+        "(Get-PhysicalDisk | Where-Object { $_.DeviceId -eq [string]$partition.DiskNumber }).MediaType"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=_WINDOWS_STORAGE_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        logger.debug(f"Storage type of {path} not determined: {error}")
+        return None
+    if completed.returncode != 0:
+        logger.debug(f"Storage type of {path} not determined: {completed.stderr.strip()[:300]}")
+        return None
+    # A Storage Spaces or RAID volume may span multiple physical disks, and some drives report "Unspecified".
+    return _WINDOWS_MEDIA_TYPE_ROTATIONAL.get(completed.stdout.strip())
 
 
 _SMI_CUDA_RE = re.compile(r"CUDA Version:\s*(\d+\.\d+)")
