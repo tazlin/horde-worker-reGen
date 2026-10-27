@@ -37,10 +37,19 @@ class TestExtraLargeBaselines:
         assert is_extra_large_model("some_qwen_checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.qwen_image.value)
         assert is_extra_large_model("some_z_image_checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.z_image_turbo.value)
         assert is_extra_large_model("some_krea2_checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo.value)
+        assert is_extra_large_model("some_moss_checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.moss_image.value)
 
     def test_sdxl_is_not_extra_large(self) -> None:
         """An SDXL model is heavy but shares the card, so it is not EXTRA_LARGE."""
         assert not is_extra_large_model("an_sdxl_model", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value)
+
+    def test_sdxl_class_baselines_are_heavy(self) -> None:
+        """Anima carries an SDXL-sized diffusion model, so it shares SDXL's tier."""
+        for baseline in (
+            KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            KNOWN_IMAGE_GENERATION_BASELINE.anima,
+        ):
+            assert model_size_tier("a_model", baseline.value) is ModelSizeTier.HEAVY
 
     def test_sd15_is_not_extra_large(self) -> None:
         """An SD1.5 model is light, so it is not EXTRA_LARGE."""

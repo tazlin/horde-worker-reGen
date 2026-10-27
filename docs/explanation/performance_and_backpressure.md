@@ -239,9 +239,9 @@ read rather than a latch: see
 
 The same "never advertise what cannot be served" rule applies to models. While *every* governed
 card sits below the device-free governor's soft floor, the pop drops the whole-card
-(`EXTRA_LARGE`) models: Flux, Cascade, Qwen, Z-Image, and the named VRAM-heavy checkpoints. A
-model that wants the whole card has nowhere to go on a card already under pressure, so offering
-it only earns work that waits on a reclaim which may never arrive.
+(`EXTRA_LARGE`) models: Flux, Cascade, Qwen, Z-Image, Krea2, MOSS-Image, and the named
+VRAM-heavy checkpoints. A model that wants the whole card has nowhere to go on a card already
+under pressure, so offering it only earns work that waits on a reclaim which may never arrive.
 
 The signal is the governor's own committed state, which requires two agreeing NVML samples, so
 the offer does not flap on a single dip. One healthy card answers "no pressure" for the whole
@@ -627,7 +627,7 @@ same moment, thrashing a sampler badly enough to trip its step-timeout watchdog 
 `concurrent_overlap_permitted` in `scheduling/concurrent_overlap.py`; the scheduler only gathers its inputs):
 a new job may join work that is already sampling only when the in-flight work can tolerate it. Models are classed into size tiers
 (`_model_size_tier`): a model in the VRAM-heavy list or carrying an extra-large baseline is
-**extra-large**; SDXL is **heavy**; SD1.5/SD2 are **light**; an unknown baseline falls back to light so a
+**extra-large**; SDXL and Anima are **heavy**; SD1.5/SD2 are **light**; an unknown baseline falls back to light so a
 missing reference does not starve dispatch. The rules, scaled by tier:
 
 - The first job (nothing in flight) always starts.

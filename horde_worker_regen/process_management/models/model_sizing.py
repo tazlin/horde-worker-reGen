@@ -25,9 +25,9 @@ class ModelSizeTier(IntEnum):
     """How much of the device a model's inference is expected to want, for concurrency decisions.
 
     Ordered so heavier tiers compare greater. ``LIGHT`` jobs (SD1.5/SD2) are cheap enough to sample side by
-    side; ``HEAVY`` (SDXL) jobs need the job they would overlap to be well underway first; and ``EXTRA_LARGE``
-    (Cascade/Flux/Qwen/Z-Image/Krea2 and the named VRAM-heavy checkpoints) effectively want the whole card and
-    never share it.
+    side; ``HEAVY`` (SDXL/Anima) jobs need the job they would overlap to be well underway first; and
+    ``EXTRA_LARGE`` (Cascade/Flux/Qwen/Z-Image/Krea2/MOSS-Image and the named VRAM-heavy checkpoints)
+    effectively want the whole card and never share it.
     """
 
     LIGHT = 0
@@ -47,6 +47,7 @@ LIGHT_BASELINE_VALUES = frozenset(
 HEAVY_BASELINE_VALUES = frozenset(
     {
         KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.anima.value,
     },
 )
 """Baselines that need the job they overlap to be well underway before joining the card."""
@@ -60,6 +61,7 @@ EXTRA_LARGE_BASELINE_VALUES = frozenset(
         KNOWN_IMAGE_GENERATION_BASELINE.qwen_image.value,
         KNOWN_IMAGE_GENERATION_BASELINE.z_image_turbo.value,
         KNOWN_IMAGE_GENERATION_BASELINE.krea2_turbo.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.moss_image.value,
     },
 )
 """Baselines that effectively want the whole card and never share it with a concurrent job."""
