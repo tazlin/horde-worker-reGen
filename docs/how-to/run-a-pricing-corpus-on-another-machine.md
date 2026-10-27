@@ -50,7 +50,7 @@ horde-benchmark pricing-corpus --tier census --machine alice-l40s
 | `smoke` | That the plumbing works; produces no usable rows | minutes |
 | `standard` | The marginal cost of each payload axis on SD1.5 and SDXL | about 1.5 h |
 | `census` | Every sampler, schedule, control type and post-processor the cost model prices | 2.5 h with `--job-budget 600`, 4 h by default |
-| `heavy` | Flux, Qwen, Z-Image, Krea2 and Anima on a card that holds them | about 1.5 h |
+| `heavy` | Flux, Qwen, Z-Image, Krea2, Anima and MOSS-Image on a card that holds them | about 1.5 h |
 
 If this machine is running the `heavy` tier for the first time, run one model as its own smoke first
 and send that bundle before the full tier:

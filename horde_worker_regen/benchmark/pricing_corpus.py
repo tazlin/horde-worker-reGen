@@ -72,10 +72,13 @@ QWEN_A = "Qwen-Image_fp8"
 ZIMAGE_A = "Z-Image-Turbo"
 KREA2_A = "Krea2-Turbo_fp8"
 ANIMA_A = "Anima-Turbo-v1.1"
+MOSS_A = "MOSS-Image-SFT"
 
-HEAVY_MODELS: tuple[str, ...] = (FLUX_A, QWEN_A, ZIMAGE_A, KREA2_A, ANIMA_A)
-"""The heavy tier's models, one per family the reference machine cannot serve; the beta-overlay names
-(Krea2, Anima) are what the worker's pending-queue opt-in resolves."""
+HEAVY_MODELS: tuple[str, ...] = (FLUX_A, QWEN_A, ZIMAGE_A, KREA2_A, ANIMA_A, MOSS_A)
+"""The heavy tier's models, one per family the reference machine cannot serve.
+
+A model whose record is only in the pending queue resolves through the worker's beta opt-in, which a
+corpus run applies."""
 
 _MODEL_TAGS: dict[str, str] = {
     SDXL_A: "sdxl",
@@ -86,6 +89,7 @@ _MODEL_TAGS: dict[str, str] = {
     ZIMAGE_A: "zimage",
     KREA2_A: "krea2",
     ANIMA_A: "anima",
+    MOSS_A: "moss",
 }
 """Short, stable per-model tags used in cell ids (the ids are read by humans and by the assembler)."""
 
@@ -282,6 +286,7 @@ CORPUS_MODEL_BASELINES: dict[str, str] = {
     ZIMAGE_A: "z_image_turbo",
     KREA2_A: "krea2_turbo",
     ANIMA_A: "anima",
+    MOSS_A: "moss_image",
 }
 """The baseline every corpus model belongs to, across all tiers.
 
@@ -907,11 +912,31 @@ _HEAVY_ANCHORS: dict[str, CorpusCell] = {
         scheduler="simple",
         source_processing="txt2img",
     ),
+    MOSS_A: CorpusCell(
+        cell_id="anchor.moss",
+        group="anchor",
+        model=MOSS_A,
+        width=1024,
+        height=1024,
+        steps=25,
+        cfg_scale=2.5,
+        n_iter=1,
+        sampler_name="er_sde",
+        scheduler="simple",
+        source_processing="txt2img",
+    ),
 }
 """Each heavy model at its native shape, inside the sampler, schedule, step and guidance ranges its model
 reference record requires; a job outside them is refused by the worker rather than measured."""
 
-_HEAVY_ALTERNATE_STEPS: dict[str, int | None] = {FLUX_A: 8, QWEN_A: 40, ZIMAGE_A: None, KREA2_A: None, ANIMA_A: 12}
+_HEAVY_ALTERNATE_STEPS: dict[str, int | None] = {
+    FLUX_A: 8,
+    QWEN_A: 40,
+    ZIMAGE_A: None,
+    KREA2_A: None,
+    ANIMA_A: 12,
+    MOSS_A: 50,
+}
 """A second trajectory length inside each model's allowed range, or None where the range is one value.
 
 Distilled turbo models are locked to one step count, so their per-step cost is not separable from the
