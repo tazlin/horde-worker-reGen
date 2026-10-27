@@ -544,6 +544,22 @@ class TestControllerClearing:
         assert proxy.clearance_value == 1  # the child can now acquire its window
         assert controller.held_grant_count == 1
 
+    def test_live_cap_below_the_slot_cap_limits_new_grants(self) -> None:
+        """A lowered live concurrent-inference cap bounds new grants without a drained resize."""
+        live_cap = [2]
+        controller = ClearanceController(device_index=0, slot_cap=2, tail_overlap=False, live_cap=lambda: live_cap[0])
+        for process_id in (2, 3):
+            controller.register(process_id, _StubProxy())
+        staged = (ClearanceWaiter(process_id=2, priority=1), ClearanceWaiter(process_id=3, priority=2))
+
+        live_cap[0] = 1
+        result = controller.step(_inputs(staged=staged), admit_fn=_always_admit)
+
+        assert result.cleared_process_ids == (2,)
+        assert controller.effective_slot_cap == 1
+        live_cap[0] = 2
+        assert controller.effective_slot_cap == 2
+
     def test_admission_denied_holds_the_waiter(self) -> None:
         """A waiter whose full-price admission does not fit is held, not cleared: its slot is a reported hold."""
         controller = _controller()

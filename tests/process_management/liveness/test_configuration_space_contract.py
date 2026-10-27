@@ -125,7 +125,8 @@ def test_every_boundary_configuration_resolves_to_a_consistent_process_topology(
     assert resolved.gpu_sampling_lease_tail_overlap is (lease_enabled and tail_overlap)
 
     expected_slots = max_threads if lease_slots is None else lease_slots
-    expected_slots = min(max(1, expected_slots), expected_processes)
+    # max_threads admits the jobs, so the lease never holds more denoise slots than that.
+    expected_slots = min(max(1, expected_slots), max_threads, expected_processes)
     assert resolved.gpu_sampling_lease_slots == expected_slots
     if lease_enabled:
         assert resolved.inference_semaphore_size == expected_processes

@@ -459,7 +459,8 @@ These fail as interactions, not as units, so component tests stay green through 
   prefetch-and-touch does; `tail_overlap=True` turns on the controller's handoff window and feeds it what
   production does, each sampler's step position through `ProcessMap.on_heartbeat` and each paid load as a
   `ram_to_vram` phase through `ProcessMap.on_job_metrics`; `gpu_sampling_lease_slots` sets the controller's cap
-  apart from `max_threads`. `idle_lane_warm=True` has a lane honour the parent's warm message
+  below `max_threads`. It cannot exceed `max_threads`, and the live concurrent-inference cap can lower it
+  further. `idle_lane_warm=True` has a lane honour the parent's warm message
   (`InferenceScheduler.warm_idle_lanes`): an idle lane holding the named model re-reads its reclaimed pages
   ahead of dispatch (off, the lane ignores the message); a dispatch adopts a running warm and clearance pays only
   the unfinished part. All four default to the off or `max_threads` value. `performance_model=True` gives

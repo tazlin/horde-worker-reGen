@@ -561,15 +561,18 @@ def _resolve_inference_concurrency(
     inference semaphore opens up to every inference process, letting spare processes stage their
     next pipeline (model load, prompt encode) ahead instead of blocking at job start.
 
-    When ``configured_lease_slots`` is ``None`` (the default) the slot count tracks the
+    When ``configured_lease_slots`` is ``None`` (the default) the slot count equals the
     concurrent-inference ceiling, so enabling the lease never serializes the denoise below the
-    concurrency ``max_threads`` already admits. An explicit value overrides that, e.g. to pin a
+    concurrency ``max_threads`` already admits. An explicit value may lower it, e.g. to pin a
     single denoise loop on time-slicing (no-MPS) hardware while still staging the next job ahead.
-    Either way the slot count is clamped to ``[1, max_inference_processes]`` (at least one denoise
-    may always run, and more slots than processes can never be used).
+    It never raises it: ``max_threads`` is the job-admission gate, so a denoise loop beyond it would
+    have no admitted job to run. The slot count is therefore clamped to
+    ``[1, min(max_concurrent_inference_processes, max_inference_processes)]``.
     """
     desired_slots = max_concurrent_inference_processes if configured_lease_slots is None else configured_lease_slots
-    lease_slots = min(max(1, desired_slots), max(1, max_inference_processes))
+    lease_slots = min(
+        max(1, desired_slots), max(1, max_concurrent_inference_processes), max(1, max_inference_processes)
+    )
     if gpu_sampling_lease_enabled:
         return max_inference_processes, lease_slots
     return max_concurrent_inference_processes, lease_slots
@@ -2364,6 +2367,7 @@ class HordeWorkerProcessManager:
                 device_index=index,
                 slot_cap=per_card_concurrency[index].gpu_sampling_lease_slots,
                 tail_overlap=per_card_concurrency[index].gpu_sampling_lease_tail_overlap,
+                live_cap=lambda: self._runtime_config.effective_max_threads,
             )
             for index in device_indices
             if self.bridge_data.gpu_sampling_lease_enabled

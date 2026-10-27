@@ -91,7 +91,7 @@ Four shared synchronization primitives gate process concurrency:
 
 | Primitive              | Purpose                                                                                            |
 | ---------------------- | -------------------------------------------------------------------------------------------------- |
-| `inference_semaphore`  | Limits processes running inference at once to `max_concurrent_inference_processes` (`max_threads`) |
+| `inference_semaphore`  | Limits processes running inference at once to `max_concurrent_inference_processes` (`max_threads`); with the sampling lease enabled it opens to the inference-process count and the lease becomes the denoise gate |
 | `vae_decode_semaphore` | Limits concurrent VAE decode operations across processes                                           |
 | `disk_lock`            | Serializes model downloads to avoid disk contention                                                |
 | `aux_model_lock`       | Serializes auxiliary model (ControlNet, LoRA) loading                                              |

@@ -1660,7 +1660,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "GPU sampling lease",
         "How many processes may run the denoising loop at once when gpu_sampling_lease_enabled is true. "
         "Leave blank to track Max threads. Set 1 to serialize (efficient on Windows WDDM, where concurrent "
-        "loops only time-slice); higher values permit that many concurrent loops.",
+        "loops only time-slice); higher values permit that many concurrent loops, up to Max threads.",
         requires_restart=True,
         minimum=None,
         maximum=16,

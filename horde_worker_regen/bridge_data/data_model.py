@@ -442,6 +442,34 @@ def _warn_lease_without_residency(
     return non_resident
 
 
+def _warn_lease_slots_above_threads(
+    *,
+    gpu_sampling_lease_enabled: bool,
+    gpu_sampling_lease_slots: int | None,
+    max_threads: int,
+    log: bool = False,
+) -> bool:
+    """Detect (and optionally warn about) more denoise slots than the worker admits jobs.
+
+    ``max_threads`` is the job-admission gate, so a denoise slot beyond it never has a job to run. The
+    runtime clamps the slot count to ``max_threads``; the warning tells the operator which value is in
+    force.
+
+    Returns:
+        True if an explicit slot count sits above the concurrency cap.
+    """
+    if not gpu_sampling_lease_enabled or gpu_sampling_lease_slots is None:
+        return False
+    above = gpu_sampling_lease_slots > max_threads
+    if above and log:
+        logger.warning(
+            f"gpu_sampling_lease_slots={gpu_sampling_lease_slots} is above max_threads={max_threads}; "
+            f"{max_threads} slots are used because the lease cannot sample more jobs than the worker admits. "
+            "Raise max_threads to run more concurrent denoise loops.",
+        )
+    return above
+
+
 def _warn_lease_slots_below_threads(
     *,
     gpu_sampling_lease_enabled: bool,
@@ -901,20 +929,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
     reload behind sampling rather than overlapping it."""
 
     gpu_sampling_lease_slots: int | None = Field(default=None, ge=1)
-    """How many inference processes may run the GPU denoising loop at once when
-    `gpu_sampling_lease_enabled` is true (clamped to the inference-process count at runtime).
+    """Maximum inference processes allowed to denoise at once when `gpu_sampling_lease_enabled` is true.
 
-    Leave unset (the default) to track `max_threads`: the lease is the denoise gate, so without this
-    the slot count would default to 1 and enabling the lease on a `max_threads > 1` worker would
-    silently sample fewer jobs at once than the worker admits. Auto-tracking keeps the
-    concurrent-denoise count your concurrency settings already imply.
+    Leave unset to use `max_threads`. An explicit value is capped at `max_threads`, since the worker
+    cannot sample more jobs than it admits. The supervisor and resource governor can lower the live
+    concurrency cap further.
 
-    Set an explicit value to override. 1 serializes denoising, so one process samples while the rest
-    stage their next pipeline; on hardware without CUDA MPS (e.g. Windows WDDM) concurrent denoise
-    loops time-slice the GPU rather than truly parallelizing, so an explicit value below `max_threads`
-    is the efficient choice there (it overlaps the next job's RAM->VRAM load and prompt encode behind
-    the current denoise without paying for time-sliced concurrent sampling). Values above 1 permit
-    that many concurrent denoise loops. No effect unless `gpu_sampling_lease_enabled` is true."""
+    Set 1 to serialize denoising while other processes load and encode their next job. On hardware
+    without CUDA MPS, such as Windows WDDM, concurrent denoise loops time-slice the GPU. A value below
+    `max_threads` can improve throughput there by overlapping preparation with sampling. Higher values
+    permit more concurrent denoise loops, up to `max_threads`.
+
+    This field has no effect unless `gpu_sampling_lease_enabled` is true."""
 
     gpu_sampling_lease_tail_overlap: bool = Field(default=True)
     """Admit the next job's sampling window during the current one's tail so the GPU never idles between
@@ -1722,6 +1748,12 @@ class reGenBridgeData(CombinedHordeBridgeData):
         )
 
         _warn_lease_slots_below_threads(
+            gpu_sampling_lease_enabled=self.gpu_sampling_lease_enabled,
+            gpu_sampling_lease_slots=self.gpu_sampling_lease_slots,
+            max_threads=self.max_threads,
+            log=True,
+        )
+        _warn_lease_slots_above_threads(
             gpu_sampling_lease_enabled=self.gpu_sampling_lease_enabled,
             gpu_sampling_lease_slots=self.gpu_sampling_lease_slots,
             max_threads=self.max_threads,

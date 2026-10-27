@@ -37,6 +37,16 @@ flowchart TD
 
 ## Who is cleared, and when
 
+Runtime capacity changes belong to `HordeWorkerProcessManager._apply_resize_capacity`, through the
+supervisor's `RESIZE_CAPACITY` command. Intake must be paused and all image and alchemy work
+finalized. Inference children must be idle, with all inference permits and clearance grants
+returned. Normal RAM/VRAM process sizing still applies.
+`ipc/inference_gate.py::ResizableInferenceGate` changes shared capacity in place, so existing
+children keep the same gate. `ClearanceController.resize_slots` changes only an idle controller. The
+live concurrent-inference cap also bounds grants (`ClearanceController.effective_slot_cap`) without
+a resize. `ProcessLifecycleManager.resize_card_target` handles pool scaling. The correlated
+acknowledgment includes whether a refusal is transient and may be retried.
+
 | Decision | Owner | Rule |
 | --- | --- | --- |
 | Whether a staged child may sample | `ClearanceController.step`, `decide_clearances`, `_clear`; verdict `decide_clearance_admit` (`scheduling/admission/clearance.py`) through `InferenceScheduler.clearance_admit_process`; `VramArbiter.evaluate` | At most the slot cap of grants are held at once, and the free places go to the staged waiters closest to the head, so queue position decides who samples next. A chosen child is cleared only when its full-price admission fits the card now, and that admission runs eviction as a side effect. An idle child with a stage permit gets the stage and sample permits in one clear, so it does not wait twice. |

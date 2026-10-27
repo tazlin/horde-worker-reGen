@@ -710,8 +710,8 @@ gpu_sampling_lease_enabled: false
 # `gpu_sampling_lease_enabled` is true. Leave unset (the default) to track max_threads, so enabling
 # the lease never samples fewer jobs at once than the worker runs concurrently. Set an explicit value
 # to override: 1 serializes denoising (efficient on no-MPS/Windows WDDM hardware, where concurrent
-# denoise loops only time-slice), higher values permit that many concurrent loops. No effect unless
-# the lease is enabled.
+# denoise loops only time-slice), higher values permit that many concurrent loops, up to max_threads
+# (a larger value is clamped to it). No effect unless the lease is enabled.
 # gpu_sampling_lease_slots: 1
 
 # Admit the next job's sampling window during the current one's tail so the GPU never idles between

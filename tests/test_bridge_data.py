@@ -10,6 +10,7 @@ from ruamel.yaml import YAML
 
 from horde_worker_regen.alchemy_forms import AuxiliaryFetchNeeds
 from horde_worker_regen.bridge_data.data_model import (
+    _warn_lease_slots_above_threads,
     _warn_lease_slots_below_threads,
     _warn_lease_without_residency,
     reGenBridgeData,
@@ -66,6 +67,39 @@ class TestLeaseResidencyWarning:
         assert bridge_data.gpu_sampling_lease_enabled is True
         # The template leaves the slot count unset so it tracks max_threads at runtime.
         assert bridge_data.gpu_sampling_lease_slots is None
+
+
+class TestLeaseSlotsAboveThreadsWarning:
+    """An explicit slot count over max_threads is clamped at runtime, so the operator is told."""
+
+    def test_disabled_lease_is_never_flagged(self) -> None:
+        """A disabled lease is never flagged, regardless of the slot/threads relationship."""
+        assert (
+            _warn_lease_slots_above_threads(
+                gpu_sampling_lease_enabled=False, gpu_sampling_lease_slots=4, max_threads=1
+            )
+            is False
+        )
+
+    def test_auto_and_matching_slots_are_not_flagged(self) -> None:
+        """Unset slots equal max_threads, and an explicit count at the cap is in force as given."""
+        assert (
+            _warn_lease_slots_above_threads(
+                gpu_sampling_lease_enabled=True, gpu_sampling_lease_slots=None, max_threads=2
+            )
+            is False
+        )
+        assert (
+            _warn_lease_slots_above_threads(gpu_sampling_lease_enabled=True, gpu_sampling_lease_slots=2, max_threads=2)
+            is False
+        )
+
+    def test_explicit_slots_above_threads_is_flagged(self) -> None:
+        """A count above max_threads is reported, since the runtime uses max_threads instead."""
+        assert (
+            _warn_lease_slots_above_threads(gpu_sampling_lease_enabled=True, gpu_sampling_lease_slots=4, max_threads=2)
+            is True
+        )
 
 
 class TestLeaseSlotsBelowThreadsWarning:

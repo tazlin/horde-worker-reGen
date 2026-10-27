@@ -207,6 +207,11 @@ def validate_config_interlocks(config: dict[str, Any]) -> list[ConfigValidationI
                     "gpu_sampling_lease_slots",
                     "Sampling lease slots below concurrent jobs leaves configured concurrency unused.",
                 )
+            elif int(slots) > _int(config, "max_threads", 1):
+                warning(
+                    "gpu_sampling_lease_slots",
+                    "Sampling lease slots above concurrent jobs are clamped to Max threads at runtime.",
+                )
         except (TypeError, ValueError):
             pass
 

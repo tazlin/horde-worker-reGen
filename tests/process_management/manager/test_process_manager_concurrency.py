@@ -44,8 +44,8 @@ class TestResolveInferenceConcurrency:
         )
         assert slots == 1
 
-    def test_explicit_slots_honored_over_concurrent_count(self) -> None:
-        """An explicit slot count is used verbatim, not bolted to the concurrent-process count."""
+    def test_explicit_slots_below_concurrent_count_are_honored(self) -> None:
+        """An explicit slot count under the concurrent-process count lowers the denoise gate as given."""
         _, slots = _resolve_inference_concurrency(
             gpu_sampling_lease_enabled=True,
             configured_lease_slots=2,
@@ -54,8 +54,18 @@ class TestResolveInferenceConcurrency:
         )
         assert slots == 2
 
+    def test_explicit_slots_above_concurrent_count_are_clamped_to_it(self) -> None:
+        """max_threads admits the jobs, so a slot beyond it would have nothing to sample."""
+        _, slots = _resolve_inference_concurrency(
+            gpu_sampling_lease_enabled=True,
+            configured_lease_slots=6,
+            max_concurrent_inference_processes=4,
+            max_inference_processes=8,
+        )
+        assert slots == 4
+
     def test_auto_slots_track_concurrent_count(self) -> None:
-        """Unset slots (None) track the concurrent-inference ceiling so the lease never under-serializes."""
+        """Unset slots (None) track the concurrent-inference ceiling without reducing sampling concurrency."""
         _, slots = _resolve_inference_concurrency(
             gpu_sampling_lease_enabled=True,
             configured_lease_slots=None,
@@ -75,11 +85,11 @@ class TestResolveInferenceConcurrency:
         assert slots == 4
 
     def test_slots_clamped_to_process_count(self) -> None:
-        """Slots can never exceed the number of inference processes."""
+        """Slots can never exceed the number of inference processes, even when the ceiling is higher."""
         _, slots = _resolve_inference_concurrency(
             gpu_sampling_lease_enabled=True,
             configured_lease_slots=99,
-            max_concurrent_inference_processes=2,
+            max_concurrent_inference_processes=8,
             max_inference_processes=4,
         )
         assert slots == 4

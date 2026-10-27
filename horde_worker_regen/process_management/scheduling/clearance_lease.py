@@ -929,6 +929,7 @@ class ClearanceController:
         tail_overlap_pad_seconds: float = _TAIL_OVERLAP_PAD_SECONDS,
         tail_overlap_margin_mb: float = _TAIL_OVERLAP_MARGIN_MB,
         clock: Callable[[], float] | None = None,
+        live_cap: Callable[[], int] | None = None,
     ) -> None:
         """Configure the controller for one card.
 
@@ -936,6 +937,10 @@ class ClearanceController:
             device_index: The card this controller governs (for logging).
             slot_cap: The steady-state cap on concurrent grants (the configured sampling-lease slot count).
             tail_overlap: Whether the one-extra-grant handoff window is enabled for this card.
+            live_cap: The worker's live concurrent-inference cap. New grants never exceed the smaller of
+                this and ``slot_cap``, so a cap lowered by the supervisor, a reload or the resource
+                governor takes effect at the next clearance without a drained resize. Grants already
+                held are left to finish. Omitted, ``slot_cap`` alone applies.
             tail_overlap_pad_seconds: Slack added to the incoming load estimate when sizing the handoff window.
             tail_overlap_margin_mb: The measured free-minus-reserve headroom an early clear requires.
             clock: Monotonic seconds source for the denial diagnostic's repeat throttle; defaults to
@@ -943,6 +948,7 @@ class ClearanceController:
         """
         self._device_index = device_index
         self._slot_cap = slot_cap
+        self._live_cap = live_cap
         self._tail_overlap = tail_overlap
         self._tail_overlap_pad_seconds = tail_overlap_pad_seconds
         self._tail_overlap_margin_mb = tail_overlap_margin_mb
@@ -999,6 +1005,13 @@ class ClearanceController:
         A staged child holds none, since its sample permit is not granted even with its weights on the card.
         """
         return self.grant_state(process_id) in _SLOT_HOLDING_STATES
+
+    @property
+    def effective_slot_cap(self) -> int:
+        """The grant cap in force now: the configured slots, lowered to the live concurrent-inference cap."""
+        if self._live_cap is None:
+            return self._slot_cap
+        return max(1, min(self._slot_cap, self._live_cap()))
 
     def resize_slots(self, slot_cap: int) -> None:
         """Change the grant cap while every registered child is outside a granted window."""
@@ -1067,7 +1080,7 @@ class ClearanceController:
 
         plan = decide_clearances(
             effective_inputs,
-            slot_cap=self._slot_cap,
+            slot_cap=self.effective_slot_cap,
             held_grant_count=self.held_grant_count,
             tail_overlap_enabled=self._tail_overlap and stage_admit_fn is None,
             tail_overlap_pad_seconds=self._tail_overlap_pad_seconds,
