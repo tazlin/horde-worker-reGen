@@ -15,6 +15,47 @@ from horde_worker_regen.analysis.diagnose import SessionDiagnosisView, SessionSu
 _STARTUP = "Setting up logger for main process"
 
 
+def test_assessment_report_adds_coverage_and_sampling_findings(tmp_path: Path) -> None:
+    """Report results accompany the isolated worker session and distinguish estimates from incomplete checks."""
+    from horde_worker_regen.benchmark.capabilities.result import CapabilityReport, WorkloadEvidence
+
+    report = CapabilityReport.model_validate(
+        {
+            "operator_assessment": True,
+            "evidence": [
+                {
+                    "evidence_id": "threads",
+                    "capability": {"tier": "sd15", "kind": "threads", "magnitude": 2},
+                    "profile": {"device_index": 0, "tier": "sd15", "model_name": "model", "threads": 2},
+                    "status": "unknown",
+                    "reason": "Jobs finished sequentially",
+                    "job_ids": ["a", "b"],
+                    "observed_sampling_concurrency": 1,
+                }
+            ],
+        }
+    )
+    report.evidence.append(
+        WorkloadEvidence.model_validate(
+            {
+                **report.evidence[0].model_dump(),
+                "evidence_id": "larger",
+                "status": "predicted",
+                "job_ids": [],
+            }
+        )
+    )
+    (tmp_path / "report.json").write_text(report.model_dump_json(), encoding="utf-8")
+    logs = tmp_path / "worker" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "bridge.log").write_text(_session_log("2026-01-01", "10:00:00", "ready"), encoding="utf-8")
+    for path in (tmp_path, logs, tmp_path / "report.json"):
+        result = diagnose(path, last=True)
+        findings = {finding.id: finding for finding in result[0].findings}
+        assert "1 checks" in findings["benchmark_coverage_incomplete"].headline
+        assert "benchmark_concurrency_unobserved" in findings
+
+
 def _session_log(ts_date: str, ts_time: str, body: str) -> str:
     """A one-session log: the main-process startup boundary followed by one body line."""
     return "\n".join(

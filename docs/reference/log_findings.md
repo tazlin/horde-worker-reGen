@@ -1,5 +1,13 @@
 # Log findings
 
+Operator assessment reports are also read by `horde-log diagnose <run-directory> --last` or by
+passing the isolated `worker/logs` directory.
+
+| Finding | Severity | Meaning | Action |
+| --- | --- | --- | --- |
+| `benchmark_coverage_incomplete` | info | Some selected checks remain unconfirmed. | Read the reasons in the report. Remove an optional limit or prepare missing models before rerunning. |
+| `benchmark_concurrency_unobserved` | warning | Completed jobs did not establish the sampling overlap the configuration permits (the thread count, lowered to the sampling-lease slot count). | Read the report and worker logs before changing thread settings. |
+
 Every finding `horde-log diagnose` can emit, and every one the dashboard's Insights tab reads from the
 running worker. Each row gives the id the finding prints, its severity, what makes it fire, and what to do
 about it. The id is stable. The JSON output is keyed on it, the dashboard's Diagnostics tab shows it, and a

@@ -127,6 +127,8 @@ class FindingKind(enum.StrEnum):
 
     MODEL_ECONOMICS = "model_economics"
     SESSION_SUMMARY = "session_summary"
+    BENCHMARK_COVERAGE_INCOMPLETE = "benchmark_coverage_incomplete"
+    BENCHMARK_CONCURRENCY_UNOBSERVED = "benchmark_concurrency_unobserved"
 
     # Read from the running worker's state by the dashboard's Insights tab, never from a log.
     FAULT_RATE = "fault_rate"
@@ -183,6 +185,32 @@ def _spec_table(*specs: FindingSpec) -> Mapping[FindingKind, FindingSpec]:
 
 
 FINDING_SPECS: Mapping[FindingKind, FindingSpec] = _spec_table(
+    FindingSpec(
+        kind=FindingKind.BENCHMARK_COVERAGE_INCOMPLETE,
+        title="Some benchmark checks were not completed",
+        action=(
+            "Read each unfinished check's reason in the benchmark report. "
+            "Remove an optional run limit or prepare missing models before rerunning."
+        ),
+        detail=(
+            "Untested settings do not establish a card limit. "
+            "Estimates and checks that did not finish remain separate from measured failures."
+        ),
+        reference_page="docs/reference/cli.md",
+    ),
+    FindingSpec(
+        kind=FindingKind.BENCHMARK_CONCURRENCY_UNOBSERVED,
+        title="Concurrent sampling was not confirmed",
+        action=(
+            "Read the benchmark report and worker logs before changing thread settings. "
+            "Jobs that finish one at a time do not confirm concurrent sampling."
+        ),
+        detail=(
+            "The jobs completed without the requested sampling overlap. "
+            "Short jobs, model loading or ordinary scheduling restrictions can prevent overlap."
+        ),
+        reference_page="docs/explanation/architecture.md",
+    ),
     FindingSpec(
         kind=FindingKind.HOST_RAM_STARVATION,
         title="System RAM pressure is holding back jobs",

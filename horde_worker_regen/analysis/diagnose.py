@@ -13,9 +13,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from loguru import logger
+from pydantic import ValidationError
+
 from .bundle import LogBundle, OrchestratorLogKind
 from .correlate import build_session_context
 from .detectors import Finding, run_detectors
+from .finding_kinds import SEVERITY_ORDER, FindingKind, Severity
 from .sessions import WorkerSession, segment_bundle_sessions
 
 DEFAULT_LOG_PATH = Path("logs")
@@ -71,7 +75,7 @@ def diagnose(
 
     Worker sessions and benchmark runs are numbered separately (see
     :func:`~horde_worker_regen.analysis.sessions.segment_bundle_sessions`), and each kind has its own
-    selectors; :func:`select_sessions` says how they combine.
+    selectors; :func:`select_sessions` describes how they combine.
 
     Args:
         path: A logs directory, a single log file, or a ``.zip`` of logs.
@@ -88,11 +92,16 @@ def diagnose(
 
     Returns:
         One :class:`SessionDiagnosis` per selected session: the worker sessions, then the benchmark
-        runs, told apart by ``session.log_kind``. Empty if the path holds no recognizable sessions.
+        runs, distinguished by ``session.log_kind``. Empty if the path does not contain recognizable sessions.
         Detectors never raise (see :func:`~horde_worker_regen.analysis.detectors.run_detectors`), so
         this is safe to call on partial or torn logs.
     """
-    bundle = LogBundle.from_path(path)
+    report_path = path if path.name == "report.json" else path / "report.json"
+    if path.name == "logs" and path.parent.name == "worker":
+        report_path = path.parent.parent / "report.json"
+    isolated_logs = report_path.parent / "worker" / "logs"
+    logs_path = isolated_logs if report_path.is_file() and isolated_logs.is_dir() else path
+    bundle = LogBundle.from_path(logs_path)
     sessions = segment_bundle_sessions(bundle, active_only=active_only)
     selected = select_sessions(
         sessions,
@@ -102,10 +111,60 @@ def diagnose(
         benchmark_index=benchmark_index,
         recent=recent,
     )
-    return [
+    diagnoses = [
         SessionDiagnosis(session=session, findings=run_detectors(build_session_context(session, bundle)))
         for session in selected
     ]
+    if diagnoses and report_path.is_file() and selected[-1] is sessions[-1]:
+        diagnoses[-1].findings.extend(assessment_findings(report_path))
+        diagnoses[-1].findings.sort(key=lambda finding: SEVERITY_ORDER[finding.severity])
+    return diagnoses
+
+
+def assessment_findings(report_path: Path) -> list[Finding]:
+    """Explain incomplete coverage and unobserved overlap from a persisted operator report."""
+    from horde_worker_regen.benchmark.capabilities.result import CapabilityReport, EvidenceStatus
+
+    try:
+        report = CapabilityReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValidationError) as error:
+        logger.warning(f"Could not read benchmark report: {error}")
+        return []
+    if not report.operator_assessment:
+        return []
+    unfinished = [item for item in report.evidence if item.status is EvidenceStatus.UNKNOWN]
+    no_overlap = [
+        item
+        for item in unfinished
+        if (item.expected_sampling_concurrency or item.profile.threads) > 1
+        and item.job_ids
+        and item.observed_sampling_concurrency < (item.expected_sampling_concurrency or item.profile.threads)
+    ]
+    findings: list[Finding] = []
+    if unfinished:
+        findings.append(
+            Finding(
+                kind=FindingKind.BENCHMARK_COVERAGE_INCOMPLETE,
+                severity=Severity.INFO,
+                headline=f"The benchmark left {len(unfinished)} checks unconfirmed.",
+                evidence=[f"{item.evidence_id}: {item.reason}" for item in unfinished],
+            )
+        )
+    if no_overlap:
+        findings.append(
+            Finding(
+                kind=FindingKind.BENCHMARK_CONCURRENCY_UNOBSERVED,
+                severity=Severity.WARNING,
+                headline=f"Concurrent sampling was not observed in {len(no_overlap)} checks.",
+                evidence=[
+                    f"{item.evidence_id}: {item.observed_sampling_concurrency}/"
+                    f"{item.expected_sampling_concurrency or item.profile.threads} "
+                    "sampling threads"
+                    for item in no_overlap
+                ],
+            )
+        )
+    return findings
 
 
 def diagnose_views(
