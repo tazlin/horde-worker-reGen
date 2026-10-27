@@ -69,25 +69,33 @@ Its absolute requirements obey `hard_floor <= soft_hold <= preload <= restore`. 
 `ram_reserve_mb` protects the same free pages as the danger floor, so the retained headroom is their
 maximum, not their sum.
 
-The available reading every floor and hold compares against is admissible host RAM: physical available
-RAM, lowered to the host's available commit where the host reports one (`GlobalMemoryStatusEx` on
-Windows, through `scheduling/host_commit.py`; POSIX reports none and physical RAM stands alone). A child
-maps its checkpoint as a copy-on-write view, which Windows charges in full to commit at map time, so a
-host whose commit limit binds before its physical memory fails the mapping while pages are still free.
-The danger-floor verdict (`assess_ram_pressure`) carries both figures, and its reason names the bound
-(`available 8000 MB (commit-bound; physical 30000 MB) above danger floor ...`). The soft pop hold, the
-degrade response with its process reduction and over-ceiling reclaim, the shed restore headroom, the
-head-of-queue reclaim and the idle-lane warm's room all read the admissible figure. The preload
-admission prices the job's own mapping against commit separately, on the same measured commit figure.
-That commit charge is the checkpoint's file size plus the job's feature RAM, with no retained-page or
-component credit, because a new mapping charges the whole file to commit whichever of its pages are cached.
-The physical-RAM charge can be a learned resident-set peak, which does not see the mapping, so it does not
-price commit (`decide_commit_admission`). A
-retained-page credit therefore lowers only the physical-RAM charge, and the `RAM credit admitting` line
-says so beside the commit charge it left whole (or `commit not priced` where the host reports no commit
-figure, the checkpoint's file size is unknown, or the target already holds the checkpoint). The credit counts a slot's retained pages only from
-a memory reading sampled at least one report interval after its last RAM unload. An earlier reading
-still includes the released model.
+The available reading every floor and hold compares against is admissible host RAM: physical
+available RAM, lowered to the host's available commit where the host reports one
+(`GlobalMemoryStatusEx` on Windows, through `scheduling/host_commit.py`; POSIX reports none and
+physical RAM stands alone). A child maps its checkpoint as a copy-on-write view, which Windows
+charges in full to commit at map time, so a host whose commit limit binds before its physical memory
+fails the mapping while pages are still free. Windows reports the limit at the current page-file
+sizes and can extend a page file when a charge reaches that limit. The reading therefore adds the
+space available for page-file growth (`page_file_growth_room_mb`). A file with a configured maximum
+may grow to it, as far as its drive's free space allows. A system-managed file may grow into all of
+its drive's free space, because Windows extends it on demand without regard to the worker's low-disk
+floor; the disk monitor and download guard handle disk safety. The `PagingFiles` registry value is
+read once per process and the current sizes and free space on every reading. A failed growth-room
+read leaves `ullAvailPageFile` alone. The danger-floor verdict (`assess_ram_pressure`) carries both
+figures, and its reason names the bound (`available 8000 MB (commit-bound; physical 30000 MB) above
+danger floor ...`). The soft pop hold, the degrade response with its process reduction and
+over-ceiling reclaim, the shed restore headroom, the head-of-queue reclaim and the idle-lane warm's
+room all read the admissible figure. The preload admission prices the job's own mapping against
+commit separately, on the same measured commit figure. That commit charge is the checkpoint's file
+size plus the job's feature RAM, with no retained-page or component credit, because a new mapping
+charges the whole file to commit whichever of its pages are cached. The physical-RAM charge can be a
+learned resident-set peak, which does not see the mapping, so it does not price commit
+(`decide_commit_admission`). A retained-page credit therefore lowers only the physical-RAM charge,
+and the `RAM credit admitting` line says so beside the commit charge it left whole (or `commit not
+priced` where the host reports no commit figure, the checkpoint's file size is unknown, or the
+target already holds the checkpoint). The credit counts a slot's retained pages only from a memory
+reading sampled at least one report interval after its last RAM unload. An earlier reading still
+includes the released model.
 
 Every requirement counts outstanding RAM: work already admitted whose allocation the available
 reading does not yet show. Preload requires `max(floor, reserve) + outstanding + incoming`, and

@@ -82,7 +82,7 @@ flowchart TD
 | The checkpoint staging charge | scheduler `_checkpoint_staging_charge_mb` | The trusted learned `WHOLE` peak, else the file size, else the context seed, never below 3,500 MB. It is a resident-set figure and excludes feature RAM. |
 | The reuse credit | `RamBudget.check_job` (`_MARGINAL_STAGING_CREDIT_FRACTION` 0.7, `_MARGINAL_STAGING_CHARGE_FLOOR_MB` 3,500 MB, `_MARGINAL_STAGING_TRANSIENT_HEADROOM_MB` 1,024 MB) | 70% of the reusable pages comes off the charge, never below 3,500 MB, and only when the credited charge plus 1,024 MB still leaves available RAM above the floor. |
 | The commit verdict | `preload.decide_commit_admission` against `HostRamSnapshot.available_commit_mb` | The charge is the checkpoint's file size (`JobSnapshot.checkpoint_file_mb`, from scheduler `_checkpoint_file_mb`) plus the job's feature RAM, with no reuse or component credit, under the same reserve, floor, committed reserve and outstanding planned RAM. The verdict is skipped on POSIX, for a checkpoint of unknown size, and for a target that already holds the checkpoint. |
-| Available commit | `scheduling/host_commit.py` `measure_available_commit_mb` | `GlobalMemoryStatusEx`'s `ullAvailPageFile` on Windows, the commit limit less the commit charged. POSIX does not charge a private mapping to commit when it is mapped, so it reports `None`. |
+| Available commit | `scheduling/host_commit.py` `measure_available_commit_mb`, `page_file_growth_room_mb` | `GlobalMemoryStatusEx`'s `ullAvailPageFile` on Windows, the commit limit at the page files' current size less the commit charged, plus the space available for page-file growth. A configured maximum limits growth, as does the drive's free space. A system-managed file may use all free space on the drive because Windows does not apply the worker's low-disk floor. The `PagingFiles` registry value is read once per process, and a failed growth-room read leaves `ullAvailPageFile` alone. POSIX does not charge a private mapping to commit when it is mapped, so it reports `None`. |
 | A RAM miss | scheduler `_apply_ram_verdict`; `scheduling/governance/preload_admission.py` `decide_ram_reclaim_outcome` | An idle-model unload under pressure, escalated for the head, then a cycle of a crept or stale slot other than the target. The outcome reads the reclaim results, never a fresh reading, and admits best-effort only a head blocker with no live job holding memory. |
 | A host that refuses a mapping | child `_is_host_commit_error` in `workers/inference_process.py`; dispatcher `HOST_COMMIT_FAILED_INFO` handling; `JobTracker.handle_host_commit_refusal`, `MAX_HOST_COMMIT_REQUEUES` (3) | A refusal at preload reports `host-commit-failed`, does not count against the model or the slot, and leaves the load to be re-admitted. A refusal during the run requeues the job without spending an inference attempt, up to 3 times, then faults it for the horde to reissue. |
 
@@ -128,6 +128,8 @@ stateDiagram-v2
   figure a decision compared is not in the parent log.
 - Available commit appears only in the danger-floor reason (`commit-bound; physical N MB`) and in the RAM verdict
   lines that name commit (`commit-bound: N MB committable`, `commit not priced`). The stats rows do not carry it.
+  The logged figure includes the page files' growth room, so on a host whose page files can still grow it
+  exceeds the current available commit reported by Windows.
 
 ## Where to read next
 

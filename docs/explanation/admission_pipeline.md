@@ -128,20 +128,22 @@ the seat is not the head's own
 | Model serviceability (the pop offer and the preload gate share it) | [`model_serviceability_verdicts`][horde_worker_regen.process_management.resources.model_serviceability.model_serviceability_verdicts] | card runtimes, model metadata, the admission baseline | one verdict per serving card | the popper, the process manager's card report, the snapshot builder |
 | Weight budget (the serviceability verdict and dispatch eligibility share it) | [`check_card_weight_budget`][horde_worker_regen.process_management.resources.model_serviceability.check_card_weight_budget] | card total, core weight seed, a whole-card model's fixed reservation | `CardWeightBudgetCheck` | `assess_model_serviceability`, `reasons_card_cannot_serve` |
 
-A child maps a checkpoint as a copy-on-write file view. On Windows that view charges its whole file size to
-system commit when it is mapped, for as long as the lane holds it, while consuming no physical RAM, so psutil's
-available figure cannot see it, and at the commit limit the child's next mapping fails. The snapshot therefore
-carries `HostRamSnapshot.available_commit_mb` (`GlobalMemoryStatusEx`'s `ullAvailPageFile`, read by
+A child maps a checkpoint as a copy-on-write file view. On Windows, the mapping charges the full
+file size to system commit for as long as the lane holds it. The commit charge does not consume
+physical RAM, so psutil's available-RAM reading does not reflect it. At the commit limit, the
+child's next mapping fails. The snapshot therefore carries `HostRamSnapshot.available_commit_mb`
+(`GlobalMemoryStatusEx`'s `ullAvailPageFile` plus the space available for page-file growth, read by
 [`measure_available_commit_mb`][horde_worker_regen.process_management.scheduling.host_commit.measure_available_commit_mb];
-None on POSIX). A preload whose target does not already hold the checkpoint is judged against it as well as
-against available RAM: the charge is the checkpoint's file size (`JobSnapshot.checkpoint_file_mb`) plus feature
-RAM, with no page-reuse or component credit, under the same reserve, danger floor and outstanding planned RAM.
-The physical-RAM verdict keeps the staging charge, which is a learned resident-set peak once one is trusted. A
-resident-set reading does not see the mapping, so the staging charge does not price commit. The preload fits
-only when both verdicts do, and a deferral that commit alone caused says so in its log line
-(`(commit-bound: N MB committable)`). The idle-lane warm re-reads pages of a mapping that already exists, so it
-is not priced against commit. Where the host reports no commit figure or the checkpoint's file size is unknown,
-the RAM verdict stands alone.
+None on POSIX). A preload whose target does not already hold the checkpoint is judged against it as
+well as against available RAM: the charge is the checkpoint's file size
+(`JobSnapshot.checkpoint_file_mb`) plus feature RAM, with no page-reuse or component credit, under
+the same reserve, danger floor and outstanding planned RAM. The physical-RAM verdict keeps the
+staging charge, which is a learned resident-set peak once one is trusted. A resident-set reading
+does not see the mapping, so the staging charge does not price commit. The preload fits only when
+both verdicts do, and a deferral that commit alone caused says so in its log line (`(commit-bound: N
+MB committable)`). The idle-lane warm re-reads pages of a mapping that already exists, so it is not
+priced against commit. Where the host reports no commit figure or the checkpoint's file size is
+unknown, the RAM verdict stands alone.
 
 Still inline on the scheduler, and the next cuts in order: the whole-card residency demand
 (`_decide_whole_card_demand`, which establishes residencies and unloads siblings inside the budget step),
