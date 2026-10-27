@@ -1,6 +1,6 @@
 """The editor's cached records resolve the same beta-aware set as the picker.
 
-A beta (pending-queue) model such as Z-Image-Turbo is absent from the canonical reference, so the
+A beta (pending-queue) model is absent from the canonical reference, so the
 editor's disk footer would miscount an on-disk beta model as "to download" if it read the canonical-only
 ``get_all_model_references``. ``cached_image_records`` must instead go through the beta-aware loader the
 picker uses, so both surfaces agree.

@@ -502,9 +502,8 @@ memory-intensive `4xNomos2_hq_dat2` upscaler (`sd15-alchemy_graph-1`) and face-f
 from affecting the others.
 
 Heavy tiers (`flux`/`qwen`/`zimage`) require explicit selection and are skipped when the machine
-cannot hold them or the checkpoint is absent. Qwen and ZImage use beta models from the pending
-reference and require `HORDE_MODEL_REFERENCE_PRIMARY_API_URL`. The benchmark sets beta opt-in
-automatically.
+cannot hold them or the checkpoint is absent. A tier whose model is only in the pending reference
+needs `HORDE_MODEL_REFERENCE_PRIMARY_API_URL`. The benchmark sets the beta opt-in automatically.
 
 Every suggested value carries a **provenance basis** so you can tell a setting that is off because it
 was *tested and failed* from one that is off only because its probe was *skipped* (never tested),

@@ -107,11 +107,11 @@ _TIER_TOGGLES: tuple[_TierToggle, ...] = (
     _TierToggle(
         BenchTier.FLUX, "Flux", "Very large (17-20 GB download, 13-16 GB VRAM). Skipped if it does not fit.", False
     ),
-    _TierToggle(BenchTier.QWEN, "Qwen", "Very large beta model. Skipped if it is not downloaded.", False),
+    _TierToggle(BenchTier.QWEN, "Qwen", "Very large model. Skipped if it is not downloaded.", False),
     _TierToggle(
         BenchTier.ZIMAGE,
         "Z-Image",
-        "Beta model of about 19 GB. Runs at a fixed 9 steps without hires-fix. Skipped if it is not downloaded.",
+        "Model of about 19 GB. Runs at a fixed 9 steps without hires-fix. Skipped if it is not downloaded.",
         False,
     ),
 )

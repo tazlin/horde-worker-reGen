@@ -59,9 +59,9 @@ and send that bundle before the full tier:
 horde-benchmark pricing-corpus --tier heavy --machine alice-l40s --model "Flux.1-Schnell fp8 (Compact)"
 ```
 
-The heavy families are the only ones that exercise the beta model opt-in and the samplers the small
-tiers never touch, so a single-model run proves the whole path in a fraction of the time a failed full
-tier would cost.
+The heavy tier uses samplers the small tiers never touch, and the beta opt-in whenever one of its
+models is only in the pending queue, so a single-model run proves the whole path in a fraction of the
+time a failed full tier would cost.
 
 A corpus run sets the worker's learned VRAM footprint store aside before it starts (the previous store is
 kept beside it under a stamped name), so one tier's measured peaks never price the next tier's cells. Pass

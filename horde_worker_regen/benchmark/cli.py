@@ -971,7 +971,7 @@ def _run_run(args: argparse.Namespace) -> int:
 
     # The harness never reads bridgeData.yaml, so set AIWORKER_CACHE_HOME (and friends) before booting the
     # worker, so the real inference children resolve the worker's model directory. Passing the tiers opts
-    # into the beta reference when a beta tier (qwen/zimage) is requested.
+    # into the beta reference when any requested tier is in BETA_TIERS.
     ensure_worker_env(args.process_mode, tiers)
     machine = detect_machine_info(probe_devices=args.process_mode == "real" and args.exhaustive)
 

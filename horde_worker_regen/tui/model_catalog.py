@@ -128,8 +128,8 @@ def _image_records_with_beta(
     """Return the image-gen records to show, plus the names that are beta (pending-queue) models.
 
     The canonical reference (``get_all_model_references``) never includes a PRIMARY's pending-queue
-    (beta) models, so a promotion candidate like qwen stays invisible in the picker until it lands in
-    the canonical data. When the operator has opted into the image-generation beta (the same env-var
+    (beta) models, so a beta model stays invisible in the picker until it is promoted into the canonical
+    data. When the operator has opted into the image-generation beta (the same env-var
     contract the worker subprocesses use), register the pending provider and merge it via ``query`` so
     those models surface and can be flagged. Beta is best-effort: any failure degrades to the canonical
     catalog rather than breaking the picker.

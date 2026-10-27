@@ -2385,7 +2385,7 @@ class HordeWorkerProcessManager:
 
                 # The orchestrator builds its own copy of the image reference, separate from the inference
                 # subprocesses; beta_aware_image_records keeps the two in agreement when beta (pending-queue)
-                # models such as qwen/Z-Image are opted into (see bridge_data.beta_source).
+                # models are opted into (see bridge_data.beta_source).
                 records = beta_aware_image_records(horde_model_reference_manager)
                 if not records:
                     raise RuntimeError(

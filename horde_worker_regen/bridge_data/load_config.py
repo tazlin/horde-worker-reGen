@@ -70,7 +70,7 @@ def _meta_instruction_matches_record(instruction: str, record: ImageGenerationMo
 
     if matches(MetaInstruction.ALL_REGEX):
         # "all" excludes the heavy baselines unless the operator opted into large models, matching the
-        # SDK's remove_large_models so a beta flux/cascade is not silently bulk-loaded.
+        # SDK's remove_large_models so a heavy model is not bulk-loaded without the operator asking.
         if os.getenv("AI_HORDE_MODEL_META_LARGE_MODELS"):
             return True
         return record.baseline not in (
@@ -102,7 +102,7 @@ def _beta_models_for_meta_instructions(
     """Resolve meta instructions against beta (pending-queue) image records.
 
     The SDK resolver only sees the canonical reference, so a meta instruction like ``all`` would
-    silently exclude beta models such as Z-Image. Apply the same instruction families to the
+    silently exclude every beta model. Apply the same instruction families to the
     beta-merged records so opted-in beta models are selected alongside the canonical ones.
     """
     matched: set[str] = set()
@@ -457,7 +457,7 @@ class BridgeDataLoader:
         # The SDK resolver only sees the canonical reference (get_all_model_references never includes a
         # PRIMARY's pending-queue / beta models), so anything beta would be silently dropped both from the
         # meta-instruction expansion below and the known-models filter further down. Build the beta-merged
-        # records once and use them to keep opted-in beta models (e.g. qwen, Z-Image) advertised.
+        # records once and use them to keep opted-in beta models advertised.
         beta_records = beta_aware_image_records(horde_model_reference_manager)
 
         # Expand the worker-local `disagg_optimized N` command before the SDK families below: it strips its

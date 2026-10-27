@@ -2,8 +2,8 @@
 
 The worker opts every install into the image-generation beta at startup (``load_env_vars``), but the
 TUI host process never runs that path. Without this, the model picker's beta gate
-(``HORDELIB_BETA_MODEL_CATEGORIES``) is unset in the TUI, so pending-queue models like qwen stay hidden
-even though the worker would happily load them. Mirroring the opt-in here, reading ``api_key`` from the
+(``HORDELIB_BETA_MODEL_CATEGORIES``) is unset in the TUI, so every pending-queue model stays hidden
+even though the worker loads them. Mirroring the opt-in here, reading ``api_key`` from the
 same bridgeData, keeps the picker consistent with what the worker will actually load. The TUI is also the
 process that spawns the worker, so the worker inherits these env vars too.
 """

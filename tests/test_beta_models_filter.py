@@ -1,6 +1,6 @@
 """Beta (PRIMARY pending-queue) models must survive config-load model resolution.
 
-Regression coverage for the bug where an opted-in beta model (e.g. Z-Image) that the operator listed in
+Regression coverage for the bug where an opted-in beta model that the operator listed in
 ``image_models_to_load`` was silently dropped: the config-load filter intersected the list with the SDK
 resolver's canonical-only ``resolve_all_model_names``, which never includes pending-queue models.
 """
@@ -102,7 +102,7 @@ class TestMetaInstructionMatchesRecord:
 def test_beta_models_for_meta_instructions_selects_by_family() -> None:
     """``all sdxl`` selects only the sdxl record; ``all`` selects both records.
 
-    Tthe canonical SDK resolver would not include the beta sdxl.
+    The canonical SDK resolver would not include the beta sdxl.
     """
     records = {
         "sdxl": _rec("sdxl", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl),

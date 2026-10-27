@@ -44,7 +44,7 @@ class TestDefaultLadder:
         assert ladder[0].baseline_hordelib == "flux_1"
 
     def test_zimage_not_included_by_default(self) -> None:
-        """Z-Image is opt-in (large and beta)."""
+        """Z-Image is a large, opt-in tier."""
         assert not any(level.tier == "zimage" for level in build_default_ladder())
 
     def test_zimage_opt_in_baseline(self) -> None:

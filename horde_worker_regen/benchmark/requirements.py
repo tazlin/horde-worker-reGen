@@ -193,8 +193,8 @@ def _offline_category_reference(category: str) -> Mapping[str, GenericModelRecor
 def beta_post_processor_names() -> frozenset[str]:
     """Post-processor names the PRIMARY's pending (beta) queue serves for the opted-in categories.
 
-    Beta post-processors (the modern upscalers and face restorers) live only in the pending queue, so the
-    canonical on-disk reference cannot see them however recent it is. This reads the same pending source
+    A beta post-processor's record exists only in the pending queue, so the canonical on-disk reference
+    does not include it however recent it is. This reads the same pending source
     the inference children resolve them through, so what the benchmark offers matches what a child can
     load.
 

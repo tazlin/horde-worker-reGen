@@ -56,8 +56,7 @@ into the pop request.
 
 Some models are published to the model reference's "pending" (beta) queue before they are promoted
 into the canonical reference. The worker opts every install into the image-generation beta by
-default, so a beta checkpoint such as `Qwen-Image_fp8` is available to load and serve without any
-extra configuration. Reading the beta queue only needs a reader-level AI-Horde key, so the worker
+default, so any beta checkpoint is available to load and serve without extra configuration. Reading the beta queue only needs a reader-level AI-Horde key, so the worker
 reuses your configured `api_key` (the anonymous `0000000000` works too).
 
 Being *available* is not the same as being *loaded*: as with any model, the worker only serves a

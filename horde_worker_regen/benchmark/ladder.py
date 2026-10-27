@@ -19,9 +19,9 @@ The matrix is grounded in what the worker and hordelib can actually do:
   process) and the graph lane (upscalers/face-fixers/strip-background, on the inference processes),
   each its own axis, plus a concurrent-with-image-jobs rung.
 - **flux/qwen/zimage** are very large (17-20 GB download, 13-16 GB VRAM); they are opt-in tiers and
-  the controller warns and pre-flight-skips them when the machine cannot hold them. qwen and zimage
-  are sourced from the beta/pending reference (see :data:`BETA_TIERS`). zimage additionally requires
-  fixed job parameters (steps=9, cfg_scale=1.0) and does not support hires_fix or controlnet.
+  the controller warns and pre-flight-skips them when the machine cannot hold them. A tier in
+  :data:`BETA_TIERS` reads its model from the beta reference. zimage requires fixed job parameters
+  (steps=9, cfg_scale=1.0) and does not support hires_fix or controlnet.
 """
 
 from __future__ import annotations
@@ -48,16 +48,14 @@ from horde_worker_regen.benchmark.scenarios import (
 from horde_worker_regen.benchmark.sizing import max_post_processing_resolution
 
 _QWEN_BETA_MODEL_NAME = "Qwen-Image"
-"""Best-guess name for the beta qwen checkpoint, sourced via the pending reference (see BETA_TIERS).
+"""The model the qwen tier benchmarks.
 
-No qwen model is in the canonical AI-Horde image reference yet; this is the expected release name.
-Confirm against the PRIMARY pending queue once published and update if it differs. A wrong/absent
-name simply pre-flight-skips the qwen tier rather than failing the run."""
+A name the reference cannot resolve pre-flight-skips the qwen tier rather than failing the run."""
 
 _ZIMAGE_BETA_MODEL_NAME = "Z-Image-Turbo"
-"""Name for the Z-Image-Turbo checkpoint, confirmed from change_id 14 in the pending reference.
+"""The model the zimage tier benchmarks.
 
-Status: pending approval. A wrong/absent name pre-flight-skips the zimage tier rather than failing."""
+A name the reference cannot resolve pre-flight-skips the zimage tier rather than failing the run."""
 
 BENCH_TIER_MODELS: dict[BenchTier, str] = {
     BenchTier.SD15: "Deliberate",
@@ -114,7 +112,7 @@ HUGE_TIERS: frozenset[BenchTier] = frozenset({BenchTier.FLUX, BenchTier.QWEN, Be
 """Tiers whose models are very large (17-20 GB); the controller warns and pre-flight-skips them."""
 
 BETA_TIERS: frozenset[BenchTier] = frozenset({BenchTier.QWEN, BenchTier.ZIMAGE})
-"""Tiers sourced from the beta/pending reference; the worker env opts into beta categories for these."""
+"""Tiers whose model needs the beta reference. Requesting one opts the worker environment into beta."""
 
 _CONTROLNET_SWEEP_TYPES: tuple[str, ...] = ("canny", "depth", "openpose")
 """A representative spread of SD1.5 controlnet preprocessors (distinct annotator families)."""

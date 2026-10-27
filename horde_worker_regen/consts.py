@@ -243,6 +243,6 @@ The face-fixer analogue of :data:`WORKER_KNOWN_BETA_UPSCALERS`: distributed as b
 model-reference pending queue (the ``gfpgan`` category) and added to the server's ``KNOWN_POST_PROCESSORS``
 only at go-live, so the worker withholds these names until the server advertises them (checked via
 :func:`server_supports_interrogation_form`). The long-standing ``GFPGAN``/``CodeFormers`` are in every
-server's enum and are never gated. ``RestoreFormer`` loads through hordelib's spandrel core; both weights
-are resolved through hordelib's gfpgan beta source.
+server's enum and are never gated. ``RestoreFormer`` loads through hordelib's spandrel core. A listed
+model's weights resolve through hordelib's gfpgan beta source.
 """

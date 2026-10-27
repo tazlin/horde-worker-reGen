@@ -153,15 +153,14 @@ def apply_huggingface_cache_isolation() -> None:
 def apply_beta_model_env_defaults(api_key: str | None = None) -> None:
     """Opt every worker (and the TUI host, which reuses this) into the image-generation, esrgan and gfpgan beta.
 
-    Beta models (e.g. qwen, the modern upscalers, and the modern face restorers) live in the
-    model-reference PRIMARY's pending queue rather than the canonical reference, so surfacing one requires
-    both hordelib's beta opt-in env vars and a PRIMARY URL to read the pending queue from (see
-    ``hordelib.beta_models``). The esrgan and gfpgan categories are opted in alongside image_generation so a
-    worker can serve the new upscalers and face restorers the moment the AI-Horde server advertises their
-    names (the worker withholds offering them until then). The gfpgan category also carries RestoreFormer,
-    which shares the face-restoration on-disk folder. Reading the pending queue only
-    needs a reader-level key, which any AI-Horde key satisfies, including the anonymous ``"0000000000"``;
-    callers pass the worker's own ``api_key`` when one is configured, otherwise the anonymous key is used.
+    Beta models live in the model-reference PRIMARY's pending queue rather than the canonical reference, so
+    surfacing one requires both hordelib's beta opt-in env vars and a PRIMARY URL to read the pending queue from
+    (see ``hordelib.beta_models``). The esrgan and gfpgan categories are opted in alongside image_generation so a
+    worker can serve a beta upscaler or face restorer as soon as the AI-Horde server advertises its name (the
+    worker withholds offering it until then). The gfpgan category shares the face-restoration on-disk folder with
+    codeformer. Reading the pending queue only needs a reader-level key, which any AI-Horde key satisfies,
+    including the anonymous ``"0000000000"``; callers pass the worker's own ``api_key`` when one is configured,
+    otherwise the anonymous key is used.
 
     Every value is applied with ``setdefault`` so an operator who set any of these explicitly wins,
     including opting back out by exporting ``HORDELIB_BETA_MODEL_CATEGORIES=""`` (an empty value is

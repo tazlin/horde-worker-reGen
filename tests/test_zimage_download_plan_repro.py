@@ -1,13 +1,11 @@
-"""Repro: a beta model on disk reported as "will download" because a surface's reference lacks it.
+"""A beta model on disk must not be reported as "will download" by a surface whose reference lacks it.
 
-User report (Z-Image-Turbo): one surface said the model "will download", the Downloads tab said "all
-requested models are present", and no download fired. Z-Image-Turbo is a *beta* (pending-queue) model,
-so whether a given surface even holds its record depends on whether that surface loaded the reference
-with the beta source. ``compute_download_plan`` answers "on disk?" against whichever reference copy it
-is handed: when the record is absent it cannot resolve the files and reports the model as to-download,
-*even though the weights are on disk*. The beta-aware download subsystem, holding the record, correctly
-reports it present. This test reproduces that contradiction deterministically (no GPU, no network) by
-running the same on-disk files through a reference that has the record vs one that does not.
+A beta model's record is only in a reference loaded with the beta source. ``compute_download_plan`` judges
+"on disk?" against the reference copy it is given. Without the record it cannot resolve the files, so it
+reports the model as to-download even though the weights are on disk, while the beta-aware download
+subsystem, which holds the record, reports it present. These tests run the same on-disk files through a
+reference with the record and one without, with no GPU and no network. The fixture uses Z-Image-Turbo's
+files as its example beta model.
 """
 
 from __future__ import annotations
@@ -37,7 +35,7 @@ def _zimage_record() -> ImageGenerationModelRecord:
         name=_MODEL_NAME,
         baseline=KNOWN_IMAGE_GENERATION_BASELINE.z_image_turbo,
         nsfw=True,
-        description="Z-Image-Turbo (beta/pending) repro record",
+        description="beta model repro record",
         size_on_disk_bytes=20_430_635_136,
         config=GenericModelRecordConfig(
             download=[
@@ -78,9 +76,8 @@ def test_present_record_sees_zimage_on_disk(tmp_path: Path) -> None:
 def test_missing_record_reports_will_download_despite_files_on_disk(tmp_path: Path) -> None:
     """The bug: the SAME on-disk files are reported as to-download when the surface's reference lacks the record.
 
-    This is the "z-image-turbo will download" half of the contradiction: a non-beta reference copy has no
-    Z-Image-Turbo record, so the planner cannot resolve its files and treats it as not-on-disk, regardless
-    of the weights actually sitting in the model folder.
+    A reference copy loaded without the beta source has no record for the fixture model, so the planner
+    cannot resolve its files and treats it as not on disk while the weights sit in the model folder.
     """
     _place_zimage_on_disk(tmp_path)
     reference_without_beta_record: dict = {}

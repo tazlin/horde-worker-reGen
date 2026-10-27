@@ -843,7 +843,7 @@ class HordeWorkerTUI(App[None]):
         with contextlib.suppress(Exception):
             apply_cache_home_env(self._config_path)
         # Mirror the worker's default beta opt-in into this process before the catalog warms, so the model
-        # picker surfaces pending-queue (beta) models like qwen instead of the canonical-only set.
+        # picker surfaces pending-queue (beta) models instead of the canonical-only set.
         with contextlib.suppress(Exception):
             apply_beta_model_env(self._config_path)
         self._maybe_check_for_updates()
