@@ -83,6 +83,61 @@ def test_run_state_tracks_current_level() -> None:
     assert state.current_level_id is None
 
 
+def test_assessment_final_metrics_and_unstarted_checks_are_visible() -> None:
+    """Fast completions retain counts and speed, and untested checks retain their explanations."""
+    from rich.console import Console
+
+    from horde_worker_regen.benchmark.progress_channel import AssessmentJobProgress, LevelPlanRow, RampPlanned
+    from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
+
+    state = BenchmarkRunState()
+    state.apply(
+        RampPlanned(
+            rows=[
+                LevelPlanRow(level_id="a", stage="assessment", tier="sd15", features=["Batch 2"]),
+                LevelPlanRow(level_id="b", stage="assessment", tier="sd15", features=["ControlNet"]),
+            ]
+        )
+    )
+    state.apply(LevelStarted(level_id="a", description="Batch 2", jobs_expected=1))
+    state.apply(
+        LevelProgress(
+            level_id="a",
+            active_jobs=[
+                AssessmentJobProgress(
+                    job_id="job",
+                    process_id=1,
+                    state="sampling",
+                    current_step=3,
+                    total_steps=16,
+                    iterations_per_second=8,
+                )
+            ],
+            iterations_per_second=8,
+            jobs_expected=1,
+        )
+    )
+    console = Console(width=120)
+    with console.capture() as captured:
+        console.print(BenchmarkView._render_current_level(state.levels["a"], 0))
+    assert "step 3/16" in captured.get() and "8.00" in captured.get()
+    state.apply(LevelFinished(level_id="a", outcome="passed", jobs_completed=1, its_p50=9, elapsed_seconds=2))
+    state.apply(LevelFinished(level_id="b", outcome="not tested", reasons=["Model not downloaded"]))
+    assert state.levels["a"].jobs_completed == 1 and state.levels["a"].iterations_per_second == 9
+    assert not state.levels["a"].active_jobs
+    assert state.levels["b"].outcome == "not tested"
+    assert state.levels["b"].reasons == ["Model not downloaded"]
+
+
+def test_complete_command_has_no_implicit_clock_and_per_card_is_opt_in(tmp_path: Path) -> None:
+    """Single-card assessment defaults to completion and global output."""
+    command = BenchmarkOptions().build_command(tmp_path)
+    assert "--seconds" not in command and "--per-card" not in command
+    command = BenchmarkOptions(time_limit_minutes=12, per_card=True).build_command(tmp_path)
+    assert command[command.index("--seconds") + 1] == "720"
+    assert "--per-card" in command
+
+
 def test_run_state_shows_startup_phase_until_first_level() -> None:
     """A RampStarting heartbeat sets a pre-level phase that the first LevelStarted clears."""
     state = BenchmarkRunState()
@@ -185,12 +240,79 @@ def test_run_state_captures_suggestion_provenance() -> None:
                 ),
             ],
             consistency_warnings=["allow_lora untested"],
+            stop_reason="The worker stopped responding",
         ),
     )
+    assert state.stop_reason == "The worker stopped responding"
     assert len(state.suggestion_decisions) == 1
     assert state.suggestion_decisions[0].setting == "allow_lora"
     assert state.suggestion_decisions[0].basis == "untested_skipped"
     assert state.consistency_warnings == ["allow_lora untested"]
+
+
+def test_run_state_carries_model_guidance_into_the_models_panel() -> None:
+    """The finished view renders the RampFinished model guidance in its own Models panel."""
+    from rich.console import Console
+
+    from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
+
+    state = BenchmarkRunState()
+    state.apply(LevelStarted(level_id="a", description="Baseline", jobs_expected=1))
+    state.apply(
+        RampFinished(
+            run_id="run1",
+            suggested_bridge_data_yaml="max_threads: 1",
+            model_guidance=["Card 0: Passed a measured baseline: SD15."],
+        ),
+    )
+    assert state.model_guidance == ["Card 0: Passed a measured baseline: SD15."]
+    console = Console(width=120)
+    with console.capture() as captured:
+        console.print(
+            BenchmarkView(worker_mode="real")._render_body(state, BenchmarkSupervisorStatus.FINISHED, 0),
+        )
+    assert "Models" in captured.get() and "Passed a measured baseline: SD15." in captured.get()
+
+
+def test_apply_without_models_keeps_the_operator_model_lists(tmp_path: Path) -> None:
+    """A suggestion with no models leaves the global and per-card models_to_load exactly as written."""
+    from horde_worker_regen.benchmark.capabilities.result import SuggestedBridgeData, SuggestedCardSettings
+    from horde_worker_regen.tui.config_form import load_config
+
+    config_path = tmp_path / "bridgeData.yaml"
+    config_path.write_text(
+        "models_to_load:\n  - top 3\n  - Deliberate\ngpu_overrides:\n  0:\n    models_to_load:\n      - card-model\n",
+        encoding="utf-8",
+    )
+    suggested = SuggestedBridgeData(max_threads=2, gpu_overrides={0: SuggestedCardSettings(max_threads=2)})
+    apply_suggested_to_config(suggested, config_path)
+
+    data = load_config(config_path)
+    assert list(data["models_to_load"]) == ["top 3", "Deliberate"]
+    assert list(data["gpu_overrides"][0]["models_to_load"]) == ["card-model"]
+    assert data["gpu_overrides"][0]["max_threads"] == 2
+    assert data["max_threads"] == 2
+
+
+def test_apply_writes_the_lease_keys_only_when_the_suggestion_sets_them(tmp_path: Path) -> None:
+    """A lease-confirmed suggestion writes both lease keys; without one the operator's lease settings stay."""
+    from horde_worker_regen.benchmark.capabilities.result import SuggestedBridgeData
+    from horde_worker_regen.tui.benchmark_launcher import suggested_config_overrides
+    from horde_worker_regen.tui.config_form import load_config
+
+    config_path = tmp_path / "bridgeData.yaml"
+    config_path.write_text("gpu_sampling_lease_enabled: false\ngpu_sampling_lease_slots: 3\n", encoding="utf-8")
+    unleased = SuggestedBridgeData(max_threads=2)
+    assert "gpu_sampling_lease_enabled" not in suggested_config_overrides(unleased)
+    apply_suggested_to_config(unleased, config_path)
+    data = load_config(config_path)
+    assert data["gpu_sampling_lease_enabled"] is False and data["gpu_sampling_lease_slots"] == 3
+
+    leased = SuggestedBridgeData(max_threads=2, gpu_sampling_lease_enabled=True, gpu_sampling_lease_slots=1)
+    apply_suggested_to_config(leased, config_path)
+    data = load_config(config_path)
+    assert data["max_threads"] == 2
+    assert data["gpu_sampling_lease_enabled"] is True and data["gpu_sampling_lease_slots"] == 1
 
 
 def test_run_state_captures_ramp_plan() -> None:
@@ -262,6 +384,23 @@ def test_record_suggested_as_known_good(tmp_path: Path, monkeypatch: pytest.Monk
     assert known_good is not None
     assert known_good.source is KnownGoodSource.BENCHMARK
     assert known_good.config_snapshot["max_threads"] == 2
+
+
+def test_loading_legacy_assessment_revokes_progress_apply_permission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older successful progress event cannot enable Apply after its report fails current guarantees."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "report.json").write_text(
+        '{"report_schema_version":6,"operator_assessment":true,"suggested_bridge_data":{"safe_to_apply":true}}',
+        encoding="utf-8",
+    )
+    supervisor = BenchmarkSupervisor(results_root=tmp_path)
+    supervisor._out_dir = tmp_path
+    assert supervisor.run_state.suggestion_confirmed
+    supervisor._load_and_record_report()
+    assert supervisor.report is not None and not supervisor.report.suggested_bridge_data.safe_to_apply
+    assert not supervisor.run_state.suggestion_confirmed
 
 
 class _FakePopen:

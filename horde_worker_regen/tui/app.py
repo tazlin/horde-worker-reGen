@@ -2677,7 +2677,7 @@ class HordeWorkerTUI(App[None]):
             return
         try:
             apply_suggested_to_config(report.suggested_bridge_data, self._config_path)
-        except OSError as write_error:
+        except (OSError, ValueError) as write_error:
             self.notify(f"Failed to write {self._config_path}: {write_error}", severity="error")
             return
         record_suggested_as_known_good(report.suggested_bridge_data, worker_version=__version__)

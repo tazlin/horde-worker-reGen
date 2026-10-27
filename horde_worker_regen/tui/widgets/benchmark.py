@@ -66,6 +66,11 @@ _OUTCOME_COLOURS: dict[str, str] = {
     "crashed": "red",
     "crashed_hang": "red",
     "skipped": "grey50",
+    "not tested": "grey50",
+    "inconclusive": "yellow",
+    "unavailable": "grey50",
+    "not applicable": "grey50",
+    "estimated": "cyan",
 }
 
 _BASIS_STYLES: dict[str, str] = {
@@ -373,16 +378,24 @@ class BenchmarkView(VerticalScroll):
                 )
             with Collapsible(title="Advanced options", collapsed=True, id="benchmark-advanced"):
                 yield self._number_row(
-                    "Soak (min)",
+                    "Time limit (min)",
                     "benchmark-soak",
-                    "5",
-                    "Minutes the sustained-load check runs after the levels finish.",
+                    "",
+                    "Leave blank to finish selected checks. Slow cards can continue while making progress.",
                 )
                 yield self._switch_row(
-                    "Validate",
+                    "Per-card settings",
+                    "benchmark-per-card",
+                    default=False,
+                    help_text=(
+                        "Write settings for the tested card even when testing one GPU. Useful if you plan to add GPUs."
+                    ),
+                )
+                yield self._switch_row(
+                    "Confirm combined settings",
                     "benchmark-validate",
                     default=True,
-                    help_text="After the levels, run the suggested config under sustained load to check it holds.",
+                    help_text="Test the proposed settings together before enabling Apply suggested config.",
                 )
                 yield self._switch_row(
                     "Downloads",
@@ -628,9 +641,10 @@ class BenchmarkView(VerticalScroll):
             if self.query_one(f"#{_tier_switch_id(toggle.tier)}", Switch).value
         ] or ["sd15"]
         try:
-            soak_minutes = float(self.query_one("#benchmark-soak", Input).value or "5")
+            value = self.query_one("#benchmark-soak", Input).value.strip()
+            time_limit_minutes = float(value) if value else None
         except ValueError:
-            soak_minutes = 5.0
+            time_limit_minutes = None
         excluded_capabilities = [
             toggle.axis.value
             for _group_name, toggles in _AXIS_GROUPS
@@ -641,7 +655,8 @@ class BenchmarkView(VerticalScroll):
             tiers=tiers,
             process_mode=self._worker_mode,
             validate=self.query_one("#benchmark-validate", Switch).value,
-            soak_minutes=soak_minutes,
+            time_limit_minutes=time_limit_minutes,
+            per_card=self.query_one("#benchmark-per-card", Switch).value,
             include_downloads=self.query_one("#benchmark-downloads", Switch).value,
             excluded_capabilities=excluded_capabilities,
             force=self.query_one("#benchmark-force", Switch).value,
@@ -919,7 +934,7 @@ class BenchmarkView(VerticalScroll):
         # PREPARING (worker being stopped, before the subprocess launches) is busy too: block a second
         # Run and the worker-restarting Restore, but there is no subprocess yet to Cancel.
         active = status in (BenchmarkSupervisorStatus.PREPARING, BenchmarkSupervisorStatus.RUNNING)
-        has_suggestion = bool(run_state.suggested_bridge_data_yaml)
+        has_suggestion = bool(run_state.suggested_bridge_data_yaml) and run_state.suggestion_confirmed
         self.query_one("#benchmark-run", Button).disabled = active
         self.query_one("#benchmark-preview", Button).disabled = active
         # Downloading contends with the GPU-exclusive run and stops a level mid-flight, so gate it while busy;
@@ -985,12 +1000,17 @@ class BenchmarkView(VerticalScroll):
         sections: list[RenderableType] = []
         if finished_with_suggestion:
             sections.append(self._render_suggestion(run_state))
+        if run_state.finished and run_state.model_guidance:
+            guidance = "\n".join(f"- {line}" for line in run_state.model_guidance)
+            sections.append(Panel(Text(guidance), title="Models", title_align="left"))
         sections.append(self._render_headline(run_state, status, frame))
         current = run_state.current_level_id
         if current is not None and current in run_state.levels:
             sections.append(self._render_current_level(run_state.levels[current], frame))
         if run_state.level_order:
             sections.append(self._render_level_table(run_state))
+        if run_state.storage_notes:
+            sections.append(Panel(Text("\n".join(run_state.storage_notes)), title="Model loading", title_align="left"))
         return Group(*sections)
 
     @staticmethod
@@ -1058,8 +1078,22 @@ class BenchmarkView(VerticalScroll):
             "  ",
             (f"{run_state.run_id or '-'}", "bold"),
             (f"   mode={run_state.process_mode or '-'}   {gpu}   ", "grey62"),
-            (f"levels {finished_levels}/{total}", "bold cyan"),
+            (f"checks {finished_levels}/{total}", "bold cyan"),
         )
+        if run_state.work_limit is not None:
+            completed = (
+                run_state.run_jobs_completed
+                if run_state.run_jobs_completed is not None
+                else sum(level.jobs_completed for level in run_state.levels.values())
+            )
+            body.append(f"\nJobs finished: {completed}. Work limit: {run_state.work_limit} image jobs and forms.")
+            body.append(
+                " No overall time limit."
+                if run_state.time_limit_seconds is None
+                else f" Time limit: {run_state.time_limit_seconds / 60:.0f} minutes."
+            )
+        if run_state.finished and run_state.stop_reason:
+            body.append(f"\n{run_state.stop_reason}", style="yellow")
         return Panel(body, border_style=status_colour)
 
     @staticmethod
@@ -1089,14 +1123,30 @@ class BenchmarkView(VerticalScroll):
         table = Table.grid(padding=(0, 2))
         table.add_column(justify="right", style="bold cyan")
         table.add_column()
-        table.add_row("Level", f"{level.level_id} ({level.stage}/{level.tier}/{level.axis})")
+        table.add_row("Check", level.description or level.level_id)
         if level.phase:
             table.add_row("Status", Text(level.phase, style="yellow"))
         table.add_row("Jobs", BenchmarkView._jobs_cell(level))
-        table.add_row("it/s", "-" if level.iterations_per_second is None else f"{level.iterations_per_second:.2f}")
-        table.add_row("VRAM", "-" if level.vram_used_mb is None else f"{level.vram_used_mb} MB")
-        table.add_row("GPU busy", "-" if level.gpu_busy_percent is None else f"{level.gpu_busy_percent:.0f}%")
+        table.add_row("Waiting / running", f"{level.jobs_waiting} / {len(level.active_jobs)}")
+        table.add_row(
+            "Sampling it/s",
+            "Not reported" if level.iterations_per_second is None else f"{level.iterations_per_second:.2f}",
+        )
+        if level.recent_iterations_per_second is not None:
+            table.add_row("Finished jobs it/s", f"{level.recent_iterations_per_second:.2f}")
+        table.add_row("Card memory used", "Not reported" if level.vram_used_mb is None else f"{level.vram_used_mb} MB")
+        table.add_row(
+            "GPU activity", "Not reported" if level.gpu_busy_percent is None else f"{level.gpu_busy_percent:.0f}%"
+        )
         table.add_row("Elapsed", f"{level.elapsed_seconds:.0f}s")
+        if level.worker_update_age is not None and level.worker_update_age > 3:
+            table.add_row("Last worker update", f"{level.worker_update_age:.0f}s ago")
+        if level.model_loading_seconds is not None:
+            table.add_row("Model loading", f"{level.model_loading_seconds:.2f}s (may use OS cache)")
+        for job in level.active_jobs:
+            steps = f"step {job.current_step}/{job.total_steps}" if job.current_step is not None else job.state
+            rate = f", {job.iterations_per_second:.2f} it/s" if job.iterations_per_second is not None else ""
+            table.add_row(f"Job {job.job_id[:8]}", f"Process {job.process_id}: {steps}{rate}")
         if level.num_process_recoveries:
             table.add_row("Restarts", Text(f"{level.num_process_recoveries} (!)", style="bold red"))
         if level.process_summary:
@@ -1106,9 +1156,10 @@ class BenchmarkView(VerticalScroll):
     def _render_level_table(self, run_state: BenchmarkRunState) -> Panel:
         """A per-level verdict table built up as levels finish."""
         table = Table(expand=True)
-        table.add_column("Level")
-        table.add_column("Stage/Tier")
+        table.add_column("Check")
+        table.add_column("Model family")
         table.add_column("Outcome")
+        table.add_column("Jobs", justify="right")
         table.add_column("it/s p50", justify="right")
         table.add_column("Notes")
         for level in run_state.ordered_levels():
@@ -1117,20 +1168,21 @@ class BenchmarkView(VerticalScroll):
             its = "-" if level.iterations_per_second is None else f"{level.iterations_per_second:.2f}"
             notes = "; ".join(level.reasons + level.advisories)
             table.add_row(
-                level.level_id,
-                f"{level.stage}/{level.tier}",
+                level.description or level.level_id,
+                _tier_label(level.tier),
                 Text(outcome, style=colour),
+                f"{level.jobs_completed}/{level.jobs_expected}" if level.jobs_expected is not None else "Not started",
                 its,
                 notes,
             )
-        return Panel(table, title="Levels", title_align="left", border_style="grey37")
+        return Panel(table, title="Checks", title_align="left", border_style="grey37")
 
     @staticmethod
     def _render_suggestion(run_state: BenchmarkRunState) -> Panel:
         """The recommended bridgeData, its run totals, and the per-setting provenance behind each value."""
         findings = f"  ·  {run_state.num_findings} findings" if run_state.num_findings else ""
         header = Text.from_markup(
-            f"[bold]{run_state.levels_passed}/{run_state.levels_total}[/] levels passed{findings}\n"
+            f"[bold]{run_state.levels_passed}/{run_state.levels_total}[/] checks passed{findings}\n"
             "Press [bold green]Apply suggested config[/] to write these settings into bridgeData.yaml.\n",
         )
         sections: list[RenderableType] = [header, Text(run_state.suggested_bridge_data_yaml, style="grey82")]

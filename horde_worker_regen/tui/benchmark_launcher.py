@@ -29,6 +29,7 @@ from loguru import logger
 
 from horde_worker_regen.benchmark.progress_channel import (
     PROGRESS_FILENAME,
+    AssessmentJobProgress,
     BenchmarkProgressEvent,
     LevelFinished,
     LevelPlanRow,
@@ -50,15 +51,27 @@ if TYPE_CHECKING:
 _CANCEL_GRACE_SECONDS = 5.0
 
 _SUGGESTED_CONFIG_KEYS = (
+    "max_power",
+    "gpu_device_indices",
+    "gpu_overrides",
+    "high_performance_mode",
+    "moderate_performance_mode",
+    "dynamic_models",
     "max_threads",
     "queue_size",
     "max_batch",
     "allow_lora",
+    "allow_img2img",
+    "allow_painting",
     "allow_controlnet",
+    "allow_sdxl_controlnet",
     "allow_post_processing",
     "models_to_load",
     "alchemist",
     "alchemy_allow_concurrent",
+    "alchemy_max_concurrency",
+    "gpu_sampling_lease_enabled",
+    "gpu_sampling_lease_slots",
 )
 """The bridgeData keys the benchmark recommendation writes when applied to the config file."""
 
@@ -82,6 +95,8 @@ class BenchmarkOptions:
     process_mode: str = "real"
     validate: bool = True
     soak_minutes: float = 5.0
+    time_limit_minutes: float | None = None
+    per_card: bool = False
     include_downloads: bool = False
     include_concurrency: bool = True
     include_features: bool = True
@@ -124,6 +139,10 @@ class BenchmarkOptions:
             "--soak-minutes",
             str(self.soak_minutes),
         ]
+        if self.time_limit_minutes is not None:
+            command.extend(["--seconds", str(self.time_limit_minutes * 60)])
+        if self.per_card:
+            command.append("--per-card")
         if not self.validate:
             command.append("--no-validate")
         if self.verbose:
@@ -203,6 +222,11 @@ class LevelState:
     outcome: str | None = None
     reasons: list[str] = dataclasses.field(default_factory=list)
     advisories: list[str] = dataclasses.field(default_factory=list)
+    active_jobs: list[AssessmentJobProgress] = dataclasses.field(default_factory=list)
+    jobs_waiting: int = 0
+    recent_iterations_per_second: float | None = None
+    worker_update_age: float | None = None
+    model_loading_seconds: float | None = None
 
 
 class BenchmarkRunState:
@@ -231,12 +255,20 @@ class BenchmarkRunState:
         self.levels_total: int = 0
         self.num_findings: int = 0
         self.suggested_bridge_data_yaml: str = ""
+        self.suggestion_confirmed: bool = True
         self.suggestion_decisions: list[SuggestionDecisionRow] = []
         """Per-setting recommendation provenance, from the RampFinished event."""
         self.consistency_warnings: list[str] = []
         """Recommendation self-consistency warnings, from the RampFinished event."""
         self.report_path: str | None = None
         self.finished: bool = False
+        self.storage_notes: list[str] = []
+        self.model_guidance: list[str] = []
+        """Model family guidance, from the RampFinished event."""
+        self.stop_reason: str = ""
+        self.work_limit: int | None = None
+        self.time_limit_seconds: float | None = None
+        self.run_jobs_completed: int | None = None
 
     def apply(self, event: BenchmarkProgressEvent) -> None:
         """Fold one progress event into the accumulated state."""
@@ -250,8 +282,18 @@ class BenchmarkRunState:
             self.tiers = list(event.tiers)
             self.process_mode = event.process_mode
             self.gpu_name = event.gpu_name
+            self.work_limit = event.work_limit
+            self.time_limit_seconds = event.time_limit_seconds
         elif isinstance(event, RampPlanned):
             self.plan_rows = list(event.rows)
+            for row in event.rows:
+                if row.stage == "assessment":
+                    level = self._level(row.level_id)
+                    level.stage = row.stage
+                    level.tier = row.tier
+                    level.description = ", ".join(row.features)
+            if any(row.stage == "assessment" for row in event.rows):
+                self.num_levels = len(self.level_order)
         elif isinstance(event, LevelStarted):
             self.startup_phase = ""  # a level is running now; the pre-level phase no longer applies
             level = self._level(event.level_id)
@@ -273,6 +315,13 @@ class BenchmarkRunState:
             level.phase = event.phase
             level.process_summary = event.process_summary
             level.num_process_recoveries = event.num_process_recoveries
+            level.active_jobs = list(event.active_jobs)
+            level.jobs_waiting = event.jobs_waiting
+            level.recent_iterations_per_second = event.recent_iterations_per_second
+            level.worker_update_age = event.worker_update_age
+            level.model_loading_seconds = event.model_loading_seconds
+            if event.run_jobs_completed is not None:
+                self.run_jobs_completed = event.run_jobs_completed
         elif isinstance(event, LevelFinished):
             level = self._level(event.level_id)
             level.outcome = event.outcome
@@ -280,9 +329,22 @@ class BenchmarkRunState:
             level.advisories = list(event.advisories)
             if event.its_p50 is not None:
                 level.iterations_per_second = event.its_p50
+                level.recent_iterations_per_second = event.its_p50
+            if event.jobs_completed is not None:
+                level.jobs_completed = event.jobs_completed
+            if event.jobs_expected is not None:
+                level.jobs_expected = event.jobs_expected
+            if event.jobs_faulted is not None:
+                level.jobs_faulted = event.jobs_faulted
+            if event.elapsed_seconds is not None:
+                level.elapsed_seconds = event.elapsed_seconds
+            if event.vram_used_high_water_mb is not None:
+                level.vram_used_mb = event.vram_used_high_water_mb
+            level.active_jobs = []
             if self.current_level_id == event.level_id:
                 self.current_level_id = None
         elif isinstance(event, RampFinished):
+            self.suggestion_confirmed = event.suggestion_confirmed
             self.levels_passed = event.levels_passed
             self.levels_total = event.levels_total
             self.num_findings = event.num_findings
@@ -291,6 +353,11 @@ class BenchmarkRunState:
             self.consistency_warnings = list(event.consistency_warnings)
             self.report_path = event.report_path
             self.finished = True
+            self.storage_notes = [*event.model_loading_summary, *event.storage_notes]
+            self.model_guidance = list(event.model_guidance)
+            self.stop_reason = event.stop_reason
+            if event.run_jobs_completed is not None:
+                self.run_jobs_completed = event.run_jobs_completed
 
     def ordered_levels(self) -> list[LevelState]:
         """Return the levels in the order they first appeared."""
@@ -437,6 +504,9 @@ class BenchmarkSupervisor:
             if report_path.exists():
                 report = CapabilityReport.model_validate_json(report_path.read_text(encoding="utf-8"))
                 self.report = report
+                self.run_state.suggestion_confirmed = (
+                    self.run_state.suggestion_confirmed and report.suggested_bridge_data.safe_to_apply
+                )
                 AppStateStore().record_benchmark(
                     build_capability_benchmark_record(report, results_dir=self._out_dir),
                 )
@@ -458,17 +528,48 @@ def suggested_config_overrides(suggested: SuggestedBridgeData) -> dict[str, obje
     ``max_batch`` is included (unlike the validation soak's ``to_bridge_overrides``) because it is a real
     worker config field the user runs with, not just a per-job payload value.
     """
-    return {
+    if not suggested.safe_to_apply:
+        raise ValueError("No combined configuration was confirmed. Review the partial capability evidence first.")
+    overrides: dict[str, object] = {
         "max_threads": suggested.max_threads,
         "queue_size": suggested.queue_size,
         "max_batch": suggested.max_batch,
         "allow_lora": suggested.allow_lora,
         "allow_controlnet": suggested.allow_controlnet,
+        "allow_sdxl_controlnet": suggested.allow_sdxl_controlnet,
         "allow_post_processing": suggested.allow_post_processing,
-        "models_to_load": list(suggested.models_to_load),
         "alchemist": suggested.alchemist,
         "alchemy_allow_concurrent": suggested.alchemy_allow_concurrent,
     }
+    # An empty assessment model list tells Apply to preserve the configured models.
+    if suggested.models_to_load:
+        overrides["models_to_load"] = list(suggested.models_to_load)
+    if suggested.max_power is not None:
+        overrides["max_power"] = suggested.max_power
+    if suggested.allow_img2img is not None:
+        overrides["allow_img2img"] = suggested.allow_img2img
+    if suggested.allow_painting is not None:
+        overrides["allow_painting"] = suggested.allow_painting
+    for field_name in (
+        "high_performance_mode",
+        "moderate_performance_mode",
+        "dynamic_models",
+        "gpu_sampling_lease_enabled",
+        "gpu_sampling_lease_slots",
+    ):
+        value = suggested.model_dump()[field_name]
+        if value is not None:
+            overrides[field_name] = value
+    if suggested.gpu_device_indices is not None:
+        overrides["gpu_device_indices"] = list(suggested.gpu_device_indices)
+    if suggested.gpu_overrides:
+        overrides["gpu_overrides"] = {
+            index: settings.model_dump(exclude=None if settings.models_to_load else {"models_to_load"})
+            for index, settings in suggested.gpu_overrides.items()
+        }
+    if suggested.clear_card_fields:
+        overrides["clear_card_fields"] = {str(index): fields for index, fields in suggested.clear_card_fields.items()}
+    return overrides
 
 
 def apply_suggested_to_config(suggested: SuggestedBridgeData, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
@@ -483,9 +584,40 @@ def apply_known_good_to_config(config_snapshot: Mapping[str, object], config_pat
     fresh benchmark recommendation and restoring a previously known-good configuration.
     """
     data = load_config(config_path)
+    removals = config_snapshot.get("clear_card_fields", {})
+    cards = data.get("gpu_overrides", {})
+    if isinstance(removals, dict) and isinstance(cards, dict):
+        for card_index, fields in removals.items():
+            if not isinstance(fields, list):
+                continue
+            for existing_key in list(cards):
+                if str(existing_key) != str(card_index):
+                    continue
+                policy = cards[existing_key]
+                for field_name in fields:
+                    if field_name in _SUGGESTED_CONFIG_KEYS and field_name in config_snapshot:
+                        policy.pop(field_name, None)
+                        if field_name == "allow_painting":
+                            policy.pop("allow_inpainting", None)
+                if not policy:
+                    del cards[existing_key]
+        if not cards:
+            data.pop("gpu_overrides", None)
     for key in _SUGGESTED_CONFIG_KEYS:
         if key in config_snapshot:
-            data[key] = config_snapshot[key]
+            value = config_snapshot[key]
+            if key == "gpu_overrides" and isinstance(value, dict):
+                cards = data.setdefault("gpu_overrides", {})
+                for index, limits in value.items():
+                    existing_key = next((key for key in cards if str(key) == str(index)), index)
+                    policy = cards.setdefault(existing_key, {})
+                    if "allow_painting" in limits:
+                        policy.pop("allow_inpainting", None)
+                    policy.update(limits)
+            else:
+                if key == "allow_painting":
+                    data.pop("allow_inpainting", None)
+                data[key] = value
     save_config(data, config_path)
 
 

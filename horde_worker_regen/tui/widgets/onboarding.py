@@ -138,9 +138,9 @@ class BenchmarkOnboardingModal(ResponsiveModalScreen[OnboardingChoice]):
         return Text.assemble(
             (headline + "\n\n", "bold"),
             (
-                "A benchmark runs test jobs of increasing difficulty and suggests settings for "
-                "bridgeData.yaml. The worker serves no jobs while it runs, because the benchmark "
-                "needs the GPU.",
+                "A capability assessment runs selected checks without an overall time limit by default. "
+                "It uses installed models where possible, tests representative workloads and reports measured "
+                "limits separately from predictions. Normal Horde service pauses while it uses the GPU.",
                 "grey70",
             ),
         )

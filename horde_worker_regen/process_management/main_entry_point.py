@@ -24,14 +24,25 @@ _KNOWN_GOOD_MIN_SESSION_SECONDS = 600.0
 """A session must run at least this long (cleanly, with jobs done) to be trusted as known-good."""
 
 _KNOWN_GOOD_CONFIG_FIELDS = (
+    "max_power",
+    "gpu_device_indices",
+    "gpu_overrides",
+    "high_performance_mode",
+    "moderate_performance_mode",
+    "dynamic_models",
     "max_threads",
     "queue_size",
     "max_batch",
     "allow_lora",
+    "allow_img2img",
+    "allow_painting",
     "allow_controlnet",
+    "allow_sdxl_controlnet",
     "allow_post_processing",
     "models_to_load",
     "alchemist",
+    "alchemy_allow_concurrent",
+    "alchemy_max_concurrency",
 )
 """The performance-relevant bridgeData fields captured in a known-good snapshot (mirrors the
 benchmark's suggested-bridge-data set, so the two sources of known-good stay comparable)."""
@@ -134,4 +145,5 @@ def _known_good_from_bridge_data(bridge_data: reGenBridgeData, worker_version: s
 
 def _relevant_config_snapshot(bridge_data: reGenBridgeData) -> dict[str, object]:
     """Return the subset of bridgeData fields that define a configuration's performance profile."""
-    return bridge_data.model_dump(include=set(_KNOWN_GOOD_CONFIG_FIELDS))
+    resolved = bridge_data.model_dump(by_alias=True)
+    return {key: resolved[key] for key in _KNOWN_GOOD_CONFIG_FIELDS if key in resolved}

@@ -749,6 +749,30 @@ registry](resilience_and_recovery.md). Reads never raise (a missing or corrupt
 file yields fresh state, so it cannot block startup) and writes are atomic. The
 module is dependency-light so it can be imported early in startup and by the TUI.
 
+## Assessment controls and application
+
+The Benchmark tab runs selected checks without an overall time limit by default. Advanced options
+include an optional time limit, **Per-card settings** for single-GPU runs, and **Confirm combined
+settings**. Confirmation tests the suggested settings together before enabling Apply. See the
+[CLI reference](../reference/cli.md#assessment-controls-and-results) for control behavior and result
+interpretation.
+
+Live updates show waiting and active jobs, sampling steps and rates, card memory, and GPU activity
+when available. Finished counts and rates remain visible even when a job completes between updates.
+Missing readings display "Not reported". Every selected check stays visible, including unavailable
+and untested checks. The header reports why the run stopped.
+
+The finished view shows model-loading measurements and a Models panel with per-card family results
+and serving advice. `BenchmarkRunState.model_guidance` receives the advice through `RampFinished`.
+Apply and Restore preserve the operator's global and per-card model lists. Applying global limits
+removes conflicting fields from the tested card's overrides. The known-good record retains that
+removal list so Restore applies settings consistently. Other card policies remain unchanged.
+
+Supervisor protocol v35 includes `RESIZE_CAPACITY`, correlated `capacity_change` acknowledgments
+that indicate whether a refusal can be retried, and `config_revision` after a normal config reload.
+Capacity changes require paused intake and finalization of accepted work. See
+[Architecture](architecture.md#operator-capability-assessment) for the worker control flow.
+
 ## See also
 
 - [Use the dashboard](../how-to/use-the-dashboard.md): the dashboard from a

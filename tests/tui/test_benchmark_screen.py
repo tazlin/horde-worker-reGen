@@ -184,12 +184,15 @@ async def test_advanced_options_start_collapsed_and_collect_through_collapsible(
         view = app.query_one(BenchmarkView)
         options = view._collect_options()
         assert options.force is False
+        assert options.time_limit_minutes is None and not options.per_card
 
         # Flipping a switch inside the collapsed section still flows into the collected options.
         app.query_one("#benchmark-force", Switch).value = True
+        app.query_one("#benchmark-per-card", Switch).value = True
         await pilot.pause()
         updated = view._collect_options()
         assert updated.force is True
+        assert updated.per_card is True
 
 
 async def test_per_axis_switch_excludes_only_that_axis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
