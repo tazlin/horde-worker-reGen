@@ -209,26 +209,24 @@ with these adjustments:
   runs a single inference process regardless of the above; image concurrency is
   what the process pool exists for.
 
-There is always **one additional safety process**. The formula above is an
-**upper bound**: two plan-time caps can lower it, each only ever reducing a card
-and never below one context per card. First, a **per-card VRAM-fit cap** bounds
-every card (single-GPU included) to the inference contexts its VRAM physically
-holds: each planned context's idle CUDA/runtime baseline plus one copy of a single
-typical (SDXL-class) working set, within the card total net of the proportional
-admission noise buffer. A very large model (Flux, Cascade, Qwen, Z-Image) does not
-raise this bound: it never co-samples with another very large model, shares the card with a
-smaller job only when the arbiter confirms room, and is otherwise paid just-in-time by the
-whole-card residency machinery when one actually dispatches, not reserved at spawn,
-so the spare contexts stay free to preload the next model. Second, a **shared-RAM
-cap** (`cap_card_process_counts`) applies to every host, single-GPU included, and
-lowers the count so the worker-wide resident set fits the single system-RAM pool
-(each resident context retains system RAM that no card's VRAM offsets; a second card
-doubles VRAM, not RAM, and one card's plan can over-commit the pool alone). Both are
-spawn-time bounds; the running worker's runtime governor down-regulates live
-concurrency further under memory pressure, and the `horde-benchmark` path is exempt
-from both caps so it can probe higher concurrency than steady-state operation would
-keep. When a cap reduces the configured count the worker logs the arithmetic so the
-smaller spawn is explained.
+There is always **one additional safety process**. The formula above is an **upper bound**: two
+plan-time caps can lower it, each only ever reducing a card and never below one context per card.
+First, a **per-card VRAM-fit cap** bounds every card (single-GPU included) to the inference contexts
+its VRAM physically holds: each planned context's idle CUDA/runtime baseline plus one copy of a
+single typical (SDXL-class) working set, within the card total net of the proportional admission
+noise buffer. A very large model (Flux, Cascade, Qwen, Z-Image) does not raise this bound: it never
+co-samples with another very large model, shares the card with a smaller job only when the arbiter
+confirms room, and is otherwise paid just-in-time by the whole-card residency machinery when one
+actually dispatches, not reserved at spawn, so the spare contexts stay free to preload the next
+model. Second, a **shared-RAM cap** (`cap_card_process_counts`) applies to every host, single-GPU
+included, and lowers the count so the worker-wide resident set fits the single system-RAM pool (each
+resident context retains system RAM that no card's VRAM offsets; a second card doubles VRAM, not
+RAM, and one card's plan can over-commit the pool alone). Both are spawn-time bounds; the running
+worker's runtime governor down-regulates live concurrency further under memory pressure. The default
+`horde-benchmark run` assessment obeys both caps, including runtime capacity changes after all
+accepted work has finished. The explicit `--exhaustive` developer harness bypasses these startup
+caps to probe higher concurrency. When a cap reduces the configured count the worker logs the
+arithmetic so the smaller spawn is explained.
 
 When the resolved plan contains more than one inference process, the lifecycle
 manager also divides the host CPU count among the planned inference processes,

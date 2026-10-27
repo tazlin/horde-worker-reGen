@@ -38,7 +38,7 @@ def format_progress_event(event: BenchmarkProgressEvent, *, verbose: bool = Fals
     if isinstance(event, RampPlanned):
         return format_plan_table(event.rows)
     if isinstance(event, LevelStarted):
-        position = f"{event.level_index + 1}/{event.num_levels}" if event.num_levels else "soak"
+        position = f"{event.level_index + 1}/{event.num_levels}" if event.num_levels else event.stage or "soak"
         expected = f", {event.jobs_expected} jobs" if event.jobs_expected is not None else ""
         return f"  |- [{position}] {event.level_id} ({event.stage}/{event.tier}/{event.axis}){expected} ..."
     if isinstance(event, LevelProgress):
@@ -51,7 +51,13 @@ def format_progress_event(event: BenchmarkProgressEvent, *, verbose: bool = Fals
             f"= Benchmark complete: {event.levels_passed}/{event.levels_total} passed{findings}, "
             f"report={event.report_path}",
         ]
+        if event.stop_reason:
+            lines.append(f"  {event.stop_reason}")
         lines.extend(_provenance_lines(event))
+        lines.extend(f"  {note}" for note in [*event.model_loading_summary, *event.storage_notes])
+        if event.model_guidance:
+            lines.append("  model guidance:")
+            lines.extend(f"    - {line}" for line in event.model_guidance)
         for warning in event.consistency_warnings:
             lines.append(f"  (!) consistency: {warning}")
         return "\n".join(lines)
@@ -189,6 +195,10 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
 def _finished_detail(event: LevelFinished) -> str:
     """Render the trailing detail (it/s and notes) of a :class:`LevelFinished` event."""
     parts: list[str] = []
+    if event.jobs_completed is not None:
+        parts.append(f"{event.jobs_completed} jobs finished")
+    if event.elapsed_seconds is not None:
+        parts.append(f"{event.elapsed_seconds:.1f}s")
     if event.its_p50 is not None:
         parts.append(f"it/s p50 {event.its_p50:.2f}")
     notes = "; ".join(event.reasons + event.advisories)

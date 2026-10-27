@@ -24,8 +24,9 @@ cover a 4090/64 GB SDXL-balanced worker, a 4090/64 GB large-model worker, a 2080
 worker, and a midrange 12-16 GB VRAM worker.
 
 If you are editing YAML by hand, pick the block closest to your card and adjust from there. The
-benchmark (on the dashboard's **Benchmark** tab, or `horde-benchmark ramp`) can suggest values tuned
-to your actual machine.
+benchmark (on the dashboard's **Benchmark** tab, or `horde-benchmark run`) suggests measured limits.
+It finishes selected checks without an overall time limit by default. Single-card suggestions use global
+settings unless per-card output is selected. Predictions remain separate from measurements; see the [CLI reference](../reference/cli.md#run-bounded-operator-assessment).
 
 ### 24 GB+ VRAM (RTX 3090, 4090)
 

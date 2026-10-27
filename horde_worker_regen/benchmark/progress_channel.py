@@ -88,6 +88,8 @@ class RampStarted(BenchmarkProgressEvent):
     process_mode: str = "real"
     gpu_name: str | None = None
     total_vram_mb: int | None = None
+    work_limit: int | None = None
+    time_limit_seconds: float | None = None
 
 
 class LevelPlanRow(BaseModel):
@@ -193,6 +195,17 @@ class LevelStarted(BenchmarkProgressEvent):
     timeout_seconds: float | None = None
 
 
+class AssessmentJobProgress(BaseModel):
+    """One active assessment job, using the child's reported sampling progress."""
+
+    job_id: str
+    process_id: int
+    state: str
+    current_step: int | None = None
+    total_steps: int | None = None
+    iterations_per_second: float | None = None
+
+
 class LevelProgress(BenchmarkProgressEvent):
     """Emitted periodically while a level runs, carrying its latest live metrics."""
 
@@ -218,6 +231,12 @@ class LevelProgress(BenchmarkProgressEvent):
     so a tailing view can show *where* a low live duty cycle is going. Empty until jobs are attributed."""
     no_jobs_available_seconds: float | None = None
     """Seconds so far the worker idled with no jobs available (demand-limited idle, not inefficiency)."""
+    active_jobs: list[AssessmentJobProgress] = Field(default_factory=list)
+    jobs_waiting: int = 0
+    recent_iterations_per_second: float | None = None
+    worker_update_age: float | None = None
+    model_loading_seconds: float | None = None
+    run_jobs_completed: int | None = None
 
 
 class LevelFinished(BenchmarkProgressEvent):
@@ -236,6 +255,13 @@ class LevelFinished(BenchmarkProgressEvent):
     """The biggest worker-side per-job gaps over the level, for a "where the duty cycle went" line."""
     no_jobs_available_seconds: float | None = None
     """Seconds the worker idled with no jobs available over the level (demand-limited idle)."""
+    evidence_status: str | None = None
+    attempted: bool = False
+    reason_code: str = ""
+    jobs_completed: int | None = None
+    jobs_expected: int | None = None
+    jobs_faulted: int | None = None
+    elapsed_seconds: float | None = None
 
 
 class SuggestionDecisionRow(BaseModel):
@@ -259,6 +285,8 @@ class RampFinished(BenchmarkProgressEvent):
     """Emitted once at the end of a ramp, carrying the totals and the synthesized recommendation."""
 
     kind: Literal[ProgressEventKind.RAMP_FINISHED] = ProgressEventKind.RAMP_FINISHED
+    suggestion_confirmed: bool = True
+    """Whether at least one enforceable configuration was confirmed for the apply action."""
     run_id: str = ""
     levels_passed: int = 0
     levels_total: int = 0
@@ -268,7 +296,14 @@ class RampFinished(BenchmarkProgressEvent):
     suggestion_decisions: list[SuggestionDecisionRow] = Field(default_factory=list)
     """Per-setting provenance for the recommendation; empty for runs from before protocol v3."""
     consistency_warnings: list[str] = Field(default_factory=list)
-    """Messages from the recommendation's self-consistency check (empty when fully grounded)."""
+    """Warnings about suggested settings that lack supporting results, or an empty list."""
+    storage_notes: list[str] = Field(default_factory=list)
+    model_loading_summary: list[str] = Field(default_factory=list)
+    model_guidance: list[str] = Field(default_factory=list)
+    """Which model families the assessment ran and which models to offer; empty for exhaustive runs."""
+    run_jobs_completed: int | None = None
+    stop_reason: str = ""
+    """Why the operator assessment stopped offering work; empty for exhaustive runs."""
 
 
 AnyProgressEvent = Annotated[

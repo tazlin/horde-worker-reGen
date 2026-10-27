@@ -35,6 +35,7 @@ class CapabilityKind(StrEnum):
     QUEUE_SIZE = auto()
     THREADS = auto()
     BATCH = auto()
+    RESOLUTION = auto()
     HIRES_FIX = auto()
     POST_PROCESSING = auto()
     CONTROLNET = auto()
@@ -72,6 +73,7 @@ _KIND_LABELS: dict[CapabilityKind, str] = {
     CapabilityKind.QUEUE_SIZE: "queue depth",
     CapabilityKind.THREADS: "threads",
     CapabilityKind.BATCH: "batch size",
+    CapabilityKind.RESOLUTION: "image resolution",
     CapabilityKind.HIRES_FIX: "hires-fix",
     CapabilityKind.POST_PROCESSING: "post-processing",
     CapabilityKind.CONTROLNET: "controlnet",

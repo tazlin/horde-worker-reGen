@@ -225,6 +225,41 @@ last-known-good settings, owned PIDs, the action ledger) persists between runs i
 a `.horde_worker_regen/` working-directory folder. Neither is required to run the
 worker. See [Frontend and Durable State](frontend_and_state.md).
 
+## Operator capability assessment
+
+The default `horde-benchmark run` starts one supervised worker connected to a local HTTP server.
+`benchmark/local_horde.py` implements the required Horde endpoints and capability schema.
+`benchmark/worker_client.py` relays the supervisor pipe. Inference, safety, resource admission,
+recovery and finalization use the normal worker code. The run uses an isolated directory with a
+copied configuration and durable state, while sharing the installation's model directories.
+Run the assessment while the production worker is stopped.
+
+`benchmark/assessment.py` manages the work budget and waits for both HTTP submissions and finalized
+stats records. It monitors communication separately from loading and sampling progress, so routine
+heartbeats cannot hide stalled work. `assessment_policy.py` selects installed checkpoints and test
+workloads based on earlier results. Settings become available to apply only after a separate check
+confirms them together. Passing individual limits does not validate their combination.
+
+Concurrency checks compare the same jobs on one lane and at the requested thread count. They
+measure total throughput as well as sampling overlap. Children timestamp sampling windows on the
+host's shared monotonic clock; the parent retains the windows and card identity in finalized job
+records. Retry history also survives finalization, so success after recovery cannot confirm clean
+execution. Alchemy results describe capacity shared by the worker, and a form's reported lane does
+not establish which device executed it. See [IPC and messaging](ipc_and_messaging.md) for the metrics
+contract and [benchmark commands](../reference/cli.md#run-bounded-operator-assessment) for check
+selection, concurrency criteria and result interpretation.
+
+Between checks, the controller pauses intake and waits for accepted work to finalize before
+reloading configuration and requesting capacity changes. The parent resizes the shared inference
+gate in place and uses normal process-sizing and resource-admission rules. Existing children retain
+the same gate. The controller retries temporary refusals while children are starting or busy. If the
+configuration is unchanged and all issued work has finalized, it only waits for the requested lanes
+to be ready. The [clearance responsibility map](../reference/responsibility-map-clearance-and-child-loads.md#who-is-cleared-and-when)
+describes capacity-change ownership and preconditions.
+
+The developer harness remains available through `run --exhaustive` and synthetic modes. Its canned
+sources and warm-session lifecycle are separate from the operator assessment.
+
 ## Dry-run mode
 
 When `dry_run_skip_api` is active,

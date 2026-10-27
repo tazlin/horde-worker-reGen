@@ -345,8 +345,8 @@ def _log_benchmark_hint() -> None:
             return
         preface = "No benchmark on record" if availability is BenchmarkAvailability.NONE else "Benchmark is stale"
         logger.info(
-            f"{preface} for worker v{__version__}. Run 'horde-benchmark ramp' (or launch the TUI with "
-            "'horde-worker') to benchmark and auto-tune this worker.",
+            f"{preface} for worker v{__version__}. Run 'horde-benchmark run' (or launch the TUI with "
+            "'horde-worker') to assess capabilities and confirm operating settings.",
         )
     except Exception as hint_error:  # noqa: BLE001 - the hint must never block worker startup
         logger.debug(f"Could not emit benchmark hint: {hint_error}")

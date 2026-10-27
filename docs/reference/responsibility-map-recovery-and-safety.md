@@ -98,6 +98,17 @@ remedy, so a `DEMOTE_SAFETY_WEIGHTS` remedy's room can be taken back on the next
 
 ## Where to read next
 
+The inference permit counter belongs to `ipc/inference_gate.py::ResizableInferenceGate`. Its short
+counter updates use an OS file lock released on process death, and blind recovery releases remain
+bounded by the current capacity. The operator assessment shuts down its ordinary worker through the
+supervisor. A wake signal prompts the waiter to recheck the permit counter. Every waiter does so at
+least every 100 ms, even without an acquisition timeout. If a process dies after returning a permit
+or consuming a signal, another waiter can still acquire the available permit. A rejected
+over-release also sends a wake without increasing capacity. The assessment reaps only
+creation-time-verified descendants from its isolated owned-PID registry if that worker exits or
+times out. Its capacity changes follow the [clearance responsibility
+map](responsibility-map-clearance-and-child-loads.md#who-is-cleared-and-when).
+
 - [Resilience and recovery](../explanation/resilience_and_recovery.md#layer-3-save-our-ship-sos-escalation) for the
   supervisor and its boot backstops, and
   [Stranded safety-check jobs](../explanation/resilience_and_recovery.md#stranded-safety-check-jobs).

@@ -269,45 +269,177 @@ Progressive worker benchmarking. Subcommands:
 | `monitor OUT_DIR` | Follow a run's `progress.jsonl`, live or as a replay. |
 | `live` | Generate load against a live AI Horde API (not implemented yet). |
 
-### `run`: the capability-probe benchmark
+### `run`: operator assessment
 
-`run` is the current benchmark engine. It reframes the question from "walk a ladder of levels" to
-"**prove a set of capabilities**": each probe binds a workload to the pass/fail criteria and the
-**capabilities it requires**, and the engine runs them in dependency order on **one warm worker**, so
-the worker boot and model load are paid once for the whole run rather than once per check. (The old
-`ramp` cold-started a fresh worker per level; `run` is the same coverage without that per-probe rampup.
-See [GPU duty cycle](../explanation/duty-cycle.md#per-probe-timing-warmup-versus-inference) for why an
-isolated cold probe reads as mostly startup.)
+<a id="run-bounded-operator-assessment"></a>
 
-Sharing a worker does not mean sharing a configuration. Each probe's bridge-data settings (its
-`allow_controlnet` / `allow_post_processing` / `alchemy_*` values) are applied to the running worker as a
-live config change before it runs, over the session's base rather than over the previous probe's, and are
-replaced before the next one. So a probe proves the configuration named in its result, and a value it
-never mentions is the session default rather than whatever an earlier probe left behind.
+The default real-mode run starts one normal worker connected to a local server implementing the
+required Horde endpoints. It uses the normal startup, admission, safety, upload and submission
+paths. Results retain generation ids and worker counters throughout the run; cold loads and
+recoveries count as evidence. The shared harness remains available through `--exhaustive` for
+developer checks and through fake/dry-run mode.
 
-It also does not mean sharing alchemy's transient model residency. Before each probe the warm driver asks
-the idle safety and post-processing processes to unload optional models from RAM and waits for their child
-acknowledgements. The probe's own warm-up then loads exactly the models it needs before the measured pass.
-If that warm-up cannot drain within its bounded budget, the probe is reported timed out immediately; the
-driver does not reset the source and install a measured copy over forms that may still be running.
-A probe that timed out can leave alchemy forms waiting for a process that never came up, or still running
-on one. The next probe's boundary drops them before the RAM cleanup, since the earlier probe is already
-scored, and a result that arrives for a dropped form is discarded rather than counted against the next
-probe. A process that does not acknowledge the RAM cleanup within 30 s fails that probe without running
-it. The probe is reported timed out with an `exit_reason` starting `boundary_cleanup_timeout` that lists
-the process ids that did not answer, and the run moves on to the next probe.
+The default run finishes selected representative checks without an overall time limit. The work
+limit is derived from those checks, two increases per capacity axis and combined-settings
+confirmation. Concurrency checks offer two jobs per requested thread at twice the baseline step
+count. The worker keeps one model on one lane, so a concurrency check assigns the other lane a
+second installed model and alternates jobs between them. The companion model's family need not be
+selected for the run. With a single installed model, the check is reported as not applicable and
+does not reserve jobs. The thread search stops at the number of installed models, since each lane
+needs its own model. After the family baselines, the controller tests the first capacity increases
+before feature checks. Further capacity searches follow those feature checks.
 
-A **capability** is a `(tier, kind, magnitude)` triple, e.g. "SD1.5 can run batch size 4". Each probe's
-verdict is `PROVEN`, `DISPROVEN`, `SKIPPED` (a prerequisite was unproven or the machine cannot host it),
-or `CRASHED`. A probe runs only when every capability it `requires` is already proven, so "a tier
-baseline failed → skip everything that builds on it" falls out of the dependency graph rather than an
-imperative cascade. After the static probes, the recommendation is synthesized and **soaked** under
-sustained load per passing tier, then re-synthesized so an unstable soak can downgrade it.
+A concurrency check runs its jobs twice. The first run is one lane under the operator's
+sampling-lease settings. The second is the requested thread count under the candidate configuration,
+which enables the sampling lease at one slot so one lane samples while the others load, encode and
+stage their next job. An operator whose configuration already enables the lease keeps their
+configured slot count for the second run. Both runs share the check's budget and both sets of jobs
+belong to its evidence. The combined-settings confirmation runs only the thread count under the
+lease settings its thread check ranked. Its result does not depend on the wall-clock gain, and its
+lane-equivalent references come from the thread check's single-lane jobs of the same model and
+shape.
 
-The report is identical in spirit to `ramp`'s: a **Capabilities** surface (everything proven) separate
-from a **conservative recommended bridgeData**, with a **provenance basis** on every value (proven /
-tested-and-failed / never-tested / not-in-this-run / held-back) and a consistency check that never ships
-a setting enabled on weaker than a real pass.
+The two runs are compared by throughput: image-job megapixelsteps divided by elapsed time from the
+earliest pop to the latest finalization. This includes time spent loading, encoding, checking safety
+and submitting results. When any job lacks either timestamp, the run uses the sampling windows'
+edges instead. The gain is the ratio of throughput at the tested thread count to single-lane
+throughput. It must exceed one and reach one plus the noise margin, the median absolute deviation of
+the single-lane jobs' pop-to-finalize times over their median. The report and the progress line
+state the gain and the jobs per minute of both runs for the tested shape. A gain within the margin
+is inconclusive with `wall_gain_below_noise`. A check whose jobs did not report the timestamps or
+the megapixelsteps is inconclusive with `throughput_unmeasured`.
+
+Confirmation also requires observed denoise overlap to reach the slot count permitted by the second
+run's lease. Lanes beyond the slots stage the next job and are reported as such. With the operator's
+lease at two or more slots a check whose sampling does not overlap repeats its second run once.
+
+Lane-equivalent throughput measures combined sampling speed relative to one lane. Divide each job's
+steps by the model's single-lane reference rate, sum the resulting durations, then divide by the
+time covered by the second run's sampling windows. When two or more windows overlap, a result below
+1.0 prevents confirmation. Partly unloaded weights can cause this slowdown. That check is
+inconclusive with `throughput_below_single_lane` and is not repeated. References come from first-run
+jobs of the same model and shape. The reference is the median rate of those that sampled alone, or
+the fastest rate observed when none did. The report and progress line state the result and each
+model's rate beside its single-lane rate.
+
+A confirmed thread count measured under the lease candidate is suggested together with
+`gpu_sampling_lease_enabled: true` and `gpu_sampling_lease_slots`. A count measured under the
+operator's own lease settings leaves both keys out, so Apply does not change them.
+
+Optional retries retain the work reserved for joint confirmation, including other cards and models.
+Batch images belong to one image job. `--seconds` and `--job-budget` set optional explicit limits.
+Slow cards can continue while loading or sampling progresses. Lost communication and unchanged work
+are bounded separately using the worker's configured loading/inference timeouts. Repeated identical
+heartbeats do not reset the work-progress clock. A worker that sends no update for 30 seconds ends
+the run with that stop reason. A worker that exits ends it with the last error line from its startup
+log.
+
+Installed checkpoints from the selected family can replace the catalog's canonical checkpoint.
+Selection respects global model exclusions and exclusions on every participating card, including
+meta rules such as `all sdxl` and `top N`. Exclusions on unselected cards do not constrain
+selection. Apply preserves those rules. If every installed representative is excluded, the run does
+not start a worker. The report records the actual checkpoint and card. Representative feature checks
+and success-dependent batch, thread and resolution checks replace blanket scenario repetitions. Each
+result is classified as a measured success or failure, a prediction, or unknown. Predictions are
+extrapolated from measurements. They do not count as additional observations or confidence
+estimates. Shared service work retains its ordinary placement.
+
+Thread checks require the sampling overlap their lease permits, reported separately from configured
+threads, and a wall-clock gain over one lane for the same jobs. New lanes must become ready before
+work is offered. Existing performance modes are retained and included in confirmed settings. A check
+whose settings equal the previous check's, with no issued job still awaiting its submit, keeps the
+running worker and only confirms its lanes are ready. The report states the total time the checks
+spent applying settings beside the total sampling time.
+
+Features the worker reports as withheld for missing preparation are left unknown before any job is
+offered, so an ineligible feature cannot consume the remaining assessment time waiting for a pop.
+
+Only jointly confirmed, enforceable operating profiles can be applied. Different model limits on one
+card are not merged into an untested combination. The export does not set `models_to_load`, globally
+or per card. The tested checkpoints represent their families, so Apply and the exported YAML keep
+the operator's model lists. The report's "Model guidance" section, the console summary and the TUI's
+Models panel carry model advice derived from the evidence. Each card's summary lists the families
+that passed a measured baseline, failed it, were only estimated or were not tested, with the GPU
+name and total VRAM when the hardware probe reported them. The guidance suggests less commonly
+offered models from a passing family to help cover gaps in availability. The offline reference
+does not include worker counts, so the advice does not give numerical estimates.
+
+The storage notes state whether the model directories are on rotational or solid-state storage (read
+from sysfs on Linux and `Get-PhysicalDisk` on Windows, otherwise undetermined) and, on rotational
+storage, how many models stay resident at the resolved inference-process count. The large families
+are the ladder's `HUGE_TIERS`. They can earn more kudos per job, and the guidance states whether
+each one passed, failed or was not selected and can be selected for a rerun. Processor and
+controlnet variants outside the representative checks remain unconfirmed, and broad feature flags
+stay off in the conservative export. Review the report before enabling additional features. Without
+a confirmed configuration, Apply is disabled.
+
+The plain-workload export explicitly disables LoRA, img2img, painting, ControlNet and
+post-processing globally and, when exported, per card. Single-card runs use global settings unless
+`--per-card` is set. Apply removes only conflicting fields from that card's existing overrides,
+preserving unrelated policies and other cards. The cleanup is retained for restoring known-good
+settings. The exported YAML includes comments listing the existing card fields to remove before
+merging it manually, including the painting alias. Copying only the global values leaves card
+overrides active.
+
+A joint run that required an inference retry, degraded dispatch or host commit retry cannot confirm
+settings, even if it ultimately submitted successfully. Operator reports older than schema 7 remain
+readable but must be rerun before applying their recommendations.
+
+Alchemy results describe shared-worker service capacity. The image card is the companion generation's
+card; a form's reported lane affinity is separate, and an unreported execution device stays unknown.
+
+#### Assessment controls and results
+
+The dashboard's Advanced options use the same assessment settings as the CLI:
+
+| Control | Behavior |
+| --- | --- |
+| Time limit (min) | Limits the entire assessment, including startup. Leave blank to finish selected checks. |
+| Per-card settings | Includes settings for the tested card even in a single-GPU run, equivalent to `--per-card`. Multi-card results always use per-card settings. |
+| Confirm combined settings | Tests proposed settings together before enabling Apply suggested config. Turning it off is equivalent to `--no-validate`. |
+
+A concurrency result reports both the single-lane and multiple-lane jobs-per-minute measurements.
+If a run replaced a worker process or required an inference retry, the result explains why the
+settings could not be confirmed. Incomplete results identify missing final records or submissions,
+missing card identity, jobs that ran on another card, or missing device peak-memory measurements.
+A timeout or lost worker connection retains its specific stop reason.
+
+Model-loading results include the first observed load and repeat loads. These durations include
+deserialization and may use the OS cache. They do not measure physical disk throughput. Storage
+advice identifies the detected media type and remains conditional when detection fails. The advice
+does not change settings.
+
+#### Exhaustive developer catalog
+
+`run --exhaustive` uses the shared capability-probe engine. Each probe defines a workload, pass/fail
+criteria and prerequisite capabilities. The engine runs probes in dependency order on one warm
+worker, reducing repeated startup and model loading. See [GPU duty
+cycle](../explanation/duty-cycle.md#per-probe-timing-warmup-versus-inference) for the effect of
+startup time on isolated cold probes.
+
+Before each probe, the worker applies the probe's bridge-data settings over the session's base
+configuration. Settings from the previous probe do not carry over. This keeps each result tied to
+the configuration tested.
+
+The warm driver also asks idle safety and post-processing processes to unload optional models from
+RAM, then waits for acknowledgments. The probe's warm-up loads the models needed for measurement. If
+warm-up does not finish within the budget, the probe times out. The driver does not start a measured
+run while warm-up forms may still be running.
+
+Before the next probe, the driver drops unfinished alchemy forms from a timed-out probe and discards
+any late results for those forms. If a process does not acknowledge RAM cleanup within 30 seconds,
+the next probe times out without running. The result's `exit_reason` begins with
+`boundary_cleanup_timeout` and lists the processes that did not respond. The run then continues.
+
+A **capability** is a `(tier, kind, magnitude)` triple, such as "SD1.5 can run batch size 4". A
+probe's verdict is `PROVEN`, `DISPROVEN`, `SKIPPED` or `CRASHED`. The engine skips probes with
+unproven prerequisites or resource requirements the machine cannot meet. After the catalog checks,
+it tests the suggested settings under sustained load for each passing tier. Failed soaks lower the
+recommendation.
+
+The report lists confirmed capabilities separately from suggested bridgeData. Every suggested value
+includes the reason it was enabled, disabled or limited. A consistency check rejects settings that
+lack a supporting pass.
 
 Key `run` options:
 
@@ -316,40 +448,50 @@ Key `run` options:
 | `--tiers` | `sd15,sdxl` | Comma-separated tiers (`sd15`, `sdxl`, `flux`, `qwen`, `zimage`). `flux`, `qwen` and `zimage` are very large, so they run only when listed, and are skipped when the machine cannot run them. |
 | `--process-mode {fake,dry_run,real}` | `real` | `real` runs jobs on the GPU. `fake` and `dry_run` test the benchmark itself and run no inference. |
 | `--out PATH` | `benchmark_results/<timestamp>` | Output directory (`report.json`, `report.md`, `progress.jsonl`). |
-| `--jobs-per-level N` | `4` | Jobs run per probe. |
-| `--probe-timeout SECONDS` | `900` | Per-probe timeout. |
-| `--only SLUG` | — | Run one probe by capability slug plus its minimal prerequisite closure; an unknown slug is an error. |
-| `--no-validate` | off | Skip the soak, the sustained-load run that follows the probes (`--soak-minutes` sets its length). |
-| `--strict-duty` | off | Fail a soak whose GPU duty cycle is under the 90% target. Without this flag a miss is only reported. |
-| `--exclude-capability KIND` | — | Skip one capability kind, in addition to anything the `--no-*` flags skip. Repeatable. The choices are the `CapabilityKind` values, e.g. `post_processing`, `controlnet`, `alchemy_concurrent`. |
-| `--no-concurrency` / `--no-features` / `--no-alchemy` / `--include-downloads` | — | Coarse stage selection (drop a whole group of probes; downloads are opt-in). |
+| `--seconds SECONDS` | none | Optional overall time limit, including startup and model loading. |
+| `--job-budget N` | derived | Optional limit on image jobs and alchemy forms across all selected cards. |
+| `--per-card` | off | Include per-card settings when testing one card. Multi-card results use per-card settings automatically. |
+| `--exhaustive` | off | Use the shared developer harness, full catalog and per-tier validation soaks. |
+| `--jobs-per-level N` | `4` | Jobs per exhaustive probe. |
+| `--probe-timeout SECONDS` | `900` | Per-probe timeout for the exhaustive engine. The operator assessment uses progress-aware waits. |
+| `--only SLUG` | none | Run one probe by capability slug plus its minimal prerequisite closure; an unknown slug is an error. |
+| `--no-validate` | off | Skip joint confirmation; the report remains useful but produces no applicable configuration. With `--exhaustive`, skip the per-tier soaks. |
+| `--strict-duty` | off | With `--exhaustive`, fail a soak whose GPU duty cycle is under the 90% target. Without this flag a miss is only reported. |
+| `--exclude-capability KIND` | none | Skip one capability kind, in addition to anything the `--no-*` flags skip. Repeatable. The choices are the `CapabilityKind` values, e.g. `post_processing`, `controlnet`, `alchemy_concurrent`. |
+| `--no-concurrency` / `--no-features` / `--no-alchemy` / `--include-downloads` | none | Coarse stage selection (drop a whole group of probes; downloads are opt-in). |
 
 ```bash
 # Prove sd15 + sdxl on this GPU and write the report:
 horde-benchmark run --tiers sd15,sdxl
 
-# Re-prove just one capability after a fix (single warm worker, one probe):
+# Check one capability and its family anchor within the shared budget:
 horde-benchmark run --only sd15-controlnet --no-validate
 ```
 
-The catalog is grounded in what hordelib actually supports: classic **controlnet**
-(canny/depth/openpose preprocessors) is probed on SD1.5 only, while the **qr_code** workflow (the real
-SDXL controlnet capability, gated by `allow_sdxl_controlnet`) is probed on SD1.5 and SDXL.
-Post-processing sweeps every upscaler and face-fixer this install can serve at 512², 1024², and a
-VRAM-derived maximum. "Can serve" is the intersection of what the SDK names and what the local model
-reference resolves, spanning both sources a worker resolves a post-processor through: the canonical
-on-disk reference and, for the categories the worker opts into beta, the PRIMARY's pending queue. The
-run's log names how many of each the sweep offered, so a sweep that only holds because the pending queue
-was reachable reads differently from one the canonical reference supports on its own. A form with no
-record in either would fault rather than skip, so it is left out.
-Alchemy is probed on both lanes independently, the CLIP lane (caption/interrogation/NSFW, on the safety
-process) and the graph lane (upscalers/face-fixers/strip-background, on the dedicated post-processing
-process), plus a concurrent-with-image probe. The graph sweep has separate warm probes for ordinary forms,
-the high-working-set `4xNomos2_hq_dat2` upscaler (`sd15-alchemy_graph-1`), and the face-fixer group
-(`sd15-alchemy_graph-2`). This identifies a heavyweight failure without letting its resident set contaminate
-the rest of the sweep. Heavy tiers (`flux`/`qwen`/`zimage`) are opt-in and self-skip when the
-machine cannot hold them or the checkpoint is absent; `qwen`/`zimage` are beta models from the pending
-reference (need `HORDE_MODEL_REFERENCE_PRIMARY_API_URL`; the beta opt-in env is set automatically).
+#### Exhaustive catalog coverage
+
+The exhaustive catalog tests the workflows supported by hordelib. Classic **controlnet**
+(canny/depth/openpose preprocessors) is tested on SD1.5 only. The **qr_code** workflow, gated by
+`allow_sdxl_controlnet`, is tested on SD1.5 and SDXL.
+
+Post-processing tests every upscaler and face-fixer this installation can serve at 512², 1024² and a
+VRAM-derived maximum. Models must be recognized by the SDK and resolved by the local model
+reference. The reference includes canonical on-disk records and, for categories with beta opt-in,
+the PRIMARY's pending queue. The log reports how many models came from each source, so coverage that
+depends on access to the pending queue is visible. Models absent from both sources are excluded
+because they would fault during execution.
+
+Alchemy checks cover the CLIP lane (caption/interrogation/NSFW on the safety process) and the graph
+lane (upscalers/face-fixers/strip-background on the post-processing process). A separate check runs
+alchemy alongside image generation. Graph checks have separate warm probes for ordinary forms, the
+memory-intensive `4xNomos2_hq_dat2` upscaler (`sd15-alchemy_graph-1`) and face-fixers
+(`sd15-alchemy_graph-2`). This isolates memory failures and prevents one probe's resident models
+from affecting the others.
+
+Heavy tiers (`flux`/`qwen`/`zimage`) require explicit selection and are skipped when the machine
+cannot hold them or the checkpoint is absent. Qwen and ZImage use beta models from the pending
+reference and require `HORDE_MODEL_REFERENCE_PRIMARY_API_URL`. The benchmark sets beta opt-in
+automatically.
 
 Every suggested value carries a **provenance basis** so you can tell a setting that is off because it
 was *tested and failed* from one that is off only because its probe was *skipped* (never tested),
@@ -360,11 +502,12 @@ enable a capability on anything weaker than a real pass.
 
 ### `plan`: preview requirements before you run
 
-The benchmark keeps every scenario identical across machines (apples-to-apples), so what changes from
-machine to machine is only *whether* a probe runs. `plan` makes that decision visible up front, without
-starting a worker: it builds the same catalog `run` would, then prints one row per probe with its
-estimated VRAM, the disk it needs free, whether it needs network or a CivitAI token, and the predicted
-verdict (`RUN`, or `SKIP` with the reason) against the detected hardware.
+The exhaustive catalog uses the same scenarios on every machine. Hardware and available resources
+determine which probes run. The default operator assessment can substitute installed checkpoints
+from the same family and adapt checks to earlier results. `plan` makes that decision visible up
+front, without starting a worker: it builds the exhaustive catalog, then prints one row per probe
+with its estimated VRAM, the disk it needs free, whether it needs network or a CivitAI token, and
+the predicted verdict (`RUN`, or `SKIP` with the reason) against the detected hardware.
 
 ```bash
 # What would run if I benchmarked just sd15 and sdxl on this box?
@@ -376,11 +519,12 @@ horde-benchmark plan --tiers flux --json
 
 `plan` accepts the same selection flags as `run` (`--tiers`, `--process-mode`, `--no-concurrency`,
 `--no-features`, `--no-alchemy`, `--exclude-capability`, `--include-downloads`, `--force`), so the
-preview matches exactly what the run would do. The same plan table is also printed at the top of every
-`run` (emitted on the progress channel as a `RampPlanned` event), so `monitor` and the dashboard show it
-too. Fake-mode plans skip device discovery because fake runs do not use or gate on GPU resources; real-mode
-plans still probe the machine for their fit verdicts. Pass `--force` to see probes that do not fit (or lack a
-token) reported as `RUN` instead of `SKIP`.
+preview identifies category requirements. The operator assessment chooses checks based on earlier
+results and may leave some categories unresolved. The same plan table is printed at the top of every
+`run` (emitted on the progress channel as a `RampPlanned` event), so `monitor` and the dashboard
+show it too. Fake-mode plans skip device discovery because fake runs do not use or gate on GPU
+resources; real-mode plans still probe the machine for their fit verdicts. Pass `--force` to see
+probes that do not fit (or lack a token) reported as `RUN` instead of `SKIP`.
 
 ### `pricing-corpus`: measure what each payload axis costs
 

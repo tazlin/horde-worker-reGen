@@ -259,15 +259,17 @@ uv run pytest -m gpu -k sd15-baseline         # one capability probe by its slug
 uv run pytest -m gpu tests/gpu                # the whole capability catalog on one warm worker
 ```
 
-The capability probes under `tests/gpu/` are the same probes `horde-benchmark run` executes, so a
-passing probe here and a passing benchmark tier agree by construction. Each probe skips itself when the
-machine does not fit its tier, and a probe that needs a CivitAI token skips without one.
+The capability probes under `tests/gpu/` are the same probes `horde-benchmark run --exhaustive`
+executes, so a passing probe here checks the same behavior as a passing benchmark tier. Each probe
+skips itself when the machine does not fit its tier, and a probe that needs a CivitAI token skips
+without one.
 
 The benchmark is a manual check on the whole machine rather than a test:
 
 ```bash
 uv run horde-benchmark plan          # what would run on this machine and why
-uv run horde-benchmark run           # the capability tiers
+uv run horde-benchmark run           # run selected checks on one normal worker
+uv run horde-benchmark run --exhaustive  # the developer capability catalog
 uv run horde-benchmark soak          # sustained throughput
 uv run horde-benchmark report        # the last run, rendered
 ```

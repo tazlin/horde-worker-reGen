@@ -13,9 +13,14 @@ from horde_worker_regen.benchmark.capabilities.capability import CapabilityKind
 from horde_worker_regen.benchmark.capabilities.recommendation import verify_suggestion_consistency
 from horde_worker_regen.benchmark.capabilities.result import (
     CapabilityReport,
+    EvidenceStatus,
+    OperatingProfile,
+    ReferenceRateBasis,
+    ReferenceSamplingRate,
     SuggestionBasis,
     SuggestionDecision,
     WorkerCapabilities,
+    WorkloadEvidence,
 )
 from horde_worker_regen.process_management.resources.duty_cycle import PHASE_ORDER
 
@@ -96,6 +101,8 @@ def _render_provenance(decisions: list[SuggestionDecision]) -> list[str]:
 
 def render_markdown(report: CapabilityReport) -> str:
     """Render the human-readable report, ending with the findings section."""
+    if report.operator_assessment:
+        return _render_assessment(report)
     lines: list[str] = ["# Worker Benchmark Report", ""]
 
     if report.machine.gpu_name:
@@ -234,4 +241,179 @@ def render_markdown(report: CapabilityReport) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["describe_decision", "render_markdown"]
+def describe_sampling_rates(rates: dict[str, float], references: dict[str, ReferenceSamplingRate]) -> str:
+    """Format each model's measured rate alongside the single-lane reference rate."""
+    parts: list[str] = []
+    for model_name, rate in rates.items():
+        reference = references.get(model_name)
+        if reference is None:
+            parts.append(f"{model_name} {rate:.1f} it/s with no single-lane rate")
+        elif reference.basis is ReferenceRateBasis.SINGLE_LANE:
+            parts.append(f"{model_name} {rate:.1f} it/s against {reference.iterations_per_second:.1f} alone")
+        else:
+            parts.append(f"{model_name} {rate:.1f} it/s against a run best of {reference.iterations_per_second:.1f}")
+    return ", ".join(parts)
+
+
+def describe_lane_throughput(item: WorkloadEvidence) -> str | None:
+    """Return a confirmed concurrency check's lane-equivalent throughput description, or None if unavailable.
+
+    A check that fell short of one lane already states the figure in its reason.
+    """
+    if item.lane_equivalent_throughput is None or item.status is not EvidenceStatus.MEASURED_SUCCESS:
+        return None
+    rates = describe_sampling_rates(item.model_sampling_rates, item.model_reference_rates)
+    return f"The lanes together sampled {item.lane_equivalent_throughput:.2f} times one lane's rate: {rates}"
+
+
+def describe_jobs_per_minute(
+    profile: OperatingProfile, *, jobs_per_minute: float | None, single_lane_jobs_per_minute: float | None
+) -> str:
+    """State the jobs per minute a concurrency check finished at its thread count and at one lane."""
+    lanes = f"{profile.threads} lanes"
+    if jobs_per_minute is None or single_lane_jobs_per_minute is None:
+        return f"Jobs per minute were not measured for both {lanes} and one lane"
+    return (
+        f"{lanes} finished {jobs_per_minute:.1f} jobs per minute against {single_lane_jobs_per_minute:.1f} on one "
+        f"lane at {profile.width}x{profile.height}, batch {profile.batch}, {profile.steps} steps"
+    )
+
+
+def describe_wall_throughput(item: WorkloadEvidence) -> str | None:
+    """Return a confirmed concurrency check's throughput gain description, or None if unavailable.
+
+    An inconclusive check already includes the jobs per minute in the reason.
+    """
+    if item.wall_gain is None or item.status is not EvidenceStatus.MEASURED_SUCCESS:
+        return None
+    jobs = describe_jobs_per_minute(
+        item.profile,
+        jobs_per_minute=item.jobs_per_minute,
+        single_lane_jobs_per_minute=item.single_lane_jobs_per_minute,
+    )
+    required = f" (minimum {item.wall_gain_required:.2f})" if item.wall_gain_required is not None else ""
+    return f"{jobs}. Throughput ratio: {item.wall_gain:.2f}{required}"
+
+
+def _render_assessment(report: CapabilityReport) -> str:
+    lines = ["# Worker capability assessment", ""]
+    if report.budget is not None:
+        budget = report.budget
+        lines.extend(
+            [
+                f"Elapsed: {budget.elapsed_seconds:.1f}s. Offered work: {budget.jobs_offered}/{budget.max_jobs}.",
+                f"Stop reason: {budget.stop_reason}.",
+            ]
+        )
+        configured = [item.configure_seconds for item in report.evidence if item.configure_seconds is not None]
+        if configured:
+            elapsed = sum(item.elapsed_seconds for item in report.evidence)
+            sampling = sum(item.sampling_seconds or 0.0 for item in report.evidence)
+            lines.append(
+                f"Checks took {elapsed:.1f}s in total, of which {sum(configured):.1f}s went to applying settings "
+                f"between checks and {sampling:.1f}s to sampling."
+            )
+        lines.append("")
+    lines.extend(
+        [
+            "Measured results apply to the named card, checkpoint and workload. Predictions are estimates. "
+            "Other setting combinations and long-term reliability were not tested.",
+            "",
+            "| Scope / image card | Model | Check | Evidence | Workload | "
+            "Sampling overlap | Device peak MB | Detail |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+    )
+    for item in report.evidence:
+        profile = item.profile
+        workload = f"{profile.width}x{profile.height}, batch {profile.batch}, threads {profile.threads}"
+        features = [*profile.post_processing, *profile.alchemy_forms]
+        if profile.control_type:
+            features.append(profile.control_type)
+        if profile.workflow:
+            features.append(profile.workflow)
+        if profile.hires_fix:
+            features.append("hires-fix")
+        if features:
+            workload += "; " + ", ".join(features)
+        peak = str(item.device_peak_mb) if item.device_peak_mb is not None else "unknown"
+        check = "Combined settings" if item.combined_validation else item.capability.label
+        status = {
+            "measured_success": "Passed",
+            "measured_failure": "Failed",
+            "predicted": "Estimated",
+            "unknown": "Inconclusive" if item.attempted or item.job_ids else "Not tested",
+        }[item.status.value]
+        if item.reason_code == "unavailable":
+            status = "Unavailable"
+        if item.reason_code == "not_applicable":
+            status = "Not applicable"
+        detail = item.reason.replace("|", "/").replace("\n", " ")
+        scope = (
+            f"shared worker (image card {profile.device_index})"
+            if profile.alchemy_forms
+            else str(profile.device_index)
+        )
+        if item.service_placements:
+            placements = ", ".join(
+                f"{placement.form or placement.job_id}: reported lane card {placement.reported_device_index}"
+                if placement.reported_device_index is not None
+                else f"{placement.form or placement.job_id}: lane unreported"
+                for placement in item.service_placements
+            )
+            detail += f"; form placement: {placements}; execution device unreported"
+        for description in (describe_wall_throughput(item), describe_lane_throughput(item)):
+            if description is not None:
+                detail += f"; {description.replace('|', '/')}"
+        lines.append(
+            f"| {scope} | {profile.model_name} | {check} | "
+            f"{status} | {workload} | "
+            f"{item.observed_sampling_concurrency}/{item.expected_sampling_concurrency or profile.threads} | "
+            f"{peak} | {detail} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Model loading",
+            "",
+            "Observed loading includes deserialization and may use the OS cache. "
+            "Physical disk speed was not measured.",
+            "",
+            "| Model | First observed load | Repeat loads | Samples |",
+            "|---|---|---|---|",
+        ]
+    )
+    for loading in report.model_loading:
+        repeats = (
+            f"{min(loading.repeat_seconds):.2f} to {max(loading.repeat_seconds):.2f}s"
+            if loading.repeat_seconds
+            else "Not reported"
+        )
+        lines.append(
+            f"| {loading.model_name} | {loading.first_seconds:.2f}s | {repeats} | {len(loading.load_seconds)} |"
+        )
+    lines.extend(["", *report.storage_notes, ""])
+    if report.model_guidance:
+        lines.extend(["", "## Model guidance", "", *[f"- {line}" for line in report.model_guidance], ""])
+    if report.suggested_bridge_data.safe_to_apply:
+        lines.extend(
+            ["", "## Suggested bridgeData", "", "```yaml", report.suggested_bridge_data.as_yaml_block(), "```", ""]
+        )
+    else:
+        lines.extend(
+            ["", "Combined settings were not confirmed. Review the results before changing the configuration.", ""]
+        )
+    lines.extend(_render_provenance(report.suggested_bridge_data.decisions))
+    lines.extend(f"- {note}" for note in report.suggested_bridge_data.notes)
+    lines.append("")
+    return "\n".join(lines)
+
+
+__all__ = [
+    "describe_decision",
+    "describe_jobs_per_minute",
+    "describe_lane_throughput",
+    "describe_sampling_rates",
+    "describe_wall_throughput",
+    "render_markdown",
+]

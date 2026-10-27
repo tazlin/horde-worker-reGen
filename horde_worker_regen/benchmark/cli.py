@@ -72,6 +72,16 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     run.add_argument("--out", type=Path, default=None, help="Output directory (default: benchmark_results/<ts>).")
     run.add_argument("--jobs-per-level", type=int, default=4)
+    run.add_argument("--seconds", type=float, default=None, help="Optional overall time limit, including startup.")
+    run.add_argument(
+        "--job-budget", type=int, default=None, help="Optional job/form limit; otherwise derived from selected checks."
+    )
+    run.add_argument("--per-card", action="store_true", help="Export per-card settings even when testing one GPU.")
+    run.add_argument(
+        "--exhaustive",
+        action="store_true",
+        help="Use the developer capability catalog and per-tier soaks through the shared test harness.",
+    )
     run.add_argument("--probe-timeout", type=float, default=900.0, help="Per-probe timeout in seconds.")
     run.add_argument("--only", default=None, help="Run a single probe by its capability slug (e.g. sd15-controlnet).")
     run.add_argument("--include-downloads", action="store_true", help="Include the ad-hoc lora download probe.")
@@ -89,9 +99,9 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
     run.add_argument(
         "--no-validate",
         action="store_true",
-        help="Skip the soak, the sustained-load run that follows the probes.",
+        help="Skip joint confirmation (or the sustained-load soaks with --exhaustive). Disables assessment Apply.",
     )
-    run.add_argument("--soak-minutes", type=float, default=5.0, help="Duration of each per-tier soak (minutes).")
+    run.add_argument("--soak-minutes", type=float, default=5.0, help="Exhaustive per-tier soak duration (minutes).")
     run.add_argument(
         "--strict-duty",
         action="store_true",
@@ -429,7 +439,28 @@ def _prepare_catalog(
         probe_timeout_seconds=getattr(args, "probe_timeout", 900.0),
         total_vram_mb=machine.total_vram_mb,
     )
-    return build_capability_catalog(options), machine, options
+    probes = build_capability_catalog(options)
+    if args.process_mode == "real":
+        from horde_worker_regen.benchmark.assessment_policy import installed_models_for_tiers
+
+        installed = installed_models_for_tiers(tiers)
+        resolved: list[CapabilityProbe] = []
+        for probe in probes:
+            model = installed.get(probe.capability.tier)
+            if model is None:
+                resolved.append(probe)
+                continue
+            scenario = probe.scenario.model_copy(
+                update={
+                    "image_jobs": [spec.model_copy(update={"model": model}) for spec in probe.scenario.image_jobs],
+                }
+            )
+            overrides = dict(probe.bridge_data_overrides)
+            if "models_to_load" in overrides:
+                overrides["models_to_load"] = [model]
+            resolved.append(probe.model_copy(update={"scenario": scenario, "bridge_data_overrides": overrides}))
+        probes = resolved
+    return probes, machine, options
 
 
 def _run_plan(args: argparse.Namespace) -> int:
@@ -916,6 +947,10 @@ def _run_run(args: argparse.Namespace) -> int:
     from horde_worker_regen.benchmark.progress_console import ConsoleProgressSink
     from horde_worker_regen.benchmark.worker_env import ensure_worker_env
 
+    if args.process_mode == "real" and not args.exhaustive and args.strict_duty:
+        print("--strict-duty requires --exhaustive; bounded assessment does not measure sustained duty.")  # noqa: T201
+        return 2
+
     tiers = _parse_tiers(args.tiers)
     if tiers is None:
         return 2
@@ -938,7 +973,7 @@ def _run_run(args: argparse.Namespace) -> int:
     # worker, so the real inference children resolve the worker's model directory. Passing the tiers opts
     # into the beta reference when a beta tier (qwen/zimage) is requested.
     ensure_worker_env(args.process_mode, tiers)
-    machine = detect_machine_info(probe_devices=args.process_mode == "real")
+    machine = detect_machine_info(probe_devices=args.process_mode == "real" and args.exhaustive)
 
     options = CatalogOptions(
         tiers=tiers,
@@ -951,19 +986,37 @@ def _run_run(args: argparse.Namespace) -> int:
         probe_timeout_seconds=args.probe_timeout,
         total_vram_mb=machine.total_vram_mb,
     )
-    executor = ProbeExecutor(
-        catalog_options=options,
-        process_mode=args.process_mode,
-        machine=machine,
-        out_dir=out_dir,
-        run_soak=not args.no_validate,
-        soak_seconds=args.soak_minutes * 60.0,
-        strict_duty_cycle=args.strict_duty,
-        only_probe=args.only,
-        progress_sink=progress_sink,
-    )
     try:
-        report = executor.run()
+        if args.process_mode == "real" and not args.exhaustive:
+            import asyncio
+
+            from horde_worker_regen.benchmark.assessment import OperatorAssessment
+
+            report = asyncio.run(
+                OperatorAssessment(
+                    catalog_options=options,
+                    out_dir=out_dir,
+                    seconds=args.seconds,
+                    max_jobs=args.job_budget,
+                    validate=not args.no_validate,
+                    only_probe=args.only,
+                    progress_sink=progress_sink,
+                    per_card=args.per_card,
+                ).run_async()
+            )
+        else:
+            executor = ProbeExecutor(
+                catalog_options=options,
+                process_mode=args.process_mode,
+                machine=machine,
+                out_dir=out_dir,
+                run_soak=not args.no_validate,
+                soak_seconds=args.soak_minutes * 60.0,
+                strict_duty_cycle=args.strict_duty,
+                only_probe=args.only,
+                progress_sink=progress_sink,
+            )
+            report = executor.run()
     except Exception:
         logger.exception("The benchmark executor crashed.")
         raise
@@ -974,10 +1027,15 @@ def _run_run(args: argparse.Namespace) -> int:
     proven = sum(1 for probe in report.probes if probe.verdict == "proven")
     print(f"\nBenchmark complete: {proven}/{len(report.probes)} probes proven.")  # noqa: T201
     print(f"Report: {out_dir / 'report.md'}")  # noqa: T201
+    if report.operator_assessment and report.budget is not None:
+        print(f"Stop reason: {report.budget.stop_reason}")  # noqa: T201
     if report.findings:
         print(f"Findings: {len(report.findings)} (see the Findings section of the report)")  # noqa: T201
-    print("\nSuggested bridgeData:")  # noqa: T201
-    print(report.suggested_bridge_data.as_yaml_block())  # noqa: T201
+    if report.suggested_bridge_data.safe_to_apply:
+        print("\nSuggested bridgeData:")  # noqa: T201
+        print(report.suggested_bridge_data.as_yaml_block())  # noqa: T201
+    else:
+        print("\nNo combined operating profile was confirmed; no configuration is ready to apply.")  # noqa: T201
     return 0
 
 
