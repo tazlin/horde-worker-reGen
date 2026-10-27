@@ -103,6 +103,8 @@ _BASELINE_LABELS: dict[str, str] = {
     "qwen_image": "Qwen",
     "z_image_turbo": "Z-Image",
     "krea2_turbo": "Krea2",
+    "moss_image": "MOSS",
+    "anima": "Anima",
 }
 """Compact labels for the known image baselines, so a Baseline column stays narrow."""
 
