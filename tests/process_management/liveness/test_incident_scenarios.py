@@ -6546,6 +6546,13 @@ _PP_CHAIN_FINISHER_STEPS = 150
 """Steps of the job that finishes into the chain: a sample long enough for the next job to be preloaded and
 staged beside it, so that job is waiting for clearance when the chain is dispatched."""
 
+_PP_CHAIN_STAGED_STEPS = 60
+"""Steps of the job staged beside the chain.
+
+A job cleared in the pass that dispatches the chain has to still be sampling when the chain's allocations land
+:data:`_PP_CHAIN_ALLOCATION_LAG_TICKS` later. A shorter sample ends inside the lag, so the defect reinjection
+has no overlap to show however the chain is booked."""
+
 _PP_CHAIN_MAX_TICKS = 60
 """Ticks the row may take to submit all three jobs. The staged job waits out the finisher's sample and the
 chain's lag and hold, which the lease-acquire timeout comfortably covers at this tick."""
@@ -6589,7 +6596,7 @@ async def _run_post_process_chain_beside_staged_job() -> _PostProcessChainRun:
     )
     empty_card_free_mb = world.card_free_mb(0)
     width, height = _PP_CHAIN_JOB_SHAPE
-    staged_job = make_job_pop_response(_SD15_OTHER.name, width=width, height=height, ddim_steps=20)
+    staged_job = make_job_pop_response(_SD15_OTHER.name, width=width, height=height, ddim_steps=_PP_CHAIN_STAGED_STEPS)
     staged_job_need_mb = predict_job_sampling_vram_mb(
         staged_job, world.scheduler._model_metadata.get_baseline(_SD15_OTHER.name)
     )

@@ -681,22 +681,6 @@
         }
       ],
       "tick": 23
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-3",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 24
     }
   ],
   "ticks_driven": 40

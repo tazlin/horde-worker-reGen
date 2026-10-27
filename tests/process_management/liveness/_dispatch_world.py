@@ -222,12 +222,13 @@ class _ModelClass:
     weights_mb: float
 
 
-# stable_diffusion_1: 3200 MB weights. The small class that co-resides almost anywhere.
-_SD15 = _ModelClass("sd15", "sd15-checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+# stable_diffusion_1: 1650 MB core weights (an fp16 UNet; 2050 MB with CLIP-L and the VAE). The small class that
+# co-resides almost anywhere.
+_SD15 = _ModelClass("sd15", "sd15-checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
 _WORLD_MAX_BATCH = 20
 """The AI Horde's per-request image ceiling: what a simulated card permits, so batch never gates dispatch."""
 
-_SD15_OTHER = _ModelClass("sd15_b", "sd15-checkpoint-b", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SD15_OTHER = _ModelClass("sd15_b", "sd15-checkpoint-b", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
 # stable_diffusion_xl: 4900 MB core weights (6600 MB with its support components).
 _SDXL = _ModelClass("sdxl", "sdxl-checkpoint", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
 _SDXL_OTHER = _ModelClass("sdxl_b", "sdxl-checkpoint-b", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
@@ -237,10 +238,10 @@ _FLUX = _ModelClass("flux", "Flux.1-Schnell fp8 (Compact)", KNOWN_IMAGE_GENERATI
 _MODEL_CLASSES = (_SD15, _SD15_OTHER, _SDXL, _SDXL_OTHER, _FLUX)
 """The pool of classes every row serves unless it asks for more (``extra_model_classes``)."""
 
-_SD15_C = _ModelClass("sd15_c", "sd15-checkpoint-c", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
-_SD15_D = _ModelClass("sd15_d", "sd15-checkpoint-d", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
-_SD15_E = _ModelClass("sd15_e", "sd15-checkpoint-e", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
-_SD15_F = _ModelClass("sd15_f", "sd15-checkpoint-f", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SD15_C = _ModelClass("sd15_c", "sd15-checkpoint-c", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
+_SD15_D = _ModelClass("sd15_d", "sd15-checkpoint-d", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
+_SD15_E = _ModelClass("sd15_e", "sd15-checkpoint-e", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
+_SD15_F = _ModelClass("sd15_f", "sd15-checkpoint-f", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
 
 _FILLER_MODEL_CLASSES = (_SD15_C, _SD15_D, _SD15_E, _SD15_F)
 """Interchangeable small classes for a row that needs more distinct models than lanes on one card.
@@ -249,9 +250,9 @@ Model->process affinity protects the last copy of every wanted model, so a row a
 needs one distinct class per lane. They are opt-in per world rather than part of the default pool because
 every row's advertised set and every card's served set are built from that pool."""
 
-_SD15_G = _ModelClass("sd15_g", "sd15-checkpoint-g", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
-_SD15_H = _ModelClass("sd15_h", "sd15-checkpoint-h", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
-_SD15_I = _ModelClass("sd15_i", "sd15-checkpoint-i", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 3200.0)
+_SD15_G = _ModelClass("sd15_g", "sd15-checkpoint-g", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
+_SD15_H = _ModelClass("sd15_h", "sd15-checkpoint-h", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
+_SD15_I = _ModelClass("sd15_i", "sd15-checkpoint-i", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1, 1650.0)
 _SDXL_C = _ModelClass("sdxl_c", "sdxl-checkpoint-c", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl, 4900.0)
 
 _ROTATION_MODEL_CLASSES = (_SD15_G, _SD15_H, _SD15_I, _SDXL_C)

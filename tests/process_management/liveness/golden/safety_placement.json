@@ -1094,33 +1094,6 @@
       "tick": 31
     },
     {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-3",
-          "verdict": "no_op"
-        },
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-4",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 32
-    },
-    {
       "dispatches": [
         {
           "lane": 1,
@@ -1139,7 +1112,7 @@
       "sampling_started": [
         "job-4"
       ],
-      "tick": 33
+      "tick": 32
     }
   ],
   "ticks_driven": 40

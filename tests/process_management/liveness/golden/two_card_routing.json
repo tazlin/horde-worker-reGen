@@ -121,36 +121,9 @@
         },
         {
           "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-2",
-          "verdict": "no_op"
-        },
-        {
-          "inputs": {
-            "decision": "no_target",
-            "model": "sd15-checkpoint-b",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "no idle inference slot available",
-          "subject": "job-3",
-          "verdict": "defer"
-        }
-      ],
-      "tick": 5
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
             "decision": "admit",
             "model": "sd15-checkpoint-b",
-            "process_id": 0
+            "process_id": 1
           },
           "kind": "vram_admission",
           "reason": "preload sent",
@@ -164,15 +137,15 @@
           "job": "job-3",
           "keep_model_resident_after": null,
           "model": "sd15-checkpoint-b",
-          "process_id": 0
+          "process_id": 1
         }
       ],
-      "tick": 6
+      "tick": 5
     },
     {
       "dispatches": [
         {
-          "lane": 0,
+          "lane": 1,
           "model": "sd15-checkpoint-b"
         }
       ],
@@ -182,29 +155,13 @@
           "job": "job-3",
           "keep_model_resident_after": false,
           "model": "sd15-checkpoint-b",
-          "process_id": 0
+          "process_id": 1
         }
       ],
       "sampling_started": [
         "job-3"
       ],
-      "tick": 7
-    },
-    {
-      "decisions": [
-        {
-          "inputs": {
-            "decision": "already_loaded",
-            "model": "sd15-checkpoint-b",
-            "process_id": null
-          },
-          "kind": "vram_admission",
-          "reason": "model already resident or loading",
-          "subject": "job-3",
-          "verdict": "no_op"
-        }
-      ],
-      "tick": 8
+      "tick": 6
     }
   ],
   "ticks_driven": 24
